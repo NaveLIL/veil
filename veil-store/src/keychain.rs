@@ -1,5 +1,4 @@
 use keyring::Entry;
-use zeroize::Zeroize;
 
 const SERVICE_NAME: &str = "veil-messenger";
 

@@ -1,0 +1,67 @@
+name: Coverage
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev
+
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin --locked
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: coverage-${{ hashFiles('**/Cargo.toml') }}
+
+      - name: Generate coverage
+        run: |
+          cargo tarpaulin \
+            --workspace \
+            --exclude-files "*/tests/*" \
+            --exclude-files "*/benches/*" \
+            --out xml \
+            --out html \
+            --output-dir coverage/ \
+            --timeout 300 \
+            --skip-clean
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage/
+          retention-days: 30
+
+      - name: Coverage summary
+        run: |
+          cargo tarpaulin \
+            --workspace \
+            --exclude-files "*/tests/*" \
+            --exclude-files "*/benches/*" \
+            --skip-clean \
+            --print-rust-flags 2>&1 | tail -5 || true
+          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo "See uploaded artifact for full HTML report." >> $GITHUB_STEP_SUMMARY

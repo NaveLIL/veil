@@ -1,4 +1,4 @@
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 use std::path::Path;
 use zeroize::Zeroize;
 

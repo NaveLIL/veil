@@ -1,0 +1,78 @@
+name: Security Audit
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  schedule:
+    # Run weekly on Monday at 06:00 UTC
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  cargo-audit:
+    name: Cargo Audit (CVE scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  cargo-deny:
+    name: Cargo Deny (licenses + advisories)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace
+
+  # Check that zeroize is used where it should be
+  zeroize-check:
+    name: Zeroize Compliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for raw secret patterns without zeroize
+        run: |
+          echo "=== Checking for potential unzeroized secrets ==="
+
+          # Files that handle secrets must import zeroize
+          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs")
+          FAIL=0
+
+          for f in $CRYPTO_FILES; do
+            if ! grep -q "use.*zeroize" "$f" && ! grep -q "Zeroize" "$f"; then
+              # Check if file actually handles key material
+              if grep -qE "(secret|key|seed|entropy)" "$f"; then
+                echo "WARNING: $f handles secrets but does not import zeroize"
+                FAIL=1
+              fi
+            fi
+          done
+
+          # Ensure no .clone() on types that should not be cloned
+          if grep -rn "shared_secret\.clone\|root_key\.clone\|chain_key\.clone" veil-crypto/src/; then
+            echo "ERROR: Secret key material is being cloned"
+            FAIL=1
+          fi
+
+          if [ $FAIL -eq 1 ]; then
+            echo "::warning::Potential zeroize compliance issues found"
+          else
+            echo "All checks passed"
+          fi

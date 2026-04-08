@@ -18,5 +18,8 @@ uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 zeroize = "1"
 
+[dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+
 [build-dependencies]
 prost-build = "0.13"
