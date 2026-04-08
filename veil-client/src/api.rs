@@ -1,7 +1,7 @@
 use std::path::Path;
-use veil_crypto::keys::{IdentityKeyPair, generate_mnemonic, validate_mnemonic};
 use veil_crypto::fingerprint;
 use veil_crypto::kdf;
+use veil_crypto::keys::{generate_mnemonic, validate_mnemonic, IdentityKeyPair};
 use veil_store::db::VeilDb;
 use veil_store::keychain;
 use zeroize::Zeroize;
@@ -61,14 +61,16 @@ impl VeilClient {
 
     /// Get our X25519 public key (identity).
     pub fn identity_key(&self) -> Result<[u8; 32], String> {
-        self.identity.as_ref()
+        self.identity
+            .as_ref()
             .map(|id| id.x25519_public_bytes())
             .ok_or("not initialized".to_string())
     }
 
     /// Get our Ed25519 public key (signing).
     pub fn signing_key(&self) -> Result<[u8; 32], String> {
-        self.identity.as_ref()
+        self.identity
+            .as_ref()
             .map(|id| id.ed25519_public_bytes())
             .ok_or("not initialized".to_string())
     }

@@ -1,11 +1,14 @@
-use std::collections::HashMap;
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::Zeroize;
 
 use crate::aead;
 use crate::kdf;
+
+/// Type alias for the skipped message keys map: (ratchet_public_key, message_number) -> message_key.
+type SkippedKeysMap = HashMap<([u8; 32], u32), [u8; 32]>;
 
 /// Maximum number of skipped message keys to store (out-of-order tolerance).
 const MAX_SKIP: u32 = 1000;
@@ -109,7 +112,8 @@ impl RatchetSession {
         let dh_output = dh_secret.diffie_hellman(&peer_key);
 
         // KDF_RK: derive new root key and sending chain key
-        let mut kdf_output = kdf::hkdf_sha256(shared_secret, dh_output.as_bytes(), b"veil-ratchet-v1", 64);
+        let mut kdf_output =
+            kdf::hkdf_sha256(shared_secret, dh_output.as_bytes(), b"veil-ratchet-v1", 64);
 
         let mut root_key = [0u8; 32];
         let mut sending_chain_key = [0u8; 32];
@@ -158,7 +162,9 @@ impl RatchetSession {
     ///
     /// Returns `(header, ciphertext)` — both must be sent to the peer.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<(MessageHeader, Vec<u8>), String> {
-        let ck = self.sending_chain_key.as_ref()
+        let ck = self
+            .sending_chain_key
+            .as_ref()
             .ok_or("sending chain not initialized (responder must receive first)")?;
 
         // KDF_CK: derive message key and next chain key
@@ -173,7 +179,9 @@ impl RatchetSession {
             pn: self.prev_send_count,
         };
 
-        self.send_count = self.send_count.checked_add(1)
+        self.send_count = self
+            .send_count
+            .checked_add(1)
             .ok_or("message counter overflow".to_string())?;
 
         // Encrypt with message key
@@ -192,7 +200,11 @@ impl RatchetSession {
     /// Decrypt a received message.
     ///
     /// Handles DH ratchet steps and out-of-order messages automatically.
-    pub fn decrypt(&mut self, header: &MessageHeader, ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+    pub fn decrypt(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, String> {
         if ciphertext.len() < aead::NONCE_SIZE {
             return Err("ciphertext too short".to_string());
         }
@@ -218,12 +230,16 @@ impl RatchetSession {
         self.skip_messages(header.n)?;
 
         // KDF_CK: derive message key
-        let ck = self.receiving_chain_key.as_ref()
+        let ck = self
+            .receiving_chain_key
+            .as_ref()
             .ok_or("receiving chain not initialized")?;
         let mut message_key = kdf::hmac_sha256(ck, b"\x01");
         let next_chain_key = kdf::hmac_sha256(ck, b"\x02");
         self.receiving_chain_key = Some(next_chain_key);
-        self.recv_count = self.recv_count.checked_add(1)
+        self.recv_count = self
+            .recv_count
+            .checked_add(1)
             .ok_or("recv counter overflow".to_string())?;
 
         // Decrypt
@@ -251,7 +267,8 @@ impl RatchetSession {
         let dh_output = our_secret.diffie_hellman(&peer_key);
 
         // KDF_RK → new root key + receiving chain key
-        let mut kdf_out = kdf::hkdf_sha256(&self.root_key, dh_output.as_bytes(), b"veil-ratchet-v1", 64);
+        let mut kdf_out =
+            kdf::hkdf_sha256(&self.root_key, dh_output.as_bytes(), b"veil-ratchet-v1", 64);
         self.root_key.copy_from_slice(&kdf_out[..32]);
         let mut recv_ck = [0u8; 32];
         recv_ck.copy_from_slice(&kdf_out[32..]);
@@ -264,7 +281,12 @@ impl RatchetSession {
         let dh_output2 = new_secret.diffie_hellman(&peer_key);
 
         // KDF_RK → new root key + sending chain key
-        let mut kdf_out2 = kdf::hkdf_sha256(&self.root_key, dh_output2.as_bytes(), b"veil-ratchet-v1", 64);
+        let mut kdf_out2 = kdf::hkdf_sha256(
+            &self.root_key,
+            dh_output2.as_bytes(),
+            b"veil-ratchet-v1",
+            64,
+        );
         self.root_key.copy_from_slice(&kdf_out2[..32]);
         let mut send_ck = [0u8; 32];
         send_ck.copy_from_slice(&kdf_out2[32..]);
@@ -303,7 +325,9 @@ impl RatchetSession {
                     }
                 }
                 self.skipped_keys.insert((rk, self.recv_count), message_key);
-                self.recv_count = self.recv_count.checked_add(1)
+                self.recv_count = self
+                    .recv_count
+                    .checked_add(1)
                     .ok_or("recv counter overflow in skip".to_string())?;
             }
             self.receiving_chain_key = Some(chain_key);
@@ -333,8 +357,7 @@ impl RatchetSession {
 
     /// Reconstruct X25519 StaticSecret from stored bytes.
     fn reconstruct_secret(&self) -> Result<X25519StaticSecret, String> {
-        let bytes = self.dh_sending_secret.as_ref()
-            .ok_or("no sending secret")?;
+        let bytes = self.dh_sending_secret.as_ref().ok_or("no sending secret")?;
         let mut arr = [0u8; 32];
         if bytes.len() != 32 {
             return Err("invalid secret length".to_string());
@@ -362,18 +385,25 @@ mod secret_key_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        value.as_ref().map(|v| base64::engine::general_purpose::STANDARD.encode(v))
+    where
+        S: Serializer,
+    {
+        value
+            .as_ref()
+            .map(|v| base64::engine::general_purpose::STANDARD.encode(v))
             .serialize(serializer)
     }
 
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
-    where D: Deserializer<'de> {
+    where
+        D: Deserializer<'de>,
+    {
         use base64::Engine;
         let opt: Option<String> = Option::deserialize(deserializer)?;
         match opt {
             Some(s) => {
-                let bytes = base64::engine::general_purpose::STANDARD.decode(&s)
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&s)
                     .map_err(serde::de::Error::custom)?;
                 Ok(Some(bytes))
             }
@@ -383,27 +413,34 @@ mod secret_key_serde {
 }
 
 mod skipped_keys_serde {
+    use super::SkippedKeysMap;
     use base64::Engine;
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::collections::HashMap;
 
-    pub fn serialize<S>(
-        value: &HashMap<([u8; 32], u32), [u8; 32]>,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error>
-    where S: Serializer {
-        let map: HashMap<String, String> = value.iter().map(|((key, n), mk)| {
-            let k = format!("{}:{}", base64::engine::general_purpose::STANDARD.encode(key), n);
-            let v = base64::engine::general_purpose::STANDARD.encode(mk);
-            (k, v)
-        }).collect();
+    pub fn serialize<S>(value: &SkippedKeysMap, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let map: HashMap<String, String> = value
+            .iter()
+            .map(|((key, n), mk)| {
+                let k = format!(
+                    "{}:{}",
+                    base64::engine::general_purpose::STANDARD.encode(key),
+                    n
+                );
+                let v = base64::engine::general_purpose::STANDARD.encode(mk);
+                (k, v)
+            })
+            .collect();
         map.serialize(serializer)
     }
 
-    pub fn deserialize<'de, D>(
-        deserializer: D,
-    ) -> Result<HashMap<([u8; 32], u32), [u8; 32]>, D::Error>
-    where D: Deserializer<'de> {
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<SkippedKeysMap, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
         let map: HashMap<String, String> = HashMap::deserialize(deserializer)?;
         let mut result = HashMap::new();
         for (k, v) in map {
@@ -412,9 +449,11 @@ mod skipped_keys_serde {
                 continue;
             }
             let n: u32 = parts[0].parse().map_err(serde::de::Error::custom)?;
-            let key_bytes = base64::engine::general_purpose::STANDARD.decode(parts[1])
+            let key_bytes = base64::engine::general_purpose::STANDARD
+                .decode(parts[1])
                 .map_err(serde::de::Error::custom)?;
-            let mk_bytes = base64::engine::general_purpose::STANDARD.decode(&v)
+            let mk_bytes = base64::engine::general_purpose::STANDARD
+                .decode(&v)
                 .map_err(serde::de::Error::custom)?;
             if key_bytes.len() == 32 && mk_bytes.len() == 32 {
                 let mut key = [0u8; 32];
@@ -459,15 +498,14 @@ mod tests {
             Some(&bob_opk),
             &alice_identity.x25519_public_bytes(),
             &alice_x3dh.ephemeral_public,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(alice_x3dh.shared_secret, bob_x3dh.shared_secret);
 
         // Initialize ratchet sessions
-        let alice_session = RatchetSession::init_initiator(
-            &alice_x3dh.shared_secret,
-            &bob_bundle.signed_prekey,
-        );
+        let alice_session =
+            RatchetSession::init_initiator(&alice_x3dh.shared_secret, &bob_bundle.signed_prekey);
         let bob_session = RatchetSession::init_responder(
             &bob_x3dh.shared_secret,
             &bob_spk.secret.to_bytes(),

@@ -35,7 +35,10 @@ fn test_db_key_isolation() {
         32,
     );
 
-    assert_ne!(key1, key2, "Different mnemonics must produce different DB keys");
+    assert_ne!(
+        key1, key2,
+        "Different mnemonics must produce different DB keys"
+    );
     assert_eq!(key1.len(), 32);
 }
 
@@ -60,7 +63,13 @@ fn test_store_conversation_roundtrip() {
         .execute(
             "INSERT INTO messages (id, conversation_id, sender_key, plaintext, is_outgoing)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["msg-1", "conv-test-1", vec![1u8; 32], "Hello from integration test", 1],
+            rusqlite::params![
+                "msg-1",
+                "conv-test-1",
+                vec![1u8; 32],
+                "Hello from integration test",
+                1
+            ],
         )
         .unwrap();
 

@@ -2,10 +2,8 @@ use sha2::{Digest, Sha256};
 
 /// Emoji set for visual fingerprints (32 unique emoji).
 const FINGERPRINT_EMOJI: [&str; 32] = [
-    "🔒", "🛡️", "🗝️", "⚡", "🌊", "🔥", "❄️", "🌿",
-    "🌙", "⭐", "🎯", "🎲", "🧩", "🏔️", "🌸", "🦋",
-    "🐺", "🦅", "🐋", "🦁", "🌍", "💎", "🔮", "🎭",
-    "🏛️", "⚓", "🚀", "🎵", "📡", "🧬", "⚔️", "🏴",
+    "🔒", "🛡️", "🗝️", "⚡", "🌊", "🔥", "❄️", "🌿", "🌙", "⭐", "🎯", "🎲", "🧩", "🏔️", "🌸", "🦋",
+    "🐺", "🦅", "🐋", "🦁", "🌍", "💎", "🔮", "🎭", "🏛️", "⚓", "🚀", "🎵", "📡", "🧬", "⚔️", "🏴",
 ];
 
 /// Generate a visual fingerprint from two identity keys.
@@ -78,7 +76,10 @@ mod tests {
         let (_, hex_ab) = generate(&key_a, &key_b);
         let (_, hex_ac) = generate(&key_a, &key_c);
 
-        assert_ne!(hex_ab, hex_ac, "Different key pairs must produce different fingerprints");
+        assert_ne!(
+            hex_ab, hex_ac,
+            "Different key pairs must produce different fingerprints"
+        );
     }
 
     #[test]

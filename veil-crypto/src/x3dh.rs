@@ -94,7 +94,7 @@ impl OneTimePreKey {
 
     /// Generate a batch of one-time prekeys.
     pub fn generate_batch(start_id: u32, count: u32) -> Vec<Self> {
-        (start_id..start_id + count).map(|id| Self::generate(id)).collect()
+        (start_id..start_id + count).map(Self::generate).collect()
     }
 }
 
@@ -254,7 +254,8 @@ mod tests {
             Some(&bob_opk),
             &alice.x25519_public_bytes(),
             &alice_result.ephemeral_public,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(
             alice_result.shared_secret, bob_result.shared_secret,
@@ -290,7 +291,8 @@ mod tests {
             None,
             &alice.x25519_public_bytes(),
             &alice_result.ephemeral_public,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(alice_result.shared_secret, bob_result.shared_secret);
     }

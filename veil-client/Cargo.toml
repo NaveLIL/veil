@@ -2,6 +2,7 @@
 name = "veil-client"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Protocol engine for Veil messenger — WebSocket, Protobuf, session management"
 
 [dependencies]
@@ -9,7 +10,7 @@ veil-crypto = { path = "../veil-crypto" }
 veil-store = { path = "../veil-store" }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"

@@ -1,7 +1,6 @@
 use std::sync::{Arc, Mutex};
 use veil_crypto::{
-    aead, fingerprint, kdf, keys, ratchet, share, signature, x3dh,
-    IdentityKeyPair, RatchetSession,
+    aead, fingerprint, kdf, keys, ratchet, share, signature, x3dh, IdentityKeyPair, RatchetSession,
 };
 
 uniffi::setup_scaffolding!();
@@ -88,8 +87,8 @@ impl VeilIdentity {
 
     #[uniffi::constructor]
     pub fn from_mnemonic(mnemonic: String) -> Result<Arc<Self>, VeilError> {
-        let kp = IdentityKeyPair::from_mnemonic(&mnemonic)
-            .map_err(|e| VeilError::Crypto { msg: e })?;
+        let kp =
+            IdentityKeyPair::from_mnemonic(&mnemonic).map_err(|e| VeilError::Crypto { msg: e })?;
         Ok(Arc::new(Self { inner: kp }))
     }
 
@@ -123,7 +122,10 @@ pub struct VeilRatchet {
 #[uniffi::export]
 impl VeilRatchet {
     #[uniffi::constructor]
-    pub fn init_initiator(shared_secret: Vec<u8>, peer_ratchet_key: Vec<u8>) -> Result<Arc<Self>, VeilError> {
+    pub fn init_initiator(
+        shared_secret: Vec<u8>,
+        peer_ratchet_key: Vec<u8>,
+    ) -> Result<Arc<Self>, VeilError> {
         let ss = to_32(&shared_secret)?;
         let prk = to_32(&peer_ratchet_key)?;
         Ok(Arc::new(Self {
@@ -132,27 +134,38 @@ impl VeilRatchet {
     }
 
     #[uniffi::constructor]
-    pub fn init_responder(shared_secret: Vec<u8>, our_spk_secret: Vec<u8>, our_spk_public: Vec<u8>) -> Result<Arc<Self>, VeilError> {
+    pub fn init_responder(
+        shared_secret: Vec<u8>,
+        our_spk_secret: Vec<u8>,
+        our_spk_public: Vec<u8>,
+    ) -> Result<Arc<Self>, VeilError> {
         let ss = to_32(&shared_secret)?;
         let pub_key = to_32(&our_spk_public)?;
         Ok(Arc::new(Self {
-            session: Mutex::new(RatchetSession::init_responder(&ss, &our_spk_secret, &pub_key)),
+            session: Mutex::new(RatchetSession::init_responder(
+                &ss,
+                &our_spk_secret,
+                &pub_key,
+            )),
         }))
     }
 
     #[uniffi::constructor]
     pub fn deserialize(json: String) -> Result<Arc<Self>, VeilError> {
-        let session: RatchetSession = serde_json::from_str(&json)
-            .map_err(|e| VeilError::Session { msg: e.to_string() })?;
+        let session: RatchetSession =
+            serde_json::from_str(&json).map_err(|e| VeilError::Session { msg: e.to_string() })?;
         Ok(Arc::new(Self {
             session: Mutex::new(session),
         }))
     }
 
     pub fn encrypt(&self, plaintext: Vec<u8>) -> Result<RatchetMessage, VeilError> {
-        let mut s = self.session.lock()
+        let mut s = self
+            .session
+            .lock()
             .map_err(|e| VeilError::Session { msg: e.to_string() })?;
-        let (header, ciphertext) = s.encrypt(&plaintext)
+        let (header, ciphertext) = s
+            .encrypt(&plaintext)
             .map_err(|e| VeilError::Crypto { msg: e })?;
         Ok(RatchetMessage {
             header: header.to_bytes(),
@@ -160,20 +173,27 @@ impl VeilRatchet {
         })
     }
 
-    pub fn decrypt(&self, header_bytes: Vec<u8>, ciphertext: Vec<u8>) -> Result<Vec<u8>, VeilError> {
+    pub fn decrypt(
+        &self,
+        header_bytes: Vec<u8>,
+        ciphertext: Vec<u8>,
+    ) -> Result<Vec<u8>, VeilError> {
         let header = ratchet::MessageHeader::from_bytes(&header_bytes)
             .map_err(|e| VeilError::InvalidInput { msg: e })?;
-        let mut s = self.session.lock()
+        let mut s = self
+            .session
+            .lock()
             .map_err(|e| VeilError::Session { msg: e.to_string() })?;
         s.decrypt(&header, &ciphertext)
             .map_err(|e| VeilError::Crypto { msg: e })
     }
 
     pub fn serialize(&self) -> Result<String, VeilError> {
-        let s = self.session.lock()
+        let s = self
+            .session
+            .lock()
             .map_err(|e| VeilError::Session { msg: e.to_string() })?;
-        serde_json::to_string(&*s)
-            .map_err(|e| VeilError::Session { msg: e.to_string() })
+        serde_json::to_string(&*s).map_err(|e| VeilError::Session { msg: e.to_string() })
     }
 }
 
@@ -192,8 +212,7 @@ pub fn validate_mnemonic(mnemonic: String) -> bool {
 #[uniffi::export]
 pub fn aead_encrypt(key: Vec<u8>, plaintext: Vec<u8>) -> Result<AeadResult, VeilError> {
     let k = to_32(&key)?;
-    let (ct, nonce) = aead::encrypt(&k, &plaintext)
-        .map_err(|e| VeilError::Crypto { msg: e })?;
+    let (ct, nonce) = aead::encrypt(&k, &plaintext).map_err(|e| VeilError::Crypto { msg: e })?;
     Ok(AeadResult {
         ciphertext: ct,
         nonce: nonce.to_vec(),
@@ -201,22 +220,32 @@ pub fn aead_encrypt(key: Vec<u8>, plaintext: Vec<u8>) -> Result<AeadResult, Veil
 }
 
 #[uniffi::export]
-pub fn aead_decrypt(key: Vec<u8>, ciphertext: Vec<u8>, nonce: Vec<u8>) -> Result<Vec<u8>, VeilError> {
+pub fn aead_decrypt(
+    key: Vec<u8>,
+    ciphertext: Vec<u8>,
+    nonce: Vec<u8>,
+) -> Result<Vec<u8>, VeilError> {
     let k = to_32(&key)?;
     let n = to_24(&nonce)?;
-    aead::decrypt(&k, &ciphertext, &n)
-        .map_err(|e| VeilError::Crypto { msg: e })
+    aead::decrypt(&k, &ciphertext, &n).map_err(|e| VeilError::Crypto { msg: e })
 }
 
 #[uniffi::export]
-pub fn ed25519_verify(public_key: Vec<u8>, message: Vec<u8>, sig: Vec<u8>) -> Result<bool, VeilError> {
+pub fn ed25519_verify(
+    public_key: Vec<u8>,
+    message: Vec<u8>,
+    sig: Vec<u8>,
+) -> Result<bool, VeilError> {
     let pk = to_32(&public_key)?;
     let s = to_64(&sig)?;
     Ok(signature::verify(&pk, &message, &s))
 }
 
 #[uniffi::export]
-pub fn generate_fingerprint(key_a: Vec<u8>, key_b: Vec<u8>) -> Result<FingerprintResult, VeilError> {
+pub fn generate_fingerprint(
+    key_a: Vec<u8>,
+    key_b: Vec<u8>,
+) -> Result<FingerprintResult, VeilError> {
     let a = to_32(&key_a)?;
     let b = to_32(&key_b)?;
     let (emoji, hex) = fingerprint::generate(&a, &b);
@@ -226,16 +255,15 @@ pub fn generate_fingerprint(key_a: Vec<u8>, key_b: Vec<u8>) -> Result<Fingerprin
 #[uniffi::export]
 pub fn derive_key_from_pin(pin: String, salt: Vec<u8>) -> Result<Vec<u8>, VeilError> {
     let s = to_32(&salt)?;
-    let key = kdf::derive_key_from_pin(&pin, &s)
-        .map_err(|e| VeilError::Crypto { msg: e })?;
+    let key = kdf::derive_key_from_pin(&pin, &s).map_err(|e| VeilError::Crypto { msg: e })?;
     Ok(key.to_vec())
 }
 
 #[uniffi::export]
 pub fn derive_key_from_password(password: String, salt: Vec<u8>) -> Result<Vec<u8>, VeilError> {
     let s = to_32(&salt)?;
-    let key = kdf::derive_key_from_password(&password, &s)
-        .map_err(|e| VeilError::Crypto { msg: e })?;
+    let key =
+        kdf::derive_key_from_password(&password, &s).map_err(|e| VeilError::Crypto { msg: e })?;
     Ok(key.to_vec())
 }
 
@@ -295,8 +323,8 @@ pub fn x3dh_initiate(
         one_time_prekey_id: peer_bundle.one_time_prekey_id,
     };
 
-    let result = x3dh::initiate(&identity.inner, &bundle)
-        .map_err(|e| VeilError::Crypto { msg: e })?;
+    let result =
+        x3dh::initiate(&identity.inner, &bundle).map_err(|e| VeilError::Crypto { msg: e })?;
 
     Ok(X3dhResultData {
         shared_secret: result.shared_secret.to_vec(),

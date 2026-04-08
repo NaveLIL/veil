@@ -5,8 +5,6 @@ use chacha20poly1305::{
 use rand::RngCore;
 use zeroize::Zeroize;
 
-/// Poly1305 authentication tag size.
-const TAG_SIZE: usize = 16;
 /// XChaCha20 nonce size.
 pub const NONCE_SIZE: usize = 24;
 /// Padding block size to hide message length.
@@ -23,8 +21,7 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_
         return Err("plaintext too large (max 4GB)".to_string());
     }
 
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
+    let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
 
     // Generate random nonce (24 bytes — safe for random generation, no collision risk)
     let mut nonce_bytes = [0u8; NONCE_SIZE];
@@ -47,9 +44,12 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_
 /// Decrypt ciphertext with XChaCha20-Poly1305.
 ///
 /// Returns the original plaintext (padding removed).
-pub fn decrypt(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8; NONCE_SIZE]) -> Result<Vec<u8>, String> {
-    let cipher =
-        XChaCha20Poly1305::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
+pub fn decrypt(
+    key: &[u8; 32],
+    ciphertext: &[u8],
+    nonce: &[u8; NONCE_SIZE],
+) -> Result<Vec<u8>, String> {
+    let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
 
     let nonce = XNonce::from_slice(nonce);
 
@@ -71,7 +71,7 @@ pub fn decrypt(key: &[u8; 32], ciphertext: &[u8], nonce: &[u8; NONCE_SIZE]) -> R
 /// Total length is always a multiple of PAD_BLOCK.
 fn pad(plaintext: &[u8]) -> Vec<u8> {
     let len = plaintext.len();
-    let total = ((len + 4 + PAD_BLOCK - 1) / PAD_BLOCK) * PAD_BLOCK;
+    let total = (len + 4).div_ceil(PAD_BLOCK) * PAD_BLOCK;
     let mut padded = vec![0u8; total];
 
     // First 4 bytes: plaintext length (big-endian)
@@ -101,6 +101,9 @@ fn unpad(padded: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Poly1305 authentication tag size (used only in tests for assertions).
+    const TAG_SIZE: usize = 16;
 
     #[test]
     fn test_encrypt_decrypt_roundtrip() {

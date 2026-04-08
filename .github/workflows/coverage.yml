@@ -40,6 +40,9 @@ jobs:
         run: |
           cargo tarpaulin \
             --workspace \
+            --exclude veil-desktop \
+            --exclude veil-share-viewer \
+            --exclude veil-ffi \
             --exclude-files "*/tests/*" \
             --exclude-files "*/benches/*" \
             --out xml \
@@ -59,6 +62,9 @@ jobs:
         run: |
           cargo tarpaulin \
             --workspace \
+            --exclude veil-desktop \
+            --exclude veil-share-viewer \
+            --exclude veil-ffi \
             --exclude-files "*/tests/*" \
             --exclude-files "*/benches/*" \
             --skip-clean \

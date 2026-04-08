@@ -106,4 +106,4 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Build benchmarks (no run)
-        run: cargo bench --workspace --no-run
+        run: cargo bench -p veil-crypto --no-run

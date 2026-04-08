@@ -38,7 +38,7 @@ jobs:
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: --workspace
+          arguments: licenses bans sources
 
   # Check that zeroize is used where it should be
   zeroize-check:

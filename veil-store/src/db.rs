@@ -11,8 +11,7 @@ impl VeilDb {
     /// Open (or create) an encrypted database at the given path.
     /// The `key` is a 32-byte encryption key derived from user identity.
     pub fn open(path: &Path, key: &[u8; 32]) -> Result<Self, String> {
-        let conn = Connection::open(path)
-            .map_err(|e| format!("open db: {e}"))?;
+        let conn = Connection::open(path).map_err(|e| format!("open db: {e}"))?;
 
         // Set SQLCipher encryption key
         let mut hex_key = hex::encode(key);
@@ -25,14 +24,16 @@ impl VeilDb {
             "PRAGMA cipher_page_size = 4096;
              PRAGMA kdf_iter = 256000;
              PRAGMA cipher_memory_security = ON;",
-        ).map_err(|e| format!("cipher pragmas: {e}"))?;
+        )
+        .map_err(|e| format!("cipher pragmas: {e}"))?;
 
         // Performance settings
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
              PRAGMA foreign_keys = ON;",
-        ).map_err(|e| format!("pragmas: {e}"))?;
+        )
+        .map_err(|e| format!("pragmas: {e}"))?;
 
         let db = Self { conn };
         db.run_migrations()?;
@@ -41,8 +42,7 @@ impl VeilDb {
 
     /// Open an in-memory database (for testing).
     pub fn open_memory(key: &[u8; 32]) -> Result<Self, String> {
-        let conn = Connection::open_in_memory()
-            .map_err(|e| format!("open memory db: {e}"))?;
+        let conn = Connection::open_in_memory().map_err(|e| format!("open memory db: {e}"))?;
 
         let mut hex_key = hex::encode(key);
         let res = conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";\n", hex_key));
@@ -54,7 +54,8 @@ impl VeilDb {
              PRAGMA kdf_iter = 256000;
              PRAGMA cipher_memory_security = ON;
              PRAGMA foreign_keys = ON;",
-        ).map_err(|e| format!("pragmas: {e}"))?;
+        )
+        .map_err(|e| format!("pragmas: {e}"))?;
 
         let db = Self { conn };
         db.run_migrations()?;
@@ -62,8 +63,9 @@ impl VeilDb {
     }
 
     fn run_migrations(&self) -> Result<(), String> {
-        self.conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_version (
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (
                 version INTEGER PRIMARY KEY
             );
 
@@ -116,7 +118,8 @@ impl VeilDb {
                 reply_to_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );",
-        ).map_err(|e| format!("migrations: {e}"))
+            )
+            .map_err(|e| format!("migrations: {e}"))
     }
 
     /// Get a reference to the underlying connection (for advanced queries).
@@ -128,17 +131,21 @@ impl VeilDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::params;
 
     #[test]
     fn test_open_memory_db() {
         let key = [42u8; 32];
         let db = VeilDb::open_memory(&key).unwrap();
         // Verify tables exist
-        let count: i64 = db.conn.query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations'",
-            [],
-            |row| row.get(0),
-        ).unwrap();
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='conversations'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert_eq!(count, 1);
     }
 
@@ -147,16 +154,21 @@ mod tests {
         let key = [42u8; 32];
         let db = VeilDb::open_memory(&key).unwrap();
 
-        db.conn.execute(
-            "INSERT INTO conversations (id, conv_type, name) VALUES (?1, ?2, ?3)",
-            params!["conv-1", 1, "Test Group"],
-        ).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO conversations (id, conv_type, name) VALUES (?1, ?2, ?3)",
+                params!["conv-1", 1, "Test Group"],
+            )
+            .unwrap();
 
-        let name: String = db.conn.query_row(
-            "SELECT name FROM conversations WHERE id = ?1",
-            params!["conv-1"],
-            |row| row.get(0),
-        ).unwrap();
+        let name: String = db
+            .conn
+            .query_row(
+                "SELECT name FROM conversations WHERE id = ?1",
+                params!["conv-1"],
+                |row| row.get(0),
+            )
+            .unwrap();
 
         assert_eq!(name, "Test Group");
     }

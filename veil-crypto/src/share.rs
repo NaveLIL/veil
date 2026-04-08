@@ -13,10 +13,7 @@ use crate::kdf;
 /// - `ciphertext`: encrypted payload
 /// - `content_key`: 32-byte key (embed in URL fragment if no password)
 /// - `salt`: 32-byte salt (needed for password-based decryption)
-pub fn encrypt_share(
-    payload: &[u8],
-    password: Option<&str>,
-) -> Result<ShareBundle, String> {
+pub fn encrypt_share(payload: &[u8], password: Option<&str>) -> Result<ShareBundle, String> {
     // Generate random content key
     let mut content_key = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut content_key);
@@ -87,7 +84,9 @@ pub fn decrypt_share(
         key.copy_from_slice(&unwrapped);
         key
     } else {
-        return Err("must provide either content_key or (password + wrapped_key + salt)".to_string());
+        return Err(
+            "must provide either content_key or (password + wrapped_key + salt)".to_string(),
+        );
     };
 
     // Decrypt payload
@@ -141,7 +140,8 @@ mod tests {
             None,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(decrypted, payload);
     }
@@ -162,7 +162,8 @@ mod tests {
             Some(password),
             bundle.wrapped_key.as_deref(),
             bundle.salt.as_ref(),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(decrypted, payload);
     }
@@ -194,7 +195,8 @@ mod tests {
             Some("test"),
             bundle.wrapped_key.as_deref(),
             bundle.salt.as_ref(),
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_eq!(decrypted, payload);
     }
@@ -208,7 +210,8 @@ mod tests {
             None,
             None,
             None,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(decrypted, b"");
     }
 }

@@ -1,7 +1,7 @@
 use base64::Engine;
 use wasm_bindgen::prelude::*;
 
-/// Decrypt a secure share given the ciphertext (base64), content key (hex), 
+/// Decrypt a secure share given the ciphertext (base64), content key (hex),
 /// and optionally a password + wrapped key + salt.
 #[wasm_bindgen]
 pub fn decrypt_share(
@@ -17,8 +17,8 @@ pub fn decrypt_share(
 
     let content_key: Option<[u8; 32]> = match content_key_hex {
         Some(ref h) => {
-            let bytes = hex::decode(h)
-                .map_err(|e| JsValue::from_str(&format!("hex decode error: {e}")))?;
+            let bytes =
+                hex::decode(h).map_err(|e| JsValue::from_str(&format!("hex decode error: {e}")))?;
             let arr: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| JsValue::from_str("content key must be 32 bytes"))?;
@@ -38,8 +38,8 @@ pub fn decrypt_share(
 
     let salt: Option<[u8; 32]> = match salt_hex {
         Some(ref h) => {
-            let bytes = hex::decode(h)
-                .map_err(|e| JsValue::from_str(&format!("salt hex decode: {e}")))?;
+            let bytes =
+                hex::decode(h).map_err(|e| JsValue::from_str(&format!("salt hex decode: {e}")))?;
             let arr: [u8; 32] = bytes
                 .try_into()
                 .map_err(|_| JsValue::from_str("salt must be 32 bytes"))?;

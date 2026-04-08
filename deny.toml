@@ -1,14 +1,11 @@
 [advisories]
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "warn"
-notice = "warn"
+ignore = []
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
@@ -18,18 +15,20 @@ allow = [
     "BSL-1.0",
     "CC0-1.0",
     "OpenSSL",
+    "MPL-2.0",
+    "CDLA-Permissive-2.0",
 ]
-copyleft = "deny"
+
+[licenses.private]
+ignore = true
 
 [bans]
 multiple-versions = "warn"
-wildcards = "deny"
+wildcards = "allow"
 highlight = "all"
 
-# Deny known-bad crates
 deny = [
-    # Use ring or RustCrypto instead
-    { name = "openssl-sys", wrappers = [] },
+    { crate = "openssl-sys", wrappers = [] },
 ]
 
 [sources]

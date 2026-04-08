@@ -1,16 +1,15 @@
-use argon2::{self, Argon2, Algorithm, Version, Params};
+use argon2::{self, Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-
 
 type HmacSha256 = Hmac<Sha256>;
 
 /// Argon2id parameters for seed derivation (from BIP39 mnemonic).
 /// Tuned for native performance: ~200ms on mobile, ~50ms on desktop.
 const ARGON2_M_COST: u32 = 65536; // 64 MB
-const ARGON2_T_COST: u32 = 3;     // 3 iterations
-const ARGON2_P_COST: u32 = 4;     // 4 parallel lanes
+const ARGON2_T_COST: u32 = 3; // 3 iterations
+const ARGON2_P_COST: u32 = 4; // 4 parallel lanes
 
 /// Argon2id parameters for PIN (lighter, ~100ms)
 const ARGON2_PIN_M_COST: u32 = 32768; // 32 MB
@@ -44,8 +43,13 @@ pub fn derive_seed_from_mnemonic(mnemonic: &str) -> Result<[u8; 64], String> {
 
 /// Derive a key from a PIN using Argon2id (lighter parameters).
 pub fn derive_key_from_pin(pin: &str, salt: &[u8; 32]) -> Result<[u8; 32], String> {
-    let params = Params::new(ARGON2_PIN_M_COST, ARGON2_PIN_T_COST, ARGON2_PIN_P_COST, Some(32))
-        .map_err(|e| format!("argon2 params: {e}"))?;
+    let params = Params::new(
+        ARGON2_PIN_M_COST,
+        ARGON2_PIN_T_COST,
+        ARGON2_PIN_P_COST,
+        Some(32),
+    )
+    .map_err(|e| format!("argon2 params: {e}"))?;
 
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
@@ -87,8 +91,7 @@ pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], output_len: usize) -> V
 
 /// HMAC-SHA256: used in Double Ratchet for chain key derivation (KDF_CK).
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key)
-        .expect("HMAC key length should be valid");
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key length should be valid");
     mac.update(data);
     let result = mac.finalize();
     let mut output = [0u8; 32];
@@ -112,8 +115,12 @@ mod tests {
     #[test]
     fn test_derive_seed_different_mnemonics() {
         let seed1 = derive_seed_from_mnemonic("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
-        let seed2 = derive_seed_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong").unwrap();
-        assert_ne!(seed1, seed2, "Different mnemonics must produce different seeds");
+        let seed2 =
+            derive_seed_from_mnemonic("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong").unwrap();
+        assert_ne!(
+            seed1, seed2,
+            "Different mnemonics must produce different seeds"
+        );
     }
 
     #[test]

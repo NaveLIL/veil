@@ -26,14 +26,10 @@ fn test_full_messaging_lifecycle() {
     assert_eq!(alice.ed25519_public_bytes(), alice2.ed25519_public_bytes());
 
     // === Phase 2: Fingerprint Verification ===
-    let (emoji_ab, hex_ab) = fingerprint::generate(
-        &alice.x25519_public_bytes(),
-        &bob.x25519_public_bytes(),
-    );
-    let (emoji_ba, hex_ba) = fingerprint::generate(
-        &bob.x25519_public_bytes(),
-        &alice.x25519_public_bytes(),
-    );
+    let (emoji_ab, hex_ab) =
+        fingerprint::generate(&alice.x25519_public_bytes(), &bob.x25519_public_bytes());
+    let (emoji_ba, hex_ba) =
+        fingerprint::generate(&bob.x25519_public_bytes(), &alice.x25519_public_bytes());
     assert_eq!(emoji_ab, emoji_ba, "Fingerprint must be symmetric");
     assert_eq!(hex_ab, hex_ba);
 
@@ -64,10 +60,8 @@ fn test_full_messaging_lifecycle() {
     assert_eq!(alice_x3dh.shared_secret, bob_x3dh.shared_secret);
 
     // === Phase 4: Double Ratchet ===
-    let mut alice_session = RatchetSession::init_initiator(
-        &alice_x3dh.shared_secret,
-        &bob_bundle.signed_prekey,
-    );
+    let mut alice_session =
+        RatchetSession::init_initiator(&alice_x3dh.shared_secret, &bob_bundle.signed_prekey);
     let mut bob_session = RatchetSession::init_responder(
         &bob_x3dh.shared_secret,
         &bob_spk.secret.to_bytes(),
@@ -139,7 +133,8 @@ fn test_out_of_order_stress() {
     )
     .unwrap();
 
-    let mut alice = RatchetSession::init_initiator(&alice_x3dh.shared_secret, &bundle.signed_prekey);
+    let mut alice =
+        RatchetSession::init_initiator(&alice_x3dh.shared_secret, &bundle.signed_prekey);
     let mut bob = RatchetSession::init_responder(
         &bob_x3dh.shared_secret,
         &bob_spk.secret.to_bytes(),
@@ -189,7 +184,8 @@ fn test_tamper_detection() {
     )
     .unwrap();
 
-    let mut alice = RatchetSession::init_initiator(&alice_x3dh.shared_secret, &bundle.signed_prekey);
+    let mut alice =
+        RatchetSession::init_initiator(&alice_x3dh.shared_secret, &bundle.signed_prekey);
     let mut bob = RatchetSession::init_responder(
         &bob_x3dh.shared_secret,
         &bob_spk.secret.to_bytes(),

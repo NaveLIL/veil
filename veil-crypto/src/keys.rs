@@ -42,7 +42,8 @@ impl IdentityKeyPair {
     /// 3. seed[32..64] → Ed25519 keypair (signing)
     pub fn from_mnemonic(mnemonic: &str) -> Result<Self, String> {
         // Validate mnemonic
-        let _m: Mnemonic = mnemonic.parse()
+        let _m: Mnemonic = mnemonic
+            .parse()
             .map_err(|e| format!("invalid mnemonic: {e}"))?;
 
         // Derive 64-byte seed
