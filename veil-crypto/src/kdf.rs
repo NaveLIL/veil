@@ -76,6 +76,32 @@ pub fn derive_key_from_password(password: &str, salt: &[u8; 32]) -> Result<[u8; 
     Ok(output)
 }
 
+/// Derive a 32-byte database encryption key from a mnemonic using Argon2id.
+///
+/// Uses Argon2id (64 MB, 3 iterations, 4 lanes) for brute-force resistance.
+/// The salt is deterministic: SHA-256("veil-db-key-v1:" || mnemonic).
+/// This ensures the same mnemonic always produces the same DB key.
+pub fn derive_db_key(mnemonic: &str) -> Result<[u8; 32], String> {
+    let salt = {
+        let mut hasher = <Sha256 as sha2::Digest>::new();
+        sha2::Digest::update(&mut hasher, b"veil-db-key-v1:");
+        sha2::Digest::update(&mut hasher, mnemonic.as_bytes());
+        sha2::Digest::finalize(hasher)
+    };
+
+    let params = Params::new(ARGON2_M_COST, ARGON2_T_COST, ARGON2_P_COST, Some(32))
+        .map_err(|e| format!("argon2 params: {e}"))?;
+
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut output = [0u8; 32];
+    argon2
+        .hash_password_into(mnemonic.as_bytes(), &salt, &mut output)
+        .map_err(|e| format!("argon2 hash: {e}"))?;
+
+    Ok(output)
+}
+
 /// HKDF-SHA256: extract and expand.
 /// Used in Double Ratchet for root key derivation (KDF_RK).
 ///
@@ -121,6 +147,22 @@ mod tests {
             seed1, seed2,
             "Different mnemonics must produce different seeds"
         );
+    }
+
+    #[test]
+    fn test_derive_db_key_deterministic() {
+        let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let k1 = derive_db_key(mnemonic).unwrap();
+        let k2 = derive_db_key(mnemonic).unwrap();
+        assert_eq!(k1, k2, "Same mnemonic must produce same DB key");
+        assert_ne!(k1, [0u8; 32], "DB key must not be all zeros");
+    }
+
+    #[test]
+    fn test_derive_db_key_different_mnemonics() {
+        let k1 = derive_db_key("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        let k2 = derive_db_key("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong").unwrap();
+        assert_ne!(k1, k2, "Different mnemonics must produce different DB keys");
     }
 
     #[test]

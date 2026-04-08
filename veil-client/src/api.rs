@@ -39,17 +39,9 @@ impl VeilClient {
     pub fn init_with_mnemonic(&mut self, mnemonic: &str, db_path: &Path) -> Result<(), String> {
         let identity = IdentityKeyPair::from_mnemonic(mnemonic)?;
 
-        // Derive database encryption key from mnemonic (PRIVATE input, not public key!)
-        // Uses the mnemonic itself as IKM — never use public keys for key derivation
-        let mut derived = kdf::hkdf_sha256(
-            b"veil-db-key-v1",
-            mnemonic.as_bytes(),
-            b"database-encryption",
-            32,
-        );
-        let mut db_key = [0u8; 32];
-        db_key.copy_from_slice(&derived);
-        derived.zeroize();
+        // Derive database encryption key from mnemonic via Argon2id.
+        // Argon2id adds brute-force resistance (64 MB, 3 iterations).
+        let mut db_key = kdf::derive_db_key(mnemonic)?;
 
         let db = VeilDb::open(db_path, &db_key)?;
         db_key.zeroize();

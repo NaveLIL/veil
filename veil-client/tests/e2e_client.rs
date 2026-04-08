@@ -22,24 +22,17 @@ fn test_client_init_deterministic() {
 fn test_db_key_isolation() {
     use veil_crypto::kdf;
 
-    let key1 = kdf::hkdf_sha256(
-        b"veil-db-key-v1",
-        b"abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
-        b"database-encryption",
-        32,
-    );
-    let key2 = kdf::hkdf_sha256(
-        b"veil-db-key-v1",
-        b"zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-        b"database-encryption",
-        32,
-    );
+    let key1 = kdf::derive_db_key(
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+    ).unwrap();
+    let key2 = kdf::derive_db_key(
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+    ).unwrap();
 
     assert_ne!(
         key1, key2,
         "Different mnemonics must produce different DB keys"
     );
-    assert_eq!(key1.len(), 32);
 }
 
 /// Test SQLCipher DB round-trip with store layer
