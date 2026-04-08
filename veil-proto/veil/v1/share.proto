@@ -1,0 +1,21 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+
+// Клиент → сервер: создать secure share
+message ShareCreate {
+  bytes ciphertext = 1;         // Зашифрованный payload (клиент шифрует)
+  bool has_password = 2;        // Защищён паролем?
+  uint32 max_views = 3;         // Макс. кол-во просмотров (1-100)
+  uint64 ttl_seconds = 4;       // Время жизни в секундах
+  uint64 size_bytes = 5;        // Размер оригинальных данных (для UI)
+  optional string content_type = 6; // "text", "file", "multi"
+}
+
+// Сервер → клиент: share создан
+message ShareCreated {
+  string share_id = 1;          // Short random ID
+  string url = 2;               // Full URL: https://domain/s/{id}
+  uint64 expires_at = 3;        // Timestamp expiration
+}

@@ -1,0 +1,14 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+
+message VoiceTokenRequest {
+  string conversation_id = 1;   // Channel, DM, or group
+}
+
+message VoiceToken {
+  string token = 1;           // LiveKit JWT token
+  string server_url = 2;      // LiveKit server URL
+  string room_name = 3;
+}

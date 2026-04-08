@@ -1,0 +1,36 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+
+// Сервер отправляет challenge при подключении
+message AuthChallenge {
+  bytes challenge = 1;  // 32 bytes random
+}
+
+// Клиент подписывает challenge и отправляет identity
+message AuthResponse {
+  bytes identity_key = 1;    // X25519 public key (32 bytes)
+  bytes signing_key = 2;     // Ed25519 public key (32 bytes)
+  bytes signature = 3;       // Ed25519 signature of challenge
+  bytes device_id = 4;       // Unique device ID (16 bytes UUID)
+  string device_name = 5;    // Human-readable: "Pixel 9", "MacBook Pro"
+  string client_version = 6; // "veil-desktop/1.0.0"
+}
+
+// Результат аутентификации
+message AuthResult {
+  bool success = 1;
+  optional string user_id = 2;
+  optional string error_message = 3;
+}
+
+// Регистрация нового устройства (link existing account)
+message RegisterDevice {
+  bytes identity_key = 1;
+  bytes signing_key = 2;
+  bytes device_id = 3;
+  string device_name = 4;
+  // Для привязки к существующему аккаунту:
+  optional bytes link_signature = 5;  // Подпись от master device
+}

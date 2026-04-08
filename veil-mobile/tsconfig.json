@@ -1,0 +1,17 @@
+{
+  "compilerOptions": {
+    "strict": true,
+    "target": "esnext",
+    "module": "commonjs",
+    "moduleResolution": "bundler",
+    "jsx": "react-jsx",
+    "lib": ["es2021"],
+    "skipLibCheck": true,
+    "paths": {
+      "@/*": ["./src/*"]
+    },
+    "baseUrl": "."
+  },
+  "include": ["src", "index.ts", "App.tsx"],
+  "exclude": ["node_modules"]
+}

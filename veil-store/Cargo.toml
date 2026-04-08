@@ -1,0 +1,16 @@
+[package]
+name = "veil-store"
+version = "0.1.0"
+edition = "2021"
+description = "Encrypted local storage for Veil messenger — SQLCipher + OS Keychain"
+
+[dependencies]
+veil-crypto = { path = "../veil-crypto" }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
+keyring = "3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+zeroize = { version = "1", features = ["derive"] }
+hex = "0.4"

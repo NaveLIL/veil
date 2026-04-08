@@ -1,0 +1,126 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+
+// ===================== Messages =====================
+
+enum MessageType {
+  MESSAGE_TYPE_TEXT = 0;
+  MESSAGE_TYPE_IMAGE = 1;
+  MESSAGE_TYPE_FILE = 2;
+  MESSAGE_TYPE_VOICE_NOTE = 3;
+  MESSAGE_TYPE_VIEW_ONCE = 4;
+  MESSAGE_TYPE_SYSTEM = 5;
+}
+
+// Клиент → сервер: отправка сообщения
+message SendMessage {
+  string conversation_id = 1;  // UUID (DM, group, channel — один тип)
+  bytes ciphertext = 2;        // E2E зашифрованный payload
+  bytes header = 3;            // Encrypted ratchet header (для DM)
+  MessageType msg_type = 4;
+  optional string reply_to_id = 5;
+  optional uint32 ttl_seconds = 6;     // Disappearing message TTL
+  repeated EncryptedAttachment attachments = 7;
+
+  // Для sealed sender: ciphertext содержит sender info внутри
+  bool sealed = 8;
+}
+
+message EncryptedAttachment {
+  string media_id = 1;       // ID загруженного файла
+  bytes encrypted_key = 2;   // Ключ шифрования файла (зашифрован для получателя)
+  bytes nonce = 3;
+  uint64 size = 4;
+  string content_type = 5;   // MIME type (зашифрован? нет — server needs for thumbnails)
+}
+
+// Сервер → клиент: подтверждение отправки
+message MessageAck {
+  string message_id = 1;
+  uint64 server_timestamp = 2;
+  uint64 ref_seq = 3;
+}
+
+// Сервер → клиент: сообщение доставлено получателю
+message MessageDelivered {
+  string message_id = 1;
+  string conversation_id = 2;
+  uint64 timestamp = 3;
+}
+
+// Клиент ↔ сервер: отметка о прочтении
+message MessageRead {
+  string conversation_id = 1;
+  string last_read_id = 2;   // ID последнего прочитанного сообщения
+  uint64 timestamp = 3;
+}
+
+// Клиент → сервер: редактирование сообщения
+message EditMessage {
+  string message_id = 1;
+  string conversation_id = 2;
+  bytes new_ciphertext = 3;
+  bytes new_header = 4;
+}
+
+// Клиент → сервер: удаление сообщения
+message DeleteMessage {
+  string message_id = 1;
+  string conversation_id = 2;
+}
+
+// Сервер → клиент: событие о сообщении (новое, edit, delete)
+message MessageEvent {
+  enum EventType {
+    NEW = 0;
+    EDITED = 1;
+    DELETED = 2;
+  }
+
+  EventType event_type = 1;
+  string message_id = 2;
+  string conversation_id = 3;
+  bytes sender_identity_key = 4;
+  string sender_username = 5;
+  uint64 server_timestamp = 6;
+
+  // Для NEW и EDITED:
+  optional bytes ciphertext = 7;
+  optional bytes header = 8;
+  optional MessageType msg_type = 9;
+  optional string reply_to_id = 10;
+  optional uint32 ttl_seconds = 11;
+  repeated EncryptedAttachment attachments = 12;
+  optional bool sealed = 13;
+
+  // Для EDITED — ID оригинального сообщения:
+  optional uint64 edit_timestamp = 14;
+}
+
+// ===================== Crypto Key Exchange =====================
+
+// Prekey bundle for X3DH session establishment
+message PreKeyBundle {
+  bytes identity_key = 1;          // IK (X25519)
+  bytes signed_prekey = 2;         // SPK (X25519)
+  bytes signed_prekey_signature = 3; // Ed25519 sig of SPK
+  uint32 signed_prekey_id = 4;
+  optional bytes one_time_prekey = 5; // OPK (X25519), may be absent
+  optional uint32 one_time_prekey_id = 6;
+}
+
+// Запрос prekey bundle для начала сессии с пользователем
+message PreKeyRequest {
+  bytes target_identity_key = 1;     // Identity key получателя
+  optional bytes target_device_id = 2; // Конкретное устройство (или все)
+}
+
+// Распространение Sender Key для группового чата
+message SenderKeyDistribution {
+  string conversation_id = 1;      // Group/channel ID
+  bytes sender_key_message = 2;    // Encrypted sender key для каждого участника
+  uint32 generation = 3;           // Key generation counter
+  bytes target_identity_key = 4;   // Для кого зашифрован данный sender key
+}

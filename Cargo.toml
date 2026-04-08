@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "veil-crypto",
+    "veil-store",
+    "veil-client",
+    "veil-ffi",
+    "veil-desktop/src-tauri",
+    "veil-share-viewer",
+]
+resolver = "2"

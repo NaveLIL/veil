@@ -1,0 +1,77 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+
+import "veil/v1/auth.proto";
+import "veil/v1/chat.proto";
+import "veil/v1/presence.proto";
+import "veil/v1/share.proto";
+import "veil/v1/server.proto";
+import "veil/v1/media.proto";
+import "veil/v1/voice.proto";
+
+// Envelope — корневое сообщение для всех WebSocket фреймов.
+// Клиент и сервер обмениваются исключительно Envelope.
+message Envelope {
+  // Sequence number (клиент задаёт, сервер отвечает тем же для ACK)
+  uint64 seq = 1;
+
+  // Серверный timestamp (UTC, наносекунды с epoch)
+  uint64 timestamp = 2;
+
+  oneof payload {
+    // Auth
+    AuthChallenge auth_challenge = 10;
+    AuthResponse auth_response = 11;
+    AuthResult auth_result = 12;
+    RegisterDevice register_device = 13;
+
+    // Chat
+    SendMessage send_message = 20;
+    MessageAck message_ack = 21;
+    MessageDelivered message_delivered = 22;
+    MessageRead message_read = 23;
+    EditMessage edit_message = 24;
+    DeleteMessage delete_message = 25;
+    MessageEvent message_event = 26;
+
+    // Crypto key exchange
+    PreKeyBundle prekey_bundle = 30;
+    PreKeyRequest prekey_request = 31;
+    SenderKeyDistribution sender_key_dist = 32;
+
+    // Presence
+    PresenceUpdate presence_update = 40;
+    TypingEvent typing_event = 41;
+
+    // Servers & Channels
+    ServerEvent server_event = 50;
+    ChannelEvent channel_event = 51;
+
+    // Shares
+    ShareCreate share_create = 60;
+    ShareCreated share_created = 61;
+
+    // Media
+    MediaUploadRequest media_upload_request = 70;
+    MediaUploadUrl media_upload_url = 71;
+
+    // Voice
+    VoiceTokenRequest voice_token_request = 80;
+    VoiceToken voice_token = 81;
+
+    // Sync (multi-device)
+    SyncRequest sync_request = 90;
+    SyncBatch sync_batch = 91;
+
+    // Error
+    Error error = 100;
+  }
+}
+
+message Error {
+  uint32 code = 1;
+  string message = 2;
+  optional uint64 ref_seq = 3;  // Ссылка на seq запроса, вызвавшего ошибку
+}

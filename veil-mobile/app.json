@@ -1,0 +1,26 @@
+{
+  "expo": {
+    "name": "Veil",
+    "slug": "veil",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "newArchEnabled": true,
+    "scheme": "veil",
+    "ios": {
+      "bundleIdentifier": "io.veil.mobile",
+      "supportsTablet": true
+    },
+    "android": {
+      "package": "io.veil.mobile",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0a0a0f"
+      }
+    },
+    "plugins": [
+      "expo-secure-store"
+    ]
+  }
+}

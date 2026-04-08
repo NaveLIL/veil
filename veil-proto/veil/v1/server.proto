@@ -1,0 +1,95 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+
+// ===================== Server (Discord-like) =====================
+
+message ServerEvent {
+  enum EventType {
+    CREATED = 0;
+    UPDATED = 1;
+    DELETED = 2;
+    MEMBER_JOINED = 3;
+    MEMBER_LEFT = 4;
+    MEMBER_KICKED = 5;
+    MEMBER_BANNED = 6;
+    ROLE_CREATED = 7;
+    ROLE_UPDATED = 8;
+    ROLE_DELETED = 9;
+  }
+
+  EventType event_type = 1;
+  string server_id = 2;
+
+  // Контекстные поля (заполняются в зависимости от event_type)
+  optional ServerInfo server_info = 3;
+  optional MemberInfo member_info = 4;
+  optional RoleInfo role_info = 5;
+}
+
+message ServerInfo {
+  string id = 1;
+  string name = 2;
+  optional string icon_url = 3;
+  bytes owner_identity_key = 4;
+}
+
+message MemberInfo {
+  bytes identity_key = 1;
+  string username = 2;
+  repeated string role_ids = 3;
+  optional string reason = 4;  // Для kick/ban
+}
+
+message RoleInfo {
+  string id = 1;
+  string name = 2;
+  uint64 permissions = 3;  // Bitmask
+  uint32 position = 4;
+  optional uint32 color = 5;  // RGB
+}
+
+message ChannelEvent {
+  enum EventType {
+    CREATED = 0;
+    UPDATED = 1;
+    DELETED = 2;
+    REORDERED = 3;
+  }
+
+  EventType event_type = 1;
+  string server_id = 2;
+  ChannelInfo channel_info = 3;
+}
+
+message ChannelInfo {
+  string id = 1;
+  string server_id = 2;
+  string name = 3;
+  ChannelType channel_type = 4;
+  optional string category_id = 5;
+  uint32 position = 6;
+  optional string topic = 7;
+}
+
+enum ChannelType {
+  CHANNEL_TEXT = 0;
+  CHANNEL_VOICE = 1;
+  CHANNEL_CATEGORY = 2;
+}
+
+// ===================== Sync (Multi-Device) =====================
+
+message SyncRequest {
+  uint64 last_sync_timestamp = 1;  // Всё после этого момента
+  optional string conversation_id = 2;  // Или конкретный conversation
+  uint32 limit = 3;
+}
+
+message SyncBatch {
+  repeated MessageEvent messages = 1;
+  repeated PresenceUpdate presences = 2;
+  bool has_more = 3;
+  uint64 sync_timestamp = 4;  // Новая "точка синхронизации"
+}

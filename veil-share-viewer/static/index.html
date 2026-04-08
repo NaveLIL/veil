@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; connect-src 'self'; img-src 'self' blob:; style-src 'self' 'unsafe-inline'">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Veil — Secure Share</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: #0a0a0f;
+      color: #e5e5e5;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .card {
+      background: #12121a;
+      border: 1px solid #1e1e2e;
+      border-radius: 16px;
+      padding: 40px;
+      max-width: 520px;
+      width: 100%;
+      text-align: center;
+    }
+    h1 { font-size: 1.4em; font-weight: 400; margin-bottom: 8px; }
+    .brand { color: #6366f1; font-size: 0.75em; letter-spacing: 0.3em; margin-bottom: 24px; }
+    #status { color: #888; margin: 20px 0; }
+    #content {
+      background: #0a0a0f;
+      border: 1px solid #2a2a35;
+      border-radius: 8px;
+      padding: 20px;
+      text-align: left;
+      white-space: pre-wrap;
+      word-break: break-word;
+      display: none;
+      max-height: 400px;
+      overflow-y: auto;
+    }
+    .password-form { margin: 20px 0; display: none; }
+    .password-form input {
+      background: #1a1a25;
+      border: 1px solid #2a2a35;
+      border-radius: 8px;
+      padding: 10px 16px;
+      color: #e5e5e5;
+      font-size: 1em;
+      width: 100%;
+      margin-bottom: 12px;
+    }
+    .password-form button {
+      background: #6366f1;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 10px 24px;
+      cursor: pointer;
+      font-size: 1em;
+    }
+    .error { color: #ef4444; }
+    .expired { color: #f59e0b; }
+    img.share-image { max-width: 100%; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="brand">VEIL</div>
+    <h1>Secure Share</h1>
+    <div id="status">Loading decryption engine...</div>
+    <div class="password-form" id="passwordForm">
+      <input type="password" id="passwordInput" placeholder="Enter password" autocomplete="off" />
+      <button onclick="submitPassword()">Decrypt</button>
+    </div>
+    <div id="content"></div>
+  </div>
+
+  <script type="module">
+    import init, { decrypt_share, version } from './pkg/veil_share_viewer.js';
+
+    const status = document.getElementById('status');
+    const content = document.getElementById('content');
+    const passwordForm = document.getElementById('passwordForm');
+
+    window.wasm = null;
+    window.shareData = null;
+
+    async function main() {
+      try {
+        await init();
+        window.wasm = { decrypt_share, version };
+        status.textContent = `Engine v${version()} ready`;
+
+        // Parse URL fragment: #id/key or #id (password-protected)
+        const hash = window.location.hash.slice(1);
+        if (!hash) {
+          status.textContent = 'No share data in URL';
+          status.className = 'error';
+          return;
+        }
+
+        const parts = hash.split('/');
+        const shareId = parts[0];
+        const contentKey = parts[1] || null;
+
+        // Clear key material from URL bar
+        history.replaceState(null, '', window.location.pathname);
+
+        // Fetch share data from server
+        const resp = await fetch(`/api/share/${shareId}`);
+        if (!resp.ok) {
+          if (resp.status === 404) {
+            status.textContent = 'Share not found or expired';
+            status.className = 'expired';
+          } else {
+            status.textContent = 'Failed to load share';
+            status.className = 'error';
+          }
+          return;
+        }
+
+        const data = await resp.json();
+        window.shareData = { ...data, contentKey };
+
+        if (data.has_password && !contentKey) {
+          status.textContent = 'This share is password-protected';
+          passwordForm.style.display = 'block';
+        } else {
+          decryptAndShow(contentKey, null);
+        }
+      } catch (e) {
+        status.textContent = `Error: ${e.message || e}`;
+        status.className = 'error';
+      }
+    }
+
+    window.submitPassword = function () {
+      const pwd = document.getElementById('passwordInput').value;
+      if (!pwd) return;
+      decryptAndShow(window.shareData?.contentKey || null, pwd);
+    };
+
+    function decryptAndShow(contentKeyHex, password) {
+      try {
+        const sd = window.shareData;
+        const plaintext = window.wasm.decrypt_share(
+          sd.ciphertext,
+          contentKeyHex,
+          password,
+          sd.wrapped_key || null,
+          sd.salt || null,
+        );
+
+        // Try to display as text
+        const decoder = new TextDecoder('utf-8', { fatal: true });
+        try {
+          const text = decoder.decode(new Uint8Array(plaintext));
+          content.textContent = text;
+          content.style.display = 'block';
+        } catch {
+          // Binary data — try as image
+          const blob = new Blob([new Uint8Array(plaintext)]);
+          const url = URL.createObjectURL(blob);
+          const img = document.createElement('img');
+          img.className = 'share-image';
+          img.onload = () => URL.revokeObjectURL(url);
+          img.src = url;
+          content.innerHTML = '';
+          content.appendChild(img);
+          content.style.display = 'block';
+        }
+
+        status.textContent = 'Decrypted successfully';
+        passwordForm.style.display = 'none';
+      } catch (e) {
+        status.textContent = `Decryption failed: ${e}`;
+        status.className = 'error';
+      }
+    }
+
+    main();
+  </script>
+</body>
+</html>

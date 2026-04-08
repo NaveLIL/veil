@@ -1,0 +1,16 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+
+message MediaUploadRequest {
+  uint64 size_bytes = 1;
+  string content_type = 2;   // MIME
+  bytes encrypted_name = 3;  // Имя файла зашифровано
+}
+
+message MediaUploadUrl {
+  string media_id = 1;       // ID для ссылки в сообщениях
+  string upload_url = 2;     // Pre-signed S3 URL
+  uint64 expires_at = 3;     // URL expiration
+}
