@@ -3,6 +3,9 @@ package veil.v1;
 
 option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
 
+import "veil/v1/chat.proto";
+import "veil/v1/presence.proto";
+
 // ===================== Server (Discord-like) =====================
 
 message ServerEvent {
