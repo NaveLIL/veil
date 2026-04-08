@@ -142,25 +142,7 @@ func (s *Service) HandlePreKeyRequest(ctx context.Context, targetIdentityKey []b
 
 // findUserDevices returns all devices belonging to a user.
 func (s *Service) findUserDevices(ctx context.Context, userID string) ([]db.Device, error) {
-	rows, err := s.db.Pool.Query(ctx,
-		`SELECT id, user_id, device_key, device_name, last_seen, created_at
-		 FROM devices WHERE user_id = $1::uuid ORDER BY last_seen DESC NULLS LAST`,
-		userID,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	var devices []db.Device
-	for rows.Next() {
-		var d db.Device
-		if err := rows.Scan(&d.ID, &d.UserID, &d.DeviceKey, &d.DeviceName, &d.LastSeen, &d.CreatedAt); err != nil {
-			return nil, err
-		}
-		devices = append(devices, d)
-	}
-	return devices, rows.Err()
+	return s.db.GetDevicesByUser(ctx, userID)
 }
 
 // LookupUser returns a user by ID (for enriching message events).

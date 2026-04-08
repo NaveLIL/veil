@@ -10,16 +10,18 @@ import (
 	"time"
 
 	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/chat"
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/gateway"
 )
 
 func main() {
 	cfg := config.Load()
 
-	// Connect to PostgreSQL
+	port := os.Getenv("AUTH_PORT")
+	if port == "" {
+		port = "8081"
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -30,43 +32,27 @@ func main() {
 	defer database.Close()
 	log.Println("database connected")
 
-	// Initialize services
 	authSvc := auth.NewService(database, cfg)
-	chatSvc := chat.NewService(database, cfg)
+	handler := auth.NewHandler(authSvc)
 
-	// Start hub
-	hub := gateway.NewHub(authSvc, chatSvc)
-	go hub.Run()
-
-	// HTTP routes
 	mux := http.NewServeMux()
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		gateway.HandleWebSocket(hub, w, r)
-	})
-
-	// Auth REST endpoints (prekeys, devices, user lookup)
-	authHandler := auth.NewHandler(authSvc)
-	authHandler.RegisterRoutes(mux)
-
-	// Chat REST endpoints (message sync, conversations)
-	chatHandler := chat.NewHandler(chatSvc)
-	chatHandler.RegisterRoutes(mux)
+	handler.RegisterRoutes(mux)
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"ok"}`))
+		w.Write([]byte(`{"service":"veil-auth","status":"ok"}`))
 	})
 
 	server := &http.Server{
-		Addr:         ":" + cfg.Port,
+		Addr:         ":" + port,
 		Handler:      mux,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 10 * time.Second,
+		IdleTimeout:  30 * time.Second,
 	}
 
-	log.Printf("veil-gateway starting on :%s", cfg.Port)
+	log.Printf("veil-auth starting on :%s", port)
 
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -74,7 +60,6 @@ func main() {
 		}
 	}()
 
-	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit

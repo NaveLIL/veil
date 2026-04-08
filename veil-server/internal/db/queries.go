@@ -324,3 +324,26 @@ func (db *DB) FindUserByID(ctx context.Context, userID string) (*User, error) {
 	}
 	return &u, nil
 }
+
+// GetDevicesByUser returns all devices belonging to a user, ordered by last_seen.
+func (db *DB) GetDevicesByUser(ctx context.Context, userID string) ([]Device, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT id, user_id, device_key, device_name, last_seen, created_at
+		 FROM devices WHERE user_id = $1::uuid ORDER BY last_seen DESC NULLS LAST`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var devices []Device
+	for rows.Next() {
+		var d Device
+		if err := rows.Scan(&d.ID, &d.UserID, &d.DeviceKey, &d.DeviceName, &d.LastSeen, &d.CreatedAt); err != nil {
+			return nil, err
+		}
+		devices = append(devices, d)
+	}
+	return devices, rows.Err()
+}
