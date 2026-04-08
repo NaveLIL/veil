@@ -9,6 +9,8 @@ use crate::kdf;
 
 /// Maximum number of skipped message keys to store (out-of-order tolerance).
 const MAX_SKIP: u32 = 1000;
+/// Absolute maximum number of total stored skipped keys (prevents unbounded growth).
+const MAX_TOTAL_SKIPPED: usize = 5000;
 
 /// Header attached to each ratchet message (sent alongside ciphertext).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,7 +162,7 @@ impl RatchetSession {
             .ok_or("sending chain not initialized (responder must receive first)")?;
 
         // KDF_CK: derive message key and next chain key
-        let message_key = kdf::hmac_sha256(ck, b"\x01");
+        let mut message_key = kdf::hmac_sha256(ck, b"\x01");
         let next_chain_key = kdf::hmac_sha256(ck, b"\x02");
 
         self.sending_chain_key = Some(next_chain_key);
@@ -175,7 +177,9 @@ impl RatchetSession {
             .ok_or("message counter overflow".to_string())?;
 
         // Encrypt with message key
-        let (ciphertext, nonce) = aead::encrypt(&message_key, plaintext)?;
+        let result = aead::encrypt(&message_key, plaintext);
+        message_key.zeroize();
+        let (ciphertext, nonce) = result?;
 
         // Prepend nonce to ciphertext for transport
         let mut output = Vec::with_capacity(aead::NONCE_SIZE + ciphertext.len());
@@ -216,10 +220,11 @@ impl RatchetSession {
         // KDF_CK: derive message key
         let ck = self.receiving_chain_key.as_ref()
             .ok_or("receiving chain not initialized")?;
-        let message_key = kdf::hmac_sha256(ck, b"\x01");
+        let mut message_key = kdf::hmac_sha256(ck, b"\x01");
         let next_chain_key = kdf::hmac_sha256(ck, b"\x02");
         self.receiving_chain_key = Some(next_chain_key);
-        self.recv_count += 1;
+        self.recv_count = self.recv_count.checked_add(1)
+            .ok_or("recv counter overflow".to_string())?;
 
         // Decrypt
         let nonce: [u8; aead::NONCE_SIZE] = ciphertext[..aead::NONCE_SIZE]
@@ -227,7 +232,9 @@ impl RatchetSession {
             .map_err(|_| "invalid nonce")?;
         let ct = &ciphertext[aead::NONCE_SIZE..];
 
-        aead::decrypt(&message_key, ct, &nonce)
+        let result = aead::decrypt(&message_key, ct, &nonce);
+        message_key.zeroize();
+        result
     }
 
     /// Perform a DH ratchet step (peer sent a new ratchet key).
@@ -287,8 +294,17 @@ impl RatchetSession {
                 chain_key = next_ck;
 
                 let rk = self.dh_receiving.unwrap_or([0u8; 32]);
+                // Enforce global cap on stored skipped keys
+                if self.skipped_keys.len() >= MAX_TOTAL_SKIPPED {
+                    // Evict oldest entry (arbitrary key — HashMap is unordered)
+                    if let Some(&oldest) = self.skipped_keys.keys().next() {
+                        let mut evicted = self.skipped_keys.remove(&oldest).unwrap_or([0u8; 32]);
+                        evicted.zeroize();
+                    }
+                }
                 self.skipped_keys.insert((rk, self.recv_count), message_key);
-                self.recv_count += 1;
+                self.recv_count = self.recv_count.checked_add(1)
+                    .ok_or("recv counter overflow in skip".to_string())?;
             }
             self.receiving_chain_key = Some(chain_key);
         }
@@ -324,7 +340,9 @@ impl RatchetSession {
             return Err("invalid secret length".to_string());
         }
         arr.copy_from_slice(bytes);
-        Ok(X25519StaticSecret::from(arr))
+        let secret = X25519StaticSecret::from(arr);
+        arr.zeroize();
+        Ok(secret)
     }
 
     /// Serialize session state for persistence (encrypted by veil-store).

@@ -74,11 +74,14 @@ pub fn derive_key_from_password(password: &str, salt: &[u8; 32]) -> Result<[u8; 
 
 /// HKDF-SHA256: extract and expand.
 /// Used in Double Ratchet for root key derivation (KDF_RK).
+///
+/// `output_len` must be <= 8160 (255 * 32).
 pub fn hkdf_sha256(salt: &[u8], ikm: &[u8], info: &[u8], output_len: usize) -> Vec<u8> {
+    assert!(output_len <= 255 * 32, "HKDF output_len must be <= 8160");
     let hk = Hkdf::<Sha256>::new(Some(salt), ikm);
     let mut okm = vec![0u8; output_len];
     hk.expand(info, &mut okm)
-        .expect("HKDF output length should be valid");
+        .expect("HKDF output length already validated");
     okm
 }
 

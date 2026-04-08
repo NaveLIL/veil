@@ -12,7 +12,7 @@ import { useAuthStore } from "../stores/auth";
 export default function OnboardingScreen() {
   const [mnemonic, setMnemonic] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
-  const { setMnemonic: storeMnemonic, setIdentityKey } = useAuthStore();
+  const { setIdentityKey } = useAuthStore();
 
   const handleGenerate = async () => {
     setLoading(true);
@@ -25,7 +25,7 @@ export default function OnboardingScreen() {
     if (!mnemonic) return;
     setLoading(true);
     const key = await VeilCrypto.createIdentity(mnemonic);
-    storeMnemonic(mnemonic);
+    setMnemonic(null); // clear local state immediately
     setIdentityKey(key);
     setLoading(false);
   };

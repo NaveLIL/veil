@@ -37,24 +37,34 @@ pub struct X3DHResult {
 }
 
 /// Server-side prekey pair (secret + public).
-#[derive(ZeroizeOnDrop)]
 pub struct SignedPreKey {
-    #[zeroize(skip)]
     pub secret: X25519StaticSecret,
-    #[zeroize(skip)]
     pub public: X25519PublicKey,
     pub id: u32,
     pub signature: [u8; 64],
 }
 
+impl Drop for SignedPreKey {
+    fn drop(&mut self) {
+        // X25519StaticSecret doesn't implement Zeroize, so we overwrite via to_bytes()
+        let mut bytes = self.secret.to_bytes();
+        bytes.zeroize();
+        self.signature.zeroize();
+    }
+}
+
 /// One-time prekey pair.
-#[derive(ZeroizeOnDrop)]
 pub struct OneTimePreKey {
-    #[zeroize(skip)]
     pub secret: X25519StaticSecret,
-    #[zeroize(skip)]
     pub public: X25519PublicKey,
     pub id: u32,
+}
+
+impl Drop for OneTimePreKey {
+    fn drop(&mut self) {
+        let mut bytes = self.secret.to_bytes();
+        bytes.zeroize();
+    }
 }
 
 impl SignedPreKey {

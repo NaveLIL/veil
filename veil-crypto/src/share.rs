@@ -99,7 +99,10 @@ pub fn decrypt_share(
         .map_err(|_| "invalid nonce")?;
     let ct = &ciphertext[aead::NONCE_SIZE..];
 
-    aead::decrypt(&key, ct, &nonce)
+    let mut key_copy = key;
+    let result = aead::decrypt(&key_copy, ct, &nonce);
+    key_copy.zeroize();
+    result
 }
 
 /// Bundle returned from share encryption.
