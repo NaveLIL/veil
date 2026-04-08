@@ -37,8 +37,8 @@ jobs:
       - name: Install cargo-deny
         uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check
-          arguments: licenses bans sources
+          command: check bans licenses sources
+          arguments: ""
 
   # Check that zeroize is used where it should be
   zeroize-check:

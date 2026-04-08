@@ -25,9 +25,7 @@ fn test_db_key_isolation() {
     let key1 = kdf::derive_db_key(
         "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
     ).unwrap();
-    let key2 = kdf::derive_db_key(
-        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
-    ).unwrap();
+    let key2 = kdf::derive_db_key("zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong").unwrap();
 
     assert_ne!(
         key1, key2,
