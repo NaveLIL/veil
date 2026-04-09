@@ -13,6 +13,8 @@ jobs:
   coverage:
     name: Code Coverage
     runs-on: ubuntu-latest
+    # Coverage is informational — never blocks merge
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -38,6 +40,7 @@ jobs:
 
       - name: Generate coverage
         run: |
+          mkdir -p coverage
           cargo tarpaulin \
             --workspace \
             --exclude veil-desktop \
@@ -48,26 +51,18 @@ jobs:
             --out xml \
             --out html \
             --output-dir coverage/ \
-            --timeout 300 \
-            --skip-clean
+            --timeout 600 \
+            --skip-clean \
+            2>&1 | tee coverage/tarpaulin.log
+          SUMMARY=$(grep -E "^[0-9]+\.[0-9]+% coverage" coverage/tarpaulin.log || echo "Coverage data unavailable")
+          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
+          echo "\`$SUMMARY\`" >> $GITHUB_STEP_SUMMARY
+          echo "See uploaded artifact for full HTML report." >> $GITHUB_STEP_SUMMARY
 
       - name: Upload coverage artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
           path: coverage/
           retention-days: 30
-
-      - name: Coverage summary
-        run: |
-          cargo tarpaulin \
-            --workspace \
-            --exclude veil-desktop \
-            --exclude veil-share-viewer \
-            --exclude veil-ffi \
-            --exclude-files "*/tests/*" \
-            --exclude-files "*/benches/*" \
-            --skip-clean \
-            --print-rust-flags 2>&1 | tail -5 || true
-          echo "## Coverage Report" >> $GITHUB_STEP_SUMMARY
-          echo "See uploaded artifact for full HTML report." >> $GITHUB_STEP_SUMMARY

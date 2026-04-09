@@ -23,3 +23,7 @@ Thumbs.db
 *.wasm
 pkg/
 !veil-server/pkg/
+
+# Coverage
+coverage/
+tarpaulin-report.*

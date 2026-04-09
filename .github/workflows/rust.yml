@@ -64,14 +64,31 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
-      - name: Clippy (all targets)
+      - name: Clippy (all targets, Linux)
+        if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Build workspace
+      - name: Clippy (all targets, macOS — exclude desktop)
+        if: runner.os == 'macOS'
+        run: cargo clippy --workspace --exclude veil-desktop --all-targets -- -D warnings
+
+      - name: Build workspace (Linux)
+        if: runner.os == 'Linux'
         run: cargo build --workspace
 
-      - name: Run tests
+      - name: Build workspace (macOS — exclude desktop)
+        if: runner.os == 'macOS'
+        run: cargo build --workspace --exclude veil-desktop
+
+      - name: Run tests (Linux)
+        if: runner.os == 'Linux'
         run: cargo test --workspace -- --nocapture
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run tests (macOS — exclude desktop)
+        if: runner.os == 'macOS'
+        run: cargo test --workspace --exclude veil-desktop -- --nocapture
         env:
           RUST_BACKTRACE: 1
 

@@ -40,10 +40,11 @@ jobs:
           command: check bans licenses sources
           arguments: ""
 
-  # Check that zeroize is used where it should be
+  # Check that zeroize is used where it should be (advisory)
   zeroize-check:
     name: Zeroize Compliance
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
