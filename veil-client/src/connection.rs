@@ -71,9 +71,13 @@ impl Connection {
         let url = &config.server_url;
         info!("connecting to {url}");
 
-        let (ws_stream, _) = connect_async(url)
-            .await
-            .map_err(|e| format!("ws connect failed: {e}"))?;
+        let (ws_stream, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            connect_async(url),
+        )
+        .await
+        .map_err(|_| format!("ws connect timed out after 8s: {url}"))?
+        .map_err(|e| format!("ws connect failed: {e}"))?;
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
