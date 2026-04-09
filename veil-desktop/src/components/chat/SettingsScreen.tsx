@@ -477,10 +477,10 @@ export const SettingsScreen: Component = () => {
             <input
               type="password"
               style={S.input}
-              placeholder="Enter new PIN (min 4 digits)"
+              placeholder="Enter new PIN (4–6 digits)"
               value={pinInput()}
               onInput={(e) => setPinInput(e.currentTarget.value.replace(/\D/g, ""))}
-              maxLength={8}
+              maxLength={6}
             />
             <input
               type="password"
@@ -488,7 +488,7 @@ export const SettingsScreen: Component = () => {
               placeholder="Confirm PIN"
               value={pinConfirm()}
               onInput={(e) => setPinConfirm(e.currentTarget.value.replace(/\D/g, ""))}
-              maxLength={8}
+              maxLength={6}
             />
             <div style={{ display: "flex", gap: "10px" }}>
               <button style={S.btnPrimary} onClick={handleSetPin}>Save PIN</button>

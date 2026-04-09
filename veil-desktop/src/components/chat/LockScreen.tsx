@@ -1,4 +1,4 @@
-import { Component, createSignal, For, onMount } from "solid-js";
+import { Component, createSignal, Show, For, onMount } from "solid-js";
 import { appStore } from "@/stores/app";
 
 /* ═══════════════════════════════════════════════════════
@@ -22,12 +22,15 @@ interface RainDrop {
 export const LockScreen: Component = () => {
   const [pin, setPin] = createSignal("");
   const [error, setError] = createSignal(false);
+  const [errorMsg, setErrorMsg] = createSignal("");
   const [loading, setLoading] = createSignal(false);
   const [shake, setShake] = createSignal(false);
   const [success, setSuccess] = createSignal(false);
   const [rainDrops, setRainDrops] = createSignal<RainDrop[]>([]);
   const [entering, setEntering] = createSignal(true);
   let submitting = false;
+
+  const MAX_PIN = 6;
 
   onMount(() => {
     const drops: RainDrop[] = Array.from({ length: 40 }, (_, i) => ({
@@ -52,20 +55,22 @@ export const LockScreen: Component = () => {
       const ok = await appStore.verifyPin(currentPin);
       if (ok) {
         setSuccess(true);
-        // Success animation before transitioning
       } else {
         setError(true);
+        setErrorMsg("Incorrect PIN");
         setShake(true);
         setTimeout(() => setShake(false), 600);
         setTimeout(() => {
           setPin("");
           setError(false);
+          setErrorMsg("");
         }, 800);
       }
-    } catch {
+    } catch (e) {
       setError(true);
+      setErrorMsg(String(e).slice(0, 60));
       setShake(true);
-      setTimeout(() => { setShake(false); setPin(""); setError(false); }, 800);
+      setTimeout(() => { setShake(false); setPin(""); setError(false); }, 1500);
     } finally {
       setLoading(false);
       submitting = false;
@@ -73,13 +78,22 @@ export const LockScreen: Component = () => {
   };
 
   const handleDigit = (d: string) => {
-    if (loading() || pin().length >= 6 || success()) return;
+    if (loading() || pin().length >= MAX_PIN || success()) return;
     const next = pin() + d;
     setPin(next);
     setError(false);
+    setErrorMsg("");
 
-    if (next.length >= 4 && !submitting) {
-      setTimeout(() => handleSubmit(next), 180);
+    // Auto-submit only when max length is reached
+    if (next.length === MAX_PIN && !submitting) {
+      setTimeout(() => handleSubmit(next), 150);
+    }
+  };
+
+  const handleConfirm = () => {
+    const current = pin();
+    if (current.length >= 4 && !submitting) {
+      handleSubmit(current);
     }
   };
 
@@ -319,9 +333,34 @@ export const LockScreen: Component = () => {
           </button>
         </div>
 
-        {/* Error message */}
+        {/* Confirm button — visible when 4-5 digits entered */}
+        <Show when={pin().length >= 4 && pin().length < MAX_PIN && !loading() && !success()}>
+          <button
+            style={{
+              "margin-top": "16px",
+              height: "40px",
+              padding: "0 28px",
+              "border-radius": "12px",
+              background: "linear-gradient(135deg, #7c6bf5 0%, #6955e0 100%)",
+              color: "#fff",
+              border: "none",
+              "font-size": "13px",
+              "font-weight": "600",
+              cursor: "pointer",
+              transition: "transform 0.15s, box-shadow 0.15s",
+              "box-shadow": "0 4px 16px rgba(124,107,245,0.25)",
+            }}
+            onClick={handleConfirm}
+            onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 24px rgba(124,107,245,0.35)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 16px rgba(124,107,245,0.25)"; }}
+          >
+            Unlock
+          </button>
+        </Show>
+
+        {/* Error / status message */}
         <div style={{ ...S.errorMsg, opacity: error() ? "1" : "0" }}>
-          Incorrect PIN
+          {errorMsg() || "Incorrect PIN"}
         </div>
       </div>
     </div>
