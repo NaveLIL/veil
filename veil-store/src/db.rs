@@ -11,6 +11,23 @@ impl VeilDb {
     /// Open (or create) an encrypted database at the given path.
     /// The `key` is a 32-byte encryption key derived from user identity.
     pub fn open(path: &Path, key: &[u8; 32]) -> Result<Self, String> {
+        match Self::open_inner(path, key) {
+            Ok(db) => Ok(db),
+            Err(e) if path.exists() && e.contains("not a database") => {
+                // Stale/unencrypted DB from a previous run — remove and retry.
+                let _ = std::fs::remove_file(path);
+                // Also remove WAL/SHM journals if present.
+                let wal = path.with_extension("db-wal");
+                let shm = path.with_extension("db-shm");
+                let _ = std::fs::remove_file(wal);
+                let _ = std::fs::remove_file(shm);
+                Self::open_inner(path, key)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn open_inner(path: &Path, key: &[u8; 32]) -> Result<Self, String> {
         let conn = Connection::open(path).map_err(|e| format!("open db: {e}"))?;
 
         // Set SQLCipher encryption key
