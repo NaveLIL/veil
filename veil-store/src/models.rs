@@ -56,3 +56,31 @@ pub struct Contact {
     pub verified: bool,
     pub created_at: String,
 }
+
+/// Role within a group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum GroupRole {
+    Member = 0,
+    Admin = 1,
+    Owner = 2,
+}
+
+/// A member of a group conversation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupMember {
+    pub group_id: String,
+    pub identity_key: Vec<u8>,
+    pub role: GroupRole,
+    pub joined_at: String,
+}
+
+/// Local sender key state (persisted for group encryption).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StoredSenderKey {
+    pub group_id: String,
+    pub sender_identity_key: Vec<u8>,
+    pub key_data: Vec<u8>,
+    pub is_outgoing: bool,
+    pub updated_at: String,
+}

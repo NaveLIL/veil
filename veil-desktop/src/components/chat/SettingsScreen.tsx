@@ -735,7 +735,7 @@ export const SettingsScreen: Component = () => {
             style={S.input}
             value={wsUrl()}
             onInput={(e) => setWsUrl(e.currentTarget.value)}
-            placeholder="ws://localhost:9080/ws"
+            placeholder="ws://5.144.181.72:9080/ws"
           />
         </div>
 
@@ -745,7 +745,7 @@ export const SettingsScreen: Component = () => {
             style={S.input}
             value={httpUrl()}
             onInput={(e) => setHttpUrl(e.currentTarget.value)}
-            placeholder="http://localhost:9080"
+            placeholder="http://5.144.181.72:9080"
           />
         </div>
 

@@ -233,6 +233,8 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 			c.handleTyping(ctx, p.TypingEvent)
 		case *pb.Envelope_PresenceUpdate:
 			c.handlePresence(ctx, p.PresenceUpdate)
+		case *pb.Envelope_SenderKeyDist:
+			c.handleSenderKeyDist(ctx, env.Seq, p.SenderKeyDist)
 		default:
 			c.sendError(env.Seq, 501, "unsupported message type")
 		}
@@ -345,6 +347,51 @@ func (c *Client) handlePreKeyRequest(ctx context.Context, seq uint64, req *pb.Pr
 		Seq: seq,
 		Payload: &pb.Envelope_PrekeyBundle{
 			PrekeyBundle: bundle,
+		},
+	})
+}
+
+// --- Presence / Typing (fan-out to conversation members) ---
+
+// --- Sender Key Distribution ---
+
+func (c *Client) handleSenderKeyDist(ctx context.Context, seq uint64, skd *pb.SenderKeyDistribution) {
+	// Verify sender is a member of the conversation
+	isMember, err := c.hub.chatSvc.DB().IsConversationMember(ctx, skd.ConversationId, c.userID)
+	if err != nil || !isMember {
+		c.sendError(seq, 403, "not a group member")
+		return
+	}
+
+	// Forward the sender key to the target user (find by identity key)
+	target, err := c.hub.chatSvc.DB().FindUserByIdentityKey(ctx, skd.TargetIdentityKey)
+	if err != nil {
+		c.sendError(seq, 404, "target user not found")
+		return
+	}
+
+	// Forward as-is to the target — client will decrypt with their ratchet session
+	fwd := &pb.Envelope{
+		Timestamp: uint64(time.Now().UnixNano()),
+		Payload: &pb.Envelope_SenderKeyDist{
+			SenderKeyDist: &pb.SenderKeyDistribution{
+				ConversationId:    skd.ConversationId,
+				SenderKeyMessage:  skd.SenderKeyMessage,
+				Generation:        skd.Generation,
+				TargetIdentityKey: skd.TargetIdentityKey,
+			},
+		},
+	}
+	data, _ := proto.Marshal(fwd)
+	c.hub.sendToUser(target.ID, data)
+
+	// ACK to sender
+	c.sendEnvelope(&pb.Envelope{
+		Seq: seq,
+		Payload: &pb.Envelope_MessageAck{
+			MessageAck: &pb.MessageAck{
+				RefSeq: seq,
+			},
 		},
 	})
 }

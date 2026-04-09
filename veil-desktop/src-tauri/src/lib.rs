@@ -473,6 +473,137 @@ fn is_connected(state: State<'_, AppState>) -> bool {
     client.is_connected()
 }
 
+// ─── Groups ───────────────────────────────────────────
+
+/// Create a new group on the server. Returns the conversation_id.
+#[tauri::command]
+fn create_group(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    name: String,
+) -> Result<String, String> {
+    let resp: serde_json::Value = state.runtime.block_on(async {
+        let http = reqwest::Client::new();
+        let r = http
+            .post(format!("{}/v1/groups", server_http_url))
+            .header("X-User-ID", &user_id)
+            .json(&serde_json::json!({ "name": name }))
+            .send()
+            .await
+            .map_err(|e| format!("create group: {e}"))?;
+        r.json().await.map_err(|e| format!("parse: {e}"))
+    })?;
+
+    let conv_id = resp["conversation_id"]
+        .as_str()
+        .ok_or("no conversation_id")?
+        .to_string();
+
+    // Persist locally
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    if let Some(db) = client.db() {
+        let _ = db.insert_conversation(&conv_id, 1, Some(&name), None, None);
+    }
+
+    Ok(conv_id)
+}
+
+/// Add a member to a group via the server.
+#[tauri::command]
+fn add_group_member(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    group_id: String,
+    target_user_id: String,
+) -> Result<(), String> {
+    state.runtime.block_on(async {
+        let http = reqwest::Client::new();
+        let r = http
+            .post(format!("{}/v1/groups/{}/members", server_http_url, group_id))
+            .header("X-User-ID", &user_id)
+            .json(&serde_json::json!({ "user_id": target_user_id }))
+            .send()
+            .await
+            .map_err(|e| format!("add member: {e}"))?;
+
+        if !r.status().is_success() {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            return Err(body["error"].as_str().unwrap_or("failed").to_string());
+        }
+        Ok(())
+    })
+}
+
+/// Remove a member from a group (or leave).
+#[tauri::command]
+fn remove_group_member(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    group_id: String,
+    target_user_id: String,
+) -> Result<(), String> {
+    state.runtime.block_on(async {
+        let http = reqwest::Client::new();
+        let r = http
+            .delete(format!(
+                "{}/v1/groups/{}/members/{}",
+                server_http_url, group_id, target_user_id
+            ))
+            .header("X-User-ID", &user_id)
+            .send()
+            .await
+            .map_err(|e| format!("remove member: {e}"))?;
+
+        if !r.status().is_success() {
+            let body: serde_json::Value = r.json().await.unwrap_or_default();
+            return Err(body["error"].as_str().unwrap_or("failed").to_string());
+        }
+        Ok(())
+    })
+}
+
+/// Get group members from the server.
+#[tauri::command]
+fn get_group_members(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    group_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let resp: serde_json::Value = state.runtime.block_on(async {
+        let http = reqwest::Client::new();
+        let r = http
+            .get(format!("{}/v1/groups/{}/members", server_http_url, group_id))
+            .header("X-User-ID", &user_id)
+            .send()
+            .await
+            .map_err(|e| format!("get members: {e}"))?;
+        r.json().await.map_err(|e| format!("parse: {e}"))
+    })?;
+
+    let members = resp["members"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+
+    // Also persist members locally
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    if let Some(db) = client.db() {
+        for m in &members {
+            if let (Some(ik_hex), Some(role)) = (m["identity_key"].as_str(), m["role"].as_i64()) {
+                if let Ok(ik) = hex::decode(ik_hex) {
+                    let _ = db.insert_group_member(&group_id, &ik, role as u8);
+                }
+            }
+        }
+    }
+
+    Ok(members)
+}
+
 // ─── App ──────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -558,6 +689,10 @@ pub fn run() {
             send_message,
             create_dm,
             is_connected,
+            create_group,
+            add_group_member,
+            remove_group_member,
+            get_group_members,
         ])
         .run(tauri::generate_context!())
         .expect("error while running veil");

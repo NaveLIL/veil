@@ -17,6 +17,20 @@ export interface Conversation {
   online?: boolean;
 }
 
+export interface GroupMember {
+  userId: string;
+  identityKey: string;
+  username: string;
+  role: number; // 0=member, 1=admin, 2=owner
+  joinedAt: string;
+}
+
+export interface Server {
+  id: string;
+  name: string;
+  iconUrl?: string;
+}
+
 export interface Message {
   id: string;
   conversationId: string;
@@ -37,8 +51,9 @@ const [activeConversationId, setActiveConversationId] = createSignal<string | nu
 const [messages, setMessages] = createSignal<Message[]>([]);
 const [isSidebarCollapsed, setSidebarCollapsed] = createSignal(false);
 const [connected, setConnected] = createSignal(false);
-const [serverUrl, setServerUrl] = createSignal("ws://localhost:9080/ws");
-const [serverHttpUrl, setServerHttpUrl] = createSignal("http://localhost:9080");
+const [serverUrl, setServerUrl] = createSignal("ws://5.144.181.72:9080/ws");
+const [serverHttpUrl, setServerHttpUrl] = createSignal("http://5.144.181.72:9080");
+const [servers, setServers] = createSignal<Server[]>([]);
 
 const AUTO_LOCK_SECONDS = 300; // 5 minutes
 let autoLockTimer: ReturnType<typeof setInterval> | null = null;
@@ -63,6 +78,8 @@ export const appStore = {
   setServerUrl,
   serverHttpUrl,
   setServerHttpUrl,
+  servers,
+  setServers,
 
   activeConversation: () => {
     const id = activeConversationId();
@@ -259,6 +276,103 @@ export const appStore = {
       });
     } catch (e) {
       console.error("establishSession failed:", e);
+    }
+  },
+
+  // ─── Groups ─────────────────────────────────────────
+
+  /** Create a new group. Works offline (local) or online (server). */
+  createGroup: async (name: string): Promise<string | null> => {
+    const uid = userId();
+    // If connected and have userId — create on server
+    if (uid && connected()) {
+      try {
+        const convId = await invoke<string>("create_group", {
+          serverHttpUrl: serverHttpUrl(),
+          userId: uid,
+          name,
+        });
+        setConversations((prev) => [
+          ...prev,
+          { id: convId, type: "group" as const, name, unreadCount: 0 },
+        ]);
+        setActiveConversationId(convId);
+        return convId;
+      } catch (e) {
+        console.error("createGroup (server) failed:", e);
+        // Fall through to local creation
+      }
+    }
+    // Offline / fallback: create locally with a temp UUID
+    const localId = crypto.randomUUID();
+    setConversations((prev) => [
+      ...prev,
+      { id: localId, type: "group" as const, name, unreadCount: 0 },
+    ]);
+    setActiveConversationId(localId);
+    return localId;
+  },
+
+  /** Add a member to a group. */
+  addGroupMember: async (groupId: string, targetUserId: string) => {
+    const uid = userId();
+    if (!uid) return;
+    try {
+      await invoke("add_group_member", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        groupId,
+        targetUserId,
+      });
+    } catch (e) {
+      console.error("addGroupMember failed:", e);
+      throw e;
+    }
+  },
+
+  /** Remove a member from a group (or leave). */
+  removeGroupMember: async (groupId: string, targetUserId: string) => {
+    const uid = userId();
+    if (!uid) return;
+    try {
+      await invoke("remove_group_member", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        groupId,
+        targetUserId,
+      });
+    } catch (e) {
+      console.error("removeGroupMember failed:", e);
+      throw e;
+    }
+  },
+
+  /** Get group members from the server. */
+  getGroupMembers: async (groupId: string): Promise<GroupMember[]> => {
+    const uid = userId();
+    if (!uid) return [];
+    try {
+      const members = await invoke<Array<{
+        user_id: string;
+        identity_key: string;
+        username: string;
+        role: number;
+        joined_at: string;
+      }>>("get_group_members", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        groupId,
+      });
+      return members.map((m) => ({
+        userId: m.user_id,
+        identityKey: m.identity_key,
+        username: m.username,
+        role: m.role,
+        joinedAt: m.joined_at,
+      }));
+    } catch (e) {
+      console.error("getGroupMembers failed:", e);
+      return [];
     }
   },
 

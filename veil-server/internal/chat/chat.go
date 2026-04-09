@@ -28,6 +28,11 @@ func NewService(database *db.DB, cfg *config.Config) *Service {
 	return &Service{db: database, cfg: cfg}
 }
 
+// DB returns the underlying database handle.
+func (s *Service) DB() *db.DB {
+	return s.db
+}
+
 // HandleSendMessage processes a client's send_message request.
 // Returns: message ID, server timestamp, list of recipient user IDs for fan-out.
 func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage) (string, time.Time, []string, error) {
@@ -153,4 +158,70 @@ func (s *Service) LookupUser(ctx context.Context, userID string) (*db.User, erro
 // GetConversationMembers returns user IDs for fan-out.
 func (s *Service) GetConversationMembers(ctx context.Context, convID string) ([]string, error) {
 	return s.db.GetConversationMembers(ctx, convID)
+}
+
+// CreateGroup creates a group conversation and returns the conversation ID.
+func (s *Service) CreateGroup(ctx context.Context, name string, creatorUserID string) (string, error) {
+	if name == "" {
+		return "", errors.New("group name required")
+	}
+	if len(name) > 100 {
+		return "", errors.New("group name too long")
+	}
+	return s.db.CreateGroup(ctx, name, creatorUserID)
+}
+
+// AddGroupMember adds a user to a group. Only admins/owners can add.
+func (s *Service) AddGroupMember(ctx context.Context, convID, requesterID, targetUserID string) error {
+	// Check requester is a member with admin or owner role
+	role, err := s.db.GetMemberRole(ctx, convID, requesterID)
+	if err != nil {
+		return ErrNotMember
+	}
+	if role < 1 { // must be admin(1) or owner(2)
+		return errors.New("insufficient permissions")
+	}
+
+	// Verify target user exists
+	_, err = s.db.FindUserByID(ctx, targetUserID)
+	if err != nil {
+		return fmt.Errorf("target user not found: %w", err)
+	}
+
+	return s.db.AddGroupMember(ctx, convID, targetUserID, 0) // role=0 member
+}
+
+// RemoveGroupMember removes a user from a group.
+func (s *Service) RemoveGroupMember(ctx context.Context, convID, requesterID, targetUserID string) error {
+	// Self-leave is always allowed
+	if requesterID == targetUserID {
+		return s.db.RemoveGroupMember(ctx, convID, targetUserID)
+	}
+
+	// Otherwise, check permissions
+	requesterRole, err := s.db.GetMemberRole(ctx, convID, requesterID)
+	if err != nil {
+		return ErrNotMember
+	}
+
+	targetRole, err := s.db.GetMemberRole(ctx, convID, targetUserID)
+	if err != nil {
+		return errors.New("target not a member")
+	}
+
+	// Cannot kick someone with equal or higher role
+	if requesterRole <= targetRole {
+		return errors.New("insufficient permissions")
+	}
+
+	return s.db.RemoveGroupMember(ctx, convID, targetUserID)
+}
+
+// GetGroupMembers returns detailed member info for a group.
+func (s *Service) GetGroupMembers(ctx context.Context, convID, requesterID string) ([]db.GroupMember, error) {
+	isMember, err := s.db.IsConversationMember(ctx, convID, requesterID)
+	if err != nil || !isMember {
+		return nil, ErrNotMember
+	}
+	return s.db.GetGroupMembersDetailed(ctx, convID)
 }

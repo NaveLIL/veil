@@ -347,3 +347,156 @@ func (db *DB) GetDevicesByUser(ctx context.Context, userID string) ([]Device, er
 	}
 	return devices, rows.Err()
 }
+
+// --- Groups ---
+
+type GroupInfo struct {
+	ConversationID string
+	Name           string
+	CreatedAt      time.Time
+}
+
+type GroupMember struct {
+	UserID      string
+	IdentityKey []byte
+	Username    string
+	Role        int16
+	JoinedAt    time.Time
+}
+
+// CreateGroup creates a group conversation and adds the creator as owner.
+func (db *DB) CreateGroup(ctx context.Context, name string, creatorUserID string) (string, error) {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var convID string
+	err = tx.QueryRow(ctx,
+		`INSERT INTO conversations (conv_type, name) VALUES (1, $1) RETURNING id`,
+		name,
+	).Scan(&convID)
+	if err != nil {
+		return "", fmt.Errorf("create group conversation: %w", err)
+	}
+
+	// Add creator as owner (role=2)
+	_, err = tx.Exec(ctx,
+		`INSERT INTO conversation_members (conversation_id, user_id, role) VALUES ($1, $2::uuid, 2)`,
+		convID, creatorUserID)
+	if err != nil {
+		return "", fmt.Errorf("add group owner: %w", err)
+	}
+
+	return convID, tx.Commit(ctx)
+}
+
+// AddGroupMember adds a user to a group conversation.
+func (db *DB) AddGroupMember(ctx context.Context, convID, userID string, role int16) error {
+	_, err := db.Pool.Exec(ctx,
+		`INSERT INTO conversation_members (conversation_id, user_id, role)
+		 VALUES ($1::uuid, $2::uuid, $3)
+		 ON CONFLICT (conversation_id, user_id) DO NOTHING`,
+		convID, userID, role,
+	)
+	return err
+}
+
+// RemoveGroupMember removes a user from a group.
+func (db *DB) RemoveGroupMember(ctx context.Context, convID, userID string) error {
+	_, err := db.Pool.Exec(ctx,
+		`DELETE FROM conversation_members WHERE conversation_id = $1::uuid AND user_id = $2::uuid`,
+		convID, userID,
+	)
+	return err
+}
+
+// GetGroupMembersDetailed returns all group members with user info.
+func (db *DB) GetGroupMembersDetailed(ctx context.Context, convID string) ([]GroupMember, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT u.id, u.identity_key, u.username, cm.role, cm.joined_at
+		 FROM conversation_members cm
+		 JOIN users u ON u.id = cm.user_id
+		 WHERE cm.conversation_id = $1::uuid
+		 ORDER BY cm.role DESC, cm.joined_at ASC`,
+		convID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var members []GroupMember
+	for rows.Next() {
+		var m GroupMember
+		if err := rows.Scan(&m.UserID, &m.IdentityKey, &m.Username, &m.Role, &m.JoinedAt); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	return members, rows.Err()
+}
+
+// GetConversationType returns the conv_type of a conversation.
+func (db *DB) GetConversationType(ctx context.Context, convID string) (int16, error) {
+	var convType int16
+	err := db.Pool.QueryRow(ctx,
+		`SELECT conv_type FROM conversations WHERE id = $1::uuid`, convID,
+	).Scan(&convType)
+	return convType, err
+}
+
+// GetMemberRole returns the role of a user in a conversation.
+func (db *DB) GetMemberRole(ctx context.Context, convID, userID string) (int16, error) {
+	var role int16
+	err := db.Pool.QueryRow(ctx,
+		`SELECT role FROM conversation_members
+		 WHERE conversation_id = $1::uuid AND user_id = $2::uuid`,
+		convID, userID,
+	).Scan(&role)
+	return role, err
+}
+
+// StoreSenderKey persists an encrypted sender key distribution.
+func (db *DB) StoreSenderKey(ctx context.Context, convID, ownerDeviceID, targetDeviceID string, encryptedKey []byte, generation int) error {
+	_, err := db.Pool.Exec(ctx,
+		`INSERT INTO sender_keys (conversation_id, owner_device_id, target_device_id, encrypted_key, generation)
+		 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)
+		 ON CONFLICT (conversation_id, owner_device_id, target_device_id)
+		 DO UPDATE SET encrypted_key = $4, generation = $5`,
+		convID, ownerDeviceID, targetDeviceID, encryptedKey, generation,
+	)
+	return err
+}
+
+// GetPendingSenderKeys returns sender keys addressed to a specific device.
+func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) ([]SenderKeyRow, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT conversation_id, owner_device_id, target_device_id, encrypted_key, generation
+		 FROM sender_keys WHERE target_device_id = $1::uuid`,
+		targetDeviceID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var keys []SenderKeyRow
+	for rows.Next() {
+		var k SenderKeyRow
+		if err := rows.Scan(&k.ConversationID, &k.OwnerDeviceID, &k.TargetDeviceID, &k.EncryptedKey, &k.Generation); err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+type SenderKeyRow struct {
+	ConversationID string
+	OwnerDeviceID  string
+	TargetDeviceID string
+	EncryptedKey   []byte
+	Generation     int
+}

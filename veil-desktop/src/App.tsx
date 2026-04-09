@@ -1,7 +1,7 @@
 import { Component, Show, Switch, Match, For, createSignal, createEffect, onMount } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { appStore } from "@/stores/app";
+import { appStore, type GroupMember } from "@/stores/app";
 import { OnboardingScreen } from "@/components/chat/OnboardingScreen";
 import { LockScreen } from "@/components/chat/LockScreen";
 import { SettingsScreen } from "@/components/chat/SettingsScreen";
@@ -78,7 +78,12 @@ const App: Component = () => {
   const [inputText, setInputText] = createSignal("");
   const [search, setSearch] = createSignal("");
   const [showNewDm, setShowNewDm] = createSignal(false);
+  const [showNewGroup, setShowNewGroup] = createSignal(false);
   const [newPeerId, setNewPeerId] = createSignal("");
+  const [newGroupName, setNewGroupName] = createSignal("");
+  const [sidebarTab, setSidebarTab] = createSignal<"all" | "dm" | "group">("all");
+  const [showMemberPanel, setShowMemberPanel] = createSignal(false);
+  const [groupMembers, setGroupMembers] = createSignal<GroupMember[]>([]);
   // Staggered island entrance
   const [island1Vis, setIsland1Vis] = createSignal(false);
   const [island2Vis, setIsland2Vis] = createSignal(false);
@@ -91,11 +96,22 @@ const App: Component = () => {
 
   const filtered = () => {
     const q = search().toLowerCase();
-    if (!q) return appStore.conversations();
-    return appStore.conversations().filter((c) => c.name.toLowerCase().includes(q));
+    const tab = sidebarTab();
+    let list = appStore.conversations();
+    if (tab === "dm") list = list.filter((c) => c.type === "dm");
+    else if (tab === "group") list = list.filter((c) => c.type === "group");
+    if (!q) return list;
+    return list.filter((c) => c.name.toLowerCase().includes(q));
   };
 
   createEffect(() => { msgs(); messagesEnd?.scrollIntoView({ behavior: "smooth" }); });
+
+  // Load messages when conversation changes
+  createEffect(() => {
+    const id = appStore.activeConversationId();
+    if (id) appStore.loadMessages(id);
+    setShowMemberPanel(false);
+  });
 
   // Trigger staggered entrance when chat screen appears
   createEffect(() => {
@@ -126,6 +142,13 @@ const App: Component = () => {
     if (!id) return;
     await appStore.createDm(id);
     setNewPeerId(""); setShowNewDm(false);
+  };
+
+  const handleNewGroup = async () => {
+    const name = newGroupName().trim();
+    if (!name) return;
+    await appStore.createGroup(name);
+    setNewGroupName(""); setShowNewGroup(false);
   };
 
   onMount(async () => {
@@ -170,11 +193,6 @@ const App: Component = () => {
     dot: (color: string) => ({ width: "14px", height: "14px", "border-radius": "50%", background: color, border: "none", cursor: "pointer" }),
   };
 
-  const servers = [
-    { id: "home", label: "V" },
-    { id: "s1", label: "DT" },
-    { id: "s2", label: "G" },
-  ];
   const [activeServer, setActiveServer] = createSignal("home");
 
   return (
@@ -207,31 +225,80 @@ const App: Component = () => {
             {/* ISLAND 1 — Server Rail */}
             <div style={{ ...S.island("68px"), ...S.islandAnim(island1Vis(), 0) }}>
               <div style={S.rail}>
-                <For each={servers}>
+                {/* Home — DMs & Groups */}
+                <button
+                  style={S.railBtn(activeServer() === "home")}
+                  onClick={() => setActiveServer("home")}
+                  title="Home"
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                    <path d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+
+                <div style={{ width: "28px", height: "2px", background: "rgba(255,255,255,0.06)", "border-radius": "1px" }} />
+
+                {/* Future servers will appear here */}
+                <For each={appStore.servers()}>
                   {(s) => (
-                    <button style={S.railBtn(activeServer() === s.id)} onClick={() => setActiveServer(s.id)}>
-                      {s.label}
+                    <button
+                      style={S.railBtn(activeServer() === s.id)}
+                      onClick={() => setActiveServer(s.id)}
+                      title={s.name}
+                    >
+                      {s.name.charAt(0).toUpperCase()}
                     </button>
                   )}
                 </For>
-                <div style={{ width: "28px", height: "2px", background: "rgba(255,255,255,0.06)", "border-radius": "1px" }} />
-                <button style={{ ...S.railBtn(false), color: "#34d399" }} onClick={() => {}}>+</button>
+
+                {/* Add Server — placeholder */}
+                <button
+                  style={{ ...S.railBtn(false), color: "#34d399", "font-size": "18px" }}
+                  onClick={() => {}}
+                  title="Join or create a server (coming soon)"
+                >+</button>
               </div>
             </div>
 
             {/* ISLAND 2 — Sidebar */}
             <div style={{ ...S.island("256px"), ...S.islandAnim(island2Vis(), 0) }}>
               <div style={S.sidebarHeader}>
-                <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", "margin-bottom": "14px" }}>
+                <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", "margin-bottom": "12px" }}>
                   <span style={{ "font-size": "15px", "font-weight": "700", color: "#eee" }}>Messages</span>
-                  <button
-                    style={{ width: "26px", height: "26px", "border-radius": "6px", background: "rgba(255,255,255,0.04)", border: "none", color: "#888", cursor: "pointer", "font-size": "16px" }}
-                    onClick={() => setShowNewDm(!showNewDm())}
-                  >+</button>
+                  <div style={{ display: "flex", gap: "4px" }}>
+                    <button
+                      style={{ width: "26px", height: "26px", "border-radius": "6px", background: "rgba(255,255,255,0.04)", border: "none", color: "#888", cursor: "pointer", "font-size": "16px" }}
+                      onClick={() => { setShowNewDm(!showNewDm()); setShowNewGroup(false); }}
+                      title="New DM"
+                    >+</button>
+                    <button
+                      style={{ width: "26px", height: "26px", "border-radius": "6px", background: "rgba(255,255,255,0.04)", border: "none", color: "#888", cursor: "pointer", "font-size": "13px" }}
+                      onClick={() => { setShowNewGroup(!showNewGroup()); setShowNewDm(false); }}
+                      title="New Group"
+                    >{"\uD83D\uDC65"}</button>
+                  </div>
+                </div>
+
+                {/* Tabs: All / DM / Groups */}
+                <div style={{ display: "flex", gap: "2px", "margin-bottom": "10px", background: "#1E1F22", "border-radius": "8px", padding: "3px" }}>
+                  <For each={[{ key: "all" as const, label: "All" }, { key: "dm" as const, label: "DMs" }, { key: "group" as const, label: "Groups" }]}>
+                    {(t) => (
+                      <button
+                        style={{
+                          flex: "1", padding: "5px 0", "border-radius": "6px", border: "none",
+                          background: sidebarTab() === t.key ? "rgba(124,107,245,0.15)" : "transparent",
+                          color: sidebarTab() === t.key ? "#7c6bf5" : "#666",
+                          "font-size": "11px", "font-weight": "600", cursor: "pointer",
+                          transition: "background 0.15s, color 0.15s",
+                        }}
+                        onClick={() => setSidebarTab(t.key)}
+                      >{t.label}</button>
+                    )}
+                  </For>
                 </div>
 
                 <Show when={showNewDm()}>
-                  <div style={{ display: "flex", gap: "8px", "margin-bottom": "12px" }}>
+                  <div style={{ display: "flex", gap: "8px", "margin-bottom": "10px" }}>
                     <input
                       style={{ ...S.searchBox, flex: "1" }}
                       placeholder="User ID..."
@@ -243,6 +310,22 @@ const App: Component = () => {
                       style={{ height: "34px", padding: "0 12px", "border-radius": "8px", background: "#7c6bf5", border: "none", color: "#fff", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
                       onClick={handleNewDm}
                     >Go</button>
+                  </div>
+                </Show>
+
+                <Show when={showNewGroup()}>
+                  <div style={{ display: "flex", gap: "8px", "margin-bottom": "10px" }}>
+                    <input
+                      style={{ ...S.searchBox, flex: "1" }}
+                      placeholder="Group name..."
+                      value={newGroupName()}
+                      onInput={(e) => setNewGroupName(e.currentTarget.value)}
+                      onKeyDown={(e) => e.key === "Enter" && handleNewGroup()}
+                    />
+                    <button
+                      style={{ height: "34px", padding: "0 12px", "border-radius": "8px", background: "#7c6bf5", border: "none", color: "#fff", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
+                      onClick={handleNewGroup}
+                    >Create</button>
                   </div>
                 </Show>
 
@@ -260,10 +343,16 @@ const App: Component = () => {
                   fallback={
                     <div style={{ "text-align": "center", "padding-top": "40px", color: "#555" }}>
                       <p style={{ "font-size": "13px" }}>No conversations</p>
-                      <button
-                        style={{ "margin-top": "8px", background: "none", border: "none", color: "#7c6bf5", "font-size": "12px", cursor: "pointer" }}
-                        onClick={() => setShowNewDm(true)}
-                      >Start a new one {"\u2192"}</button>
+                      <div style={{ display: "flex", gap: "8px", "justify-content": "center", "margin-top": "8px" }}>
+                        <button
+                          style={{ background: "none", border: "none", color: "#7c6bf5", "font-size": "12px", cursor: "pointer" }}
+                          onClick={() => setShowNewDm(true)}
+                        >New DM {"\u2192"}</button>
+                        <button
+                          style={{ background: "none", border: "none", color: "#7c6bf5", "font-size": "12px", cursor: "pointer" }}
+                          onClick={() => setShowNewGroup(true)}
+                        >New Group {"\u2192"}</button>
+                      </div>
                     </div>
                   }
                 >
@@ -275,9 +364,21 @@ const App: Component = () => {
                         onMouseEnter={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "rgba(255,255,255,0.03)"; }}
                         onMouseLeave={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "transparent"; }}
                       >
-                        <div style={S.avatar(36)}>{c.name.charAt(0).toUpperCase()}</div>
+                        <div style={{
+                          ...S.avatar(36),
+                          "border-radius": c.type === "group" ? "10px" : "50%",
+                          background: c.type === "group" ? "rgba(124,107,245,0.12)" : "#36373D",
+                          color: c.type === "group" ? "#7c6bf5" : "#999",
+                        }}>
+                          {c.type === "group" ? "\uD83D\uDC65" : c.name.charAt(0).toUpperCase()}
+                        </div>
                         <div style={{ flex: "1", "min-width": "0" }}>
-                          <div style={{ "font-size": "13px", "font-weight": "500", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{c.name}</div>
+                          <div style={{ display: "flex", "align-items": "center", gap: "6px" }}>
+                            <span style={{ "font-size": "13px", "font-weight": "500", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{c.name}</span>
+                            <Show when={c.type === "group"}>
+                              <span style={{ "font-size": "9px", "font-weight": "600", color: "#7c6bf5", background: "rgba(124,107,245,0.1)", padding: "1px 5px", "border-radius": "4px" }}>GRP</span>
+                            </Show>
+                          </div>
                           <Show when={c.lastMessage}>
                             <div style={{ "font-size": "11px", color: "#666", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "margin-top": "2px" }}>{c.lastMessage}</div>
                           </Show>
@@ -315,7 +416,7 @@ const App: Component = () => {
             </div>
 
             {/* ISLAND 3 — Chat */}
-            <div style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}>
+            <div style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0), position: "relative" }}>
               <Show when={conv()} fallback={
                 <div style={{ flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" }}>
                   <div style={{ width: "56px", height: "56px", "border-radius": "16px", background: "rgba(124,107,245,0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" }}>
@@ -323,17 +424,49 @@ const App: Component = () => {
                   </div>
                   <div style={{ "font-size": "16px", "font-weight": "500", color: "#aaa", "margin-bottom": "6px" }}>Veil Messenger</div>
                   <div style={{ "font-size": "13px", color: "#555" }}>Select a conversation or start a new one</div>
+                  <div style={{ display: "flex", gap: "12px", "margin-top": "20px" }}>
+                    <button
+                      style={{ padding: "8px 16px", "border-radius": "8px", background: "rgba(124,107,245,0.1)", border: "none", color: "#7c6bf5", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
+                      onClick={() => setShowNewDm(true)}
+                    >New DM</button>
+                    <button
+                      style={{ padding: "8px 16px", "border-radius": "8px", background: "rgba(124,107,245,0.1)", border: "none", color: "#7c6bf5", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
+                      onClick={() => setShowNewGroup(true)}
+                    >New Group</button>
+                  </div>
                   <div style={{ "font-size": "11px", color: "#444", "margin-top": "16px" }}>{"\uD83D\uDD12"} End-to-end encrypted</div>
                 </div>
               }>
                 {(c) => (
                   <>
                     <div style={S.chatHeader}>
-                      <div style={S.avatar(32)}>{c().name.charAt(0).toUpperCase()}</div>
-                      <div>
-                        <div style={{ "font-size": "14px", "font-weight": "600", color: "#eee" }}>{c().name}</div>
-                        <div style={{ "font-size": "11px", color: "#555" }}>{"\uD83D\uDD12"} Encrypted</div>
+                      <div style={{
+                        ...S.avatar(32),
+                        "border-radius": c().type === "group" ? "10px" : "50%",
+                        background: c().type === "group" ? "rgba(124,107,245,0.12)" : "#36373D",
+                        color: c().type === "group" ? "#7c6bf5" : "#999",
+                      }}>
+                        {c().type === "group" ? "\uD83D\uDC65" : c().name.charAt(0).toUpperCase()}
                       </div>
+                      <div style={{ flex: "1" }}>
+                        <div style={{ "font-size": "14px", "font-weight": "600", color: "#eee" }}>{c().name}</div>
+                        <div style={{ "font-size": "11px", color: "#555" }}>
+                          {c().type === "group" ? "\uD83D\uDD12 Encrypted group" : "\uD83D\uDD12 Encrypted"}
+                        </div>
+                      </div>
+                      <Show when={c().type === "group"}>
+                        <button
+                          style={{ padding: "4px 10px", "border-radius": "6px", background: showMemberPanel() ? "rgba(124,107,245,0.15)" : "rgba(255,255,255,0.04)", border: "none", color: showMemberPanel() ? "#7c6bf5" : "#888", cursor: "pointer", "font-size": "11px", transition: "background 0.15s" }}
+                          onClick={async () => {
+                            if (!showMemberPanel()) {
+                              const members = await appStore.getGroupMembers(c().id);
+                              setGroupMembers(members);
+                            }
+                            setShowMemberPanel(!showMemberPanel());
+                          }}
+                          title="Group members"
+                        >{"\uD83D\uDC65"} Members</button>
+                      </Show>
                     </div>
 
                     <div style={S.msgArea}>
@@ -348,21 +481,44 @@ const App: Component = () => {
                           const prev = () => idx() > 0 ? msgs()[idx() - 1] : null;
                           const gap = () => !prev() || prev()!.senderKey !== msg.senderKey || msg.timestamp - prev()!.timestamp > 300000;
                           const time = () => new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+                          // Day separator
+                          const msgDate = () => new Date(msg.timestamp).toDateString();
+                          const prevDate = () => prev() ? new Date(prev()!.timestamp).toDateString() : null;
+                          const showDay = () => msgDate() !== prevDate();
+                          const dayLabel = () => {
+                            const d = new Date(msg.timestamp);
+                            const today = new Date();
+                            const yesterday = new Date(today); yesterday.setDate(today.getDate() - 1);
+                            if (d.toDateString() === today.toDateString()) return "Today";
+                            if (d.toDateString() === yesterday.toDateString()) return "Yesterday";
+                            return d.toLocaleDateString([], { month: "short", day: "numeric", year: d.getFullYear() !== today.getFullYear() ? "numeric" : undefined });
+                          };
+
                           return (
-                            <div style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px" }}>
-                              <Show when={gap()} fallback={<div style={{ width: "36px", "flex-shrink": "0" }} />}>
-                                <div style={{ ...S.avatar(36), "margin-top": "2px" }}>{msg.senderName.charAt(0).toUpperCase()}</div>
+                            <>
+                              <Show when={showDay()}>
+                                <div style={{ display: "flex", "align-items": "center", gap: "12px", margin: "20px 0 12px", padding: "0 8px" }}>
+                                  <div style={{ flex: "1", height: "1px", background: "rgba(255,255,255,0.04)" }} />
+                                  <span style={{ "font-size": "10px", color: "#555", "font-weight": "600", "white-space": "nowrap" }}>{dayLabel()}</span>
+                                  <div style={{ flex: "1", height: "1px", background: "rgba(255,255,255,0.04)" }} />
+                                </div>
                               </Show>
-                              <div style={{ flex: "1", "min-width": "0" }}>
-                                <Show when={gap()}>
-                                  <div style={{ display: "flex", "align-items": "baseline", gap: "8px", "margin-bottom": "3px" }}>
-                                    <span style={{ "font-size": "13px", "font-weight": "600", color: msg.isOwn ? "#7c6bf5" : "#ddd" }}>{msg.senderName}</span>
-                                    <span style={{ "font-size": "10px", color: "#555", "font-family": "monospace" }}>{time()}</span>
-                                  </div>
+                              <div style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px" }}>
+                                <Show when={gap()} fallback={<div style={{ width: "36px", "flex-shrink": "0" }} />}>
+                                  <div style={{ ...S.avatar(36), "margin-top": "2px" }}>{msg.senderName.charAt(0).toUpperCase()}</div>
                                 </Show>
-                                <div style={{ "font-size": "13.5px", color: "#ccc", "line-height": "1.55", "word-break": "break-word", "user-select": "text" }}>{msg.text}</div>
+                                <div style={{ flex: "1", "min-width": "0" }}>
+                                  <Show when={gap()}>
+                                    <div style={{ display: "flex", "align-items": "baseline", gap: "8px", "margin-bottom": "3px" }}>
+                                      <span style={{ "font-size": "13px", "font-weight": "600", color: msg.isOwn ? "#7c6bf5" : "#ddd" }}>{msg.senderName}</span>
+                                      <span style={{ "font-size": "10px", color: "#555", "font-family": "monospace" }}>{time()}</span>
+                                    </div>
+                                  </Show>
+                                  <div style={{ "font-size": "13.5px", color: "#ccc", "line-height": "1.55", "word-break": "break-word", "user-select": "text" }}>{msg.text}</div>
+                                </div>
                               </div>
-                            </div>
+                            </>
                           );
                         }}
                       </For>
@@ -381,6 +537,50 @@ const App: Component = () => {
                         <button style={S.sendBtn(!!inputText().trim())} onClick={handleSend}>{"\u27A4"}</button>
                       </div>
                     </div>
+
+                    {/* Group Member Panel */}
+                    <Show when={showMemberPanel() && c().type === "group"}>
+                      <div style={{
+                        position: "absolute", top: "0", right: "0", width: "220px", height: "100%",
+                        background: "#2B2D31", "border-left": "1px solid rgba(255,255,255,0.04)",
+                        display: "flex", "flex-direction": "column", "z-index": "10",
+                      }}>
+                        <div style={{ padding: "16px", "border-bottom": "1px solid rgba(255,255,255,0.04)" }}>
+                          <div style={{ "font-size": "12px", "font-weight": "700", color: "#eee", "text-transform": "uppercase", "letter-spacing": "0.05em" }}>
+                            Members — {groupMembers().length}
+                          </div>
+                        </div>
+                        <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 12px" }}>
+                          <For each={groupMembers()}>
+                            {(m) => (
+                              <div style={{ display: "flex", "align-items": "center", gap: "10px", padding: "8px 6px", "border-radius": "8px" }}>
+                                <div style={{ ...S.avatar(30), "font-size": "11px" }}>{m.username.charAt(0).toUpperCase()}</div>
+                                <div style={{ flex: "1", "min-width": "0" }}>
+                                  <div style={{ "font-size": "12px", "font-weight": "500", color: "#ddd", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{m.username}</div>
+                                  <Show when={m.role > 0}>
+                                    <div style={{ "font-size": "9px", color: m.role === 2 ? "#f59e0b" : "#7c6bf5", "font-weight": "600" }}>
+                                      {m.role === 2 ? "OWNER" : "ADMIN"}
+                                    </div>
+                                  </Show>
+                                </div>
+                              </div>
+                            )}
+                          </For>
+                          <Show when={groupMembers().length === 0}>
+                            <div style={{ "text-align": "center", padding: "20px 0", color: "#555", "font-size": "12px" }}>No members loaded</div>
+                          </Show>
+                        </div>
+                        {/* Placeholder: future add member button */}
+                        <div style={{ padding: "12px", "border-top": "1px solid rgba(255,255,255,0.04)" }}>
+                          <button style={{
+                            width: "100%", padding: "8px", "border-radius": "8px",
+                            background: "rgba(124,107,245,0.1)", border: "none",
+                            color: "#7c6bf5", "font-size": "11px", "font-weight": "600",
+                            cursor: "pointer",
+                          }}>+ Invite member</button>
+                        </div>
+                      </div>
+                    </Show>
                   </>
                 )}
               </Show>

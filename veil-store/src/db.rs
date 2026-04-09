@@ -134,6 +134,23 @@ impl VeilDb {
                 msg_type INTEGER DEFAULT 0,
                 reply_to_id TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS group_members (
+                group_id TEXT NOT NULL REFERENCES conversations(id),
+                identity_key BLOB NOT NULL,
+                role INTEGER NOT NULL DEFAULT 0,  -- 0=member, 1=admin, 2=owner
+                joined_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, identity_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS sender_keys_local (
+                group_id TEXT NOT NULL,
+                sender_identity_key BLOB NOT NULL,
+                key_data BLOB NOT NULL,           -- Serialized SenderKeyState
+                is_outgoing INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, sender_identity_key)
             );",
             )
             .map_err(|e| format!("migrations: {e}"))
@@ -306,6 +323,116 @@ impl VeilDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("load ratchet session: {e}")),
         }
+    }
+
+    // ─── CRUD: Group Members ──────────────────────────────
+
+    pub fn insert_group_member(
+        &self,
+        group_id: &str,
+        identity_key: &[u8],
+        role: u8,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO group_members (group_id, identity_key, role)
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![group_id, identity_key, role],
+            )
+            .map_err(|e| format!("insert group member: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_group_members(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<crate::models::GroupMember>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT group_id, identity_key, role, joined_at
+                 FROM group_members WHERE group_id = ?1 ORDER BY joined_at ASC",
+            )
+            .map_err(|e| format!("prepare: {e}"))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                Ok(crate::models::GroupMember {
+                    group_id: row.get(0)?,
+                    identity_key: row.get(1)?,
+                    role: match row.get::<_, u8>(2)? {
+                        1 => crate::models::GroupRole::Admin,
+                        2 => crate::models::GroupRole::Owner,
+                        _ => crate::models::GroupRole::Member,
+                    },
+                    joined_at: row.get(3)?,
+                })
+            })
+            .map_err(|e| format!("query: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect: {e}"))
+    }
+
+    pub fn remove_group_member(
+        &self,
+        group_id: &str,
+        identity_key: &[u8],
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM group_members WHERE group_id = ?1 AND identity_key = ?2",
+                rusqlite::params![group_id, identity_key],
+            )
+            .map_err(|e| format!("remove group member: {e}"))?;
+        Ok(())
+    }
+
+    // ─── CRUD: Sender Keys ───────────────────────────────
+
+    pub fn save_sender_key(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8],
+        key_data: &[u8],
+        is_outgoing: bool,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO sender_keys_local
+                    (group_id, sender_identity_key, key_data, is_outgoing, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, datetime('now'))",
+                rusqlite::params![group_id, sender_identity_key, key_data, is_outgoing as u8],
+            )
+            .map_err(|e| format!("save sender key: {e}"))?;
+        Ok(())
+    }
+
+    pub fn load_sender_key(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, String> {
+        match self.conn.query_row(
+            "SELECT key_data FROM sender_keys_local
+             WHERE group_id = ?1 AND sender_identity_key = ?2",
+            rusqlite::params![group_id, sender_identity_key],
+            |row| row.get(0),
+        ) {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("load sender key: {e}")),
+        }
+    }
+
+    pub fn delete_sender_keys_for_group(&self, group_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM sender_keys_local WHERE group_id = ?1",
+                rusqlite::params![group_id],
+            )
+            .map_err(|e| format!("delete sender keys: {e}"))?;
+        Ok(())
     }
 }
 
