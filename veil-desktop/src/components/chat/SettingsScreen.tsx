@@ -35,7 +35,40 @@ export const SettingsScreen: Component = () => {
   const [networkSaved, setNetworkSaved] = createSignal(false);
 
   // Auto-lock
-  const [autoLockMin, setAutoLockMin] = createSignal(5);
+  const [autoLockMin, setAutoLockMin] = createSignal(15);
+  const [autoLockOpen, setAutoLockOpen] = createSignal(false);
+
+  // Recovery phrase
+  const [showRecovery, setShowRecovery] = createSignal(false);
+  const [recoveryPhrase, setRecoveryPhrase] = createSignal<string | null>(null);
+  const [recoveryConfirmed, setRecoveryConfirmed] = createSignal(false);
+  const [recoveryLoading, setRecoveryLoading] = createSignal(false);
+
+  const autoLockOptions = [
+    { value: 1, label: "1 minute" },
+    { value: 5, label: "5 minutes" },
+    { value: 15, label: "15 minutes" },
+    { value: 30, label: "30 minutes" },
+    { value: 60, label: "1 hour" },
+  ];
+
+  const loadRecoveryPhrase = async () => {
+    setRecoveryLoading(true);
+    try {
+      const seed = await invoke<string | null>("get_stored_seed");
+      setRecoveryPhrase(seed);
+    } catch (e) {
+      console.error("Failed to load recovery phrase:", e);
+    } finally {
+      setRecoveryLoading(false);
+    }
+  };
+
+  const hideRecoveryPhrase = () => {
+    setShowRecovery(false);
+    setRecoveryPhrase(null);
+    setRecoveryConfirmed(false);
+  };
 
   onMount(async () => {
     setTimeout(() => setEntering(false), 30);
@@ -47,10 +80,22 @@ export const SettingsScreen: Component = () => {
 
   // Close on Escape
   const handleKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") goBack();
+    if (e.key === "Escape") {
+      if (autoLockOpen()) { setAutoLockOpen(false); return; }
+      goBack();
+    }
   };
-  onMount(() => document.addEventListener("keydown", handleKey));
-  onCleanup(() => document.removeEventListener("keydown", handleKey));
+  const handleClickOutside = () => {
+    if (autoLockOpen()) setAutoLockOpen(false);
+  };
+  onMount(() => {
+    document.addEventListener("keydown", handleKey);
+    document.addEventListener("click", handleClickOutside);
+  });
+  onCleanup(() => {
+    document.removeEventListener("keydown", handleKey);
+    document.removeEventListener("click", handleClickOutside);
+  });
 
   const goBack = () => {
     setEntering(true);
@@ -463,25 +508,194 @@ export const SettingsScreen: Component = () => {
         <div style={S.cardTitle}>Auto-Lock</div>
         <div style={S.field}>
           <span style={S.fieldLabel}>Lock after inactivity</span>
-          <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-            <select
+          <div style={{ position: "relative" }}>
+            <button
               style={{
-                ...S.input,
-                width: "120px",
+                height: "34px",
+                padding: "0 32px 0 14px",
+                "border-radius": "10px",
+                background: "rgba(255,255,255,0.04)",
+                border: "1px solid rgba(255,255,255,0.08)",
+                color: "rgba(255,255,255,0.6)",
+                "font-size": "13px",
                 cursor: "pointer",
-                appearance: "auto" as const,
+                "min-width": "130px",
+                "text-align": "left",
+                position: "relative" as const,
+                transition: "border-color 0.2s",
               }}
-              value={autoLockMin()}
-              onChange={(e) => setAutoLockMin(Number(e.currentTarget.value))}
+              onClick={(e) => { e.stopPropagation(); setAutoLockOpen(!autoLockOpen()); }}
             >
-              <option value={1}>1 minute</option>
-              <option value={5}>5 minutes</option>
-              <option value={15}>15 minutes</option>
-              <option value={30}>30 minutes</option>
-              <option value={60}>1 hour</option>
-            </select>
+              {autoLockOptions.find(o => o.value === autoLockMin())?.label}
+              <span style={{
+                position: "absolute",
+                right: "10px",
+                top: "50%",
+                transform: autoLockOpen() ? "translateY(-50%) rotate(180deg)" : "translateY(-50%)",
+                "font-size": "10px",
+                color: "rgba(255,255,255,0.3)",
+                transition: "transform 0.2s",
+              }}>{"\u25BC"}</span>
+            </button>
+            <Show when={autoLockOpen()}>
+              <div style={{
+                position: "absolute",
+                top: "calc(100% + 4px)",
+                right: "0",
+                "min-width": "130px",
+                background: "#2B2D31",
+                border: "1px solid rgba(255,255,255,0.08)",
+                "border-radius": "10px",
+                padding: "4px",
+                "z-index": "50",
+                "box-shadow": "0 8px 24px rgba(0,0,0,0.4)",
+              }}>
+                <For each={autoLockOptions}>
+                  {(opt) => (
+                    <button
+                      style={{
+                        display: "block",
+                        width: "100%",
+                        height: "32px",
+                        padding: "0 12px",
+                        "border-radius": "8px",
+                        background: autoLockMin() === opt.value ? "rgba(124,107,245,0.15)" : "transparent",
+                        color: autoLockMin() === opt.value ? "#c4b8fb" : "rgba(255,255,255,0.5)",
+                        border: "none",
+                        cursor: "pointer",
+                        "font-size": "13px",
+                        "text-align": "left",
+                        transition: "background 0.15s, color 0.15s",
+                      }}
+                      onClick={() => { setAutoLockMin(opt.value); setAutoLockOpen(false); }}
+                      onMouseEnter={(e) => {
+                        if (autoLockMin() !== opt.value) {
+                          e.currentTarget.style.background = "rgba(255,255,255,0.04)";
+                          e.currentTarget.style.color = "rgba(255,255,255,0.7)";
+                        }
+                      }}
+                      onMouseLeave={(e) => {
+                        if (autoLockMin() !== opt.value) {
+                          e.currentTarget.style.background = "transparent";
+                          e.currentTarget.style.color = "rgba(255,255,255,0.5)";
+                        }
+                      }}
+                    >
+                      {opt.label}
+                    </button>
+                  )}
+                </For>
+              </div>
+            </Show>
           </div>
         </div>
+      </div>
+
+      {/* Recovery Phrase */}
+      <div style={S.card}>
+        <div style={S.cardTitle}>Recovery Phrase</div>
+
+        <Show when={!showRecovery()}>
+          <div style={S.paragraph}>
+            Your 12-word recovery phrase is the <strong style={{ color: "rgba(251,191,36,0.8)" }}>only way</strong> to restore access to your account and messages on a new device. Keep it safe and never share it with anyone.
+          </div>
+          <button style={S.btnDanger} onClick={() => setShowRecovery(true)}>
+            Show Recovery Phrase
+          </button>
+        </Show>
+
+        <Show when={showRecovery() && !recoveryConfirmed()}>
+          <div style={{
+            background: "rgba(240,72,72,0.06)",
+            border: "1px solid rgba(240,72,72,0.15)",
+            "border-radius": "10px",
+            padding: "16px 20px",
+            "margin-bottom": "16px",
+          }}>
+            <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-bottom": "10px" }}>
+              <span style={{ "font-size": "18px" }}>{"\u26A0\uFE0F"}</span>
+              <span style={{ "font-size": "14px", "font-weight": "700", color: "#f04848" }}>Security Warning</span>
+            </div>
+            <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.55)", "line-height": "1.7" }}>
+              <strong style={{ color: "rgba(255,255,255,0.7)" }}>Never share your recovery phrase with anyone.</strong>
+              {" "}Anyone with these 12 words will have <strong style={{ color: "#f04848" }}>full access</strong> to your account, messages, and identity. Veil support will never ask for your phrase.
+            </div>
+            <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.55)", "line-height": "1.7", "margin-top": "8px" }}>
+              Make sure no one can see your screen right now.
+            </div>
+          </div>
+          <div style={{ display: "flex", gap: "10px" }}>
+            <button style={S.btnDanger} onClick={() => { setRecoveryConfirmed(true); loadRecoveryPhrase(); }}>
+              I understand, show phrase
+            </button>
+            <button style={S.btnSecondary} onClick={hideRecoveryPhrase}>
+              Cancel
+            </button>
+          </div>
+        </Show>
+
+        <Show when={showRecovery() && recoveryConfirmed()}>
+          <Show when={recoveryLoading()}>
+            <div style={{ ...S.paragraph, color: "rgba(255,255,255,0.3)" }}>Loading...</div>
+          </Show>
+          <Show when={!recoveryLoading() && recoveryPhrase()}>
+            <div style={{
+              background: "rgba(240,72,72,0.04)",
+              border: "1px solid rgba(240,72,72,0.1)",
+              "border-radius": "12px",
+              padding: "20px",
+              "margin-bottom": "14px",
+            }}>
+              <div style={{
+                display: "grid",
+                "grid-template-columns": "repeat(3, 1fr)",
+                gap: "10px",
+              }}>
+                <For each={recoveryPhrase()!.split(" ")}>
+                  {(word, i) => (
+                    <div style={{
+                      display: "flex",
+                      "align-items": "center",
+                      gap: "8px",
+                      height: "36px",
+                      padding: "0 12px",
+                      "border-radius": "8px",
+                      background: "rgba(255,255,255,0.03)",
+                      border: "1px solid rgba(255,255,255,0.05)",
+                    }}>
+                      <span style={{
+                        "font-size": "11px",
+                        color: "rgba(255,255,255,0.2)",
+                        "min-width": "18px",
+                        "font-weight": "600",
+                      }}>{i() + 1}</span>
+                      <span style={{
+                        "font-size": "13px",
+                        color: "rgba(255,255,255,0.8)",
+                        "font-family": "monospace",
+                        "font-weight": "500",
+                      }}>{word}</span>
+                    </div>
+                  )}
+                </For>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: "10px" }}>
+              <button
+                style={S.btnPrimary}
+                onClick={() => copyText(recoveryPhrase()!, "phrase")}
+              >
+                {copied() === "phrase" ? "\u2713 Copied" : "Copy Phrase"}
+              </button>
+              <button style={S.btnSecondary} onClick={hideRecoveryPhrase}>
+                Hide
+              </button>
+            </div>
+          </Show>
+          <Show when={!recoveryLoading() && !recoveryPhrase()}>
+            <div style={S.errorMsg}>Recovery phrase not found. It may not have been stored.</div>
+          </Show>
+        </Show>
       </div>
 
       <div style={S.card}>
@@ -549,7 +763,13 @@ export const SettingsScreen: Component = () => {
         </div>
         <div style={{ ...S.field, "border-bottom": "none" }}>
           <span style={S.fieldLabel}>User ID</span>
-          <span style={S.fieldValue}>{userId()}</span>
+          <span style={{
+            ...S.fieldValue,
+            color: appStore.userId() ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.15)",
+            "font-style": appStore.userId() ? "normal" : ("italic" as const),
+          }}>
+            {appStore.userId() || "assigned after connecting"}
+          </span>
         </div>
       </div>
     </>
