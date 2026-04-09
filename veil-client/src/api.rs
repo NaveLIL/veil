@@ -49,10 +49,8 @@ pub struct VeilClient {
 impl VeilClient {
     pub fn new() -> Self {
         let mut device_id = [0u8; 16];
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(&mut device_id);
-        }
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut device_id);
         Self {
             identity: None,
             db: None,
@@ -70,10 +68,8 @@ impl VeilClient {
     /// Create a VeilClient with a pre-existing identity (no DB).
     pub fn from_identity(identity: IdentityKeyPair) -> Self {
         let mut device_id = [0u8; 16];
-        use std::io::Read;
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = f.read_exact(&mut device_id);
-        }
+        use rand::RngCore;
+        rand::rngs::OsRng.fill_bytes(&mut device_id);
         Self {
             identity: Some(identity),
             db: None,

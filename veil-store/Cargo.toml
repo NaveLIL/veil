@@ -7,8 +7,8 @@ description = "Encrypted local storage for Veil messenger — SQLCipher + OS Key
 
 [dependencies]
 veil-crypto = { path = "../veil-crypto" }
-rusqlite = { version = "0.31", features = ["bundled-sqlcipher"] }
-keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust", "windows-native"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4"] }

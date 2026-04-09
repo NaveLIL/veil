@@ -22,5 +22,6 @@ veil-crypto = { path = "../../veil-crypto" }
 veil-store = { path = "../../veil-store" }
 veil-client = { path = "../../veil-client" }
 hex = "0.4"
+rand = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

@@ -159,7 +159,10 @@ const App: Component = () => {
         appStore.setIdentity(key);
         const hasPin = await invoke<boolean>("has_pin");
         appStore.setScreen(hasPin ? "locked" : "chat");
-        if (!hasPin) await appStore.connectToServer();
+        if (!hasPin) {
+          await appStore.loadConversations();
+          await appStore.connectToServer();
+        }
       }
     } catch { appStore.setScreen("onboarding"); }
     await appStore.setupEventListeners();

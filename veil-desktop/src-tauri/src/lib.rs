@@ -66,13 +66,10 @@ fn get_stored_seed() -> Result<Option<String>, String> {
 
 #[tauri::command]
 fn set_pin(pin: String) -> Result<(), String> {
-    // Generate random salt
+    // Generate random salt (cross-platform)
     let mut salt = [0u8; 32];
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom")
-        .map_err(|e| e.to_string())?
-        .read_exact(&mut salt)
-        .map_err(|e| e.to_string())?;
+    use rand::RngCore;
+    rand::rngs::OsRng.fill_bytes(&mut salt);
 
     let hash = veil_crypto::kdf::derive_key_from_pin(&pin, &salt)?;
     keychain::store_seed(PIN_HASH_ACCOUNT, &hex::encode(hash))?;
