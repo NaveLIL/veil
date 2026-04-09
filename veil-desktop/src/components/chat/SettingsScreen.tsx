@@ -43,6 +43,7 @@ export const SettingsScreen: Component = () => {
   const [recoveryPhrase, setRecoveryPhrase] = createSignal<string | null>(null);
   const [recoveryConfirmed, setRecoveryConfirmed] = createSignal(false);
   const [recoveryLoading, setRecoveryLoading] = createSignal(false);
+  const [recoveryError, setRecoveryError] = createSignal("");
 
   const autoLockOptions = [
     { value: 1, label: "1 minute" },
@@ -54,11 +55,16 @@ export const SettingsScreen: Component = () => {
 
   const loadRecoveryPhrase = async () => {
     setRecoveryLoading(true);
+    setRecoveryError("");
     try {
       const seed = await invoke<string | null>("get_stored_seed");
       setRecoveryPhrase(seed);
+      if (!seed) {
+        setRecoveryError("Recovery phrase not found in keychain. You may need to restore from your backup.");
+      }
     } catch (e) {
       console.error("Failed to load recovery phrase:", e);
+      setRecoveryError(`Keychain error: ${String(e)}`);
     } finally {
       setRecoveryLoading(false);
     }
@@ -68,6 +74,7 @@ export const SettingsScreen: Component = () => {
     setShowRecovery(false);
     setRecoveryPhrase(null);
     setRecoveryConfirmed(false);
+    setRecoveryError("");
   };
 
   onMount(async () => {
@@ -693,7 +700,7 @@ export const SettingsScreen: Component = () => {
             </div>
           </Show>
           <Show when={!recoveryLoading() && !recoveryPhrase()}>
-            <div style={S.errorMsg}>Recovery phrase not found. It may not have been stored.</div>
+            <div style={S.errorMsg}>{recoveryError() || "Recovery phrase not found."}</div>
           </Show>
         </Show>
       </div>
