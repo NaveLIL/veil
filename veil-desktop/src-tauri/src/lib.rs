@@ -159,7 +159,7 @@ fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value
                     veil_store::models::ConversationType::Channel => "channel",
                 },
                 "name": c.name.unwrap_or_default(),
-                "peerKey": c.peer_identity_key.map(|k| hex::encode(k)),
+                "peerKey": c.peer_identity_key.map(hex::encode),
                 "lastMessageAt": c.last_message_at,
             })
         })

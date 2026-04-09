@@ -124,7 +124,7 @@ impl Connection {
         };
         let auth_bytes = auth_resp.encode_to_vec();
         ws_write
-            .send(WsMessage::Binary(auth_bytes.into()))
+            .send(WsMessage::Binary(auth_bytes))
             .await
             .map_err(|e| format!("send auth_response: {e}"))?;
 
@@ -164,7 +164,7 @@ impl Connection {
         // --- Background write loop ---
         tokio::spawn(async move {
             while let Some(data) = send_rx.recv().await {
-                if ws_write.send(WsMessage::Binary(data.into())).await.is_err() {
+                if ws_write.send(WsMessage::Binary(data)).await.is_err() {
                     break;
                 }
             }

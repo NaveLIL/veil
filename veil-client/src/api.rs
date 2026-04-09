@@ -335,11 +335,8 @@ impl VeilClient {
             ephemeral_key,
         )?;
 
-        let session = RatchetSession::init_responder(
-            &result.shared_secret,
-            &spk_secret_bytes.to_vec(),
-            &spk_pub,
-        );
+        let session =
+            RatchetSession::init_responder(&result.shared_secret, &spk_secret_bytes, &spk_pub);
 
         self.ratchet_sessions.insert(*sender_identity_key, session);
 

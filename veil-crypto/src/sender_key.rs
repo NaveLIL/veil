@@ -75,6 +75,12 @@ pub struct SenderKeyStore {
     incoming: std::collections::HashMap<(String, [u8; 32]), SenderKeyState>,
 }
 
+impl Default for SenderKeyState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SenderKeyState {
     /// Create a new sender key with a random chain key.
     pub fn new() -> Self {
