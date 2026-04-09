@@ -77,6 +77,7 @@ export const OnboardingScreen: Component = () => {
   const progress = () => ((taglineIdx() + 1) / TAGLINES.length) * 100;
 
   const transitionTo = (next: Step) => {
+    setError("");
     setLeaving(true);
     setTimeout(() => {
       setLeaving(false);
@@ -88,6 +89,7 @@ export const OnboardingScreen: Component = () => {
 
   const generateMnemonic = async () => {
     try {
+      setError("");
       setLoading(true);
       const m = await invoke<string>("generate_mnemonic");
       setMnemonic(m);
@@ -109,17 +111,35 @@ export const OnboardingScreen: Component = () => {
     try {
       setLoading(true);
       setError("");
-      const key = await invoke<string>("init_identity", { mnemonic: phrase });
-      await invoke("store_seed", { mnemonic: phrase });
+
+      // Normalize spaces/newlines from textarea or clipboard before validation.
+      const normalized = phrase.trim().replace(/\s+/g, " ");
+      if (!normalized) {
+        setError("Recovery phrase is empty. Please enter your words and try again.");
+        return;
+      }
+
+      const valid = await invoke<boolean>("validate_mnemonic_cmd", { mnemonic: normalized });
+      if (!valid) {
+        setError("Invalid recovery phrase. Check word order and spelling.");
+        return;
+      }
+
+      const key = await invoke<string>("init_identity", { mnemonic: normalized });
+      await invoke("store_seed", { mnemonic: normalized });
+
       appStore.setIdentity(key);
+      appStore.uploadPrekeys();
       appStore.setScreen("disclaimer");
       appStore.connectToServer();
+
+      // Clear sensitive inputs only after successful identity initialization.
+      setMnemonic("");
+      setRestoreInput("");
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
-      setMnemonic("");
-      setRestoreInput("");
     }
   };
 
@@ -447,9 +467,15 @@ export const OnboardingScreen: Component = () => {
           </div>
 
           <button
-            style={{ ...S.btnPrimary, width: "100%", "margin-top": "20px" }}
+            style={{
+              ...S.btnPrimary,
+              width: "100%",
+              "margin-top": "20px",
+              opacity: mnemonic().trim() && !loading() ? "1" : "0.4",
+              cursor: mnemonic().trim() && !loading() ? "pointer" : "not-allowed",
+            }}
             onClick={() => initIdentity(mnemonic())}
-            disabled={loading()}
+            disabled={loading() || !mnemonic().trim()}
             onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(124,107,245,0.35)"; }}
             onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(124,107,245,0.25)"; }}
           >
@@ -477,7 +503,10 @@ export const OnboardingScreen: Component = () => {
             style={S.textarea}
             placeholder="word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12"
             value={restoreInput()}
-            onInput={(e) => setRestoreInput(e.currentTarget.value)}
+            onInput={(e) => {
+              setRestoreInput(e.currentTarget.value);
+              if (error()) setError("");
+            }}
             onFocus={(e) => { e.currentTarget.style.borderColor = "rgba(124,107,245,0.3)"; e.currentTarget.style.background = "rgba(255,255,255,0.06)"; }}
             onBlur={(e) => { e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"; e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
           />
