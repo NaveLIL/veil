@@ -28,7 +28,7 @@ wildcards = "allow"
 highlight = "all"
 
 deny = [
-    { crate = "openssl-sys", wrappers = [] },
+    { crate = "openssl-sys", wrappers = ["rusqlite"] },
 ]
 
 [sources]

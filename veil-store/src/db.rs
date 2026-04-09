@@ -374,11 +374,7 @@ impl VeilDb {
             .map_err(|e| format!("collect: {e}"))
     }
 
-    pub fn remove_group_member(
-        &self,
-        group_id: &str,
-        identity_key: &[u8],
-    ) -> Result<(), String> {
+    pub fn remove_group_member(&self, group_id: &str, identity_key: &[u8]) -> Result<(), String> {
         self.conn
             .execute(
                 "DELETE FROM group_members WHERE group_id = ?1 AND identity_key = ?2",

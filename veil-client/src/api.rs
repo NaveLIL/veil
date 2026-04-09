@@ -50,7 +50,7 @@ impl VeilClient {
     pub fn new() -> Self {
         let mut device_id = [0u8; 16];
         use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut device_id);
+        let _ = rand::rngs::OsRng.try_fill_bytes(&mut device_id);
         Self {
             identity: None,
             db: None,
@@ -69,7 +69,7 @@ impl VeilClient {
     pub fn from_identity(identity: IdentityKeyPair) -> Self {
         let mut device_id = [0u8; 16];
         use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut device_id);
+        let _ = rand::rngs::OsRng.try_fill_bytes(&mut device_id);
         Self {
             identity: Some(identity),
             db: None,
@@ -162,8 +162,8 @@ impl VeilClient {
             cert_pins: vec![],
         };
 
-        let mut conn = Connection::connect(&config, identity, &self.device_id, "veil-desktop")
-            .await?;
+        let mut conn =
+            Connection::connect(&config, identity, &self.device_id, "veil-desktop").await?;
 
         // Drain the Authenticated event to get user_id
         let user_id = match conn.events.try_recv() {
@@ -274,19 +274,16 @@ impl VeilClient {
         let identity = self.identity.as_ref().ok_or("not initialized")?;
         let result = x3dh::initiate(identity, bundle)?;
 
-        let session = RatchetSession::init_initiator(
-            &result.shared_secret,
-            &bundle.signed_prekey,
-        );
+        let session = RatchetSession::init_initiator(&result.shared_secret, &bundle.signed_prekey);
 
         // Store the ephemeral public key for the first message header
         self.ratchet_sessions.insert(*peer_identity_key, session);
 
         // Persist session to DB
         if let Some(ref db) = self.db {
-            if let Ok(data) = serde_json::to_vec(
-                self.ratchet_sessions.get(peer_identity_key).unwrap(),
-            ) {
+            if let Ok(data) =
+                serde_json::to_vec(self.ratchet_sessions.get(peer_identity_key).unwrap())
+            {
                 let _ = db.save_ratchet_session(peer_identity_key, &data);
             }
         }
@@ -348,9 +345,9 @@ impl VeilClient {
 
         // Persist
         if let Some(ref db) = self.db {
-            if let Ok(data) = serde_json::to_vec(
-                self.ratchet_sessions.get(sender_identity_key).unwrap(),
-            ) {
+            if let Ok(data) =
+                serde_json::to_vec(self.ratchet_sessions.get(sender_identity_key).unwrap())
+            {
                 let _ = db.save_ratchet_session(sender_identity_key, &data);
             }
         }
@@ -381,7 +378,9 @@ impl VeilClient {
         peer_identity_key: &[u8; 32],
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        let session = self.ratchet_sessions.get_mut(peer_identity_key)
+        let session = self
+            .ratchet_sessions
+            .get_mut(peer_identity_key)
             .ok_or("no ratchet session with this peer")?;
 
         let (ratchet_header, ciphertext) = session.encrypt(plaintext)?;
@@ -424,8 +423,13 @@ impl VeilClient {
                 let mut ek = [0u8; 32];
                 ek.copy_from_slice(&header[1..33]);
                 let spk_id = u32::from_be_bytes([header[33], header[34], header[35], header[36]]);
-                let opk_id_raw = u32::from_be_bytes([header[37], header[38], header[39], header[40]]);
-                let opk_id = if opk_id_raw == 0xFFFFFFFF { None } else { Some(opk_id_raw) };
+                let opk_id_raw =
+                    u32::from_be_bytes([header[37], header[38], header[39], header[40]]);
+                let opk_id = if opk_id_raw == 0xFFFFFFFF {
+                    None
+                } else {
+                    Some(opk_id_raw)
+                };
 
                 // Establish responder session if needed
                 if !self.has_session(sender_identity_key) {
@@ -433,7 +437,9 @@ impl VeilClient {
                 }
 
                 let rh = MessageHeader::from_bytes(&header[41..])?;
-                let session = self.ratchet_sessions.get_mut(sender_identity_key)
+                let session = self
+                    .ratchet_sessions
+                    .get_mut(sender_identity_key)
                     .ok_or("session establishment failed")?;
                 let plaintext = session.decrypt(&rh, ciphertext)?;
 
@@ -451,7 +457,9 @@ impl VeilClient {
                     return Err("ratchet header too short".to_string());
                 }
                 let rh = MessageHeader::from_bytes(&header[1..])?;
-                let session = self.ratchet_sessions.get_mut(sender_identity_key)
+                let session = self
+                    .ratchet_sessions
+                    .get_mut(sender_identity_key)
                     .ok_or("no ratchet session with this peer")?;
                 let plaintext = session.decrypt(&rh, ciphertext)?;
 
@@ -481,7 +489,14 @@ impl VeilClient {
         server_timestamp: Option<i64>,
     ) {
         if let Some(ref db) = self.db {
-            let _ = db.insert_message(message_id, conversation_id, sender_key, plaintext, false, server_timestamp);
+            let _ = db.insert_message(
+                message_id,
+                conversation_id,
+                sender_key,
+                plaintext,
+                false,
+                server_timestamp,
+            );
         }
     }
 

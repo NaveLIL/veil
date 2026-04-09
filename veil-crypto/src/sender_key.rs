@@ -159,22 +159,15 @@ impl SenderKeyStore {
     /// Process a received sender key distribution.
     pub fn process_distribution(&mut self, dist: &SenderKeyDistribution) {
         let state = SenderKeyState::from_distribution(dist.key_id, dist.chain_key);
-        self.incoming.insert(
-            (dist.group_id.clone(), dist.sender_identity_key),
-            state,
-        );
+        self.incoming
+            .insert((dist.group_id.clone(), dist.sender_identity_key), state);
     }
 
     /// Encrypt a group message (using our outgoing sender key).
-    pub fn encrypt(
-        &mut self,
-        group_id: &str,
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        let state = self
-            .outgoing
-            .get_mut(group_id)
-            .ok_or_else(|| "no sender key for this group — call create_outgoing first".to_string())?;
+    pub fn encrypt(&mut self, group_id: &str, plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        let state = self.outgoing.get_mut(group_id).ok_or_else(|| {
+            "no sender key for this group — call create_outgoing first".to_string()
+        })?;
 
         state.encrypt(plaintext)
     }
@@ -200,10 +193,9 @@ impl SenderKeyStore {
         let ciphertext = &wire[33..];
 
         let lookup = (group_id.to_string(), *sender_ik);
-        let state = self
-            .incoming
-            .get_mut(&lookup)
-            .ok_or_else(|| "no sender key from this peer — key distribution required".to_string())?;
+        let state = self.incoming.get_mut(&lookup).ok_or_else(|| {
+            "no sender key from this peer — key distribution required".to_string()
+        })?;
 
         // Verify key_id matches
         if state.key_id != key_id {

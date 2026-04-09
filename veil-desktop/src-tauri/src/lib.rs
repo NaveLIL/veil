@@ -69,7 +69,9 @@ fn set_pin(pin: String) -> Result<(), String> {
     // Generate random salt (cross-platform)
     let mut salt = [0u8; 32];
     use rand::RngCore;
-    rand::rngs::OsRng.fill_bytes(&mut salt);
+    rand::rngs::OsRng
+        .try_fill_bytes(&mut salt)
+        .map_err(|e| format!("RNG failed: {e}"))?;
 
     let hash = veil_crypto::kdf::derive_key_from_pin(&pin, &salt)?;
     keychain::store_seed(PIN_HASH_ACCOUNT, &hex::encode(hash))?;
@@ -192,10 +194,7 @@ fn get_messages(
 
 /// Generate and upload prekeys for X3DH key exchange.
 #[tauri::command]
-fn upload_prekeys(
-    state: State<'_, AppState>,
-    server_http_url: String,
-) -> Result<(), String> {
+fn upload_prekeys(state: State<'_, AppState>, server_http_url: String) -> Result<(), String> {
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     let prekey_set = client.generate_prekeys()?;
     let identity_key = hex::encode(client.identity_key()?);
@@ -241,7 +240,10 @@ fn establish_session(
     let bundle_json: serde_json::Value = state.runtime.block_on(async {
         let http = reqwest::Client::new();
         let resp = http
-            .get(format!("{}/v1/prekeys/{}", server_http_url, peer_identity_key))
+            .get(format!(
+                "{}/v1/prekeys/{}",
+                server_http_url, peer_identity_key
+            ))
             .send()
             .await
             .map_err(|e| format!("fetch prekeys: {e}"))?;
@@ -253,8 +255,12 @@ fn establish_session(
         .map_err(|e| format!("decode ik: {e}"))?;
     let spk = hex::decode(bundle_json["signed_prekey"].as_str().unwrap_or(""))
         .map_err(|e| format!("decode spk: {e}"))?;
-    let spk_sig = hex::decode(bundle_json["signed_prekey_signature"].as_str().unwrap_or(""))
-        .map_err(|e| format!("decode sig: {e}"))?;
+    let spk_sig = hex::decode(
+        bundle_json["signed_prekey_signature"]
+            .as_str()
+            .unwrap_or(""),
+    )
+    .map_err(|e| format!("decode sig: {e}"))?;
     let signing = hex::decode(bundle_json["signing_key"].as_str().unwrap_or(""))
         .map_err(|e| format!("decode signing: {e}"))?;
     let spk_id = bundle_json["signed_prekey_id"].as_u64().unwrap_or(1) as u32;
@@ -518,7 +524,10 @@ fn add_group_member(
     state.runtime.block_on(async {
         let http = reqwest::Client::new();
         let r = http
-            .post(format!("{}/v1/groups/{}/members", server_http_url, group_id))
+            .post(format!(
+                "{}/v1/groups/{}/members",
+                server_http_url, group_id
+            ))
             .header("X-User-ID", &user_id)
             .json(&serde_json::json!({ "user_id": target_user_id }))
             .send()
@@ -573,7 +582,10 @@ fn get_group_members(
     let resp: serde_json::Value = state.runtime.block_on(async {
         let http = reqwest::Client::new();
         let r = http
-            .get(format!("{}/v1/groups/{}/members", server_http_url, group_id))
+            .get(format!(
+                "{}/v1/groups/{}/members",
+                server_http_url, group_id
+            ))
             .header("X-User-ID", &user_id)
             .send()
             .await
@@ -581,10 +593,7 @@ fn get_group_members(
         r.json().await.map_err(|e| format!("parse: {e}"))
     })?;
 
-    let members = resp["members"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
+    let members = resp["members"].as_array().cloned().unwrap_or_default();
 
     // Also persist members locally
     let client = state.client.lock().map_err(|e| e.to_string())?;
@@ -610,7 +619,10 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
-            let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .unwrap_or_else(|_| PathBuf::from("."));
             std::fs::create_dir_all(&data_dir).ok();
 
             app.manage(AppState {

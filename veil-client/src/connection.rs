@@ -71,13 +71,11 @@ impl Connection {
         let url = &config.server_url;
         info!("connecting to {url}");
 
-        let (ws_stream, _) = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            connect_async(url),
-        )
-        .await
-        .map_err(|_| format!("ws connect timed out after 8s: {url}"))?
-        .map_err(|e| format!("ws connect failed: {e}"))?;
+        let (ws_stream, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(8), connect_async(url))
+                .await
+                .map_err(|_| format!("ws connect timed out after 8s: {url}"))?
+                .map_err(|e| format!("ws connect failed: {e}"))?;
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
@@ -157,18 +155,16 @@ impl Connection {
         info!("authenticated as user_id={user_id}");
 
         // Notify app about successful auth
-        let _ = event_tx.send(ConnectionEvent::Authenticated {
-            user_id: user_id.clone(),
-        }).await;
+        let _ = event_tx
+            .send(ConnectionEvent::Authenticated {
+                user_id: user_id.clone(),
+            })
+            .await;
 
         // --- Background write loop ---
         tokio::spawn(async move {
             while let Some(data) = send_rx.recv().await {
-                if ws_write
-                    .send(WsMessage::Binary(data.into()))
-                    .await
-                    .is_err()
-                {
+                if ws_write.send(WsMessage::Binary(data.into())).await.is_err() {
                     break;
                 }
             }
@@ -186,15 +182,19 @@ impl Connection {
                     }
                     Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
                     Some(Ok(WsMessage::Close(_))) | None => {
-                        let _ = evt.send(ConnectionEvent::Disconnected {
-                            reason: "server closed".into(),
-                        }).await;
+                        let _ = evt
+                            .send(ConnectionEvent::Disconnected {
+                                reason: "server closed".into(),
+                            })
+                            .await;
                         break;
                     }
                     Some(Err(e)) => {
-                        let _ = evt.send(ConnectionEvent::Disconnected {
-                            reason: format!("{e}"),
-                        }).await;
+                        let _ = evt
+                            .send(ConnectionEvent::Disconnected {
+                                reason: format!("{e}"),
+                            })
+                            .await;
                         break;
                     }
                     _ => continue,
