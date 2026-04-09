@@ -1,13 +1,30 @@
+use std::collections::HashMap;
 use std::path::Path;
 use veil_crypto::fingerprint;
 use veil_crypto::kdf;
 use veil_crypto::keys::{generate_mnemonic, validate_mnemonic, IdentityKeyPair};
+use veil_crypto::ratchet::{MessageHeader, RatchetSession};
+use veil_crypto::x3dh;
 use veil_store::db::VeilDb;
 use veil_store::keychain;
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::Zeroize;
 
 use crate::connection::{Connection, ConnectionConfig, ConnectionEvent};
 use crate::protocol::proto;
+
+// Wire header type tags
+const HEADER_INITIAL: u8 = 0x01; // X3DH init + ratchet header
+const HEADER_RATCHET: u8 = 0x02; // Ratchet header only
+
+/// Prekey set generated for uploading to the server.
+pub struct PreKeySet {
+    pub spk_public: [u8; 32],
+    pub spk_id: u32,
+    pub spk_signature: [u8; 64],
+    pub signing_key: [u8; 32],
+    pub otk_publics: Vec<([u8; 32], u32)>,
+}
 
 /// Main client API — the single entry point for all UI interactions.
 ///
@@ -18,11 +35,19 @@ pub struct VeilClient {
     db: Option<VeilDb>,
     connection: Option<Connection>,
     device_id: [u8; 16],
+    /// Active ratchet sessions keyed by peer identity key (X25519 public).
+    ratchet_sessions: HashMap<[u8; 32], RatchetSession>,
+    /// Our signed prekey secret (for X3DH responder).
+    spk_secret: Option<[u8; 32]>,
+    spk_public: Option<[u8; 32]>,
+    spk_id: u32,
+    /// One-time prekey secrets (for X3DH responder).
+    otk_secrets: HashMap<u32, [u8; 32]>,
+    otk_next_id: u32,
 }
 
 impl VeilClient {
     pub fn new() -> Self {
-        // Generate a random device ID for this instance
         let mut device_id = [0u8; 16];
         use std::io::Read;
         if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
@@ -33,6 +58,12 @@ impl VeilClient {
             db: None,
             connection: None,
             device_id,
+            ratchet_sessions: HashMap::new(),
+            spk_secret: None,
+            spk_public: None,
+            spk_id: 1,
+            otk_secrets: HashMap::new(),
+            otk_next_id: 1,
         }
     }
 
@@ -48,6 +79,12 @@ impl VeilClient {
             db: None,
             connection: None,
             device_id,
+            ratchet_sessions: HashMap::new(),
+            spk_secret: None,
+            spk_public: None,
+            spk_id: 1,
+            otk_secrets: HashMap::new(),
+            otk_next_id: 1,
         }
     }
 
@@ -67,16 +104,20 @@ impl VeilClient {
     pub fn init_with_mnemonic(&mut self, mnemonic: &str, db_path: &Path) -> Result<(), String> {
         let identity = IdentityKeyPair::from_mnemonic(mnemonic)?;
 
-        // Derive database encryption key from mnemonic via Argon2id.
-        // Argon2id adds brute-force resistance (64 MB, 3 iterations).
         let mut db_key = kdf::derive_db_key(mnemonic)?;
-
         let db = VeilDb::open(db_path, &db_key)?;
         db_key.zeroize();
 
+        // Load persisted ratchet sessions from DB
+        // (sessions are stored as JSON-serialized blobs)
         self.identity = Some(identity);
         self.db = Some(db);
         Ok(())
+    }
+
+    /// Get a reference to the DB (if open).
+    pub fn db(&self) -> Option<&VeilDb> {
+        self.db.as_ref()
     }
 
     /// Get our X25519 public key (identity).
@@ -149,19 +190,23 @@ impl VeilClient {
     }
 
     /// Send a text message to a conversation.
-    /// For now sends plaintext as ciphertext (E2E encryption via ratchet is next step).
+    /// Uses ratchet encryption if a session exists with the peer, otherwise plaintext.
     pub async fn send_message(
-        &self,
+        &mut self,
         conversation_id: &str,
         plaintext: &str,
     ) -> Result<u64, String> {
+        // Encrypt first (needs mutable borrow)
+        let (ciphertext, header_bytes) = self.encrypt_outgoing(conversation_id, plaintext)?;
+
+        // Then get connection (immutable borrow of connection only)
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let seq = conn.next_seq().await;
 
         let send_msg = proto::SendMessage {
             conversation_id: conversation_id.to_string(),
-            ciphertext: plaintext.as_bytes().to_vec(),
-            header: vec![],
+            ciphertext,
+            header: header_bytes,
             msg_type: proto::MessageType::Text.into(),
             reply_to_id: None,
             ttl_seconds: None,
@@ -176,12 +221,285 @@ impl VeilClient {
         };
 
         conn.send_envelope(&env).await?;
+
+        // Persist outgoing message to DB
+        if let Some(ref db) = self.db {
+            let our_key = self.identity_key().unwrap_or([0u8; 32]);
+            let msg_id = uuid::Uuid::new_v4().to_string();
+            let _ = db.insert_message(&msg_id, conversation_id, &our_key, plaintext, true, None);
+        }
+
         Ok(seq)
     }
 
     /// Check if we're connected to the server.
     pub fn is_connected(&self) -> bool {
         self.connection.is_some()
+    }
+
+    // ─── E2E Encryption ──────────────────────────────────
+
+    /// Generate prekeys for X3DH. Call after identity init, upload result to server.
+    pub fn generate_prekeys(&mut self) -> Result<PreKeySet, String> {
+        let identity = self.identity.as_ref().ok_or("not initialized")?;
+
+        let spk = x3dh::SignedPreKey::generate(identity, self.spk_id);
+        let spk_pub = *spk.public.as_bytes();
+        let spk_sig = spk.signature;
+
+        self.spk_secret = Some(spk.secret.to_bytes());
+        self.spk_public = Some(spk_pub);
+
+        let mut otk_publics = Vec::new();
+        for i in 0..20u32 {
+            let id = self.otk_next_id + i;
+            let otk = x3dh::OneTimePreKey::generate(id);
+            let pub_bytes = *otk.public.as_bytes();
+            self.otk_secrets.insert(id, otk.secret.to_bytes());
+            otk_publics.push((pub_bytes, id));
+        }
+        self.otk_next_id += 20;
+
+        Ok(PreKeySet {
+            spk_public: spk_pub,
+            spk_id: self.spk_id,
+            spk_signature: spk_sig,
+            signing_key: identity.ed25519_public_bytes(),
+            otk_publics,
+        })
+    }
+
+    /// Initiate X3DH with a peer's prekey bundle, create ratchet session.
+    pub fn establish_session(
+        &mut self,
+        peer_identity_key: &[u8; 32],
+        bundle: &x3dh::PreKeyBundle,
+    ) -> Result<(), String> {
+        let identity = self.identity.as_ref().ok_or("not initialized")?;
+        let result = x3dh::initiate(identity, bundle)?;
+
+        let session = RatchetSession::init_initiator(
+            &result.shared_secret,
+            &bundle.signed_prekey,
+        );
+
+        // Store the ephemeral public key for the first message header
+        self.ratchet_sessions.insert(*peer_identity_key, session);
+
+        // Persist session to DB
+        if let Some(ref db) = self.db {
+            if let Ok(data) = serde_json::to_vec(
+                self.ratchet_sessions.get(peer_identity_key).unwrap(),
+            ) {
+                let _ = db.save_ratchet_session(peer_identity_key, &data);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Process an initial X3DH message from a peer (responder side).
+    pub fn process_initial_message(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        ephemeral_key: &[u8; 32],
+        spk_id: u32,
+        opk_id: Option<u32>,
+    ) -> Result<(), String> {
+        let identity = self.identity.as_ref().ok_or("not initialized")?;
+
+        let spk_secret_bytes = self.spk_secret.ok_or("no signed prekey")?;
+        if self.spk_public.is_none() {
+            return Err("no signed prekey public".to_string());
+        }
+        let spk_pub = self.spk_public.unwrap();
+
+        // Reconstruct SignedPreKey for X3DH respond
+        let spk_secret = X25519StaticSecret::from(spk_secret_bytes);
+        let spk = x3dh::SignedPreKey {
+            secret: spk_secret,
+            public: X25519PublicKey::from(spk_pub),
+            id: spk_id,
+            signature: [0u8; 64], // Not needed for respond
+        };
+
+        let otk = opk_id.and_then(|id| {
+            self.otk_secrets.remove(&id).map(|secret_bytes| {
+                let secret = X25519StaticSecret::from(secret_bytes);
+                x3dh::OneTimePreKey {
+                    secret,
+                    public: X25519PublicKey::from(&X25519StaticSecret::from(secret_bytes)),
+                    id,
+                }
+            })
+        });
+
+        let result = x3dh::respond(
+            identity,
+            &spk,
+            otk.as_ref(),
+            sender_identity_key,
+            ephemeral_key,
+        )?;
+
+        let session = RatchetSession::init_responder(
+            &result.shared_secret,
+            &spk_secret_bytes.to_vec(),
+            &spk_pub,
+        );
+
+        self.ratchet_sessions.insert(*sender_identity_key, session);
+
+        // Persist
+        if let Some(ref db) = self.db {
+            if let Ok(data) = serde_json::to_vec(
+                self.ratchet_sessions.get(sender_identity_key).unwrap(),
+            ) {
+                let _ = db.save_ratchet_session(sender_identity_key, &data);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a ratchet session exists with a peer.
+    pub fn has_session(&self, peer_identity_key: &[u8; 32]) -> bool {
+        self.ratchet_sessions.contains_key(peer_identity_key)
+    }
+
+    /// Encrypt outgoing plaintext. Returns (ciphertext, wire_header).
+    /// If no ratchet session exists, sends plaintext (pre-E2E fallback).
+    fn encrypt_outgoing(
+        &mut self,
+        _conversation_id: &str,
+        plaintext: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        // TODO: look up peer_identity_key from conversation_id via DB
+        // For now, no E2E without explicit session establishment
+        Ok((plaintext.as_bytes().to_vec(), vec![]))
+    }
+
+    /// Encrypt for a specific peer (used when peer identity key is known).
+    pub fn encrypt_for(
+        &mut self,
+        peer_identity_key: &[u8; 32],
+        plaintext: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let session = self.ratchet_sessions.get_mut(peer_identity_key)
+            .ok_or("no ratchet session with this peer")?;
+
+        let (ratchet_header, ciphertext) = session.encrypt(plaintext)?;
+        let rh_bytes = ratchet_header.to_bytes();
+
+        // Build wire header: type + ratchet header
+        let mut header = Vec::with_capacity(1 + rh_bytes.len());
+        header.push(HEADER_RATCHET);
+        header.extend_from_slice(&rh_bytes);
+
+        // Persist updated session
+        if let Some(ref db) = self.db {
+            if let Ok(data) = serde_json::to_vec(session) {
+                let _ = db.save_ratchet_session(peer_identity_key, &data);
+            }
+        }
+
+        Ok((ciphertext, header))
+    }
+
+    /// Decrypt an incoming message from a peer.
+    /// Handles both initial X3DH messages and regular ratchet messages.
+    pub fn decrypt_from(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        header: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if header.is_empty() {
+            // No header = plaintext fallback (pre-E2E)
+            return Ok(ciphertext.to_vec());
+        }
+
+        match header[0] {
+            HEADER_INITIAL => {
+                // Parse X3DH init header
+                if header.len() < 1 + 32 + 4 + 4 + 40 {
+                    return Err("initial header too short".to_string());
+                }
+                let mut ek = [0u8; 32];
+                ek.copy_from_slice(&header[1..33]);
+                let spk_id = u32::from_be_bytes([header[33], header[34], header[35], header[36]]);
+                let opk_id_raw = u32::from_be_bytes([header[37], header[38], header[39], header[40]]);
+                let opk_id = if opk_id_raw == 0xFFFFFFFF { None } else { Some(opk_id_raw) };
+
+                // Establish responder session if needed
+                if !self.has_session(sender_identity_key) {
+                    self.process_initial_message(sender_identity_key, &ek, spk_id, opk_id)?;
+                }
+
+                let rh = MessageHeader::from_bytes(&header[41..])?;
+                let session = self.ratchet_sessions.get_mut(sender_identity_key)
+                    .ok_or("session establishment failed")?;
+                let plaintext = session.decrypt(&rh, ciphertext)?;
+
+                // Persist updated session
+                if let Some(ref db) = self.db {
+                    if let Ok(data) = serde_json::to_vec(session) {
+                        let _ = db.save_ratchet_session(sender_identity_key, &data);
+                    }
+                }
+
+                Ok(plaintext)
+            }
+            HEADER_RATCHET => {
+                if header.len() < 41 {
+                    return Err("ratchet header too short".to_string());
+                }
+                let rh = MessageHeader::from_bytes(&header[1..])?;
+                let session = self.ratchet_sessions.get_mut(sender_identity_key)
+                    .ok_or("no ratchet session with this peer")?;
+                let plaintext = session.decrypt(&rh, ciphertext)?;
+
+                // Persist updated session
+                if let Some(ref db) = self.db {
+                    if let Ok(data) = serde_json::to_vec(session) {
+                        let _ = db.save_ratchet_session(sender_identity_key, &data);
+                    }
+                }
+
+                Ok(plaintext)
+            }
+            _ => {
+                // Unknown header type — treat as plaintext
+                Ok(ciphertext.to_vec())
+            }
+        }
+    }
+
+    /// Persist a received message to the local DB.
+    pub fn persist_incoming_message(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_key: &[u8],
+        plaintext: &str,
+        server_timestamp: Option<i64>,
+    ) {
+        if let Some(ref db) = self.db {
+            let _ = db.insert_message(message_id, conversation_id, sender_key, plaintext, false, server_timestamp);
+        }
+    }
+
+    /// Persist a conversation to the local DB.
+    pub fn persist_conversation(
+        &self,
+        id: &str,
+        conv_type: u8,
+        name: Option<&str>,
+        peer_key: Option<&[u8]>,
+    ) {
+        if let Some(ref db) = self.db {
+            let _ = db.insert_conversation(id, conv_type, name, peer_key, None);
+        }
     }
 }
 

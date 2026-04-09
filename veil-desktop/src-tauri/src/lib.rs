@@ -1,8 +1,10 @@
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_notification::NotificationExt;
 use veil_client::api::VeilClient;
 use veil_client::connection::ConnectionEvent;
 use veil_store::keychain;
@@ -11,6 +13,7 @@ struct AppState {
     client: Mutex<VeilClient>,
     runtime: tokio::runtime::Runtime,
     last_activity: Mutex<Instant>,
+    db_dir: PathBuf,
 }
 
 const KEYCHAIN_ACCOUNT: &str = "veil-default";
@@ -31,10 +34,10 @@ fn validate_mnemonic_cmd(mnemonic: &str) -> bool {
 
 #[tauri::command]
 fn init_identity(state: State<'_, AppState>, mnemonic: &str) -> Result<String, String> {
-    let kp = veil_crypto::IdentityKeyPair::from_mnemonic(mnemonic)?;
-    let hex_key = hex::encode(kp.x25519_public_bytes());
+    let db_path = state.db_dir.join("veil.db");
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    *client = VeilClient::from_identity(kp);
+    client.init_with_mnemonic(mnemonic, &db_path)?;
+    let hex_key = hex::encode(client.identity_key()?);
     Ok(hex_key)
 }
 
@@ -127,6 +130,175 @@ fn idle_seconds(state: State<'_, AppState>) -> u64 {
         .unwrap_or(0)
 }
 
+// ─── DB Persistence ───────────────────────────────────
+
+/// Re-initialize client from stored seed (called after PIN unlock on restart).
+#[tauri::command]
+fn init_from_seed(state: State<'_, AppState>) -> Result<String, String> {
+    let mnemonic = keychain::get_seed(KEYCHAIN_ACCOUNT)?;
+    let db_path = state.db_dir.join("veil.db");
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    client.init_with_mnemonic(&mnemonic, &db_path)?;
+    let hex_key = hex::encode(client.identity_key()?);
+    Ok(hex_key)
+}
+
+/// Get persisted conversations from the encrypted DB.
+#[tauri::command]
+fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("database not initialized")?;
+    let convs = db.get_conversations()?;
+    Ok(convs
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "type": match c.conv_type {
+                    veil_store::models::ConversationType::DM => "dm",
+                    veil_store::models::ConversationType::Group => "group",
+                    veil_store::models::ConversationType::Channel => "channel",
+                },
+                "name": c.name.unwrap_or_default(),
+                "peerKey": c.peer_identity_key.map(|k| hex::encode(k)),
+                "lastMessageAt": c.last_message_at,
+            })
+        })
+        .collect())
+}
+
+/// Get persisted messages for a conversation.
+#[tauri::command]
+fn get_messages(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    limit: Option<u32>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("database not initialized")?;
+    let msgs = db.get_messages(&conversation_id, limit.unwrap_or(200))?;
+    Ok(msgs
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "id": m.id,
+                "conversationId": m.conversation_id,
+                "senderKey": hex::encode(&m.sender_key),
+                "text": m.plaintext,
+                "isOwn": m.is_outgoing,
+                "timestamp": m.server_timestamp.unwrap_or(0),
+                "createdAt": m.created_at,
+            })
+        })
+        .collect())
+}
+
+/// Generate and upload prekeys for X3DH key exchange.
+#[tauri::command]
+fn upload_prekeys(
+    state: State<'_, AppState>,
+    server_http_url: String,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    let prekey_set = client.generate_prekeys()?;
+    let identity_key = hex::encode(client.identity_key()?);
+
+    // Upload via REST API
+    let otks: Vec<serde_json::Value> = prekey_set
+        .otk_publics
+        .iter()
+        .map(|(key, id)| {
+            serde_json::json!({
+                "key": hex::encode(key),
+                "id": id,
+            })
+        })
+        .collect();
+
+    state.runtime.block_on(async {
+        let http = reqwest::Client::new();
+        http.post(format!("{}/v1/prekeys", server_http_url))
+            .json(&serde_json::json!({
+                "identity_key": identity_key,
+                "signing_key": hex::encode(prekey_set.signing_key),
+                "signed_prekey": hex::encode(prekey_set.spk_public),
+                "signed_prekey_id": prekey_set.spk_id,
+                "signed_prekey_signature": hex::encode(prekey_set.spk_signature),
+                "one_time_prekeys": otks,
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("upload prekeys: {e}"))
+    })?;
+
+    Ok(())
+}
+
+/// Fetch a peer's prekey bundle and establish an encrypted session.
+#[tauri::command]
+fn establish_session(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    peer_identity_key: String,
+) -> Result<(), String> {
+    let bundle_json: serde_json::Value = state.runtime.block_on(async {
+        let http = reqwest::Client::new();
+        let resp = http
+            .get(format!("{}/v1/prekeys/{}", server_http_url, peer_identity_key))
+            .send()
+            .await
+            .map_err(|e| format!("fetch prekeys: {e}"))?;
+        resp.json().await.map_err(|e| format!("parse prekeys: {e}"))
+    })?;
+
+    // Parse bundle from JSON
+    let ik = hex::decode(bundle_json["identity_key"].as_str().unwrap_or(""))
+        .map_err(|e| format!("decode ik: {e}"))?;
+    let spk = hex::decode(bundle_json["signed_prekey"].as_str().unwrap_or(""))
+        .map_err(|e| format!("decode spk: {e}"))?;
+    let spk_sig = hex::decode(bundle_json["signed_prekey_signature"].as_str().unwrap_or(""))
+        .map_err(|e| format!("decode sig: {e}"))?;
+    let signing = hex::decode(bundle_json["signing_key"].as_str().unwrap_or(""))
+        .map_err(|e| format!("decode signing: {e}"))?;
+    let spk_id = bundle_json["signed_prekey_id"].as_u64().unwrap_or(1) as u32;
+
+    let opk = bundle_json["one_time_prekey"]
+        .as_str()
+        .and_then(|s| hex::decode(s).ok())
+        .and_then(|b| if b.len() == 32 { Some(b) } else { None });
+    let opk_id = bundle_json["one_time_prekey_id"].as_u64().map(|v| v as u32);
+
+    if ik.len() != 32 || spk.len() != 32 || spk_sig.len() != 64 || signing.len() != 32 {
+        return Err("invalid prekey bundle field lengths".to_string());
+    }
+
+    let mut ik_arr = [0u8; 32];
+    let mut spk_arr = [0u8; 32];
+    let mut sig_arr = [0u8; 64];
+    let mut sign_arr = [0u8; 32];
+    ik_arr.copy_from_slice(&ik);
+    spk_arr.copy_from_slice(&spk);
+    sig_arr.copy_from_slice(&spk_sig);
+    sign_arr.copy_from_slice(&signing);
+
+    let bundle = veil_crypto::x3dh::PreKeyBundle {
+        identity_key: ik_arr,
+        signing_key: sign_arr,
+        signed_prekey: spk_arr,
+        signed_prekey_signature: sig_arr,
+        signed_prekey_id: spk_id,
+        one_time_prekey: opk.map(|b| {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&b);
+            arr
+        }),
+        one_time_prekey_id: opk_id,
+    };
+
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    client.establish_session(&ik_arr, &bundle)
+}
+
 // ─── Connection ───────────────────────────────────────
 
 #[tauri::command]
@@ -139,18 +311,16 @@ fn connect_to_server(
     let result = state.runtime.block_on(client.connect(&server_url))?;
 
     // Start background event polling loop
-    // We'll poll every 50ms and emit events to the UI
     let app_handle = app.clone();
     std::thread::spawn(move || {
         let state_inner = app_handle.state::<AppState>();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
-            let mut client: std::sync::MutexGuard<'_, VeilClient> = match state_inner.client.lock() {
+            let mut client = match state_inner.client.lock() {
                 Ok(c) => c,
                 Err(_) => break,
             };
             let event = state_inner.runtime.block_on(client.poll_event());
-            drop(client); // Release lock before emitting
 
             if let Some(evt) = event {
                 match evt {
@@ -160,11 +330,38 @@ fn connect_to_server(
                         sender_identity_key,
                         sender_username,
                         ciphertext,
+                        header,
                         server_timestamp,
-                        ..
                     } => {
-                        // For now, treat ciphertext as plaintext (pre-E2E)
-                        let text = String::from_utf8_lossy(&ciphertext).to_string();
+                        // Decrypt: try E2E, fallback to plaintext
+                        let sender_key: [u8; 32] = sender_identity_key
+                            .as_slice()
+                            .try_into()
+                            .unwrap_or([0u8; 32]);
+
+                        let text = match client.decrypt_from(&sender_key, &header, &ciphertext) {
+                            Ok(pt) => String::from_utf8_lossy(&pt).to_string(),
+                            Err(_) => String::from_utf8_lossy(&ciphertext).to_string(),
+                        };
+
+                        // Persist to DB
+                        let ts_ms = (server_timestamp / 1_000_000) as i64;
+                        client.persist_incoming_message(
+                            &message_id,
+                            &conversation_id,
+                            &sender_identity_key,
+                            &text,
+                            Some(ts_ms),
+                        );
+                        client.persist_conversation(
+                            &conversation_id,
+                            0, // DM
+                            Some(&sender_username),
+                            Some(&sender_identity_key),
+                        );
+
+                        drop(client); // Release lock before emitting
+
                         let _ = app_handle.emit(
                             "veil://message",
                             serde_json::json!({
@@ -173,15 +370,24 @@ fn connect_to_server(
                                 "senderKey": hex::encode(&sender_identity_key),
                                 "senderName": sender_username,
                                 "text": text,
-                                "timestamp": server_timestamp / 1_000_000, // ns → ms
+                                "timestamp": server_timestamp / 1_000_000,
                             }),
                         );
+
+                        // Desktop notification
+                        let _ = app_handle
+                            .notification()
+                            .builder()
+                            .title(&sender_username)
+                            .body(&text)
+                            .show();
                     }
                     ConnectionEvent::MessageAcked {
                         message_id,
                         ref_seq,
                         ..
                     } => {
+                        drop(client);
                         let _ = app_handle.emit(
                             "veil://message-ack",
                             serde_json::json!({
@@ -191,6 +397,7 @@ fn connect_to_server(
                         );
                     }
                     ConnectionEvent::Disconnected { reason } => {
+                        drop(client);
                         let _ = app_handle.emit(
                             "veil://disconnected",
                             serde_json::json!({ "reason": reason }),
@@ -198,6 +405,7 @@ fn connect_to_server(
                         break;
                     }
                     ConnectionEvent::Error { code, message } => {
+                        drop(client);
                         let _ = app_handle.emit(
                             "veil://error",
                             serde_json::json!({ "code": code, "message": message }),
@@ -220,7 +428,7 @@ fn send_message(
     conversation_id: String,
     text: String,
 ) -> Result<u64, String> {
-    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
     state
         .runtime
         .block_on(client.send_message(&conversation_id, &text))
@@ -269,17 +477,20 @@ fn is_connected(state: State<'_, AppState>) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-
     tauri::Builder::default()
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_deep_link::init())
-        .manage(AppState {
-            client: Mutex::new(VeilClient::new()),
-            runtime,
-            last_activity: Mutex::new(Instant::now()),
-        })
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            let data_dir = app.path().app_data_dir().unwrap_or_else(|_| PathBuf::from("."));
+            std::fs::create_dir_all(&data_dir).ok();
+
+            app.manage(AppState {
+                client: Mutex::new(VeilClient::new()),
+                runtime: tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
+                last_activity: Mutex::new(Instant::now()),
+                db_dir: data_dir,
+            });
             // System tray with menu
             let show = MenuItem::with_id(app, "show", "Show Veil", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "Quit", true, None::<&str>)?;
@@ -338,6 +549,11 @@ pub fn run() {
             clear_pin,
             touch_activity,
             idle_seconds,
+            init_from_seed,
+            get_conversations,
+            get_messages,
+            upload_prekeys,
+            establish_session,
             connect_to_server,
             send_message,
             create_dm,

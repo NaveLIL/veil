@@ -151,6 +151,15 @@ export const appStore = {
   verifyPin: async (pin: string): Promise<boolean> => {
     const ok = await invoke<boolean>("verify_pin", { pin });
     if (ok) {
+      // Re-initialize client from stored seed (opens encrypted DB)
+      try {
+        const key = await invoke<string>("init_from_seed");
+        setIdentity(key);
+      } catch (e) {
+        console.error("init_from_seed failed:", e);
+      }
+      // Load persisted conversations from DB
+      await appStore.loadConversations();
       setScreen("chat");
       appStore.startAutoLock();
       // Reconnect to server after unlock
@@ -187,6 +196,70 @@ export const appStore = {
   /** Touch activity (called on user interaction). */
   touchActivity: () => {
     invoke("touch_activity").catch(() => {});
+  },
+
+  /** Load persisted conversations from the encrypted DB. */
+  loadConversations: async () => {
+    try {
+      const convs = await invoke<Array<{ id: string; type: string; name: string; peerKey?: string; lastMessageAt?: string }>>("get_conversations");
+      setConversations(convs.map(c => ({
+        id: c.id,
+        type: (c.type === "group" ? "group" : "dm") as "dm" | "group",
+        name: c.name || c.id.slice(0, 8),
+        unreadCount: 0,
+        lastMessageTime: c.lastMessageAt ? new Date(c.lastMessageAt).getTime() : undefined,
+      })));
+    } catch (e) {
+      console.error("loadConversations failed:", e);
+    }
+  },
+
+  /** Load persisted messages for a conversation. */
+  loadMessages: async (conversationId: string) => {
+    try {
+      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; timestamp: number; createdAt: string }>>(
+        "get_messages",
+        { conversationId },
+      );
+      const loaded: Message[] = msgs.map(m => ({
+        id: m.id,
+        conversationId: m.conversationId,
+        senderName: m.isOwn ? "You" : m.senderKey.slice(0, 8),
+        senderKey: m.senderKey,
+        text: m.text,
+        timestamp: m.timestamp || new Date(m.createdAt).getTime(),
+        isOwn: m.isOwn,
+      }));
+      setMessages(prev => {
+        // Merge: keep existing messages that aren't from DB, add DB messages
+        const existingIds = new Set(loaded.map(m => m.id));
+        const kept = prev.filter(m => m.conversationId !== conversationId || !existingIds.has(m.id));
+        return [...loaded, ...kept.filter(m => m.conversationId === conversationId)];
+      });
+    } catch (e) {
+      console.error("loadMessages failed:", e);
+    }
+  },
+
+  /** Upload X3DH prekeys to the server (call after identity init). */
+  uploadPrekeys: async () => {
+    try {
+      await invoke("upload_prekeys", { serverHttpUrl: serverHttpUrl() });
+    } catch (e) {
+      console.error("uploadPrekeys failed:", e);
+    }
+  },
+
+  /** Establish an E2E encrypted session with a peer. */
+  establishSession: async (peerIdentityKey: string) => {
+    try {
+      await invoke("establish_session", {
+        serverHttpUrl: serverHttpUrl(),
+        peerIdentityKey,
+      });
+    } catch (e) {
+      console.error("establishSession failed:", e);
+    }
   },
 
   /** Set up Tauri event listeners for incoming server events. */

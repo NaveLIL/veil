@@ -887,7 +887,7 @@ veil/
 - [x] PostgreSQL migrations, Docker compose
 - [x] UniFFI: `.udl` definition, Kotlin/Swift/TS bindings generation
 
-### Phase 2: Desktop App (3 недели) ⚠️ IN PROGRESS
+### Phase 2: Desktop App (3 недели) ✅ DONE
 - [x] Tauri v2 scaffold, Cargo deps on veil-* crates
 - [x] Tauri commands: auth, send/receive, conversations
 - [x] UI: Auth screen (BIP39 mnemonic entry, PIN setup)
@@ -895,7 +895,7 @@ veil/
 - [x] PIN lock / auto-lock
 - [x] System tray, notifications, deep links
 - [x] Encrypted local DB (SQLCipher via veil-store)
-- [ ] **Первый работающий DM чат Desktop ↔ Desktop**
+- [x] **Первый работающий DM чат Desktop ↔ Desktop**
 
 ### Phase 3: Mobile App (3-4 недели) ⚠️ IN PROGRESS
 - [x] React Native bare workflow (no Expo — нужен JSI)

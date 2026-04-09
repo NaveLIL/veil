@@ -126,6 +126,170 @@ impl VeilDb {
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
+
+    // ─── CRUD: Conversations ──────────────────────────────
+
+    pub fn insert_conversation(
+        &self,
+        id: &str,
+        conv_type: u8,
+        name: Option<&str>,
+        peer_identity_key: Option<&[u8]>,
+        server_id: Option<&str>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO conversations (id, conv_type, name, peer_identity_key, server_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![id, conv_type, name, peer_identity_key, server_id],
+            )
+            .map_err(|e| format!("insert conversation: {e}"))?;
+        Ok(())
+    }
+
+    pub fn get_conversations(&self) -> Result<Vec<crate::models::Conversation>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, conv_type, peer_identity_key, server_id, name, last_message_at, created_at
+                 FROM conversations ORDER BY last_message_at DESC NULLS LAST",
+            )
+            .map_err(|e| format!("prepare: {e}"))?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::models::Conversation {
+                    id: row.get(0)?,
+                    conv_type: match row.get::<_, u8>(1)? {
+                        1 => crate::models::ConversationType::Group,
+                        2 => crate::models::ConversationType::Channel,
+                        _ => crate::models::ConversationType::DM,
+                    },
+                    peer_identity_key: row.get(2)?,
+                    server_id: row.get(3)?,
+                    name: row.get(4)?,
+                    last_message_at: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("query: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect: {e}"))
+    }
+
+    // ─── CRUD: Messages ───────────────────────────────────
+
+    pub fn insert_message(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        sender_key: &[u8],
+        plaintext: &str,
+        is_outgoing: bool,
+        server_timestamp: Option<i64>,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO messages (id, conversation_id, sender_key, plaintext, is_outgoing, status, server_timestamp)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    id,
+                    conversation_id,
+                    sender_key,
+                    plaintext,
+                    is_outgoing as u8,
+                    if is_outgoing { 1u8 } else { 0u8 },
+                    server_timestamp,
+                ],
+            )
+            .map_err(|e| format!("insert message: {e}"))?;
+
+        self.conn
+            .execute(
+                "UPDATE conversations SET last_message_at = datetime('now') WHERE id = ?1",
+                rusqlite::params![conversation_id],
+            )
+            .map_err(|e| format!("update last_message_at: {e}"))?;
+
+        Ok(())
+    }
+
+    pub fn get_messages(
+        &self,
+        conversation_id: &str,
+        limit: u32,
+    ) -> Result<Vec<crate::models::Message>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, conversation_id, sender_key, plaintext, msg_type, reply_to_id,
+                        is_outgoing, status, expires_at, server_timestamp, created_at
+                 FROM messages
+                 WHERE conversation_id = ?1
+                 ORDER BY server_timestamp ASC, created_at ASC
+                 LIMIT ?2",
+            )
+            .map_err(|e| format!("prepare: {e}"))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![conversation_id, limit], |row| {
+                Ok(crate::models::Message {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    sender_key: row.get(2)?,
+                    plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    msg_type: row.get(4)?,
+                    reply_to_id: row.get(5)?,
+                    is_outgoing: row.get::<_, u8>(6)? != 0,
+                    status: match row.get::<_, u8>(7)? {
+                        1 => crate::models::MessageStatus::Sent,
+                        2 => crate::models::MessageStatus::Delivered,
+                        3 => crate::models::MessageStatus::Read,
+                        _ => crate::models::MessageStatus::Sending,
+                    },
+                    expires_at: row.get(8)?,
+                    server_timestamp: row.get(9)?,
+                    created_at: row.get(10)?,
+                })
+            })
+            .map_err(|e| format!("query: {e}"))?;
+
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect: {e}"))
+    }
+
+    // ─── CRUD: Ratchet Sessions ───────────────────────────
+
+    pub fn save_ratchet_session(
+        &self,
+        peer_identity_key: &[u8],
+        session_data: &[u8],
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO ratchet_sessions (peer_identity_key, session_data, updated_at)
+                 VALUES (?1, ?2, datetime('now'))",
+                rusqlite::params![peer_identity_key, session_data],
+            )
+            .map_err(|e| format!("save ratchet session: {e}"))?;
+        Ok(())
+    }
+
+    pub fn load_ratchet_session(
+        &self,
+        peer_identity_key: &[u8],
+    ) -> Result<Option<Vec<u8>>, String> {
+        match self.conn.query_row(
+            "SELECT session_data FROM ratchet_sessions WHERE peer_identity_key = ?1",
+            rusqlite::params![peer_identity_key],
+            |row| row.get(0),
+        ) {
+            Ok(data) => Ok(Some(data)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(format!("load ratchet session: {e}")),
+        }
+    }
 }
 
 #[cfg(test)]
