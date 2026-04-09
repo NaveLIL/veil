@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 
 // ─── Types ───────────────────────────────────────────
 
-export type Screen = "onboarding" | "locked" | "disclaimer" | "chat";
+export type Screen = "onboarding" | "locked" | "disclaimer" | "chat" | "settings";
 
 export interface Conversation {
   id: string;

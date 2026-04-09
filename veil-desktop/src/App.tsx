@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { appStore } from "@/stores/app";
 import { OnboardingScreen } from "@/components/chat/OnboardingScreen";
 import { LockScreen } from "@/components/chat/LockScreen";
+import { SettingsScreen } from "@/components/chat/SettingsScreen";
 
 const appWindow = getCurrentWindow();
 
@@ -199,6 +200,7 @@ const App: Component = () => {
         <Match when={appStore.screen() === "onboarding"}><OnboardingScreen /></Match>
         <Match when={appStore.screen() === "locked"}><LockScreen /></Match>
         <Match when={appStore.screen() === "disclaimer"}><DisclaimerScreen /></Match>
+        <Match when={appStore.screen() === "settings"}><SettingsScreen /></Match>
         <Match when={appStore.screen() === "chat"}>
           <div style={S.body}>
 
@@ -299,6 +301,11 @@ const App: Component = () => {
                     {appStore.connected() ? "Online" : "Offline"}
                   </div>
                 </div>
+                <button
+                  style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", "font-size": "14px" }}
+                  onClick={() => appStore.setScreen("settings")}
+                  title="Settings"
+                >{"\u2699\uFE0F"}</button>
                 <button
                   style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", "font-size": "13px" }}
                   onClick={() => appStore.lock()}
