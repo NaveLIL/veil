@@ -1,0 +1,196 @@
+@import "tailwindcss";
+
+/* ─── Veil Dark Theme ──────────────────────────────── */
+@theme {
+  /* ─── Island Layout ──────────────────────────────── */
+  --color-window: #1E1F22;
+  --color-island: #2B2D31;
+
+  /* ─── Core palette ──────────────────────────────── */
+  --color-background: #0c0c12;
+  --color-foreground: #ededf0;
+  --color-card: #13131c;
+  --color-card-foreground: #ededf0;
+  --color-popover: #161622;
+  --color-popover-foreground: #ededf0;
+  --color-primary: #7c6bf5;
+  --color-primary-foreground: #ffffff;
+  --color-secondary: #1c1c2b;
+  --color-secondary-foreground: #d0d0dd;
+  --color-muted: #16161f;
+  --color-muted-foreground: #7a7a90;
+  --color-accent: #1f1f30;
+  --color-accent-foreground: #ededf0;
+  --color-destructive: #f04848;
+  --color-destructive-foreground: #ffffff;
+  --color-border: #22223a;
+  --color-input: #1a1a2c;
+  --color-ring: #7c6bf5;
+  --color-sidebar: #0a0a12;
+  --color-sidebar-foreground: #b8b8cc;
+  --color-sidebar-border: #1a1a28;
+  --color-sidebar-active: #7c6bf5;
+  --color-online: #34d399;
+  --color-idle: #fbbf24;
+  --color-dnd: #f04848;
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.5rem;
+  --radius-lg: 0.75rem;
+  --radius-xl: 1rem;
+}
+
+/* ─── Gradient used by OnboardingScreen & LockScreen ─ */
+.bg-gradient-chat {
+  background: linear-gradient(145deg, #1E1F22 0%, #15151a 100%);
+}
+
+/* ─── Base Styles ──────────────────────────────────── */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  border-color: var(--color-border);
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  background: var(--color-window);
+  color: var(--color-foreground);
+  overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ─── Scrollbar ────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(120, 120, 160, 0.08);
+  border-radius: 10px;
+  transition: background 0.2s;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 120, 160, 0.25);
+}
+
+/* Show scrollbar on hover for island scroll containers */
+.overflow-y-auto::-webkit-scrollbar-thumb {
+  background: transparent;
+}
+
+.overflow-y-auto:hover::-webkit-scrollbar-thumb {
+  background: rgba(120, 120, 160, 0.12);
+}
+
+.overflow-y-auto:hover::-webkit-scrollbar-thumb:hover {
+  background: rgba(120, 120, 160, 0.3);
+}
+
+/* Fully hide scrollbar (used on ServerRail) */
+.scrollbar-hide {
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* ─── Message selection ────────────────────────────── */
+.message-text {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* ─── Animations ───────────────────────────────────── */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes fadeInScale {
+  from { opacity: 0; transform: translate(-50%, -50%) scale(0.96); }
+  to { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+}
+
+@keyframes slideInRight {
+  from { opacity: 0; transform: translateX(12px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(124, 107, 245, 0.4); }
+  50% { box-shadow: 0 0 12px 4px rgba(124, 107, 245, 0.15); }
+}
+
+@keyframes statusPulse {
+  0%, 100% { transform: scale(1); }
+  50% { transform: scale(1.15); }
+}
+
+/* ─── Hebrew Rain (Onboarding) ─────────────────────── */
+@keyframes hebrewRain {
+  0% { transform: translateY(-40px); opacity: 0; }
+  5% { opacity: 1; }
+  90% { opacity: 1; }
+  100% { transform: translateY(calc(100vh + 40px)); opacity: 0; }
+}
+
+@keyframes glowPulse {
+  0%, 100% { opacity: 0.5; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.05); }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.25s ease-out;
+}
+
+.animate-fadeInScale {
+  animation: fadeInScale 0.2s ease-out;
+}
+
+.animate-slideInRight {
+  animation: slideInRight 0.2s ease-out;
+}
+
+.animate-shimmer {
+  animation: shimmer 2s ease-in-out infinite;
+  background-size: 200% 100%;
+}
+
+.animate-pulseGlow {
+  animation: pulseGlow 2.5s ease-in-out infinite;
+}
+
+/* ─── Glass Effect ─────────────────────────────────── */
+.glass {
+  background: rgba(18, 18, 30, 0.75);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+}
+
+.glass-light {
+  background: rgba(28, 28, 44, 0.6);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegram/nicegram-ios/main/nicegram-ios/nicegram-ios/tauri/capability-schema.json",
+  "identifier": "default",
+  "description": "Default permissions for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:window:default",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-focus",
+    "core:window:allow-is-maximized",
+    "core:window:allow-is-minimized",
+    "core:window:allow-is-fullscreen",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-size",
+    "core:window:allow-set-position",
+    "core:window:allow-center",
+    "core:event:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    "os:default",
+    "deep-link:default"
+  ]
+}
