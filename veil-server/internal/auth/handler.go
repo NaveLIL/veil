@@ -37,9 +37,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 // UploadPreKeysRequest is the JSON body for prekey upload.
 type UploadPreKeysRequest struct {
-	DeviceID      string          `json:"device_id"`       // hex-encoded device ID
-	SignedPreKey  *PreKeyJSON     `json:"signed_prekey"`   // Exactly one signed prekey
-	OneTimeKeys   []PreKeyJSON    `json:"one_time_prekeys"` // Batch of OPKs
+	DeviceID     string       `json:"device_id"`        // hex-encoded device ID
+	SignedPreKey *PreKeyJSON  `json:"signed_prekey"`    // Exactly one signed prekey
+	OneTimeKeys  []PreKeyJSON `json:"one_time_prekeys"` // Batch of OPKs
 }
 
 type PreKeyJSON struct {
@@ -113,8 +113,8 @@ func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
 
 	remaining, _ := h.svc.db.CountUnusedOPKs(r.Context(), device.ID)
 	writeJSON(w, http.StatusOK, map[string]any{
-		"stored":         len(prekeys),
-		"opk_remaining":  remaining,
+		"stored":        len(prekeys),
+		"opk_remaining": remaining,
 	})
 }
 
@@ -272,10 +272,10 @@ func (s *Service) GetPreKeyBundle(ctx context.Context, targetIdentityKey []byte)
 
 	bundle := map[string]any{
 		"identity_key":            base64.StdEncoding.EncodeToString(user.IdentityKey),
-		"signing_key":            base64.StdEncoding.EncodeToString(user.SigningKey),
-		"signed_prekey":          base64.StdEncoding.EncodeToString(spk.PublicKey),
+		"signing_key":             base64.StdEncoding.EncodeToString(user.SigningKey),
+		"signed_prekey":           base64.StdEncoding.EncodeToString(spk.PublicKey),
 		"signed_prekey_signature": base64.StdEncoding.EncodeToString(spk.Signature),
-		"signed_prekey_id":       spk.ID,
+		"signed_prekey_id":        spk.ID,
 	}
 
 	opk, err := s.db.ClaimOneTimePreKey(ctx, device.ID)

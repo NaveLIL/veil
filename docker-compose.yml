@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: veil
       POSTGRES_PASSWORD: veildev
     ports:
-      - "5432:5432"
+      - "5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./veil-server/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
@@ -23,7 +23,7 @@ services:
       context: ./veil-server
       dockerfile: Dockerfile
     ports:
-      - "8080:8080"
+      - "9080:8080"
     environment:
       PORT: "8080"
       DATABASE_URL: "postgres://veil:veildev@postgres:5432/veil?sslmode=disable"

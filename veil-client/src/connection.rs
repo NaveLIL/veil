@@ -1,7 +1,250 @@
-// Connection management — WebSocket + TLS + cert pinning
-// TODO: Implement in next phase
+use std::sync::Arc;
 
+use futures_util::{SinkExt, StreamExt};
+use prost::Message as ProstMessage;
+use tokio::sync::{mpsc, Mutex};
+use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+use tracing::{info, warn};
+
+use veil_crypto::signature;
+use veil_crypto::IdentityKeyPair;
+
+use crate::protocol::proto;
+
+/// Configuration for the WebSocket connection.
 pub struct ConnectionConfig {
     pub server_url: String,
-    pub cert_pins: Vec<String>, // SHA256 hashes of expected TLS certificates
+    pub cert_pins: Vec<String>,
+}
+
+/// Events emitted by the connection to the application layer.
+#[derive(Debug, Clone)]
+pub enum ConnectionEvent {
+    /// Authentication succeeded — user_id from server.
+    Authenticated { user_id: String },
+    /// Authentication failed.
+    AuthFailed { reason: String },
+    /// Incoming message from another user.
+    MessageReceived {
+        message_id: String,
+        conversation_id: String,
+        sender_identity_key: Vec<u8>,
+        sender_username: String,
+        ciphertext: Vec<u8>,
+        header: Vec<u8>,
+        server_timestamp: u64,
+    },
+    /// Server acknowledged our sent message.
+    MessageAcked {
+        message_id: String,
+        server_timestamp: u64,
+        ref_seq: u64,
+    },
+    /// Connection closed.
+    Disconnected { reason: String },
+    /// Server error.
+    Error { code: u32, message: String },
+}
+
+/// Sender half — used to send protobuf envelopes to the server.
+pub type WsSender = mpsc::Sender<Vec<u8>>;
+
+/// Manages a WebSocket connection to the Veil gateway.
+pub struct Connection {
+    /// Send raw protobuf bytes to the WS write loop.
+    pub sender: WsSender,
+    /// Receive application-level events.
+    pub events: mpsc::Receiver<ConnectionEvent>,
+    /// Current sequence number for outgoing messages.
+    seq: Arc<Mutex<u64>>,
+}
+
+impl Connection {
+    /// Connect to the server, perform auth challenge-response, and start
+    /// background read/write loops. Returns immediately after auth completes.
+    pub async fn connect(
+        config: &ConnectionConfig,
+        identity: &IdentityKeyPair,
+        device_id: &[u8; 16],
+        device_name: &str,
+    ) -> Result<Self, String> {
+        let url = &config.server_url;
+        info!("connecting to {url}");
+
+        let (ws_stream, _) = connect_async(url)
+            .await
+            .map_err(|e| format!("ws connect failed: {e}"))?;
+
+        let (mut ws_write, mut ws_read) = ws_stream.split();
+
+        // Channel: app → WS write loop
+        let (send_tx, mut send_rx) = mpsc::channel::<Vec<u8>>(256);
+        // Channel: WS read loop → app
+        let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(256);
+
+        let seq = Arc::new(Mutex::new(1u64));
+
+        // --- Step 1: Wait for AuthChallenge ---
+        let challenge = loop {
+            match ws_read.next().await {
+                Some(Ok(WsMessage::Binary(data))) => {
+                    let env = proto::Envelope::decode(data.as_ref())
+                        .map_err(|e| format!("decode challenge: {e}"))?;
+                    if let Some(proto::envelope::Payload::AuthChallenge(ch)) = env.payload {
+                        break ch.challenge;
+                    }
+                    warn!("expected auth_challenge, got other payload");
+                }
+                Some(Ok(WsMessage::Ping(_))) => continue,
+                Some(Err(e)) => return Err(format!("ws read error during auth: {e}")),
+                None => return Err("connection closed before auth challenge".into()),
+                _ => continue,
+            }
+        };
+
+        info!("received auth challenge ({} bytes)", challenge.len());
+
+        // --- Step 2: Sign challenge and send AuthResponse ---
+        let sig = signature::sign(identity, &challenge);
+        let auth_resp = proto::Envelope {
+            seq: 2,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::AuthResponse(
+                proto::AuthResponse {
+                    identity_key: identity.x25519_public_bytes().to_vec(),
+                    signing_key: identity.ed25519_public_bytes().to_vec(),
+                    signature: sig.to_vec(),
+                    device_id: device_id.to_vec(),
+                    device_name: device_name.to_string(),
+                    client_version: "veil-desktop/0.1.0".to_string(),
+                },
+            )),
+        };
+        let auth_bytes = auth_resp.encode_to_vec();
+        ws_write
+            .send(WsMessage::Binary(auth_bytes.into()))
+            .await
+            .map_err(|e| format!("send auth_response: {e}"))?;
+
+        // --- Step 3: Wait for AuthResult ---
+        let user_id = loop {
+            match ws_read.next().await {
+                Some(Ok(WsMessage::Binary(data))) => {
+                    let env = proto::Envelope::decode(data.as_ref())
+                        .map_err(|e| format!("decode auth_result: {e}"))?;
+                    if let Some(proto::envelope::Payload::AuthResult(r)) = env.payload {
+                        if r.success {
+                            break r.user_id.unwrap_or_default();
+                        } else {
+                            return Err(format!(
+                                "auth failed: {}",
+                                r.error_message.unwrap_or_default()
+                            ));
+                        }
+                    }
+                }
+                Some(Ok(WsMessage::Ping(_))) => continue,
+                Some(Err(e)) => return Err(format!("ws read error during auth: {e}")),
+                None => return Err("connection closed during auth".into()),
+                _ => continue,
+            }
+        };
+
+        info!("authenticated as user_id={user_id}");
+
+        // Notify app about successful auth
+        let _ = event_tx.send(ConnectionEvent::Authenticated {
+            user_id: user_id.clone(),
+        }).await;
+
+        // --- Background write loop ---
+        tokio::spawn(async move {
+            while let Some(data) = send_rx.recv().await {
+                if ws_write
+                    .send(WsMessage::Binary(data.into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+
+        // --- Background read loop ---
+        let evt = event_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match ws_read.next().await {
+                    Some(Ok(WsMessage::Binary(data))) => {
+                        if let Ok(env) = proto::Envelope::decode(data.as_ref()) {
+                            dispatch_event(&evt, env).await;
+                        }
+                    }
+                    Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+                    Some(Ok(WsMessage::Close(_))) | None => {
+                        let _ = evt.send(ConnectionEvent::Disconnected {
+                            reason: "server closed".into(),
+                        }).await;
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        let _ = evt.send(ConnectionEvent::Disconnected {
+                            reason: format!("{e}"),
+                        }).await;
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+        });
+
+        Ok(Self {
+            sender: send_tx,
+            events: event_rx,
+            seq,
+        })
+    }
+
+    /// Get and increment the next sequence number.
+    pub async fn next_seq(&self) -> u64 {
+        let mut s = self.seq.lock().await;
+        let v = *s;
+        *s += 1;
+        v
+    }
+
+    /// Send a protobuf-encoded envelope to the server.
+    pub async fn send_envelope(&self, env: &proto::Envelope) -> Result<(), String> {
+        let data = env.encode_to_vec();
+        self.sender
+            .send(data)
+            .await
+            .map_err(|e| format!("send failed: {e}"))
+    }
+}
+
+/// Dispatch a received Envelope into a typed ConnectionEvent.
+async fn dispatch_event(tx: &mpsc::Sender<ConnectionEvent>, env: proto::Envelope) {
+    let event = match env.payload {
+        Some(proto::envelope::Payload::MessageEvent(me)) => ConnectionEvent::MessageReceived {
+            message_id: me.message_id,
+            conversation_id: me.conversation_id,
+            sender_identity_key: me.sender_identity_key,
+            sender_username: me.sender_username,
+            ciphertext: me.ciphertext.unwrap_or_default(),
+            header: me.header.unwrap_or_default(),
+            server_timestamp: me.server_timestamp,
+        },
+        Some(proto::envelope::Payload::MessageAck(ack)) => ConnectionEvent::MessageAcked {
+            message_id: ack.message_id,
+            server_timestamp: ack.server_timestamp,
+            ref_seq: ack.ref_seq,
+        },
+        Some(proto::envelope::Payload::Error(e)) => ConnectionEvent::Error {
+            code: e.code,
+            message: e.message,
+        },
+        _ => return, // Ignore unhandled types for now
+    };
+    let _ = tx.send(event).await;
 }
