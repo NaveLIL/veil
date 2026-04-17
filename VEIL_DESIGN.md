@@ -891,10 +891,14 @@ veil/
 - [x] Tauri v2 scaffold, Cargo deps on veil-* crates
 - [x] Tauri commands: auth, send/receive, conversations
 - [x] UI: Auth screen (BIP39 mnemonic entry, PIN setup)
-- [x] UI: Conversation list + DM chat (Revolt UI fork or custom React)
-- [x] PIN lock / auto-lock
+- [x] UI: Conversation list + DM chat (custom SolidJS)
+- [x] PIN lock / auto-lock (Argon2id async + spawn_blocking)
 - [x] System tray, notifications, deep links
 - [x] Encrypted local DB (SQLCipher via veil-store)
+- [x] Island layout (4 animated cards: rail, sidebar, chat, members)
+- [x] Standardized ContextMenu component (Kobalte, WAI ARIA)
+- [x] Context menu on messages (copy, delete)
+- [x] Hebrew rain lock screen with stagger animations
 - [x] **Первый работающий DM чат Desktop ↔ Desktop**
 
 ### Phase 3: Mobile App (3-4 недели) ⚠️ IN PROGRESS
@@ -907,13 +911,24 @@ veil/
 - [ ] Background WebSocket (foreground service Android)
 - [ ] **Первый работающий DM: Desktop ↔ Mobile**
 
-### Phase 4: Groups & Servers (3 недели)
-- [ ] `veil-crypto`: Sender Keys for groups
-- [ ] `server/cmd/chat`: group fan-out, sender key distribution
-- [ ] Server/Channel/Role model (PostgreSQL)
-- [ ] Desktop UI: servers, channels, member list, roles
+### Phase 4: Groups & Servers (3 недели) ⚠️ IN PROGRESS
+- [x] `veil-crypto`: Sender Keys for groups (SenderKeyState, distribution, wire format)
+- [x] `veil-store`: group_members + sender_keys_local tables, CRUD
+- [x] `server/cmd/chat`: group REST endpoints, fan-out, sender key distribution WS
+- [x] Tauri commands: create_group, add/remove/get group members
+- [x] Desktop UI: sidebar tabs (All/DMs/Groups), new group dialog, group avatars
+- [x] Desktop UI: group member panel (Island 4) with slide animation
+- [ ] Server/Channel model (channels inside servers)
+- [ ] Role/Permission model (PostgreSQL + UI)
+- [ ] Desktop UI: server rail, channel list, role management
+- [ ] Group encryption key rotation on join/leave
+- [x] Desktop: message replies, edits, delete
+- [x] Desktop: delete animation, message length limit (4000 chars)
+- [x] Desktop: markdown rendering (bold, italic, code, links, spoilers)
+- [x] Desktop: typing indicators, read receipts
+- [x] Desktop: big emoji (1-3 emoji-only messages rendered large)
+- [x] Desktop: reactions (emoji quick-pick in context menu, reaction pills)
 - [ ] Mobile UI: servers, channels (native navigation)
-- [ ] Group encryption, key rotation on join/leave
 
 ### Phase 5: Secure Shares (1-2 недели) ⚠️ IN PROGRESS
 - [ ] `server/cmd/share`: CRUD, TTL, view counter, auto-purge, password rate-limit
