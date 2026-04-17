@@ -10,6 +10,7 @@ import "veil/v1/share.proto";
 import "veil/v1/server.proto";
 import "veil/v1/media.proto";
 import "veil/v1/voice.proto";
+import "veil/v1/friends.proto";
 
 // Envelope — корневое сообщение для всех WebSocket фреймов.
 // Клиент и сервер обмениваются исключительно Envelope.
@@ -46,6 +47,16 @@ message Envelope {
     // Presence
     PresenceUpdate presence_update = 40;
     TypingEvent typing_event = 41;
+
+    // Friends
+    FriendRequest friend_request = 42;
+    FriendRequestEvent friend_request_event = 43;
+    FriendRespond friend_respond = 44;
+    FriendAcceptedEvent friend_accepted_event = 45;
+    FriendRemove friend_remove = 46;
+    FriendRemovedEvent friend_removed_event = 47;
+    FriendListRequest friend_list_request = 48;
+    FriendListResponse friend_list_response = 49;
 
     // Servers & Channels
     ServerEvent server_event = 50;

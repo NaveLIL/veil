@@ -1,0 +1,71 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+
+// ── Friend Requests ──────────────────────────────────
+
+// Client → Server: send a friend request to another user
+message FriendRequest {
+  string target_user_id = 1;      // User ID to send request to
+  optional string message = 2;    // Optional intro message
+}
+
+// Server → Client: incoming friend request notification
+message FriendRequestEvent {
+  string request_id = 1;
+  string from_user_id = 2;
+  string from_username = 3;
+  optional string message = 4;
+  uint64 timestamp = 5;
+}
+
+// Client → Server: accept or reject a friend request
+message FriendRespond {
+  string request_id = 1;
+  bool accept = 2;
+}
+
+// Server → Client: friend request was accepted (both users get this)
+message FriendAcceptedEvent {
+  string user_id = 1;
+  string username = 2;
+}
+
+// Client → Server: remove a friend
+message FriendRemove {
+  string user_id = 1;
+}
+
+// Server → Client: you've been removed as a friend (also sent on remove)
+message FriendRemovedEvent {
+  string user_id = 1;
+}
+
+// Client → Server: request my friend list
+message FriendListRequest {}
+
+// Server → Client: full friend list response
+message FriendListResponse {
+  repeated FriendEntry friends = 1;
+  repeated FriendRequestEntry pending_requests = 2;
+}
+
+message FriendEntry {
+  string user_id = 1;
+  string username = 2;
+  PresenceStatus status = 3;       // Current online status
+  optional uint64 last_seen = 4;   // Timestamp of last presence
+}
+
+message FriendRequestEntry {
+  string request_id = 1;
+  string from_user_id = 2;
+  string from_username = 3;
+  optional string message = 4;
+  uint64 timestamp = 5;
+  bool outgoing = 6;               // true = I sent this, false = sent to me
+}
+
+// Reuse PresenceStatus from presence.proto
+import "veil/v1/presence.proto";
