@@ -5,6 +5,10 @@ import { appStore, type GroupMember } from "@/stores/app";
 import { OnboardingScreen } from "@/components/chat/OnboardingScreen";
 import { LockScreen } from "@/components/chat/LockScreen";
 import { SettingsScreen } from "@/components/chat/SettingsScreen";
+import {
+  ContextMenu, ContextMenuTrigger, ContextMenuContent,
+  ContextMenuItem, ContextMenuSeparator, ContextMenuIcon, ContextMenuShortcut,
+} from "@/components/ui/context-menu";
 
 const appWindow = getCurrentWindow();
 
@@ -584,20 +588,46 @@ const App: Component = () => {
                                   <div style={{ flex: "1", height: "1px", background: "rgba(255,255,255,0.04)" }} />
                                 </div>
                               </Show>
-                              <div style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px" }}>
-                                <Show when={gap()} fallback={<div style={{ width: "36px", "flex-shrink": "0" }} />}>
-                                  <div style={{ ...S.avatar(36), "margin-top": "2px" }}>{msg.senderName.charAt(0).toUpperCase()}</div>
-                                </Show>
-                                <div style={{ flex: "1", "min-width": "0" }}>
-                                  <Show when={gap()}>
-                                    <div style={{ display: "flex", "align-items": "baseline", gap: "8px", "margin-bottom": "3px" }}>
-                                      <span style={{ "font-size": "13px", "font-weight": "600", color: msg.isOwn ? "#7c6bf5" : "#ddd" }}>{msg.senderName}</span>
-                                      <span style={{ "font-size": "10px", color: "#555", "font-family": "monospace" }}>{time()}</span>
+                              <ContextMenu>
+                                <ContextMenuTrigger>
+                                  <div style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px" }}>
+                                    <Show when={gap()} fallback={<div style={{ width: "36px", "flex-shrink": "0" }} />}>
+                                      <div style={{ ...S.avatar(36), "margin-top": "2px" }}>{msg.senderName.charAt(0).toUpperCase()}</div>
+                                    </Show>
+                                    <div style={{ flex: "1", "min-width": "0" }}>
+                                      <Show when={gap()}>
+                                        <div style={{ display: "flex", "align-items": "baseline", gap: "8px", "margin-bottom": "3px" }}>
+                                          <span style={{ "font-size": "13px", "font-weight": "600", color: msg.isOwn ? "#7c6bf5" : "#ddd" }}>{msg.senderName}</span>
+                                          <span style={{ "font-size": "10px", color: "#555", "font-family": "monospace" }}>{time()}</span>
+                                        </div>
+                                      </Show>
+                                      <div style={{ "font-size": "13.5px", color: "#ccc", "line-height": "1.55", "word-break": "break-word", "user-select": "text" }}>{msg.text}</div>
                                     </div>
-                                  </Show>
-                                  <div style={{ "font-size": "13.5px", color: "#ccc", "line-height": "1.55", "word-break": "break-word", "user-select": "text" }}>{msg.text}</div>
-                                </div>
-                              </div>
+                                  </div>
+                                </ContextMenuTrigger>
+                                <ContextMenuContent>
+                                  <ContextMenuItem onSelect={() => navigator.clipboard.writeText(msg.text)}>
+                                    <ContextMenuIcon>
+                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
+                                    </ContextMenuIcon>
+                                    Copy text
+                                    <ContextMenuShortcut>⌘C</ContextMenuShortcut>
+                                  </ContextMenuItem>
+                                  <ContextMenuItem onSelect={() => navigator.clipboard.writeText(msg.id)}>
+                                    <ContextMenuIcon>
+                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" /></svg>
+                                    </ContextMenuIcon>
+                                    Copy message ID
+                                  </ContextMenuItem>
+                                  <ContextMenuSeparator />
+                                  <ContextMenuItem variant="danger" onSelect={() => console.log("delete", msg.id)}>
+                                    <ContextMenuIcon>
+                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" /></svg>
+                                    </ContextMenuIcon>
+                                    Delete message
+                                  </ContextMenuItem>
+                                </ContextMenuContent>
+                              </ContextMenu>
                             </>
                           );
                         }}

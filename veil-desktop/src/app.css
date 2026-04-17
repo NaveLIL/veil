@@ -241,3 +241,189 @@ body {
   -webkit-backdrop-filter: blur(12px);
 }
 
+/* ═══════════════════════════════════════════════════════
+   CONTEXT MENU — Veil standard
+   Used with <ContextMenu> components from ui/context-menu.
+   All colors reference CSS variables from @theme above.
+   ═══════════════════════════════════════════════════════ */
+
+/* ─── Open / Close keyframes ───────────────────────── */
+@keyframes veil-ctx-show {
+  from { opacity: 0; transform: scale(0.92); }
+  to   { opacity: 1; transform: scale(1); }
+}
+@keyframes veil-ctx-hide {
+  from { opacity: 1; transform: scale(1); }
+  to   { opacity: 0; transform: scale(0.92); }
+}
+
+/* ─── Content panel ────────────────────────────────── */
+.veil-ctx-content {
+  min-width: 180px;
+  padding: 5px;
+  background: var(--color-island);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 10px;
+  box-shadow:
+    0 16px 48px rgba(0, 0, 0, 0.45),
+    0 4px 12px rgba(0, 0, 0, 0.25),
+    inset 0 0.5px 0 rgba(255, 255, 255, 0.04);
+  z-index: 200;
+  outline: none;
+  overflow: hidden;
+
+  /* origin-aware animation from Kobalte */
+  transform-origin: var(--kb-menu-content-transform-origin);
+  animation: veil-ctx-hide 150ms ease-in forwards;
+}
+.veil-ctx-content[data-expanded] {
+  animation: veil-ctx-show 200ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+/* ─── Sub-content inherits content styles ──────────── */
+.veil-ctx-sub-content {
+  transform-origin: var(--kb-menu-content-transform-origin);
+}
+
+/* ─── Menu item ────────────────────────────────────── */
+.veil-ctx-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #ccc;
+  cursor: default;
+  outline: none;
+  user-select: none;
+  transition: background 0.1s ease, color 0.1s ease;
+}
+
+.veil-ctx-item[data-highlighted] {
+  background: rgba(255, 255, 255, 0.06);
+  color: #fff;
+}
+
+.veil-ctx-item[data-disabled] {
+  color: #555;
+  pointer-events: none;
+}
+
+/* Danger variant */
+.veil-ctx-item--danger {
+  color: #f87171;
+}
+.veil-ctx-item--danger[data-highlighted] {
+  background: rgba(248, 113, 113, 0.1);
+  color: #ef4444;
+}
+
+/* ─── Icon slot (left) ─────────────────────────────── */
+.veil-ctx-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  color: #888;
+}
+.veil-ctx-item[data-highlighted] .veil-ctx-icon {
+  color: #bbb;
+}
+.veil-ctx-item--danger .veil-ctx-icon {
+  color: #f87171;
+}
+.veil-ctx-item--danger[data-highlighted] .veil-ctx-icon {
+  color: #ef4444;
+}
+
+/* ─── Shortcut slot (right) ────────────────────────── */
+.veil-ctx-shortcut {
+  margin-left: auto;
+  padding-left: 20px;
+  font-size: 11px;
+  font-weight: 400;
+  color: #555;
+  letter-spacing: 0.02em;
+  font-family: system-ui, sans-serif;
+}
+.veil-ctx-item[data-highlighted] .veil-ctx-shortcut {
+  color: #777;
+}
+
+/* ─── Item description ─────────────────────────────── */
+.veil-ctx-item-desc {
+  font-size: 11px;
+  color: #666;
+  margin-top: 1px;
+}
+
+/* ─── Separator ────────────────────────────────────── */
+.veil-ctx-separator {
+  height: 1px;
+  margin: 4px 6px;
+  background: rgba(255, 255, 255, 0.06);
+  border: none;
+}
+
+/* ─── Group label ──────────────────────────────────── */
+.veil-ctx-group-label {
+  padding: 6px 10px 4px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #666;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  user-select: none;
+}
+
+/* ─── Sub-menu trigger chevron ─────────────────────── */
+.veil-ctx-sub-trigger {
+  padding-right: 6px;
+}
+.veil-ctx-chevron {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  color: #555;
+  transition: transform 0.15s ease;
+}
+.veil-ctx-sub-trigger[data-expanded] .veil-ctx-chevron {
+  transform: translateX(1px);
+  color: #888;
+}
+
+/* ─── Checkbox / Radio indicator ───────────────────── */
+.veil-ctx-checkbox-item,
+.veil-ctx-radio-item {
+  padding-left: 6px;
+}
+
+.veil-ctx-indicator {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+}
+
+.veil-ctx-check-icon,
+.veil-ctx-dot-icon {
+  opacity: 0;
+  transform: scale(0.8);
+  transition: opacity 0.12s ease, transform 0.12s ease;
+}
+
+.veil-ctx-indicator[data-checked] .veil-ctx-check-icon,
+.veil-ctx-indicator[data-checked] .veil-ctx-dot-icon {
+  opacity: 1;
+  transform: scale(1);
+  color: var(--color-primary);
+}
+
+
