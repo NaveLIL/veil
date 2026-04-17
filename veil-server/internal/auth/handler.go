@@ -30,6 +30,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/prekeys/{identityKey}", h.GetPreKeyBundle)
 	mux.HandleFunc("GET /v1/prekeys/{identityKey}/count", h.GetOPKCount)
 	mux.HandleFunc("GET /v1/devices/{userID}", h.ListDevices)
+	mux.HandleFunc("GET /v1/users/search", h.SearchUser)
 	mux.HandleFunc("GET /v1/users/{identityKey}", h.LookupUser)
 }
 
@@ -335,4 +336,25 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 
 func errorResp(msg string) map[string]string {
 	return map[string]string{"error": msg}
+}
+
+// SearchUser looks up a user by username query parameter.
+func (h *Handler) SearchUser(w http.ResponseWriter, r *http.Request) {
+	username := r.URL.Query().Get("username")
+	if username == "" {
+		writeJSON(w, http.StatusBadRequest, errorResp("username query parameter required"))
+		return
+	}
+
+	user, err := h.svc.db.FindUserByUsername(r.Context(), username)
+	if err != nil {
+		writeJSON(w, http.StatusNotFound, errorResp("user not found"))
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"user_id":      user.ID,
+		"username":     user.Username,
+		"identity_key": hex.EncodeToString(user.IdentityKey),
+	})
 }

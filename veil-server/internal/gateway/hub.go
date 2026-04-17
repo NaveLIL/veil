@@ -99,6 +99,8 @@ func (h *Hub) Run() {
 						delete(uc, client)
 						if len(uc) == 0 {
 							delete(h.userClients, client.userID)
+							// Last connection for this user — broadcast offline
+							go h.broadcastPresenceOnDisconnect(client.userID, client.identityKey)
 						}
 					}
 				}
@@ -241,6 +243,14 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 			c.handlePresence(ctx, p.PresenceUpdate)
 		case *pb.Envelope_SenderKeyDist:
 			c.handleSenderKeyDist(ctx, env.Seq, p.SenderKeyDist)
+		case *pb.Envelope_FriendRequest:
+			c.handleFriendRequest(ctx, env.Seq, p.FriendRequest)
+		case *pb.Envelope_FriendRespond:
+			c.handleFriendRespond(ctx, env.Seq, p.FriendRespond)
+		case *pb.Envelope_FriendRemove:
+			c.handleFriendRemove(ctx, env.Seq, p.FriendRemove)
+		case *pb.Envelope_FriendListRequest:
+			c.handleFriendListRequest(ctx, env.Seq)
 		default:
 			c.sendError(env.Seq, 501, "unsupported message type")
 		}
@@ -570,20 +580,273 @@ func (c *Client) handleTyping(ctx context.Context, ev *pb.TypingEvent) {
 
 func (c *Client) handlePresence(ctx context.Context, ev *pb.PresenceUpdate) {
 	ev.IdentityKey = c.identityKey
-	// Broadcast to all connected clients (simple approach)
+	// Only broadcast presence to friends
+	friendIDs, err := c.hub.chatSvc.DB().GetFriendIDs(ctx, c.userID)
+	if err != nil {
+		log.Printf("presence: failed to get friends for %s: %v", c.userID, err)
+		return
+	}
 	data, _ := proto.Marshal(&pb.Envelope{
 		Payload: &pb.Envelope_PresenceUpdate{PresenceUpdate: ev},
 	})
-	c.hub.mu.RLock()
-	for client := range c.hub.clients {
-		if client != c && client.authenticated {
-			select {
-			case client.send <- data:
-			default:
-			}
-		}
+	for _, fid := range friendIDs {
+		c.hub.sendToUser(fid, data)
 	}
-	c.hub.mu.RUnlock()
+}
+
+// broadcastPresenceOnDisconnect sends OFFLINE status to all friends when a user's last client disconnects.
+func (h *Hub) broadcastPresenceOnDisconnect(userID string, identityKey []byte) {
+	ctx := context.Background()
+	friendIDs, err := h.chatSvc.DB().GetFriendIDs(ctx, userID)
+	if err != nil || len(friendIDs) == 0 {
+		return
+	}
+	now := uint64(time.Now().UnixNano())
+	data, _ := proto.Marshal(&pb.Envelope{
+		Payload: &pb.Envelope_PresenceUpdate{
+			PresenceUpdate: &pb.PresenceUpdate{
+				IdentityKey: identityKey,
+				Status:      pb.PresenceStatus_PRESENCE_OFFLINE,
+				LastSeen:    &now,
+			},
+		},
+	})
+	for _, fid := range friendIDs {
+		h.sendToUser(fid, data)
+	}
+}
+
+// --- Friends ---
+
+func (c *Client) handleFriendRequest(ctx context.Context, seq uint64, req *pb.FriendRequest) {
+	// Prevent self-friend
+	if req.TargetUserId == c.userID {
+		c.sendError(seq, 400, "cannot send friend request to yourself")
+		return
+	}
+
+	// Check target exists
+	target, err := c.hub.chatSvc.DB().FindUserByID(ctx, req.TargetUserId)
+	if err != nil {
+		c.sendError(seq, 404, "user not found")
+		return
+	}
+
+	// Check not already friends
+	already, err := c.hub.chatSvc.DB().AreFriends(ctx, c.userID, req.TargetUserId)
+	if err != nil {
+		c.sendError(seq, 500, "internal error")
+		return
+	}
+	if already {
+		c.sendError(seq, 409, "already friends")
+		return
+	}
+
+	var msg *string
+	if req.Message != nil {
+		msg = req.Message
+	}
+	reqID, createdAt, err := c.hub.chatSvc.DB().CreateFriendRequest(ctx, c.userID, req.TargetUserId, msg)
+	if err != nil {
+		c.sendError(seq, 400, err.Error())
+		return
+	}
+
+	// ACK to sender
+	c.sendEnvelope(&pb.Envelope{
+		Seq: seq,
+		Payload: &pb.Envelope_MessageAck{
+			MessageAck: &pb.MessageAck{RefSeq: seq},
+		},
+	})
+
+	// Notify target user about the incoming friend request
+	var msgStr string
+	if msg != nil {
+		msgStr = *msg
+	}
+	event := &pb.Envelope{
+		Timestamp: uint64(createdAt.UnixNano()),
+		Payload: &pb.Envelope_FriendRequestEvent{
+			FriendRequestEvent: &pb.FriendRequestEvent{
+				RequestId:    reqID,
+				FromUserId:   c.userID,
+				FromUsername:  c.username,
+				Message:      &msgStr,
+				Timestamp:    uint64(createdAt.UnixNano()),
+			},
+		},
+	}
+	eventData, _ := proto.Marshal(event)
+	c.hub.sendToUser(target.ID, eventData)
+}
+
+func (c *Client) handleFriendRespond(ctx context.Context, seq uint64, resp *pb.FriendRespond) {
+	if resp.Accept {
+		otherUserID, err := c.hub.chatSvc.DB().AcceptFriendRequest(ctx, resp.RequestId, c.userID)
+		if err != nil {
+			c.sendError(seq, 400, err.Error())
+			return
+		}
+
+		// ACK to accepting user
+		c.sendEnvelope(&pb.Envelope{
+			Seq: seq,
+			Payload: &pb.Envelope_MessageAck{
+				MessageAck: &pb.MessageAck{RefSeq: seq},
+			},
+		})
+
+		// Notify both users about new friendship
+		acceptor, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
+		requester, _ := c.hub.chatSvc.LookupUser(ctx, otherUserID)
+
+		// Tell the original requester that their request was accepted
+		if requester != nil {
+			var acceptorName string
+			if acceptor != nil {
+				acceptorName = acceptor.Username
+			}
+			ev := &pb.Envelope{
+				Timestamp: uint64(time.Now().UnixNano()),
+				Payload: &pb.Envelope_FriendAcceptedEvent{
+					FriendAcceptedEvent: &pb.FriendAcceptedEvent{
+						UserId:   c.userID,
+						Username: acceptorName,
+					},
+				},
+			}
+			data, _ := proto.Marshal(ev)
+			c.hub.sendToUser(otherUserID, data)
+		}
+
+		// Tell the acceptor about the new friend (so they can update their list)
+		if requester != nil {
+			ev := &pb.Envelope{
+				Timestamp: uint64(time.Now().UnixNano()),
+				Payload: &pb.Envelope_FriendAcceptedEvent{
+					FriendAcceptedEvent: &pb.FriendAcceptedEvent{
+						UserId:   otherUserID,
+						Username: requester.Username,
+					},
+				},
+			}
+			data, _ := proto.Marshal(ev)
+			c.hub.sendToUser(c.userID, data)
+		}
+	} else {
+		err := c.hub.chatSvc.DB().RejectFriendRequest(ctx, resp.RequestId, c.userID)
+		if err != nil {
+			c.sendError(seq, 400, err.Error())
+			return
+		}
+		c.sendEnvelope(&pb.Envelope{
+			Seq: seq,
+			Payload: &pb.Envelope_MessageAck{
+				MessageAck: &pb.MessageAck{RefSeq: seq},
+			},
+		})
+	}
+}
+
+func (c *Client) handleFriendRemove(ctx context.Context, seq uint64, req *pb.FriendRemove) {
+	err := c.hub.chatSvc.DB().RemoveFriend(ctx, c.userID, req.UserId)
+	if err != nil {
+		c.sendError(seq, 400, err.Error())
+		return
+	}
+
+	// ACK
+	c.sendEnvelope(&pb.Envelope{
+		Seq: seq,
+		Payload: &pb.Envelope_MessageAck{
+			MessageAck: &pb.MessageAck{RefSeq: seq},
+		},
+	})
+
+	// Notify the removed friend
+	ev := &pb.Envelope{
+		Timestamp: uint64(time.Now().UnixNano()),
+		Payload: &pb.Envelope_FriendRemovedEvent{
+			FriendRemovedEvent: &pb.FriendRemovedEvent{
+				UserId: c.userID,
+			},
+		},
+	}
+	data, _ := proto.Marshal(ev)
+	c.hub.sendToUser(req.UserId, data)
+}
+
+func (c *Client) handleFriendListRequest(ctx context.Context, seq uint64) {
+	dbObj := c.hub.chatSvc.DB()
+
+	friends, err := dbObj.GetFriends(ctx, c.userID)
+	if err != nil {
+		c.sendError(seq, 500, "failed to get friends")
+		return
+	}
+
+	pendingReqs, err := dbObj.GetPendingFriendRequests(ctx, c.userID)
+	if err != nil {
+		c.sendError(seq, 500, "failed to get friend requests")
+		return
+	}
+
+	// Build friend entries with presence info
+	var friendEntries []*pb.FriendEntry
+	for _, f := range friends {
+		entry := &pb.FriendEntry{
+			UserId:   f.UserID,
+			Username: f.Username,
+			Status:   pb.PresenceStatus_PRESENCE_OFFLINE, // default
+		}
+		// Check if friend is currently online
+		c.hub.mu.RLock()
+		if clients, ok := c.hub.userClients[f.UserID]; ok && len(clients) > 0 {
+			entry.Status = pb.PresenceStatus_PRESENCE_ONLINE
+		}
+		c.hub.mu.RUnlock()
+		friendEntries = append(friendEntries, entry)
+	}
+
+	// Build pending request entries
+	var requestEntries []*pb.FriendRequestEntry
+	for _, r := range pendingReqs {
+		outgoing := r.FromUserID == c.userID
+		var otherUserID string
+		if outgoing {
+			otherUserID = r.ToUserID
+		} else {
+			otherUserID = r.FromUserID
+		}
+		otherUser, _ := dbObj.FindUserByID(ctx, otherUserID)
+		var otherUsername string
+		if otherUser != nil {
+			otherUsername = otherUser.Username
+		}
+		entry := &pb.FriendRequestEntry{
+			RequestId:    r.ID,
+			FromUserId:   r.FromUserID,
+			FromUsername:  otherUsername,
+			Timestamp:    uint64(r.CreatedAt.UnixNano()),
+			Outgoing:     outgoing,
+		}
+		if r.Message != nil {
+			entry.Message = r.Message
+		}
+		requestEntries = append(requestEntries, entry)
+	}
+
+	c.sendEnvelope(&pb.Envelope{
+		Seq: seq,
+		Payload: &pb.Envelope_FriendListResponse{
+			FriendListResponse: &pb.FriendListResponse{
+				Friends:         friendEntries,
+				PendingRequests: requestEntries,
+			},
+		},
+	})
 }
 
 // --- Helpers ---

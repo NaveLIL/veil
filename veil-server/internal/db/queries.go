@@ -585,3 +585,207 @@ func (db *DB) GetReactionsForMessages(ctx context.Context, messageIDs []string) 
 	}
 	return out, rows.Err()
 }
+
+// --- Friends ---
+
+type FriendRequest struct {
+	ID         string
+	FromUserID string
+	ToUserID   string
+	Message    *string
+	Status     int16 // 0=pending, 1=accepted, 2=rejected
+	CreatedAt  time.Time
+}
+
+type Friendship struct {
+	UserID    string
+	Username  string
+	CreatedAt time.Time
+}
+
+// CreateFriendRequest sends a new friend request. Returns the request ID.
+func (db *DB) CreateFriendRequest(ctx context.Context, fromUserID, toUserID string, message *string) (string, time.Time, error) {
+	var id string
+	var createdAt time.Time
+	err := db.Pool.QueryRow(ctx,
+		`INSERT INTO friend_requests (from_user_id, to_user_id, message)
+		 VALUES ($1, $2, $3)
+		 ON CONFLICT (from_user_id, to_user_id) DO UPDATE SET status = 0, message = $3, created_at = now()
+		 RETURNING id, created_at`,
+		fromUserID, toUserID, message,
+	).Scan(&id, &createdAt)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("create friend request: %w", err)
+	}
+	return id, createdAt, nil
+}
+
+// GetPendingFriendRequests returns all pending requests for a user (both incoming and outgoing).
+func (db *DB) GetPendingFriendRequests(ctx context.Context, userID string) ([]FriendRequest, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT id, from_user_id, to_user_id, message, status, created_at
+		 FROM friend_requests
+		 WHERE (to_user_id = $1 OR from_user_id = $1) AND status = 0
+		 ORDER BY created_at DESC`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []FriendRequest
+	for rows.Next() {
+		var r FriendRequest
+		if err := rows.Scan(&r.ID, &r.FromUserID, &r.ToUserID, &r.Message, &r.Status, &r.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// AcceptFriendRequest marks request as accepted and creates a friendship. Returns the other user's ID.
+func (db *DB) AcceptFriendRequest(ctx context.Context, requestID, acceptingUserID string) (string, error) {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var fromUserID, toUserID string
+	err = tx.QueryRow(ctx,
+		`UPDATE friend_requests SET status = 1
+		 WHERE id = $1 AND to_user_id = $2 AND status = 0
+		 RETURNING from_user_id, to_user_id`, requestID, acceptingUserID,
+	).Scan(&fromUserID, &toUserID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", fmt.Errorf("friend request not found or already handled")
+		}
+		return "", err
+	}
+
+	// Insert friendship with canonical ordering (user_id_1 < user_id_2)
+	uid1, uid2 := fromUserID, toUserID
+	if uid1 > uid2 {
+		uid1, uid2 = uid2, uid1
+	}
+	_, err = tx.Exec(ctx,
+		`INSERT INTO friendships (user_id_1, user_id_2) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+		uid1, uid2,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return "", err
+	}
+	return fromUserID, nil
+}
+
+// RejectFriendRequest marks request as rejected.
+func (db *DB) RejectFriendRequest(ctx context.Context, requestID, rejectingUserID string) error {
+	tag, err := db.Pool.Exec(ctx,
+		`UPDATE friend_requests SET status = 2
+		 WHERE id = $1 AND to_user_id = $2 AND status = 0`, requestID, rejectingUserID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("friend request not found or already handled")
+	}
+	return nil
+}
+
+// RemoveFriend deletes a friendship between two users.
+func (db *DB) RemoveFriend(ctx context.Context, userID1, userID2 string) error {
+	uid1, uid2 := userID1, userID2
+	if uid1 > uid2 {
+		uid1, uid2 = uid2, uid1
+	}
+	_, err := db.Pool.Exec(ctx,
+		`DELETE FROM friendships WHERE user_id_1 = $1 AND user_id_2 = $2`,
+		uid1, uid2,
+	)
+	return err
+}
+
+// GetFriends returns all friends for a user.
+func (db *DB) GetFriends(ctx context.Context, userID string) ([]Friendship, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT u.id, u.username, f.created_at
+		 FROM friendships f
+		 JOIN users u ON u.id = CASE
+		     WHEN f.user_id_1 = $1 THEN f.user_id_2
+		     ELSE f.user_id_1
+		 END
+		 WHERE f.user_id_1 = $1 OR f.user_id_2 = $1
+		 ORDER BY u.username`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Friendship
+	for rows.Next() {
+		var f Friendship
+		if err := rows.Scan(&f.UserID, &f.Username, &f.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// GetFriendIDs returns just friend user IDs for a user (for presence filtering).
+func (db *DB) GetFriendIDs(ctx context.Context, userID string) ([]string, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT CASE WHEN user_id_1 = $1 THEN user_id_2 ELSE user_id_1 END
+		 FROM friendships
+		 WHERE user_id_1 = $1 OR user_id_2 = $1`,
+		userID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// AreFriends checks if two users are friends.
+func (db *DB) AreFriends(ctx context.Context, userID1, userID2 string) (bool, error) {
+	uid1, uid2 := userID1, userID2
+	if uid1 > uid2 {
+		uid1, uid2 = uid2, uid1
+	}
+	var exists bool
+	err := db.Pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM friendships WHERE user_id_1 = $1 AND user_id_2 = $2)`,
+		uid1, uid2,
+	).Scan(&exists)
+	return exists, err
+}
+
+// FindUserByUsername looks up a user by username.
+func (db *DB) FindUserByUsername(ctx context.Context, username string) (*User, error) {
+	var u User
+	err := db.Pool.QueryRow(ctx,
+		`SELECT id, identity_key, signing_key, username, created_at
+		 FROM users WHERE username = $1`, username,
+	).Scan(&u.ID, &u.IdentityKey, &u.SigningKey, &u.Username, &u.CreatedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &u, nil
+}
