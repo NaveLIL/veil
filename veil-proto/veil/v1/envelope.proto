@@ -35,6 +35,8 @@ message Envelope {
     EditMessage edit_message = 24;
     DeleteMessage delete_message = 25;
     MessageEvent message_event = 26;
+    ReactionUpdate reaction_update = 27;
+    ReactionEvent reaction_event = 28;
 
     // Crypto key exchange
     PreKeyBundle prekey_bundle = 30;

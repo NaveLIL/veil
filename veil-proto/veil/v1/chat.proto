@@ -99,6 +99,24 @@ message MessageEvent {
   optional uint64 edit_timestamp = 14;
 }
 
+// Клиент → сервер: добавить/убрать реакцию
+message ReactionUpdate {
+  string message_id = 1;
+  string conversation_id = 2;
+  string emoji = 3;        // Unicode emoji (e.g. "👍")
+  bool add = 4;            // true = add, false = remove
+}
+
+// Сервер → клиент: реакция обновлена
+message ReactionEvent {
+  string message_id = 1;
+  string conversation_id = 2;
+  string emoji = 3;
+  string user_id = 4;
+  string username = 5;
+  bool add = 6;
+}
+
 // ===================== Crypto Key Exchange =====================
 
 // Prekey bundle for X3DH session establishment
