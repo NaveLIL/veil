@@ -39,6 +39,7 @@ export interface Message {
   text: string;
   timestamp: number;
   isOwn: boolean;
+  replyToId?: string;
 }
 
 // ─── Global App State ────────────────────────────────
@@ -54,6 +55,13 @@ const [connected, setConnected] = createSignal(false);
 const [serverUrl, setServerUrl] = createSignal("ws://5.144.181.72:9080/ws");
 const [serverHttpUrl, setServerHttpUrl] = createSignal("http://5.144.181.72:9080");
 const [servers, setServers] = createSignal<Server[]>([]);
+// Typing indicators: conversationId → Set of identityKeys currently typing
+const [typingUsers, setTypingUsers] = createSignal<Record<string, Set<string>>>({});
+let typingTimers: Record<string, ReturnType<typeof setTimeout>> = {};
+let lastTypingSent = 0;
+// Reactions: messageId → { emoji → { userId, username }[] }
+export type ReactionMap = Record<string, { userId: string; username: string }[]>;
+const [reactions, setReactions] = createSignal<Record<string, ReactionMap>>({});
 
 const AUTO_LOCK_SECONDS = 300; // 5 minutes
 let autoLockTimer: ReturnType<typeof setInterval> | null = null;
@@ -80,6 +88,8 @@ export const appStore = {
   setServerHttpUrl,
   servers,
   setServers,
+  typingUsers,
+  reactions,
 
   activeConversation: () => {
     const id = activeConversationId();
@@ -116,13 +126,92 @@ export const appStore = {
   },
 
   /** Send a text message to the active conversation. */
-  sendMessage: async (text: string) => {
+  sendMessage: async (text: string, replyToId?: string) => {
     const convId = activeConversationId();
     if (!convId) return;
     try {
-      await invoke("send_message", { conversationId: convId, text });
+      await invoke("send_message", { conversationId: convId, text, replyToId: replyToId ?? null });
     } catch (e) {
       console.error("send failed:", e);
+    }
+  },
+
+  editMessage: async (messageId: string, newText: string) => {
+    const convId = activeConversationId();
+    if (!convId) return;
+    try {
+      await invoke("edit_message", { messageId, conversationId: convId, newText });
+      setMessages((prev) =>
+        prev.map((m) => (m.id === messageId ? { ...m, text: newText } : m))
+      );
+    } catch (e) {
+      console.error("edit failed:", e);
+    }
+  },
+
+  deleteMessage: async (messageId: string) => {
+    const convId = activeConversationId();
+    if (!convId) return;
+    try {
+      await invoke("delete_message", { messageId, conversationId: convId });
+      setMessages((prev) => prev.filter((m) => m.id !== messageId));
+    } catch (e) {
+      console.error("delete failed:", e);
+    }
+  },
+
+  /** Notify peers that we are typing (debounced — at most once per 3s). */
+  sendTyping: () => {
+    const convId = activeConversationId();
+    if (!convId) return;
+    const now = Date.now();
+    if (now - lastTypingSent < 3000) return;
+    lastTypingSent = now;
+    invoke("send_typing", { conversationId: convId, started: true }).catch(() => {});
+  },
+
+  /** Get display names of users currently typing in a conversation. */
+  getTypingNames: (conversationId: string, allMessages: Message[]): string[] => {
+    const set = typingUsers()[conversationId];
+    if (!set || set.size === 0) return [];
+    const names: string[] = [];
+    for (const key of set) {
+      const msg = allMessages.find((m) => m.senderKey === key && !m.isOwn);
+      names.push(msg?.senderName ?? key.slice(0, 8));
+    }
+    return names;
+  },
+
+  /** Toggle a reaction on a message. */
+  toggleReaction: async (messageId: string, emoji: string) => {
+    const convId = activeConversationId();
+    const uid = userId();
+    if (!convId || !uid) return;
+
+    // Check if we already reacted with this emoji
+    const msgReactions = reactions()[messageId] ?? {};
+    const emojiList = msgReactions[emoji] ?? [];
+    const alreadyReacted = emojiList.some((r) => r.userId === uid);
+    const add = !alreadyReacted;
+
+    // Optimistic update
+    setReactions((prev) => {
+      const copy = { ...prev };
+      const msgR = { ...(copy[messageId] ?? {}) };
+      if (add) {
+        msgR[emoji] = [...(msgR[emoji] ?? []), { userId: uid, username: "You" }];
+      } else {
+        msgR[emoji] = (msgR[emoji] ?? []).filter((r) => r.userId !== uid);
+        if (msgR[emoji].length === 0) delete msgR[emoji];
+      }
+      copy[messageId] = msgR;
+      return copy;
+    });
+
+    try {
+      await invoke("toggle_reaction", { messageId, conversationId: convId, emoji, userId: uid, add });
+    } catch (e) {
+      console.error("reaction failed:", e);
     }
   },
 
@@ -236,7 +325,7 @@ export const appStore = {
   /** Load persisted messages for a conversation. */
   loadMessages: async (conversationId: string) => {
     try {
-      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; timestamp: number; createdAt: string }>>(
+      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; timestamp: number; createdAt: string; replyToId?: string }>>(
         "get_messages",
         { conversationId },
       );
@@ -248,6 +337,7 @@ export const appStore = {
         text: m.text,
         timestamp: m.timestamp || new Date(m.createdAt).getTime(),
         isOwn: m.isOwn,
+        replyToId: m.replyToId ?? undefined,
       }));
       setMessages(prev => {
         // Merge: keep existing messages that aren't from DB, add DB messages
@@ -380,7 +470,7 @@ export const appStore = {
 
   /** Set up Tauri event listeners for incoming server events. */
   setupEventListeners: async () => {
-    await listen<{ messageId: string; conversationId: string; senderKey: string; senderName: string; text: string; timestamp: number }>(
+    await listen<{ messageId: string; conversationId: string; senderKey: string; senderName: string; text: string; timestamp: number; replyToId?: string }>(
       "veil://message",
       (event) => {
         const d = event.payload;
@@ -393,6 +483,7 @@ export const appStore = {
           text: d.text,
           timestamp: d.timestamp,
           isOwn,
+          replyToId: d.replyToId ?? undefined,
         });
 
         // Auto-create conversation if not present
@@ -417,9 +508,84 @@ export const appStore = {
       setConnected(false);
     });
 
+    await listen<{ messageId: string; conversationId: string; newText: string; editTimestamp: number }>(
+      "veil://message-edited",
+      (event) => {
+        const d = event.payload;
+        setMessages((prev) =>
+          prev.map((m) => (m.id === d.messageId ? { ...m, text: d.newText } : m))
+        );
+      },
+    );
+
+    await listen<{ messageId: string; conversationId: string }>(
+      "veil://message-deleted",
+      (event) => {
+        const d = event.payload;
+        setMessages((prev) => prev.filter((m) => m.id !== d.messageId));
+      },
+    );
+
+    await listen<{ conversationId: string; identityKey: string; started: boolean }>(
+      "veil://typing",
+      (event) => {
+        const { conversationId, identityKey, started } = event.payload;
+        setTypingUsers((prev) => {
+          const copy = { ...prev };
+          const set = new Set(copy[conversationId] ?? []);
+          if (started) {
+            set.add(identityKey);
+          } else {
+            set.delete(identityKey);
+          }
+          copy[conversationId] = set;
+          return copy;
+        });
+        // Auto-clear after 5s (in case stop event is lost)
+        const timerKey = `${conversationId}:${identityKey}`;
+        if (typingTimers[timerKey]) clearTimeout(typingTimers[timerKey]);
+        if (started) {
+          typingTimers[timerKey] = setTimeout(() => {
+            setTypingUsers((prev) => {
+              const copy = { ...prev };
+              const set = new Set(copy[conversationId] ?? []);
+              set.delete(identityKey);
+              copy[conversationId] = set;
+              return copy;
+            });
+            delete typingTimers[timerKey];
+          }, 5000);
+        } else {
+          delete typingTimers[timerKey];
+        }
+      },
+    );
+
     await listen<{ code: number; message: string }>("veil://error", (event) => {
       console.error("server error:", event.payload);
     });
+
+    await listen<{ messageId: string; conversationId: string; emoji: string; userId: string; username: string; add: boolean }>(
+      "veil://reaction",
+      (event) => {
+        const { messageId, emoji, userId: uid, username, add } = event.payload;
+        setReactions((prev) => {
+          const copy = { ...prev };
+          const msgR = { ...(copy[messageId] ?? {}) };
+          if (add) {
+            const existing = msgR[emoji] ?? [];
+            if (!existing.some((r) => r.userId === uid)) {
+              msgR[emoji] = [...existing, { userId: uid, username }];
+            }
+          } else {
+            msgR[emoji] = (msgR[emoji] ?? []).filter((r) => r.userId !== uid);
+            if (msgR[emoji].length === 0) delete msgR[emoji];
+          }
+          copy[messageId] = msgR;
+          return copy;
+        });
+      },
+    );
 
     // Deep links: veil://add/{userId} or veil://share/{id}
     await listen<string[]>("deep-link://new-url", (event) => {

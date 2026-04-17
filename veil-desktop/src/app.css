@@ -116,6 +116,103 @@ body {
   user-select: text;
 }
 
+/* ─── Markdown Renderer ────────────────────────────── */
+.md-message {
+  white-space: pre-wrap;
+}
+
+.md-code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 0.85em;
+  background: rgba(0, 0, 0, 0.3);
+  color: #e8b4f8;
+  padding: 1.5px 5px;
+  border-radius: 4px;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.md-codeblock {
+  position: relative;
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  background: #1a1a24;
+  color: #c8d0e0;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 6px 0;
+  overflow-x: auto;
+  white-space: pre;
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+.md-codeblock code {
+  font-family: inherit;
+  font-size: inherit;
+  background: none;
+  padding: 0;
+  color: inherit;
+}
+
+.md-codeblock-lang {
+  position: absolute;
+  top: 6px;
+  right: 10px;
+  font-size: 10px;
+  font-weight: 600;
+  color: #555;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  pointer-events: none;
+}
+
+.md-link {
+  color: #7c9bf5;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(124, 155, 245, 0.3);
+  transition: color 0.15s, border-color 0.15s;
+  cursor: pointer;
+}
+
+.md-link:hover {
+  color: #9db5ff;
+  border-bottom-color: rgba(157, 181, 255, 0.5);
+}
+
+.md-quote {
+  border-left: 3px solid #7c6bf5;
+  padding: 4px 12px;
+  margin: 4px 0;
+  background: rgba(124, 107, 245, 0.05);
+  border-radius: 0 6px 6px 0;
+  color: #aaa;
+}
+
+.md-spoiler {
+  background: #3a3a4a;
+  color: transparent;
+  border-radius: 4px;
+  padding: 0 4px;
+  cursor: pointer;
+  transition: background 0.25s, color 0.25s;
+}
+
+.md-spoiler:hover {
+  background: #444460;
+}
+
+.md-spoiler-revealed {
+  background: rgba(124, 107, 245, 0.1);
+  color: inherit;
+}
+
+.md-spoiler-revealed:hover {
+  background: rgba(124, 107, 245, 0.15);
+}
+
 /* ─── Animations ───────────────────────────────────── */
 @keyframes fadeIn {
   from { opacity: 0; transform: translateY(6px); }
@@ -145,6 +242,16 @@ body {
 @keyframes statusPulse {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.15); }
+}
+
+@keyframes typingBounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.4; }
+  30% { transform: translateY(-4px); opacity: 1; }
+}
+
+@keyframes emojiPickerIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.96); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
 }
 
 /* ─── Hebrew Rain (Onboarding) ─────────────────────── */

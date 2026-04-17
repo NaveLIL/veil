@@ -59,7 +59,10 @@ export const ContextMenuContent: Component<ContentProps> = (props) => {
   const [local] = splitProps(props, ["class", "children"]);
   return (
     <KContextMenu.Portal>
-      <KContextMenu.Content class={cn("veil-ctx-content", local.class)}>
+      <KContextMenu.Content
+        class={cn("veil-ctx-content", local.class)}
+        onContextMenu={(e: MouseEvent) => e.preventDefault()}
+      >
         {local.children}
       </KContextMenu.Content>
     </KContextMenu.Portal>

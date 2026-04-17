@@ -1,14 +1,21 @@
 import { Component, Show, Switch, Match, For, createSignal, createEffect, onMount, onCleanup, untrack } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { appStore, type GroupMember } from "@/stores/app";
+import { appStore, type GroupMember, type Message } from "@/stores/app";
 import { OnboardingScreen } from "@/components/chat/OnboardingScreen";
 import { LockScreen } from "@/components/chat/LockScreen";
 import { SettingsScreen } from "@/components/chat/SettingsScreen";
+
+/** Detect emoji-only messages (1-3 emoji, no other text). */
+const EMOJI_ONLY_RE = /^(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}(?:\u{FE0F})?(?:\u{200D}\p{Extended_Pictographic}(?:\u{FE0F})?)*){1,3}$/u;
+const isEmojiOnly = (text: string) => EMOJI_ONLY_RE.test(text.trim());
+
 import {
   ContextMenu, ContextMenuTrigger, ContextMenuContent,
   ContextMenuItem, ContextMenuSeparator, ContextMenuIcon, ContextMenuShortcut,
 } from "@/components/ui/context-menu";
+import { EmojiPicker } from "@/components/ui/emoji-picker";
+import { MessageRenderer } from "@/components/chat/MessageRenderer";
 
 const appWindow = getCurrentWindow();
 
@@ -146,12 +153,18 @@ const App: Component = () => {
   const [sidebarTab, setSidebarTab] = createSignal<"all" | "dm" | "group">("all");
   const [memberPanelOpen, setMemberPanelOpen] = createSignal(false);
   const [groupMembers, setGroupMembers] = createSignal<GroupMember[]>([]);
+  const [replyingTo, setReplyingTo] = createSignal<Message | null>(null);
+  const [editingMessage, setEditingMessage] = createSignal<Message | null>(null);
+  const [editText, setEditText] = createSignal("");
+  const [deletingIds, setDeletingIds] = createSignal<Set<string>>(new Set());
+  const MAX_MSG_LEN = 4000;
   // Staggered island entrance
   const [island1Vis, setIsland1Vis] = createSignal(false);
   const [island2Vis, setIsland2Vis] = createSignal(false);
   const [island3Vis, setIsland3Vis] = createSignal(false);
   const [island4Vis, setIsland4Vis] = createSignal(false);
   let messagesEnd: HTMLDivElement | undefined;
+  let inputRef: HTMLTextAreaElement | undefined;
 
   const conv = () => appStore.activeConversation();
   const msgs = () => appStore.messages().filter((m) => m.conversationId === conv()?.id);
@@ -174,6 +187,8 @@ const App: Component = () => {
     const id = appStore.activeConversationId();
     if (id) appStore.loadMessages(id);
     setMemberPanelOpen(false);
+    setReplyingTo(null);
+    setEditingMessage(null);
   });
 
   // Trigger staggered entrance when chat screen appears
@@ -202,16 +217,45 @@ const App: Component = () => {
 
   const handleSend = () => {
     const text = inputText().trim();
-    if (!text || !conv()) return;
+    if (!text || !conv() || text.length > MAX_MSG_LEN) return;
+    const reply = replyingTo();
     appStore.addMessage({
       id: crypto.randomUUID(),
       conversationId: conv()!.id,
       senderName: "You",
       senderKey: appStore.identity() ?? "",
       text, timestamp: Date.now(), isOwn: true,
+      replyToId: reply?.id,
     });
     setInputText("");
-    appStore.sendMessage(text);
+    setReplyingTo(null);
+    if (inputRef) inputRef.style.height = "21px";
+    appStore.sendMessage(text, reply?.id);
+  };
+
+  const startEdit = (msg: Message) => {
+    setEditingMessage(msg);
+    setEditText(msg.text);
+    setReplyingTo(null);
+  };
+
+  const handleEditSave = () => {
+    const msg = editingMessage();
+    const newText = editText().trim();
+    if (!msg || !newText || newText === msg.text) {
+      setEditingMessage(null);
+      return;
+    }
+    appStore.editMessage(msg.id, newText);
+    setEditingMessage(null);
+  };
+
+  const handleDelete = (msg: Message) => {
+    setDeletingIds((prev) => { const s = new Set(prev); s.add(msg.id); return s; });
+    setTimeout(() => {
+      appStore.deleteMessage(msg.id);
+      setDeletingIds((prev) => { const s = new Set(prev); s.delete(msg.id); return s; });
+    }, 350);
   };
 
   const handleNewDm = async () => {
@@ -229,6 +273,9 @@ const App: Component = () => {
   };
 
   onMount(async () => {
+    // Suppress native WebKitGTK context menu globally — Kobalte handles its own
+    document.addEventListener("contextmenu", (e) => e.preventDefault(), { capture: true });
+
     try {
       const seed = await invoke<string | null>("get_stored_seed");
       if (seed) {
@@ -267,8 +314,8 @@ const App: Component = () => {
     chatHeader: { height: "56px", padding: "0 24px", display: "flex", "align-items": "center", gap: "12px", "border-bottom": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" },
     msgArea: { flex: "1", "overflow-y": "auto" as const, padding: "20px 24px", "min-height": "0" },
     inputWrap: { padding: "10px 20px 20px", "flex-shrink": "0" },
-    inputBar: { display: "flex", "align-items": "center", gap: "10px", background: "#383A40", "border-radius": "12px", padding: "12px 16px" },
-    inputField: { flex: "1", background: "transparent", border: "none", color: "#ddd", "font-size": "13px", outline: "none" },
+    inputBar: { display: "flex", "align-items": "flex-end", gap: "10px", background: "#383A40", "border-radius": "12px", padding: "12px 16px" },
+    inputField: { flex: "1", background: "transparent", border: "none", color: "#ddd", "font-size": "13px", outline: "none", resize: "none" as const, "font-family": "inherit", "line-height": "1.45", "max-height": "150px", "overflow-y": "auto" as const, height: "21px" },
     sendBtn: (hasText: boolean) => ({ width: "32px", height: "32px", "border-radius": "8px", border: "none", background: hasText ? "#7c6bf5" : "transparent", color: hasText ? "#fff" : "#555", cursor: hasText ? "pointer" : "default", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "14px", transition: "background 0.2s" }),
     dot: (color: string) => ({ width: "14px", height: "14px", "border-radius": "50%", background: color, border: "none", cursor: "pointer" }),
   };
@@ -579,8 +626,14 @@ const App: Component = () => {
                             return d.toLocaleDateString([], { month: "short", day: "numeric", year: d.getFullYear() !== today.getFullYear() ? "numeric" : undefined });
                           };
 
+                          const isDeleting = () => deletingIds().has(msg.id);
+
                           return (
-                            <>
+                            <div style={{
+                              opacity: isDeleting() ? "0" : "1",
+                              transform: isDeleting() ? "scale(0.96) translateX(-30px)" : "scale(1) translateX(0)",
+                              transition: "opacity 0.3s ease, transform 0.3s ease",
+                            }}>
                               <Show when={showDay()}>
                                 <div style={{ display: "flex", "align-items": "center", gap: "12px", margin: "20px 0 12px", padding: "0 8px" }}>
                                   <div style={{ flex: "1", height: "1px", background: "rgba(255,255,255,0.04)" }} />
@@ -590,7 +643,7 @@ const App: Component = () => {
                               </Show>
                               <ContextMenu>
                                 <ContextMenuTrigger>
-                                  <div style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px" }}>
+                                  <div id={`msg-${msg.id}`} style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px", transition: "background 0.3s" }}>
                                     <Show when={gap()} fallback={<div style={{ width: "36px", "flex-shrink": "0" }} />}>
                                       <div style={{ ...S.avatar(36), "margin-top": "2px" }}>{msg.senderName.charAt(0).toUpperCase()}</div>
                                     </Show>
@@ -601,11 +654,158 @@ const App: Component = () => {
                                           <span style={{ "font-size": "10px", color: "#555", "font-family": "monospace" }}>{time()}</span>
                                         </div>
                                       </Show>
-                                      <div style={{ "font-size": "13.5px", color: "#ccc", "line-height": "1.55", "word-break": "break-word", "user-select": "text" }}>{msg.text}</div>
+                                      <Show when={msg.replyToId}>
+                                        {(() => {
+                                          const ref = () => msgs().find((m) => m.id === msg.replyToId);
+                                          return (
+                                            <div
+                                              style={{
+                                                display: "flex", "align-items": "center", gap: "8px",
+                                                padding: "4px 10px", "margin-bottom": "4px",
+                                                "border-left": "2px solid #7c6bf5",
+                                                background: "rgba(124,107,245,0.06)", "border-radius": "0 6px 6px 0",
+                                                cursor: "pointer",
+                                              }}
+                                              onClick={() => {
+                                                const el = document.getElementById(`msg-${msg.replyToId}`);
+                                                if (el) {
+                                                  el.scrollIntoView({ behavior: "smooth", block: "center" });
+                                                  el.style.background = "rgba(124,107,245,0.12)";
+                                                  setTimeout(() => { el.style.background = ""; }, 1500);
+                                                }
+                                              }}
+                                            >
+                                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#7c6bf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style={{ "flex-shrink": "0" }}><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 00-4-4H4" /></svg>
+                                              <span style={{ "font-size": "11px", color: "#7c6bf5", "font-weight": "600", "flex-shrink": "0" }}>
+                                                {ref()?.senderName ?? "..."}
+                                              </span>
+                                              <span style={{ "font-size": "11px", color: "#888", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                                                {ref()?.text ?? "Message not found"}
+                                              </span>
+                                            </div>
+                                          );
+                                        })()}
+                                      </Show>
+                                      <Show when={editingMessage()?.id === msg.id}
+                                        fallback={
+                                          <Show when={!isEmojiOnly(msg.text)}
+                                            fallback={
+                                              <div style={{
+                                                "font-size": "40px",
+                                                "line-height": "1.2",
+                                                color: "#ccc", "word-break": "break-word", "user-select": "text",
+                                              }}>{msg.text}</div>
+                                            }
+                                          >
+                                            <MessageRenderer
+                                              text={msg.text}
+                                              style={{
+                                                "font-size": "13.5px",
+                                                "line-height": "1.55",
+                                                color: "#ccc", "word-break": "break-word", "user-select": "text",
+                                              }}
+                                            />
+                                          </Show>
+                                        }
+                                      >
+                                        <div style={{ display: "flex", gap: "8px", "align-items": "center" }}>
+                                          <input
+                                            style={{
+                                              flex: "1", background: "#383A40", border: "1px solid #7c6bf5",
+                                              "border-radius": "8px", padding: "6px 10px", color: "#ddd",
+                                              "font-size": "13px", outline: "none",
+                                            }}
+                                            value={editText()}
+                                            onInput={(e) => setEditText(e.currentTarget.value)}
+                                            onKeyDown={(e) => {
+                                              if (e.key === "Enter") { e.preventDefault(); handleEditSave(); }
+                                              if (e.key === "Escape") setEditingMessage(null);
+                                            }}
+                                            ref={(el) => setTimeout(() => el.focus(), 0)}
+                                          />
+                                          <button
+                                            style={{ padding: "4px 10px", "border-radius": "6px", background: "#7c6bf5", border: "none", color: "#fff", "font-size": "11px", "font-weight": "600", cursor: "pointer" }}
+                                            onClick={handleEditSave}
+                                          >Save</button>
+                                          <button
+                                            style={{ padding: "4px 10px", "border-radius": "6px", background: "transparent", border: "1px solid #555", color: "#888", "font-size": "11px", cursor: "pointer" }}
+                                            onClick={() => setEditingMessage(null)}
+                                          >Esc</button>
+                                        </div>
+                                      </Show>
+                                      {/* Reaction pills */}
+                                      {(() => {
+                                        const msgReactions = () => appStore.reactions()[msg.id] ?? {};
+                                        const entries = () => Object.entries(msgReactions());
+                                        return (
+                                          <Show when={entries().length > 0}>
+                                            <div style={{ display: "flex", "flex-wrap": "wrap", gap: "4px", "margin-top": "4px" }}>
+                                              <For each={entries()}>
+                                                {([emoji, users]) => {
+                                                  const isOwn = () => users.some((u) => u.userId === appStore.userId());
+                                                  return (
+                                                    <button
+                                                      onClick={() => appStore.toggleReaction(msg.id, emoji)}
+                                                      style={{
+                                                        display: "inline-flex", "align-items": "center", gap: "4px",
+                                                        padding: "2px 8px", "border-radius": "10px",
+                                                        background: isOwn() ? "rgba(124,107,245,0.2)" : "rgba(255,255,255,0.06)",
+                                                        border: isOwn() ? "1px solid rgba(124,107,245,0.4)" : "1px solid transparent",
+                                                        cursor: "pointer", "font-size": "12px", color: "#ccc",
+                                                        transition: "background 0.15s, border 0.15s",
+                                                      }}
+                                                      title={users.map((u) => u.username).join(", ")}
+                                                    >
+                                                      <span>{emoji}</span>
+                                                      <span style={{ "font-size": "10px", color: isOwn() ? "#7c6bf5" : "#888" }}>{users.length}</span>
+                                                    </button>
+                                                  );
+                                                }}
+                                              </For>
+                                            </div>
+                                          </Show>
+                                        );
+                                      })()}
                                     </div>
                                   </div>
                                 </ContextMenuTrigger>
                                 <ContextMenuContent>
+                                  {/* Quick emoji reactions */}
+                                  <div style={{ display: "flex", "justify-content": "center", gap: "2px", padding: "4px 8px 2px" }}>
+                                    <For each={["👍", "❤️", "😂", "😮", "😢", "🔥", "👎"]}>
+                                      {(emoji) => (
+                                        <button
+                                          onClick={() => appStore.toggleReaction(msg.id, emoji)}
+                                          style={{
+                                            width: "28px", height: "28px", "border-radius": "6px",
+                                            background: "transparent", border: "none", cursor: "pointer",
+                                            "font-size": "16px", display: "flex", "align-items": "center",
+                                            "justify-content": "center", transition: "background 0.15s",
+                                          }}
+                                          onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.08)"; }}
+                                          onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
+                                        >
+                                          {emoji}
+                                        </button>
+                                      )}
+                                    </For>
+                                  </div>
+                                  <ContextMenuSeparator />
+                                  <ContextMenuItem onSelect={() => setReplyingTo(msg)}>
+                                    <ContextMenuIcon>
+                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 00-4-4H4" /></svg>
+                                    </ContextMenuIcon>
+                                    Reply
+                                  </ContextMenuItem>
+                                  <Show when={msg.isOwn}>
+                                    <ContextMenuItem onSelect={() => startEdit(msg)}>
+                                      <ContextMenuIcon>
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
+                                      </ContextMenuIcon>
+                                      Edit
+                                    </ContextMenuItem>
+                                  </Show>
+                                  <ContextMenuSeparator />
                                   <ContextMenuItem onSelect={() => navigator.clipboard.writeText(msg.text)}>
                                     <ContextMenuIcon>
                                       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
@@ -619,32 +819,133 @@ const App: Component = () => {
                                     </ContextMenuIcon>
                                     Copy message ID
                                   </ContextMenuItem>
-                                  <ContextMenuSeparator />
-                                  <ContextMenuItem variant="danger" onSelect={() => console.log("delete", msg.id)}>
-                                    <ContextMenuIcon>
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" /></svg>
-                                    </ContextMenuIcon>
-                                    Delete message
-                                  </ContextMenuItem>
+                                  <Show when={msg.isOwn}>
+                                    <ContextMenuSeparator />
+                                    <ContextMenuItem variant="danger" onSelect={() => handleDelete(msg)}>
+                                      <ContextMenuIcon>
+                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" /></svg>
+                                      </ContextMenuIcon>
+                                      Delete message
+                                    </ContextMenuItem>
+                                  </Show>
                                 </ContextMenuContent>
                               </ContextMenu>
-                            </>
+                            </div>
                           );
                         }}
                       </For>
                       <div ref={messagesEnd} />
                     </div>
 
+                    {(() => {
+                      const names = () => conv() ? appStore.getTypingNames(conv()!.id, msgs()) : [];
+                      const label = () => {
+                        const n = names();
+                        if (n.length === 0) return "";
+                        if (n.length === 1) return `${n[0]} is typing`;
+                        if (n.length === 2) return `${n[0]} and ${n[1]} are typing`;
+                        return `${n[0]} and ${n.length - 1} others are typing`;
+                      };
+                      return (
+                        <div style={{
+                          height: "20px", padding: "0 24px",
+                          overflow: "hidden",
+                          opacity: names().length > 0 ? "1" : "0",
+                          transition: "opacity 0.2s ease",
+                        }}>
+                          <div style={{ display: "flex", "align-items": "center", gap: "6px" }}>
+                            <span style={{ display: "inline-flex", gap: "2px" }}>
+                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "#7c6bf5", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "0ms" }} />
+                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "#7c6bf5", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "200ms" }} />
+                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "#7c6bf5", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "400ms" }} />
+                            </span>
+                            <span style={{ "font-size": "11px", color: "#888" }}>{label()}</span>
+                          </div>
+                        </div>
+                      );
+                    })()}
+
                     <div style={S.inputWrap}>
+                      <Show when={replyingTo()}>
+                        {(reply) => (
+                          <div style={{
+                            display: "flex", "align-items": "center", gap: "10px",
+                            padding: "8px 16px", "margin-bottom": "8px",
+                            background: "rgba(124,107,245,0.06)", "border-radius": "10px",
+                            "border-left": "3px solid #7c6bf5",
+                          }}>
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7c6bf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style={{ "flex-shrink": "0" }}><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 00-4-4H4" /></svg>
+                            <div style={{ flex: "1", "min-width": "0" }}>
+                              <div style={{ "font-size": "11px", "font-weight": "600", color: "#7c6bf5" }}>{reply().senderName}</div>
+                              <div style={{ "font-size": "12px", color: "#888", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{reply().text}</div>
+                            </div>
+                            <button
+                              style={{ width: "20px", height: "20px", "border-radius": "4px", background: "transparent", border: "none", color: "#666", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center", "flex-shrink": "0" }}
+                              onClick={() => setReplyingTo(null)}
+                            >
+                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                            </button>
+                          </div>
+                        )}
+                      </Show>
                       <div style={S.inputBar}>
-                        <input
+                        <textarea
+                          ref={inputRef}
                           style={S.inputField}
                           placeholder={`Message ${c().name}...`}
                           value={inputText()}
-                          onInput={(e) => setInputText(e.currentTarget.value)}
-                          onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+                          maxLength={MAX_MSG_LEN}
+                          rows={1}
+                          onInput={(e) => {
+                            setInputText(e.currentTarget.value);
+                            appStore.sendTyping();
+                            /* Auto-resize */
+                            e.currentTarget.style.height = "21px";
+                            e.currentTarget.style.height = Math.min(e.currentTarget.scrollHeight, 150) + "px";
+                          }}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !e.shiftKey) {
+                              e.preventDefault();
+                              handleSend();
+                              /* Reset height after send */
+                              if (inputRef) inputRef.style.height = "21px";
+                            }
+                          }}
+                          onPaste={(e) => {
+                            /* Allow multi-line paste naturally, just auto-resize after */
+                            requestAnimationFrame(() => {
+                              const el = e.currentTarget;
+                              el.style.height = "21px";
+                              el.style.height = Math.min(el.scrollHeight, 150) + "px";
+                            });
+                          }}
                         />
-                        <button style={S.sendBtn(!!inputText().trim())} onClick={handleSend}>{"\u27A4"}</button>
+                        <Show when={inputText().length > MAX_MSG_LEN * 0.9}>
+                          <span style={{ "font-size": "10px", color: inputText().length >= MAX_MSG_LEN ? "#f44" : "#666", "font-family": "monospace", "flex-shrink": "0", "margin-right": "4px" }}>
+                            {inputText().length}/{MAX_MSG_LEN}
+                          </span>
+                        </Show>
+                        <EmojiPicker onSelect={(emoji) => {
+                          const el = inputRef;
+                          if (el) {
+                            const start = el.selectionStart ?? inputText().length;
+                            const end = el.selectionEnd ?? start;
+                            const val = inputText();
+                            const next = val.slice(0, start) + emoji + val.slice(end);
+                            if (next.length <= MAX_MSG_LEN) {
+                              setInputText(next);
+                              /* Restore cursor after emoji */
+                              requestAnimationFrame(() => {
+                                const pos = start + emoji.length;
+                                el.setSelectionRange(pos, pos);
+                                el.focus();
+                              });
+                            }
+                          } else {
+                            setInputText(inputText() + emoji);
+                          }
+                        }} />
+                        <button style={S.sendBtn(!!inputText().trim() && inputText().length <= MAX_MSG_LEN)} onClick={handleSend}>{"\u27A4"}</button>
                       </div>
                     </div>
 
