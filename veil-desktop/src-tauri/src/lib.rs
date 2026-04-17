@@ -192,6 +192,7 @@ fn get_messages(
                 "isOwn": m.is_outgoing,
                 "timestamp": m.server_timestamp.unwrap_or(0),
                 "createdAt": m.created_at,
+                "replyToId": m.reply_to_id,
             })
         })
         .collect())
@@ -340,6 +341,7 @@ fn connect_to_server(
                         ciphertext,
                         header,
                         server_timestamp,
+                        reply_to_id,
                     } => {
                         // Decrypt: try E2E, fallback to plaintext
                         let sender_key: [u8; 32] = sender_identity_key
@@ -360,6 +362,7 @@ fn connect_to_server(
                             &sender_identity_key,
                             &text,
                             Some(ts_ms),
+                            reply_to_id.as_deref(),
                         );
                         client.persist_conversation(
                             &conversation_id,
@@ -379,6 +382,7 @@ fn connect_to_server(
                                 "senderName": sender_username,
                                 "text": text,
                                 "timestamp": server_timestamp / 1_000_000,
+                                "replyToId": reply_to_id,
                             }),
                         );
 
@@ -404,6 +408,52 @@ fn connect_to_server(
                             }),
                         );
                     }
+                    ConnectionEvent::MessageEdited {
+                        message_id,
+                        conversation_id,
+                        sender_identity_key,
+                        ciphertext,
+                        header,
+                        edit_timestamp,
+                    } => {
+                        let sender_key: [u8; 32] = sender_identity_key
+                            .as_slice()
+                            .try_into()
+                            .unwrap_or([0u8; 32]);
+
+                        let new_text = match client.decrypt_from(&sender_key, &header, &ciphertext) {
+                            Ok(pt) => String::from_utf8_lossy(&pt).to_string(),
+                            Err(_) => String::from_utf8_lossy(&ciphertext).to_string(),
+                        };
+
+                        client.update_local_message(&message_id, &new_text);
+                        drop(client);
+
+                        let _ = app_handle.emit(
+                            "veil://message-edited",
+                            serde_json::json!({
+                                "messageId": message_id,
+                                "conversationId": conversation_id,
+                                "newText": new_text,
+                                "editTimestamp": edit_timestamp / 1_000_000,
+                            }),
+                        );
+                    }
+                    ConnectionEvent::MessageDeleted {
+                        message_id,
+                        conversation_id,
+                    } => {
+                        client.delete_local_message(&message_id);
+                        drop(client);
+
+                        let _ = app_handle.emit(
+                            "veil://message-deleted",
+                            serde_json::json!({
+                                "messageId": message_id,
+                                "conversationId": conversation_id,
+                            }),
+                        );
+                    }
                     ConnectionEvent::Disconnected { reason } => {
                         drop(client);
                         let _ = app_handle.emit(
@@ -417,6 +467,48 @@ fn connect_to_server(
                         let _ = app_handle.emit(
                             "veil://error",
                             serde_json::json!({ "code": code, "message": message }),
+                        );
+                    }
+                    ConnectionEvent::TypingEvent {
+                        conversation_id,
+                        identity_key,
+                        started,
+                    } => {
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://typing",
+                            serde_json::json!({
+                                "conversationId": conversation_id,
+                                "identityKey": hex::encode(&identity_key),
+                                "started": started,
+                            }),
+                        );
+                    }
+                    ConnectionEvent::ReactionEvent {
+                        message_id,
+                        conversation_id,
+                        emoji,
+                        user_id,
+                        username,
+                        add,
+                    } => {
+                        // Persist to local DB
+                        if add {
+                            client.add_local_reaction(&message_id, &user_id, &emoji, &username);
+                        } else {
+                            client.remove_local_reaction(&message_id, &user_id, &emoji);
+                        }
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://reaction",
+                            serde_json::json!({
+                                "messageId": message_id,
+                                "conversationId": conversation_id,
+                                "emoji": emoji,
+                                "userId": user_id,
+                                "username": username,
+                                "add": add,
+                            }),
                         );
                     }
                     _ => {}
@@ -435,11 +527,78 @@ fn send_message(
     state: State<'_, AppState>,
     conversation_id: String,
     text: String,
+    reply_to_id: Option<String>,
 ) -> Result<u64, String> {
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     state
         .runtime
-        .block_on(client.send_message(&conversation_id, &text))
+        .block_on(client.send_message(&conversation_id, &text, reply_to_id.as_deref()))
+}
+
+#[tauri::command]
+fn edit_message(
+    state: State<'_, AppState>,
+    message_id: String,
+    conversation_id: String,
+    new_text: String,
+) -> Result<u64, String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    state
+        .runtime
+        .block_on(client.edit_message(&message_id, &conversation_id, &new_text))
+}
+
+#[tauri::command]
+fn delete_message(
+    state: State<'_, AppState>,
+    message_id: String,
+    conversation_id: String,
+) -> Result<u64, String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    state
+        .runtime
+        .block_on(client.delete_message(&message_id, &conversation_id))
+}
+
+#[tauri::command]
+fn send_typing(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    started: bool,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    state
+        .runtime
+        .block_on(client.send_typing(&conversation_id, started))
+}
+
+#[tauri::command]
+fn toggle_reaction(
+    state: State<'_, AppState>,
+    message_id: String,
+    conversation_id: String,
+    emoji: String,
+    user_id: String,
+    add: bool,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    if add {
+        client.add_local_reaction(&message_id, &user_id, &emoji, "You");
+    } else {
+        client.remove_local_reaction(&message_id, &user_id, &emoji);
+    }
+    state
+        .runtime
+        .block_on(client.send_reaction(&message_id, &conversation_id, &emoji, add))
+}
+
+#[tauri::command]
+fn get_reactions(
+    state: State<'_, AppState>,
+    message_id: String,
+) -> Result<Vec<(String, String, String)>, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    Ok(client.get_local_reactions(&message_id))
 }
 
 /// Create a DM conversation via the Go REST API.
@@ -701,6 +860,11 @@ pub fn run() {
             establish_session,
             connect_to_server,
             send_message,
+            edit_message,
+            delete_message,
+            send_typing,
+            toggle_reaction,
+            get_reactions,
             create_dm,
             is_connected,
             create_group,
