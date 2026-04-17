@@ -511,6 +511,93 @@ fn connect_to_server(
                             }),
                         );
                     }
+                    ConnectionEvent::PresenceUpdate {
+                        identity_key,
+                        status,
+                        status_text,
+                        last_seen,
+                    } => {
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://presence",
+                            serde_json::json!({
+                                "identityKey": hex::encode(&identity_key),
+                                "status": status,
+                                "statusText": status_text,
+                                "lastSeen": last_seen,
+                            }),
+                        );
+                    }
+                    ConnectionEvent::FriendRequestReceived {
+                        request_id,
+                        from_user_id,
+                        from_username,
+                        message,
+                        timestamp,
+                    } => {
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://friend-request",
+                            serde_json::json!({
+                                "requestId": request_id,
+                                "fromUserId": from_user_id,
+                                "fromUsername": from_username,
+                                "message": message,
+                                "timestamp": timestamp,
+                            }),
+                        );
+                        let _ = app_handle
+                            .notification()
+                            .builder()
+                            .title("Friend Request")
+                            .body(&format!("{} wants to be your friend", from_username))
+                            .show();
+                    }
+                    ConnectionEvent::FriendAccepted {
+                        user_id,
+                        username,
+                    } => {
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://friend-accepted",
+                            serde_json::json!({
+                                "userId": user_id,
+                                "username": username,
+                            }),
+                        );
+                    }
+                    ConnectionEvent::FriendRemoved { user_id } => {
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://friend-removed",
+                            serde_json::json!({ "userId": user_id }),
+                        );
+                    }
+                    ConnectionEvent::FriendListReceived {
+                        friends,
+                        pending_requests,
+                    } => {
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://friend-list",
+                            serde_json::json!({
+                                "friends": friends.iter().map(|f| serde_json::json!({
+                                    "userId": f.user_id,
+                                    "username": f.username,
+                                    "status": f.status,
+                                    "lastSeen": f.last_seen,
+                                })).collect::<Vec<_>>(),
+                                "pendingRequests": pending_requests.iter().map(|r| serde_json::json!({
+                                    "requestId": r.request_id,
+                                    "fromUserId": r.from_user_id,
+                                    "fromUsername": r.from_username,
+                                    "message": r.message,
+                                    "timestamp": r.timestamp,
+                                    "outgoing": r.outgoing,
+                                })).collect::<Vec<_>>(),
+                            }),
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -774,6 +861,78 @@ fn get_group_members(
     Ok(members)
 }
 
+// ─── Friends & Presence ───────────────────────────────
+
+#[tauri::command]
+fn send_friend_request(
+    state: State<'_, AppState>,
+    target_user_id: String,
+    message: Option<String>,
+) -> Result<(), String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    state
+        .runtime
+        .block_on(client.send_friend_request(&target_user_id, message.as_deref()))
+}
+
+#[tauri::command]
+fn respond_friend_request(
+    state: State<'_, AppState>,
+    request_id: String,
+    accept: bool,
+) -> Result<(), String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    state
+        .runtime
+        .block_on(client.respond_friend_request(&request_id, accept))
+}
+
+#[tauri::command]
+fn remove_friend(state: State<'_, AppState>, user_id: String) -> Result<(), String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    state.runtime.block_on(client.remove_friend(&user_id))
+}
+
+#[tauri::command]
+fn request_friend_list(state: State<'_, AppState>) -> Result<(), String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    state.runtime.block_on(client.request_friend_list())
+}
+
+#[tauri::command]
+fn send_presence(
+    state: State<'_, AppState>,
+    status: i32,
+    status_text: Option<String>,
+) -> Result<(), String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    state
+        .runtime
+        .block_on(client.send_presence(status, status_text.as_deref()))
+}
+
+/// Search for a user by username via the server REST API.
+#[tauri::command]
+fn search_user(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    username: String,
+) -> Result<serde_json::Value, String> {
+    state.runtime.block_on(async {
+        let http = reqwest::Client::new();
+        let r = http
+            .get(format!("{}/v1/users/search", server_http_url))
+            .query(&[("username", &username)])
+            .send()
+            .await
+            .map_err(|e| format!("search user: {e}"))?;
+        if !r.status().is_success() {
+            return Err("user not found".to_string());
+        }
+        r.json().await.map_err(|e| format!("parse: {e}"))
+    })
+}
+
 // ─── App ──────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -871,6 +1030,12 @@ pub fn run() {
             add_group_member,
             remove_group_member,
             get_group_members,
+            send_friend_request,
+            respond_friend_request,
+            remove_friend,
+            request_friend_list,
+            send_presence,
+            search_user,
         ])
         .run(tauri::generate_context!())
         .expect("error while running veil");

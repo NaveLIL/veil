@@ -16,6 +16,7 @@ import {
 } from "@/components/ui/context-menu";
 import { EmojiPicker } from "@/components/ui/emoji-picker";
 import { MessageRenderer } from "@/components/chat/MessageRenderer";
+import { FriendsPanel } from "@/components/chat/FriendsPanel";
 
 const appWindow = getCurrentWindow();
 
@@ -157,6 +158,7 @@ const App: Component = () => {
   const [editingMessage, setEditingMessage] = createSignal<Message | null>(null);
   const [editText, setEditText] = createSignal("");
   const [deletingIds, setDeletingIds] = createSignal<Set<string>>(new Set());
+  const [showFriendsPanel, setShowFriendsPanel] = createSignal(false);
   const MAX_MSG_LEN = 4000;
   // Staggered island entrance
   const [island1Vis, setIsland1Vis] = createSignal(false);
@@ -365,6 +367,19 @@ const App: Component = () => {
 
                 <div style={{ width: "28px", height: "2px", background: "rgba(255,255,255,0.06)", "border-radius": "1px" }} />
 
+                {/* Friends */}
+                <button
+                  style={S.railBtn(showFriendsPanel())}
+                  onClick={() => setShowFriendsPanel(!showFriendsPanel())}
+                  title="Friends"
+                >
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
+                    <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                    <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="1.8"/>
+                    <path d="M22 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                  </svg>
+                </button>
+
                 {/* Future servers will appear here */}
                 <For each={appStore.servers()}>
                   {(s) => (
@@ -542,8 +557,9 @@ const App: Component = () => {
               </div>
             </div>
 
-            {/* ISLAND 3 — Chat */}
+            {/* ISLAND 3 — Chat or Friends */}
             <div style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}>
+              <Show when={!showFriendsPanel()} fallback={<FriendsPanel />}>
               <Show when={conv()} fallback={
                 <div style={{ flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" }}>
                   <div style={{ width: "56px", height: "56px", "border-radius": "16px", background: "rgba(124,107,245,0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" }}>
@@ -952,6 +968,7 @@ const App: Component = () => {
 
                   </>
                 )}
+              </Show>
               </Show>
             </div>
 

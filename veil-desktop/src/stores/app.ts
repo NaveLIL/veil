@@ -63,6 +63,28 @@ let lastTypingSent = 0;
 export type ReactionMap = Record<string, { userId: string; username: string }[]>;
 const [reactions, setReactions] = createSignal<Record<string, ReactionMap>>({});
 
+// Friends & Presence
+export interface Friend {
+  userId: string;
+  username: string;
+  status: number; // 0=unknown, 1=online, 2=offline, 3=away, 4=dnd
+  lastSeen?: number;
+}
+
+export interface FriendRequest {
+  requestId: string;
+  fromUserId: string;
+  fromUsername: string;
+  message?: string;
+  timestamp: number;
+  outgoing: boolean;
+}
+
+const [friends, setFriends] = createSignal<Friend[]>([]);
+const [friendRequests, setFriendRequests] = createSignal<FriendRequest[]>([]);
+const [presenceMap, setPresenceMap] = createSignal<Record<string, number>>({});
+// identityKey → status
+
 const AUTO_LOCK_SECONDS = 300; // 5 minutes
 let autoLockTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -90,6 +112,9 @@ export const appStore = {
   setServers,
   typingUsers,
   reactions,
+  friends,
+  friendRequests,
+  presenceMap,
 
   activeConversation: () => {
     const id = activeConversationId();
@@ -119,6 +144,9 @@ export const appStore = {
       const uid = await invoke<string>("connect_to_server", { serverUrl: serverUrl() });
       setConnected(true);
       setUserId(uid);
+      // Request friend list and announce online after connecting
+      appStore.requestFriendList();
+      appStore.sendPresence(1); // ONLINE
     } catch (e) {
       console.error("connect failed:", e);
       setConnected(false);
@@ -212,6 +240,73 @@ export const appStore = {
       await invoke("toggle_reaction", { messageId, conversationId: convId, emoji, userId: uid, add });
     } catch (e) {
       console.error("reaction failed:", e);
+    }
+  },
+
+  // ─── Friends & Presence ──────────────────────────────
+
+  /** Request the full friend list from server. */
+  requestFriendList: async () => {
+    try {
+      await invoke("request_friend_list");
+    } catch (e) {
+      console.error("requestFriendList failed:", e);
+    }
+  },
+
+  /** Send a friend request to a user by their user_id. */
+  sendFriendRequest: async (targetUserId: string, message?: string) => {
+    try {
+      await invoke("send_friend_request", { targetUserId, message: message ?? null });
+    } catch (e) {
+      console.error("sendFriendRequest failed:", e);
+      throw e;
+    }
+  },
+
+  /** Accept or reject a friend request. */
+  respondFriendRequest: async (requestId: string, accept: boolean) => {
+    try {
+      await invoke("respond_friend_request", { requestId, accept });
+      // Remove from pending list optimistically
+      setFriendRequests((prev) => prev.filter((r) => r.requestId !== requestId));
+    } catch (e) {
+      console.error("respondFriendRequest failed:", e);
+      throw e;
+    }
+  },
+
+  /** Remove a friend. */
+  removeFriend: async (targetUserId: string) => {
+    try {
+      await invoke("remove_friend", { userId: targetUserId });
+      setFriends((prev) => prev.filter((f) => f.userId !== targetUserId));
+    } catch (e) {
+      console.error("removeFriend failed:", e);
+      throw e;
+    }
+  },
+
+  /** Send presence status. 1=online, 2=offline, 3=away, 4=dnd */
+  sendPresence: async (status: number) => {
+    try {
+      await invoke("send_presence", { status, statusText: null });
+    } catch (e) {
+      console.error("sendPresence failed:", e);
+    }
+  },
+
+  /** Search for a user by username. */
+  searchUser: async (username: string): Promise<{ userId: string; username: string; identityKey: string } | null> => {
+    try {
+      const result = await invoke<{ user_id: string; username: string; identity_key: string }>(
+        "search_user",
+        { serverHttpUrl: serverHttpUrl(), username },
+      );
+      return { userId: result.user_id, username: result.username, identityKey: result.identity_key };
+    } catch (e) {
+      console.error("searchUser failed:", e);
+      return null;
     }
   },
 
@@ -584,6 +679,82 @@ export const appStore = {
           copy[messageId] = msgR;
           return copy;
         });
+      },
+    );
+
+    // ── Friend / Presence events ──
+
+    await listen<{ identityKey: string; status: number; statusText?: string; lastSeen?: number }>(
+      "veil://presence",
+      (event) => {
+        const { identityKey, status } = event.payload;
+        setPresenceMap((prev) => ({ ...prev, [identityKey]: status }));
+        // Also update friend list status
+        setFriends((prev) =>
+          prev.map((f) => {
+            // We need to match by identityKey somehow — for now update conversation's online
+            return f;
+          }),
+        );
+      },
+    );
+
+    await listen<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number }>(
+      "veil://friend-request",
+      (event) => {
+        const d = event.payload;
+        setFriendRequests((prev) => [
+          ...prev,
+          {
+            requestId: d.requestId,
+            fromUserId: d.fromUserId,
+            fromUsername: d.fromUsername,
+            message: d.message,
+            timestamp: d.timestamp,
+            outgoing: false,
+          },
+        ]);
+      },
+    );
+
+    await listen<{ userId: string; username: string }>(
+      "veil://friend-accepted",
+      (event) => {
+        const { userId: uid, username } = event.payload;
+        // Add to friends list
+        setFriends((prev) => {
+          if (prev.some((f) => f.userId === uid)) return prev;
+          return [...prev, { userId: uid, username, status: 1 }]; // assume online since just connected
+        });
+        // Remove from pending if it was there
+        setFriendRequests((prev) => prev.filter((r) => r.fromUserId !== uid));
+      },
+    );
+
+    await listen<{ userId: string }>(
+      "veil://friend-removed",
+      (event) => {
+        const { userId: uid } = event.payload;
+        setFriends((prev) => prev.filter((f) => f.userId !== uid));
+      },
+    );
+
+    await listen<{
+      friends: Array<{ userId: string; username: string; status: number; lastSeen?: number }>;
+      pendingRequests: Array<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number; outgoing: boolean }>;
+    }>(
+      "veil://friend-list",
+      (event) => {
+        const d = event.payload;
+        setFriends(d.friends.map((f) => ({ userId: f.userId, username: f.username, status: f.status, lastSeen: f.lastSeen })));
+        setFriendRequests(d.pendingRequests.map((r) => ({
+          requestId: r.requestId,
+          fromUserId: r.fromUserId,
+          fromUsername: r.fromUsername,
+          message: r.message,
+          timestamp: r.timestamp,
+          outgoing: r.outgoing,
+        })));
       },
     );
 

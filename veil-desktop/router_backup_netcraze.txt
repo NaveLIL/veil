@@ -1,0 +1,410 @@
+[K! $$$ Agent: http/rci
+! $$$ Last change: Sat, 11 Apr 2026 11:44:40 GMT
+! $$$ Md5 checksum: 22a368722fa74a5ee8b948d2f6fe9a11
+! $$$ Model: Netcraze Giga
+! $$$ Username: admin
+! $$$ Version: 2.06.1
+system
+    set dev.usb.force_usb2 0
+    set net.ipv4.ip_forward 1
+    set net.ipv4.neigh.default.gc_thresh1 256
+    set net.ipv4.neigh.default.gc_thresh2 1024
+    set net.ipv4.neigh.default.gc_thresh3 2048
+    set net.ipv4.tcp_fin_timeout 30
+    set net.ipv4.tcp_keepalive_time 120
+    set net.ipv6.conf.all.forwarding 1
+    set net.ipv6.neigh.default.gc_thresh1 256
+    set net.ipv6.neigh.default.gc_thresh2 1024
+    set net.ipv6.neigh.default.gc_thresh3 2048
+    set net.netfilter.nf_conntrack_tcp_timeout_established 1200
+    set vm.overcommit_memory 0
+    set vm.swappiness 60
+    set vm.vfs_cache_pressure 1000
+    clock timezone Asia/Yekaterinburg
+    domainname WORKGROUP
+    hostname Netcraze-8099
+    caption default
+!
+schedule schedule0
+    description "\xd0\xa0\xd0\xb0\xd1\x81\xd0\xbf\xd0\xb8\xd1\x81\xd0\xb0\xd0\xbd\xd0\xb8\xd0\xb5 \xd0\xb0\xd0\xb2\xd1\x82\xd0\xbe\xd0\xbe\xd0\xb1\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbb\xd0\xb5\xd0\xbd\xd0\xb8\xd1\x8f"
+    action start 0 1 *
+    action stop 0 6 *
+!
+known host "yandex-mini2-V2JG - Home network - 2026-03-07 17:06" 3c:0b:4f:d8:d4:4e
+known host "cachyos-x8664 - \xd0\x9e\xd1\x81\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbd\xd0\xb0\xd1\x8f - 2026-04-11 15:37" 3c:58:c2:5b:36:f0
+known host "DESKTOP-7DUKHGP - \xd0\x9e\xd1\x81\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbd\xd0\xb0\xd1\x8f - 2026-03-13 08:29" 7c:67:a2:ca:dc:b2
+known host "Mi-TV-Stick - \xd0\x9e\xd1\x81\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbd\xd0\xb0\xd1\x8f - 2026-03-07 18:50" 80:9d:65:e0:2a:04
+known host "Xiaomi-TV-Box - \xd0\x9e\xd1\x81\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbd\xd0\xb0\xd1\x8f - 2026-03-07 17:11" 80:9d:65:ea:3e:02
+known host "LAPTOP-J5ALBVCJ - \xd0\x9e\xd1\x81\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbd\xd0\xb0\xd1\x8f - 2026-03-09 13:43" a8:93:4a:f9:be:71
+known host "Samsung - Home network - 2026-03-07 17:04" bc:45:5b:88:ae:3a
+known host "localhost - \xd0\x9e\xd1\x81\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbd\xd0\xb0\xd1\x8f - 2026-03-07 18:16" f8:3f:51:78:05:e2
+isolate-private
+user admin
+    password nt 325a4861fd0861c8bc3eb8ef3998202d
+    password md5 6d00a51a9030000e87acd41baa2964c8
+    tag cli
+    tag http
+    tag cifs
+    tag printers
+    tag webdav
+!
+interface GigabitEthernet0
+    up
+!
+interface GigabitEthernet0/0
+    rename 1
+    switchport mode access
+    switchport mode trunk
+    switchport access vlan 1
+    up
+!
+interface GigabitEthernet0/1
+    rename 2
+    switchport mode access
+    switchport mode trunk
+    switchport access vlan 1
+    up
+!
+interface GigabitEthernet0/2
+    rename 3
+    switchport mode access
+    switchport mode trunk
+    switchport access vlan 1
+    up
+!
+interface GigabitEthernet0/3
+    rename 4
+    switchport mode access
+    switchport mode trunk
+    switchport access vlan 1
+    up
+!
+interface GigabitEthernet0/Vlan1
+    description "Home VLAN"
+    ip dhcp client dns-routes
+    up
+!
+interface GigabitEthernet1
+    rename ISP
+    description "\xd0\x9f\xd0\xbe\xd0\xb4\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5 Ethernet"
+    mac address factory wan
+    security-level public
+    ip address dhcp
+    ip dhcp client hostname Netcraze-8099
+    ip dhcp client dns-routes
+    ip mtu 1500
+    igmp upstream
+    ipv6 address auto
+    ipv6 prefix auto
+    ipv6 name-servers
+    up
+!
+interface GigabitEthernet1/0
+    rename 0
+    up
+!
+interface WifiMaster0
+    country-code RU
+    compatibility BGN+AX
+    channel width 40-above
+    tx-burst
+    rekey-interval 86400
+    beamforming explicit
+    vht
+    downlink-mumimo
+    uplink-mumimo
+    spatial-reuse
+    up
+!
+interface WifiMaster0/AccessPoint0
+    rename AccessPoint
+    description "Wi-Fi access point"
+    mac access-list type none
+    wps
+    wps no auto-self-pin
+    authentication wpa-psk ns3 l8xUnaQsspq+zD20iEIjpta7
+    encryption enable
+    encryption wpa2
+    encryption wpa3
+    ip dhcp client dns-routes
+    ssid Netcraze-8099
+    wmm
+    rrm
+    ft mdid ev
+    ft enable
+    down
+!
+interface WifiMaster0/AccessPoint1
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    wmm
+    rrm
+    ft mdid -v
+    ft enable
+    down
+!
+interface WifiMaster0/AccessPoint2
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster0/AccessPoint3
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster0/AccessPoint4
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster0/AccessPoint5
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster0/AccessPoint6
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster0/WifiStation0
+    security-level public
+    encryption no enable
+    ip dhcp client dns-routes
+    standby enable
+    standby timeout 600
+    down
+!
+interface WifiMaster1
+    country-code RU
+    compatibility AN+AC+AX
+    channel width 160
+    tx-burst
+    rekey-interval 86400
+    beamforming explicit
+    target-waketime
+    downlink-mumimo
+    uplink-mumimo
+    spatial-reuse
+    up
+!
+interface WifiMaster1/AccessPoint0
+    rename AccessPoint_5G
+    description "5GHz Wi-Fi access point"
+    mac access-list type none
+    wps
+    wps no auto-self-pin
+    authentication wpa-psk ns3 l8xUnaQsspq+zD20iEIjpta7
+    encryption enable
+    encryption wpa2
+    encryption wpa3
+    ip dhcp client dns-routes
+    ssid Netcraze-8099
+    wmm
+    rrm
+    ft mdid ev
+    ft enable
+    follow AccessPoint
+    up
+!
+interface WifiMaster1/AccessPoint1
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    rrm
+    ft mdid -v
+    ft enable
+    down
+!
+interface WifiMaster1/AccessPoint2
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster1/AccessPoint3
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster1/AccessPoint4
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster1/AccessPoint5
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster1/AccessPoint6
+    mac access-list type none
+    security-level private
+    encryption no enable
+    ip dhcp client dns-routes
+    down
+!
+interface WifiMaster1/WifiStation0
+    security-level public
+    encryption no enable
+    ip dhcp client dns-routes
+    standby enable
+    standby timeout 600
+    down
+!
+interface Bridge0
+    rename Home
+    description "\xd0\x9e\xd1\x81\xd0\xbd\xd0\xbe\xd0\xb2\xd0\xbd\xd0\xb0\xd1\x8f"
+    include GigabitEthernet0/Vlan1
+    include AccessPoint
+    include AccessPoint_5G
+    mac address factory lan
+    mac access-list type none
+    security-level private
+    ip address 192.168.1.1 255.255.255.0
+    ip dhcp client dns-routes
+    igmp downstream
+    band-steering
+    iapp key ns3 LO6UkGXnObHXMb/rRXKs8augbCV9eljyc1Cx34iTO77YlCLU
+    up
+!
+interface PPPoE0
+    description "\xd0\x9f\xd0\xbe\xd0\xb4\xd0\xba\xd0\xbb\xd1\x8e\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5 Ethernet"
+    role inet
+    ipv6cp
+    lcp echo 30 3
+    ipcp default-route
+    ipcp dns-routes
+    ipcp address
+    no ccp
+    security-level public
+    authentication identity 79220054746_serv1_66
+    authentication password ns3 5crp4Hl9yuE3wx5EbNweEDHL
+    ip mtu 1492
+    ip global 32767
+    ip tcp adjust-mss pmtu
+    ip name-servers
+    ipv6 address auto
+    ipv6 prefix auto
+    connect via ISP
+    up
+!
+interface Wireguard1
+    description fin2-428.conf.txt
+    security-level public
+    ip address 10.8.0.169 255.255.255.0
+    ip mtu 1380
+    ip global 49150
+    ip tcp adjust-mss pmtu
+    wireguard peer yvivDnCDbJdwhYDmjf0i2/4o8hOJMBx0ULlvfgx9RX4=
+        endpoint 185.75.135.93:51820
+        keepalive-interval 25
+        preshared-key wlX28ajgfMiA9P4Jze0TYvtLMZnJ/2j0xmEvz8Nu73I=
+        allow-ips 0.0.0.0 0.0.0.0
+        allow-ips :: 0
+        connect
+    !
+    up
+!
+ip route default Wireguard1
+ip dhcp pool _WEBADMIN
+    range 192.168.1.33 192.168.1.152
+    bind Home
+    enable
+!
+ip dhcp pool _WEBADMIN_GUEST_AP
+    enable
+!
+ip name-server 1.1.1.1 "" on Wireguard1
+ip http port 80
+ip http security-level public
+ip http lockout-policy 5 15 3
+ip http ssl enable
+ip http ssl port 443
+ip http webdav
+    security-level public
+!
+ip conntrack max-entries 32768
+ip nat Home
+ip telnet
+    port 23
+    security-level private
+    lockout-policy 5 15 3
+!
+ip ssh
+    port 22
+    security-level public
+    lockout-policy 5 15 3
+!
+ip hotspot
+    host 3c:0b:4f:d8:d4:4e permit
+    host 3c:0b:4f:d8:d4:4e conform
+    host 80:9d:65:ea:3e:02 permit
+    host 80:9d:65:ea:3e:02 conform
+    host f8:3f:51:78:05:e2 permit
+    host f8:3f:51:78:05:e2 conform
+    host 80:9d:65:e0:2a:04 permit
+    host 80:9d:65:e0:2a:04 conform
+    host a8:93:4a:f9:be:71 permit
+    host a8:93:4a:f9:be:71 conform
+    host bc:45:5b:88:ae:3a permit
+    host 7c:67:a2:ca:dc:b2 permit
+    host 7c:67:a2:ca:dc:b2 conform
+    host 3c:58:c2:5b:36:f0 permit
+    host 3c:58:c2:5b:36:f0 conform
+!
+ipv6 subnet Default
+    bind Home
+    mode slaac
+    prefix length 64
+    number 0
+!
+ipv6 local-prefix default
+ppe software
+ppe hardware
+upnp lan Home
+service dhcp
+service dns-proxy
+service igmp-proxy
+service http
+service cifs
+service telnet
+service ssh
+service ntp
+service upnp
+cifs
+    automount
+    permissive
+!
+dns-proxy
+    rebind-protect auto
+!
+easyconfig disable
+components
+    auto-update channel stable
+    auto-update schedule schedule0
+!
+cloud control2 security-level public
+!
+[K
