@@ -19,6 +19,24 @@ pub struct ConnectionConfig {
 
 /// Events emitted by the connection to the application layer.
 #[derive(Debug, Clone)]
+pub struct FriendInfo {
+    pub user_id: String,
+    pub username: String,
+    pub status: i32,
+    pub last_seen: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FriendRequestInfo {
+    pub request_id: String,
+    pub from_user_id: String,
+    pub from_username: String,
+    pub message: Option<String>,
+    pub timestamp: u64,
+    pub outgoing: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum ConnectionEvent {
     /// Authentication succeeded — user_id from server.
     Authenticated { user_id: String },
@@ -63,6 +81,35 @@ pub enum ConnectionEvent {
         user_id: String,
         username: String,
         add: bool,
+    },
+    /// Presence update from a friend.
+    PresenceUpdate {
+        identity_key: Vec<u8>,
+        status: i32,
+        status_text: Option<String>,
+        last_seen: Option<u64>,
+    },
+    /// Incoming friend request notification.
+    FriendRequestReceived {
+        request_id: String,
+        from_user_id: String,
+        from_username: String,
+        message: Option<String>,
+        timestamp: u64,
+    },
+    /// A friend request was accepted (new friend).
+    FriendAccepted {
+        user_id: String,
+        username: String,
+    },
+    /// A friend removed you.
+    FriendRemoved {
+        user_id: String,
+    },
+    /// Full friend list response.
+    FriendListReceived {
+        friends: Vec<FriendInfo>,
+        pending_requests: Vec<FriendRequestInfo>,
     },
     /// Server acknowledged our sent message.
     MessageAcked {
@@ -308,6 +355,58 @@ async fn dispatch_event(tx: &mpsc::Sender<ConnectionEvent>, env: proto::Envelope
             username: re.username,
             add: re.add,
         },
+        Some(proto::envelope::Payload::PresenceUpdate(pu)) => ConnectionEvent::PresenceUpdate {
+            identity_key: pu.identity_key,
+            status: pu.status,
+            status_text: pu.status_text,
+            last_seen: pu.last_seen,
+        },
+        Some(proto::envelope::Payload::FriendRequestEvent(fre)) => {
+            ConnectionEvent::FriendRequestReceived {
+                request_id: fre.request_id,
+                from_user_id: fre.from_user_id,
+                from_username: fre.from_username,
+                message: fre.message,
+                timestamp: fre.timestamp,
+            }
+        }
+        Some(proto::envelope::Payload::FriendAcceptedEvent(fae)) => {
+            ConnectionEvent::FriendAccepted {
+                user_id: fae.user_id,
+                username: fae.username,
+            }
+        }
+        Some(proto::envelope::Payload::FriendRemovedEvent(fre)) => {
+            ConnectionEvent::FriendRemoved {
+                user_id: fre.user_id,
+            }
+        }
+        Some(proto::envelope::Payload::FriendListResponse(flr)) => {
+            ConnectionEvent::FriendListReceived {
+                friends: flr
+                    .friends
+                    .into_iter()
+                    .map(|f| FriendInfo {
+                        user_id: f.user_id,
+                        username: f.username,
+                        status: f.status,
+                        last_seen: f.last_seen,
+                    })
+                    .collect(),
+                pending_requests: flr
+                    .pending_requests
+                    .into_iter()
+                    .map(|r| FriendRequestInfo {
+                        request_id: r.request_id,
+                        from_user_id: r.from_user_id,
+                        from_username: r.from_username,
+                        message: r.message,
+                        timestamp: r.timestamp,
+                        outgoing: r.outgoing,
+                    })
+                    .collect(),
+            }
+        }
         _ => return, // Ignore unhandled types for now
     };
     let _ = tx.send(event).await;

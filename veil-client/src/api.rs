@@ -664,6 +664,99 @@ impl VeilClient {
             let _ = db.insert_conversation(id, conv_type, name, peer_key, None);
         }
     }
+
+    // ── Friends & Presence ────────────────────────────────
+
+    /// Send a friend request to a user by user ID.
+    pub async fn send_friend_request(
+        &self,
+        target_user_id: &str,
+        message: Option<&str>,
+    ) -> Result<(), String> {
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let seq = conn.next_seq().await;
+        conn.send_envelope(&proto::Envelope {
+            seq,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::FriendRequest(
+                proto::FriendRequest {
+                    target_user_id: target_user_id.to_string(),
+                    message: message.map(|s| s.to_string()),
+                },
+            )),
+        })
+        .await
+    }
+
+    /// Respond to a friend request (accept or reject).
+    pub async fn respond_friend_request(
+        &self,
+        request_id: &str,
+        accept: bool,
+    ) -> Result<(), String> {
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let seq = conn.next_seq().await;
+        conn.send_envelope(&proto::Envelope {
+            seq,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::FriendRespond(
+                proto::FriendRespond {
+                    request_id: request_id.to_string(),
+                    accept,
+                },
+            )),
+        })
+        .await
+    }
+
+    /// Remove a friend.
+    pub async fn remove_friend(&self, user_id: &str) -> Result<(), String> {
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let seq = conn.next_seq().await;
+        conn.send_envelope(&proto::Envelope {
+            seq,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::FriendRemove(
+                proto::FriendRemove {
+                    user_id: user_id.to_string(),
+                },
+            )),
+        })
+        .await
+    }
+
+    /// Request the full friend list from the server.
+    pub async fn request_friend_list(&self) -> Result<(), String> {
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let seq = conn.next_seq().await;
+        conn.send_envelope(&proto::Envelope {
+            seq,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::FriendListRequest(
+                proto::FriendListRequest {},
+            )),
+        })
+        .await
+    }
+
+    /// Send presence update to the server.
+    pub async fn send_presence(&self, status: i32, status_text: Option<&str>) -> Result<(), String> {
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let seq = conn.next_seq().await;
+        conn.send_envelope(&proto::Envelope {
+            seq,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::PresenceUpdate(
+                proto::PresenceUpdate {
+                    identity_key: Vec::new(), // Server fills this
+                    status,
+                    status_text: status_text.map(|s| s.to_string()),
+                    last_seen: None,
+                },
+            )),
+        })
+        .await
+    }
 }
 
 impl Default for VeilClient {

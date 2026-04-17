@@ -10,6 +10,7 @@ fn main() -> Result<()> {
         "../veil-proto/veil/v1/media.proto",
         "../veil-proto/veil/v1/voice.proto",
         "../veil-proto/veil/v1/server.proto",
+        "../veil-proto/veil/v1/friends.proto",
     ];
 
     prost_build::compile_protos(&proto_files, &["../veil-proto"])?;
