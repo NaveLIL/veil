@@ -183,6 +183,47 @@ body {
   background-size: 200% 100%;
 }
 
+/* ─── Members Panel (Island 4) ─────────────────────── */
+.members-wrapper {
+  flex-shrink: 0;
+  width: 0;
+  margin-left: -8px;
+  overflow: hidden;
+  transition: width 0.35s cubic-bezier(0.4, 0, 0.2, 1),
+              margin-left 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.members-wrapper.open {
+  width: 240px;
+  margin-left: 0;
+}
+
+.members-card {
+  width: 240px;
+  height: 100%;
+  background: #2B2D31;
+  border-radius: 12px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.members-content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 0.25s ease 0.18s,
+              transform 0.25s ease 0.18s;
+}
+
+.members-wrapper.open .members-content {
+  opacity: 1;
+  transform: translateY(0);
+}
+
 .animate-pulseGlow {
   animation: pulseGlow 2.5s ease-in-out infinite;
 }

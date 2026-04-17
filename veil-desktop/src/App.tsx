@@ -1,4 +1,4 @@
-import { Component, Show, Switch, Match, For, createSignal, createEffect, onMount } from "solid-js";
+import { Component, Show, Switch, Match, For, createSignal, createEffect, onMount, onCleanup, untrack } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { appStore, type GroupMember } from "@/stores/app";
@@ -11,8 +11,48 @@ const appWindow = getCurrentWindow();
 /* ═══════════════════════════════════════════════════════
    DISCLAIMER — philosophical bridge before chat
    ═══════════════════════════════════════════════════════ */
+
+const TIPS = [
+  {
+    icon: "shield",
+    text: "No matter how strong the encryption,\nthe weakest link is always human.",
+    sub: "Stay vigilant. Trust no one blindly.",
+  },
+  {
+    icon: "shield",
+    text: "Veil uses the X3DH + Double Ratchet protocol\nfor perfect forward secrecy in every conversation.",
+    sub: "Even if keys are compromised, past messages stay safe.",
+  },
+  {
+    icon: "eye",
+    text: "Never share your recovery phrase.\nNo legitimate service will ever ask for it.",
+    sub: "Your keys, your messages. No exceptions.",
+  },
+  {
+    icon: "lock",
+    text: "Every group message is encrypted with\nSender Keys — efficient and secure at scale.",
+    sub: "Group privacy without compromise.",
+  },
+  {
+    icon: "shield",
+    text: "Verify fingerprints out-of-band\nbefore trusting a new contact.",
+    sub: "A quick call can prevent a sophisticated attack.",
+  },
+  {
+    icon: "eye",
+    text: "Metadata matters. Veil minimizes what the\nserver knows about who talks to whom.",
+    sub: "Privacy is more than just encryption.",
+  },
+  {
+    icon: "lock",
+    text: "Your PIN protects local keys with\nArgon2id key derivation — brute-force resistant.",
+    sub: "A strong PIN is your first line of defense.",
+  },
+];
+
 const DisclaimerScreen: Component = () => {
   const [phase, setPhase] = createSignal<"in" | "hold" | "out">("in");
+  const tip = TIPS[Math.floor(Math.random() * TIPS.length)];
 
   onMount(() => {
     setTimeout(() => setPhase("hold"), 50);
@@ -22,6 +62,27 @@ const DisclaimerScreen: Component = () => {
 
   const opacity = () => phase() === "hold" ? "1" : "0";
   const ty = () => phase() === "in" ? "20px" : phase() === "out" ? "-12px" : "0";
+
+  const iconSvg = () => {
+    if (tip.icon === "eye") return (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" fill="rgba(124,107,245,0.2)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
+        <circle cx="12" cy="12" r="3" fill="rgba(124,107,245,0.3)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
+      </svg>
+    );
+    if (tip.icon === "lock") return (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+        <rect x="3" y="11" width="18" height="11" rx="2" fill="rgba(124,107,245,0.2)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
+        <path d="M7 11V7a5 5 0 0 1 10 0v4" stroke="rgba(124,107,245,0.6)" stroke-width="1.5" fill="none"/>
+      </svg>
+    );
+    return (
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
+        <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"
+          fill="rgba(124,107,245,0.2)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
+      </svg>
+    );
+  };
 
   return (
     <div style={{
@@ -45,22 +106,19 @@ const DisclaimerScreen: Component = () => {
         <div style={{
           width: "48px", height: "48px", margin: "0 auto 28px", "border-radius": "14px",
           background: "rgba(124,107,245,0.08)", display: "flex",
-          "align-items": "center", "justify-content": "center",
+          "align-items": "center", "justify-content": "center", position: "relative",
         }}>
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-            <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"
-              fill="rgba(124,107,245,0.2)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
-          </svg>
+          {iconSvg()}
         </div>
         <div style={{
           "font-size": "20px", "font-weight": "400", color: "rgba(255,255,255,0.85)",
           "line-height": "1.6", "letter-spacing": "0.01em",
-          "font-style": "italic", "margin-bottom": "16px",
+          "font-style": "italic", "margin-bottom": "16px", "white-space": "pre-line",
         }}>
-          "No matter how strong the encryption,<br/>the weakest link is always human."
+          "{tip.text}"
         </div>
         <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.25)", "letter-spacing": "0.05em" }}>
-          Stay vigilant. Trust no one blindly.
+          {tip.sub}
         </div>
         <div style={{
           width: "40px", height: "2px", "border-radius": "1px",
@@ -82,12 +140,13 @@ const App: Component = () => {
   const [newPeerId, setNewPeerId] = createSignal("");
   const [newGroupName, setNewGroupName] = createSignal("");
   const [sidebarTab, setSidebarTab] = createSignal<"all" | "dm" | "group">("all");
-  const [showMemberPanel, setShowMemberPanel] = createSignal(false);
+  const [memberPanelOpen, setMemberPanelOpen] = createSignal(false);
   const [groupMembers, setGroupMembers] = createSignal<GroupMember[]>([]);
   // Staggered island entrance
   const [island1Vis, setIsland1Vis] = createSignal(false);
   const [island2Vis, setIsland2Vis] = createSignal(false);
   const [island3Vis, setIsland3Vis] = createSignal(false);
+  const [island4Vis, setIsland4Vis] = createSignal(false);
   let messagesEnd: HTMLDivElement | undefined;
 
   const conv = () => appStore.activeConversation();
@@ -110,17 +169,31 @@ const App: Component = () => {
   createEffect(() => {
     const id = appStore.activeConversationId();
     if (id) appStore.loadMessages(id);
-    setShowMemberPanel(false);
+    setMemberPanelOpen(false);
   });
 
   // Trigger staggered entrance when chat screen appears
   createEffect(() => {
-    if (appStore.screen() === "chat") {
-      setIsland1Vis(false); setIsland2Vis(false); setIsland3Vis(false);
-      setTimeout(() => setIsland1Vis(true), 80);
-      setTimeout(() => setIsland2Vis(true), 200);
-      setTimeout(() => setIsland3Vis(true), 340);
+    const screen = appStore.screen();
+
+    // Keep islands hidden outside chat so re-entry always starts from hidden state.
+    if (screen !== "chat") {
+      setIsland1Vis(false); setIsland2Vis(false); setIsland3Vis(false); setIsland4Vis(false);
+      return;
     }
+
+    setIsland1Vis(false); setIsland2Vis(false); setIsland3Vis(false); setIsland4Vis(false);
+    const t1 = setTimeout(() => setIsland1Vis(true), 80);
+    const t2 = setTimeout(() => setIsland2Vis(true), 200);
+    const t3 = setTimeout(() => setIsland3Vis(true), 340);
+    const t4 = untrack(() => memberPanelOpen()) ? setTimeout(() => setIsland4Vis(true), 480) : undefined;
+
+    onCleanup(() => {
+      clearTimeout(t1);
+      clearTimeout(t2);
+      clearTimeout(t3);
+      if (t4) clearTimeout(t4);
+    });
   });
 
   const handleSend = () => {
@@ -419,7 +492,7 @@ const App: Component = () => {
             </div>
 
             {/* ISLAND 3 — Chat */}
-            <div style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0), position: "relative" }}>
+            <div style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}>
               <Show when={conv()} fallback={
                 <div style={{ flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" }}>
                   <div style={{ width: "56px", height: "56px", "border-radius": "16px", background: "rgba(124,107,245,0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" }}>
@@ -459,13 +532,17 @@ const App: Component = () => {
                       </div>
                       <Show when={c().type === "group"}>
                         <button
-                          style={{ padding: "4px 10px", "border-radius": "6px", background: showMemberPanel() ? "rgba(124,107,245,0.15)" : "rgba(255,255,255,0.04)", border: "none", color: showMemberPanel() ? "#7c6bf5" : "#888", cursor: "pointer", "font-size": "11px", transition: "background 0.15s" }}
+                          style={{ padding: "4px 10px", "border-radius": "6px", background: memberPanelOpen() ? "rgba(124,107,245,0.15)" : "rgba(255,255,255,0.04)", border: "none", color: memberPanelOpen() ? "#7c6bf5" : "#888", cursor: "pointer", "font-size": "11px", transition: "background 0.15s" }}
                           onClick={async () => {
-                            if (!showMemberPanel()) {
+                            if (!memberPanelOpen()) {
                               const members = await appStore.getGroupMembers(c().id);
                               setGroupMembers(members);
+                              setMemberPanelOpen(true);
+                              setTimeout(() => setIsland4Vis(true), 50);
+                            } else {
+                              setIsland4Vis(false);
+                              setTimeout(() => setMemberPanelOpen(false), 450);
                             }
-                            setShowMemberPanel(!showMemberPanel());
                           }}
                           title="Group members"
                         >{"\uD83D\uDC65"} Members</button>
@@ -541,52 +618,71 @@ const App: Component = () => {
                       </div>
                     </div>
 
-                    {/* Group Member Panel */}
-                    <Show when={showMemberPanel() && c().type === "group"}>
-                      <div style={{
-                        position: "absolute", top: "0", right: "0", width: "220px", height: "100%",
-                        background: "#2B2D31", "border-left": "1px solid rgba(255,255,255,0.04)",
-                        display: "flex", "flex-direction": "column", "z-index": "10",
-                      }}>
-                        <div style={{ padding: "16px", "border-bottom": "1px solid rgba(255,255,255,0.04)" }}>
-                          <div style={{ "font-size": "12px", "font-weight": "700", color: "#eee", "text-transform": "uppercase", "letter-spacing": "0.05em" }}>
-                            Members — {groupMembers().length}
-                          </div>
-                        </div>
-                        <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 12px" }}>
-                          <For each={groupMembers()}>
-                            {(m) => (
-                              <div style={{ display: "flex", "align-items": "center", gap: "10px", padding: "8px 6px", "border-radius": "8px" }}>
-                                <div style={{ ...S.avatar(30), "font-size": "11px" }}>{m.username.charAt(0).toUpperCase()}</div>
-                                <div style={{ flex: "1", "min-width": "0" }}>
-                                  <div style={{ "font-size": "12px", "font-weight": "500", color: "#ddd", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{m.username}</div>
-                                  <Show when={m.role > 0}>
-                                    <div style={{ "font-size": "9px", color: m.role === 2 ? "#f59e0b" : "#7c6bf5", "font-weight": "600" }}>
-                                      {m.role === 2 ? "OWNER" : "ADMIN"}
-                                    </div>
-                                  </Show>
-                                </div>
-                              </div>
-                            )}
-                          </For>
-                          <Show when={groupMembers().length === 0}>
-                            <div style={{ "text-align": "center", padding: "20px 0", color: "#555", "font-size": "12px" }}>No members loaded</div>
-                          </Show>
-                        </div>
-                        {/* Placeholder: future add member button */}
-                        <div style={{ padding: "12px", "border-top": "1px solid rgba(255,255,255,0.04)" }}>
-                          <button style={{
-                            width: "100%", padding: "8px", "border-radius": "8px",
-                            background: "rgba(124,107,245,0.1)", border: "none",
-                            color: "#7c6bf5", "font-size": "11px", "font-weight": "600",
-                            cursor: "pointer",
-                          }}>+ Invite member</button>
-                        </div>
-                      </div>
-                    </Show>
+
                   </>
                 )}
               </Show>
+            </div>
+
+            {/* ISLAND 4 — Members Panel */}
+            <div style={{
+              width: memberPanelOpen() ? "240px" : "0px",
+              "margin-left": memberPanelOpen() ? "0px" : "-8px",
+              "flex-shrink": "0",
+              overflow: "hidden",
+              transition: "width 0.4s cubic-bezier(0.4,0,0.2,1), margin-left 0.4s cubic-bezier(0.4,0,0.2,1)",
+            }}>
+              <div style={{
+                width: "240px",
+                height: "100%",
+                background: "#2B2D31",
+                "border-radius": "12px",
+                display: "flex",
+                "flex-direction": "column",
+                overflow: "hidden",
+                opacity: island4Vis() ? "1" : "0",
+                transform: island4Vis() ? "translateY(0) scale(1)" : "translateY(12px) scale(0.97)",
+                transition: "opacity 0.4s ease 0.15s, transform 0.4s ease 0.15s",
+              }}>
+                <div style={{ display: "flex", "flex-direction": "column", flex: "1", "min-height": "0" }}>
+                  {/* Header */}
+                  <div style={{ padding: "16px 16px 14px", "border-bottom": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" }}>
+                    <div style={{ "font-size": "12px", "font-weight": "700", color: "#eee", "text-transform": "uppercase", "letter-spacing": "0.05em" }}>
+                      Members — {groupMembers().length}
+                    </div>
+                  </div>
+                  {/* List */}
+                  <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 12px", "min-height": "0" }}>
+                    <For each={groupMembers()}>
+                      {(m) => (
+                        <div style={{ display: "flex", "align-items": "center", gap: "10px", padding: "8px 6px", "border-radius": "8px" }}>
+                          <div style={{ ...S.avatar(30), "font-size": "11px" }}>{m.username.charAt(0).toUpperCase()}</div>
+                          <div style={{ flex: "1", "min-width": "0" }}>
+                            <div style={{ "font-size": "12px", "font-weight": "500", color: "#ddd", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{m.username}</div>
+                            <Show when={m.role > 0}>
+                              <div style={{ "font-size": "9px", color: m.role === 2 ? "#f59e0b" : "#7c6bf5", "font-weight": "600" }}>
+                                {m.role === 2 ? "OWNER" : "ADMIN"}
+                              </div>
+                            </Show>
+                          </div>
+                        </div>
+                      )}
+                    </For>
+                    <Show when={groupMembers().length === 0}>
+                      <div style={{ "text-align": "center", padding: "20px 0", color: "#555", "font-size": "12px" }}>No members loaded</div>
+                    </Show>
+                  </div>
+                  {/* Invite button */}
+                  <div style={{ padding: "12px", "border-top": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" }}>
+                    <button style={{
+                      width: "100%", padding: "8px", "border-radius": "8px",
+                      background: "rgba(124,107,245,0.1)", border: "none",
+                      color: "#7c6bf5", "font-size": "11px", "font-weight": "600",
+                      cursor: "pointer",
+                    }}>+ Invite member</button>
+                  </div>
+                </div>
+              </div>
             </div>
 
           </div>

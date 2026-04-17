@@ -80,17 +80,21 @@ fn set_pin(pin: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn verify_pin(state: State<'_, AppState>, pin: String) -> Result<bool, String> {
+async fn verify_pin(state: State<'_, AppState>, pin: String) -> Result<bool, String> {
     let stored_hash = keychain::get_seed(PIN_HASH_ACCOUNT)?;
     let stored_salt = keychain::get_seed(PIN_SALT_ACCOUNT)?;
 
-    let salt_bytes = hex::decode(&stored_salt).map_err(|e| e.to_string())?;
-    let salt: [u8; 32] = salt_bytes
-        .try_into()
-        .map_err(|_| "invalid salt length".to_string())?;
-
-    let hash = veil_crypto::kdf::derive_key_from_pin(&pin, &salt)?;
-    let matches = hex::encode(hash) == stored_hash;
+    // Run Argon2id off main thread so WebView animations keep rendering
+    let matches = tokio::task::spawn_blocking(move || -> Result<bool, String> {
+        let salt_bytes = hex::decode(&stored_salt).map_err(|e| e.to_string())?;
+        let salt: [u8; 32] = salt_bytes
+            .try_into()
+            .map_err(|_| "invalid salt length".to_string())?;
+        let hash = veil_crypto::kdf::derive_key_from_pin(&pin, &salt)?;
+        Ok(hex::encode(hash) == stored_hash)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
 
     if matches {
         // Reset activity timer on successful unlock
@@ -132,8 +136,9 @@ fn idle_seconds(state: State<'_, AppState>) -> u64 {
 // ─── DB Persistence ───────────────────────────────────
 
 /// Re-initialize client from stored seed (called after PIN unlock on restart).
+/// Async so the heavy Argon2id work runs off the main thread.
 #[tauri::command]
-fn init_from_seed(state: State<'_, AppState>) -> Result<String, String> {
+async fn init_from_seed(state: State<'_, AppState>) -> Result<String, String> {
     let mnemonic = keychain::get_seed(KEYCHAIN_ACCOUNT)?;
     let db_path = state.db_dir.join("veil.db");
     let mut client = state.client.lock().map_err(|e| e.to_string())?;

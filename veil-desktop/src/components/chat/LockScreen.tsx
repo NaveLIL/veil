@@ -55,6 +55,8 @@ export const LockScreen: Component = () => {
       const ok = await appStore.verifyPin(currentPin);
       if (ok) {
         setSuccess(true);
+        // Show green dots briefly, then go straight to chat
+        setTimeout(() => appStore.setScreen("chat"), 600);
       } else {
         setError(true);
         setErrorMsg("Incorrect PIN");

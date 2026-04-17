@@ -168,21 +168,23 @@ export const appStore = {
   verifyPin: async (pin: string): Promise<boolean> => {
     const ok = await invoke<boolean>("verify_pin", { pin });
     if (ok) {
-      // Re-initialize client from stored seed (opens encrypted DB)
-      try {
-        const key = await invoke<string>("init_from_seed");
-        setIdentity(key);
-      } catch (e) {
-        console.error("init_from_seed failed:", e);
-      }
-      // Load persisted conversations from DB
-      await appStore.loadConversations();
-      setScreen("chat");
-      appStore.startAutoLock();
-      // Reconnect to server after unlock
-      if (!connected()) {
-        appStore.connectToServer();
-      }
+      // Delay heavy init so unlock + stagger animations play smoothly.
+      // LockScreen transitions to chat at +600ms, stagger ends ~+1400ms.
+      // Starting Argon2id-heavy init_from_seed earlier saturates CPU and
+      // prevents the browser from rendering CSS transitions.
+      setTimeout(async () => {
+        try {
+          const key = await invoke<string>("init_from_seed");
+          setIdentity(key);
+        } catch (e) {
+          console.error("init_from_seed failed:", e);
+        }
+        await appStore.loadConversations();
+        appStore.startAutoLock();
+        if (!connected()) {
+          appStore.connectToServer();
+        }
+      }, 1500);
     }
     return ok;
   },
