@@ -230,6 +230,39 @@ func (db *DB) GetPendingMessages(ctx context.Context, userID string, since time.
 	return msgs, rows.Err()
 }
 
+// UpdateMessageCiphertext updates the ciphertext of a message (edit).
+// Only the original sender can edit. Returns conversation_id for fan-out.
+func (db *DB) UpdateMessageCiphertext(ctx context.Context, messageID, senderID string, newCiphertext, newHeader []byte) (string, time.Time, error) {
+	var convID string
+	var editedAt time.Time
+	err := db.Pool.QueryRow(ctx,
+		`UPDATE messages SET ciphertext = $1, header = $2, edited_at = now()
+		 WHERE id = $3::uuid AND sender_id = $4::uuid AND is_deleted = false
+		 RETURNING conversation_id, edited_at`,
+		newCiphertext, newHeader, messageID, senderID,
+	).Scan(&convID, &editedAt)
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("update message: %w", err)
+	}
+	return convID, editedAt, nil
+}
+
+// SoftDeleteMessage marks a message as deleted (wipes ciphertext).
+// Only the original sender can delete. Returns conversation_id for fan-out.
+func (db *DB) SoftDeleteMessage(ctx context.Context, messageID, senderID string) (string, error) {
+	var convID string
+	err := db.Pool.QueryRow(ctx,
+		`UPDATE messages SET is_deleted = true, ciphertext = '\x00', header = NULL, edited_at = now()
+		 WHERE id = $1::uuid AND sender_id = $2::uuid AND is_deleted = false
+		 RETURNING conversation_id`,
+		messageID, senderID,
+	).Scan(&convID)
+	if err != nil {
+		return "", fmt.Errorf("delete message: %w", err)
+	}
+	return convID, nil
+}
+
 // --- Conversations ---
 
 // FindOrCreateDM finds an existing DM conversation between two users, or creates one.
@@ -499,4 +532,56 @@ type SenderKeyRow struct {
 	TargetDeviceID string
 	EncryptedKey   []byte
 	Generation     int
+}
+
+// --- Reactions ---
+
+// AddReaction inserts a reaction (idempotent — ignores conflict).
+func (db *DB) AddReaction(ctx context.Context, messageID, conversationID, userID, emoji string) error {
+	_, err := db.Pool.Exec(ctx,
+		`INSERT INTO reactions (message_id, conversation_id, user_id, emoji)
+		 VALUES ($1, $2, $3, $4)
+		 ON CONFLICT DO NOTHING`,
+		messageID, conversationID, userID, emoji,
+	)
+	return err
+}
+
+// RemoveReaction deletes a specific reaction.
+func (db *DB) RemoveReaction(ctx context.Context, messageID, userID, emoji string) error {
+	_, err := db.Pool.Exec(ctx,
+		`DELETE FROM reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3`,
+		messageID, userID, emoji,
+	)
+	return err
+}
+
+// Reaction represents a single stored reaction.
+type Reaction struct {
+	MessageID      string
+	ConversationID string
+	UserID         string
+	Emoji          string
+}
+
+// GetReactionsForMessages returns all reactions for the given message IDs.
+func (db *DB) GetReactionsForMessages(ctx context.Context, messageIDs []string) ([]Reaction, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT message_id, conversation_id, user_id, emoji
+		 FROM reactions WHERE message_id = ANY($1)`,
+		messageIDs,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Reaction
+	for rows.Next() {
+		var r Reaction
+		if err := rows.Scan(&r.MessageID, &r.ConversationID, &r.UserID, &r.Emoji); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }

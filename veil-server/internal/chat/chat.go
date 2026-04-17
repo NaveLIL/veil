@@ -94,6 +94,84 @@ func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, ms
 	return dbMsg.ID, dbMsg.CreatedAt, recipients, nil
 }
 
+// HandleEditMessage processes a client's edit_message request.
+// Returns: edit timestamp, list of recipient user IDs for fan-out.
+func (s *Service) HandleEditMessage(ctx context.Context, senderUserID string, msg *pb.EditMessage) (time.Time, []string, error) {
+	if len(msg.NewCiphertext) == 0 {
+		return time.Time{}, nil, errors.New("empty ciphertext")
+	}
+	if len(msg.NewCiphertext) > s.cfg.MaxMessageSize {
+		return time.Time{}, nil, ErrMessageTooBig
+	}
+
+	convID, editedAt, err := s.db.UpdateMessageCiphertext(ctx, msg.MessageId, senderUserID, msg.NewCiphertext, msg.NewHeader)
+	if err != nil {
+		return time.Time{}, nil, fmt.Errorf("edit message: %w", err)
+	}
+
+	members, err := s.db.GetConversationMembers(ctx, convID)
+	if err != nil {
+		return time.Time{}, nil, fmt.Errorf("get members: %w", err)
+	}
+
+	var recipients []string
+	for _, uid := range members {
+		if uid != senderUserID {
+			recipients = append(recipients, uid)
+		}
+	}
+	return editedAt, recipients, nil
+}
+
+// HandleDeleteMessage processes a client's delete_message request.
+// Returns: list of recipient user IDs for fan-out.
+func (s *Service) HandleDeleteMessage(ctx context.Context, senderUserID string, msg *pb.DeleteMessage) ([]string, error) {
+	convID, err := s.db.SoftDeleteMessage(ctx, msg.MessageId, senderUserID)
+	if err != nil {
+		return nil, fmt.Errorf("delete message: %w", err)
+	}
+
+	members, err := s.db.GetConversationMembers(ctx, convID)
+	if err != nil {
+		return nil, fmt.Errorf("get members: %w", err)
+	}
+
+	var recipients []string
+	for _, uid := range members {
+		if uid != senderUserID {
+			recipients = append(recipients, uid)
+		}
+	}
+	return recipients, nil
+}
+
+// HandleReaction processes a client's reaction_update request.
+// Returns: list of recipient user IDs for fan-out.
+func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *pb.ReactionUpdate) ([]string, error) {
+	if msg.Add {
+		if err := s.db.AddReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji); err != nil {
+			return nil, fmt.Errorf("add reaction: %w", err)
+		}
+	} else {
+		if err := s.db.RemoveReaction(ctx, msg.MessageId, senderUserID, msg.Emoji); err != nil {
+			return nil, fmt.Errorf("remove reaction: %w", err)
+		}
+	}
+
+	members, err := s.db.GetConversationMembers(ctx, msg.ConversationId)
+	if err != nil {
+		return nil, fmt.Errorf("get members: %w", err)
+	}
+
+	var recipients []string
+	for _, uid := range members {
+		if uid != senderUserID {
+			recipients = append(recipients, uid)
+		}
+	}
+	return recipients, nil
+}
+
 // HandlePreKeyRequest fetches a prekey bundle for establishing an X3DH session.
 func (s *Service) HandlePreKeyRequest(ctx context.Context, targetIdentityKey []byte) (*pb.PreKeyBundle, error) {
 	// Find user

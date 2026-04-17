@@ -227,6 +227,12 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 		switch p := env.Payload.(type) {
 		case *pb.Envelope_SendMessage:
 			c.handleSendMessage(ctx, env.Seq, p.SendMessage)
+		case *pb.Envelope_EditMessage:
+			c.handleEditMessage(ctx, env.Seq, p.EditMessage)
+		case *pb.Envelope_DeleteMessage:
+			c.handleDeleteMessage(ctx, env.Seq, p.DeleteMessage)
+		case *pb.Envelope_ReactionUpdate:
+			c.handleReaction(ctx, env.Seq, p.ReactionUpdate)
 		case *pb.Envelope_PrekeyRequest:
 			c.handlePreKeyRequest(ctx, env.Seq, p.PrekeyRequest)
 		case *pb.Envelope_TypingEvent:
@@ -329,6 +335,154 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 	}
 	eventData, _ := proto.Marshal(event)
 
+	for _, recipientID := range recipients {
+		c.hub.sendToUser(recipientID, eventData)
+	}
+}
+
+// --- Edit Message ---
+
+func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.EditMessage) {
+	editedAt, recipients, err := c.hub.chatSvc.HandleEditMessage(ctx, c.userID, msg)
+	if err != nil {
+		c.sendError(seq, 400, err.Error())
+		return
+	}
+
+	// ACK to sender
+	c.sendEnvelope(&pb.Envelope{
+		Seq:       seq,
+		Timestamp: uint64(editedAt.UnixNano()),
+		Payload: &pb.Envelope_MessageAck{
+			MessageAck: &pb.MessageAck{
+				MessageId:       msg.MessageId,
+				ServerTimestamp: uint64(editedAt.UnixNano()),
+				RefSeq:          seq,
+			},
+		},
+	})
+
+	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
+	var senderKey []byte
+	var senderName string
+	if sender != nil {
+		senderKey = sender.IdentityKey
+		senderName = sender.Username
+	}
+
+	editTs := uint64(editedAt.UnixNano())
+	event := &pb.Envelope{
+		Timestamp: editTs,
+		Payload: &pb.Envelope_MessageEvent{
+			MessageEvent: &pb.MessageEvent{
+				EventType:         pb.MessageEvent_EDITED,
+				MessageId:         msg.MessageId,
+				ConversationId:    msg.ConversationId,
+				SenderIdentityKey: senderKey,
+				SenderUsername:    senderName,
+				ServerTimestamp:   editTs,
+				Ciphertext:        msg.NewCiphertext,
+				Header:            msg.NewHeader,
+				EditTimestamp:     &editTs,
+			},
+		},
+	}
+	eventData, _ := proto.Marshal(event)
+	for _, recipientID := range recipients {
+		c.hub.sendToUser(recipientID, eventData)
+	}
+}
+
+// --- Delete Message ---
+
+func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.DeleteMessage) {
+	recipients, err := c.hub.chatSvc.HandleDeleteMessage(ctx, c.userID, msg)
+	if err != nil {
+		c.sendError(seq, 400, err.Error())
+		return
+	}
+
+	now := uint64(time.Now().UnixNano())
+
+	// ACK to sender
+	c.sendEnvelope(&pb.Envelope{
+		Seq:       seq,
+		Timestamp: now,
+		Payload: &pb.Envelope_MessageAck{
+			MessageAck: &pb.MessageAck{
+				MessageId:       msg.MessageId,
+				ServerTimestamp: now,
+				RefSeq:          seq,
+			},
+		},
+	})
+
+	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
+	var senderKey []byte
+	var senderName string
+	if sender != nil {
+		senderKey = sender.IdentityKey
+		senderName = sender.Username
+	}
+
+	event := &pb.Envelope{
+		Timestamp: now,
+		Payload: &pb.Envelope_MessageEvent{
+			MessageEvent: &pb.MessageEvent{
+				EventType:         pb.MessageEvent_DELETED,
+				MessageId:         msg.MessageId,
+				ConversationId:    msg.ConversationId,
+				SenderIdentityKey: senderKey,
+				SenderUsername:    senderName,
+				ServerTimestamp:   now,
+			},
+		},
+	}
+	eventData, _ := proto.Marshal(event)
+	for _, recipientID := range recipients {
+		c.hub.sendToUser(recipientID, eventData)
+	}
+}
+
+// --- Reactions ---
+
+func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.ReactionUpdate) {
+	recipients, err := c.hub.chatSvc.HandleReaction(ctx, c.userID, msg)
+	if err != nil {
+		c.sendError(seq, 400, err.Error())
+		return
+	}
+
+	// ACK to sender
+	now := uint64(time.Now().UnixNano())
+	c.sendEnvelope(&pb.Envelope{
+		Seq:       seq,
+		Timestamp: now,
+		Payload:   &pb.Envelope_MessageAck{MessageAck: &pb.MessageAck{MessageId: msg.MessageId, ServerTimestamp: now, RefSeq: seq}},
+	})
+
+	// Lookup sender info
+	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
+	var senderName string
+	if sender != nil {
+		senderName = sender.Username
+	}
+
+	// Fan-out ReactionEvent to other members
+	event := &pb.Envelope{
+		Timestamp: now,
+		Payload: &pb.Envelope_ReactionEvent{
+			ReactionEvent: &pb.ReactionEvent{
+				MessageId:      msg.MessageId,
+				ConversationId: msg.ConversationId,
+				Emoji:          msg.Emoji,
+				UserId:         c.userID,
+				Username:       senderName,
+				Add:            msg.Add,
+			},
+		},
+	}
+	eventData, _ := proto.Marshal(event)
 	for _, recipientID := range recipients {
 		c.hub.sendToUser(recipientID, eventData)
 	}
