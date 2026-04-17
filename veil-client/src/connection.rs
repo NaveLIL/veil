@@ -33,6 +33,36 @@ pub enum ConnectionEvent {
         ciphertext: Vec<u8>,
         header: Vec<u8>,
         server_timestamp: u64,
+        reply_to_id: Option<String>,
+    },
+    /// A message was edited by its sender.
+    MessageEdited {
+        message_id: String,
+        conversation_id: String,
+        sender_identity_key: Vec<u8>,
+        ciphertext: Vec<u8>,
+        header: Vec<u8>,
+        edit_timestamp: u64,
+    },
+    /// A message was deleted by its sender.
+    MessageDeleted {
+        message_id: String,
+        conversation_id: String,
+    },
+    /// A remote user started/stopped typing.
+    TypingEvent {
+        conversation_id: String,
+        identity_key: Vec<u8>,
+        started: bool,
+    },
+    /// A reaction was added/removed on a message.
+    ReactionEvent {
+        message_id: String,
+        conversation_id: String,
+        emoji: String,
+        user_id: String,
+        username: String,
+        add: bool,
     },
     /// Server acknowledged our sent message.
     MessageAcked {
@@ -230,15 +260,32 @@ impl Connection {
 /// Dispatch a received Envelope into a typed ConnectionEvent.
 async fn dispatch_event(tx: &mpsc::Sender<ConnectionEvent>, env: proto::Envelope) {
     let event = match env.payload {
-        Some(proto::envelope::Payload::MessageEvent(me)) => ConnectionEvent::MessageReceived {
-            message_id: me.message_id,
-            conversation_id: me.conversation_id,
-            sender_identity_key: me.sender_identity_key,
-            sender_username: me.sender_username,
-            ciphertext: me.ciphertext.unwrap_or_default(),
-            header: me.header.unwrap_or_default(),
-            server_timestamp: me.server_timestamp,
-        },
+        Some(proto::envelope::Payload::MessageEvent(me)) => {
+            match me.event_type() {
+                proto::message_event::EventType::Edited => ConnectionEvent::MessageEdited {
+                    message_id: me.message_id,
+                    conversation_id: me.conversation_id,
+                    sender_identity_key: me.sender_identity_key,
+                    ciphertext: me.ciphertext.unwrap_or_default(),
+                    header: me.header.unwrap_or_default(),
+                    edit_timestamp: me.edit_timestamp.unwrap_or(me.server_timestamp),
+                },
+                proto::message_event::EventType::Deleted => ConnectionEvent::MessageDeleted {
+                    message_id: me.message_id,
+                    conversation_id: me.conversation_id,
+                },
+                _ => ConnectionEvent::MessageReceived {
+                    message_id: me.message_id,
+                    conversation_id: me.conversation_id,
+                    sender_identity_key: me.sender_identity_key,
+                    sender_username: me.sender_username,
+                    ciphertext: me.ciphertext.unwrap_or_default(),
+                    header: me.header.unwrap_or_default(),
+                    server_timestamp: me.server_timestamp,
+                    reply_to_id: me.reply_to_id,
+                },
+            }
+        }
         Some(proto::envelope::Payload::MessageAck(ack)) => ConnectionEvent::MessageAcked {
             message_id: ack.message_id,
             server_timestamp: ack.server_timestamp,
@@ -247,6 +294,19 @@ async fn dispatch_event(tx: &mpsc::Sender<ConnectionEvent>, env: proto::Envelope
         Some(proto::envelope::Payload::Error(e)) => ConnectionEvent::Error {
             code: e.code,
             message: e.message,
+        },
+        Some(proto::envelope::Payload::TypingEvent(te)) => ConnectionEvent::TypingEvent {
+            conversation_id: te.conversation_id,
+            identity_key: te.identity_key,
+            started: te.started,
+        },
+        Some(proto::envelope::Payload::ReactionEvent(re)) => ConnectionEvent::ReactionEvent {
+            message_id: re.message_id,
+            conversation_id: re.conversation_id,
+            emoji: re.emoji,
+            user_id: re.user_id,
+            username: re.username,
+            add: re.add,
         },
         _ => return, // Ignore unhandled types for now
     };

@@ -151,6 +151,14 @@ impl VeilDb {
                 is_outgoing INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (group_id, sender_identity_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS reactions (
+                message_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                emoji TEXT NOT NULL,
+                username TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (message_id, user_id, emoji)
             );",
             )
             .map_err(|e| format!("migrations: {e}"))
@@ -222,11 +230,12 @@ impl VeilDb {
         plaintext: &str,
         is_outgoing: bool,
         server_timestamp: Option<i64>,
+        reply_to_id: Option<&str>,
     ) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT OR IGNORE INTO messages (id, conversation_id, sender_key, plaintext, is_outgoing, status, server_timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT OR IGNORE INTO messages (id, conversation_id, sender_key, plaintext, is_outgoing, status, server_timestamp, reply_to_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     id,
                     conversation_id,
@@ -235,6 +244,7 @@ impl VeilDb {
                     is_outgoing as u8,
                     if is_outgoing { 1u8 } else { 0u8 },
                     server_timestamp,
+                    reply_to_id,
                 ],
             )
             .map_err(|e| format!("insert message: {e}"))?;
@@ -291,6 +301,32 @@ impl VeilDb {
 
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect: {e}"))
+    }
+
+    /// Update the plaintext of an existing message (edit).
+    pub fn update_message_text(&self, message_id: &str, new_text: &str) -> Result<(), String> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE messages SET plaintext = ?1 WHERE id = ?2",
+                rusqlite::params![new_text, message_id],
+            )
+            .map_err(|e| format!("update message text: {e}"))?;
+        if updated == 0 {
+            return Err("message not found".to_string());
+        }
+        Ok(())
+    }
+
+    /// Delete a message by ID (hard delete from local store).
+    pub fn delete_message(&self, message_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM messages WHERE id = ?1",
+                rusqlite::params![message_id],
+            )
+            .map_err(|e| format!("delete message: {e}"))?;
+        Ok(())
     }
 
     // ─── CRUD: Ratchet Sessions ───────────────────────────
@@ -429,6 +465,58 @@ impl VeilDb {
             )
             .map_err(|e| format!("delete sender keys: {e}"))?;
         Ok(())
+    }
+
+    // ─── CRUD: Reactions ──────────────────────────────────
+
+    pub fn add_reaction(
+        &self,
+        message_id: &str,
+        user_id: &str,
+        emoji: &str,
+        username: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO reactions (message_id, user_id, emoji, username)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![message_id, user_id, emoji, username],
+            )
+            .map_err(|e| format!("add reaction: {e}"))?;
+        Ok(())
+    }
+
+    pub fn remove_reaction(
+        &self,
+        message_id: &str,
+        user_id: &str,
+        emoji: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM reactions WHERE message_id = ?1 AND user_id = ?2 AND emoji = ?3",
+                rusqlite::params![message_id, user_id, emoji],
+            )
+            .map_err(|e| format!("remove reaction: {e}"))?;
+        Ok(())
+    }
+
+    /// Returns all reactions for a given message: Vec<(emoji, user_id, username)>
+    pub fn get_reactions(&self, message_id: &str) -> Result<Vec<(String, String, String)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT emoji, user_id, username FROM reactions WHERE message_id = ?1")
+            .map_err(|e| format!("prepare reactions: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![message_id], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .map_err(|e| format!("query reactions: {e}"))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| format!("read reaction: {e}"))?);
+        }
+        Ok(out)
     }
 }
 

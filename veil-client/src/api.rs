@@ -191,6 +191,7 @@ impl VeilClient {
         &mut self,
         conversation_id: &str,
         plaintext: &str,
+        reply_to_id: Option<&str>,
     ) -> Result<u64, String> {
         // Encrypt first (needs mutable borrow)
         let (ciphertext, header_bytes) = self.encrypt_outgoing(conversation_id, plaintext)?;
@@ -204,7 +205,7 @@ impl VeilClient {
             ciphertext,
             header: header_bytes,
             msg_type: proto::MessageType::Text.into(),
-            reply_to_id: None,
+            reply_to_id: reply_to_id.map(|s| s.to_string()),
             ttl_seconds: None,
             attachments: vec![],
             sealed: false,
@@ -222,7 +223,7 @@ impl VeilClient {
         if let Some(ref db) = self.db {
             let our_key = self.identity_key().unwrap_or([0u8; 32]);
             let msg_id = uuid::Uuid::new_v4().to_string();
-            let _ = db.insert_message(&msg_id, conversation_id, &our_key, plaintext, true, None);
+            let _ = db.insert_message(&msg_id, conversation_id, &our_key, plaintext, true, None, reply_to_id);
         }
 
         Ok(seq)
@@ -484,6 +485,7 @@ impl VeilClient {
         sender_key: &[u8],
         plaintext: &str,
         server_timestamp: Option<i64>,
+        reply_to_id: Option<&str>,
     ) {
         if let Some(ref db) = self.db {
             let _ = db.insert_message(
@@ -493,7 +495,160 @@ impl VeilClient {
                 plaintext,
                 false,
                 server_timestamp,
+                reply_to_id,
             );
+        }
+    }
+
+    /// Send an edit_message to the server.
+    pub async fn edit_message(
+        &mut self,
+        message_id: &str,
+        conversation_id: &str,
+        new_text: &str,
+    ) -> Result<u64, String> {
+        let (ciphertext, header_bytes) = self.encrypt_outgoing(conversation_id, new_text)?;
+
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let seq = conn.next_seq().await;
+
+        let edit_msg = proto::EditMessage {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            new_ciphertext: ciphertext,
+            new_header: header_bytes,
+        };
+
+        let env = proto::Envelope {
+            seq,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::EditMessage(edit_msg)),
+        };
+
+        conn.send_envelope(&env).await?;
+
+        // Update local DB
+        if let Some(ref db) = self.db {
+            let _ = db.update_message_text(message_id, new_text);
+        }
+
+        Ok(seq)
+    }
+
+    /// Send a delete_message to the server.
+    pub async fn delete_message(
+        &mut self,
+        message_id: &str,
+        conversation_id: &str,
+    ) -> Result<u64, String> {
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let seq = conn.next_seq().await;
+
+        let del_msg = proto::DeleteMessage {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+        };
+
+        let env = proto::Envelope {
+            seq,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::DeleteMessage(del_msg)),
+        };
+
+        conn.send_envelope(&env).await?;
+
+        // Delete from local DB
+        if let Some(ref db) = self.db {
+            let _ = db.delete_message(message_id);
+        }
+
+        Ok(seq)
+    }
+
+    /// Send a typing indicator to a conversation.
+    pub async fn send_typing(
+        &mut self,
+        conversation_id: &str,
+        started: bool,
+    ) -> Result<(), String> {
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let identity_key = self
+            .identity
+            .as_ref()
+            .ok_or("no identity")?
+            .x25519_public_bytes()
+            .to_vec();
+
+        let env = proto::Envelope {
+            seq: conn.next_seq().await,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::TypingEvent(proto::TypingEvent {
+                conversation_id: conversation_id.to_string(),
+                identity_key,
+                started,
+            })),
+        };
+        conn.send_envelope(&env).await
+    }
+
+    /// Send a reaction (add or remove) to the server.
+    pub async fn send_reaction(
+        &mut self,
+        message_id: &str,
+        conversation_id: &str,
+        emoji: &str,
+        add: bool,
+    ) -> Result<(), String> {
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let env = proto::Envelope {
+            seq: conn.next_seq().await,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::ReactionUpdate(
+                proto::ReactionUpdate {
+                    message_id: message_id.to_string(),
+                    conversation_id: conversation_id.to_string(),
+                    emoji: emoji.to_string(),
+                    add,
+                },
+            )),
+        };
+        conn.send_envelope(&env).await
+    }
+
+    /// Add a reaction to local DB.
+    pub fn add_local_reaction(&self, message_id: &str, user_id: &str, emoji: &str, username: &str) {
+        if let Some(ref db) = self.db {
+            let _ = db.add_reaction(message_id, user_id, emoji, username);
+        }
+    }
+
+    /// Remove a reaction from local DB.
+    pub fn remove_local_reaction(&self, message_id: &str, user_id: &str, emoji: &str) {
+        if let Some(ref db) = self.db {
+            let _ = db.remove_reaction(message_id, user_id, emoji);
+        }
+    }
+
+    /// Get reactions for a message from local DB.
+    pub fn get_local_reactions(&self, message_id: &str) -> Vec<(String, String, String)> {
+        if let Some(ref db) = self.db {
+            db.get_reactions(message_id).unwrap_or_default()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Update a message in local DB (for incoming edits).
+    pub fn update_local_message(&self, message_id: &str, new_text: &str) {
+        if let Some(ref db) = self.db {
+            let _ = db.update_message_text(message_id, new_text);
+        }
+    }
+
+    /// Delete a message from local DB (for incoming deletes).
+    pub fn delete_local_message(&self, message_id: &str) {
+        if let Some(ref db) = self.db {
+            let _ = db.delete_message(message_id);
         }
     }
 
