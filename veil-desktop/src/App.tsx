@@ -367,19 +367,6 @@ const App: Component = () => {
 
                 <div style={{ width: "28px", height: "2px", background: "rgba(255,255,255,0.06)", "border-radius": "1px" }} />
 
-                {/* Friends */}
-                <button
-                  style={S.railBtn(showFriendsPanel())}
-                  onClick={() => setShowFriendsPanel(!showFriendsPanel())}
-                  title="Friends"
-                >
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-                    <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                    <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="1.8"/>
-                    <path d="M22 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                  </svg>
-                </button>
-
                 {/* Future servers will appear here */}
                 <For each={appStore.servers()}>
                   {(s) => (
@@ -404,6 +391,36 @@ const App: Component = () => {
 
             {/* ISLAND 2 — Sidebar */}
             <div style={{ ...S.island("256px"), ...S.islandAnim(island2Vis(), 0) }}>
+              {/* Friends button — Discord-style */}
+              <button
+                style={{
+                  display: "flex", "align-items": "center", gap: "10px",
+                  width: "100%", padding: "12px 20px", border: "none",
+                  background: showFriendsPanel() ? "rgba(124,107,245,0.1)" : "transparent",
+                  color: showFriendsPanel() ? "#7c6bf5" : "#999",
+                  cursor: "pointer", "font-size": "13px", "font-weight": "600",
+                  "border-bottom": "1px solid rgba(255,255,255,0.04)",
+                  transition: "background 0.15s, color 0.15s",
+                  "flex-shrink": "0",
+                }}
+                onClick={() => {
+                  setShowFriendsPanel(true);
+                  appStore.setActiveConversationId("");
+                }}
+              >
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                  <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                  <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="1.8"/>
+                  <path d="M22 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                Friends
+                <Show when={appStore.friendRequests().filter(r => !r.outgoing).length > 0}>
+                  <span style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "#7c6bf5", display: "inline-flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "#fff", "font-weight": "700", padding: "0 5px", "margin-left": "auto" }}>
+                    {appStore.friendRequests().filter(r => !r.outgoing).length}
+                  </span>
+                </Show>
+              </button>
+
               <div style={S.sidebarHeader}>
                 <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", "margin-bottom": "12px" }}>
                   <span style={{ "font-size": "15px", "font-weight": "700", color: "#eee" }}>Messages</span>
@@ -499,39 +516,68 @@ const App: Component = () => {
                   }
                 >
                   <For each={filtered()}>
-                    {(c) => (
-                      <button
-                        style={S.contactBtn(appStore.activeConversationId() === c.id)}
-                        onClick={() => appStore.selectConversation(c.id)}
-                        onMouseEnter={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "rgba(255,255,255,0.03)"; }}
-                        onMouseLeave={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "transparent"; }}
-                      >
-                        <div style={{
-                          ...S.avatar(36),
-                          "border-radius": c.type === "group" ? "10px" : "50%",
-                          background: c.type === "group" ? "rgba(124,107,245,0.12)" : "#36373D",
-                          color: c.type === "group" ? "#7c6bf5" : "#999",
-                        }}>
-                          {c.type === "group" ? "\uD83D\uDC65" : c.name.charAt(0).toUpperCase()}
-                        </div>
-                        <div style={{ flex: "1", "min-width": "0" }}>
-                          <div style={{ display: "flex", "align-items": "center", gap: "6px" }}>
-                            <span style={{ "font-size": "13px", "font-weight": "500", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{c.name}</span>
-                            <Show when={c.type === "group"}>
-                              <span style={{ "font-size": "9px", "font-weight": "600", color: "#7c6bf5", background: "rgba(124,107,245,0.1)", padding: "1px 5px", "border-radius": "4px" }}>GRP</span>
+                    {(c) => {
+                      const isFriend = () => c.type === "dm" && appStore.friends().some(f => f.username === c.name || f.userId === c.id);
+                      return (
+                      <ContextMenu>
+                        <ContextMenuTrigger>
+                          <button
+                            style={S.contactBtn(appStore.activeConversationId() === c.id)}
+                            onClick={() => { setShowFriendsPanel(false); appStore.selectConversation(c.id); }}
+                            onMouseEnter={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "rgba(255,255,255,0.03)"; }}
+                            onMouseLeave={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "transparent"; }}
+                          >
+                            <div style={{
+                              ...S.avatar(36),
+                              "border-radius": c.type === "group" ? "10px" : "50%",
+                              background: c.type === "group" ? "rgba(124,107,245,0.12)" : "#36373D",
+                              color: c.type === "group" ? "#7c6bf5" : "#999",
+                            }}>
+                              {c.type === "group" ? "\uD83D\uDC65" : c.name.charAt(0).toUpperCase()}
+                            </div>
+                            <div style={{ flex: "1", "min-width": "0" }}>
+                              <div style={{ display: "flex", "align-items": "center", gap: "6px" }}>
+                                <span style={{ "font-size": "13px", "font-weight": "500", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{c.name}</span>
+                                <Show when={c.type === "group"}>
+                                  <span style={{ "font-size": "9px", "font-weight": "600", color: "#7c6bf5", background: "rgba(124,107,245,0.1)", padding: "1px 5px", "border-radius": "4px" }}>GRP</span>
+                                </Show>
+                              </div>
+                              <Show when={c.lastMessage}>
+                                <div style={{ "font-size": "11px", color: "#666", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "margin-top": "2px" }}>{c.lastMessage}</div>
+                              </Show>
+                            </div>
+                            <Show when={c.unreadCount > 0}>
+                              <div style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "#7c6bf5", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "#fff", "font-weight": "700", padding: "0 5px" }}>
+                                {c.unreadCount}
+                              </div>
                             </Show>
-                          </div>
-                          <Show when={c.lastMessage}>
-                            <div style={{ "font-size": "11px", color: "#666", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "margin-top": "2px" }}>{c.lastMessage}</div>
+                          </button>
+                        </ContextMenuTrigger>
+                        <ContextMenuContent>
+                          <ContextMenuItem onSelect={() => { setShowFriendsPanel(false); appStore.selectConversation(c.id); }}>
+                            <ContextMenuIcon>{"\uD83D\uDCAC"}</ContextMenuIcon>
+                            Open
+                          </ContextMenuItem>
+                          <Show when={c.type === "dm"}>
+                            <ContextMenuSeparator />
+                            <Show when={!isFriend()} fallback={
+                              <ContextMenuItem variant="danger" onSelect={() => {
+                                const friend = appStore.friends().find(f => f.username === c.name || f.userId === c.id);
+                                if (friend) appStore.removeFriend(friend.userId);
+                              }}>
+                                <ContextMenuIcon>{"\u2717"}</ContextMenuIcon>
+                                Remove Friend
+                              </ContextMenuItem>
+                            }>
+                              <ContextMenuItem onSelect={() => appStore.sendFriendRequest(c.id)}>
+                                <ContextMenuIcon>{"\uD83D\uDC64"}</ContextMenuIcon>
+                                Add Friend
+                              </ContextMenuItem>
+                            </Show>
                           </Show>
-                        </div>
-                        <Show when={c.unreadCount > 0}>
-                          <div style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "#7c6bf5", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "#fff", "font-weight": "700", padding: "0 5px" }}>
-                            {c.unreadCount}
-                          </div>
-                        </Show>
-                      </button>
-                    )}
+                        </ContextMenuContent>
+                      </ContextMenu>
+                    );}}
                   </For>
                 </Show>
               </div>
@@ -559,7 +605,7 @@ const App: Component = () => {
 
             {/* ISLAND 3 — Chat or Friends */}
             <div style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}>
-              <Show when={!showFriendsPanel()} fallback={<FriendsPanel />}>
+              <Show when={!showFriendsPanel()} fallback={<FriendsPanel onNavigate={() => setShowFriendsPanel(false)} />}>
               <Show when={conv()} fallback={
                 <div style={{ flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" }}>
                   <div style={{ width: "56px", height: "56px", "border-radius": "16px", background: "rgba(124,107,245,0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" }}>

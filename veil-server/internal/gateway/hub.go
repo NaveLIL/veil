@@ -643,6 +643,17 @@ func (c *Client) handleFriendRequest(ctx context.Context, seq uint64, req *pb.Fr
 		return
 	}
 
+	// Check if there's already a pending request (either direction)
+	pending, err := c.hub.chatSvc.DB().HasPendingFriendRequest(ctx, c.userID, req.TargetUserId)
+	if err != nil {
+		c.sendError(seq, 500, "internal error")
+		return
+	}
+	if pending {
+		c.sendError(seq, 409, "friend request already pending")
+		return
+	}
+
 	var msg *string
 	if req.Message != nil {
 		msg = req.Message
@@ -672,7 +683,7 @@ func (c *Client) handleFriendRequest(ctx context.Context, seq uint64, req *pb.Fr
 			FriendRequestEvent: &pb.FriendRequestEvent{
 				RequestId:    reqID,
 				FromUserId:   c.userID,
-				FromUsername:  c.username,
+				FromUsername: c.username,
 				Message:      &msgStr,
 				Timestamp:    uint64(createdAt.UnixNano()),
 			},
@@ -828,7 +839,7 @@ func (c *Client) handleFriendListRequest(ctx context.Context, seq uint64) {
 		entry := &pb.FriendRequestEntry{
 			RequestId:    r.ID,
 			FromUserId:   r.FromUserID,
-			FromUsername:  otherUsername,
+			FromUsername: otherUsername,
 			Timestamp:    uint64(r.CreatedAt.UnixNano()),
 			Outgoing:     outgoing,
 		}

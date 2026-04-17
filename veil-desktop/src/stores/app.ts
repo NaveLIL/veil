@@ -255,12 +255,36 @@ export const appStore = {
   },
 
   /** Send a friend request to a user by their user_id. */
-  sendFriendRequest: async (targetUserId: string, message?: string) => {
+  /** Send a friend request. Returns "sent" | "already_pending" | "already_friends" | "error". */
+  sendFriendRequest: async (targetUserId: string, message?: string): Promise<string> => {
+    // Local duplicate check — if already pending, don't even bother the server
+    const existing = friendRequests().find(
+      (r) => (r.outgoing && r.fromUserId === targetUserId) || (!r.outgoing && r.fromUserId === targetUserId),
+    );
+    if (existing) return "already_pending";
+    const alreadyFriend = friends().some((f) => f.userId === targetUserId);
+    if (alreadyFriend) return "already_friends";
+
     try {
       await invoke("send_friend_request", { targetUserId, message: message ?? null });
+      // Optimistically add outgoing request so it appears in Pending immediately
+      setFriendRequests((prev) => [
+        ...prev,
+        {
+          requestId: `outgoing-${targetUserId}-${Date.now()}`,
+          fromUserId: targetUserId,
+          fromUsername: targetUserId.slice(0, 8),
+          message,
+          timestamp: Date.now() * 1_000_000,
+          outgoing: true,
+        },
+      ]);
+      // Also request the real list from server (will overwrite optimistic entry)
+      await invoke("request_friend_list");
+      return "sent";
     } catch (e) {
       console.error("sendFriendRequest failed:", e);
-      throw e;
+      return "error";
     }
   },
 

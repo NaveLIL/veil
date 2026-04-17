@@ -620,6 +620,20 @@ func (db *DB) CreateFriendRequest(ctx context.Context, fromUserID, toUserID stri
 	return id, createdAt, nil
 }
 
+// HasPendingFriendRequest checks if there is already a pending request between two users (in either direction).
+func (db *DB) HasPendingFriendRequest(ctx context.Context, fromUserID, toUserID string) (bool, error) {
+	var exists bool
+	err := db.Pool.QueryRow(ctx,
+		`SELECT EXISTS(
+			SELECT 1 FROM friend_requests
+			WHERE ((from_user_id = $1 AND to_user_id = $2) OR (from_user_id = $2 AND to_user_id = $1))
+			AND status = 0
+		)`,
+		fromUserID, toUserID,
+	).Scan(&exists)
+	return exists, err
+}
+
 // GetPendingFriendRequests returns all pending requests for a user (both incoming and outgoing).
 func (db *DB) GetPendingFriendRequests(ctx context.Context, userID string) ([]FriendRequest, error) {
 	rows, err := db.Pool.Query(ctx,
