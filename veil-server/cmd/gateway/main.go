@@ -14,6 +14,7 @@ import (
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
 	"github.com/AegisSec/veil-server/internal/gateway"
+	"github.com/AegisSec/veil-server/internal/servers"
 )
 
 func main() {
@@ -51,6 +52,11 @@ func main() {
 	// Chat REST endpoints (message sync, conversations)
 	chatHandler := chat.NewHandler(chatSvc)
 	chatHandler.RegisterRoutes(mux)
+
+	// Servers / Channels / Roles / Invites REST endpoints
+	serversSvc := servers.NewService(database, hub)
+	serversHandler := servers.NewHandler(serversSvc)
+	serversHandler.RegisterRoutes(mux)
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

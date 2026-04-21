@@ -138,6 +138,22 @@ func (h *Hub) sendToUser(userID string, data []byte) {
 	}
 }
 
+// BroadcastToUsers serializes the envelope once and delivers it to all listed users.
+// Used by the servers package as a Broadcaster implementation.
+func (h *Hub) BroadcastToUsers(userIDs []string, env *pb.Envelope) {
+	if env == nil || len(userIDs) == 0 {
+		return
+	}
+	data, err := proto.Marshal(env)
+	if err != nil {
+		log.Printf("hub broadcast: marshal failed: %v", err)
+		return
+	}
+	for _, uid := range userIDs {
+		h.sendToUser(uid, data)
+	}
+}
+
 // HandleWebSocket upgrades HTTP to WebSocket, sends auth challenge, starts pumps.
 func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
