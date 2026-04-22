@@ -102,6 +102,133 @@
     `target/tarpaulin/coverage.json`; wire a CI step that fails on
     coverage drop for `veil-crypto` (the highest-stakes crate).
 
+## Known weak spots (audited 2026-04-22) and ideal fixes
+
+Honest list of architectural and quality gaps observed in the current
+codebase, paired with the *ideal* (not minimal) remediation. "Ideal"
+here means: the fix that would not need to be redone when the next
+scaling or compliance milestone hits.
+
+### W1. Single in-process hub (architectural ceiling ~25k WS)
+- **Symptom**: all WebSocket state — `clients`, `userClients`, `ipConns`
+  — lives behind one `sync.RWMutex` in `internal/gateway/Hub`. Fan-out
+  walks `userClients[uid]` while holding it. Mutex contention starts
+  hurting around 10k concurrent conns and becomes the wall ~25k.
+- **Ideal fix**: two-step migration.
+  1. **Sharded hub** (item 5 below) as the local-process win.
+  2. **Distributed gateway tier**: each `cmd/gateway` node holds only
+     its own connections; cross-node fan-out goes through **NATS
+     JetStream** (preferred over Redis Streams: per-subject ordering,
+     consumer groups, durable history with TTL). DB write + broker
+     publish wrapped in a **transactional outbox** so we never lose a
+     message on a node crash. Sticky-session not required — any node
+     can deliver to any user once it subscribes to that user's
+     subject. Goal: stateless gateway nodes behind a TCP load
+     balancer (Hetzner/AWS NLB), zero-downtime rolling deploys.
+
+### W2. Test coverage uneven across packages
+- **Symptom**: `veil-crypto` is well-tested (X3DH, ratchet, sender
+  keys, AEAD round-trips). `authmw`/`httpmw`/`gateway` have focused
+  unit tests. **`chat/` and `servers/` have zero handler tests**, and
+  these are the most-edited packages with the most business logic
+  (permissions, history pagination, role checks).
+- **Ideal fix**: in-process integration test harness. Spin up an
+  ephemeral Postgres (testcontainers-go), apply `migrations/`, mount
+  the full mux including `authmw`, drive it with the real
+  signed-request helper. One file per handler exercising: happy path,
+  unauthorised user, missing permission, malformed body, body too
+  large, replay rejection. Target ≥80% line coverage on
+  `internal/{chat,servers,auth}` and gate it in CI.
+
+### W3. `allowUnsigned=true` still in production
+- **Symptom**: the legacy bypass in `authmw/signed.go` is a backdoor
+  by design. Until it's flipped, the entire signed-request
+  infrastructure is *opt-in* per request, not enforced.
+- **Ideal fix**: not just flip the boolean — **delete the branch and
+  the `allowUnsigned` parameter entirely**. Add a CI lint that fails
+  if `X-User-ID` is read without a prior signed-request verification
+  on the same handler. Verification end-to-end: drive both Tauri and
+  React-Native through a smoke suite that asserts every REST call
+  carries the X-Veil-{User,Timestamp,Signature} triplet.
+
+### W4. `/metrics` exposed without auth
+- **Symptom**: `GET /metrics` returns the full Prometheus surface to
+  the open internet. Helpful for debugging today, leak vector
+  tomorrow (per-user request rates, internal route names, hostnames).
+- **Ideal fix**: bind a separate **internal-only listener** (e.g.
+  `127.0.0.1:9090`) for `/metrics` and `/debug/pprof/*`, never
+  exposed by the docker-compose `ports:` mapping. Prometheus scrapes
+  it via `docker exec` or via a sidecar on the same compose network.
+  Public port keeps only `/health` and `/ws`. As a stop-gap before
+  that: TLS-terminating reverse proxy with HTTP basic auth on
+  `/metrics`.
+
+### W5. No frontend tests (desktop or mobile)
+- **Symptom**: state is non-trivial (optimistic message inserts,
+  reconnect with replay, sender-key distribution timing, presence
+  fan-in). Right now any regression is caught by the user.
+- **Ideal fix**: **Vitest + React Testing Library** for store logic
+  and pure components, **Playwright** for end-to-end flows running
+  against a disposable gateway (`docker compose -f
+  docker-compose.test.yml up`). Target the four flows that hurt most
+  on regression: onboarding (mnemonic → keychain → first connect),
+  send-and-receive in DM, group create + sender-key handshake,
+  reconnect after offline. Frontend coverage gate at ≥60% for
+  `stores/`.
+
+### W6. Single-host deploy, no redundancy
+- **Symptom**: one VPS runs gateway + Postgres in compose. Loss of
+  the host = loss of the service and possibly data.
+- **Ideal fix**: managed Postgres with point-in-time recovery
+  (Hetzner managed PG / Neon / RDS). Two gateway nodes minimum
+  behind a TCP LB once W1 step 2 is done. Daily restic-style backup
+  of `pgdata` to S3-compatible object storage with a documented
+  restore drill. Until then: at minimum, an automated nightly
+  `pg_dump` to a separate region.
+
+### W7. WS `CheckOrigin` allow-all by default in production
+- **Symptom**: code path is *implemented* (`VEIL_WS_ORIGINS`), but
+  the env var isn't set on the VPS — falls back to `*`. A malicious
+  third-party web page could open a WS to the gateway from any
+  user's browser.
+- **Ideal fix**: make the empty default **deny browser origins**
+  (still allow native clients with no `Origin`). Gateway main
+  refuses to start without an explicit `VEIL_WS_ORIGINS` *or* an
+  explicit `VEIL_WS_ORIGINS=*` opt-out flag — fail-closed pattern.
+
+### W8. Sender-Key rotation not surfaced
+- **Symptom**: keys are minted on first message and never explicitly
+  rotated on member departure. Forward secrecy for groups is weaker
+  than the protocol allows.
+- **Ideal fix**: rotate sender-key on every group membership change
+  (add/remove), and additionally on a configurable interval (e.g.
+  24h or 1000 messages, whichever first). Surface a non-intrusive
+  "encryption updated" pill in the chat island. Document the
+  guarantee in `VEIL_DESIGN.md`.
+
+### W9. Logging may leak high-cardinality user data
+- **Symptom**: `httpmw.AccessLog` writes `user=<userID>` on every
+  request. In high volume that's a per-user activity ledger sitting
+  in `docker logs`. For a privacy-first messenger that's an
+  uncomfortable artifact.
+- **Ideal fix**: log a per-process **HMAC of the userID** (key
+  derived from a server-side secret rotated daily). Operators can
+  still correlate within a day's worth of logs; an attacker
+  exfiltrating logs cannot tie entries back to user accounts.
+  Configure log retention at 7 days max in compose / journald.
+
+### W10. No rate-limit on WS message types
+- **Symptom**: REST has per-user token-bucket. WS messages flow
+  freely once authenticated — a compromised account can flood
+  `send_message` or `typing` events at line speed.
+- **Ideal fix**: per-`(userID, kind)` token bucket inside the hub,
+  evaluated in `handleEnvelope` before dispatch. Tighter limits for
+  cheap-to-spam kinds (`typing`, `presence`) than for `send_message`.
+  Drop with `veil_ws_messages_rejected_total{kind,reason}` metric;
+  disconnect on sustained abuse.
+
+---
+
 ## Capacity target (rough numbers, current architecture)
 
 - One 4 vCPU / 8 GB VPS: ~5k concurrent WS, ~500 msg/s.
