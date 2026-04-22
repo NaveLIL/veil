@@ -1,35 +1,65 @@
 package chat
 
 import (
+	"context"
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
 	"strconv"
 	"time"
+
+	"github.com/AegisSec/veil-server/internal/authmw"
 )
 
 // Handler provides REST endpoints for the chat service.
 // Message sync, conversation management.
 type Handler struct {
 	svc *Service
+	mw  *authmw.Middleware
+	rl  *authmw.RateLimit
 }
 
-func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
+// NewHandler builds the chat REST handler. mw and rl may be nil to disable
+// signature checks / rate limiting (used in tests and the all-in-one binary).
+func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
+	return &Handler{svc: svc, mw: mw, rl: rl}
+}
+
+// SigningKeyLookup returns an authmw.UserKeyLookup backed by the service's
+// database, for use when constructing the shared signing middleware.
+func (s *Service) SigningKeyLookup() authmw.UserKeyLookup {
+	return authmw.LookupFunc(func(ctx context.Context, userID string) (ed25519.PublicKey, error) {
+		u, err := s.db.FindUserByID(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		return ed25519.PublicKey(u.SigningKey), nil
+	})
 }
 
 // RegisterRoutes registers chat REST endpoints on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /v1/messages/{conversationID}", h.GetMessages)
-	mux.HandleFunc("POST /v1/conversations/dm", h.CreateDM)
-	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", h.GetMembers)
+	signed := func(f http.HandlerFunc) http.HandlerFunc {
+		if h.mw != nil {
+			f = h.mw.RequireSigned(f)
+		}
+		if h.rl != nil {
+			f = h.rl.Wrap(f)
+		}
+		return f
+	}
+
+	mux.HandleFunc("GET /v1/messages/{conversationID}", signed(h.GetMessages))
+	mux.HandleFunc("POST /v1/conversations/dm", signed(h.CreateDM))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", signed(h.GetMembers))
 
 	// Group endpoints
-	mux.HandleFunc("POST /v1/groups", h.CreateGroup)
-	mux.HandleFunc("POST /v1/groups/{groupID}/members", h.AddGroupMember)
-	mux.HandleFunc("DELETE /v1/groups/{groupID}/members/{userID}", h.RemoveGroupMember)
-	mux.HandleFunc("GET /v1/groups/{groupID}/members", h.GetGroupMembers)
+	mux.HandleFunc("POST /v1/groups", signed(h.CreateGroup))
+	mux.HandleFunc("POST /v1/groups/{groupID}/members", signed(h.AddGroupMember))
+	mux.HandleFunc("DELETE /v1/groups/{groupID}/members/{userID}", signed(h.RemoveGroupMember))
+	mux.HandleFunc("GET /v1/groups/{groupID}/members", signed(h.GetGroupMembers))
 }
 
 // --- Message Sync (store-and-forward) ---

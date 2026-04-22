@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,6 +17,7 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/auth"
 	"github.com/AegisSec/veil-server/internal/chat"
+	"github.com/AegisSec/veil-server/internal/metrics"
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 )
 
@@ -21,14 +26,98 @@ const (
 	writeWait      = 10 * time.Second
 	pongWait       = 60 * time.Second
 	pingPeriod     = (pongWait * 9) / 10
+
+	// defaultMaxConnsPerIP caps concurrent WebSocket connections originating
+	// from a single client IP. Override via VEIL_WS_MAX_CONNS_PER_IP. Zero or
+	// negative disables the check (NOT recommended in production).
+	defaultMaxConnsPerIP = 64
 )
+
+// allowedOrigins, when non-nil and non-empty, restricts WebSocket Upgrade to
+// the listed Origin headers. The "*" wildcard or a nil/empty list permits
+// any origin (legacy behaviour). Configure via SetAllowedOrigins or the
+// VEIL_WS_ORIGINS environment variable read by ConfigureFromEnv.
+var (
+	allowedOriginsMu sync.RWMutex
+	allowedOrigins   map[string]struct{}
+	originAllowAll   = true
+)
+
+// SetAllowedOrigins replaces the WebSocket origin allow-list. Pass nil or an
+// empty slice (or a slice containing "*") to allow any origin. Call once at
+// startup before HandleWebSocket begins serving.
+func SetAllowedOrigins(origins []string) {
+	allowedOriginsMu.Lock()
+	defer allowedOriginsMu.Unlock()
+	if len(origins) == 0 {
+		allowedOrigins = nil
+		originAllowAll = true
+		return
+	}
+	allowedOrigins = make(map[string]struct{}, len(origins))
+	originAllowAll = false
+	for _, o := range origins {
+		o = strings.TrimSpace(o)
+		if o == "" {
+			continue
+		}
+		if o == "*" {
+			allowedOrigins = nil
+			originAllowAll = true
+			return
+		}
+		allowedOrigins[o] = struct{}{}
+	}
+}
+
+// ConfigureFromEnv applies VEIL_WS_ORIGINS (comma-separated) and
+// VEIL_WS_MAX_CONNS_PER_IP (integer) to package-level defaults. Call from
+// main before starting the gateway.
+func ConfigureFromEnv() {
+	if raw := strings.TrimSpace(os.Getenv("VEIL_WS_ORIGINS")); raw != "" {
+		SetAllowedOrigins(strings.Split(raw, ","))
+	}
+	if raw := strings.TrimSpace(os.Getenv("VEIL_WS_MAX_CONNS_PER_IP")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil {
+			maxConnsPerIPOverride.Store(int64(n))
+		}
+	}
+}
+
+// maxConnsPerIPOverride lets ops tune the per-IP cap at startup without a
+// recompile. Zero means "use defaultMaxConnsPerIP".
+var maxConnsPerIPOverride atomicInt64
+
+type atomicInt64 struct{ v int64 }
+
+func (a *atomicInt64) Load() int64        { return a.v }
+func (a *atomicInt64) Store(n int64)      { a.v = n }
+func (a *atomicInt64) effectiveCap() int  { return effectiveMaxConns(a.Load()) }
+func effectiveMaxConns(override int64) int {
+	if override == 0 {
+		return defaultMaxConnsPerIP
+	}
+	return int(override)
+}
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  4096,
 	WriteBufferSize: 4096,
 	CheckOrigin: func(r *http.Request) bool {
-		// TODO: restrict to allowed origins in production
-		return true
+		origin := r.Header.Get("Origin")
+		// Native clients (Tauri/mobile) often omit Origin entirely; this is
+		// expected and not a browser CSRF risk because the WS protocol
+		// requires Origin only from web pages.
+		if origin == "" {
+			return true
+		}
+		allowedOriginsMu.RLock()
+		defer allowedOriginsMu.RUnlock()
+		if originAllowAll {
+			return true
+		}
+		_, ok := allowedOrigins[origin]
+		return ok
 	},
 }
 
@@ -40,6 +129,8 @@ type Client struct {
 
 	// Connection ID for challenge tracking (not user-visible)
 	connID string
+	// Originating client IP (used for per-IP connection cap accounting).
+	ip string
 
 	// Identity (set after successful authentication)
 	authenticated bool
@@ -58,7 +149,9 @@ type Hub struct {
 	clients map[*Client]bool
 	// Index: userID → set of clients (for message fan-out)
 	userClients map[string]map[*Client]bool
-	mu          sync.RWMutex
+	// Index: client IP → live connection count (per-IP cap enforcement)
+	ipConns map[string]int
+	mu      sync.RWMutex
 
 	register   chan *Client
 	unregister chan *Client
@@ -72,10 +165,45 @@ func NewHub(authSvc *auth.Service, chatSvc *chat.Service) *Hub {
 	return &Hub{
 		clients:     make(map[*Client]bool),
 		userClients: make(map[string]map[*Client]bool),
+		ipConns:     make(map[string]int),
 		register:    make(chan *Client),
 		unregister:  make(chan *Client),
 		authSvc:     authSvc,
 		chatSvc:     chatSvc,
+	}
+}
+
+// tryAcquireIP increments the connection count for ip if it's still under
+// the per-IP cap. Returns true on success; false (without incrementing) when
+// the cap would be exceeded. ip="" bypasses the check.
+func (h *Hub) tryAcquireIP(ip string) bool {
+	if ip == "" {
+		return true
+	}
+	cap := maxConnsPerIPOverride.effectiveCap()
+	if cap <= 0 {
+		return true
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.ipConns[ip] >= cap {
+		return false
+	}
+	h.ipConns[ip]++
+	return true
+}
+
+// releaseIP decrements the per-IP counter. Safe to call with ip="".
+func (h *Hub) releaseIP(ip string) {
+	if ip == "" {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if n := h.ipConns[ip]; n > 1 {
+		h.ipConns[ip] = n - 1
+	} else {
+		delete(h.ipConns, ip)
 	}
 }
 
@@ -85,8 +213,11 @@ func (h *Hub) Run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
+			n := len(h.clients)
 			h.mu.Unlock()
-			log.Printf("client connected: %s (total: %d)", client.connID, len(h.clients))
+			metrics.WSConnectionsTotal.Inc()
+			metrics.WSConnectionsActive.Set(float64(n))
+			log.Printf("client connected: %s (total: %d)", client.connID, n)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
@@ -105,10 +236,13 @@ func (h *Hub) Run() {
 					}
 				}
 			}
+			n := len(h.clients)
 			h.mu.Unlock()
+			metrics.WSConnectionsActive.Set(float64(n))
+			h.releaseIP(client.ip)
 			// Clean up auth challenge
 			h.authSvc.RemoveChallenge(client.connID)
-			log.Printf("client disconnected: %s (total: %d)", client.connID, len(h.clients))
+			log.Printf("client disconnected: %s (total: %d)", client.connID, n)
 		}
 	}
 }
@@ -156,8 +290,21 @@ func (h *Hub) BroadcastToUsers(userIDs []string, env *pb.Envelope) {
 
 // HandleWebSocket upgrades HTTP to WebSocket, sends auth challenge, starts pumps.
 func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
+	ip := wsClientIP(r)
+
+	// Per-IP connection cap. Reject BEFORE upgrade so we don't waste a
+	// goroutine + websocket buffer on an attacker flooding from one IP.
+	if !hub.tryAcquireIP(ip) {
+		metrics.WSRefusedTotal.WithLabelValues("ip_cap").Inc()
+		http.Error(w, "too many connections from this address", http.StatusTooManyRequests)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		// Upgrade may fail because of CheckOrigin too — count it.
+		metrics.WSRefusedTotal.WithLabelValues("upgrade_error").Inc()
+		hub.releaseIP(ip)
 		log.Printf("upgrade error: %v", err)
 		return
 	}
@@ -168,6 +315,7 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		conn:   conn,
 		send:   make(chan []byte, 256),
 		connID: connID,
+		ip:     ip,
 	}
 
 	hub.register <- client
@@ -222,7 +370,43 @@ func (c *Client) readPump() {
 			continue
 		}
 
+		metrics.WSMessagesTotal.WithLabelValues(envelopeKind(&env)).Inc()
 		c.handleEnvelope(&env)
+	}
+}
+
+// envelopeKind returns a low-cardinality string label for the envelope's
+// payload variant — used as a Prometheus label for veil_ws_messages_total.
+func envelopeKind(env *pb.Envelope) string {
+	switch env.Payload.(type) {
+	case *pb.Envelope_AuthResponse:
+		return "auth_response"
+	case *pb.Envelope_SendMessage:
+		return "send_message"
+	case *pb.Envelope_EditMessage:
+		return "edit_message"
+	case *pb.Envelope_DeleteMessage:
+		return "delete_message"
+	case *pb.Envelope_ReactionUpdate:
+		return "reaction"
+	case *pb.Envelope_PrekeyRequest:
+		return "prekey_request"
+	case *pb.Envelope_TypingEvent:
+		return "typing"
+	case *pb.Envelope_PresenceUpdate:
+		return "presence"
+	case *pb.Envelope_SenderKeyDist:
+		return "sender_key_dist"
+	case *pb.Envelope_FriendRequest:
+		return "friend_request"
+	case *pb.Envelope_FriendRespond:
+		return "friend_respond"
+	case *pb.Envelope_FriendRemove:
+		return "friend_remove"
+	case *pb.Envelope_FriendListRequest:
+		return "friend_list_request"
+	default:
+		return "other"
 	}
 }
 
@@ -290,6 +474,7 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 	)
 	if err != nil {
 		log.Printf("auth failed [%s]: %v", c.connID, err)
+		metrics.WSAuthFailuresTotal.Inc()
 		c.sendAuthResult(seq, false, "", err.Error())
 		return
 	}
@@ -948,4 +1133,22 @@ func (c *Client) writePump() {
 			}
 		}
 	}
+}
+
+// wsClientIP extracts the originating client IP for a WebSocket upgrade
+// request, honouring X-Forwarded-For (first hop) when behind a reverse
+// proxy. Returns "" if RemoteAddr is malformed and no XFF is set, in which
+// case the per-IP cap is bypassed (callers handle this).
+func wsClientIP(r *http.Request) string {
+	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		if comma := strings.IndexByte(xff, ','); comma >= 0 {
+			return strings.TrimSpace(xff[:comma])
+		}
+		return strings.TrimSpace(xff)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }

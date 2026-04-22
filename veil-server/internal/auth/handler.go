@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
 )
 
@@ -18,20 +20,46 @@ import (
 // (Challenge-response stays in the gateway — it's WS-bound.)
 type Handler struct {
 	svc *Service
+	mw  *authmw.Middleware
+	rl  *authmw.RateLimit
 }
 
-func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
+// NewHandler builds the auth REST handler. mw and rl may be nil to disable
+// signature checks / rate limiting (used in tests and the all-in-one binary).
+func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
+	return &Handler{svc: svc, mw: mw, rl: rl}
+}
+
+// SigningKeyLookup returns an authmw.UserKeyLookup backed by the service's
+// database, for use when constructing the shared signing middleware.
+func (s *Service) SigningKeyLookup() authmw.UserKeyLookup {
+	return authmw.LookupFunc(func(ctx context.Context, userID string) (ed25519.PublicKey, error) {
+		u, err := s.db.FindUserByID(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		return ed25519.PublicKey(u.SigningKey), nil
+	})
 }
 
 // RegisterRoutes registers auth REST endpoints on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /v1/prekeys", h.UploadPreKeys)
-	mux.HandleFunc("GET /v1/prekeys/{identityKey}", h.GetPreKeyBundle)
-	mux.HandleFunc("GET /v1/prekeys/{identityKey}/count", h.GetOPKCount)
-	mux.HandleFunc("GET /v1/devices/{userID}", h.ListDevices)
-	mux.HandleFunc("GET /v1/users/search", h.SearchUser)
-	mux.HandleFunc("GET /v1/users/{identityKey}", h.LookupUser)
+	signed := func(f http.HandlerFunc) http.HandlerFunc {
+		if h.mw != nil {
+			f = h.mw.RequireSigned(f)
+		}
+		if h.rl != nil {
+			f = h.rl.Wrap(f)
+		}
+		return f
+	}
+
+	mux.HandleFunc("POST /v1/prekeys", signed(h.UploadPreKeys))
+	mux.HandleFunc("GET /v1/prekeys/{identityKey}", signed(h.GetPreKeyBundle))
+	mux.HandleFunc("GET /v1/prekeys/{identityKey}/count", signed(h.GetOPKCount))
+	mux.HandleFunc("GET /v1/devices/{userID}", signed(h.ListDevices))
+	mux.HandleFunc("GET /v1/users/search", signed(h.SearchUser))
+	mux.HandleFunc("GET /v1/users/{identityKey}", signed(h.LookupUser))
 }
 
 // --- Prekey Upload ---

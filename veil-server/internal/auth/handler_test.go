@@ -18,7 +18,7 @@ func newTestHandler() *auth.Handler {
 		PreKeyLowWarning: 10,
 	}
 	svc := auth.NewService(nil, cfg)
-	return auth.NewHandler(svc)
+	return auth.NewHandler(svc, nil, nil)
 }
 
 func TestLookupUser_InvalidHex(t *testing.T) {

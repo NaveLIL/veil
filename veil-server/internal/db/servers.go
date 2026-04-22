@@ -14,7 +14,7 @@ import (
 // ─── Permission bitmask ──────────────────────────────
 
 const (
-	PermViewChannel        uint64 = 1 << 0  // can see channel exists in list
+	PermViewChannel        uint64 = 1 << 0 // can see channel exists in list
 	PermSendMessages       uint64 = 1 << 1
 	PermManageMessages     uint64 = 1 << 2
 	PermMentionEveryone    uint64 = 1 << 3
@@ -43,12 +43,13 @@ type Server struct {
 }
 
 type ServerMember struct {
-	ServerID string
-	UserID   string
-	Username string
-	Nickname *string
-	JoinedAt time.Time
-	RoleIDs  []string
+	ServerID    string
+	UserID      string
+	IdentityKey []byte
+	Username    string
+	Nickname    *string
+	JoinedAt    time.Time
+	RoleIDs     []string
 }
 
 type Role struct {
@@ -232,24 +233,50 @@ func (db *DB) AddServerMember(ctx context.Context, serverID, userID string) erro
 	return err
 }
 
-// RemoveServerMember removes a user from a server (does not delete the user).
+// RemoveServerMember removes a user from a server.
+// Also cleans up conversation memberships in this server's channels and any
+// role assignments. Does not delete the user account itself.
 func (db *DB) RemoveServerMember(ctx context.Context, serverID, userID string) error {
-	_, err := db.Pool.Exec(ctx,
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	// Remove from all conversation_members for this server's channels.
+	// (The conversation_members FK does not cascade with server_members.)
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM conversation_members
+		 WHERE user_id = $2::uuid
+		   AND conversation_id IN (
+		       SELECT conversation_id FROM channels
+		       WHERE server_id = $1 AND conversation_id IS NOT NULL
+		   )`,
+		serverID, userID); err != nil {
+		return fmt.Errorf("clean conv members: %w", err)
+	}
+
+	// member_roles cascades on (server_id, user_id) FK to server_members,
+	// so removing the row below will also drop role assignments.
+	if _, err := tx.Exec(ctx,
 		`DELETE FROM server_members WHERE server_id = $1 AND user_id = $2::uuid`,
-		serverID, userID)
-	return err
+		serverID, userID); err != nil {
+		return fmt.Errorf("delete member: %w", err)
+	}
+
+	return tx.Commit(ctx)
 }
 
 // GetServerMembers returns all members of a server with their assigned role IDs.
 func (db *DB) GetServerMembers(ctx context.Context, serverID string) ([]ServerMember, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT sm.server_id, sm.user_id, u.username, sm.nickname, sm.joined_at,
+		`SELECT sm.server_id, sm.user_id, u.identity_key, u.username, sm.nickname, sm.joined_at,
 		        COALESCE(array_agg(mr.role_id) FILTER (WHERE mr.role_id IS NOT NULL), '{}')::uuid[]
 		 FROM server_members sm
 		 JOIN users u ON u.id = sm.user_id
 		 LEFT JOIN member_roles mr ON mr.server_id = sm.server_id AND mr.user_id = sm.user_id
 		 WHERE sm.server_id = $1
-		 GROUP BY sm.server_id, sm.user_id, u.username, sm.nickname, sm.joined_at
+		 GROUP BY sm.server_id, sm.user_id, u.identity_key, u.username, sm.nickname, sm.joined_at
 		 ORDER BY sm.joined_at ASC`,
 		serverID)
 	if err != nil {
@@ -260,7 +287,7 @@ func (db *DB) GetServerMembers(ctx context.Context, serverID string) ([]ServerMe
 	for rows.Next() {
 		var m ServerMember
 		var roleIDs []string
-		if err := rows.Scan(&m.ServerID, &m.UserID, &m.Username, &m.Nickname, &m.JoinedAt, &roleIDs); err != nil {
+		if err := rows.Scan(&m.ServerID, &m.UserID, &m.IdentityKey, &m.Username, &m.Nickname, &m.JoinedAt, &roleIDs); err != nil {
 			return nil, err
 		}
 		m.RoleIDs = roleIDs
@@ -466,16 +493,33 @@ func (db *DB) CreateChannel(ctx context.Context, serverID, name string, channelT
 	return &c, tx.Commit(ctx)
 }
 
-// UpdateChannel updates name/topic/nsfw/slowmode.
-func (db *DB) UpdateChannel(ctx context.Context, channelID string, name, topic *string, nsfw *bool, slowmode *int32) error {
+// UpdateChannel updates name/topic/nsfw/slowmode/position/category.
+// If clearCategory is true, category_id is set to NULL (move out of any category).
+// Otherwise, when categoryID != nil it's set to that value.
+func (db *DB) UpdateChannel(ctx context.Context, channelID string, name, topic *string, nsfw *bool, slowmode *int32, position *int16, categoryID *string, clearCategory bool) error {
+	if clearCategory {
+		_, err := db.Pool.Exec(ctx,
+			`UPDATE channels
+			 SET name = COALESCE($2, name),
+			     topic = COALESCE($3, topic),
+			     nsfw = COALESCE($4, nsfw),
+			     slowmode_secs = COALESCE($5, slowmode_secs),
+			     position = COALESCE($6, position),
+			     category_id = NULL
+			 WHERE id = $1`,
+			channelID, name, topic, nsfw, slowmode, position)
+		return err
+	}
 	_, err := db.Pool.Exec(ctx,
 		`UPDATE channels
 		 SET name = COALESCE($2, name),
 		     topic = COALESCE($3, topic),
 		     nsfw = COALESCE($4, nsfw),
-		     slowmode_secs = COALESCE($5, slowmode_secs)
+		     slowmode_secs = COALESCE($5, slowmode_secs),
+		     position = COALESCE($6, position),
+		     category_id = COALESCE($7, category_id)
 		 WHERE id = $1`,
-		channelID, name, topic, nsfw, slowmode)
+		channelID, name, topic, nsfw, slowmode, position, categoryID)
 	return err
 }
 
@@ -594,7 +638,8 @@ func (db *DB) UseInvite(ctx context.Context, code, userID string) (*Server, erro
 
 	if !alreadyMember {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2::uuid)`,
+			`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2::uuid)
+			 ON CONFLICT DO NOTHING`,
 			inv.ServerID, userID); err != nil {
 			return nil, fmt.Errorf("join server: %w", err)
 		}

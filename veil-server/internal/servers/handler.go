@@ -1,55 +1,73 @@
 package servers
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"time"
 
+	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
 )
 
 // Handler exposes REST endpoints for servers/channels/roles/invites.
 type Handler struct {
 	svc *Service
+	mw  *authmw.Middleware
+	rl  *authmw.RateLimit
 }
 
-func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
+// NewHandler builds a handler. The middleware and rate limiter may be nil; in
+// that case routes are registered without authentication or throttling — used
+// by tests and the all-in-one binary's local mode.
+func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
+	return &Handler{svc: svc, mw: mw, rl: rl}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	signed := func(f http.HandlerFunc) http.HandlerFunc {
+		if h.mw != nil {
+			f = h.mw.RequireSigned(f)
+		}
+		if h.rl != nil {
+			f = h.rl.Wrap(f)
+		}
+		return f
+	}
+
 	// Servers
-	mux.HandleFunc("POST /v1/servers", h.CreateServer)
-	mux.HandleFunc("GET /v1/servers", h.ListServers)
-	mux.HandleFunc("GET /v1/servers/{serverID}", h.GetServer)
-	mux.HandleFunc("PATCH /v1/servers/{serverID}", h.UpdateServer)
-	mux.HandleFunc("DELETE /v1/servers/{serverID}", h.DeleteServer)
-	mux.HandleFunc("POST /v1/servers/{serverID}/leave", h.LeaveServer)
+	mux.HandleFunc("POST /v1/servers", signed(h.CreateServer))
+	mux.HandleFunc("GET /v1/servers", signed(h.ListServers))
+	mux.HandleFunc("GET /v1/servers/{serverID}", signed(h.GetServer))
+	mux.HandleFunc("PATCH /v1/servers/{serverID}", signed(h.UpdateServer))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}", signed(h.DeleteServer))
+	mux.HandleFunc("POST /v1/servers/{serverID}/leave", signed(h.LeaveServer))
 
 	// Members
-	mux.HandleFunc("GET /v1/servers/{serverID}/members", h.ListMembers)
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}", h.KickMember)
+	mux.HandleFunc("GET /v1/servers/{serverID}/members", signed(h.ListMembers))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}", signed(h.KickMember))
 
 	// Channels
-	mux.HandleFunc("GET /v1/servers/{serverID}/channels", h.ListChannels)
-	mux.HandleFunc("POST /v1/servers/{serverID}/channels", h.CreateChannel)
-	mux.HandleFunc("PATCH /v1/channels/{channelID}", h.UpdateChannel)
-	mux.HandleFunc("DELETE /v1/channels/{channelID}", h.DeleteChannel)
+	mux.HandleFunc("GET /v1/servers/{serverID}/channels", signed(h.ListChannels))
+	mux.HandleFunc("POST /v1/servers/{serverID}/channels", signed(h.CreateChannel))
+	mux.HandleFunc("POST /v1/servers/{serverID}/channels/reorder", signed(h.ReorderChannels))
+	mux.HandleFunc("PATCH /v1/channels/{channelID}", signed(h.UpdateChannel))
+	mux.HandleFunc("DELETE /v1/channels/{channelID}", signed(h.DeleteChannel))
 
 	// Roles
-	mux.HandleFunc("GET /v1/servers/{serverID}/roles", h.ListRoles)
-	mux.HandleFunc("POST /v1/servers/{serverID}/roles", h.CreateRole)
-	mux.HandleFunc("PATCH /v1/servers/{serverID}/roles/{roleID}", h.UpdateRole)
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/roles/{roleID}", h.DeleteRole)
-	mux.HandleFunc("PUT /v1/servers/{serverID}/members/{userID}/roles/{roleID}", h.AssignRole)
-	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}/roles/{roleID}", h.UnassignRole)
+	mux.HandleFunc("GET /v1/servers/{serverID}/roles", signed(h.ListRoles))
+	mux.HandleFunc("POST /v1/servers/{serverID}/roles", signed(h.CreateRole))
+	mux.HandleFunc("PATCH /v1/servers/{serverID}/roles/{roleID}", signed(h.UpdateRole))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/roles/{roleID}", signed(h.DeleteRole))
+	mux.HandleFunc("PUT /v1/servers/{serverID}/members/{userID}/roles/{roleID}", signed(h.AssignRole))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}/roles/{roleID}", signed(h.UnassignRole))
 
-	// Invites
-	mux.HandleFunc("POST /v1/servers/{serverID}/invites", h.CreateInvite)
-	mux.HandleFunc("GET /v1/servers/{serverID}/invites", h.ListInvites)
-	mux.HandleFunc("DELETE /v1/invites/{code}", h.RevokeInvite)
+	// Invites — preview is intentionally NOT signed (pre-join lookup), but creating/listing/revoking and using are.
+	mux.HandleFunc("POST /v1/servers/{serverID}/invites", signed(h.CreateInvite))
+	mux.HandleFunc("GET /v1/servers/{serverID}/invites", signed(h.ListInvites))
+	mux.HandleFunc("DELETE /v1/invites/{code}", signed(h.RevokeInvite))
 	mux.HandleFunc("GET /v1/invites/{code}", h.PreviewInvite)
-	mux.HandleFunc("POST /v1/invites/{code}/use", h.UseInvite)
+	mux.HandleFunc("POST /v1/invites/{code}/use", signed(h.UseInvite))
 }
 
 // ─── Helpers ─────────────────────────────────────────
@@ -184,11 +202,12 @@ func (h *Handler) LeaveServer(w http.ResponseWriter, r *http.Request) {
 // ─── Members ─────────────────────────────────────────
 
 type memberJSON struct {
-	UserID   string   `json:"user_id"`
-	Username string   `json:"username"`
-	Nickname *string  `json:"nickname,omitempty"`
-	JoinedAt string   `json:"joined_at"`
-	RoleIDs  []string `json:"role_ids"`
+	UserID      string   `json:"user_id"`
+	IdentityKey string   `json:"identity_key"`
+	Username    string   `json:"username"`
+	Nickname    *string  `json:"nickname,omitempty"`
+	JoinedAt    string   `json:"joined_at"`
+	RoleIDs     []string `json:"role_ids"`
 }
 
 func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
@@ -204,11 +223,12 @@ func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
 	out := make([]memberJSON, len(members))
 	for i, m := range members {
 		out[i] = memberJSON{
-			UserID:   m.UserID,
-			Username: m.Username,
-			Nickname: m.Nickname,
-			JoinedAt: m.JoinedAt.Format(time.RFC3339),
-			RoleIDs:  m.RoleIDs,
+			UserID:      m.UserID,
+			IdentityKey: hex.EncodeToString(m.IdentityKey),
+			Username:    m.Username,
+			Nickname:    m.Nickname,
+			JoinedAt:    m.JoinedAt.Format(time.RFC3339),
+			RoleIDs:     m.RoleIDs,
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"members": out})
@@ -334,6 +354,44 @@ func (h *Handler) DeleteChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// ReorderChannels accepts a list of channel placements and updates them in bulk.
+type reorderItemReq struct {
+	ChannelID     string  `json:"channel_id"`
+	Position      int16   `json:"position"`
+	CategoryID    *string `json:"category_id,omitempty"`
+	ClearCategory bool    `json:"clear_category,omitempty"`
+}
+
+type reorderReq struct {
+	Items []reorderItemReq `json:"items"`
+}
+
+func (h *Handler) ReorderChannels(w http.ResponseWriter, r *http.Request) {
+	uid := requireUser(w, r)
+	if uid == "" {
+		return
+	}
+	var req reorderReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("invalid JSON"))
+		return
+	}
+	items := make([]ReorderItem, 0, len(req.Items))
+	for _, it := range req.Items {
+		items = append(items, ReorderItem{
+			ChannelID:     it.ChannelID,
+			Position:      it.Position,
+			CategoryID:    it.CategoryID,
+			ClearCategory: it.ClearCategory,
+		})
+	}
+	if err := h.svc.ReorderChannels(r.Context(), r.PathValue("serverID"), uid, items); err != nil {
+		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "reordered"})
 }
 
 // ─── Roles ───────────────────────────────────────────

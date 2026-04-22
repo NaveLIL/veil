@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AegisSec/veil-server/internal/auth"
+	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
 )
@@ -33,7 +34,9 @@ func main() {
 	log.Println("database connected")
 
 	authSvc := auth.NewService(database, cfg)
-	handler := auth.NewHandler(authSvc)
+	signedMw := authmw.New(authSvc.SigningKeyLookup(), true)
+	rl := authmw.NewRateLimit(240, time.Minute)
+	handler := auth.NewHandler(authSvc, signedMw, rl)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)

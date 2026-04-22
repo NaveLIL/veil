@@ -2,9 +2,11 @@ package servers
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"time"
 
+	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 )
@@ -22,6 +24,18 @@ type Service struct {
 
 func NewService(database *db.DB, bcast Broadcaster) *Service {
 	return &Service{db: database, bcast: bcast}
+}
+
+// SigningKeyLookup returns an authmw.UserKeyLookup backed by this service's
+// database, used when constructing the shared signing middleware.
+func (s *Service) SigningKeyLookup() authmw.UserKeyLookup {
+	return authmw.LookupFunc(func(ctx context.Context, userID string) (ed25519.PublicKey, error) {
+		u, err := s.db.FindUserByID(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		return ed25519.PublicKey(u.SigningKey), nil
+	})
 }
 
 // memberIDs returns user IDs of all members of a server.
@@ -205,12 +219,53 @@ func (s *Service) UpdateChannel(ctx context.Context, channelID, requesterID stri
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
 	}
-	if err := s.db.UpdateChannel(ctx, channelID, name, topic, nsfw, slowmode); err != nil {
+	if err := s.db.UpdateChannel(ctx, channelID, name, topic, nsfw, slowmode, nil, nil, false); err != nil {
 		return err
 	}
 	updated, _ := s.db.GetChannel(ctx, channelID)
 	if updated != nil {
 		s.broadcastChannelEvent(ctx, ch.ServerID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
+	}
+	return nil
+}
+
+// ReorderItem describes a single channel’s new placement.
+type ReorderItem struct {
+	ChannelID     string
+	Position      int16
+	CategoryID    *string // nil + ClearCategory=true means move to top-level
+	ClearCategory bool
+}
+
+// ReorderChannels applies multiple position/category changes in one transaction-ish
+// pass. Caller must have ManageChannels permission on the server. All channels
+// referenced must belong to the same server.
+func (s *Service) ReorderChannels(ctx context.Context, serverID, requesterID string, items []ReorderItem) error {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageChannels)
+	if err != nil || !can {
+		return errors.New("insufficient permissions")
+	}
+	if len(items) == 0 {
+		return nil
+	}
+	for _, it := range items {
+		ch, err := s.db.GetChannel(ctx, it.ChannelID)
+		if err != nil {
+			return errors.New("channel not found: " + it.ChannelID)
+		}
+		if ch.ServerID != serverID {
+			return errors.New("channel does not belong to server")
+		}
+		pos := it.Position
+		if err := s.db.UpdateChannel(ctx, it.ChannelID, nil, nil, nil, nil, &pos, it.CategoryID, it.ClearCategory); err != nil {
+			return err
+		}
+	}
+	// Broadcast a single UPDATED per channel so clients refresh the tree.
+	for _, it := range items {
+		if updated, _ := s.db.GetChannel(ctx, it.ChannelID); updated != nil {
+			s.broadcastChannelEvent(ctx, serverID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
+		}
 	}
 	return nil
 }

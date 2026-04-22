@@ -9,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/chat"
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
@@ -33,7 +34,9 @@ func main() {
 	log.Println("database connected")
 
 	chatSvc := chat.NewService(database, cfg)
-	handler := chat.NewHandler(chatSvc)
+	signedMw := authmw.New(chatSvc.SigningKeyLookup(), true)
+	rl := authmw.NewRateLimit(240, time.Minute)
+	handler := chat.NewHandler(chatSvc, signedMw, rl)
 
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
