@@ -159,6 +159,59 @@ impl VeilDb {
                 emoji TEXT NOT NULL,
                 username TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY (message_id, user_id, emoji)
+            );
+
+            -- ─── Discord-like servers (cache) ─────────────────
+            -- Server is source of truth; rows here are an offline cache so the
+            -- UI can render instantly. Background sync replaces rows wholesale.
+            CREATE TABLE IF NOT EXISTS servers_cache (
+                id           TEXT PRIMARY KEY,
+                name         TEXT NOT NULL,
+                description  TEXT,
+                icon_url     TEXT,
+                owner_id     TEXT NOT NULL,
+                position     INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                synced_at    TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS server_channels_cache (
+                id              TEXT PRIMARY KEY,
+                server_id       TEXT NOT NULL REFERENCES servers_cache(id) ON DELETE CASCADE,
+                conversation_id TEXT,
+                name            TEXT NOT NULL,
+                channel_type    INTEGER NOT NULL DEFAULT 0,
+                category_id     TEXT,
+                position        INTEGER NOT NULL DEFAULT 0,
+                topic           TEXT,
+                nsfw            INTEGER NOT NULL DEFAULT 0,
+                slowmode_secs   INTEGER NOT NULL DEFAULT 0,
+                synced_at       TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_chcache_server
+                ON server_channels_cache(server_id, position);
+
+            CREATE TABLE IF NOT EXISTS server_roles_cache (
+                id           TEXT NOT NULL,
+                server_id    TEXT NOT NULL REFERENCES servers_cache(id) ON DELETE CASCADE,
+                name         TEXT NOT NULL,
+                permissions  INTEGER NOT NULL DEFAULT 0,
+                position     INTEGER NOT NULL DEFAULT 0,
+                color        INTEGER,
+                is_default   INTEGER NOT NULL DEFAULT 0,
+                hoist        INTEGER NOT NULL DEFAULT 0,
+                mentionable  INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (server_id, id)
+            );
+
+            CREATE TABLE IF NOT EXISTS server_members_cache (
+                server_id    TEXT NOT NULL REFERENCES servers_cache(id) ON DELETE CASCADE,
+                user_id      TEXT NOT NULL,
+                username     TEXT NOT NULL,
+                nickname     TEXT,
+                role_ids     TEXT NOT NULL DEFAULT '[]',  -- JSON array
+                joined_at    TEXT NOT NULL,
+                PRIMARY KEY (server_id, user_id)
             );",
             )
             .map_err(|e| format!("migrations: {e}"))
@@ -467,6 +520,32 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Load every saved sender key entry for a group (incoming + outgoing).
+    /// Returns a list of `(sender_identity_key, key_data, is_outgoing)`.
+    pub fn load_sender_keys_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>, bool)>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_identity_key, key_data, is_outgoing
+                 FROM sender_keys_local WHERE group_id = ?1",
+            )
+            .map_err(|e| format!("prepare load sender keys: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, u8>(2)? != 0,
+                ))
+            })
+            .map_err(|e| format!("query sender keys: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect sender keys: {e}"))
+    }
+
     // ─── CRUD: Reactions ──────────────────────────────────
 
     pub fn add_reaction(
@@ -517,6 +596,415 @@ impl VeilDb {
             out.push(r.map_err(|e| format!("read reaction: {e}"))?);
         }
         Ok(out)
+    }
+
+    // ─── CRUD: Servers cache ──────────────────────────────
+
+    /// Replace the entire servers cache with the provided list (full sync).
+    /// Channels/roles/members for stale servers are deleted via FK CASCADE.
+    pub fn replace_servers(
+        &mut self,
+        servers: &[crate::models::CachedServer],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin tx: {e}"))?;
+        tx.execute("DELETE FROM servers_cache", [])
+            .map_err(|e| format!("clear servers: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO servers_cache (id, name, description, icon_url, owner_id, position, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                )
+                .map_err(|e| format!("prepare insert server: {e}"))?;
+            for s in servers {
+                stmt.execute(rusqlite::params![
+                    s.id,
+                    s.name,
+                    s.description,
+                    s.icon_url,
+                    s.owner_id,
+                    s.position,
+                    s.created_at,
+                ])
+                .map_err(|e| format!("insert server: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("commit: {e}"))?;
+        Ok(())
+    }
+
+    /// Insert or replace a single server (used on WS ServerEvent::CREATED/UPDATED).
+    pub fn upsert_server(&self, s: &crate::models::CachedServer) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO servers_cache (id, name, description, icon_url, owner_id, position, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                 ON CONFLICT(id) DO UPDATE SET
+                    name=excluded.name,
+                    description=excluded.description,
+                    icon_url=excluded.icon_url,
+                    owner_id=excluded.owner_id,
+                    position=excluded.position,
+                    synced_at=datetime('now')",
+                rusqlite::params![
+                    s.id,
+                    s.name,
+                    s.description,
+                    s.icon_url,
+                    s.owner_id,
+                    s.position,
+                    s.created_at,
+                ],
+            )
+            .map_err(|e| format!("upsert server: {e}"))?;
+        Ok(())
+    }
+
+    pub fn delete_server(&self, server_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM servers_cache WHERE id = ?1",
+                rusqlite::params![server_id],
+            )
+            .map_err(|e| format!("delete server: {e}"))?;
+        Ok(())
+    }
+
+    pub fn list_servers(&self) -> Result<Vec<crate::models::CachedServer>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, name, description, icon_url, owner_id, position, created_at
+                 FROM servers_cache ORDER BY position ASC, created_at ASC",
+            )
+            .map_err(|e| format!("prepare list servers: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(crate::models::CachedServer {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    icon_url: row.get(3)?,
+                    owner_id: row.get(4)?,
+                    position: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("query servers: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect servers: {e}"))
+    }
+
+    // ─── CRUD: Channels cache ─────────────────────────────
+
+    /// Replace all channels for a single server (full per-server sync).
+    pub fn replace_channels(
+        &mut self,
+        server_id: &str,
+        channels: &[crate::models::CachedChannel],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin tx: {e}"))?;
+        tx.execute(
+            "DELETE FROM server_channels_cache WHERE server_id = ?1",
+            rusqlite::params![server_id],
+        )
+        .map_err(|e| format!("clear channels: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO server_channels_cache
+                       (id, server_id, conversation_id, name, channel_type, category_id,
+                        position, topic, nsfw, slowmode_secs)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                )
+                .map_err(|e| format!("prepare insert channel: {e}"))?;
+            for c in channels {
+                stmt.execute(rusqlite::params![
+                    c.id,
+                    c.server_id,
+                    c.conversation_id,
+                    c.name,
+                    c.channel_type,
+                    c.category_id,
+                    c.position,
+                    c.topic,
+                    c.nsfw as u8,
+                    c.slowmode_secs,
+                ])
+                .map_err(|e| format!("insert channel: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("commit channels: {e}"))?;
+        Ok(())
+    }
+
+    pub fn upsert_channel(&self, c: &crate::models::CachedChannel) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO server_channels_cache
+                   (id, server_id, conversation_id, name, channel_type, category_id,
+                    position, topic, nsfw, slowmode_secs)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
+                 ON CONFLICT(id) DO UPDATE SET
+                    server_id=excluded.server_id,
+                    conversation_id=excluded.conversation_id,
+                    name=excluded.name,
+                    channel_type=excluded.channel_type,
+                    category_id=excluded.category_id,
+                    position=excluded.position,
+                    topic=excluded.topic,
+                    nsfw=excluded.nsfw,
+                    slowmode_secs=excluded.slowmode_secs,
+                    synced_at=datetime('now')",
+                rusqlite::params![
+                    c.id,
+                    c.server_id,
+                    c.conversation_id,
+                    c.name,
+                    c.channel_type,
+                    c.category_id,
+                    c.position,
+                    c.topic,
+                    c.nsfw as u8,
+                    c.slowmode_secs,
+                ],
+            )
+            .map_err(|e| format!("upsert channel: {e}"))?;
+        Ok(())
+    }
+
+    pub fn delete_channel(&self, channel_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM server_channels_cache WHERE id = ?1",
+                rusqlite::params![channel_id],
+            )
+            .map_err(|e| format!("delete channel: {e}"))?;
+        Ok(())
+    }
+
+    pub fn list_channels(
+        &self,
+        server_id: &str,
+    ) -> Result<Vec<crate::models::CachedChannel>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, server_id, conversation_id, name, channel_type, category_id,
+                        position, topic, nsfw, slowmode_secs
+                 FROM server_channels_cache
+                 WHERE server_id = ?1
+                 ORDER BY position ASC, name ASC",
+            )
+            .map_err(|e| format!("prepare list channels: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![server_id], |row| {
+                Ok(crate::models::CachedChannel {
+                    id: row.get(0)?,
+                    server_id: row.get(1)?,
+                    conversation_id: row.get(2)?,
+                    name: row.get(3)?,
+                    channel_type: row.get(4)?,
+                    category_id: row.get(5)?,
+                    position: row.get(6)?,
+                    topic: row.get(7)?,
+                    nsfw: row.get::<_, u8>(8)? != 0,
+                    slowmode_secs: row.get(9)?,
+                })
+            })
+            .map_err(|e| format!("query channels: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect channels: {e}"))
+    }
+
+    // ─── CRUD: Roles cache ────────────────────────────────
+
+    pub fn replace_roles(
+        &mut self,
+        server_id: &str,
+        roles: &[crate::models::CachedRole],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin tx: {e}"))?;
+        tx.execute(
+            "DELETE FROM server_roles_cache WHERE server_id = ?1",
+            rusqlite::params![server_id],
+        )
+        .map_err(|e| format!("clear roles: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO server_roles_cache
+                       (id, server_id, name, permissions, position, color, is_default, hoist, mentionable)
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                )
+                .map_err(|e| format!("prepare insert role: {e}"))?;
+            for r in roles {
+                stmt.execute(rusqlite::params![
+                    r.id,
+                    r.server_id,
+                    r.name,
+                    r.permissions as i64,
+                    r.position,
+                    r.color,
+                    r.is_default as u8,
+                    r.hoist as u8,
+                    r.mentionable as u8,
+                ])
+                .map_err(|e| format!("insert role: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("commit roles: {e}"))?;
+        Ok(())
+    }
+
+    pub fn list_roles(&self, server_id: &str) -> Result<Vec<crate::models::CachedRole>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, server_id, name, permissions, position, color, is_default, hoist, mentionable
+                 FROM server_roles_cache
+                 WHERE server_id = ?1
+                 ORDER BY position DESC",
+            )
+            .map_err(|e| format!("prepare list roles: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![server_id], |row| {
+                Ok(crate::models::CachedRole {
+                    id: row.get(0)?,
+                    server_id: row.get(1)?,
+                    name: row.get(2)?,
+                    permissions: row.get::<_, i64>(3)? as u64,
+                    position: row.get(4)?,
+                    color: row.get(5)?,
+                    is_default: row.get::<_, u8>(6)? != 0,
+                    hoist: row.get::<_, u8>(7)? != 0,
+                    mentionable: row.get::<_, u8>(8)? != 0,
+                })
+            })
+            .map_err(|e| format!("query roles: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect roles: {e}"))
+    }
+
+    // ─── CRUD: Members cache ──────────────────────────────
+
+    pub fn replace_server_members(
+        &mut self,
+        server_id: &str,
+        members: &[crate::models::CachedServerMember],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction()
+            .map_err(|e| format!("begin tx: {e}"))?;
+        tx.execute(
+            "DELETE FROM server_members_cache WHERE server_id = ?1",
+            rusqlite::params![server_id],
+        )
+        .map_err(|e| format!("clear members: {e}"))?;
+        {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO server_members_cache
+                       (server_id, user_id, username, nickname, role_ids, joined_at)
+                     VALUES (?1,?2,?3,?4,?5,?6)",
+                )
+                .map_err(|e| format!("prepare insert member: {e}"))?;
+            for m in members {
+                let role_ids = serde_json::to_string(&m.role_ids)
+                    .map_err(|e| format!("encode role_ids: {e}"))?;
+                stmt.execute(rusqlite::params![
+                    m.server_id,
+                    m.user_id,
+                    m.username,
+                    m.nickname,
+                    role_ids,
+                    m.joined_at,
+                ])
+                .map_err(|e| format!("insert member: {e}"))?;
+            }
+        }
+        tx.commit().map_err(|e| format!("commit members: {e}"))?;
+        Ok(())
+    }
+
+    pub fn upsert_server_member(
+        &self,
+        m: &crate::models::CachedServerMember,
+    ) -> Result<(), String> {
+        let role_ids =
+            serde_json::to_string(&m.role_ids).map_err(|e| format!("encode role_ids: {e}"))?;
+        self.conn
+            .execute(
+                "INSERT INTO server_members_cache
+                   (server_id, user_id, username, nickname, role_ids, joined_at)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(server_id, user_id) DO UPDATE SET
+                    username=excluded.username,
+                    nickname=excluded.nickname,
+                    role_ids=excluded.role_ids",
+                rusqlite::params![
+                    m.server_id,
+                    m.user_id,
+                    m.username,
+                    m.nickname,
+                    role_ids,
+                    m.joined_at,
+                ],
+            )
+            .map_err(|e| format!("upsert member: {e}"))?;
+        Ok(())
+    }
+
+    pub fn delete_server_member(&self, server_id: &str, user_id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM server_members_cache WHERE server_id = ?1 AND user_id = ?2",
+                rusqlite::params![server_id, user_id],
+            )
+            .map_err(|e| format!("delete member: {e}"))?;
+        Ok(())
+    }
+
+    pub fn list_server_members(
+        &self,
+        server_id: &str,
+    ) -> Result<Vec<crate::models::CachedServerMember>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT server_id, user_id, username, nickname, role_ids, joined_at
+                 FROM server_members_cache
+                 WHERE server_id = ?1
+                 ORDER BY joined_at ASC",
+            )
+            .map_err(|e| format!("prepare list members: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![server_id], |row| {
+                let role_ids_json: String = row.get(4)?;
+                let role_ids: Vec<String> =
+                    serde_json::from_str(&role_ids_json).unwrap_or_default();
+                Ok(crate::models::CachedServerMember {
+                    server_id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    username: row.get(2)?,
+                    nickname: row.get(3)?,
+                    role_ids,
+                    joined_at: row.get(5)?,
+                })
+            })
+            .map_err(|e| format!("query members: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect members: {e}"))
     }
 }
 

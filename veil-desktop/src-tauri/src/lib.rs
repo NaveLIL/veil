@@ -14,6 +14,10 @@ struct AppState {
     runtime: tokio::runtime::Runtime,
     last_activity: Mutex<Instant>,
     db_dir: PathBuf,
+    /// Shared HTTP client — reuses TCP/TLS connections + HTTP/2 streams across
+    /// all REST calls. Eliminates per-request handshake overhead, the main
+    /// cause of the perceived "server tab is slow / hangs" UX.
+    http: reqwest::Client,
 }
 
 const KEYCHAIN_ACCOUNT: &str = "veil-default";
@@ -349,8 +353,20 @@ fn connect_to_server(
                             .try_into()
                             .unwrap_or([0u8; 32]);
 
-                        let text = match client.decrypt_from(&sender_key, &header, &ciphertext) {
-                            Ok(pt) => String::from_utf8_lossy(&pt).to_string(),
+                        let text = match client.decrypt_from(
+                            &sender_key,
+                            &conversation_id,
+                            &header,
+                            &ciphertext,
+                        ) {
+                            Ok(veil_client::api::DecryptedPayload::Text(pt)) => {
+                                String::from_utf8_lossy(&pt).to_string()
+                            }
+                            Ok(veil_client::api::DecryptedPayload::Control) => {
+                                // SKDM or other control frame — swallow.
+                                drop(client);
+                                continue;
+                            }
                             Err(_) => String::from_utf8_lossy(&ciphertext).to_string(),
                         };
 
@@ -421,8 +437,19 @@ fn connect_to_server(
                             .try_into()
                             .unwrap_or([0u8; 32]);
 
-                        let new_text = match client.decrypt_from(&sender_key, &header, &ciphertext) {
-                            Ok(pt) => String::from_utf8_lossy(&pt).to_string(),
+                        let new_text = match client.decrypt_from(
+                            &sender_key,
+                            &conversation_id,
+                            &header,
+                            &ciphertext,
+                        ) {
+                            Ok(veil_client::api::DecryptedPayload::Text(pt)) => {
+                                String::from_utf8_lossy(&pt).to_string()
+                            }
+                            Ok(veil_client::api::DecryptedPayload::Control) => {
+                                drop(client);
+                                continue;
+                            }
                             Err(_) => String::from_utf8_lossy(&ciphertext).to_string(),
                         };
 
@@ -597,6 +624,85 @@ fn connect_to_server(
                                 })).collect::<Vec<_>>(),
                             }),
                         );
+                    }
+                    ConnectionEvent::ServerEvent {
+                        event_type,
+                        server_id,
+                        server_info,
+                        member_info,
+                        role_info,
+                    } => {
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://server-event",
+                            serde_json::json!({
+                                "eventType": event_type,
+                                "serverId": server_id,
+                                "serverInfo": server_info.map(|si| serde_json::json!({
+                                    "id": si.id,
+                                    "name": si.name,
+                                    "iconUrl": si.icon_url,
+                                    "ownerIdentityKey": hex::encode(&si.owner_identity_key),
+                                })),
+                                "memberInfo": member_info.map(|mi| serde_json::json!({
+                                    "identityKey": hex::encode(&mi.identity_key),
+                                    "username": mi.username,
+                                    "roleIds": mi.role_ids,
+                                    "reason": mi.reason,
+                                })),
+                                "roleInfo": role_info.map(|ri| serde_json::json!({
+                                    "id": ri.id,
+                                    "name": ri.name,
+                                    "permissions": ri.permissions,
+                                    "position": ri.position,
+                                    "color": ri.color,
+                                })),
+                            }),
+                        );
+                    }
+                    ConnectionEvent::ChannelEvent {
+                        event_type,
+                        server_id,
+                        channel,
+                    } => {
+                        drop(client);
+                        let _ = app_handle.emit(
+                            "veil://channel-event",
+                            serde_json::json!({
+                                "eventType": event_type,
+                                "serverId": server_id,
+                                "channel": {
+                                    "id": channel.id,
+                                    "serverId": channel.server_id,
+                                    "name": channel.name,
+                                    "channelType": channel.channel_type,
+                                    "categoryId": channel.category_id,
+                                    "position": channel.position,
+                                    "topic": channel.topic,
+                                },
+                            }),
+                        );
+                    }
+                    ConnectionEvent::SenderKeyDist {
+                        conversation_id,
+                        sender_key_message,
+                        ..
+                    } => {
+                        match client.process_sealed_skdm(&sender_key_message) {
+                            Ok(()) => {
+                                drop(client);
+                                let _ = app_handle.emit(
+                                    "veil://sender-key-received",
+                                    serde_json::json!({
+                                        "conversationId": conversation_id,
+                                    }),
+                                );
+                            }
+                            Err(e) => {
+                                drop(client);
+                                eprintln!("[skdm] open failed: {e}");
+                            }
+                        }
                     }
                     _ => {}
                 }
@@ -861,6 +967,921 @@ fn get_group_members(
     Ok(members)
 }
 
+// ─── Servers / Channels / Roles / Invites ─────────────
+
+/// Helper: parse a JSON error body and produce a String.
+fn rest_err(body: &serde_json::Value, fallback: &str) -> String {
+    body.get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+async fn rest_send_json(
+    state: &AppState,
+    method: reqwest::Method,
+    url: String,
+    user_id: &str,
+    body: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    // 1. Compute body bytes + hash up-front (so signing covers the wire body).
+    let body_bytes: Vec<u8> = match body.as_ref() {
+        Some(b) => serde_json::to_vec(b).map_err(|e| format!("serialize body: {e}"))?,
+        None => Vec::new(),
+    };
+    let body_hash = Sha256::digest(&body_bytes);
+
+    // 2. Extract path from URL for canonical signing message.
+    let path = reqwest::Url::parse(&url)
+        .map(|u| u.path().to_string())
+        .unwrap_or_else(|_| url.clone());
+
+    let ts_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+
+    let canonical = format!(
+        "{}\n{}\n{}\n{}",
+        method.as_str(),
+        path,
+        ts_ms,
+        hex::encode(body_hash)
+    );
+
+    // 3. Sign — short-lived client lock, dropped before async send.
+    let sig_b64 = {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        match client.sign_message(canonical.as_bytes()) {
+            Ok(sig) => Some(base64::engine::general_purpose::STANDARD.encode(sig)),
+            Err(_) => None, // Identity not yet initialized — fall back to legacy auth.
+        }
+    };
+
+    // 4. Build & send request via shared HTTP client (connection pooling).
+    let mut req = state
+        .http
+        .request(method, url)
+        .header("X-User-ID", user_id);
+    if let Some(sig) = sig_b64 {
+        req = req
+            .header("X-Veil-User", user_id)
+            .header("X-Veil-Timestamp", ts_ms.to_string())
+            .header("X-Veil-Signature", sig);
+    }
+    if !body_bytes.is_empty() {
+        req = req
+            .header("Content-Type", "application/json")
+            .body(body_bytes);
+    }
+    let resp = req
+        .send()
+        .await
+        .map_err(|e| format!("http request failed: {e}"))?;
+    let status = resp.status();
+    // Read body once as bytes so we can include raw text in error paths even
+    // when the server returns non-JSON (proxy errors, html, etc.).
+    let body_bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("read response body: {e}"))?;
+    let json: serde_json::Value = if body_bytes.is_empty() {
+        serde_json::Value::Null
+    } else {
+        serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null)
+    };
+    if !status.is_success() {
+        let fallback = if json.is_null() {
+            let snippet = String::from_utf8_lossy(&body_bytes);
+            let truncated: String = snippet.chars().take(200).collect();
+            format!("HTTP {}: {}", status.as_u16(), truncated)
+        } else {
+            format!("HTTP {}", status.as_u16())
+        };
+        return Err(rest_err(&json, &fallback));
+    }
+    Ok(json)
+}
+
+#[tauri::command]
+fn create_server(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    name: String,
+) -> Result<serde_json::Value, String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        format!("{}/v1/servers", server_http_url),
+        &user_id,
+        Some(serde_json::json!({ "name": name })),
+    ))
+}
+
+#[tauri::command]
+fn list_servers(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let resp = state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::GET,
+        format!("{}/v1/servers", server_http_url),
+        &user_id,
+        None,
+    ))?;
+    Ok(resp["servers"].as_array().cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+fn get_server(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+) -> Result<serde_json::Value, String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::GET,
+        format!("{}/v1/servers/{}", server_http_url, server_id),
+        &user_id,
+        None,
+    ))
+}
+
+#[tauri::command]
+fn update_server(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    name: Option<String>,
+    description: Option<String>,
+    icon_url: Option<String>,
+) -> Result<(), String> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = name {
+        body.insert("name".into(), v.into());
+    }
+    if let Some(v) = description {
+        body.insert("description".into(), v.into());
+    }
+    if let Some(v) = icon_url {
+        body.insert("icon_url".into(), v.into());
+    }
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::PATCH,
+        format!("{}/v1/servers/{}", server_http_url, server_id),
+        &user_id,
+        Some(serde_json::Value::Object(body)),
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_server(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+) -> Result<(), String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::DELETE,
+        format!("{}/v1/servers/{}", server_http_url, server_id),
+        &user_id,
+        None,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn leave_server(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+) -> Result<(), String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        format!("{}/v1/servers/{}/leave", server_http_url, server_id),
+        &user_id,
+        None,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_server_members(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let resp = state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::GET,
+        format!("{}/v1/servers/{}/members", server_http_url, server_id),
+        &user_id,
+        None,
+    ))?;
+    Ok(resp["members"].as_array().cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+fn kick_server_member(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    target_user_id: String,
+    reason: Option<String>,
+) -> Result<(), String> {
+    let body = reason.map(|r| serde_json::json!({ "reason": r }));
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::DELETE,
+        format!(
+            "{}/v1/servers/{}/members/{}",
+            server_http_url, server_id, target_user_id
+        ),
+        &user_id,
+        body,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_channels(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let resp = state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::GET,
+        format!("{}/v1/servers/{}/channels", server_http_url, server_id),
+        &user_id,
+        None,
+    ))?;
+    Ok(resp["channels"].as_array().cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+fn create_channel(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    name: String,
+    channel_type: i16,
+    category_id: Option<String>,
+    topic: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::json!({
+        "name": name,
+        "channel_type": channel_type,
+    });
+    if let Some(v) = category_id {
+        body["category_id"] = v.into();
+    }
+    if let Some(v) = topic {
+        body["topic"] = v.into();
+    }
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        format!("{}/v1/servers/{}/channels", server_http_url, server_id),
+        &user_id,
+        Some(body),
+    ))
+}
+
+#[tauri::command]
+fn update_channel(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    channel_id: String,
+    name: Option<String>,
+    topic: Option<String>,
+    nsfw: Option<bool>,
+    slowmode_secs: Option<i32>,
+) -> Result<(), String> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = name {
+        body.insert("name".into(), v.into());
+    }
+    if let Some(v) = topic {
+        body.insert("topic".into(), v.into());
+    }
+    if let Some(v) = nsfw {
+        body.insert("nsfw".into(), v.into());
+    }
+    if let Some(v) = slowmode_secs {
+        body.insert("slowmode_secs".into(), v.into());
+    }
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::PATCH,
+        format!("{}/v1/channels/{}", server_http_url, channel_id),
+        &user_id,
+        Some(serde_json::Value::Object(body)),
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_channel(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    channel_id: String,
+) -> Result<(), String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::DELETE,
+        format!("{}/v1/channels/{}", server_http_url, channel_id),
+        &user_id,
+        None,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn reorder_channels(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    items: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        format!(
+            "{}/v1/servers/{}/channels/reorder",
+            server_http_url, server_id
+        ),
+        &user_id,
+        Some(serde_json::json!({ "items": items })),
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_roles(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let resp = state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::GET,
+        format!("{}/v1/servers/{}/roles", server_http_url, server_id),
+        &user_id,
+        None,
+    ))?;
+    Ok(resp["roles"].as_array().cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+fn create_role(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    name: String,
+    permissions: u64,
+    color: Option<i32>,
+) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::json!({
+        "name": name,
+        "permissions": permissions,
+    });
+    if let Some(c) = color {
+        body["color"] = c.into();
+    }
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        format!("{}/v1/servers/{}/roles", server_http_url, server_id),
+        &user_id,
+        Some(body),
+    ))
+}
+
+#[tauri::command]
+fn update_role(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    role_id: String,
+    name: Option<String>,
+    permissions: Option<u64>,
+    color: Option<i32>,
+) -> Result<(), String> {
+    let mut body = serde_json::Map::new();
+    if let Some(v) = name {
+        body.insert("name".into(), v.into());
+    }
+    if let Some(v) = permissions {
+        body.insert("permissions".into(), v.into());
+    }
+    if let Some(v) = color {
+        body.insert("color".into(), v.into());
+    }
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::PATCH,
+        format!(
+            "{}/v1/servers/{}/roles/{}",
+            server_http_url, server_id, role_id
+        ),
+        &user_id,
+        Some(serde_json::Value::Object(body)),
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_role(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    role_id: String,
+) -> Result<(), String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::DELETE,
+        format!(
+            "{}/v1/servers/{}/roles/{}",
+            server_http_url, server_id, role_id
+        ),
+        &user_id,
+        None,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn assign_role(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    target_user_id: String,
+    role_id: String,
+) -> Result<(), String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::PUT,
+        format!(
+            "{}/v1/servers/{}/members/{}/roles/{}",
+            server_http_url, server_id, target_user_id, role_id
+        ),
+        &user_id,
+        None,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn unassign_role(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    target_user_id: String,
+    role_id: String,
+) -> Result<(), String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::DELETE,
+        format!(
+            "{}/v1/servers/{}/members/{}/roles/{}",
+            server_http_url, server_id, target_user_id, role_id
+        ),
+        &user_id,
+        None,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn create_invite(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    max_uses: i32,
+    expires_in_secs: i64,
+) -> Result<serde_json::Value, String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        format!("{}/v1/servers/{}/invites", server_http_url, server_id),
+        &user_id,
+        Some(serde_json::json!({
+            "max_uses": max_uses,
+            "expires_in_secs": expires_in_secs,
+        })),
+    ))
+}
+
+#[tauri::command]
+fn list_invites(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let resp = state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::GET,
+        format!("{}/v1/servers/{}/invites", server_http_url, server_id),
+        &user_id,
+        None,
+    ))?;
+    Ok(resp["invites"].as_array().cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+fn revoke_invite(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    code: String,
+) -> Result<(), String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::DELETE,
+        format!("{}/v1/invites/{}", server_http_url, code),
+        &user_id,
+        None,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn preview_invite(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    code: String,
+) -> Result<serde_json::Value, String> {
+    // Public endpoint — no auth required.
+    let url = format!("{}/v1/invites/{}", server_http_url, code);
+    state.runtime.block_on(async move {
+        let http = reqwest::Client::new();
+        let resp = http
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| format!("preview: {e}"))?;
+        let status = resp.status();
+        let json: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if !status.is_success() {
+            return Err(rest_err(&json, &format!("HTTP {}", status.as_u16())));
+        }
+        Ok(json)
+    })
+}
+
+#[tauri::command]
+fn use_invite(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    code: String,
+) -> Result<serde_json::Value, String> {
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        format!("{}/v1/invites/{}/use", server_http_url, code),
+        &user_id,
+        None,
+    ))
+}
+
+// ─── Server / Channel local cache (offline-first) ─────
+//
+// Source of truth is the gateway. The cache exists so the UI can render the
+// server rail and channel tree instantly on app start, before REST returns.
+// The frontend is expected to (a) call load_cached_* on mount,
+// (b) call save_cached_* with the freshly-fetched payload on successful REST,
+// (c) listen to veil://server-event / veil://channel-event and refetch.
+
+fn cached_server_from_json(v: &serde_json::Value, position: i32) -> Option<veil_store::models::CachedServer> {
+    Some(veil_store::models::CachedServer {
+        id: v.get("id")?.as_str()?.to_string(),
+        name: v.get("name")?.as_str()?.to_string(),
+        description: v.get("description").and_then(|x| x.as_str()).map(String::from),
+        icon_url: v.get("icon_url").and_then(|x| x.as_str()).map(String::from),
+        owner_id: v.get("owner_id")?.as_str()?.to_string(),
+        position,
+        created_at: v.get("created_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+    })
+}
+
+fn cached_channel_from_json(server_id: &str, v: &serde_json::Value) -> Option<veil_store::models::CachedChannel> {
+    Some(veil_store::models::CachedChannel {
+        id: v.get("id")?.as_str()?.to_string(),
+        server_id: server_id.to_string(),
+        conversation_id: v.get("conversation_id").and_then(|x| x.as_str()).map(String::from),
+        name: v.get("name")?.as_str()?.to_string(),
+        channel_type: v.get("channel_type").and_then(|x| x.as_i64()).unwrap_or(0) as i16,
+        category_id: v.get("category_id").and_then(|x| x.as_str()).map(String::from),
+        position: v.get("position").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
+        topic: v.get("topic").and_then(|x| x.as_str()).map(String::from),
+        nsfw: v.get("nsfw").and_then(|x| x.as_bool()).unwrap_or(false),
+        slowmode_secs: v.get("slowmode_secs").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
+    })
+}
+
+fn cached_role_from_json(server_id: &str, v: &serde_json::Value) -> Option<veil_store::models::CachedRole> {
+    Some(veil_store::models::CachedRole {
+        id: v.get("id")?.as_str()?.to_string(),
+        server_id: server_id.to_string(),
+        name: v.get("name")?.as_str()?.to_string(),
+        permissions: v.get("permissions").and_then(|x| x.as_u64()).unwrap_or(0),
+        position: v.get("position").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
+        color: v.get("color").and_then(|x| x.as_i64()).map(|c| c as i32),
+        is_default: v.get("is_default").and_then(|x| x.as_bool()).unwrap_or(false),
+        hoist: v.get("hoist").and_then(|x| x.as_bool()).unwrap_or(false),
+        mentionable: v.get("mentionable").and_then(|x| x.as_bool()).unwrap_or(false),
+    })
+}
+
+fn cached_member_from_json(server_id: &str, v: &serde_json::Value) -> Option<veil_store::models::CachedServerMember> {
+    let role_ids = v
+        .get("role_ids")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|r| r.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    Some(veil_store::models::CachedServerMember {
+        server_id: server_id.to_string(),
+        user_id: v.get("user_id")?.as_str()?.to_string(),
+        username: v.get("username").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        nickname: v.get("nickname").and_then(|x| x.as_str()).map(String::from),
+        role_ids,
+        joined_at: v.get("joined_at").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+    })
+}
+
+#[tauri::command]
+fn cache_load_servers(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("db not initialized")?;
+    let servers = db.list_servers()?;
+    Ok(servers
+        .into_iter()
+        .map(|s| {
+            serde_json::json!({
+                "id": s.id,
+                "name": s.name,
+                "description": s.description,
+                "icon_url": s.icon_url,
+                "owner_id": s.owner_id,
+                "position": s.position,
+                "created_at": s.created_at,
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn cache_save_servers(
+    state: State<'_, AppState>,
+    servers: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db_mut().ok_or("db not initialized")?;
+    let cached: Vec<_> = servers
+        .iter()
+        .enumerate()
+        .filter_map(|(i, v)| cached_server_from_json(v, i as i32))
+        .collect();
+    db.replace_servers(&cached)
+}
+
+#[tauri::command]
+fn cache_delete_server(state: State<'_, AppState>, server_id: String) -> Result<(), String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("db not initialized")?;
+    db.delete_server(&server_id)
+}
+
+#[tauri::command]
+fn cache_load_channels(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("db not initialized")?;
+    let chans = db.list_channels(&server_id)?;
+    Ok(chans
+        .into_iter()
+        .map(|c| {
+            serde_json::json!({
+                "id": c.id,
+                "server_id": c.server_id,
+                "conversation_id": c.conversation_id,
+                "name": c.name,
+                "channel_type": c.channel_type,
+                "category_id": c.category_id,
+                "position": c.position,
+                "topic": c.topic,
+                "nsfw": c.nsfw,
+                "slowmode_secs": c.slowmode_secs,
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn cache_save_channels(
+    state: State<'_, AppState>,
+    server_id: String,
+    channels: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db_mut().ok_or("db not initialized")?;
+    let cached: Vec<_> = channels
+        .iter()
+        .filter_map(|v| cached_channel_from_json(&server_id, v))
+        .collect();
+    db.replace_channels(&server_id, &cached)
+}
+
+#[tauri::command]
+fn cache_delete_channel(state: State<'_, AppState>, channel_id: String) -> Result<(), String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("db not initialized")?;
+    db.delete_channel(&channel_id)
+}
+
+#[tauri::command]
+fn cache_load_roles(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("db not initialized")?;
+    let roles = db.list_roles(&server_id)?;
+    Ok(roles
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "id": r.id,
+                "server_id": r.server_id,
+                "name": r.name,
+                "permissions": r.permissions,
+                "position": r.position,
+                "color": r.color,
+                "is_default": r.is_default,
+                "hoist": r.hoist,
+                "mentionable": r.mentionable,
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn cache_save_roles(
+    state: State<'_, AppState>,
+    server_id: String,
+    roles: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db_mut().ok_or("db not initialized")?;
+    let cached: Vec<_> = roles
+        .iter()
+        .filter_map(|v| cached_role_from_json(&server_id, v))
+        .collect();
+    db.replace_roles(&server_id, &cached)
+}
+
+#[tauri::command]
+fn cache_load_server_members(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("db not initialized")?;
+    let members = db.list_server_members(&server_id)?;
+    Ok(members
+        .into_iter()
+        .map(|m| {
+            serde_json::json!({
+                "server_id": m.server_id,
+                "user_id": m.user_id,
+                "username": m.username,
+                "nickname": m.nickname,
+                "role_ids": m.role_ids,
+                "joined_at": m.joined_at,
+            })
+        })
+        .collect())
+}
+
+#[tauri::command]
+fn cache_save_server_members(
+    state: State<'_, AppState>,
+    server_id: String,
+    members: Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db_mut().ok_or("db not initialized")?;
+    let cached: Vec<_> = members
+        .iter()
+        .filter_map(|v| cached_member_from_json(&server_id, v))
+        .collect();
+    db.replace_server_members(&server_id, &cached)
+}
+
+// ─── Sender Keys (Phase E) ────────────────────────────
+
+/// Mark a conversation as a channel — outgoing messages are encrypted with
+/// per-group sender keys and incoming messages are decrypted via SenderKeyStore.
+#[tauri::command]
+fn mark_channel_conversation(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    client.mark_channel_conversation(&conversation_id);
+    Ok(())
+}
+
+/// Hydrate sender keys (outgoing + all incoming) for a channel from the local DB.
+#[tauri::command]
+fn hydrate_channel_sender_keys(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    client.hydrate_channel_sender_keys(&conversation_id)
+}
+
+/// Distribute our outgoing sender key to a list of channel members
+/// (sealed envelope per recipient identity key, sent via SenderKeyDist envelope).
+#[tauri::command]
+fn distribute_sender_key(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    peer_identity_keys: Vec<String>,
+) -> Result<u32, String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    client.mark_channel_conversation(&conversation_id);
+
+    let our_ik = client.identity_key()?;
+    let mut sent = 0u32;
+    for hex_key in &peer_identity_keys {
+        let bytes = match hex::decode(hex_key) {
+            Ok(b) if b.len() == 32 => b,
+            _ => continue,
+        };
+        let mut peer_ik = [0u8; 32];
+        peer_ik.copy_from_slice(&bytes);
+        if peer_ik == our_ik {
+            continue; // skip self
+        }
+        match state
+            .runtime
+            .block_on(client.send_sender_key_to(&conversation_id, &peer_ik))
+        {
+            Ok(_) => sent += 1,
+            Err(e) => eprintln!("[skdm] send to {hex_key}: {e}"),
+        }
+    }
+    Ok(sent)
+}
+
+/// Force-rotate our outgoing sender key for a channel (e.g. on member kick).
+#[tauri::command]
+fn rotate_sender_key(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    client.rotate_sender_key(&conversation_id)
+}
+
 // ─── Friends & Presence ───────────────────────────────
 
 #[tauri::command]
@@ -938,6 +1959,14 @@ fn search_user(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            // A second instance tried to start — focus the existing window instead.
+            if let Some(win) = app.get_webview_window("main") {
+                let _ = win.show();
+                let _ = win.set_focus();
+                let _ = win.unminimize();
+            }
+        }))
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
@@ -953,6 +1982,12 @@ pub fn run() {
                 runtime: tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
                 last_activity: Mutex::new(Instant::now()),
                 db_dir: data_dir,
+                http: reqwest::Client::builder()
+                    .pool_idle_timeout(std::time::Duration::from_secs(30))
+                    .pool_max_idle_per_host(8)
+                    .timeout(std::time::Duration::from_secs(20))
+                    .build()
+                    .expect("reqwest client"),
             });
             // System tray with menu
             let show = MenuItem::with_id(app, "show", "Show Veil", true, None::<&str>)?;
@@ -1036,6 +2071,44 @@ pub fn run() {
             request_friend_list,
             send_presence,
             search_user,
+            create_server,
+            list_servers,
+            get_server,
+            update_server,
+            delete_server,
+            leave_server,
+            list_server_members,
+            kick_server_member,
+            list_channels,
+            create_channel,
+            update_channel,
+            reorder_channels,
+            delete_channel,
+            list_roles,
+            create_role,
+            update_role,
+            delete_role,
+            assign_role,
+            unassign_role,
+            create_invite,
+            list_invites,
+            revoke_invite,
+            preview_invite,
+            use_invite,
+            cache_load_servers,
+            cache_save_servers,
+            cache_delete_server,
+            cache_load_channels,
+            cache_save_channels,
+            cache_delete_channel,
+            cache_load_roles,
+            cache_save_roles,
+            cache_load_server_members,
+            cache_save_server_members,
+            mark_channel_conversation,
+            hydrate_channel_sender_keys,
+            distribute_sender_key,
+            rotate_sender_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running veil");

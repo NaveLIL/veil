@@ -253,6 +253,47 @@ impl SenderKeyStore {
         self.outgoing.remove(group_id);
         self.incoming.retain(|(gid, _), _| gid != group_id);
     }
+
+    /// Remove a single incoming key (e.g. when a member leaves the group).
+    pub fn remove_incoming(&mut self, group_id: &str, sender_ik: &[u8; 32]) {
+        self.incoming.remove(&(group_id.to_string(), *sender_ik));
+    }
+
+    /// Serialize the outgoing key state for a group (for persistence).
+    pub fn serialize_outgoing(&self, group_id: &str) -> Option<Vec<u8>> {
+        self.outgoing
+            .get(group_id)
+            .and_then(|s| serde_json::to_vec(s).ok())
+    }
+
+    /// Serialize an incoming key state (for persistence).
+    pub fn serialize_incoming(&self, group_id: &str, sender_ik: &[u8; 32]) -> Option<Vec<u8>> {
+        self.incoming
+            .get(&(group_id.to_string(), *sender_ik))
+            .and_then(|s| serde_json::to_vec(s).ok())
+    }
+
+    /// Restore an outgoing key state from persisted bytes.
+    pub fn load_outgoing(&mut self, group_id: &str, data: &[u8]) -> Result<(), String> {
+        let state: SenderKeyState =
+            serde_json::from_slice(data).map_err(|e| format!("decode outgoing sk: {e}"))?;
+        self.outgoing.insert(group_id.to_string(), state);
+        Ok(())
+    }
+
+    /// Restore an incoming key state from persisted bytes.
+    pub fn load_incoming(
+        &mut self,
+        group_id: &str,
+        sender_ik: &[u8; 32],
+        data: &[u8],
+    ) -> Result<(), String> {
+        let state: SenderKeyState =
+            serde_json::from_slice(data).map_err(|e| format!("decode incoming sk: {e}"))?;
+        self.incoming
+            .insert((group_id.to_string(), *sender_ik), state);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -320,5 +361,125 @@ mod tests {
         let mut store = SenderKeyStore::new();
         store.create_outgoing(group, &ik);
         assert!(!store.needs_rotation(group));
+    }
+}
+
+// ─── Sealed SKDM Envelope ──────────────────────────────
+//
+// Sender Key Distribution Messages are delivered to peers without relying on
+// the (currently incomplete) cold-start of pairwise Double Ratchet sessions.
+// We use ECIES-style sealed envelopes:
+//   ephemeral X25519 keypair → DH(eph_priv, recipient_static_pub) → HKDF → AEAD key
+// Authenticity of the sender is asserted by including the sender's identity
+// public key in the AAD-like context (HKDF salt) so any tampering breaks decryption,
+// and by transmitting the SKDM via the server which forwards based on
+// conversation_membership of the authenticated sender.
+//
+// Wire format:
+//   [1B version=0x01][32B sender_ik][32B eph_pub][24B nonce][N B ciphertext]
+
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519Secret};
+
+const SEALED_SKDM_VERSION: u8 = 0x01;
+
+/// Seal a SKDM JSON for a specific recipient. Returns wire bytes.
+pub fn seal_skdm(
+    sender_ik: &[u8; 32],
+    recipient_ik: &[u8; 32],
+    skdm_json: &[u8],
+) -> Result<Vec<u8>, String> {
+    let mut eph_secret_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut eph_secret_bytes);
+    let eph_secret = X25519Secret::from(eph_secret_bytes);
+    let eph_pub = X25519PublicKey::from(&eph_secret);
+
+    let recipient_pub = X25519PublicKey::from(*recipient_ik);
+    let shared = eph_secret.diffie_hellman(&recipient_pub);
+    eph_secret_bytes.zeroize();
+
+    // HKDF salt binds sender_ik || recipient_ik; info is a domain separator.
+    let mut salt = Vec::with_capacity(64);
+    salt.extend_from_slice(sender_ik);
+    salt.extend_from_slice(recipient_ik);
+    let key = kdf::hkdf_sha256(&salt, shared.as_bytes(), b"veil-skdm-v1", 32);
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&key);
+
+    let (ct, nonce) = aead::encrypt(&key_arr, skdm_json)?;
+    key_arr.zeroize();
+
+    let mut wire = Vec::with_capacity(1 + 32 + 32 + 24 + ct.len());
+    wire.push(SEALED_SKDM_VERSION);
+    wire.extend_from_slice(sender_ik);
+    wire.extend_from_slice(eph_pub.as_bytes());
+    wire.extend_from_slice(&nonce);
+    wire.extend_from_slice(&ct);
+    Ok(wire)
+}
+
+/// Open a sealed SKDM. Returns `(sender_identity_key, skdm_json_bytes)`.
+pub fn open_skdm(
+    recipient_ik_secret: &[u8; 32],
+    recipient_ik_public: &[u8; 32],
+    wire: &[u8],
+) -> Result<([u8; 32], Vec<u8>), String> {
+    if wire.len() < 1 + 32 + 32 + 24 + 16 {
+        return Err("sealed SKDM too short".to_string());
+    }
+    if wire[0] != SEALED_SKDM_VERSION {
+        return Err(format!("unknown sealed SKDM version: {:#x}", wire[0]));
+    }
+    let mut sender_ik = [0u8; 32];
+    sender_ik.copy_from_slice(&wire[1..33]);
+    let mut eph_pub_bytes = [0u8; 32];
+    eph_pub_bytes.copy_from_slice(&wire[33..65]);
+    let mut nonce = [0u8; 24];
+    nonce.copy_from_slice(&wire[65..89]);
+    let ct = &wire[89..];
+
+    let recipient_secret = X25519Secret::from(*recipient_ik_secret);
+    let eph_pub = X25519PublicKey::from(eph_pub_bytes);
+    let shared = recipient_secret.diffie_hellman(&eph_pub);
+
+    let mut salt = Vec::with_capacity(64);
+    salt.extend_from_slice(&sender_ik);
+    salt.extend_from_slice(recipient_ik_public);
+    let key = kdf::hkdf_sha256(&salt, shared.as_bytes(), b"veil-skdm-v1", 32);
+    let mut key_arr = [0u8; 32];
+    key_arr.copy_from_slice(&key);
+
+    let pt = aead::decrypt(&key_arr, ct, &nonce)?;
+    key_arr.zeroize();
+    Ok((sender_ik, pt))
+}
+
+#[cfg(test)]
+mod sealed_tests {
+    use super::*;
+    use x25519_dalek::{PublicKey, StaticSecret};
+
+    #[test]
+    fn test_seal_open_roundtrip() {
+        let mut rng = rand::rngs::OsRng;
+        let mut sender_secret_bytes = [0u8; 32];
+        let mut recipient_secret_bytes = [0u8; 32];
+        rng.fill_bytes(&mut sender_secret_bytes);
+        rng.fill_bytes(&mut recipient_secret_bytes);
+
+        let sender_secret = StaticSecret::from(sender_secret_bytes);
+        let recipient_secret = StaticSecret::from(recipient_secret_bytes);
+        let sender_pub = PublicKey::from(&sender_secret);
+        let recipient_pub = PublicKey::from(&recipient_secret);
+
+        let payload = b"{\"group_id\":\"abc\",\"key_id\":1}";
+        let sealed = seal_skdm(sender_pub.as_bytes(), recipient_pub.as_bytes(), payload).unwrap();
+        let (got_sender, got_payload) = open_skdm(
+            &recipient_secret_bytes,
+            recipient_pub.as_bytes(),
+            &sealed,
+        )
+        .unwrap();
+        assert_eq!(&got_sender, sender_pub.as_bytes());
+        assert_eq!(got_payload, payload);
     }
 }

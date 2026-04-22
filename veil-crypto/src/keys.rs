@@ -108,6 +108,19 @@ impl IdentityKeyPair {
         &self.x25519_public
     }
 
+    /// Open a sealed Sender Key Distribution Message addressed to us.
+    /// Returns `(sender_identity_key, skdm_json_bytes)`.
+    pub fn open_sealed_skdm(&self, wire: &[u8]) -> Result<([u8; 32], Vec<u8>), String> {
+        let secret = self.x25519_secret.to_bytes();
+        let public = *self.x25519_public.as_bytes();
+        let result = crate::sender_key::open_skdm(&secret, &public, wire);
+        // best-effort zeroize of the local copy of the secret
+        let mut s = secret;
+        use zeroize::Zeroize;
+        s.zeroize();
+        result
+    }
+
     /// Get reference to the Ed25519 verifying key.
     pub fn ed25519_verifying_key(&self) -> &Ed25519VerifyingKey {
         &self.ed25519_verifying

@@ -5,6 +5,11 @@ import { appStore, type GroupMember, type Message } from "@/stores/app";
 import { OnboardingScreen } from "@/components/chat/OnboardingScreen";
 import { LockScreen } from "@/components/chat/LockScreen";
 import { SettingsScreen } from "@/components/chat/SettingsScreen";
+import { ServerSettingsScreen } from "@/components/server/ServerSettingsScreen";
+import { CreateServerDialog } from "@/components/server/CreateServerDialog";
+import { JoinServerDialog } from "@/components/server/JoinServerDialog";
+import { CreateChannelDialog } from "@/components/server/CreateChannelDialog";
+import { CreateInviteDialog } from "@/components/server/CreateInviteDialog";
 
 /** Detect emoji-only messages (1-3 emoji, no other text). */
 const EMOJI_ONLY_RE = /^(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}(?:\u{FE0F})?(?:\u{200D}\p{Extended_Pictographic}(?:\u{FE0F})?)*){1,3}$/u;
@@ -13,6 +18,8 @@ const isEmojiOnly = (text: string) => EMOJI_ONLY_RE.test(text.trim());
 import {
   ContextMenu, ContextMenuTrigger, ContextMenuContent,
   ContextMenuItem, ContextMenuSeparator, ContextMenuIcon, ContextMenuShortcut,
+  ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent,
+  ContextMenuCheckboxItem,
 } from "@/components/ui/context-menu";
 import { EmojiPicker } from "@/components/ui/emoji-picker";
 import { MessageRenderer } from "@/components/chat/MessageRenderer";
@@ -323,6 +330,50 @@ const App: Component = () => {
   };
 
   const [activeServer, setActiveServer] = createSignal("home");
+  const [showCreateServer, setShowCreateServer] = createSignal(false);
+  const [showJoinServer, setShowJoinServer] = createSignal(false);
+  const [showCreateChannel, setShowCreateChannel] = createSignal(false);
+  const [showCreateInvite, setShowCreateInvite] = createSignal(false);
+  // Collapsed category IDs (per-server). Default: all expanded.
+  const [collapsedCats, setCollapsedCats] = createSignal<Set<string>>(new Set());
+  const toggleCategory = (id: string) => {
+    setCollapsedCats((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  };
+
+  // Drag-and-drop state for channel reordering
+  const [dragChannelId, setDragChannelId] = createSignal<string | null>(null);
+  const [dropTarget, setDropTarget] = createSignal<
+    { kind: "before"; id: string } | { kind: "category"; id: string | null } | null
+  >(null);
+
+  // Keep the local rail selection in sync with the global app store so that
+  // newly-created servers / store-driven changes are reflected in the UI.
+  createEffect(() => {
+    const id = appStore.activeServerId();
+    setActiveServer(id ?? "home");
+  });
+
+  // When a server becomes active, ensure channels + members are loaded so the
+  // sidebar (Island 2) and members panel (Island 4) have data to render.
+  createEffect(() => {
+    const sid = appStore.activeServerId();
+    if (!sid) return;
+    const tasks: Promise<unknown>[] = [];
+    if ((appStore.channelsByServer()[sid] ?? []).length === 0) {
+      tasks.push(appStore.loadChannels(sid));
+    }
+    if ((appStore.serverMembers()[sid] ?? []).length === 0) {
+      tasks.push(appStore.loadServerMembers(sid));
+    }
+    if ((appStore.serverRoles()[sid] ?? []).length === 0) {
+      tasks.push(appStore.loadServerRoles(sid));
+    }
+    if (tasks.length > 0) Promise.all(tasks).catch(() => {});
+  });
 
   return (
     <div style={S.root} onMouseDown={() => appStore.touchActivity()}>
@@ -348,6 +399,7 @@ const App: Component = () => {
         <Match when={appStore.screen() === "locked"}><LockScreen /></Match>
         <Match when={appStore.screen() === "disclaimer"}><DisclaimerScreen /></Match>
         <Match when={appStore.screen() === "settings"}><SettingsScreen /></Match>
+        <Match when={appStore.screen() === "serverSettings"}><ServerSettingsScreen /></Match>
         <Match when={appStore.screen() === "chat"}>
           <div style={S.body}>
 
@@ -357,7 +409,7 @@ const App: Component = () => {
                 {/* Home — DMs & Groups */}
                 <button
                   style={S.railBtn(activeServer() === "home")}
-                  onClick={() => setActiveServer("home")}
+                  onClick={() => { setActiveServer("home"); appStore.selectServer(null); }}
                   title="Home"
                 >
                   <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
@@ -372,7 +424,11 @@ const App: Component = () => {
                   {(s) => (
                     <button
                       style={S.railBtn(activeServer() === s.id)}
-                      onClick={() => setActiveServer(s.id)}
+                      onClick={() => { setActiveServer(s.id); appStore.selectServer(s.id); }}
+                      onContextMenu={(e) => {
+                        e.preventDefault();
+                        appStore.openServerSettings?.(s.id);
+                      }}
                       title={s.name}
                     >
                       {s.name.charAt(0).toUpperCase()}
@@ -380,17 +436,445 @@ const App: Component = () => {
                   )}
                 </For>
 
-                {/* Add Server — placeholder */}
+                {/* Create Server */}
                 <button
-                  style={{ ...S.railBtn(false), color: "#34d399", "font-size": "18px" }}
-                  onClick={() => {}}
-                  title="Join or create a server (coming soon)"
+                  style={{ ...S.railBtn(false), color: "#34d399", "font-size": "20px", "font-weight": "600" }}
+                  onClick={() => setShowCreateServer(true)}
+                  title="Create a server"
                 >+</button>
+
+                {/* Join Server */}
+                <button
+                  style={{ ...S.railBtn(false), color: "#7c6bf5", "font-size": "15px" }}
+                  onClick={() => setShowJoinServer(true)}
+                  title="Join a server with an invite"
+                >
+                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+                    <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/>
+                    <path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                  </svg>
+                </button>
               </div>
             </div>
 
             {/* ISLAND 2 — Sidebar */}
             <div style={{ ...S.island("256px"), ...S.islandAnim(island2Vis(), 0) }}>
+              {/* ── Server context: channels list ───────────────── */}
+              <Show when={appStore.activeServerId()}>
+                {(sid) => {
+                  const server = () => appStore.servers().find((s) => s.id === sid());
+                  const channels = () => (appStore.channelsByServer()[sid()] ?? [])
+                    .slice()
+                    .sort((a, b) => a.position - b.position);
+                  const isOwner = () => server()?.ownerId === appStore.userId();
+                  const channelIcon = (type: number) => {
+                    if (type === 1) return "\uD83D\uDD08"; // 🔈 voice
+                    if (type === 2) return "\u25BE";      // ▾ category
+                    return "#";
+                  };
+                  const headerBtn = (active = false) => ({
+                    width: "26px", height: "26px", "border-radius": "6px",
+                    background: active ? "rgba(124,107,245,0.15)" : "transparent",
+                    border: "none",
+                    color: active ? "#7c6bf5" : "#888",
+                    cursor: "pointer",
+                    display: "flex" as const, "align-items": "center" as const, "justify-content": "center" as const,
+                    transition: "background 0.15s, color 0.15s",
+                  });
+                  return (
+                    <>
+                      {/* Server header */}
+                      <div style={{
+                        padding: "14px 16px",
+                        "border-bottom": "1px solid rgba(255,255,255,0.04)",
+                        display: "flex", "align-items": "center", gap: "8px",
+                        "flex-shrink": "0",
+                      }}>
+                        <div style={{
+                          width: "30px", height: "30px", "border-radius": "9px",
+                          background: "rgba(124,107,245,0.15)",
+                          color: "#7c6bf5",
+                          display: "flex", "align-items": "center", "justify-content": "center",
+                          "font-size": "13px", "font-weight": "700", "flex-shrink": "0",
+                        }}>{(server()?.name ?? "?").charAt(0).toUpperCase()}</div>
+                        <div style={{ flex: "1", "min-width": "0" }}>
+                          <div style={{
+                            "font-size": "13px", "font-weight": "700", color: "#eee",
+                            "white-space": "nowrap", overflow: "hidden", "text-overflow": "ellipsis",
+                          }}>{server()?.name ?? "Server"}</div>
+                          <div style={{ "font-size": "10px", color: "#555" }}>
+                            {(appStore.serverMembers()[sid()] ?? []).length} members
+                          </div>
+                        </div>
+                        <button
+                          style={headerBtn(memberPanelOpen())}
+                          title="Members"
+                          onClick={async () => {
+                            if (!memberPanelOpen()) {
+                              await appStore.loadServerMembers(sid()).catch(() => {});
+                              setMemberPanelOpen(true);
+                              setTimeout(() => setIsland4Vis(true), 50);
+                            } else {
+                              setIsland4Vis(false);
+                              setTimeout(() => setMemberPanelOpen(false), 450);
+                            }
+                          }}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+                            <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                            <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="1.8"/>
+                            <path d="M22 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                          </svg>
+                        </button>
+                        <button
+                          style={headerBtn(false)}
+                          title="Invite people"
+                          onClick={() => setShowCreateInvite(true)}
+                        >
+                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
+                            <circle cx="8.5" cy="7" r="4"/>
+                            <line x1="20" y1="8" x2="20" y2="14"/>
+                            <line x1="23" y1="11" x2="17" y2="11"/>
+                          </svg>
+                        </button>
+                        <Show when={isOwner()}>
+                          <button
+                            style={headerBtn(false)}
+                            title="Server settings"
+                            onClick={() => appStore.openServerSettings(sid())}
+                          >
+                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                              <circle cx="12" cy="12" r="3"/>
+                              <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
+                            </svg>
+                          </button>
+                        </Show>
+                      </div>
+
+                      {/* Channel list */}
+                      <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 8px", "min-height": "0" }}>
+                        <div style={{
+                          display: "flex", "align-items": "center", "justify-content": "space-between",
+                          padding: "6px 10px 4px",
+                        }}>
+                          <span style={{
+                            "font-size": "10px", "font-weight": "700", color: "#666",
+                            "letter-spacing": "0.08em", "text-transform": "uppercase",
+                          }}>Channels</span>
+                          <Show when={isOwner()}>
+                            <button
+                              style={{
+                                width: "20px", height: "20px", "border-radius": "5px",
+                                background: "transparent", border: "none",
+                                color: "#666", cursor: "pointer", "font-size": "16px",
+                                display: "flex", "align-items": "center", "justify-content": "center",
+                                "line-height": "1",
+                              }}
+                              onClick={() => setShowCreateChannel(true)}
+                              title="Create channel"
+                            >+</button>
+                          </Show>
+                        </div>
+                        <Show when={channels().length > 0} fallback={
+                          <div style={{ "text-align": "center", color: "#555", "font-size": "12px", padding: "20px 12px" }}>
+                            No channels yet
+                            <Show when={isOwner()}>
+                              <div style={{ "margin-top": "8px" }}>
+                                <button
+                                  style={{ background: "none", border: "none", color: "#7c6bf5", "font-size": "12px", cursor: "pointer" }}
+                                  onClick={() => setShowCreateChannel(true)}
+                                >Create channel {"\u2192"}</button>
+                              </div>
+                            </Show>
+                          </div>
+                        }>
+                          {(() => {
+                            const groups = (): { orphans: any[]; cats: { cat: any; kids: any[] }[] } => {
+                              const all = channels();
+                              const cats = all.filter((c) => c.channelType === 2);
+                              const orphans = all.filter((c) => c.channelType !== 2 && !c.categoryId);
+                              const grouped = cats.map((cat) => ({
+                                cat,
+                                kids: all.filter((c) => c.channelType !== 2 && c.categoryId === cat.id),
+                              }));
+                              return { orphans, cats: grouped };
+                            };
+
+                            const performReorder = (
+                              draggedId: string,
+                              targetCategoryId: string | null,
+                              beforeChannelId: string | null,
+                            ) => {
+                              const sid = appStore.activeServerId();
+                              if (!sid) return;
+                              const all = channels();
+                              const dragged = all.find((c) => c.id === draggedId);
+                              if (!dragged || dragged.channelType === 2) return;
+                              const srcCat = dragged.categoryId ?? null;
+                              const targetBucket = all
+                                .filter(
+                                  (c) =>
+                                    c.channelType !== 2 &&
+                                    c.id !== draggedId &&
+                                    (targetCategoryId
+                                      ? c.categoryId === targetCategoryId
+                                      : !c.categoryId),
+                                )
+                                .sort((a, b) => a.position - b.position);
+                              let insertAt = targetBucket.length;
+                              if (beforeChannelId) {
+                                const idx = targetBucket.findIndex((c) => c.id === beforeChannelId);
+                                if (idx >= 0) insertAt = idx;
+                              }
+                              targetBucket.splice(insertAt, 0, dragged);
+                              const items: Array<{
+                                channelId: string;
+                                position: number;
+                                categoryId?: string | null;
+                                clearCategory?: boolean;
+                              }> = targetBucket.map((c, i) => {
+                                if (c.id === draggedId) {
+                                  return targetCategoryId
+                                    ? { channelId: c.id, position: i, categoryId: targetCategoryId }
+                                    : { channelId: c.id, position: i, clearCategory: true };
+                                }
+                                return { channelId: c.id, position: i };
+                              });
+                              if (srcCat !== targetCategoryId) {
+                                const srcBucket = all
+                                  .filter(
+                                    (c) =>
+                                      c.channelType !== 2 &&
+                                      c.id !== draggedId &&
+                                      (srcCat ? c.categoryId === srcCat : !c.categoryId),
+                                  )
+                                  .sort((a, b) => a.position - b.position);
+                                srcBucket.forEach((c, i) =>
+                                  items.push({ channelId: c.id, position: i }),
+                                );
+                              }
+                              appStore.reorderChannels(sid, items);
+                            };
+
+                            const channelBtn = (ch: any) => {
+                              const active = () => appStore.activeChannelId() === ch.id;
+                              const isDropBefore = () => {
+                                const dt = dropTarget();
+                                return dt?.kind === "before" && dt.id === ch.id;
+                              };
+                              return (
+                                <div
+                                  style={{ position: "relative" }}
+                                  draggable={isOwner()}
+                                  onDragStart={(e) => {
+                                    if (!isOwner()) return;
+                                    setDragChannelId(ch.id);
+                                    e.dataTransfer?.setData("text/plain", ch.id);
+                                    if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
+                                  }}
+                                  onDragEnd={() => {
+                                    setDragChannelId(null);
+                                    setDropTarget(null);
+                                  }}
+                                  onDragOver={(e) => {
+                                    if (!dragChannelId() || dragChannelId() === ch.id) return;
+                                    e.preventDefault();
+                                    if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+                                    setDropTarget({ kind: "before", id: ch.id });
+                                  }}
+                                  onDragLeave={() => {
+                                    const dt = dropTarget();
+                                    if (dt?.kind === "before" && dt.id === ch.id) setDropTarget(null);
+                                  }}
+                                  onDrop={(e) => {
+                                    e.preventDefault();
+                                    const dragged = dragChannelId();
+                                    setDragChannelId(null);
+                                    setDropTarget(null);
+                                    if (!dragged || dragged === ch.id) return;
+                                    const targetCat = ch.categoryId ?? null;
+                                    performReorder(dragged, targetCat, ch.id);
+                                  }}
+                                >
+                                  <Show when={isDropBefore()}>
+                                    <div style={{
+                                      position: "absolute", top: "-1px", left: "8px", right: "8px",
+                                      height: "2px", background: "#7c6bf5", "border-radius": "2px",
+                                      "pointer-events": "none",
+                                    }} />
+                                  </Show>
+                                  <ContextMenu>
+                                    <ContextMenuTrigger>
+                                      <button
+                                        style={{
+                                          display: "flex", "align-items": "center", gap: "6px",
+                                          width: "100%", padding: "6px 10px",
+                                          "border-radius": "6px",
+                                          background: active() ? "rgba(255,255,255,0.06)" : "transparent",
+                                          color: active() ? "#eee" : "#888",
+                                          border: "none", cursor: "pointer",
+                                          "text-align": "left", "margin-bottom": "1px",
+                                          "font-family": "inherit",
+                                          transition: "background 0.12s, color 0.12s",
+                                        }}
+                                        onClick={() => appStore.selectChannel(ch.id)}
+                                        onMouseEnter={(e) => { if (!active()) e.currentTarget.style.background = "rgba(255,255,255,0.03)"; }}
+                                        onMouseLeave={(e) => { if (!active()) e.currentTarget.style.background = "transparent"; }}
+                                      >
+                                        <span style={{ "font-size": "14px", color: "#666", width: "16px", "text-align": "center", "flex-shrink": "0" }}>
+                                          {channelIcon(ch.channelType)}
+                                        </span>
+                                        <span style={{
+                                          "font-size": "13px", "font-weight": active() ? "600" : "500",
+                                          "white-space": "nowrap", overflow: "hidden", "text-overflow": "ellipsis", flex: "1",
+                                        }}>{ch.name}</span>
+                                      </button>
+                                    </ContextMenuTrigger>
+                                    <ContextMenuContent>
+                                      <ContextMenuItem onSelect={() => navigator.clipboard?.writeText(ch.id)}>
+                                        <ContextMenuIcon>{"\u{1F4CB}"}</ContextMenuIcon>
+                                        Copy channel ID
+                                      </ContextMenuItem>
+                                      <Show when={isOwner()}>
+                                        <ContextMenuSeparator />
+                                        <ContextMenuItem onSelect={() => {
+                                          const next = window.prompt("Rename channel", ch.name);
+                                          if (next && next.trim() && next.trim() !== ch.name) {
+                                            const sid = appStore.activeServerId();
+                                            if (sid) appStore.updateChannel(sid, ch.id, { name: next.trim() });
+                                          }
+                                        }}>
+                                          <ContextMenuIcon>{"\u270F\uFE0F"}</ContextMenuIcon>
+                                          Rename
+                                        </ContextMenuItem>
+                                        <ContextMenuItem
+                                          onSelect={() => {
+                                            if (window.confirm(`Delete channel #${ch.name}? This cannot be undone.`)) {
+                                              const sid = appStore.activeServerId();
+                                              if (sid) appStore.deleteChannel(sid, ch.id);
+                                            }
+                                          }}
+                                        >
+                                          <ContextMenuIcon>{"\u{1F5D1}\uFE0F"}</ContextMenuIcon>
+                                          <span style={{ color: "#f87171" }}>Delete</span>
+                                        </ContextMenuItem>
+                                      </Show>
+                                    </ContextMenuContent>
+                                  </ContextMenu>
+                                </div>
+                              );
+                            };
+
+                            const catDropProps = (catId: string | null) => ({
+                              onDragOver: (e: DragEvent) => {
+                                if (!dragChannelId()) return;
+                                e.preventDefault();
+                                if (e.dataTransfer) e.dataTransfer.dropEffect = "move";
+                                setDropTarget({ kind: "category", id: catId });
+                              },
+                              onDrop: (e: DragEvent) => {
+                                e.preventDefault();
+                                const dragged = dragChannelId();
+                                setDragChannelId(null);
+                                setDropTarget(null);
+                                if (!dragged) return;
+                                performReorder(dragged, catId, null);
+                              },
+                            });
+
+                            return (
+                              <>
+                                {/* Orphan channels (no category) */}
+                                <div {...catDropProps(null)} style={{ "min-height": "4px" }}>
+                                  <For each={groups().orphans}>{channelBtn}</For>
+                                </div>
+
+                                {/* Categorized channels */}
+                                <For each={groups().cats}>
+                                  {(g) => {
+                                    const collapsed = () => collapsedCats().has(g.cat.id);
+                                    return (
+                                      <div style={{ "margin-top": "8px" }} {...catDropProps(g.cat.id)}>
+                                        <button
+                                          onClick={() => toggleCategory(g.cat.id)}
+                                          style={{
+                                            display: "flex", "align-items": "center", gap: "4px",
+                                            width: "100%", padding: "6px 6px 4px",
+                                            background: "transparent", border: "none",
+                                            color: "#666", cursor: "pointer",
+                                            "text-align": "left",
+                                            "font-family": "inherit",
+                                            "font-size": "10px", "font-weight": "700",
+                                            "letter-spacing": "0.08em", "text-transform": "uppercase",
+                                            transition: "color 0.15s",
+                                          }}
+                                          onMouseEnter={(e) => (e.currentTarget.style.color = "#bbb")}
+                                          onMouseLeave={(e) => (e.currentTarget.style.color = "#666")}
+                                        >
+                                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style={{ transform: collapsed() ? "rotate(-90deg)" : "none", transition: "transform 0.15s", "flex-shrink": "0" }}>
+                                            <polyline points="6 9 12 15 18 9" />
+                                          </svg>
+                                          <span style={{ flex: "1", overflow: "hidden", "white-space": "nowrap", "text-overflow": "ellipsis" }}>{g.cat.name}</span>
+                                          <Show when={isOwner()}>
+                                            <span
+                                              role="button"
+                                              tabindex="-1"
+                                              title="Create channel in category"
+                                              onClick={(e) => {
+                                                e.stopPropagation();
+                                                // TODO: prefill category in CreateChannelDialog when category prop is supported.
+                                                setShowCreateChannel(true);
+                                              }}
+                                              style={{
+                                                "font-size": "14px", color: "#666",
+                                                padding: "0 4px",
+                                                "line-height": "1",
+                                              }}
+                                            >+</span>
+                                          </Show>
+                                        </button>
+                                        <Show when={!collapsed()}>
+                                          <For each={g.kids}>{channelBtn}</For>
+                                        </Show>
+                                      </div>
+                                    );
+                                  }}
+                                </For>
+                              </>
+                            );
+                          })()}
+                        </Show>
+                      </div>
+
+                      {/* User panel (same as home) */}
+                      <div style={S.userPanel}>
+                        <div style={{ ...S.avatar(34), background: "rgba(124,107,245,0.15)", color: "#7c6bf5", "font-size": "11px", "font-weight": "800" }}>ME</div>
+                        <div style={{ flex: "1", "min-width": "0" }}>
+                          <div style={{ "font-size": "12px", "font-weight": "500", color: "#bbb", "font-family": "monospace" }}>{shortId()}</div>
+                          <div style={{ "font-size": "10px", color: appStore.connected() ? "#34d399" : "#555", "margin-top": "1px" }}>
+                            {appStore.connected() ? "Online" : "Offline"}
+                          </div>
+                        </div>
+                        <button
+                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", "font-size": "14px" }}
+                          onClick={() => appStore.setScreen("settings")}
+                          title="Settings"
+                        >{"\u2699\uFE0F"}</button>
+                        <button
+                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", "font-size": "13px" }}
+                          onClick={() => appStore.lock()}
+                          title="Lock"
+                        >{"\uD83D\uDD12"}</button>
+                      </div>
+                    </>
+                  );
+                }}
+              </Show>
+
+              {/* ── Home context: friends + DMs + groups ─────────── */}
+              <Show when={!appStore.activeServerId()}>
+              <>
               {/* Friends button — Discord-style */}
               <button
                 style={{
@@ -601,6 +1085,8 @@ const App: Component = () => {
                   title="Lock"
                 >{"\uD83D\uDD12"}</button>
               </div>
+              </>
+              </Show>
             </div>
 
             {/* ISLAND 3 — Chat or Friends */}
@@ -1039,42 +1525,159 @@ const App: Component = () => {
                 transition: "opacity 0.4s ease 0.15s, transform 0.4s ease 0.15s",
               }}>
                 <div style={{ display: "flex", "flex-direction": "column", flex: "1", "min-height": "0" }}>
-                  {/* Header */}
-                  <div style={{ padding: "16px 16px 14px", "border-bottom": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" }}>
-                    <div style={{ "font-size": "12px", "font-weight": "700", color: "#eee", "text-transform": "uppercase", "letter-spacing": "0.05em" }}>
-                      Members — {groupMembers().length}
-                    </div>
-                  </div>
-                  {/* List */}
-                  <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 12px", "min-height": "0" }}>
-                    <For each={groupMembers()}>
-                      {(m) => (
-                        <div style={{ display: "flex", "align-items": "center", gap: "10px", padding: "8px 6px", "border-radius": "8px" }}>
-                          <div style={{ ...S.avatar(30), "font-size": "11px" }}>{m.username.charAt(0).toUpperCase()}</div>
-                          <div style={{ flex: "1", "min-width": "0" }}>
-                            <div style={{ "font-size": "12px", "font-weight": "500", color: "#ddd", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{m.username}</div>
-                            <Show when={m.role > 0}>
-                              <div style={{ "font-size": "9px", color: m.role === 2 ? "#f59e0b" : "#7c6bf5", "font-weight": "600" }}>
-                                {m.role === 2 ? "OWNER" : "ADMIN"}
-                              </div>
-                            </Show>
+                  {(() => {
+                    const sid = () => appStore.activeServerId();
+                    const inServer = () => !!sid();
+                    const ownerId = () => appStore.servers().find((s) => s.id === sid())?.ownerId;
+                    const meId = () => appStore.userId();
+                    const iAmOwner = () => !!ownerId() && ownerId() === meId();
+                    const rolesForServer = () => (sid() ? (appStore.serverRoles()[sid()!] ?? []) : []);
+                    type Row =
+                      | { kind: "server"; userId: string; username: string; roleIds: string[]; isOwner: boolean }
+                      | { kind: "group"; username: string; role: number };
+                    const rows = (): Row[] => inServer()
+                      ? (appStore.serverMembers()[sid()!] ?? []).map((m): Row => ({
+                          kind: "server",
+                          userId: m.userId,
+                          username: m.nickname || m.username,
+                          roleIds: m.roleIds,
+                          isOwner: m.userId === ownerId(),
+                        }))
+                      : groupMembers().map((m): Row => ({ kind: "group", username: m.username, role: m.role }));
+                    const total = () => rows().length;
+
+                    const renderAvatarRow = (username: string, badgeText?: string, badgeColor?: string) => (
+                      <div style={{ display: "flex", "align-items": "center", gap: "10px", padding: "8px 6px", "border-radius": "8px", cursor: "default", transition: "background 0.12s" }}
+                        onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.03)")}
+                        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
+                      >
+                        <div style={{ ...S.avatar(30), "font-size": "11px" }}>{username.charAt(0).toUpperCase()}</div>
+                        <div style={{ flex: "1", "min-width": "0" }}>
+                          <div style={{ "font-size": "12px", "font-weight": "500", color: "#ddd", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{username}</div>
+                          <Show when={badgeText}>
+                            <div style={{ "font-size": "9px", color: badgeColor ?? "#7c6bf5", "font-weight": "600" }}>{badgeText}</div>
+                          </Show>
+                        </div>
+                      </div>
+                    );
+
+                    return (
+                      <>
+                        {/* Header */}
+                        <div style={{ padding: "16px 16px 14px", "border-bottom": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" }}>
+                          <div style={{ "font-size": "12px", "font-weight": "700", color: "#eee", "text-transform": "uppercase", "letter-spacing": "0.05em" }}>
+                            Members — {total()}
                           </div>
                         </div>
-                      )}
-                    </For>
-                    <Show when={groupMembers().length === 0}>
-                      <div style={{ "text-align": "center", padding: "20px 0", color: "#555", "font-size": "12px" }}>No members loaded</div>
-                    </Show>
-                  </div>
-                  {/* Invite button */}
-                  <div style={{ padding: "12px", "border-top": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" }}>
-                    <button style={{
-                      width: "100%", padding: "8px", "border-radius": "8px",
-                      background: "rgba(124,107,245,0.1)", border: "none",
-                      color: "#7c6bf5", "font-size": "11px", "font-weight": "600",
-                      cursor: "pointer",
-                    }}>+ Invite member</button>
-                  </div>
+                        {/* List */}
+                        <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 12px", "min-height": "0" }}>
+                          <For each={rows()}>
+                            {(m) => {
+                              if (m.kind === "group") {
+                                return renderAvatarRow(
+                                  m.username,
+                                  m.role > 0 ? (m.role === 2 ? "OWNER" : "ADMIN") : undefined,
+                                  m.role === 2 ? "#f59e0b" : "#7c6bf5",
+                                );
+                              }
+                              const isMe = () => m.userId === meId();
+                              const canKick = () => iAmOwner() && !isMe() && !m.isOwner;
+                              const canManageRoles = () => iAmOwner() && !m.isOwner;
+                              return (
+                                <ContextMenu>
+                                  <ContextMenuTrigger>
+                                    {renderAvatarRow(
+                                      m.username,
+                                      m.isOwner ? "OWNER" : undefined,
+                                      m.isOwner ? "#f59e0b" : "#7c6bf5",
+                                    )}
+                                  </ContextMenuTrigger>
+                                  <ContextMenuContent>
+                                    <Show when={!isMe()}>
+                                      <ContextMenuItem onSelect={() => { appStore.createDm(m.userId, m.username); }}>
+                                        <ContextMenuIcon>{"\uD83D\uDCAC"}</ContextMenuIcon>
+                                        Message
+                                      </ContextMenuItem>
+                                    </Show>
+                                    <ContextMenuItem onSelect={() => { void navigator.clipboard.writeText(m.userId); }}>
+                                      <ContextMenuIcon>{"\uD83D\uDCCB"}</ContextMenuIcon>
+                                      Copy User ID
+                                      <ContextMenuShortcut>{m.userId.slice(0, 6)}…</ContextMenuShortcut>
+                                    </ContextMenuItem>
+
+                                    <Show when={canManageRoles() && rolesForServer().length > 0}>
+                                      <ContextMenuSeparator />
+                                      <ContextMenuSub>
+                                        <ContextMenuSubTrigger>
+                                          <ContextMenuIcon>{"\uD83C\uDFAD"}</ContextMenuIcon>
+                                          Roles
+                                        </ContextMenuSubTrigger>
+                                        <ContextMenuSubContent>
+                                          <For each={rolesForServer().filter((r) => !r.isDefault)}>
+                                            {(r) => {
+                                              const assigned = () => m.roleIds.includes(r.id);
+                                              return (
+                                                <ContextMenuCheckboxItem
+                                                  checked={assigned()}
+                                                  onChange={(v) => {
+                                                    if (v) appStore.assignRole(sid()!, m.userId, r.id);
+                                                    else appStore.unassignRole(sid()!, m.userId, r.id);
+                                                  }}
+                                                >
+                                                  <span style={{
+                                                    display: "inline-block", width: "8px", height: "8px",
+                                                    "border-radius": "50%", "margin-right": "8px",
+                                                    background: r.color != null ? `#${(r.color & 0xffffff).toString(16).padStart(6, "0")}` : "#666",
+                                                  }} />
+                                                  {r.name}
+                                                </ContextMenuCheckboxItem>
+                                              );
+                                            }}
+                                          </For>
+                                        </ContextMenuSubContent>
+                                      </ContextMenuSub>
+                                    </Show>
+
+                                    <Show when={canKick()}>
+                                      <ContextMenuSeparator />
+                                      <ContextMenuItem
+                                        variant="danger"
+                                        onSelect={() => {
+                                          if (confirm(`Kick ${m.username} from the server?`)) {
+                                            appStore.kickMember(sid()!, m.userId);
+                                          }
+                                        }}
+                                      >
+                                        <ContextMenuIcon>{"\u2717"}</ContextMenuIcon>
+                                        Kick
+                                      </ContextMenuItem>
+                                    </Show>
+                                  </ContextMenuContent>
+                                </ContextMenu>
+                              );
+                            }}
+                          </For>
+                          <Show when={total() === 0}>
+                            <div style={{ "text-align": "center", padding: "20px 0", color: "#555", "font-size": "12px" }}>No members loaded</div>
+                          </Show>
+                        </div>
+                        {/* Invite button */}
+                        <Show when={inServer()}>
+                          <div style={{ padding: "12px", "border-top": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" }}>
+                            <button
+                              style={{
+                                width: "100%", padding: "8px", "border-radius": "8px",
+                                background: "rgba(124,107,245,0.1)", border: "none",
+                                color: "#7c6bf5", "font-size": "11px", "font-weight": "600",
+                                cursor: "pointer",
+                              }}
+                              onClick={() => setShowCreateInvite(true)}
+                            >+ Invite member</button>
+                          </div>
+                        </Show>
+                      </>
+                    );
+                  })()}
                 </div>
               </div>
             </div>
@@ -1082,6 +1685,18 @@ const App: Component = () => {
           </div>
         </Match>
       </Switch>
+
+      {/* Server creation / join dialogs (mounted globally so they overlay the chat) */}
+      <CreateServerDialog open={showCreateServer()} onClose={() => setShowCreateServer(false)} />
+      <JoinServerDialog open={showJoinServer()} onClose={() => setShowJoinServer(false)} />
+      <Show when={appStore.activeServerId()}>
+        {(sid) => (
+          <>
+            <CreateChannelDialog open={showCreateChannel()} serverId={sid()} onClose={() => setShowCreateChannel(false)} />
+            <CreateInviteDialog open={showCreateInvite()} serverId={sid()} onClose={() => setShowCreateInvite(false)} />
+          </>
+        )}
+      </Show>
     </div>
   );
 };

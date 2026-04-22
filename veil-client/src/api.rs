@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use veil_crypto::fingerprint;
 use veil_crypto::kdf;
 use veil_crypto::keys::{generate_mnemonic, validate_mnemonic, IdentityKeyPair};
 use veil_crypto::ratchet::{MessageHeader, RatchetSession};
+use veil_crypto::sender_key::{SenderKeyDistribution, SenderKeyStore};
 use veil_crypto::x3dh;
 use veil_store::db::VeilDb;
 use veil_store::keychain;
@@ -16,6 +17,19 @@ use crate::protocol::proto;
 // Wire header type tags
 const HEADER_INITIAL: u8 = 0x01; // X3DH init + ratchet header
 const HEADER_RATCHET: u8 = 0x02; // Ratchet header only
+const HEADER_SENDER_KEY: u8 = 0x05; // Group/channel sender-key encrypted message
+
+// Inner type bytes (inside ratchet-decrypted plaintext for pairwise channel)
+const INNER_TEXT: u8 = 0x00; // UTF-8 text message
+const INNER_SKDM: u8 = 0x01; // Sender Key Distribution Message (JSON)
+
+/// Result of decrypting an incoming message.
+pub enum DecryptedPayload {
+    /// Real text or binary content for the UI / persistence.
+    Text(Vec<u8>),
+    /// Internal control frame (e.g. SKDM) — already processed; do not surface.
+    Control,
+}
 
 /// Prekey set generated for uploading to the server.
 pub struct PreKeySet {
@@ -44,6 +58,10 @@ pub struct VeilClient {
     /// One-time prekey secrets (for X3DH responder).
     otk_secrets: HashMap<u32, [u8; 32]>,
     otk_next_id: u32,
+    /// Sender-key store for channel/group E2E.
+    sender_keys: SenderKeyStore,
+    /// Conversations that should be encrypted with sender keys (channels & encrypted groups).
+    channel_conversations: HashSet<String>,
 }
 
 impl VeilClient {
@@ -62,6 +80,8 @@ impl VeilClient {
             spk_id: 1,
             otk_secrets: HashMap::new(),
             otk_next_id: 1,
+            sender_keys: SenderKeyStore::new(),
+            channel_conversations: HashSet::new(),
         }
     }
 
@@ -81,6 +101,8 @@ impl VeilClient {
             spk_id: 1,
             otk_secrets: HashMap::new(),
             otk_next_id: 1,
+            sender_keys: SenderKeyStore::new(),
+            channel_conversations: HashSet::new(),
         }
     }
 
@@ -116,6 +138,11 @@ impl VeilClient {
         self.db.as_ref()
     }
 
+    /// Get a mutable reference to the DB (if open) — needed for transactions.
+    pub fn db_mut(&mut self) -> Option<&mut VeilDb> {
+        self.db.as_mut()
+    }
+
     /// Get our X25519 public key (identity).
     pub fn identity_key(&self) -> Result<[u8; 32], String> {
         self.identity
@@ -130,6 +157,13 @@ impl VeilClient {
             .as_ref()
             .map(|id| id.ed25519_public_bytes())
             .ok_or("not initialized".to_string())
+    }
+
+    /// Sign an arbitrary message with our Ed25519 identity key. Used for
+    /// authenticating REST requests via the X-Veil-Signature header scheme.
+    pub fn sign_message(&self, message: &[u8]) -> Result<[u8; 64], String> {
+        let id = self.identity.as_ref().ok_or("not initialized")?;
+        Ok(veil_crypto::signature::sign(id, message))
     }
 
     /// Generate a fingerprint for contact verification.
@@ -359,14 +393,35 @@ impl VeilClient {
     }
 
     /// Encrypt outgoing plaintext. Returns (ciphertext, wire_header).
-    /// If no ratchet session exists, sends plaintext (pre-E2E fallback).
+    /// For channel conversations, encrypts with the per-group sender key and
+    /// uses a dedicated outer header tag. Otherwise falls back to plaintext
+    /// (pairwise sessions for DMs go through `encrypt_for` directly).
     fn encrypt_outgoing(
         &mut self,
-        _conversation_id: &str,
+        conversation_id: &str,
         plaintext: &str,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        // TODO: look up peer_identity_key from conversation_id via DB
-        // For now, no E2E without explicit session establishment
+        if self.channel_conversations.contains(conversation_id) {
+            let our_key = self.identity_key()?;
+            // Make sure we have an outgoing sender key for this channel.
+            if !self.sender_keys.has_outgoing(conversation_id)
+                || self.sender_keys.needs_rotation(conversation_id)
+            {
+                let _ = self
+                    .sender_keys
+                    .create_outgoing(conversation_id, &our_key);
+                self.persist_outgoing_sender_key(conversation_id);
+            }
+
+            let ct = self
+                .sender_keys
+                .encrypt(conversation_id, plaintext.as_bytes())?;
+            self.persist_outgoing_sender_key(conversation_id);
+            return Ok((ct, vec![HEADER_SENDER_KEY]));
+        }
+
+        // No automatic pairwise lookup yet — callers use `encrypt_for` directly
+        // when they know the peer identity key.
         Ok((plaintext.as_bytes().to_vec(), vec![]))
     }
 
@@ -401,15 +456,17 @@ impl VeilClient {
 
     /// Decrypt an incoming message from a peer.
     /// Handles both initial X3DH messages and regular ratchet messages.
+    /// `conversation_id` is required for sender-key (channel) messages.
     pub fn decrypt_from(
         &mut self,
         sender_identity_key: &[u8; 32],
+        conversation_id: &str,
         header: &[u8],
         ciphertext: &[u8],
-    ) -> Result<Vec<u8>, String> {
+    ) -> Result<DecryptedPayload, String> {
         if header.is_empty() {
             // No header = plaintext fallback (pre-E2E)
-            return Ok(ciphertext.to_vec());
+            return Ok(DecryptedPayload::Text(ciphertext.to_vec()));
         }
 
         match header[0] {
@@ -448,7 +505,7 @@ impl VeilClient {
                     }
                 }
 
-                Ok(plaintext)
+                self.process_ratchet_plaintext(sender_identity_key, plaintext)
             }
             HEADER_RATCHET => {
                 if header.len() < 41 {
@@ -468,13 +525,267 @@ impl VeilClient {
                     }
                 }
 
-                Ok(plaintext)
+                self.process_ratchet_plaintext(sender_identity_key, plaintext)
+            }
+            HEADER_SENDER_KEY => {
+                self.ensure_incoming_sender_key_loaded(conversation_id, sender_identity_key);
+                let pt =
+                    self.sender_keys
+                        .decrypt(conversation_id, sender_identity_key, ciphertext)?;
+                self.persist_incoming_sender_key(conversation_id, sender_identity_key);
+                Ok(DecryptedPayload::Text(pt))
             }
             _ => {
                 // Unknown header type — treat as plaintext
-                Ok(ciphertext.to_vec())
+                Ok(DecryptedPayload::Text(ciphertext.to_vec()))
             }
         }
+    }
+
+    /// Strip the inner type byte from ratchet-decrypted plaintext.
+    /// `0x00` = real text (return Text), `0x01` = SKDM (process and return Control).
+    /// Legacy plaintexts without a prefix byte are heuristically detected (UTF-8).
+    fn process_ratchet_plaintext(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        mut plaintext: Vec<u8>,
+    ) -> Result<DecryptedPayload, String> {
+        if plaintext.is_empty() {
+            return Ok(DecryptedPayload::Text(plaintext));
+        }
+        match plaintext[0] {
+            INNER_TEXT => {
+                plaintext.remove(0);
+                Ok(DecryptedPayload::Text(plaintext))
+            }
+            INNER_SKDM => {
+                let body = &plaintext[1..];
+                let dist: SenderKeyDistribution = serde_json::from_slice(body)
+                    .map_err(|e| format!("decode SKDM: {e}"))?;
+                // Only honour SKDMs whose declared sender matches the ratchet peer.
+                if &dist.sender_identity_key != sender_identity_key {
+                    return Err("SKDM sender mismatch".to_string());
+                }
+                let group_id = dist.group_id.clone();
+                self.sender_keys.process_distribution(&dist);
+                self.channel_conversations.insert(group_id.clone());
+                self.persist_incoming_sender_key(&group_id, sender_identity_key);
+                Ok(DecryptedPayload::Control)
+            }
+            _ => {
+                // Legacy / unprefixed payload — surface as text for backward compat.
+                Ok(DecryptedPayload::Text(plaintext))
+            }
+        }
+    }
+
+    /// Mark a conversation as a channel — outgoing messages will be encrypted
+    /// with a sender key, and incoming messages will look up the sender key store.
+    pub fn mark_channel_conversation(&mut self, conversation_id: &str) {
+        self.channel_conversations
+            .insert(conversation_id.to_string());
+    }
+
+    pub fn is_channel_conversation(&self, conversation_id: &str) -> bool {
+        self.channel_conversations.contains(conversation_id)
+    }
+
+    /// Build the inner SKDM payload (ratchet-plaintext) for our current outgoing
+    /// sender key in `conversation_id`. Creates the key if missing.
+    pub fn build_skdm(&mut self, conversation_id: &str) -> Result<Vec<u8>, String> {
+        let our_key = self.identity_key()?;
+        if !self.sender_keys.has_outgoing(conversation_id) {
+            let _ = self
+                .sender_keys
+                .create_outgoing(conversation_id, &our_key);
+            self.persist_outgoing_sender_key(conversation_id);
+        }
+        let raw = self
+            .sender_keys
+            .serialize_outgoing(conversation_id)
+            .ok_or("missing outgoing sender key")?;
+        // Reconstruct the distribution view from the persisted state.
+        // (serialize_outgoing returns SenderKeyState; we need a SenderKeyDistribution)
+        let state: serde_json::Value = serde_json::from_slice(&raw)
+            .map_err(|e| format!("decode outgoing state: {e}"))?;
+        let key_id = state["key_id"].as_u64().ok_or("missing key_id")? as u32;
+        let chain_arr = state["chain_key"]
+            .as_array()
+            .ok_or("missing chain_key")?;
+        let mut chain_key = [0u8; 32];
+        for (i, v) in chain_arr.iter().enumerate().take(32) {
+            chain_key[i] = v.as_u64().unwrap_or(0) as u8;
+        }
+        let dist = SenderKeyDistribution {
+            group_id: conversation_id.to_string(),
+            sender_identity_key: our_key,
+            key_id,
+            chain_key,
+        };
+        let json = serde_json::to_vec(&dist).map_err(|e| format!("encode SKDM: {e}"))?;
+        let mut payload = Vec::with_capacity(1 + json.len());
+        payload.push(INNER_SKDM);
+        payload.extend_from_slice(&json);
+        Ok(payload)
+    }
+
+    /// Wrap a UTF-8 message with the inner-text type byte for pairwise channels.
+    pub fn wrap_text_inner(plaintext: &str) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + plaintext.len());
+        buf.push(INNER_TEXT);
+        buf.extend_from_slice(plaintext.as_bytes());
+        buf
+    }
+
+    /// Force-rotate our outgoing sender key for a channel (e.g. after a member leaves).
+    pub fn rotate_sender_key(&mut self, conversation_id: &str) -> Result<(), String> {
+        let our_key = self.identity_key()?;
+        let _ = self
+            .sender_keys
+            .create_outgoing(conversation_id, &our_key);
+        self.persist_outgoing_sender_key(conversation_id);
+        Ok(())
+    }
+
+    /// Distribute our current outgoing sender key for `conversation_id` to a single peer.
+    /// Sends a sealed SKDM via the server's SenderKeyDistribution envelope.
+    pub async fn send_sender_key_to(
+        &mut self,
+        conversation_id: &str,
+        peer_identity_key: &[u8; 32],
+    ) -> Result<u64, String> {
+        let our_key = self.identity_key()?;
+        // Make sure we have an outgoing key.
+        if !self.sender_keys.has_outgoing(conversation_id) {
+            let _ = self
+                .sender_keys
+                .create_outgoing(conversation_id, &our_key);
+            self.persist_outgoing_sender_key(conversation_id);
+        }
+
+        // Build the SKDM JSON payload (sender_identity_key + group_id + key_id + chain_key).
+        let raw = self
+            .sender_keys
+            .serialize_outgoing(conversation_id)
+            .ok_or("missing outgoing sender key")?;
+        let state: serde_json::Value =
+            serde_json::from_slice(&raw).map_err(|e| format!("decode outgoing state: {e}"))?;
+        let key_id = state["key_id"].as_u64().ok_or("missing key_id")? as u32;
+        let chain_arr = state["chain_key"].as_array().ok_or("missing chain_key")?;
+        let mut chain_key = [0u8; 32];
+        for (i, v) in chain_arr.iter().enumerate().take(32) {
+            chain_key[i] = v.as_u64().unwrap_or(0) as u8;
+        }
+        let dist = SenderKeyDistribution {
+            group_id: conversation_id.to_string(),
+            sender_identity_key: our_key,
+            key_id,
+            chain_key,
+        };
+        let json = serde_json::to_vec(&dist).map_err(|e| format!("encode SKDM: {e}"))?;
+
+        // Seal for the peer.
+        let sealed =
+            veil_crypto::sender_key::seal_skdm(&our_key, peer_identity_key, &json)?;
+
+        let conn = self.connection.as_ref().ok_or("not connected")?;
+        let seq = conn.next_seq().await;
+        let env = proto::Envelope {
+            seq,
+            timestamp: 0,
+            payload: Some(proto::envelope::Payload::SenderKeyDist(
+                proto::SenderKeyDistribution {
+                    conversation_id: conversation_id.to_string(),
+                    sender_key_message: sealed,
+                    generation: key_id,
+                    target_identity_key: peer_identity_key.to_vec(),
+                },
+            )),
+        };
+        conn.send_envelope(&env).await?;
+        Ok(seq)
+    }
+
+    /// Process an incoming sealed SKDM that the gateway forwarded to us.
+    /// Stores the resulting incoming sender key.
+    pub fn process_sealed_skdm(&mut self, sealed_wire: &[u8]) -> Result<(), String> {
+        let identity = self.identity.as_ref().ok_or("not initialized")?;
+        let (sender_ik, payload) = identity.open_sealed_skdm(sealed_wire)?;
+        let dist: SenderKeyDistribution = serde_json::from_slice(&payload)
+            .map_err(|e| format!("decode SKDM payload: {e}"))?;
+        if dist.sender_identity_key != sender_ik {
+            return Err("SKDM sender mismatch".to_string());
+        }
+        let group_id = dist.group_id.clone();
+        self.sender_keys.process_distribution(&dist);
+        self.channel_conversations.insert(group_id.clone());
+        self.persist_incoming_sender_key(&group_id, &sender_ik);
+        Ok(())
+    }
+
+    /// Drop a peer's incoming sender key (e.g. after a kick/leave WS event).
+    pub fn drop_incoming_sender_key(&mut self, conversation_id: &str, sender_ik: &[u8; 32]) {
+        self.sender_keys.remove_incoming(conversation_id, sender_ik);
+        // Note: per-row delete is not exposed by VeilDb today; on next save it
+        // will be overwritten if the peer re-distributes.
+    }
+
+    fn persist_outgoing_sender_key(&self, conversation_id: &str) {
+        if let (Some(db), Ok(our_key)) = (self.db.as_ref(), self.identity_key()) {
+            if let Some(data) = self.sender_keys.serialize_outgoing(conversation_id) {
+                let _ = db.save_sender_key(conversation_id, &our_key, &data, true);
+            }
+        }
+    }
+
+    fn persist_incoming_sender_key(&self, conversation_id: &str, sender_ik: &[u8; 32]) {
+        if let Some(db) = self.db.as_ref() {
+            if let Some(data) = self.sender_keys.serialize_incoming(conversation_id, sender_ik) {
+                let _ = db.save_sender_key(conversation_id, sender_ik, &data, false);
+            }
+        }
+    }
+
+    fn ensure_incoming_sender_key_loaded(
+        &mut self,
+        conversation_id: &str,
+        sender_ik: &[u8; 32],
+    ) {
+        // Already in memory? Nothing to do.
+        // (We can't peek into the private map; just attempt a lazy load —
+        //  load_incoming is idempotent and overwriting with on-disk state is fine
+        //  ONLY if we haven't ratcheted past it. Avoid clobbering newer in-memory state.)
+        if self.sender_keys.serialize_incoming(conversation_id, sender_ik).is_some() {
+            return;
+        }
+        if let Some(db) = self.db.as_ref() {
+            if let Ok(Some(data)) = db.load_sender_key(conversation_id, sender_ik) {
+                let _ = self.sender_keys.load_incoming(conversation_id, sender_ik, &data);
+            }
+        }
+    }
+
+    /// Hydrate sender keys (outgoing + all incoming) for a channel from the DB.
+    pub fn hydrate_channel_sender_keys(&mut self, conversation_id: &str) -> Result<(), String> {
+        self.channel_conversations
+            .insert(conversation_id.to_string());
+        let our_key = self.identity_key().ok();
+        if let Some(db) = self.db.as_ref() {
+            let rows = db.load_sender_keys_for_group(conversation_id)?;
+            for (sender_ik, data, is_outgoing) in rows {
+                if sender_ik.len() != 32 {
+                    continue;
+                }
+                let mut ik = [0u8; 32];
+                ik.copy_from_slice(&sender_ik);
+                if is_outgoing && Some(ik) == our_key {
+                    let _ = self.sender_keys.load_outgoing(conversation_id, &data);
+                } else {
+                    let _ = self.sender_keys.load_incoming(conversation_id, &ik, &data);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Persist a received message to the local DB.

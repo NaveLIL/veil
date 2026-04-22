@@ -1,13 +1,13 @@
-import { Component, For, Show, createSignal } from "solid-js";
-import { Search, Plus, Settings, MessageSquare, Users, Hash, Lock, Zap } from "lucide-solid";
+import { Component, For, Show, createSignal, createMemo } from "solid-js";
+import { Search, Plus, Settings, MessageSquare, Users, Hash, Lock, Zap, Volume2, ChevronDown, UserPlus } from "lucide-solid";
 import { Avatar } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Tooltip } from "@/components/ui/tooltip";
 import { NewDmDialog } from "@/components/chat/NewDmDialog";
+import { CreateChannelDialog } from "@/components/server/CreateChannelDialog";
+import { CreateInviteDialog } from "@/components/server/CreateInviteDialog";
 import { cn } from "@/lib/utils";
-import { appStore, type Conversation } from "@/stores/app";
-
-// ─── Conversation List Item ──────────────────────────
+import { appStore, type Conversation, type Channel } from "@/stores/app";
 
 const ConversationItem: Component<{
   conversation: Conversation;
@@ -33,7 +33,7 @@ const ConversationItem: Component<{
         "flex items-center gap-3 w-full px-3 py-2.5 rounded-xl transition-all duration-150 text-left cursor-pointer group",
         "hover:bg-white/[0.04]",
         props.isActive && "bg-primary/[0.08] border border-primary/10",
-        !props.isActive && "border border-transparent"
+        !props.isActive && "border border-transparent",
       )}
       onClick={props.onClick}
     >
@@ -45,18 +45,18 @@ const ConversationItem: Component<{
       />
       <div class="flex-1 min-w-0">
         <div class="flex items-center justify-between">
-          <span class={cn(
-            "text-[13px] font-medium truncate",
-            props.isActive ? "text-foreground" : "text-sidebar-foreground group-hover:text-foreground"
-          )}>
+          <span
+            class={cn(
+              "text-[13px] font-medium truncate",
+              props.isActive ? "text-foreground" : "text-sidebar-foreground group-hover:text-foreground",
+            )}
+          >
             {props.conversation.name}
           </span>
           <span class="text-[11px] text-muted-foreground/60 shrink-0 ml-2">{timeAgo()}</span>
         </div>
         <Show when={props.conversation.lastMessage}>
-          <p class="text-xs text-muted-foreground/70 truncate mt-0.5">
-            {props.conversation.lastMessage}
-          </p>
+          <p class="text-xs text-muted-foreground/70 truncate mt-0.5">{props.conversation.lastMessage}</p>
         </Show>
       </div>
       <Show when={props.conversation.unreadCount > 0}>
@@ -66,15 +66,15 @@ const ConversationItem: Component<{
   );
 };
 
-// ─── Nav Item ────────────────────────────────────────
-
 const NavItem: Component<{ icon: any; label: string; active?: boolean; badge?: number }> = (props) => (
-  <button class={cn(
-    "flex items-center gap-3 w-full px-3 py-2 rounded-lg text-[13px] transition-all duration-150 cursor-pointer",
-    props.active
-      ? "text-foreground bg-white/[0.06]"
-      : "text-muted-foreground hover:text-sidebar-foreground hover:bg-white/[0.03]"
-  )}>
+  <button
+    class={cn(
+      "flex items-center gap-3 w-full px-3 py-2 rounded-lg text-[13px] transition-all duration-150 cursor-pointer",
+      props.active
+        ? "text-foreground bg-white/[0.06]"
+        : "text-muted-foreground hover:text-sidebar-foreground hover:bg-white/[0.03]",
+    )}
+  >
     <props.icon class="h-4 w-4 shrink-0" />
     <span class="flex-1 text-left">{props.label}</span>
     <Show when={props.badge}>
@@ -82,8 +82,6 @@ const NavItem: Component<{ icon: any; label: string; active?: boolean; badge?: n
     </Show>
   </button>
 );
-
-// ─── Section Label ───────────────────────────────────
 
 const SectionLabel: Component<{ children: any; action?: { icon: any; onClick: () => void; tooltip: string } }> = (props) => (
   <div class="flex items-center justify-between px-3 pt-5 pb-1.5">
@@ -103,19 +101,53 @@ const SectionLabel: Component<{ children: any; action?: { icon: any; onClick: ()
   </div>
 );
 
-// ─── Channel Sidebar ─────────────────────────────────
+const ChannelItem: Component<{ channel: Channel; isActive: boolean; onClick: () => void }> = (props) => {
+  const Icon = () =>
+    props.channel.channelType === 1 ? <Volume2 class="h-4 w-4 shrink-0" /> : <Hash class="h-4 w-4 shrink-0" />;
+  return (
+    <button
+      class={cn(
+        "flex items-center gap-2 w-full pl-3 pr-2 py-1.5 rounded-md text-[13px] transition-all duration-150 cursor-pointer group text-left",
+        props.isActive
+          ? "bg-white/[0.08] text-foreground"
+          : "text-muted-foreground hover:text-foreground hover:bg-white/[0.04]",
+      )}
+      onClick={props.onClick}
+    >
+      <Icon />
+      <span class="flex-1 truncate">{props.channel.name}</span>
+    </button>
+  );
+};
+
+const DmHeader: Component<{ onNewDm: () => void }> = (props) => (
+  <div class="flex items-center justify-between px-4 h-14 shrink-0 border-b border-white/[0.06]">
+    <div class="flex items-center gap-2.5">
+      <span class="text-sm font-bold tracking-wide text-foreground/90">Direct Messages</span>
+    </div>
+    <Tooltip content="New conversation">
+      <button
+        class="flex items-center justify-center w-8 h-8 rounded-lg text-muted-foreground hover:text-foreground hover:bg-white/[0.06] transition-all duration-150 cursor-pointer"
+        onClick={props.onNewDm}
+      >
+        <Plus class="h-4 w-4" />
+      </button>
+    </Tooltip>
+  </div>
+);
 
 export const ChannelSidebar: Component = () => {
   const [searchQuery, setSearchQuery] = createSignal("");
   const [showNewDm, setShowNewDm] = createSignal(false);
   const [searchFocused, setSearchFocused] = createSignal(false);
+  const [showCreateChannel, setShowCreateChannel] = createSignal(false);
+  const [showInvite, setShowInvite] = createSignal(false);
+  const [serverMenuOpen, setServerMenuOpen] = createSignal(false);
 
   const filtered = () => {
     const q = searchQuery().toLowerCase();
     if (!q) return appStore.conversations();
-    return appStore.conversations().filter((c) =>
-      c.name.toLowerCase().includes(q)
-    );
+    return appStore.conversations().filter((c) => c.name.toLowerCase().includes(q));
   };
 
   const shortId = () => {
@@ -124,96 +156,231 @@ export const ChannelSidebar: Component = () => {
     return id.slice(0, 8);
   };
 
+  const activeServer = createMemo(() => {
+    const id = appStore.activeServerId();
+    if (!id) return null;
+    return appStore.servers().find((s) => s.id === id) ?? null;
+  });
+
+  const serverChannels = createMemo<{
+    uncategorized: Channel[];
+    categories: Array<{ category: Channel; channels: Channel[] }>;
+  }>(() => {
+    const sid = appStore.activeServerId();
+    if (!sid) return { uncategorized: [], categories: [] };
+    const all = (appStore.channelsByServer()[sid] ?? []).slice().sort((a, b) => a.position - b.position);
+    const categories = all.filter((c) => c.channelType === 2);
+    const others = all.filter((c) => c.channelType !== 2);
+    const uncategorized = others.filter((c) => !c.categoryId);
+    const grouped = categories.map((cat) => ({
+      category: cat,
+      channels: others.filter((c) => c.categoryId === cat.id).sort((a, b) => a.position - b.position),
+    }));
+    return { uncategorized, categories: grouped };
+  });
+
   return (
     <div class="flex flex-col h-full">
-      {/* Header — server name area */}
-      <div class="flex items-center justify-between px-4 h-14 shrink-0 border-b border-white/[0.06]">
-        <div class="flex items-center gap-2.5">
-          <span class="text-sm font-bold tracking-wide text-foreground/90">Direct Messages</span>
-        </div>
-        <Tooltip content="New conversation">
-          <button
-            class="flex items-center justify-center w-8 h-8 rounded-lg text-muted-foreground hover:text-foreground hover:bg-white/[0.06] transition-all duration-150 cursor-pointer"
-            onClick={() => setShowNewDm(true)}
-          >
-            <Plus class="h-4 w-4" />
-          </button>
-        </Tooltip>
-      </div>
-
-      {/* Search */}
-      <div class="px-3 pt-3 pb-1 shrink-0">
-        <div class={cn(
-          "relative flex items-center rounded-lg transition-all duration-200 h-9",
-          searchFocused() ? "bg-white/[0.06] ring-1 ring-primary/30" : "bg-white/[0.04]"
-        )}>
-          <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/40" />
-          <input
-            placeholder="Search..."
-            class="w-full h-full pl-8 pr-3 text-[13px] bg-transparent text-foreground placeholder:text-muted-foreground/30 focus:outline-none"
-            value={searchQuery()}
-            onInput={(e) => setSearchQuery(e.currentTarget.value)}
-            onFocus={() => setSearchFocused(true)}
-            onBlur={() => setSearchFocused(false)}
-          />
-        </div>
-      </div>
-
-      {/* Navigation */}
-      <div class="px-2 pt-1 shrink-0 space-y-0.5">
-        <NavItem icon={MessageSquare} label="Direct Messages" active />
-        <NavItem icon={Users} label="Groups" />
-        <NavItem icon={Hash} label="Channels" />
-      </div>
-
-      {/* Conversations section */}
-      <SectionLabel action={{ icon: Plus, onClick: () => setShowNewDm(true), tooltip: "New DM" }}>
-        Conversations
-      </SectionLabel>
-
-      {/* Conversation list — scrollable zone */}
-      <div class="flex-1 overflow-y-auto px-2 min-h-0">
-        <Show
-          when={filtered().length > 0}
-          fallback={
-            <div class="flex flex-col items-center pt-8 pb-4 animate-fadeIn">
-              <div class="flex items-center justify-center w-10 h-10 rounded-xl bg-white/[0.03] mb-2.5">
-                <MessageSquare class="h-4 w-4 text-muted-foreground/20" />
-              </div>
-              <p class="text-[12px] text-muted-foreground/40">No conversations yet</p>
+      <Show when={activeServer()} fallback={<DmHeader onNewDm={() => setShowNewDm(true)} />}>
+        {(srv) => (
+          <>
+            <div class="relative shrink-0">
               <button
-                class="mt-1.5 text-[11px] text-primary/60 hover:text-primary transition-colors cursor-pointer"
-                onClick={() => setShowNewDm(true)}
+                class="flex items-center justify-between w-full px-4 h-14 border-b border-white/[0.06] hover:bg-white/[0.03] transition-colors cursor-pointer"
+                onClick={() => setServerMenuOpen((v) => !v)}
               >
-                Start a new conversation →
+                <span class="text-sm font-bold tracking-wide text-foreground/90 truncate">{srv().name}</span>
+                <ChevronDown
+                  class={cn("h-4 w-4 text-muted-foreground/60 transition-transform", serverMenuOpen() && "rotate-180")}
+                />
               </button>
-            </div>
-          }
-        >
-          <For each={filtered()}>
-            {(conv) => (
-              <ConversationItem
-                conversation={conv}
-                isActive={appStore.activeConversationId() === conv.id}
-                onClick={() => appStore.selectConversation(conv.id)}
-              />
-            )}
-          </For>
-        </Show>
-      </div>
 
-      {/* User panel — fixed at bottom */}
+              <Show when={serverMenuOpen()}>
+                <div class="fixed inset-0 z-10" onClick={() => setServerMenuOpen(false)} />
+                <div class="absolute left-3 right-3 top-12 z-20 glass border border-white/[0.06] rounded-lg shadow-xl shadow-black/40 overflow-hidden animate-fadeIn">
+                  <button
+                    class="flex items-center gap-2 w-full px-3 py-2 text-[13px] text-foreground hover:bg-white/[0.06] transition-colors cursor-pointer"
+                    onClick={() => {
+                      setServerMenuOpen(false);
+                      setShowInvite(true);
+                    }}
+                  >
+                    <UserPlus class="h-3.5 w-3.5 text-primary" />
+                    Invite People
+                  </button>
+                  <button
+                    class="flex items-center gap-2 w-full px-3 py-2 text-[13px] text-foreground hover:bg-white/[0.06] transition-colors cursor-pointer"
+                    onClick={() => {
+                      setServerMenuOpen(false);
+                      setShowCreateChannel(true);
+                    }}
+                  >
+                    <Plus class="h-3.5 w-3.5 text-online" />
+                    Create Channel
+                  </button>
+                  <button
+                    class="flex items-center gap-2 w-full px-3 py-2 text-[13px] text-foreground hover:bg-white/[0.06] transition-colors cursor-pointer"
+                    onClick={() => {
+                      setServerMenuOpen(false);
+                      appStore.openServerSettings(srv().id);
+                    }}
+                  >
+                    <Settings class="h-3.5 w-3.5 text-muted-foreground/60" />
+                    Server Settings
+                  </button>
+                  <div class="h-px bg-white/[0.06]" />
+                  <Show when={srv().ownerId === appStore.userId()}>
+                    <button
+                      class="flex items-center gap-2 w-full px-3 py-2 text-[13px] text-destructive hover:bg-destructive/10 transition-colors cursor-pointer"
+                      onClick={async () => {
+                        setServerMenuOpen(false);
+                        if (confirm(`Delete server "${srv().name}"? This cannot be undone.`)) {
+                          await appStore.deleteServer(srv().id);
+                        }
+                      }}
+                    >
+                      Delete Server
+                    </button>
+                  </Show>
+                  <Show when={srv().ownerId !== appStore.userId()}>
+                    <button
+                      class="flex items-center gap-2 w-full px-3 py-2 text-[13px] text-destructive hover:bg-destructive/10 transition-colors cursor-pointer"
+                      onClick={async () => {
+                        setServerMenuOpen(false);
+                        if (confirm(`Leave server "${srv().name}"?`)) {
+                          await appStore.leaveServer(srv().id);
+                        }
+                      }}
+                    >
+                      Leave Server
+                    </button>
+                  </Show>
+                </div>
+              </Show>
+            </div>
+
+            <div class="flex-1 overflow-y-auto px-2 pt-3 min-h-0 space-y-0.5">
+              <Show when={serverChannels().uncategorized.length === 0 && serverChannels().categories.length === 0}>
+                <div class="flex flex-col items-center pt-8 pb-4 animate-fadeIn">
+                  <div class="flex items-center justify-center w-10 h-10 rounded-xl bg-white/[0.03] mb-2.5">
+                    <Hash class="h-4 w-4 text-muted-foreground/20" />
+                  </div>
+                  <p class="text-[12px] text-muted-foreground/40">No channels yet</p>
+                  <button
+                    class="mt-1.5 text-[11px] text-primary/60 hover:text-primary transition-colors cursor-pointer"
+                    onClick={() => setShowCreateChannel(true)}
+                  >
+                    Create the first channel →
+                  </button>
+                </div>
+              </Show>
+
+              <For each={serverChannels().uncategorized}>
+                {(ch) => (
+                  <ChannelItem
+                    channel={ch}
+                    isActive={appStore.activeChannelId() === ch.id}
+                    onClick={() => appStore.selectChannel(ch.id)}
+                  />
+                )}
+              </For>
+
+              <For each={serverChannels().categories}>
+                {(group) => (
+                  <div class="pt-2">
+                    <div class="flex items-center justify-between px-2 py-1">
+                      <span class="text-[10px] font-semibold text-muted-foreground/40 uppercase tracking-[0.1em] truncate">
+                        {group.category.name}
+                      </span>
+                    </div>
+                    <For each={group.channels}>
+                      {(ch) => (
+                        <ChannelItem
+                          channel={ch}
+                          isActive={appStore.activeChannelId() === ch.id}
+                          onClick={() => appStore.selectChannel(ch.id)}
+                        />
+                      )}
+                    </For>
+                  </div>
+                )}
+              </For>
+            </div>
+          </>
+        )}
+      </Show>
+
+      <Show when={!activeServer()}>
+        <div class="px-3 pt-3 pb-1 shrink-0">
+          <div
+            class={cn(
+              "relative flex items-center rounded-lg transition-all duration-200 h-9",
+              searchFocused() ? "bg-white/[0.06] ring-1 ring-primary/30" : "bg-white/[0.04]",
+            )}
+          >
+            <Search class="absolute left-2.5 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground/40" />
+            <input
+              placeholder="Search..."
+              class="w-full h-full pl-8 pr-3 text-[13px] bg-transparent text-foreground placeholder:text-muted-foreground/30 focus:outline-none"
+              value={searchQuery()}
+              onInput={(e) => setSearchQuery(e.currentTarget.value)}
+              onFocus={() => setSearchFocused(true)}
+              onBlur={() => setSearchFocused(false)}
+            />
+          </div>
+        </div>
+
+        <div class="px-2 pt-1 shrink-0 space-y-0.5">
+          <NavItem icon={MessageSquare} label="Direct Messages" active />
+          <NavItem icon={Users} label="Groups" />
+          <NavItem icon={Hash} label="Channels" />
+        </div>
+
+        <SectionLabel action={{ icon: Plus, onClick: () => setShowNewDm(true), tooltip: "New DM" }}>
+          Conversations
+        </SectionLabel>
+
+        <div class="flex-1 overflow-y-auto px-2 min-h-0">
+          <Show
+            when={filtered().length > 0}
+            fallback={
+              <div class="flex flex-col items-center pt-8 pb-4 animate-fadeIn">
+                <div class="flex items-center justify-center w-10 h-10 rounded-xl bg-white/[0.03] mb-2.5">
+                  <MessageSquare class="h-4 w-4 text-muted-foreground/20" />
+                </div>
+                <p class="text-[12px] text-muted-foreground/40">No conversations yet</p>
+                <button
+                  class="mt-1.5 text-[11px] text-primary/60 hover:text-primary transition-colors cursor-pointer"
+                  onClick={() => setShowNewDm(true)}
+                >
+                  Start a new conversation →
+                </button>
+              </div>
+            }
+          >
+            <For each={filtered()}>
+              {(conv) => (
+                <ConversationItem
+                  conversation={conv}
+                  isActive={appStore.activeConversationId() === conv.id}
+                  onClick={() => appStore.selectConversation(conv.id)}
+                />
+              )}
+            </For>
+          </Show>
+        </div>
+      </Show>
+
       <div class="shrink-0 border-t border-white/[0.06]">
         <div class="flex items-center gap-3 px-3 py-2.5">
           <Avatar fallback="Me" size="sm" status={appStore.connected() ? "online" : "offline"} />
           <div class="flex-1 min-w-0">
-            <p class="text-[12px] font-medium text-foreground/80 truncate font-mono">
-              {shortId()}
-            </p>
+            <p class="text-[12px] font-medium text-foreground/80 truncate font-mono">{shortId()}</p>
             <div class="flex items-center gap-1 mt-0.5">
-              <Show when={appStore.connected()} fallback={
-                <span class="text-[10px] text-muted-foreground/40">Offline</span>
-              }>
+              <Show
+                when={appStore.connected()}
+                fallback={<span class="text-[10px] text-muted-foreground/40">Offline</span>}
+              >
                 <Zap class="h-2.5 w-2.5 text-online" />
                 <span class="text-[10px] text-online/70 font-medium">Connected</span>
               </Show>
@@ -237,8 +404,23 @@ export const ChannelSidebar: Component = () => {
         </div>
       </div>
 
-      {/* New DM Dialog */}
       <NewDmDialog open={showNewDm()} onClose={() => setShowNewDm(false)} />
+      <Show when={activeServer()}>
+        {(srv) => (
+          <>
+            <CreateChannelDialog
+              open={showCreateChannel()}
+              serverId={srv().id}
+              onClose={() => setShowCreateChannel(false)}
+            />
+            <CreateInviteDialog
+              open={showInvite()}
+              serverId={srv().id}
+              onClose={() => setShowInvite(false)}
+            />
+          </>
+        )}
+      </Show>
     </div>
   );
 };

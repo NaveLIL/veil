@@ -84,3 +84,57 @@ pub struct StoredSenderKey {
     pub is_outgoing: bool,
     pub updated_at: String,
 }
+
+// ─── Discord-like server cache models ──────────────────────────────────
+
+/// Cached server (offline rendering of the server rail).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedServer {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub icon_url: Option<String>,
+    pub owner_id: String,
+    pub position: i32,
+    pub created_at: String,
+}
+
+/// Cached channel within a server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedChannel {
+    pub id: String,
+    pub server_id: String,
+    pub conversation_id: Option<String>,
+    pub name: String,
+    pub channel_type: i16, // 0=text, 1=voice, 2=category
+    pub category_id: Option<String>,
+    pub position: i32,
+    pub topic: Option<String>,
+    pub nsfw: bool,
+    pub slowmode_secs: i32,
+}
+
+/// Cached role within a server.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedRole {
+    pub id: String,
+    pub server_id: String,
+    pub name: String,
+    pub permissions: u64,
+    pub position: i32,
+    pub color: Option<i32>,
+    pub is_default: bool,
+    pub hoist: bool,
+    pub mentionable: bool,
+}
+
+/// Cached server member with role assignments.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CachedServerMember {
+    pub server_id: String,
+    pub user_id: String,
+    pub username: String,
+    pub nickname: Option<String>,
+    pub role_ids: Vec<String>,
+    pub joined_at: String,
+}

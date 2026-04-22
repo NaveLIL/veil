@@ -4,7 +4,7 @@ import { listen } from "@tauri-apps/api/event";
 
 // ─── Types ───────────────────────────────────────────
 
-export type Screen = "onboarding" | "locked" | "disclaimer" | "chat" | "settings";
+export type Screen = "onboarding" | "locked" | "disclaimer" | "chat" | "settings" | "serverSettings";
 
 export interface Conversation {
   id: string;
@@ -28,7 +28,44 @@ export interface GroupMember {
 export interface Server {
   id: string;
   name: string;
+  description?: string;
   iconUrl?: string;
+  ownerId: string;
+}
+
+export interface Channel {
+  id: string;
+  serverId: string;
+  conversationId?: string;
+  name: string;
+  channelType: number; // 0=text, 1=voice, 2=category
+  categoryId?: string;
+  position: number;
+  topic?: string;
+  nsfw: boolean;
+  slowmodeSecs: number;
+}
+
+export interface Role {
+  id: string;
+  serverId: string;
+  name: string;
+  permissions: number;
+  position: number;
+  color?: number;
+  isDefault: boolean;
+  hoist: boolean;
+  mentionable: boolean;
+}
+
+export interface ServerMember {
+  serverId: string;
+  userId: string;
+  identityKey?: string;
+  username: string;
+  nickname?: string;
+  roleIds: string[];
+  joinedAt: string;
 }
 
 export interface Message {
@@ -55,6 +92,13 @@ const [connected, setConnected] = createSignal(false);
 const [serverUrl, setServerUrl] = createSignal("ws://5.144.181.72:9080/ws");
 const [serverHttpUrl, setServerHttpUrl] = createSignal("http://5.144.181.72:9080");
 const [servers, setServers] = createSignal<Server[]>([]);
+const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
+const [channelsByServer, setChannelsByServer] = createSignal<Record<string, Channel[]>>({});
+const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
+const [serverMembers, setServerMembers] = createSignal<Record<string, ServerMember[]>>({});
+const [serverRoles, setServerRoles] = createSignal<Record<string, Role[]>>({});
+// Currently-open server settings overlay; null = closed.
+const [serverSettingsId, setServerSettingsId] = createSignal<string | null>(null);
 // Typing indicators: conversationId → Set of identityKeys currently typing
 const [typingUsers, setTypingUsers] = createSignal<Record<string, Set<string>>>({});
 let typingTimers: Record<string, ReturnType<typeof setTimeout>> = {};
@@ -88,6 +132,70 @@ const [presenceMap, setPresenceMap] = createSignal<Record<string, number>>({});
 const AUTO_LOCK_SECONDS = 300; // 5 minutes
 let autoLockTimer: ReturnType<typeof setInterval> | null = null;
 
+// ─── JSON ↔ store-type adapters (snake_case from Rust ↔ camelCase) ────
+
+function serverFromJSON(v: any): Server {
+  return {
+    id: v.id,
+    name: v.name,
+    description: v.description ?? undefined,
+    iconUrl: v.icon_url ?? undefined,
+    ownerId: v.owner_id,
+  };
+}
+
+function serverToJSON(s: Server): any {
+  return {
+    id: s.id,
+    name: s.name,
+    description: s.description ?? null,
+    icon_url: s.iconUrl ?? null,
+    owner_id: s.ownerId,
+    created_at: "",
+  };
+}
+
+function channelFromJSON(v: any): Channel {
+  return {
+    id: v.id,
+    serverId: v.server_id,
+    conversationId: v.conversation_id ?? undefined,
+    name: v.name,
+    channelType: v.channel_type ?? 0,
+    categoryId: v.category_id ?? undefined,
+    position: v.position ?? 0,
+    topic: v.topic ?? undefined,
+    nsfw: !!v.nsfw,
+    slowmodeSecs: v.slowmode_secs ?? 0,
+  };
+}
+
+function memberFromJSON(v: any): ServerMember {
+  return {
+    serverId: v.server_id,
+    userId: v.user_id,
+    identityKey: typeof v.identity_key === "string" ? v.identity_key : undefined,
+    username: v.username,
+    nickname: v.nickname ?? undefined,
+    roleIds: Array.isArray(v.role_ids) ? v.role_ids : [],
+    joinedAt: v.joined_at,
+  };
+}
+
+function roleFromJSON(v: any): Role {
+  return {
+    id: v.id,
+    serverId: v.server_id,
+    name: v.name,
+    permissions: Number(v.permissions ?? 0),
+    position: v.position ?? 0,
+    color: v.color ?? undefined,
+    isDefault: !!v.is_default,
+    hoist: !!v.hoist,
+    mentionable: !!v.mentionable,
+  };
+}
+
 export const appStore = {
   screen,
   setScreen,
@@ -110,6 +218,14 @@ export const appStore = {
   setServerHttpUrl,
   servers,
   setServers,
+  activeServerId,
+  setActiveServerId,
+  channelsByServer,
+  activeChannelId,
+  setActiveChannelId,
+  serverMembers,
+  serverRoles,
+  serverSettingsId,
   typingUsers,
   reactions,
   friends,
@@ -119,10 +235,30 @@ export const appStore = {
   activeConversation: () => {
     const id = activeConversationId();
     if (!id) return null;
-    return conversations().find((c) => c.id === id) ?? null;
+    const real = conversations().find((c) => c.id === id);
+    if (real) return real;
+    // Virtual conversation backed by an active text channel — keeps ChatIsland working
+    // before the channel beats its way into the conversations list (Phase E).
+    const sid = activeServerId();
+    const cid = activeChannelId();
+    if (sid && cid) {
+      const ch = (channelsByServer()[sid] ?? []).find((c) => c.id === cid && c.conversationId === id);
+      if (ch) {
+        return {
+          id,
+          name: `# ${ch.name}`,
+          unreadCount: 0,
+          online: false,
+        } as Conversation;
+      }
+    }
+    return null;
   },
 
   selectConversation: (id: string) => {
+    // Selecting a DM clears any active server/channel context
+    setActiveServerId(null);
+    setActiveChannelId(null);
     setActiveConversationId(id);
   },
 
@@ -147,6 +283,8 @@ export const appStore = {
       // Request friend list and announce online after connecting
       appStore.requestFriendList();
       appStore.sendPresence(1); // ONLINE
+      // Load Discord-like servers (cache-first then refresh)
+      appStore.loadServers();
     } catch (e) {
       console.error("connect failed:", e);
       setConnected(false);
@@ -159,6 +297,11 @@ export const appStore = {
     if (!convId) return;
     try {
       await invoke("send_message", { conversationId: convId, text, replyToId: replyToId ?? null });
+      // Backend already persisted the outgoing message to the local DB
+      // (api.rs send_message inserts before returning). The gateway filters
+      // the sender from broadcast, so we won't get a veil://message echo.
+      // Refresh from DB to display the just-sent message exactly once.
+      appStore.loadMessages(convId).catch(() => {});
     } catch (e) {
       console.error("send failed:", e);
     }
@@ -459,10 +602,15 @@ export const appStore = {
         replyToId: m.replyToId ?? undefined,
       }));
       setMessages(prev => {
-        // Merge: keep existing messages that aren't from DB, add DB messages
-        const existingIds = new Set(loaded.map(m => m.id));
-        const kept = prev.filter(m => m.conversationId !== conversationId || !existingIds.has(m.id));
-        return [...loaded, ...kept.filter(m => m.conversationId === conversationId)];
+        const loadedIds = new Set(loaded.map(m => m.id));
+        // Keep messages from OTHER conversations untouched. For the current
+        // conversation, keep only local optimistic items not yet in DB so we
+        // don't duplicate, and prepend the DB-loaded list.
+        const otherConvs = prev.filter(m => m.conversationId !== conversationId);
+        const localOnly = prev.filter(
+          m => m.conversationId === conversationId && !loadedIds.has(m.id),
+        );
+        return [...otherConvs, ...loaded, ...localOnly];
       });
     } catch (e) {
       console.error("loadMessages failed:", e);
@@ -585,6 +733,618 @@ export const appStore = {
       console.error("getGroupMembers failed:", e);
       return [];
     }
+  },
+
+  // ─── Servers / Channels / Roles / Invites ────────
+
+  selectServer: (serverId: string | null) => {
+    setActiveServerId(serverId);
+    if (serverId) {
+      // Auto-select first text channel of the server, if any
+      const chans = channelsByServer()[serverId] ?? [];
+      const firstText = chans.find((c) => c.channelType === 0);
+      if (firstText) {
+        appStore.selectChannel(firstText.id);
+      } else {
+        setActiveChannelId(null);
+        setActiveConversationId(null);
+      }
+      // Lazy load channels if missing
+      if (chans.length === 0) appStore.loadChannels(serverId);
+    } else {
+      setActiveChannelId(null);
+      setActiveConversationId(null);
+    }
+  },
+
+  selectChannel: (channelId: string | null) => {
+    setActiveChannelId(channelId);
+    if (!channelId) {
+      setActiveConversationId(null);
+      return;
+    }
+    // Bind the channel's underlying conversation so ChatIsland renders it.
+    const sid = activeServerId();
+    if (!sid) return;
+    const ch = (channelsByServer()[sid] ?? []).find((c) => c.id === channelId);
+    if (ch?.conversationId) {
+      const convId = ch.conversationId;
+      setActiveConversationId(convId);
+      // Mark this conversation as a channel — outgoing messages will be encrypted
+      // with sender keys; hydrate any persisted sender-key state from the local DB.
+      invoke("mark_channel_conversation", { conversationId: convId }).catch(() => {});
+      invoke("hydrate_channel_sender_keys", { conversationId: convId }).catch(() => {});
+      appStore.loadMessages(convId).catch(() => {});
+      // Distribute (or refresh) our sender key to known members.
+      const members = serverMembers()[sid] ?? [];
+      if (members.length > 0) {
+        appStore.distributeSenderKey(convId, members);
+      }
+    } else {
+      setActiveConversationId(null);
+    }
+  },
+
+  /** Hydrate the server rail from local cache (instant), then refresh from REST. */
+  loadServers: async () => {
+    // 1. Cache first for instant UI
+    try {
+      const cached = await invoke<Array<any>>("cache_load_servers");
+      setServers(cached.map(serverFromJSON));
+    } catch (e) {
+      console.warn("cache_load_servers failed:", e);
+    }
+    // 2. REST refresh
+    const uid = userId();
+    if (!uid) return;
+    try {
+      const fresh = await invoke<Array<any>>("list_servers", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+      });
+      setServers(fresh.map(serverFromJSON));
+      await invoke("cache_save_servers", { servers: fresh }).catch(() => {});
+    } catch (e) {
+      console.error("list_servers failed:", e);
+    }
+  },
+
+  loadChannels: async (serverId: string) => {
+    // 1. Cache first
+    try {
+      const cached = await invoke<Array<any>>("cache_load_channels", { serverId });
+      setChannelsByServer((prev) => ({ ...prev, [serverId]: cached.map(channelFromJSON) }));
+    } catch {}
+    // 2. REST refresh
+    const uid = userId();
+    if (!uid) return;
+    try {
+      const fresh = await invoke<Array<any>>("list_channels", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        serverId,
+      });
+      setChannelsByServer((prev) => ({ ...prev, [serverId]: fresh.map(channelFromJSON) }));
+      await invoke("cache_save_channels", { serverId, channels: fresh }).catch(() => {});
+      // If active server but no active channel, pick first text channel
+      if (activeServerId() === serverId && !activeChannelId()) {
+        const firstText = fresh.find((c) => (c.channel_type ?? 0) === 0);
+        if (firstText) appStore.selectChannel(firstText.id);
+      }
+    } catch (e) {
+      console.error("list_channels failed:", e);
+    }
+  },
+
+  loadServerMembers: async (serverId: string) => {
+    try {
+      const cached = await invoke<Array<any>>("cache_load_server_members", { serverId });
+      setServerMembers((prev) => ({ ...prev, [serverId]: cached.map(memberFromJSON) }));
+    } catch {}
+    const uid = userId();
+    if (!uid) return;
+    try {
+      const fresh = await invoke<Array<any>>("list_server_members", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        serverId,
+      });
+      const mapped = fresh.map(memberFromJSON);
+      setServerMembers((prev) => ({ ...prev, [serverId]: mapped }));
+      await invoke("cache_save_server_members", { serverId, members: fresh }).catch(() => {});
+      // If we're viewing a channel of this server, push our sender key to the freshly
+      // known members. (Idempotent: noop for already-up-to-date peers, refresh on change.)
+      if (activeServerId() === serverId) {
+        const convId = activeConversationId();
+        if (convId) {
+          appStore.distributeSenderKey(convId, mapped);
+        }
+      }
+    } catch (e) {
+      console.error("list_server_members failed:", e);
+    }
+  },
+
+  /**
+   * Phase E: Distribute the current outgoing sender key for `conversationId`
+   * to every known member that has an identity_key (skip self, skip unknown).
+   */
+  distributeSenderKey: (conversationId: string, members: ServerMember[]) => {
+    const peers = members
+      .map((m) => m.identityKey)
+      .filter((k): k is string => typeof k === "string" && k.length === 64);
+    if (peers.length === 0) return;
+    invoke<number>("distribute_sender_key", {
+      conversationId,
+      peerIdentityKeys: peers,
+    }).catch((e) => console.warn("distribute_sender_key failed:", e));
+  },
+
+  loadServerRoles: async (serverId: string) => {
+    try {
+      const cached = await invoke<Array<any>>("cache_load_roles", { serverId });
+      setServerRoles((prev) => ({ ...prev, [serverId]: cached.map(roleFromJSON) }));
+    } catch {}
+    const uid = userId();
+    if (!uid) return;
+    try {
+      const fresh = await invoke<Array<any>>("list_roles", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        serverId,
+      });
+      setServerRoles((prev) => ({ ...prev, [serverId]: fresh.map(roleFromJSON) }));
+      await invoke("cache_save_roles", { serverId, roles: fresh }).catch(() => {});
+    } catch (e) {
+      console.error("list_roles failed:", e);
+    }
+  },
+
+  createServer: async (name: string): Promise<Server | null> => {
+    const uid = userId();
+    if (!uid || !name.trim()) return null;
+    try {
+      const s = await invoke<any>("create_server", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        name: name.trim(),
+      });
+      const created = serverFromJSON(s);
+      setServers((prev) => [...prev, created]);
+      // Persist the updated list
+      await invoke("cache_save_servers", {
+        servers: [...servers().map(serverToJSON)],
+      }).catch(() => {});
+      return created;
+    } catch (e) {
+      console.error("create_server failed:", e);
+      throw e;
+    }
+  },
+
+  deleteServer: async (serverId: string) => {
+    const uid = userId();
+    if (!uid) return;
+    try {
+      await invoke("delete_server", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        serverId,
+      });
+      setServers((prev) => prev.filter((s) => s.id !== serverId));
+      setChannelsByServer((prev) => {
+        const c = { ...prev };
+        delete c[serverId];
+        return c;
+      });
+      if (activeServerId() === serverId) {
+        setActiveServerId(null);
+        setActiveChannelId(null);
+      }
+      await invoke("cache_delete_server", { serverId }).catch(() => {});
+    } catch (e) {
+      console.error("delete_server failed:", e);
+      throw e;
+    }
+  },
+
+  leaveServer: async (serverId: string) => {
+    const uid = userId();
+    if (!uid) return;
+    try {
+      await invoke("leave_server", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        serverId,
+      });
+      setServers((prev) => prev.filter((s) => s.id !== serverId));
+      if (activeServerId() === serverId) {
+        setActiveServerId(null);
+        setActiveChannelId(null);
+      }
+      await invoke("cache_delete_server", { serverId }).catch(() => {});
+    } catch (e) {
+      console.error("leave_server failed:", e);
+      throw e;
+    }
+  },
+
+  createChannel: async (
+    serverId: string,
+    name: string,
+    channelType: number,
+    categoryId?: string,
+    topic?: string,
+  ): Promise<Channel | null> => {
+    const uid = userId();
+    if (!uid) return null;
+    try {
+      const c = await invoke<any>("create_channel", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        serverId,
+        name,
+        channelType,
+        categoryId: categoryId ?? null,
+        topic: topic ?? null,
+      });
+      const ch = channelFromJSON(c);
+      setChannelsByServer((prev) => ({
+        ...prev,
+        [serverId]: [...(prev[serverId] ?? []), ch],
+      }));
+      return ch;
+    } catch (e) {
+      console.error("create_channel failed:", e);
+      throw e;
+    }
+  },
+
+  deleteChannel: async (serverId: string, channelId: string) => {
+    const uid = userId();
+    if (!uid) return;
+    try {
+      await invoke("delete_channel", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        channelId,
+      });
+      setChannelsByServer((prev) => ({
+        ...prev,
+        [serverId]: (prev[serverId] ?? []).filter((c) => c.id !== channelId),
+      }));
+      if (activeChannelId() === channelId) setActiveChannelId(null);
+      await invoke("cache_delete_channel", { channelId }).catch(() => {});
+    } catch (e) {
+      console.error("delete_channel failed:", e);
+      throw e;
+    }
+  },
+
+  createInvite: async (
+    serverId: string,
+    maxUses: number,
+    expiresInSecs: number,
+  ): Promise<{ code: string } | null> => {
+    const uid = userId();
+    if (!uid) return null;
+    try {
+      const inv = await invoke<{ code: string }>("create_invite", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        serverId,
+        maxUses,
+        expiresInSecs,
+      });
+      return inv;
+    } catch (e) {
+      console.error("create_invite failed:", e);
+      throw e;
+    }
+  },
+
+  previewInvite: async (code: string): Promise<any> => {
+    return invoke("preview_invite", { serverHttpUrl: serverHttpUrl(), code });
+  },
+
+  useInvite: async (code: string): Promise<Server | null> => {
+    const uid = userId();
+    if (!uid) return null;
+    try {
+      const s = await invoke<any>("use_invite", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        code,
+      });
+      const joined = serverFromJSON(s);
+      setServers((prev) => {
+        if (prev.some((p) => p.id === joined.id)) return prev;
+        return [...prev, joined];
+      });
+      return joined;
+    } catch (e) {
+      console.error("use_invite failed:", e);
+      throw e;
+    }
+  },
+
+  // ─── Server settings overlay ─────────────────────
+
+  openServerSettings: (serverId: string) => {
+    setServerSettingsId(serverId);
+    setScreen("serverSettings");
+    // Make sure members + roles + invites data is warm. Run in parallel so the
+    // overlay does not feel sluggish on slow networks.
+    Promise.all([
+      appStore.loadServerMembers(serverId),
+      appStore.loadServerRoles(serverId),
+    ]).catch(() => {});
+  },
+
+  closeServerSettings: () => {
+    setServerSettingsId(null);
+    setScreen("chat");
+  },
+
+  // ─── Server settings extra actions (Phase D ServerSettingsScreen) ─────
+
+  updateServer: async (
+    serverId: string,
+    patch: { name?: string; description?: string; iconUrl?: string },
+  ) => {
+    const uid = userId();
+    if (!uid) return;
+    await invoke("update_server", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      name: patch.name ?? null,
+      description: patch.description ?? null,
+      iconUrl: patch.iconUrl ?? null,
+    });
+    setServers((prev) =>
+      prev.map((s) =>
+        s.id === serverId
+          ? {
+              ...s,
+              name: patch.name ?? s.name,
+              description: patch.description ?? s.description,
+              iconUrl: patch.iconUrl ?? s.iconUrl,
+            }
+          : s,
+      ),
+    );
+  },
+
+  updateChannel: async (
+    serverId: string,
+    channelId: string,
+    patch: { name?: string; topic?: string; nsfw?: boolean; slowmodeSecs?: number },
+  ) => {
+    const uid = userId();
+    if (!uid) return;
+    await invoke("update_channel", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      channelId,
+      name: patch.name ?? null,
+      topic: patch.topic ?? null,
+      nsfw: patch.nsfw ?? null,
+      slowmodeSecs: patch.slowmodeSecs ?? null,
+    });
+    setChannelsByServer((prev) => ({
+      ...prev,
+      [serverId]: (prev[serverId] ?? []).map((c) =>
+        c.id === channelId
+          ? {
+              ...c,
+              name: patch.name ?? c.name,
+              topic: patch.topic ?? c.topic,
+              nsfw: patch.nsfw ?? c.nsfw,
+              slowmodeSecs: patch.slowmodeSecs ?? c.slowmodeSecs,
+            }
+          : c,
+      ),
+    }));
+  },
+
+  reorderChannels: async (
+    serverId: string,
+    items: Array<{
+      channelId: string;
+      position: number;
+      categoryId?: string | null;
+      clearCategory?: boolean;
+    }>,
+  ) => {
+    const uid = userId();
+    if (!uid) return;
+    // Optimistic local update
+    setChannelsByServer((prev) => {
+      const list = prev[serverId];
+      if (!list) return prev;
+      const byId = new Map(list.map((c) => [c.id, c]));
+      for (const it of items) {
+        const c = byId.get(it.channelId);
+        if (!c) continue;
+        byId.set(it.channelId, {
+          ...c,
+          position: it.position,
+          categoryId: it.clearCategory
+            ? undefined
+            : it.categoryId !== undefined
+              ? (it.categoryId ?? undefined)
+              : c.categoryId,
+        });
+      }
+      const next = Array.from(byId.values()).sort((a, b) => a.position - b.position);
+      return { ...prev, [serverId]: next };
+    });
+    const payload = items.map((it) => ({
+      channel_id: it.channelId,
+      position: it.position,
+      category_id: it.categoryId ?? null,
+      clear_category: it.clearCategory ?? false,
+    }));
+    try {
+      await invoke("reorder_channels", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        serverId,
+        items: payload,
+      });
+    } catch (e) {
+      console.error("reorder_channels failed", e);
+      // Refresh from server on failure
+      await (appStore as any).loadChannels(serverId);
+    }
+  },
+
+  createRole: async (
+    serverId: string,
+    name: string,
+    permissions: number,
+    color?: number,
+  ): Promise<Role | null> => {
+    const uid = userId();
+    if (!uid) return null;
+    const r = await invoke<any>("create_role", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      name,
+      permissions,
+      color: color ?? null,
+    });
+    const role = roleFromJSON(r);
+    setServerRoles((prev) => ({
+      ...prev,
+      [serverId]: [...(prev[serverId] ?? []), role],
+    }));
+    return role;
+  },
+
+  updateRole: async (
+    serverId: string,
+    roleId: string,
+    patch: { name?: string; permissions?: number; color?: number },
+  ) => {
+    const uid = userId();
+    if (!uid) return;
+    await invoke("update_role", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      roleId,
+      name: patch.name ?? null,
+      permissions: patch.permissions ?? null,
+      color: patch.color ?? null,
+    });
+    setServerRoles((prev) => ({
+      ...prev,
+      [serverId]: (prev[serverId] ?? []).map((r) =>
+        r.id === roleId
+          ? {
+              ...r,
+              name: patch.name ?? r.name,
+              permissions: patch.permissions ?? r.permissions,
+              color: patch.color ?? r.color,
+            }
+          : r,
+      ),
+    }));
+  },
+
+  deleteRole: async (serverId: string, roleId: string) => {
+    const uid = userId();
+    if (!uid) return;
+    await invoke("delete_role", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      roleId,
+    });
+    setServerRoles((prev) => ({
+      ...prev,
+      [serverId]: (prev[serverId] ?? []).filter((r) => r.id !== roleId),
+    }));
+  },
+
+  assignRole: async (serverId: string, targetUserId: string, roleId: string) => {
+    const uid = userId();
+    if (!uid) return;
+    await invoke("assign_role", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      targetUserId,
+      roleId,
+    });
+    setServerMembers((prev) => ({
+      ...prev,
+      [serverId]: (prev[serverId] ?? []).map((m) =>
+        m.userId === targetUserId && !m.roleIds.includes(roleId)
+          ? { ...m, roleIds: [...m.roleIds, roleId] }
+          : m,
+      ),
+    }));
+  },
+
+  unassignRole: async (serverId: string, targetUserId: string, roleId: string) => {
+    const uid = userId();
+    if (!uid) return;
+    await invoke("unassign_role", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      targetUserId,
+      roleId,
+    });
+    setServerMembers((prev) => ({
+      ...prev,
+      [serverId]: (prev[serverId] ?? []).map((m) =>
+        m.userId === targetUserId
+          ? { ...m, roleIds: m.roleIds.filter((r) => r !== roleId) }
+          : m,
+      ),
+    }));
+  },
+
+  kickMember: async (serverId: string, targetUserId: string, reason?: string) => {
+    const uid = userId();
+    if (!uid) return;
+    await invoke("kick_server_member", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      targetUserId,
+      reason: reason ?? null,
+    });
+    setServerMembers((prev) => ({
+      ...prev,
+      [serverId]: (prev[serverId] ?? []).filter((m) => m.userId !== targetUserId),
+    }));
+  },
+
+  listInvites: async (serverId: string): Promise<any[]> => {
+    const uid = userId();
+    if (!uid) return [];
+    const invs = await invoke<any[]>("list_invites", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+    });
+    return invs;
+  },
+
+  revokeInvite: async (code: string) => {
+    const uid = userId();
+    if (!uid) return;
+    await invoke("revoke_invite", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      code,
+    });
   },
 
   /** Set up Tauri event listeners for incoming server events. */
@@ -781,6 +1541,94 @@ export const appStore = {
         })));
       },
     );
+
+    // ── Server / Channel events ──
+
+    // ServerEvent::EventType — keep in sync with veil/v1/server.proto
+    const SE_CREATED = 0;
+    const SE_UPDATED = 1;
+    const SE_DELETED = 2;
+    const SE_MEMBER_JOINED = 3;
+    const SE_MEMBER_LEFT = 4;
+    const SE_MEMBER_KICKED = 5;
+    const SE_ROLE_CREATED = 7;
+    const SE_ROLE_UPDATED = 8;
+    const SE_ROLE_DELETED = 9;
+
+    await listen<{
+      eventType: number;
+      serverId: string;
+      serverInfo?: { id: string; name: string; iconUrl?: string; ownerIdentityKey: string };
+      memberInfo?: { identityKey: string; username: string; roleIds: string[]; reason?: string };
+      roleInfo?: { id: string; name: string; permissions: number; position: number; color?: number };
+    }>("veil://server-event", (event) => {
+      const d = event.payload;
+      switch (d.eventType) {
+        case SE_CREATED:
+        case SE_UPDATED:
+          // Server doesn't ship full owner_id/created_at in WS event — refetch.
+          appStore.loadServers();
+          break;
+        case SE_DELETED:
+          setServers((prev) => prev.filter((s) => s.id !== d.serverId));
+          if (activeServerId() === d.serverId) {
+            setActiveServerId(null);
+            setActiveChannelId(null);
+          }
+          invoke("cache_delete_server", { serverId: d.serverId }).catch(() => {});
+          break;
+        case SE_MEMBER_JOINED:
+        case SE_MEMBER_LEFT:
+        case SE_MEMBER_KICKED:
+          // Refresh the member list for that server if it's currently loaded.
+          if (serverMembers()[d.serverId]) appStore.loadServerMembers(d.serverId);
+          break;
+        case SE_ROLE_CREATED:
+        case SE_ROLE_UPDATED:
+        case SE_ROLE_DELETED:
+          if (serverRoles()[d.serverId]) appStore.loadServerRoles(d.serverId);
+          break;
+      }
+    });
+
+    // ChannelEvent::EventType
+    const CE_CREATED = 0;
+    const CE_UPDATED = 1;
+    const CE_DELETED = 2;
+    const CE_REORDERED = 3;
+
+    await listen<{
+      eventType: number;
+      serverId: string;
+      channel: {
+        id: string;
+        serverId: string;
+        name: string;
+        channelType: number;
+        categoryId?: string;
+        position: number;
+        topic?: string;
+      };
+    }>("veil://channel-event", (event) => {
+      const d = event.payload;
+      const ch = d.channel;
+      switch (d.eventType) {
+        case CE_CREATED:
+        case CE_UPDATED:
+        case CE_REORDERED:
+          // Refetch full channel list (event payload lacks nsfw/slowmode/conv_id).
+          appStore.loadChannels(d.serverId);
+          break;
+        case CE_DELETED:
+          setChannelsByServer((prev) => ({
+            ...prev,
+            [d.serverId]: (prev[d.serverId] ?? []).filter((c) => c.id !== ch.id),
+          }));
+          if (activeChannelId() === ch.id) setActiveChannelId(null);
+          invoke("cache_delete_channel", { channelId: ch.id }).catch(() => {});
+          break;
+      }
+    });
 
     // Deep links: veil://add/{userId} or veil://share/{id}
     await listen<string[]>("deep-link://new-url", (event) => {

@@ -1,13 +1,16 @@
-import { Component, For, createSignal } from "solid-js";
-import { Shield, Plus } from "lucide-solid";
+import { Component, For, Show, createSignal } from "solid-js";
+import { Shield, Plus, Compass } from "lucide-solid";
 import { Tooltip } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { appStore } from "@/stores/app";
+import { CreateServerDialog } from "@/components/server/CreateServerDialog";
+import { JoinServerDialog } from "@/components/server/JoinServerDialog";
 
 // ─── Server Icon Button ──────────────────────────────
 
 interface ServerIconProps {
   name: string;
-  color?: string;
+  iconUrl?: string;
   isActive?: boolean;
   isHome?: boolean;
   onClick?: () => void;
@@ -29,16 +32,14 @@ const ServerIcon: Component<ServerIconProps> = (props) => {
       <div
         class={cn(
           "absolute left-0 w-1 rounded-r-full bg-foreground transition-all duration-200",
-          props.isActive
-            ? "h-10"
-            : "h-0 group-hover:h-5",
+          props.isActive ? "h-10" : "h-0 group-hover:h-5",
         )}
       />
 
       <Tooltip content={props.name} side="right">
         <button
           class={cn(
-            "flex items-center justify-center transition-all duration-200 cursor-pointer",
+            "flex items-center justify-center transition-all duration-200 cursor-pointer overflow-hidden",
             props.isHome
               ? "w-12 h-12 rounded-2xl"
               : "w-12 h-12 rounded-3xl group-hover:rounded-2xl",
@@ -49,9 +50,13 @@ const ServerIcon: Component<ServerIconProps> = (props) => {
           )}
           onClick={props.onClick}
         >
-          {props.isHome ? (
+          <Show when={props.isHome}>
             <Shield class="h-5 w-5 text-primary" />
-          ) : (
+          </Show>
+          <Show when={!props.isHome && props.iconUrl}>
+            <img src={props.iconUrl} alt={props.name} class="w-full h-full object-cover" />
+          </Show>
+          <Show when={!props.isHome && !props.iconUrl}>
             <span
               class={cn(
                 "text-sm font-semibold transition-colors duration-200",
@@ -62,7 +67,7 @@ const ServerIcon: Component<ServerIconProps> = (props) => {
             >
               {initials()}
             </span>
-          )}
+          </Show>
         </button>
       </Tooltip>
     </div>
@@ -79,36 +84,33 @@ const RailSeparator: Component = () => (
 
 // ─── Server Rail ─────────────────────────────────────
 
-/** Placeholder server entries — will be replaced with real data later */
-const MOCK_SERVERS = [
-  { id: "home", name: "Veil Home" },
-  { id: "s1", name: "Dev Team" },
-  { id: "s2", name: "Gaming" },
-];
-
 export const ServerRail: Component = () => {
-  const [activeId, setActiveId] = createSignal("home");
+  const [showCreate, setShowCreate] = createSignal(false);
+  const [showJoin, setShowJoin] = createSignal(false);
+
+  const isHome = () => appStore.activeServerId() === null;
 
   return (
     <div class="flex flex-col items-center h-full w-[72px] py-3 gap-2">
-      {/* Home button */}
+      {/* Home button — DMs */}
       <ServerIcon
-        name="Veil Home"
+        name="Direct Messages"
         isHome
-        isActive={activeId() === "home"}
-        onClick={() => setActiveId("home")}
+        isActive={isHome()}
+        onClick={() => appStore.selectServer(null)}
       />
 
       <RailSeparator />
 
       {/* Server list — scrollable */}
       <div class="flex-1 overflow-y-auto flex flex-col items-center gap-2 min-h-0 w-full scrollbar-hide">
-        <For each={MOCK_SERVERS.filter((s) => s.id !== "home")}>
+        <For each={appStore.servers()}>
           {(server) => (
             <ServerIcon
               name={server.name}
-              isActive={activeId() === server.id}
-              onClick={() => setActiveId(server.id)}
+              iconUrl={server.iconUrl}
+              isActive={appStore.activeServerId() === server.id}
+              onClick={() => appStore.selectServer(server.id)}
             />
           )}
         </For>
@@ -117,11 +119,27 @@ export const ServerRail: Component = () => {
       <RailSeparator />
 
       {/* Add server */}
-      <Tooltip content="Add a server" side="right">
-        <button class="flex items-center justify-center w-12 h-12 rounded-3xl bg-white/[0.06] hover:rounded-2xl hover:bg-online/20 transition-all duration-200 cursor-pointer group">
+      <Tooltip content="Create a server" side="right">
+        <button
+          class="flex items-center justify-center w-12 h-12 rounded-3xl bg-white/[0.06] hover:rounded-2xl hover:bg-online/20 transition-all duration-200 cursor-pointer group"
+          onClick={() => setShowCreate(true)}
+        >
           <Plus class="h-5 w-5 text-online transition-colors duration-200" />
         </button>
       </Tooltip>
+
+      <Tooltip content="Join a server" side="right">
+        <button
+          class="flex items-center justify-center w-12 h-12 rounded-3xl bg-white/[0.06] hover:rounded-2xl hover:bg-primary/20 transition-all duration-200 cursor-pointer group"
+          onClick={() => setShowJoin(true)}
+        >
+          <Compass class="h-5 w-5 text-primary transition-colors duration-200" />
+        </button>
+      </Tooltip>
+
+      <CreateServerDialog open={showCreate()} onClose={() => setShowCreate(false)} />
+      <JoinServerDialog open={showJoin()} onClose={() => setShowJoin(false)} />
     </div>
   );
 };
+

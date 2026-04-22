@@ -111,16 +111,75 @@ pub enum ConnectionEvent {
         friends: Vec<FriendInfo>,
         pending_requests: Vec<FriendRequestInfo>,
     },
+    /// A server-level event (created/updated/deleted, member join/leave/kick/ban, role CRUD).
+    ServerEvent {
+        event_type: i32, // proto::server_event::EventType as i32
+        server_id: String,
+        server_info: Option<ServerInfoLite>,
+        member_info: Option<MemberInfoLite>,
+        role_info: Option<RoleInfoLite>,
+    },
+    /// A channel-level event (created/updated/deleted/reordered).
+    ChannelEvent {
+        event_type: i32, // proto::channel_event::EventType as i32
+        server_id: String,
+        channel: ChannelInfoLite,
+    },
     /// Server acknowledged our sent message.
     MessageAcked {
         message_id: String,
         server_timestamp: u64,
         ref_seq: u64,
     },
+    /// A Sender Key Distribution Message arrived from a peer.
+    /// `sender_key_message` is a sealed envelope (see veil_crypto::sender_key::open_skdm).
+    SenderKeyDist {
+        conversation_id: String,
+        sender_key_message: Vec<u8>,
+        generation: u32,
+        target_identity_key: Vec<u8>,
+    },
     /// Connection closed.
     Disconnected { reason: String },
     /// Server error.
     Error { code: u32, message: String },
+}
+
+/// Lightweight projection of ServerInfo for events crossing FFI/Tauri boundary.
+#[derive(Debug, Clone)]
+pub struct ServerInfoLite {
+    pub id: String,
+    pub name: String,
+    pub icon_url: Option<String>,
+    pub owner_identity_key: Vec<u8>,
+}
+
+#[derive(Debug, Clone)]
+pub struct MemberInfoLite {
+    pub identity_key: Vec<u8>,
+    pub username: String,
+    pub role_ids: Vec<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RoleInfoLite {
+    pub id: String,
+    pub name: String,
+    pub permissions: u64,
+    pub position: u32,
+    pub color: Option<u32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChannelInfoLite {
+    pub id: String,
+    pub server_id: String,
+    pub name: String,
+    pub channel_type: i32, // proto::ChannelType as i32
+    pub category_id: Option<String>,
+    pub position: u32,
+    pub topic: Option<String>,
 }
 
 /// Sender half — used to send protobuf envelopes to the server.
@@ -407,6 +466,51 @@ async fn dispatch_event(tx: &mpsc::Sender<ConnectionEvent>, env: proto::Envelope
                     .collect(),
             }
         }
+        Some(proto::envelope::Payload::ServerEvent(se)) => ConnectionEvent::ServerEvent {
+            event_type: se.event_type,
+            server_id: se.server_id,
+            server_info: se.server_info.map(|si| ServerInfoLite {
+                id: si.id,
+                name: si.name,
+                icon_url: si.icon_url,
+                owner_identity_key: si.owner_identity_key,
+            }),
+            member_info: se.member_info.map(|mi| MemberInfoLite {
+                identity_key: mi.identity_key,
+                username: mi.username,
+                role_ids: mi.role_ids,
+                reason: mi.reason,
+            }),
+            role_info: se.role_info.map(|ri| RoleInfoLite {
+                id: ri.id,
+                name: ri.name,
+                permissions: ri.permissions,
+                position: ri.position,
+                color: ri.color,
+            }),
+        },
+        Some(proto::envelope::Payload::ChannelEvent(ce)) => {
+            let info = ce.channel_info.unwrap_or_default();
+            ConnectionEvent::ChannelEvent {
+                event_type: ce.event_type,
+                server_id: ce.server_id,
+                channel: ChannelInfoLite {
+                    id: info.id,
+                    server_id: info.server_id,
+                    name: info.name,
+                    channel_type: info.channel_type,
+                    category_id: info.category_id,
+                    position: info.position,
+                    topic: info.topic,
+                },
+            }
+        }
+        Some(proto::envelope::Payload::SenderKeyDist(skd)) => ConnectionEvent::SenderKeyDist {
+            conversation_id: skd.conversation_id,
+            sender_key_message: skd.sender_key_message,
+            generation: skd.generation,
+            target_identity_key: skd.target_identity_key,
+        },
         _ => return, // Ignore unhandled types for now
     };
     let _ = tx.send(event).await;

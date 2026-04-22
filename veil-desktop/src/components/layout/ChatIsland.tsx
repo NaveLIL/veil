@@ -9,6 +9,7 @@ import {
   PanelRightClose,
   Lock,
   ShieldCheck,
+  Hash,
 } from "lucide-solid";
 import { Avatar } from "@/components/ui/avatar";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -172,14 +173,24 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
   return (
     <div class="flex flex-col h-full">
       <Show when={conv()} fallback={<EmptyState />}>
-        {(c) => (
+        {(c) => {
+          const isChannel = () => c().name.startsWith("# ");
+          const displayName = () => (isChannel() ? c().name.slice(2) : c().name);
+          return (
           <>
             {/* Chat header */}
             <div class="flex items-center justify-between px-5 h-14 border-b border-white/[0.06] shrink-0">
               <div class="flex items-center gap-3">
-                <Avatar fallback={c().name} size="sm" status={c().online ? "online" : undefined} />
+                <Show
+                  when={isChannel()}
+                  fallback={<Avatar fallback={c().name} size="sm" status={c().online ? "online" : undefined} />}
+                >
+                  <div class="flex items-center justify-center w-8 h-8 rounded-lg bg-white/[0.06]">
+                    <Hash class="h-4 w-4 text-muted-foreground" />
+                  </div>
+                </Show>
                 <div>
-                  <h3 class="text-[13px] font-semibold text-foreground/90 leading-tight">{c().name}</h3>
+                  <h3 class="text-[13px] font-semibold text-foreground/90 leading-tight">{displayName()}</h3>
                   <div class="flex items-center gap-1.5 mt-0.5">
                     <Lock class="h-2.5 w-2.5 text-muted-foreground/30" />
                     <span class="text-[10px] text-muted-foreground/40">Encrypted</span>
@@ -187,16 +198,18 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
                 </div>
               </div>
               <div class="flex items-center gap-1">
-                <Tooltip content="Voice call">
-                  <button class="flex items-center justify-center w-8 h-8 rounded-lg text-muted-foreground/40 hover:text-foreground hover:bg-white/[0.05] transition-all cursor-pointer">
-                    <Phone class="h-4 w-4" />
-                  </button>
-                </Tooltip>
-                <Tooltip content="Video call">
-                  <button class="flex items-center justify-center w-8 h-8 rounded-lg text-muted-foreground/40 hover:text-foreground hover:bg-white/[0.05] transition-all cursor-pointer">
-                    <Video class="h-4 w-4" />
-                  </button>
-                </Tooltip>
+                <Show when={!isChannel()}>
+                  <Tooltip content="Voice call">
+                    <button class="flex items-center justify-center w-8 h-8 rounded-lg text-muted-foreground/40 hover:text-foreground hover:bg-white/[0.05] transition-all cursor-pointer">
+                      <Phone class="h-4 w-4" />
+                    </button>
+                  </Tooltip>
+                  <Tooltip content="Video call">
+                    <button class="flex items-center justify-center w-8 h-8 rounded-lg text-muted-foreground/40 hover:text-foreground hover:bg-white/[0.05] transition-all cursor-pointer">
+                      <Video class="h-4 w-4" />
+                    </button>
+                  </Tooltip>
+                </Show>
                 <Tooltip content={props.detailsOpen ? "Hide details" : "Show details"}>
                   <button
                     class={cn(
@@ -218,9 +231,8 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
 
             {/* Messages — scrollable zone */}
             <div class="flex-1 overflow-y-auto min-h-0">
-              <Show
-                when={appStore.messages().length > 0}
-                fallback={<ChatBeginning name={c().name} />}
+              <Show when={appStore.messages().length > 0}
+                fallback={<ChatBeginning name={displayName()} />}
               >
                 <div class="py-2">
                   <For each={appStore.messages()}>
@@ -253,7 +265,7 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
                       "focus:outline-none",
                       "min-h-[36px] max-h-[160px] overflow-y-auto"
                     )}
-                    placeholder={`Message ${c().name}...`}
+                    placeholder={`Message ${displayName()}...`}
                     rows={1}
                     value={inputText()}
                     onInput={handleInput}
@@ -280,7 +292,8 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
               </div>
             </div>
           </>
-        )}
+          );
+        }}
       </Show>
     </div>
   );
