@@ -33,29 +33,38 @@ const (
 	defaultMaxConnsPerIP = 64
 )
 
-// allowedOrigins, when non-nil and non-empty, restricts WebSocket Upgrade to
-// the listed Origin headers. The "*" wildcard or a nil/empty list permits
-// any origin (legacy behaviour). Configure via SetAllowedOrigins or the
-// VEIL_WS_ORIGINS environment variable read by ConfigureFromEnv.
+// allowedOrigins is the WebSocket Origin allow-list. Browsers must send a
+// non-empty Origin matching one of the entries (or "*" with originAllowAll).
+// Native clients (Tauri/mobile) omit Origin entirely and bypass this check;
+// the WS Origin header exists for browser CSRF defence only.
+//
+// Default policy is FAIL-CLOSED: an unconfigured allow-list rejects every
+// browser request. Operators must opt in explicitly via SetAllowedOrigins
+// or the VEIL_WS_ORIGINS env var (an explicit "*" disables the check with
+// a warning log).
 var (
 	allowedOriginsMu sync.RWMutex
 	allowedOrigins   map[string]struct{}
-	originAllowAll   = true
+	originAllowAll   = false
 )
 
-// SetAllowedOrigins replaces the WebSocket origin allow-list. Pass nil or an
-// empty slice (or a slice containing "*") to allow any origin. Call once at
-// startup before HandleWebSocket begins serving.
+// SetAllowedOrigins replaces the WebSocket origin allow-list.
+//   - nil/empty: fail-closed — every browser Origin is rejected (native
+//     clients without Origin still pass).
+//   - slice containing "*": fail-open — every Origin allowed. Use only for
+//     local development.
+//   - any other slice: explicit allow-list of Origin header values.
+//
+// Call once at startup before HandleWebSocket begins serving.
 func SetAllowedOrigins(origins []string) {
 	allowedOriginsMu.Lock()
 	defer allowedOriginsMu.Unlock()
+	allowedOrigins = nil
+	originAllowAll = false
 	if len(origins) == 0 {
-		allowedOrigins = nil
-		originAllowAll = true
 		return
 	}
-	allowedOrigins = make(map[string]struct{}, len(origins))
-	originAllowAll = false
+	entries := make(map[string]struct{}, len(origins))
 	for _, o := range origins {
 		o = strings.TrimSpace(o)
 		if o == "" {
@@ -66,22 +75,33 @@ func SetAllowedOrigins(origins []string) {
 			originAllowAll = true
 			return
 		}
-		allowedOrigins[o] = struct{}{}
+		entries[o] = struct{}{}
+	}
+	if len(entries) > 0 {
+		allowedOrigins = entries
 	}
 }
 
-// ConfigureFromEnv applies VEIL_WS_ORIGINS (comma-separated) and
-// VEIL_WS_MAX_CONNS_PER_IP (integer) to package-level defaults. Call from
-// main before starting the gateway.
-func ConfigureFromEnv() {
-	if raw := strings.TrimSpace(os.Getenv("VEIL_WS_ORIGINS")); raw != "" {
-		SetAllowedOrigins(strings.Split(raw, ","))
+// ConfigureFromEnv applies VEIL_WS_ORIGINS (comma-separated, REQUIRED — set
+// to "*" to keep legacy allow-all behaviour) and VEIL_WS_MAX_CONNS_PER_IP
+// (integer) to package-level defaults. Call from main before starting the
+// gateway. Returns an error when VEIL_WS_ORIGINS is unset so callers can
+// fail-fast (preventing accidental allow-all in production).
+func ConfigureFromEnv() error {
+	raw := strings.TrimSpace(os.Getenv("VEIL_WS_ORIGINS"))
+	if raw == "" {
+		return fmt.Errorf("VEIL_WS_ORIGINS must be set (use \"*\" to keep legacy allow-all, otherwise list comma-separated browser origins like \"https://app.example,tauri://localhost\")")
 	}
-	if raw := strings.TrimSpace(os.Getenv("VEIL_WS_MAX_CONNS_PER_IP")); raw != "" {
-		if n, err := strconv.Atoi(raw); err == nil {
+	SetAllowedOrigins(strings.Split(raw, ","))
+	if originAllowAll {
+		log.Printf("WARN: VEIL_WS_ORIGINS=* — accepting any browser Origin (development mode); set explicit origins in production")
+	}
+	if v := strings.TrimSpace(os.Getenv("VEIL_WS_MAX_CONNS_PER_IP")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
 			maxConnsPerIPOverride.Store(int64(n))
 		}
 	}
+	return nil
 }
 
 // maxConnsPerIPOverride lets ops tune the per-IP cap at startup without a
@@ -90,9 +110,9 @@ var maxConnsPerIPOverride atomicInt64
 
 type atomicInt64 struct{ v int64 }
 
-func (a *atomicInt64) Load() int64        { return a.v }
-func (a *atomicInt64) Store(n int64)      { a.v = n }
-func (a *atomicInt64) effectiveCap() int  { return effectiveMaxConns(a.Load()) }
+func (a *atomicInt64) Load() int64       { return a.v }
+func (a *atomicInt64) Store(n int64)     { a.v = n }
+func (a *atomicInt64) effectiveCap() int { return effectiveMaxConns(a.Load()) }
 func effectiveMaxConns(override int64) int {
 	if override == 0 {
 		return defaultMaxConnsPerIP

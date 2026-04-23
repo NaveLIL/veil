@@ -73,10 +73,15 @@ func TestWS_OriginAllowList_NativeClientNoOriginAllowed(t *testing.T) {
 
 func TestWS_PerIPCap_RejectsExcessConnections(t *testing.T) {
 	t.Setenv("VEIL_WS_MAX_CONNS_PER_IP", "2")
-	gateway.ConfigureFromEnv()
+	t.Setenv("VEIL_WS_ORIGINS", "*")
+	if err := gateway.ConfigureFromEnv(); err != nil {
+		t.Fatalf("ConfigureFromEnv: %v", err)
+	}
 	t.Cleanup(func() {
 		t.Setenv("VEIL_WS_MAX_CONNS_PER_IP", "0")
-		gateway.ConfigureFromEnv()
+		t.Setenv("VEIL_WS_ORIGINS", "*")
+		_ = gateway.ConfigureFromEnv()
+		gateway.SetAllowedOrigins(nil)
 	})
 
 	server, _ := setupTestServer(t)
@@ -119,4 +124,55 @@ func TestWS_PerIPCap_RejectsExcessConnections(t *testing.T) {
 		t.Fatalf("dial after release: %v", err)
 	}
 	c4.Close()
+}
+
+// TestWS_OriginAllowList_FailClosed verifies the W7 ideal-fix behaviour:
+// with no allow-list configured (nil/empty), browser-style requests carrying
+// an Origin header are rejected, while native clients without Origin still
+// connect successfully.
+func TestWS_OriginAllowList_FailClosed(t *testing.T) {
+	gateway.SetAllowedOrigins(nil)
+	t.Cleanup(func() { gateway.SetAllowedOrigins(nil) })
+
+	server, _ := setupTestServer(t)
+	defer server.Close()
+
+	// Browser request with Origin → 403.
+	hdr := http.Header{}
+	hdr.Set("Origin", "https://anyone.example")
+	_, resp, err := websocket.DefaultDialer.Dial(wsURL(server), hdr)
+	if err == nil {
+		t.Fatal("expected dial to fail when allow-list is empty (fail-closed)")
+	}
+	if resp == nil || resp.StatusCode != http.StatusForbidden {
+		got := 0
+		if resp != nil {
+			got = resp.StatusCode
+		}
+		t.Fatalf("want 403 from CheckOrigin (fail-closed default), got %d (err=%v)", got, err)
+	}
+
+	// Native client (no Origin) must still connect — Tauri/mobile path.
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL(server), nil)
+	if err != nil {
+		t.Fatalf("native client (no Origin) must remain allowed under fail-closed default: %v", err)
+	}
+	conn.Close()
+}
+
+// TestWS_ConfigureFromEnv_RequiresOrigins documents the fail-fast contract
+// of ConfigureFromEnv: an unset VEIL_WS_ORIGINS must produce an error so
+// production deploys cannot accidentally inherit a permissive default.
+func TestWS_ConfigureFromEnv_RequiresOrigins(t *testing.T) {
+	t.Setenv("VEIL_WS_ORIGINS", "")
+	if err := gateway.ConfigureFromEnv(); err == nil {
+		t.Fatal("ConfigureFromEnv must return an error when VEIL_WS_ORIGINS is unset")
+	}
+
+	// Explicit "*" opt-in must succeed (and log a warning, not asserted here).
+	t.Setenv("VEIL_WS_ORIGINS", "*")
+	if err := gateway.ConfigureFromEnv(); err != nil {
+		t.Fatalf("ConfigureFromEnv with explicit \"*\" must succeed, got: %v", err)
+	}
+	t.Cleanup(func() { gateway.SetAllowedOrigins(nil) })
 }

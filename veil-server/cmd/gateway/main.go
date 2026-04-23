@@ -45,7 +45,9 @@ func main() {
 
 	// Start hub
 	hub := gateway.NewHub(authSvc, chatSvc)
-	gateway.ConfigureFromEnv()
+	if err := gateway.ConfigureFromEnv(); err != nil {
+		log.Fatalf("gateway config: %v", err)
+	}
 	go hub.Run()
 
 	// HTTP routes
