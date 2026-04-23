@@ -179,6 +179,12 @@ type Hub struct {
 	// Services
 	authSvc *auth.Service
 	chatSvc *chat.Service
+
+	// Optional offline-push notifier. When non-nil, recipients with
+	// zero live WebSocket sessions on a NEW message event get an
+	// encrypted envelope POSTed to every distributor URL they have
+	// registered. Wired by cmd/gateway/main.go via SetPushNotifier.
+	pushNotifier PushNotifier
 }
 
 func NewHub(authSvc *auth.Service, chatSvc *chat.Service) *Hub {
@@ -288,6 +294,49 @@ func (h *Hub) sendToUser(userID string, data []byte) {
 		case c.send <- data:
 		default:
 			// Client too slow, will be cleaned up by writePump
+		}
+	}
+}
+
+// PushNotifier is the seam between the gateway and the push package
+// (UnifiedPush + ntfy delivery). It is invoked when the message-event
+// fan-out finds no live WebSocket session for a recipient. Wiring is
+// optional — the gateway boots fine without a notifier; in that mode
+// offline recipients just wait for their next /v1/messages sync poll.
+type PushNotifier interface {
+	NotifyOffline(ctx context.Context, userID string, env *pb.Envelope)
+}
+
+// SetPushNotifier installs (or replaces) the notifier. nil disables.
+// Safe to call before Run; not safe to swap mid-flight.
+func (h *Hub) SetPushNotifier(n PushNotifier) { h.pushNotifier = n }
+
+// fanoutMessageEvent dispatches a freshly produced MessageEvent to
+// every recipient. Recipients with at least one live WS session
+// receive the envelope through the regular send queue; recipients with
+// zero live sessions are routed to the push notifier (if any).
+//
+// Used only for NEW message events. Edits/deletes/reactions remain on
+// the original sendToUser path because the on-device push UX for those
+// is noisy and out of scope for Phase 4.
+func (h *Hub) fanoutMessageEvent(ctx context.Context, recipients []string, data []byte, env *pb.Envelope) {
+	for _, uid := range recipients {
+		h.mu.RLock()
+		clients := h.userClients[uid]
+		online := len(clients) > 0
+		h.mu.RUnlock()
+
+		if online {
+			for c := range clients {
+				select {
+				case c.send <- data:
+				default:
+				}
+			}
+			continue
+		}
+		if h.pushNotifier != nil {
+			h.pushNotifier.NotifyOffline(ctx, uid, env)
 		}
 	}
 }
@@ -575,9 +624,7 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 	}
 	eventData, _ := proto.Marshal(event)
 
-	for _, recipientID := range recipients {
-		c.hub.sendToUser(recipientID, eventData)
-	}
+	c.hub.fanoutMessageEvent(ctx, recipients, eventData, event)
 }
 
 // --- Edit Message ---

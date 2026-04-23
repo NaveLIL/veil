@@ -39,6 +39,9 @@ serde_json = "1"
 # Base64 encoding
 base64 = "0.22"
 
+# Error derive
+thiserror = "1"
+
 # Constant-time comparison
 subtle = "2"
 

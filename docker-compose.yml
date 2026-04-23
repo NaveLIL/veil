@@ -27,9 +27,55 @@ services:
     environment:
       PORT: "8080"
       DATABASE_URL: "postgres://veil:veildev@postgres:5432/veil?sslmode=disable"
+      VEIL_WS_ORIGINS:           "${VEIL_WS_ORIGINS:-*}"
+      VEIL_WS_MAX_CONNS_PER_IP:  "${VEIL_WS_MAX_CONNS_PER_IP:-64}"
+      # Phase 4 — UnifiedPush + ntfy. Generate a 32-byte key with:
+      #   openssl rand -base64 32
+      # then set VEIL_PUSH_TRANSPORT_KEY in your .env so the dispatcher
+      # boots in enabled mode. Leaving it empty disables push delivery
+      # (subscribe/list/delete endpoints stay reachable).
+      VEIL_PUSH_TRANSPORT_KEY: "${VEIL_PUSH_TRANSPORT_KEY:-}"
+      VEIL_PUSH_HASH_SALT:     "${VEIL_PUSH_HASH_SALT:-veil/push/v1}"
+      VEIL_PUSH_JITTER_MS:     "${VEIL_PUSH_JITTER_MS:-2000}"
+      # Phase 3 — tus.io resumable encrypted uploads. Generate the
+      # bearer-token HMAC key with:
+      #   openssl rand -base64 32
+      # Leaving VEIL_UPLOAD_TOKEN_KEY empty disables uploads.
+      VEIL_UPLOAD_TOKEN_KEY:           "${VEIL_UPLOAD_TOKEN_KEY:-}"
+      UPLOAD_LOCAL_DIR:                "/var/veil/uploads"
+      UPLOAD_MAX_BYTES:                "${UPLOAD_MAX_BYTES:-1073741824}"
+      UPLOAD_USER_DAILY_QUOTA_BYTES:   "${UPLOAD_USER_DAILY_QUOTA_BYTES:-5368709120}"
+      UPLOAD_QUOTA_WINDOW:             "${UPLOAD_QUOTA_WINDOW:-24h}"
+      UPLOAD_RETENTION:                "${UPLOAD_RETENTION:-720h}"
+      UPLOAD_ABORT_TTL:                "${UPLOAD_ABORT_TTL:-24h}"
+      UPLOAD_SWEEP_INTERVAL:           "${UPLOAD_SWEEP_INTERVAL:-1h}"
+      UPLOAD_TOKEN_TTL:                "${UPLOAD_TOKEN_TTL:-24h}"
+    volumes:
+      - uploadsdata:/var/veil/uploads
     depends_on:
       postgres:
         condition: service_healthy
 
+  # Self-hosted UnifiedPush distributor. Mobile clients can register
+  # against http://<your-host>:9081/<topic> and the gateway POSTs the
+  # encrypted envelope there. Operators who prefer ntfy.sh can drop
+  # this service and point clients at the public instance.
+  ntfy:
+    image: binwiederhier/ntfy:v2.11.0
+    command: serve
+    ports:
+      - "9081:80"
+    environment:
+      NTFY_BASE_URL: "http://localhost:9081"
+      NTFY_BEHIND_PROXY: "false"
+      NTFY_AUTH_FILE: "/var/lib/ntfy/user.db"
+      NTFY_AUTH_DEFAULT_ACCESS: "deny-all"
+      NTFY_CACHE_FILE: "/var/lib/ntfy/cache.db"
+      NTFY_ATTACHMENT_CACHE_DIR: "/var/lib/ntfy/attachments"
+    volumes:
+      - ntfydata:/var/lib/ntfy
+
 volumes:
   pgdata:
+  ntfydata:
+  uploadsdata:

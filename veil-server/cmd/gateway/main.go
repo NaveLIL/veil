@@ -19,7 +19,9 @@ import (
 	"github.com/AegisSec/veil-server/internal/gateway"
 	"github.com/AegisSec/veil-server/internal/httpmw"
 	"github.com/AegisSec/veil-server/internal/metrics"
+	"github.com/AegisSec/veil-server/internal/push"
 	"github.com/AegisSec/veil-server/internal/servers"
+	"github.com/AegisSec/veil-server/internal/uploads"
 )
 
 func main() {
@@ -76,6 +78,54 @@ func main() {
 
 	serversHandler := servers.NewHandler(serversSvc, signedMw, rl)
 	serversHandler.RegisterRoutes(mux)
+
+	// Phase 4 — UnifiedPush + ntfy. The push notifier wires into the
+	// gateway's offline-fanout path: when sendToUser finds zero live
+	// WS sessions, the dispatcher POSTs an encrypted envelope to every
+	// distributor URL the recipient has registered. Boots in disabled
+	// mode when VEIL_PUSH_TRANSPORT_KEY is unset (subscribe/list/delete
+	// remain reachable but no traffic leaves the gateway).
+	pushKey, err := push.LoadTransportKey()
+	if err != nil {
+		log.Fatalf("push: %v", err)
+	}
+	pushDispatcher := push.New(push.Options{
+		Store:        push.NewDBStore(database),
+		TransportKey: pushKey,
+		Salt:         push.LoadSalt(),
+		MaxJitter:    push.LoadJitter(),
+		Logger:       slog.Default(),
+	})
+	hub.SetPushNotifier(pushDispatcher)
+	pushHandler := push.NewHandler(database, signedMw, rl)
+	pushHandler.RegisterRoutes(mux)
+	if pushDispatcher.Enabled() {
+		log.Printf("push dispatcher enabled (jitter=%s)", push.LoadJitter())
+	}
+
+	// Phase 3 — tus.io resumable encrypted uploads. The token-mint
+	// route uses the existing signed REST middleware; the tusd traffic
+	// (POST/PATCH/HEAD) authenticates via short-lived bearer tokens to
+	// avoid hashing every PATCH chunk for an Ed25519 signature.
+	uploadKey, err := uploads.LoadTokenKey(os.Getenv)
+	if err != nil {
+		log.Fatalf("uploads: %v", err)
+	}
+	uploadCfg := uploads.LoadConfigFromEnv()
+	uploadSvc, err := uploads.New(uploadCfg, uploadKey, uploads.NewDBStore(database), slog.Default())
+	if err != nil {
+		log.Fatalf("uploads: %v", err)
+	}
+	uploadSvc.RegisterRoutes(mux, signedMw, rl)
+	if uploadSvc.Enabled() {
+		log.Printf("uploads enabled (dir=%s, quota=%d/%s)",
+			uploadCfg.LocalDir, uploadCfg.UserDailyQuota, uploadCfg.QuotaWindow)
+		uploadCtx, uploadCancel := context.WithCancel(context.Background())
+		defer uploadCancel()
+		go uploadSvc.Sweeper(uploadCtx)
+	} else {
+		log.Printf("uploads disabled (set VEIL_UPLOAD_TOKEN_KEY to enable)")
+	}
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

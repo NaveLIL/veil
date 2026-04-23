@@ -125,6 +125,30 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     output
 }
 
+/// Derive a per-conversation push key (`K_push`) from the ratchet root
+/// key. Used by Phase 4 (UnifiedPush) so the on-device service
+/// extension can decrypt the inner preview ciphertext without touching
+/// the live ratchet state. Domain-separated from any other HKDF use in
+/// this crate via the fixed `info` string.
+///
+/// Why a separate sub-key: the ratchet root rotates on every chain
+/// step. Push notifications must remain decryptable for as long as the
+/// inner ciphertext sits on a distributor (ntfy, ~12h default), so we
+/// derive a *static* per-conversation `K_push` once per ratchet epoch
+/// and rotate explicitly. Compromise of `K_push` reveals only push
+/// previews, never live ratchet state.
+pub fn derive_push_key(root_key: &[u8; 32], conversation_id: &[u8]) -> [u8; 32] {
+    let okm = hkdf_sha256(
+        b"veil/push/v1/salt",
+        root_key,
+        &[b"veil/push/v1/info|", conversation_id].concat(),
+        32,
+    );
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&okm);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,5 +213,19 @@ mod tests {
         let mac3 = hmac_sha256(b"key", b"other");
         assert_eq!(mac1, mac2);
         assert_ne!(mac1, mac3);
+    }
+
+    #[test]
+    fn test_derive_push_key_deterministic_and_separated() {
+        let root = [7u8; 32];
+        let k_a = derive_push_key(&root, b"conv-A");
+        let k_a2 = derive_push_key(&root, b"conv-A");
+        let k_b = derive_push_key(&root, b"conv-B");
+        assert_eq!(k_a, k_a2, "same (root, conv) must produce same K_push");
+        assert_ne!(k_a, k_b, "different conversation_id must produce different K_push");
+        // Domain separation: derive_push_key must not equal a plain
+        // hkdf_sha256 with no domain prefix.
+        let plain = hkdf_sha256(&[], &root, b"conv-A", 32);
+        assert_ne!(k_a.to_vec(), plain, "must use distinct salt+info");
     }
 }

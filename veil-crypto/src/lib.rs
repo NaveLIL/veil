@@ -18,6 +18,7 @@
 //! - [`fingerprint`] — Visual fingerprint generation (emoji + hex)
 
 pub mod aead;
+pub mod chunked_aead;
 pub mod fingerprint;
 pub mod kdf;
 pub mod keys;
