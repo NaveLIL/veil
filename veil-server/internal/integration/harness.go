@@ -40,8 +40,8 @@ import (
 	"github.com/AegisSec/veil-server/internal/chat"
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 	"github.com/AegisSec/veil-server/internal/servers"
+	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
