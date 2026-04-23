@@ -34,7 +34,7 @@ func main() {
 	log.Println("database connected")
 
 	chatSvc := chat.NewService(database, cfg)
-	signedMw := authmw.New(chatSvc.SigningKeyLookup(), true)
+	signedMw := authmw.New(chatSvc.SigningKeyLookup())
 	rl := authmw.NewRateLimit(240, time.Minute)
 	handler := chat.NewHandler(chatSvc, signedMw, rl)
 

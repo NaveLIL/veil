@@ -65,27 +65,26 @@ func (f LookupFunc) GetSigningKey(ctx context.Context, userID string) (ed25519.P
 // shared across authenticated REST endpoints. A single instance should be
 // created at startup and shared between handlers.
 type Middleware struct {
-	lookup        UserKeyLookup
-	keys          *signingKeyCache
-	nonces        *nonceCache
-	allowUnsigned bool
+	lookup UserKeyLookup
+	keys   *signingKeyCache
+	nonces *nonceCache
 
 	stop chan struct{}
 }
 
-// New constructs a Middleware. When allowUnsigned is true, requests without
-// the signature triplet but with a legacy X-User-ID header are still
-// accepted (migration window). Flip to false to enforce strict signing.
+// New constructs a Middleware. All authenticated REST endpoints require a
+// valid Ed25519 signature triplet (X-Veil-User, X-Veil-Timestamp,
+// X-Veil-Signature); the legacy unsigned bypass that previously honoured a
+// bare X-User-ID header has been removed (W3 / SECURITY).
 //
 // The returned middleware spawns a background goroutine that periodically
 // evicts expired entries from its internal caches; call Close to stop it.
-func New(lookup UserKeyLookup, allowUnsigned bool) *Middleware {
+func New(lookup UserKeyLookup) *Middleware {
 	m := &Middleware{
-		lookup:        lookup,
-		keys:          newSigningKeyCache(),
-		nonces:        newNonceCache(),
-		allowUnsigned: allowUnsigned,
-		stop:          make(chan struct{}),
+		lookup: lookup,
+		keys:   newSigningKeyCache(),
+		nonces: newNonceCache(),
+		stop:   make(chan struct{}),
 	}
 	go m.gcLoop()
 	return m
@@ -119,16 +118,6 @@ func (m *Middleware) RequireSigned(next http.HandlerFunc) http.HandlerFunc {
 		sigB64 := r.Header.Get("X-Veil-Signature")
 
 		if userID == "" || tsStr == "" || sigB64 == "" {
-			if m.allowUnsigned && r.Header.Get("X-User-ID") != "" {
-				// Even on the legacy unsigned path we still cap body size so a
-				// rogue client cannot bypass the limit by omitting signature
-				// headers while allowUnsigned=true.
-				if r.Body != nil {
-					r.Body = http.MaxBytesReader(w, r.Body, maxBodyBytes)
-				}
-				next(w, r)
-				return
-			}
 			writeError(w, http.StatusUnauthorized, "signed request required (X-Veil-User, X-Veil-Timestamp, X-Veil-Signature)")
 			return
 		}

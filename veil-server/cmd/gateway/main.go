@@ -61,9 +61,9 @@ func main() {
 
 	// Shared signature middleware + per-user rate limit. The middleware reads
 	// signing keys via the servers service (any of the three would do; they
-	// all share the same DB). allowUnsigned=true keeps backward compatibility
-	// during client rollout; flip to false to enforce strict signing.
-	signedMw := authmw.New(serversSvc.SigningKeyLookup(), true)
+	// all share the same DB). The legacy unsigned bypass was removed in W3 —
+	// every REST call must carry the X-Veil-{User,Timestamp,Signature} triplet.
+	signedMw := authmw.New(serversSvc.SigningKeyLookup())
 	rl := authmw.NewRateLimit(240, time.Minute) // 4 req/sec sustained, burst 240
 
 	// Auth REST endpoints (prekeys, devices, user lookup)

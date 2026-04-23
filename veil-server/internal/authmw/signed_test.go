@@ -50,7 +50,7 @@ func newSignedRequest(t *testing.T, priv ed25519.PrivateKey, userID, method, pat
 
 func TestRequireSigned_HappyPath(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	mw := authmw.New(&fakeLookup{pub: pub}, false)
+	mw := authmw.New(&fakeLookup{pub: pub})
 	defer mw.Close()
 
 	called := false
@@ -77,7 +77,7 @@ func TestRequireSigned_HappyPath(t *testing.T) {
 
 func TestRequireSigned_BodyPreservedForHandler(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	mw := authmw.New(&fakeLookup{pub: pub}, false)
+	mw := authmw.New(&fakeLookup{pub: pub})
 	defer mw.Close()
 
 	body := []byte(`{"x":42}`)
@@ -97,7 +97,7 @@ func TestRequireSigned_BodyPreservedForHandler(t *testing.T) {
 
 func TestRequireSigned_RejectsTamperedBody(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	mw := authmw.New(&fakeLookup{pub: pub}, false)
+	mw := authmw.New(&fakeLookup{pub: pub})
 	defer mw.Close()
 
 	body := []byte(`{"a":1}`)
@@ -115,7 +115,7 @@ func TestRequireSigned_RejectsTamperedBody(t *testing.T) {
 
 func TestRequireSigned_RejectsStaleTimestamp(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	mw := authmw.New(&fakeLookup{pub: pub}, false)
+	mw := authmw.New(&fakeLookup{pub: pub})
 	defer mw.Close()
 
 	stale := time.Now().Add(-2 * authmw.SignatureMaxSkew).UnixMilli()
@@ -132,7 +132,7 @@ func TestRequireSigned_RejectsStaleTimestamp(t *testing.T) {
 
 func TestRequireSigned_RejectsReplay(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	mw := authmw.New(&fakeLookup{pub: pub}, false)
+	mw := authmw.New(&fakeLookup{pub: pub})
 	defer mw.Close()
 
 	body := []byte(`{}`)
@@ -158,34 +158,20 @@ func TestRequireSigned_RejectsReplay(t *testing.T) {
 	}
 }
 
-func TestRequireSigned_LegacyAllowedWhenConfigured(t *testing.T) {
+// TestRequireSigned_RejectsBareXUserID verifies the W3 invariant: after the
+// allowUnsigned bypass was deleted, a request carrying only the legacy
+// X-User-ID header (no X-Veil-* triplet) must always be rejected with 401,
+// regardless of middleware configuration.
+func TestRequireSigned_RejectsBareXUserID(t *testing.T) {
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
-	mw := authmw.New(&fakeLookup{pub: pub}, true)
-	defer mw.Close()
-
-	r := httptest.NewRequest(http.MethodGet, "/v1/x", nil)
-	r.Header.Set("X-User-ID", "legacy-uid")
-	w := httptest.NewRecorder()
-	called := false
-	mw.RequireSigned(func(w http.ResponseWriter, _ *http.Request) {
-		called = true
-		w.WriteHeader(http.StatusOK)
-	})(w, r)
-	if w.Code != http.StatusOK || !called {
-		t.Fatalf("legacy path: want 200+called, got %d called=%v", w.Code, called)
-	}
-}
-
-func TestRequireSigned_LegacyBlockedWhenStrict(t *testing.T) {
-	pub, _, _ := ed25519.GenerateKey(rand.Reader)
-	mw := authmw.New(&fakeLookup{pub: pub}, false)
+	mw := authmw.New(&fakeLookup{pub: pub})
 	defer mw.Close()
 
 	r := httptest.NewRequest(http.MethodGet, "/v1/x", nil)
 	r.Header.Set("X-User-ID", "legacy-uid")
 	w := httptest.NewRecorder()
 	mw.RequireSigned(func(http.ResponseWriter, *http.Request) {
-		t.Fatal("strict mode must not allow legacy")
+		t.Fatal("bare X-User-ID must never be accepted")
 	})(w, r)
 	if w.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", w.Code)
@@ -194,7 +180,7 @@ func TestRequireSigned_LegacyBlockedWhenStrict(t *testing.T) {
 
 func TestRequireSigned_RejectsOversizedBody(t *testing.T) {
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	mw := authmw.New(&fakeLookup{pub: pub}, false)
+	mw := authmw.New(&fakeLookup{pub: pub})
 	defer mw.Close()
 
 	huge := bytes.Repeat([]byte("x"), 5<<20) // 5 MiB > 4 MiB limit

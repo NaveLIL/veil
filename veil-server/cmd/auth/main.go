@@ -34,7 +34,7 @@ func main() {
 	log.Println("database connected")
 
 	authSvc := auth.NewService(database, cfg)
-	signedMw := authmw.New(authSvc.SigningKeyLookup(), true)
+	signedMw := authmw.New(authSvc.SigningKeyLookup())
 	rl := authmw.NewRateLimit(240, time.Minute)
 	handler := auth.NewHandler(authSvc, signedMw, rl)
 

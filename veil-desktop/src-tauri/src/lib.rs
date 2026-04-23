@@ -843,17 +843,13 @@ fn create_group(
     user_id: String,
     name: String,
 ) -> Result<String, String> {
-    let resp: serde_json::Value = state.runtime.block_on(async {
-        let http = reqwest::Client::new();
-        let r = http
-            .post(format!("{}/v1/groups", server_http_url))
-            .header("X-User-ID", &user_id)
-            .json(&serde_json::json!({ "name": name }))
-            .send()
-            .await
-            .map_err(|e| format!("create group: {e}"))?;
-        r.json().await.map_err(|e| format!("parse: {e}"))
-    })?;
+    let resp = state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        format!("{}/v1/groups", server_http_url),
+        &user_id,
+        Some(serde_json::json!({ "name": name })),
+    ))?;
 
     let conv_id = resp["conversation_id"]
         .as_str()
@@ -878,25 +874,16 @@ fn add_group_member(
     group_id: String,
     target_user_id: String,
 ) -> Result<(), String> {
-    state.runtime.block_on(async {
-        let http = reqwest::Client::new();
-        let r = http
-            .post(format!(
-                "{}/v1/groups/{}/members",
-                server_http_url, group_id
-            ))
-            .header("X-User-ID", &user_id)
-            .json(&serde_json::json!({ "user_id": target_user_id }))
-            .send()
-            .await
-            .map_err(|e| format!("add member: {e}"))?;
-
-        if !r.status().is_success() {
-            let body: serde_json::Value = r.json().await.unwrap_or_default();
-            return Err(body["error"].as_str().unwrap_or("failed").to_string());
-        }
-        Ok(())
-    })
+    state
+        .runtime
+        .block_on(rest_send_json(
+            &state,
+            reqwest::Method::POST,
+            format!("{}/v1/groups/{}/members", server_http_url, group_id),
+            &user_id,
+            Some(serde_json::json!({ "user_id": target_user_id })),
+        ))
+        .map(|_| ())
 }
 
 /// Remove a member from a group (or leave).
@@ -908,24 +895,19 @@ fn remove_group_member(
     group_id: String,
     target_user_id: String,
 ) -> Result<(), String> {
-    state.runtime.block_on(async {
-        let http = reqwest::Client::new();
-        let r = http
-            .delete(format!(
+    state
+        .runtime
+        .block_on(rest_send_json(
+            &state,
+            reqwest::Method::DELETE,
+            format!(
                 "{}/v1/groups/{}/members/{}",
                 server_http_url, group_id, target_user_id
-            ))
-            .header("X-User-ID", &user_id)
-            .send()
-            .await
-            .map_err(|e| format!("remove member: {e}"))?;
-
-        if !r.status().is_success() {
-            let body: serde_json::Value = r.json().await.unwrap_or_default();
-            return Err(body["error"].as_str().unwrap_or("failed").to_string());
-        }
-        Ok(())
-    })
+            ),
+            &user_id,
+            None,
+        ))
+        .map(|_| ())
 }
 
 /// Get group members from the server.
@@ -936,19 +918,13 @@ fn get_group_members(
     user_id: String,
     group_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let resp: serde_json::Value = state.runtime.block_on(async {
-        let http = reqwest::Client::new();
-        let r = http
-            .get(format!(
-                "{}/v1/groups/{}/members",
-                server_http_url, group_id
-            ))
-            .header("X-User-ID", &user_id)
-            .send()
-            .await
-            .map_err(|e| format!("get members: {e}"))?;
-        r.json().await.map_err(|e| format!("parse: {e}"))
-    })?;
+    let resp = state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::GET,
+        format!("{}/v1/groups/{}/members", server_http_url, group_id),
+        &user_id,
+        None,
+    ))?;
 
     let members = resp["members"].as_array().cloned().unwrap_or_default();
 
@@ -1013,25 +989,23 @@ async fn rest_send_json(
     );
 
     // 3. Sign — short-lived client lock, dropped before async send.
+    //    Signing is REQUIRED: the server's allowUnsigned bypass has been
+    //    removed, so a missing signature would 401 every request anyway.
     let sig_b64 = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
-        match client.sign_message(canonical.as_bytes()) {
-            Ok(sig) => Some(base64::engine::general_purpose::STANDARD.encode(sig)),
-            Err(_) => None, // Identity not yet initialized — fall back to legacy auth.
-        }
+        client
+            .sign_message(canonical.as_bytes())
+            .map(|sig| base64::engine::general_purpose::STANDARD.encode(sig))
+            .map_err(|e| format!("identity not initialized — cannot sign request: {e}"))?
     };
 
     // 4. Build & send request via shared HTTP client (connection pooling).
     let mut req = state
         .http
         .request(method, url)
-        .header("X-User-ID", user_id);
-    if let Some(sig) = sig_b64 {
-        req = req
-            .header("X-Veil-User", user_id)
-            .header("X-Veil-Timestamp", ts_ms.to_string())
-            .header("X-Veil-Signature", sig);
-    }
+        .header("X-Veil-User", user_id)
+        .header("X-Veil-Timestamp", ts_ms.to_string())
+        .header("X-Veil-Signature", sig_b64);
     if !body_bytes.is_empty() {
         req = req
             .header("Content-Type", "application/json")
