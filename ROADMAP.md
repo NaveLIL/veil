@@ -7,6 +7,58 @@
 
 ## Recently shipped
 
+### W7 — Fail-closed WebSocket Origin allow-list (2026-04-23)
+- `gateway.ConfigureFromEnv` now returns an error when `VEIL_WS_ORIGINS`
+  is unset; `cmd/gateway` fails fast on startup. Empty allow-list rejects
+  every browser request (native clients with no `Origin` are still
+  allowed — Tauri/mobile path is unaffected). Explicit `*` keeps legacy
+  permissive behaviour and emits a warning log. New tests:
+  `TestWS_OriginAllowList_FailClosed`,
+  `TestWS_ConfigureFromEnv_RequiresOrigins`. Commit `da334ab`.
+- VPS deploy still pending — needs `VEIL_WS_ORIGINS` set in compose env
+  before the next gateway rebuild (currently unreachable).
+
+### W3 — Deleted `allowUnsigned` legacy bypass (2026-04-23)
+- `authmw.New()` lost the bool parameter; the `if m.allowUnsigned &&
+  X-User-ID != ""` branch is gone. Every REST handler now requires the
+  `X-Veil-{User,Timestamp,Signature}` triplet. Updated `cmd/{auth,chat,
+  gateway}` constructors and tests.
+- Migrated 4 group REST commands in `veil-desktop/src-tauri/src/lib.rs`
+  (`create_group`, `add_group_member`, `remove_group_member`,
+  `get_group_members`) to the signing-aware `rest_send_json` helper.
+  `rest_send_json` no longer falls back to unsigned when local identity
+  is missing — surfaces a clear error instead.
+- New invariant test `internal/authmw/lint_test.go` walks
+  `internal/{auth,chat,servers}` and fails CI when any file reads
+  `r.Header.Get("X-User-ID")` without the package also wrapping a route
+  in `mw.RequireSigned(...)`. Locks in the contract for future handlers.
+- Replaced `LegacyAllowedWhenConfigured`/`LegacyBlockedWhenStrict` with
+  `TestRequireSigned_RejectsBareXUserID` asserting unconditional reject.
+  Commit `9413892`.
+
+### W2 — Integration test harness for chat/servers (in progress, 2026-04-23)
+- Added `internal/integration/` package guarded by the `integration`
+  build tag. `harness.New(t)` spins up a Postgres container via
+  testcontainers-go, applies every SQL file under `migrations/` in
+  lexicographic order, mounts the production REST mux (auth + chat +
+  servers all gated by the real `authmw` middleware), and exposes
+  `CreateUser` / `Do` (signed) / `DoUnsigned` helpers.
+- Initial test suite: 6 tests in `servers_integration_test.go`
+  (`CreateAndGet`, `RejectsUnsigned`, `NonOwnerCannotDelete`,
+  `ListIncludesNew`, `Channels_CreateAndList`, `InvitePreviewIsPublic`)
+  and 6 tests in `chat_integration_test.go` (`CreateDMHappyPath`,
+  `GetMessagesForbiddenForNonMember`, `GetMessagesEmptyForNew`,
+  `CreateGroupAndAddMember`, `RejectsUnsigned`,
+  `AddGroupMember_NonMemberCannotAdd`).
+- Run with `go test -tags=integration ./internal/integration/...`
+  (requires a running Docker daemon). Tests are excluded from the
+  default `go test ./...` so unit tests still run without Docker.
+- TODO before marking W2 complete: add coverage for the rest of the
+  servers surface (roles, invites use, channel reorder, member kick),
+  reach the ROADMAP's ≥80% target, wire `-tags=integration` into CI.
+
+## Recently shipped
+
 ### Security / signed REST
 - Ed25519 request signing across `auth/`, `chat/`, `servers/` handlers via
   shared `internal/authmw` package.
