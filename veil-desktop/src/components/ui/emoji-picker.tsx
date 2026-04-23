@@ -1,4 +1,5 @@
 import { Component, createSignal, For, Show, onMount, onCleanup } from "solid-js";
+import { Smile, Search, X } from "lucide-solid";
 
 /* ── Emoji categories with curated sets ────────────── */
 const CATEGORIES = [
@@ -163,12 +164,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
         }}
         title="Emoji"
       >
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="10" />
-          <path d="M8 14s1.5 2 4 2 4-2 4-2" />
-          <line x1="9" y1="9" x2="9.01" y2="9" stroke-width="2.5" />
-          <line x1="15" y1="9" x2="15.01" y2="9" stroke-width="2.5" />
-        </svg>
+        <Smile size={20} strokeWidth={1.8} />
       </button>
 
       {/* Picker popover */}
@@ -198,9 +194,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
               background: "#1E1F22", "border-radius": "8px", padding: "0 10px",
               height: "34px",
             }}>
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#666" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style={{ "flex-shrink": "0" }}>
-                <circle cx="11" cy="11" r="8" /><line x1="21" y1="21" x2="16.65" y2="16.65" />
-              </svg>
+              <Search size={14} color="#666" strokeWidth={2} style={{ "flex-shrink": "0" }} />
               <input
                 style={{
                   flex: "1", background: "transparent", border: "none",
@@ -221,9 +215,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
                   }}
                   onClick={() => setSearch("")}
                 >
-                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
-                    <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
-                  </svg>
+                  <X size={12} strokeWidth={2.5} />
                 </button>
               </Show>
             </div>

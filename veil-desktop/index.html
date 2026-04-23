@@ -7,6 +7,10 @@
   </head>
   <body>
     <div id="root"></div>
+    <!-- Portal target for Kobalte overlays (Dialog/Select/Toast/Sheet).
+         Sibling of #root so blur/backdrop layering is consistent and
+         transformed ancestors don't clip overlays. -->
+    <div id="island-portal"></div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

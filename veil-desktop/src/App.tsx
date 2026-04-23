@@ -24,6 +24,13 @@ import {
 import { EmojiPicker } from "@/components/ui/emoji-picker";
 import { MessageRenderer } from "@/components/chat/MessageRenderer";
 import { FriendsPanel } from "@/components/chat/FriendsPanel";
+import { ToastViewport } from "@/components/ui/toast";
+import { CommandPalette, useCommandPaletteHotkey } from "@/components/ui/CommandPalette";
+import {
+  MessageCircle, Globe, Users, UserPlus, UserMinus, Settings, Lock,
+  ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
+  Volume2, MessageSquare, Eye, Shield,
+} from "lucide-solid";
 
 const appWindow = getCurrentWindow();
 
@@ -83,24 +90,10 @@ const DisclaimerScreen: Component = () => {
   const ty = () => phase() === "in" ? "20px" : phase() === "out" ? "-12px" : "0";
 
   const iconSvg = () => {
-    if (tip.icon === "eye") return (
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z" fill="rgba(124,107,245,0.2)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
-        <circle cx="12" cy="12" r="3" fill="rgba(124,107,245,0.3)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
-      </svg>
-    );
-    if (tip.icon === "lock") return (
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-        <rect x="3" y="11" width="18" height="11" rx="2" fill="rgba(124,107,245,0.2)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
-        <path d="M7 11V7a5 5 0 0 1 10 0v4" stroke="rgba(124,107,245,0.6)" stroke-width="1.5" fill="none"/>
-      </svg>
-    );
-    return (
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none">
-        <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"
-          fill="rgba(124,107,245,0.2)" stroke="rgba(124,107,245,0.6)" stroke-width="1.5"/>
-      </svg>
-    );
+    const tint = "rgba(124,107,245,0.7)";
+    if (tip.icon === "eye") return <Eye size={22} color={tint} strokeWidth={1.5} />;
+    if (tip.icon === "lock") return <Lock size={22} color={tint} strokeWidth={1.5} />;
+    return <Shield size={22} color={tint} strokeWidth={1.5} />;
   };
 
   return (
@@ -170,6 +163,7 @@ const App: Component = () => {
   // Staggered island entrance
   const [island1Vis, setIsland1Vis] = createSignal(false);
   const [island2Vis, setIsland2Vis] = createSignal(false);
+  const [cmdkOpen, setCmdkOpen] = useCommandPaletteHotkey();
   const [island3Vis, setIsland3Vis] = createSignal(false);
   const [island4Vis, setIsland4Vis] = createSignal(false);
   let messagesEnd: HTMLDivElement | undefined;
@@ -412,9 +406,7 @@ const App: Component = () => {
                   onClick={() => { setActiveServer("home"); appStore.selectServer(null); }}
                   title="Home"
                 >
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none">
-                    <path d="M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                  </svg>
+                  <MessageCircle size={20} strokeWidth={1.8} />
                 </button>
 
                 <div style={{ width: "28px", height: "2px", background: "rgba(255,255,255,0.06)", "border-radius": "1px" }} />
@@ -449,10 +441,7 @@ const App: Component = () => {
                   onClick={() => setShowJoinServer(true)}
                   title="Join a server with an invite"
                 >
-                  <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                    <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="1.8"/>
-                    <path d="M3 12h18M12 3a14 14 0 010 18M12 3a14 14 0 000 18" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
-                  </svg>
+                  <Globe size={18} strokeWidth={1.8} />
                 </button>
               </div>
             </div>
@@ -468,9 +457,9 @@ const App: Component = () => {
                     .sort((a, b) => a.position - b.position);
                   const isOwner = () => server()?.ownerId === appStore.userId();
                   const channelIcon = (type: number) => {
-                    if (type === 1) return "\uD83D\uDD08"; // 🔈 voice
-                    if (type === 2) return "\u25BE";      // ▾ category
-                    return "#";
+                    if (type === 1) return <Volume2 size={13} strokeWidth={2} style={{ color: "#666" }} />;
+                    if (type === 2) return <ChevronDown size={12} strokeWidth={2.5} style={{ color: "#666" }} />;
+                    return <span style={{ color: "#666" }}>#</span>;
                   };
                   const headerBtn = (active = false) => ({
                     width: "26px", height: "26px", "border-radius": "6px",
@@ -520,23 +509,14 @@ const App: Component = () => {
                             }
                           }}
                         >
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
-                            <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                            <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="1.8"/>
-                            <path d="M22 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                          </svg>
+                          <Users size={14} strokeWidth={1.8} />
                         </button>
                         <button
                           style={headerBtn(false)}
                           title="Invite people"
                           onClick={() => setShowCreateInvite(true)}
                         >
-                          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                            <path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/>
-                            <circle cx="8.5" cy="7" r="4"/>
-                            <line x1="20" y1="8" x2="20" y2="14"/>
-                            <line x1="23" y1="11" x2="17" y2="11"/>
-                          </svg>
+                          <UserPlus size={14} strokeWidth={1.8} />
                         </button>
                         <Show when={isOwner()}>
                           <button
@@ -544,10 +524,7 @@ const App: Component = () => {
                             title="Server settings"
                             onClick={() => appStore.openServerSettings(sid())}
                           >
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                              <circle cx="12" cy="12" r="3"/>
-                              <path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33H9a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82V9a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/>
-                            </svg>
+                            <Settings size={14} strokeWidth={1.8} />
                           </button>
                         </Show>
                       </div>
@@ -733,7 +710,7 @@ const App: Component = () => {
                                     </ContextMenuTrigger>
                                     <ContextMenuContent>
                                       <ContextMenuItem onSelect={() => navigator.clipboard?.writeText(ch.id)}>
-                                        <ContextMenuIcon>{"\u{1F4CB}"}</ContextMenuIcon>
+                                        <ContextMenuIcon><Copy size={14} strokeWidth={2} /></ContextMenuIcon>
                                         Copy channel ID
                                       </ContextMenuItem>
                                       <Show when={isOwner()}>
@@ -745,7 +722,7 @@ const App: Component = () => {
                                             if (sid) appStore.updateChannel(sid, ch.id, { name: next.trim() });
                                           }
                                         }}>
-                                          <ContextMenuIcon>{"\u270F\uFE0F"}</ContextMenuIcon>
+                                          <ContextMenuIcon><Pencil size={14} strokeWidth={2} /></ContextMenuIcon>
                                           Rename
                                         </ContextMenuItem>
                                         <ContextMenuItem
@@ -756,7 +733,7 @@ const App: Component = () => {
                                             }
                                           }}
                                         >
-                                          <ContextMenuIcon>{"\u{1F5D1}\uFE0F"}</ContextMenuIcon>
+                                          <ContextMenuIcon><Trash2 size={14} strokeWidth={2} /></ContextMenuIcon>
                                           <span style={{ color: "#f87171" }}>Delete</span>
                                         </ContextMenuItem>
                                       </Show>
@@ -812,9 +789,11 @@ const App: Component = () => {
                                           onMouseEnter={(e) => (e.currentTarget.style.color = "#bbb")}
                                           onMouseLeave={(e) => (e.currentTarget.style.color = "#666")}
                                         >
-                                          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" style={{ transform: collapsed() ? "rotate(-90deg)" : "none", transition: "transform 0.15s", "flex-shrink": "0" }}>
-                                            <polyline points="6 9 12 15 18 9" />
-                                          </svg>
+                                          <ChevronDown
+                                            size={10}
+                                            strokeWidth={3}
+                                            style={{ transform: collapsed() ? "rotate(-90deg)" : "none", transition: "transform 0.15s", "flex-shrink": "0" }}
+                                          />
                                           <span style={{ flex: "1", overflow: "hidden", "white-space": "nowrap", "text-overflow": "ellipsis" }}>{g.cat.name}</span>
                                           <Show when={isOwner()}>
                                             <span
@@ -857,15 +836,15 @@ const App: Component = () => {
                           </div>
                         </div>
                         <button
-                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", "font-size": "14px" }}
+                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
                           onClick={() => appStore.setScreen("settings")}
                           title="Settings"
-                        >{"\u2699\uFE0F"}</button>
+                        ><Settings size={15} strokeWidth={1.8} /></button>
                         <button
-                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", "font-size": "13px" }}
+                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
                           onClick={() => appStore.lock()}
                           title="Lock"
-                        >{"\uD83D\uDD12"}</button>
+                        ><Lock size={14} strokeWidth={1.8} /></button>
                       </div>
                     </>
                   );
@@ -892,11 +871,7 @@ const App: Component = () => {
                   appStore.setActiveConversationId("");
                 }}
               >
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
-                  <path d="M16 21v-2a4 4 0 00-4-4H6a4 4 0 00-4-4v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                  <circle cx="9" cy="7" r="4" stroke="currentColor" stroke-width="1.8"/>
-                  <path d="M22 21v-2a4 4 0 00-3-3.87M16 3.13a4 4 0 010 7.75" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-                </svg>
+                <Users size={18} strokeWidth={1.8} />
                 Friends
                 <Show when={appStore.friendRequests().filter(r => !r.outgoing).length > 0}>
                   <span style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "#7c6bf5", display: "inline-flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "#fff", "font-weight": "700", padding: "0 5px", "margin-left": "auto" }}>
@@ -1039,7 +1014,7 @@ const App: Component = () => {
                         </ContextMenuTrigger>
                         <ContextMenuContent>
                           <ContextMenuItem onSelect={() => { setShowFriendsPanel(false); appStore.selectConversation(c.id); }}>
-                            <ContextMenuIcon>{"\uD83D\uDCAC"}</ContextMenuIcon>
+                            <ContextMenuIcon><MessageSquare size={14} strokeWidth={2} /></ContextMenuIcon>
                             Open
                           </ContextMenuItem>
                           <Show when={c.type === "dm"}>
@@ -1049,12 +1024,12 @@ const App: Component = () => {
                                 const friend = appStore.friends().find(f => f.username === c.name || f.userId === c.id);
                                 if (friend) appStore.removeFriend(friend.userId);
                               }}>
-                                <ContextMenuIcon>{"\u2717"}</ContextMenuIcon>
+                                <ContextMenuIcon><UserMinus size={14} strokeWidth={2} /></ContextMenuIcon>
                                 Remove Friend
                               </ContextMenuItem>
                             }>
                               <ContextMenuItem onSelect={() => appStore.sendFriendRequest(c.id)}>
-                                <ContextMenuIcon>{"\uD83D\uDC64"}</ContextMenuIcon>
+                                <ContextMenuIcon><UserPlus size={14} strokeWidth={2} /></ContextMenuIcon>
                                 Add Friend
                               </ContextMenuItem>
                             </Show>
@@ -1223,7 +1198,7 @@ const App: Component = () => {
                                                 }
                                               }}
                                             >
-                                              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="#7c6bf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style={{ "flex-shrink": "0" }}><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 00-4-4H4" /></svg>
+                                              <Reply size={12} color="#7c6bf5" strokeWidth={2} style={{ "flex-shrink": "0" }} />
                                               <span style={{ "font-size": "11px", color: "#7c6bf5", "font-weight": "600", "flex-shrink": "0" }}>
                                                 {ref()?.senderName ?? "..."}
                                               </span>
@@ -1341,14 +1316,14 @@ const App: Component = () => {
                                   <ContextMenuSeparator />
                                   <ContextMenuItem onSelect={() => setReplyingTo(msg)}>
                                     <ContextMenuIcon>
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 00-4-4H4" /></svg>
+                                      <Reply size={16} strokeWidth={2} />
                                     </ContextMenuIcon>
                                     Reply
                                   </ContextMenuItem>
                                   <Show when={msg.isOwn}>
                                     <ContextMenuItem onSelect={() => startEdit(msg)}>
                                       <ContextMenuIcon>
-                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7" /><path d="M18.5 2.5a2.121 2.121 0 013 3L12 15l-4 1 1-4 9.5-9.5z" /></svg>
+                                        <Pencil size={16} strokeWidth={2} />
                                       </ContextMenuIcon>
                                       Edit
                                     </ContextMenuItem>
@@ -1356,14 +1331,14 @@ const App: Component = () => {
                                   <ContextMenuSeparator />
                                   <ContextMenuItem onSelect={() => navigator.clipboard.writeText(msg.text)}>
                                     <ContextMenuIcon>
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" /><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1" /></svg>
+                                      <Copy size={16} strokeWidth={2} />
                                     </ContextMenuIcon>
                                     Copy text
                                     <ContextMenuShortcut>⌘C</ContextMenuShortcut>
                                   </ContextMenuItem>
                                   <ContextMenuItem onSelect={() => navigator.clipboard.writeText(msg.id)}>
                                     <ContextMenuIcon>
-                                      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 007.54.54l3-3a5 5 0 00-7.07-7.07l-1.72 1.71" /><path d="M14 11a5 5 0 00-7.54-.54l-3 3a5 5 0 007.07 7.07l1.71-1.71" /></svg>
+                                      <Link2 size={16} strokeWidth={2} />
                                     </ContextMenuIcon>
                                     Copy message ID
                                   </ContextMenuItem>
@@ -1371,7 +1346,7 @@ const App: Component = () => {
                                     <ContextMenuSeparator />
                                     <ContextMenuItem variant="danger" onSelect={() => handleDelete(msg)}>
                                       <ContextMenuIcon>
-                                        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6" /><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6" /><path d="M10 11v6" /><path d="M14 11v6" /><path d="M9 6V4a1 1 0 011-1h4a1 1 0 011 1v2" /></svg>
+                                        <Trash2 size={16} strokeWidth={2} />
                                       </ContextMenuIcon>
                                       Delete message
                                     </ContextMenuItem>
@@ -1422,7 +1397,7 @@ const App: Component = () => {
                             background: "rgba(124,107,245,0.06)", "border-radius": "10px",
                             "border-left": "3px solid #7c6bf5",
                           }}>
-                            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7c6bf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style={{ "flex-shrink": "0" }}><polyline points="9 17 4 12 9 7" /><path d="M20 18v-2a4 4 0 00-4-4H4" /></svg>
+                            <Reply size={14} color="#7c6bf5" strokeWidth={2} style={{ "flex-shrink": "0" }} />
                             <div style={{ flex: "1", "min-width": "0" }}>
                               <div style={{ "font-size": "11px", "font-weight": "600", color: "#7c6bf5" }}>{reply().senderName}</div>
                               <div style={{ "font-size": "12px", color: "#888", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{reply().text}</div>
@@ -1431,7 +1406,7 @@ const App: Component = () => {
                               style={{ width: "20px", height: "20px", "border-radius": "4px", background: "transparent", border: "none", color: "#666", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center", "flex-shrink": "0" }}
                               onClick={() => setReplyingTo(null)}
                             >
-                              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></svg>
+                              <X size={14} strokeWidth={2} />
                             </button>
                           </div>
                         )}
@@ -1697,6 +1672,11 @@ const App: Component = () => {
           </>
         )}
       </Show>
+
+      {/* Phase 1: global toast viewport (Kobalte-backed). */}
+      <ToastViewport />
+      {/* Phase 2: Cmd/Ctrl+K command palette (Tantivy local search). */}
+      <CommandPalette open={cmdkOpen()} onClose={() => setCmdkOpen(false)} />
     </div>
   );
 };

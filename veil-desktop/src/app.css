@@ -239,6 +239,11 @@ body {
   50% { box-shadow: 0 0 12px 4px rgba(124, 107, 245, 0.15); }
 }
 
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
 @keyframes statusPulse {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.15); }

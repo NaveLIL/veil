@@ -1,5 +1,6 @@
 import { ContextMenu as KContextMenu } from "@kobalte/core/context-menu";
 import { type Component, type JSX, type ParentComponent, splitProps } from "solid-js";
+import { ChevronRight } from "lucide-solid";
 import { cn } from "@/lib/utils";
 
 /* ═══════════════════════════════════════════════════════
@@ -159,9 +160,7 @@ export const ContextMenuSubTrigger: Component<SubTriggerProps> = (props) => {
     <KContextMenu.SubTrigger class={cn("veil-ctx-item veil-ctx-sub-trigger", local.class)} {...rest}>
       {local.children}
       <span class="veil-ctx-chevron" aria-hidden="true">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="9 18 15 12 9 6" />
-        </svg>
+        <ChevronRight size={14} strokeWidth={2} />
       </span>
     </KContextMenu.SubTrigger>
   );
