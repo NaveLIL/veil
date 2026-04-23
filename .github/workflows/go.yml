@@ -75,3 +75,29 @@ jobs:
         env:
           DATABASE_URL: postgres://veil:veiltest@localhost:5432/veil_test?sslmode=disable
         run: go test -v -race -timeout 60s ./...
+
+  # End-to-end REST tests against an ephemeral Postgres container spun up
+  # via testcontainers-go. Gated by the `integration` build tag so that the
+  # default `go test ./...` job above stays Docker-free.
+  integration:
+    name: Integration (testcontainers)
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+          cache-dependency-path: veil-server/go.sum
+
+      - name: Verify Docker is available
+        run: docker info
+
+      - name: Run integration tests
+        env:
+          # testcontainers-go reuses containers across tests when ryuk is
+          # disabled; on CI we want clean teardown.
+          TESTCONTAINERS_RYUK_DISABLED: "false"
+        run: go test -tags=integration -timeout 5m -v ./internal/integration/...

@@ -82,7 +82,7 @@ func TestChat_CreateGroupAndAddMember(t *testing.T) {
 		"name":    "Squad",
 		"members": []string{},
 	})
-	if status != http.StatusOK {
+	if status != http.StatusCreated {
 		t.Fatalf("create group: status=%d body=%v", status, body)
 	}
 	groupID, _ := body["conversation_id"].(string)

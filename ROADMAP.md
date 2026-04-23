@@ -36,26 +36,33 @@
   `TestRequireSigned_RejectsBareXUserID` asserting unconditional reject.
   Commit `9413892`.
 
-### W2 — Integration test harness for chat/servers (in progress, 2026-04-23)
+### W2 — Integration test harness for chat/servers (done, 2026-04-25)
 - Added `internal/integration/` package guarded by the `integration`
   build tag. `harness.New(t)` spins up a Postgres container via
   testcontainers-go, applies every SQL file under `migrations/` in
   lexicographic order, mounts the production REST mux (auth + chat +
   servers all gated by the real `authmw` middleware), and exposes
   `CreateUser` / `Do` (signed) / `DoUnsigned` helpers.
-- Initial test suite: 6 tests in `servers_integration_test.go`
-  (`CreateAndGet`, `RejectsUnsigned`, `NonOwnerCannotDelete`,
-  `ListIncludesNew`, `Channels_CreateAndList`, `InvitePreviewIsPublic`)
-  and 6 tests in `chat_integration_test.go` (`CreateDMHappyPath`,
-  `GetMessagesForbiddenForNonMember`, `GetMessagesEmptyForNew`,
-  `CreateGroupAndAddMember`, `RejectsUnsigned`,
-  `AddGroupMember_NonMemberCannotAdd`).
-- Run with `go test -tags=integration ./internal/integration/...`
-  (requires a running Docker daemon). Tests are excluded from the
-  default `go test ./...` so unit tests still run without Docker.
-- TODO before marking W2 complete: add coverage for the rest of the
-  servers surface (roles, invites use, channel reorder, member kick),
-  reach the ROADMAP's ≥80% target, wire `-tags=integration` into CI.
+- Initial test suite (commit `269fe8c`): 6 tests in
+  `servers_integration_test.go` and 6 tests in
+  `chat_integration_test.go`.
+- Follow-up coverage expansion: added
+  `roles_integration_test.go` (4 tests — owner-create+list, non-admin
+  forbidden, assign/unassign round-trip via ListMembers, update+delete
+  lifecycle), `invites_integration_test.go` (5 tests — create/list/use
+  joins server, public preview returns server, revoke prevents use,
+  max_uses=1 enforced, expires_in_secs honoured), and
+  `members_integration_test.go` (7 tests — owner sees all,
+  non-member→403, owner kicks → kicked user→403 on GET, non-admin
+  kick→403, owner cannot self-kick, owner cannot leave, regular member
+  can leave → loses access). Also fixed pre-existing tests that asserted
+  `200 OK` for create endpoints which actually return `201 Created`.
+- CI: added `integration` job to `.github/workflows/go.yml`. Runs
+  `go test -tags=integration -timeout 5m ./internal/integration/...`
+  on ubuntu-latest where Docker is preinstalled. Default `go test ./...`
+  job in the same workflow stays Docker-free thanks to the build tag.
+- Run locally with `go test -tags=integration ./internal/integration/...`
+  (requires a running Docker daemon).
 
 ## Recently shipped
 

@@ -17,7 +17,7 @@ func TestServers_CreateAndGet(t *testing.T) {
 	owner := h.CreateUser("alice")
 
 	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers", map[string]string{"name": "Aegis"})
-	if status != http.StatusOK {
+	if status != http.StatusCreated {
 		t.Fatalf("create: status=%d body=%v", status, body)
 	}
 	srvID, _ := body["id"].(string)
@@ -51,7 +51,7 @@ func TestServers_NonOwnerCannotDelete(t *testing.T) {
 	intruder := h.CreateUser("intruder")
 
 	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers", map[string]string{"name": "Sec"})
-	if status != http.StatusOK {
+	if status != http.StatusCreated {
 		t.Fatalf("create: status=%d %v", status, body)
 	}
 	srvID := body["id"].(string)
@@ -73,7 +73,7 @@ func TestServers_ListIncludesNew(t *testing.T) {
 	u := h.CreateUser("listuser")
 	for _, name := range []string{"alpha", "beta", "gamma"} {
 		status, _, _ := h.Do(u, http.MethodPost, "/v1/servers", map[string]string{"name": name})
-		if status != http.StatusOK {
+		if status != http.StatusCreated {
 			t.Fatalf("create %s: status=%d", name, status)
 		}
 	}
@@ -94,10 +94,10 @@ func TestChannels_CreateAndList(t *testing.T) {
 	srvID := body["id"].(string)
 
 	status, _, ch := h.Do(u, http.MethodPost, "/v1/servers/"+srvID+"/channels", map[string]any{
-		"name": "general",
-		"type": 0,
+		"name":         "general",
+		"channel_type": 0,
 	})
-	if status != http.StatusOK {
+	if status != http.StatusCreated {
 		t.Fatalf("create channel: status=%d body=%v", status, ch)
 	}
 	if ch["name"] != "general" {
