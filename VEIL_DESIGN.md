@@ -1,8 +1,7 @@
-# VEIL — Next-Generation Encrypted Messenger
+# VEIL — заметки по архитектуре
 
-> Рабочее название: **Veil** (завеса, покров)
-> Альтернативы: **Bastion**, **Aegis**, **Citadel**, **Phantom**
-> Философия: *"Невидимость по умолчанию"*
+> Рабочее название: **Veil**
+> Альтернативы которые рассматривал: Bastion, Aegis, Citadel, Phantom — остановился на Veil
 
 ---
 

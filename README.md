@@ -1,110 +1,62 @@
-# Veil — Next-Generation Encrypted Messenger
+# Veil
 
-**Native-only** end-to-end encrypted messenger. Keys never leave Rust memory.
+E2EE мессенджер. Вся крипто — в Rust, UI просто рендерит то что приходит с Rust-стороны. Ключи не пересекают FFI-границу.
 
-## Architecture
+Переписал с нуля после того, как EREZ Secret вырос до 22k LOC монолита с криптой на TweetNaCl в JS. Подробнее в [VEIL_DESIGN.md](VEIL_DESIGN.md).
 
-| Module | Language | Purpose |
-|--------|----------|---------|
-| `veil-crypto` | Rust | Cryptographic engine (X3DH, Double Ratchet, AEAD, chunked AEAD, sender keys, BIP39) |
-| `veil-store` | Rust | Encrypted local storage (SQLCipher + OS Keychain) |
-| `veil-client` | Rust | Protocol engine (WebSocket, Protobuf, offline queue, optional FTS hook) |
-| `veil-search` | Rust | Local-only Tantivy full-text index over decrypted messages |
-| `veil-uploads` | Rust | tus.io resumable client + streaming chunked-AEAD encrypt/decrypt |
-| `veil-ffi` | Rust | UniFFI bindings for Kotlin/Swift |
-| `veil-proto` | Protobuf | Wire protocol definitions |
-| `veil-server` | Go | WebSocket gateway, auth, chat, servers/channels, push, uploads |
-| `veil-desktop` | Rust + SolidJS | Tauri v2 desktop app (Cmd-K palette, Island UI) |
-| `veil-mobile` | TypeScript | React Native (Expo) mobile app |
-| `veil-share-viewer` | Rust (WASM) | Browser decryptor for secure shares |
+## Структура
 
-### Server packages (`veil-server/internal/`)
+| Модуль | Язык | Что делает |
+|--------|------|------------|
+| `veil-crypto` | Rust | X3DH, Double Ratchet, XChaCha20-Poly1305, chunked AEAD, BIP39 |
+| `veil-store` | Rust | SQLCipher + OS Keychain |
+| `veil-client` | Rust | WebSocket, Protobuf, offline queue, хук для FTS |
+| `veil-search` | Rust | Локальный Tantivy индекс, данные никуда не уходят |
+| `veil-uploads` | Rust | tus.io клиент + streaming chunked-AEAD |
+| `veil-ffi` | Rust | UniFFI bindgen для Kotlin/Swift |
+| `veil-proto` | Protobuf | Протокол |
+| `veil-server` | Go | Gateway, auth, чат, группы, push, загрузки |
+| `veil-desktop` | Rust + SolidJS | Tauri v2, Island UI, Cmd-K поиск |
+| `veil-mobile` | TypeScript | React Native (Expo) |
+| `veil-share-viewer` | Rust (WASM) | Расшифровка secure-share ссылок в браузере |
 
-| Package | Purpose |
-|---------|---------|
-| `auth` | Identity registration + signed-REST authentication |
-| `authmw` | Ed25519 request signature middleware + per-user rate limit |
-| `chat` | Conversations, messages, members, reactions, edits/deletes |
-| `servers` | Discord-like servers, channels, roles, invites |
-| `gateway` | WebSocket hub, fan-out, offline-push routing |
-| `push` | UnifiedPush / ntfy dispatcher (XChaCha20 envelopes, jitter, dead-endpoint pruning) |
-| `uploads` | tusd v2 wrapper, HMAC bearer tokens, per-user quota, sweeper |
-| `metrics` | Prometheus metrics on a dedicated internal listener |
-| `integration` | testcontainers harness for end-to-end Go suite |
+Go-пакеты в `veil-server/internal/`: `auth`, `authmw`, `chat`, `servers`, `gateway`, `push`, `uploads`, `metrics`, `integration`.
 
-## Build
+## Сборка
 
 ```bash
-# Rust workspace (all crates)
 cargo build --workspace
 cargo test  --workspace
 
-# Server (Go)
-cd veil-server && go build ./cmd/gateway/
-go test ./...
+cd veil-server && go build ./cmd/gateway/ && go test ./...
 
-# Desktop
 cd veil-desktop && pnpm install && pnpm tauri dev
-
-# Mobile
-cd veil-mobile && pnpm install && npx expo start
+cd veil-mobile  && pnpm install && npx expo start
 ```
 
-## Run the stack
+## Запуск локально
 
 ```bash
-# Postgres + gateway + ntfy distributor
 docker compose up -d
 ```
 
-Generate transport keys before enabling phase 3/4 services:
+Переменные для фаз 3 и 4. Без них соответствующие подсистемы стартуют в disabled-режиме — эндпоинты живые, трафик не пропускается:
 
 ```bash
-# Phase 3 — uploads bearer-token HMAC key
 export VEIL_UPLOAD_TOKEN_KEY="$(openssl rand -base64 32)"
-
-# Phase 4 — push transport AEAD key
 export VEIL_PUSH_TRANSPORT_KEY="$(openssl rand -base64 32)"
-export VEIL_PUSH_HASH_SALT="<unique per deployment>"
+export VEIL_PUSH_HASH_SALT="уникальное для деплоя значение"
 ```
 
-Leaving either env var empty boots the corresponding subsystem in
-**disabled** mode (endpoints reachable, traffic refused) so the
-gateway always starts.
+## Крипто
 
-## Security
+XChaCha20-Poly1305 везде. X3DH для установки сессии, Double Ratchet для forward secrecy. Sender Keys для больших групп (>500 участников). Файлы — chunked AEAD, каждый чанк привязан к индексу и флагу final в nonce и AAD, детектирует перестановку/обрезание/замену. Push preview шифруется отдельным `K_push` — HKDF из ratchet root с domain separator. Взлом push = видны превью, не сами сообщения. SQLCipher, `cipher_memory_security = ON`. Seed в OS Keychain. На Linux: `keyring` v3 обязательно с фичами `sync-secret-service` + `crypto-rust`, иначе будет in-memory mock и всё потеряется при перезапуске. Сервер видит только ciphertext + метаданные (размер, тайминг).
 
-- XChaCha20-Poly1305 + HKDF-SHA256 + Argon2id
-- X3DH key agreement with SPK signature verification
-- Double Ratchet with forward secrecy + post-compromise security
-- Sender keys for encrypted groups/channels (Signal-style)
-- Chunked AEAD for streaming uploads — nonce + AAD bind chunk index
-  and final-flag, so reorder, truncation and per-chunk tampering are
-  all detectable
-- `zeroize` on drop for all key material
-- SQLCipher with `cipher_memory_security = ON`
-- OS Keychain (Linux: secret-service via `keyring` v3 with
-  `sync-secret-service` + `crypto-rust` features) for seed storage
-- Server is E2EE-blind: only ciphertext + opaque size/timing metadata
-  for files; only constant-size padded envelopes for push
-- Push key (`K_push`) is HKDF-derived from the ratchet root with
-  domain separation — leak of `K_push` reveals previews only, never
-  live ratchet state
+## Где что сделано
 
-## Phase status
+Готово: identity/X3DH/ratchet, gateway + signed REST, resumable зашифрованные загрузки через tus.io, UnifiedPush/ntfy push-уведомления, группы/sender-keys/серверы-каналы-роли, локальный поиск с Cmd-K палитрой, базовая UI-библиотека (toast, sheet, switch, z-index слои).
 
-- ✅ Phase 1 — identity, X3DH, ratchet, store
-- ✅ Phase 2 — gateway, signed REST, hub, offline queue
-- ✅ Phase 3 — resumable encrypted uploads (tus.io + chunked AEAD)
-- ✅ Phase 4 — UnifiedPush + ntfy offline notifications
-- ✅ Phase 4A — groups, sender keys, Discord-like servers/channels/roles
-- ✅ Local-only Tantivy full-text search (Cmd-K palette)
-- 🔜 Phase 5 — calls (WebRTC + DTLS-SRTP)
-- 🔜 Phase 6 — MLS migration
-
-See [`INTEGRATION_ROADMAP.md`](INTEGRATION_ROADMAP.md) for the detailed
-plan and [`VEIL_DESIGN.md`](VEIL_DESIGN.md) for the cryptographic
-design.
+Следующее: звонки (WebRTC), MLS-миграция для DM и маленьких групп, мобильный UI. См. [INTEGRATION_ROADMAP.md](INTEGRATION_ROADMAP.md).
 
 ## License
 
