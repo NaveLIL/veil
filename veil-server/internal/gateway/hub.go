@@ -446,6 +446,15 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 			return
 		}
 
+		// W10 — per-(user, kind) rate limit. Drop with a 429-equivalent
+		// error so the client knows to back off, and increment the
+		// rejected-total metric so ops can see the offender.
+		kind := kindForUserBucket(envelopeKind(env))
+		if !allowEnvelope(c.userID, kind) {
+			c.sendError(env.Seq, 429, "ws rate limit exceeded for "+kind)
+			return
+		}
+
 		switch p := env.Payload.(type) {
 		case *pb.Envelope_SendMessage:
 			c.handleSendMessage(ctx, env.Seq, p.SendMessage)

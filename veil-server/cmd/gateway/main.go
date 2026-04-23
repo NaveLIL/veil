@@ -83,10 +83,16 @@ func main() {
 		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	// Prometheus exposition endpoint. Kept off the signed-request path so
-	// scrapers don't need credentials; protect at the network layer (firewall
-	// or reverse-proxy auth) for production deployments.
-	mux.Handle("GET /metrics", metrics.Handler())
+	// W4 — Prometheus exposition endpoint moves to a separate internal-only
+	// listener bound to VEIL_INTERNAL_ADDR (default 127.0.0.1:9090). The
+	// previous behaviour exposed full per-route req-rate to the open
+	// internet, which is a privacy/operational leak. Set
+	// VEIL_INTERNAL_ADDR="" to opt-in to the legacy public /metrics path
+	// (e.g. for local dev where there's no Prometheus sidecar).
+	internalAddr, exposePublicMetrics := metricsBindAddr()
+	if exposePublicMetrics {
+		mux.Handle("GET /metrics", metrics.Handler())
+	}
 
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
@@ -104,6 +110,28 @@ func main() {
 		}
 	}()
 
+	// Internal listener for Prometheus + future pprof. Bound to a
+	// non-public address by default so the docker-compose `ports:` mapping
+	// only exposes /health and /ws to the internet.
+	var internalSrv *http.Server
+	if internalAddr != "" {
+		internalMux := http.NewServeMux()
+		internalMux.Handle("GET /metrics", metrics.Handler())
+		internalSrv = &http.Server{
+			Addr:         internalAddr,
+			Handler:      internalMux,
+			ReadTimeout:  15 * time.Second,
+			WriteTimeout: 15 * time.Second,
+			IdleTimeout:  60 * time.Second,
+		}
+		log.Printf("veil-gateway internal listener (metrics) on %s", internalAddr)
+		go func() {
+			if err := internalSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Fatalf("internal server error: %v", err)
+			}
+		}()
+	}
+
 	// Graceful shutdown
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
@@ -113,6 +141,34 @@ func main() {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer shutdownCancel()
 	server.Shutdown(shutdownCtx)
+	if internalSrv != nil {
+		internalSrv.Shutdown(shutdownCtx)
+	}
+}
+
+// metricsBindAddr resolves the VEIL_INTERNAL_ADDR env var, returning the
+// listen address for the internal mux and whether to keep /metrics on the
+// public mux as well.
+//
+//   - unset → "127.0.0.1:9090", public exposure off (production default).
+//   - "off" or "disabled" → no internal listener, public /metrics off
+//     (use this when an external sidecar scrapes via docker exec).
+//   - "public" → no internal listener, /metrics stays on public mux
+//     (legacy mode; **not recommended** for internet-facing deploys).
+//   - any other value → bind to it, public exposure off.
+func metricsBindAddr() (addr string, exposePublic bool) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv("VEIL_INTERNAL_ADDR")))
+	switch raw {
+	case "":
+		return "127.0.0.1:9090", false
+	case "off", "disabled", "none":
+		return "", false
+	case "public":
+		log.Printf("WARN: VEIL_INTERNAL_ADDR=public — /metrics is publicly exposed; protect at the edge")
+		return "", true
+	default:
+		return raw, false
+	}
 }
 
 // parseCORSOrigins reads VEIL_CORS_ORIGINS (comma-separated) and returns the

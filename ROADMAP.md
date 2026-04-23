@@ -64,6 +64,37 @@
 - Run locally with `go test -tags=integration ./internal/integration/...`
   (requires a running Docker daemon).
 
+### W4 — `/metrics` moved to internal-only listener (done, 2026-04-23)
+- `cmd/gateway/main.go` now binds Prometheus exposition to a separate
+  `http.Server` on `VEIL_INTERNAL_ADDR` (default `127.0.0.1:9090`). The
+  public mux on `:cfg.Port` no longer registers `/metrics` so the open
+  internet sees only `/health`, `/ws`, and the signed REST surface.
+- `metricsBindAddr()` recognises three special values: unset → default
+  internal bind, `off`/`disabled`/`none` → no metrics endpoint at all
+  (use when an external sidecar scrapes via `docker exec`), and
+  `public` → keep legacy public `/metrics` with a WARN log (dev only).
+  Any other value is treated as a literal listen address.
+- Compose deployment doesn't need a port mapping for 9090 — a Prometheus
+  sidecar on the same compose network reaches `gateway:9090`. Lock-down
+  is automatic for the existing VPS (no envvar = bind to localhost).
+
+### W10 — Per-(user, kind) WS message rate limiting (done, 2026-04-23)
+- New `internal/gateway/ratelimit.go` with a token-bucket map keyed on
+  `userID + "\x00" + kind`. Per-kind caps tuned in `wsBucketLimits`:
+  send_message 120/min, typing 120/min, presence 60/min, friend_request
+  30/min, etc. Unknown kinds fall back to `defaultWSLimit` (60/min) so
+  a typo in dispatch can never open a flood vector.
+- Limiter consulted in `Client.handleEnvelope` immediately after the
+  auth gate. Rejects send back a `429` error envelope and increment
+  `veil_ws_messages_rejected_total{kind, reason="rate_limit"}`.
+  Sustained offenders aren't auto-disconnected (a single hiccup
+  shouldn't drop a long-lived connection); the metric makes them
+  visible for ops alerts.
+- Idle bucket GC every 10 minutes bounds memory on long-running
+  processes. Tests in `ratelimit_test.go` cover: cap enforcement,
+  refill restoring access, per-user isolation, per-kind isolation,
+  empty-userID bypass, default-limit fallback.
+
 ## Recently shipped
 
 ### Security / signed REST
@@ -210,17 +241,11 @@ scaling or compliance milestone hits.
   React-Native through a smoke suite that asserts every REST call
   carries the X-Veil-{User,Timestamp,Signature} triplet.
 
-### W4. `/metrics` exposed without auth
-- **Symptom**: `GET /metrics` returns the full Prometheus surface to
-  the open internet. Helpful for debugging today, leak vector
-  tomorrow (per-user request rates, internal route names, hostnames).
-- **Ideal fix**: bind a separate **internal-only listener** (e.g.
-  `127.0.0.1:9090`) for `/metrics` and `/debug/pprof/*`, never
-  exposed by the docker-compose `ports:` mapping. Prometheus scrapes
-  it via `docker exec` or via a sidecar on the same compose network.
-  Public port keeps only `/health` and `/ws`. As a stop-gap before
-  that: TLS-terminating reverse proxy with HTTP basic auth on
-  `/metrics`.
+### W4. `/metrics` exposed without auth — **DONE 2026-04-23**
+- See "W4 — `/metrics` moved to internal-only listener" above. The
+  internal listener defaults to `127.0.0.1:9090` so existing deploys
+  get lockdown automatically; `/debug/pprof/*` is the obvious next
+  thing to register on the same internal mux when needed.
 
 ### W5. No frontend tests (desktop or mobile)
 - **Symptom**: state is non-trivial (optimistic message inserts,
@@ -276,15 +301,12 @@ scaling or compliance milestone hits.
   exfiltrating logs cannot tie entries back to user accounts.
   Configure log retention at 7 days max in compose / journald.
 
-### W10. No rate-limit on WS message types
-- **Symptom**: REST has per-user token-bucket. WS messages flow
-  freely once authenticated — a compromised account can flood
-  `send_message` or `typing` events at line speed.
-- **Ideal fix**: per-`(userID, kind)` token bucket inside the hub,
-  evaluated in `handleEnvelope` before dispatch. Tighter limits for
-  cheap-to-spam kinds (`typing`, `presence`) than for `send_message`.
-  Drop with `veil_ws_messages_rejected_total{kind,reason}` metric;
-  disconnect on sustained abuse.
+### W10. No rate-limit on WS message types — **DONE 2026-04-23**
+- See "W10 — Per-(user, kind) WS message rate limiting" above.
+  Auto-disconnect for sustained abusers is the obvious next step
+  (currently the metric flags them but the connection stays open);
+  defer until we have a Grafana alert wired to
+  `rate(veil_ws_messages_rejected_total[5m])`.
 
 ---
 

@@ -72,6 +72,18 @@ var (
 		},
 		[]string{"kind"},
 	)
+
+	// WSMessagesRejectedTotal counts inbound WS messages dropped before
+	// dispatch — currently only by the per-(user, kind) rate limiter.
+	// Reason "rate_limit" is the only producer today; other reasons may be
+	// added later (e.g. "size_cap").
+	WSMessagesRejectedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "veil_ws_messages_rejected_total",
+			Help: "Total inbound WebSocket messages rejected before handler dispatch.",
+		},
+		[]string{"kind", "reason"},
+	)
 )
 
 func init() {
@@ -83,6 +95,7 @@ func init() {
 		WSAuthFailuresTotal,
 		WSRefusedTotal,
 		WSMessagesTotal,
+		WSMessagesRejectedTotal,
 	)
 }
 
