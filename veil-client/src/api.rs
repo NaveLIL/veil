@@ -1,11 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use veil_crypto::fingerprint;
 use veil_crypto::kdf;
 use veil_crypto::keys::{generate_mnemonic, validate_mnemonic, IdentityKeyPair};
 use veil_crypto::ratchet::{MessageHeader, RatchetSession};
 use veil_crypto::sender_key::{SenderKeyDistribution, SenderKeyStore};
 use veil_crypto::x3dh;
+use veil_search::Indexer;
 use veil_store::db::VeilDb;
 use veil_store::keychain;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
@@ -62,6 +65,8 @@ pub struct VeilClient {
     sender_keys: SenderKeyStore,
     /// Conversations that should be encrypted with sender keys (channels & encrypted groups).
     channel_conversations: HashSet<String>,
+    /// Optional local-only full-text index. Index calls are best-effort and never fatal.
+    indexer: Option<Arc<Indexer>>,
 }
 
 impl VeilClient {
@@ -82,6 +87,7 @@ impl VeilClient {
             otk_next_id: 1,
             sender_keys: SenderKeyStore::new(),
             channel_conversations: HashSet::new(),
+            indexer: None,
         }
     }
 
@@ -103,7 +109,19 @@ impl VeilClient {
             otk_next_id: 1,
             sender_keys: SenderKeyStore::new(),
             channel_conversations: HashSet::new(),
+            indexer: None,
         }
+    }
+
+    /// Attach a local search index. Subsequent message inserts/edits/deletes
+    /// will be mirrored into it on a best-effort basis.
+    pub fn set_indexer(&mut self, indexer: Arc<Indexer>) {
+        self.indexer = Some(indexer);
+    }
+
+    /// Borrow the local search index, if attached.
+    pub fn indexer(&self) -> Option<Arc<Indexer>> {
+        self.indexer.clone()
     }
 
     /// Generate a new BIP39 mnemonic (12 words).
@@ -258,6 +276,13 @@ impl VeilClient {
             let our_key = self.identity_key().unwrap_or([0u8; 32]);
             let msg_id = uuid::Uuid::new_v4().to_string();
             let _ = db.insert_message(&msg_id, conversation_id, &our_key, plaintext, true, None, reply_to_id);
+            if let Some(ref idx) = self.indexer {
+                let ts = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                let _ = idx.index_message(&msg_id, conversation_id, &hex::encode(our_key), plaintext, ts);
+            }
         }
 
         Ok(seq)
@@ -808,6 +833,15 @@ impl VeilClient {
                 server_timestamp,
                 reply_to_id,
             );
+            if let Some(ref idx) = self.indexer {
+                let ts = server_timestamp.unwrap_or_else(|| {
+                    SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0)
+                });
+                let _ = idx.index_message(message_id, conversation_id, &hex::encode(sender_key), plaintext, ts);
+            }
         }
     }
 
@@ -842,6 +876,17 @@ impl VeilClient {
         if let Some(ref db) = self.db {
             let _ = db.update_message_text(message_id, new_text);
         }
+        if let Some(ref idx) = self.indexer {
+            // Re-index keeps the body field current. Conversation/sender/ts are
+            // re-derived from the existing row only on next full rebuild; for
+            // edits we just patch the body in place.
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let our_key = self.identity_key().unwrap_or([0u8; 32]);
+            let _ = idx.index_message(message_id, conversation_id, &hex::encode(our_key), new_text, ts);
+        }
 
         Ok(seq)
     }
@@ -871,6 +916,9 @@ impl VeilClient {
         // Delete from local DB
         if let Some(ref db) = self.db {
             let _ = db.delete_message(message_id);
+        }
+        if let Some(ref idx) = self.indexer {
+            let _ = idx.delete(message_id);
         }
 
         Ok(seq)
@@ -954,12 +1002,25 @@ impl VeilClient {
         if let Some(ref db) = self.db {
             let _ = db.update_message_text(message_id, new_text);
         }
+        if let Some(ref idx) = self.indexer {
+            // We don't know conversation/sender here without a DB read; the body
+            // change is what matters for FTS. Re-issue with empty fields — the
+            // next full re-index (rebuild) will restore metadata.
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let _ = idx.index_message(message_id, "", "", new_text, ts);
+        }
     }
 
     /// Delete a message from local DB (for incoming deletes).
     pub fn delete_local_message(&self, message_id: &str) {
         if let Some(ref db) = self.db {
             let _ = db.delete_message(message_id);
+        }
+        if let Some(ref idx) = self.indexer {
+            let _ = idx.delete(message_id);
         }
     }
 

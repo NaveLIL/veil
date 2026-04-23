@@ -6,6 +6,7 @@ members = [
     "veil-ffi",
     "veil-desktop/src-tauri",
     "veil-share-viewer",
+    "veil-search",
     "veil-uploads",
 ]
 resolver = "2"

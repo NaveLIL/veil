@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -7,6 +7,7 @@ use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
 use veil_client::api::VeilClient;
 use veil_client::connection::ConnectionEvent;
+use veil_search::{Indexer, SearchHit};
 use veil_store::keychain;
 
 struct AppState {
@@ -18,6 +19,8 @@ struct AppState {
     /// all REST calls. Eliminates per-request handshake overhead, the main
     /// cause of the perceived "server tab is slow / hangs" UX.
     http: reqwest::Client,
+    /// Local-only full-text index. Initialised lazily in `setup`.
+    indexer: Arc<Indexer>,
 }
 
 const KEYCHAIN_ACCOUNT: &str = "veil-default";
@@ -41,6 +44,7 @@ fn init_identity(state: State<'_, AppState>, mnemonic: &str) -> Result<String, S
     let db_path = state.db_dir.join("veil.db");
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     client.init_with_mnemonic(mnemonic, &db_path)?;
+    client.set_indexer(state.indexer.clone());
     let hex_key = hex::encode(client.identity_key()?);
     Ok(hex_key)
 }
@@ -147,6 +151,7 @@ async fn init_from_seed(state: State<'_, AppState>) -> Result<String, String> {
     let db_path = state.db_dir.join("veil.db");
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     client.init_with_mnemonic(&mnemonic, &db_path)?;
+    client.set_indexer(state.indexer.clone());
     let hex_key = hex::encode(client.identity_key()?);
     Ok(hex_key)
 }
@@ -1928,6 +1933,108 @@ fn search_user(
     })
 }
 
+// ─── Local search ─────────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct SearchHitDto {
+    id: String,
+    #[serde(rename = "conversationId")]
+    conversation_id: String,
+    sender: String,
+    body: String,
+    ts: i64,
+    score: f32,
+}
+
+impl From<SearchHit> for SearchHitDto {
+    fn from(h: SearchHit) -> Self {
+        Self {
+            id: h.id,
+            conversation_id: h.conversation_id,
+            sender: h.sender,
+            body: h.body,
+            ts: h.ts,
+            score: h.score,
+        }
+    }
+}
+
+#[tauri::command]
+fn search_messages(
+    state: State<'_, AppState>,
+    query: String,
+    conversation_id: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<SearchHitDto>, String> {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = limit.unwrap_or(50).clamp(1, 500);
+    let hits = state
+        .indexer
+        .search(trimmed, conversation_id.as_deref(), limit)
+        .map_err(|e| e.to_string())?;
+    Ok(hits.into_iter().map(SearchHitDto::from).collect())
+}
+
+#[tauri::command]
+fn clear_search_index(state: State<'_, AppState>) -> Result<(), String> {
+    state.indexer.clear().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn rebuild_search_index(state: State<'_, AppState>) -> Result<usize, String> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("database not initialized")?;
+    state.indexer.clear().map_err(|e| e.to_string())?;
+    let convs = db.get_conversations()?;
+    let mut indexed = 0usize;
+    for conv in convs {
+        let msgs = db.get_messages(&conv.id, 100_000)?;
+        for m in msgs {
+            let ts = m.server_timestamp.unwrap_or_else(|| {
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0)
+            });
+            if state
+                .indexer
+                .index_message(
+                    &m.id,
+                    &conv.id,
+                    &hex::encode(&m.sender_key),
+                    &m.plaintext,
+                    ts,
+                )
+                .is_ok()
+            {
+                indexed += 1;
+            }
+        }
+    }
+    Ok(indexed)
+}
+
+/// Run [`rebuild_search_index`] once per install. A marker file under the
+/// index directory records that backfill has happened so subsequent launches
+/// skip the work. Returns the number of messages indexed (0 if skipped).
+#[tauri::command]
+fn ensure_search_backfill(state: State<'_, AppState>) -> Result<usize, String> {
+    let marker = state.db_dir.join("search").join("v1").join(".backfilled");
+    if marker.exists() {
+        return Ok(0);
+    }
+    let n = rebuild_search_index(state)?;
+    if let Some(parent) = marker.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let _ = std::fs::write(&marker, b"1");
+    Ok(n)
+}
+
 // ─── App ──────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1951,6 +2058,12 @@ pub fn run() {
                 .unwrap_or_else(|_| PathBuf::from("."));
             std::fs::create_dir_all(&data_dir).ok();
 
+            let index_dir = data_dir.join("search").join("v1");
+            let indexer = Arc::new(
+                Indexer::open(&index_dir)
+                    .expect("failed to open local search index"),
+            );
+
             app.manage(AppState {
                 client: Mutex::new(VeilClient::new()),
                 runtime: tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
@@ -1962,6 +2075,7 @@ pub fn run() {
                     .timeout(std::time::Duration::from_secs(20))
                     .build()
                     .expect("reqwest client"),
+                indexer,
             });
             // System tray with menu
             let show = MenuItem::with_id(app, "show", "Show Veil", true, None::<&str>)?;
@@ -2035,6 +2149,10 @@ pub fn run() {
             get_reactions,
             create_dm,
             is_connected,
+            search_messages,
+            clear_search_index,
+            rebuild_search_index,
+            ensure_search_backfill,
             create_group,
             add_group_member,
             remove_group_member,

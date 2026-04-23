@@ -535,6 +535,11 @@ export const appStore = {
         if (!connected()) {
           appStore.connectToServer();
         }
+        // First-launch backfill of the local search index. Idempotent: backend
+        // marks itself "done" and no-ops on subsequent launches.
+        invoke<number>("ensure_search_backfill")
+          .then((n) => { if (n > 0) console.info(`[search] backfilled ${n} messages`); })
+          .catch((e) => console.warn("ensure_search_backfill failed:", e));
       }, 1500);
     }
     return ok;

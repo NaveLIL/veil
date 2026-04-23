@@ -8,6 +8,7 @@ description = "Protocol engine for Veil messenger — WebSocket, Protobuf, sessi
 [dependencies]
 veil-crypto = { path = "../veil-crypto" }
 veil-store = { path = "../veil-store" }
+veil-search = { path = "../veil-search" }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
