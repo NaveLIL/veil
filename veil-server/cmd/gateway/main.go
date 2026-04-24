@@ -147,8 +147,14 @@ func main() {
 		downloadsDir = "cmd/gateway/downloads"
 	}
 	if st, err := os.Stat(downloadsDir); err == nil && st.IsDir() {
+		// Tight rate-limit for downloads: 5 req/min per IP to prevent
+		// bandwidth exhaustion from large files (.AppImage ~113 MB).
+		dlRL := authmw.NewRateLimit(5, time.Minute)
 		fs := http.FileServer(http.Dir(downloadsDir))
-		mux.Handle("GET /downloads/", http.StripPrefix("/downloads/", fs))
+		stripped := http.StripPrefix("/downloads/", fs)
+		mux.Handle("GET /downloads/", dlRL.Wrap(func(w http.ResponseWriter, r *http.Request) {
+			stripped.ServeHTTP(w, r)
+		}))
 		log.Printf("downloads served from %s", downloadsDir)
 	} else {
 		log.Printf("downloads disabled (no directory at %s)", downloadsDir)
