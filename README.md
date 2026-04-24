@@ -48,6 +48,18 @@ export VEIL_PUSH_TRANSPORT_KEY="$(openssl rand -base64 32)"
 export VEIL_PUSH_HASH_SALT="уникальное для деплоя значение"
 ```
 
+## Публичный деплой с TLS
+
+Caddy перед gateway: автоматически тянет Let's Encrypt сертификат, проксирует и лендинг, и WebSocket, и REST через один домен. Конфиг в [Caddyfile](Caddyfile).
+
+```bash
+export VEIL_PUBLIC_HOST=secret.erez.pro
+export VEIL_TLS_EMAIL=admin@example.com
+docker compose --profile proxy up -d
+```
+
+Клиенты после этого подключаются по `wss://secret.erez.pro/ws`, REST — `https://secret.erez.pro/v1/*`. На корне домена — лендинг, встроенный в gateway бинарник.
+
 ## Крипто
 
 XChaCha20-Poly1305 везде. X3DH для установки сессии, Double Ratchet для forward secrecy. Sender Keys для больших групп (>500 участников). Файлы — chunked AEAD, каждый чанк привязан к индексу и флагу final в nonce и AAD, детектирует перестановку/обрезание/замену. Push preview шифруется отдельным `K_push` — HKDF из ratchet root с domain separator. Взлом push = видны превью, не сами сообщения. SQLCipher, `cipher_memory_security = ON`. Seed в OS Keychain. На Linux: `keyring` v3 обязательно с фичами `sync-secret-service` + `crypto-rust`, иначе будет in-memory mock и всё потеряется при перезапуске. Сервер видит только ciphertext + метаданные (размер, тайминг).

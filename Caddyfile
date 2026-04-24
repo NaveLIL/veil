@@ -1,0 +1,36 @@
+# Reverse-proxy перед gateway. Caddy сам тянет Let's Encrypt сертификат
+# для домена и держит его актуальным. Поднимается через docker compose,
+# профиль `proxy` (см. docker-compose.yml).
+#
+# Запуск с публичным TLS:
+#   VEIL_PUBLIC_HOST=secret.erez.pro VEIL_TLS_EMAIL=admin@example.com \
+#     docker compose --profile proxy up -d
+#
+# Локальная разработка без TLS — используйте gateway напрямую
+# (http://localhost:9080), Caddy не нужен.
+
+{
+	# email для уведомлений Let's Encrypt о просроченных сертификатах
+	email {$VEIL_TLS_EMAIL}
+}
+
+{$VEIL_PUBLIC_HOST} {
+	encode zstd gzip
+
+	# Все эндпоинты gateway: лендинг (/), WebSocket (/ws),
+	# REST (/v1/*), health (/health), tus (/v1/uploads/*).
+	# WebSocket Caddy апгрейдит автоматически.
+	reverse_proxy gateway:8080 {
+		# уважаем X-Forwarded-* для IP-based rate-limit gateway-а
+		header_up X-Real-IP {remote_host}
+	}
+
+	header {
+		# минимальный security baseline; CSP уже задаётся в landing HTML
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options    "nosniff"
+		Referrer-Policy           "no-referrer"
+		# CORS для WebSocket-апгрейда уже включается в gateway,
+		# дополнительные origins прокидывайте через VEIL_WS_ORIGINS
+	}
+}

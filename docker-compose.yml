@@ -75,7 +75,33 @@ services:
     volumes:
       - ntfydata:/var/lib/ntfy
 
+  # Опциональный reverse-proxy для публичного домена с автоматическим
+  # TLS (Let's Encrypt). Включается через профиль:
+  #   VEIL_PUBLIC_HOST=secret.erez.pro VEIL_TLS_EMAIL=admin@example.com \
+  #     docker compose --profile proxy up -d
+  # Без VEIL_PUBLIC_HOST смысла поднимать нет — gateway уже доступен
+  # на :9080 для локальной разработки.
+  caddy:
+    image: caddy:2.8-alpine
+    profiles: ["proxy"]
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      VEIL_PUBLIC_HOST: "${VEIL_PUBLIC_HOST:-}"
+      VEIL_TLS_EMAIL:   "${VEIL_TLS_EMAIL:-}"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddydata:/data
+      - caddyconfig:/config
+    depends_on:
+      - gateway
+
 volumes:
   pgdata:
   ntfydata:
   uploadsdata:
+  caddydata:
+  caddyconfig:
