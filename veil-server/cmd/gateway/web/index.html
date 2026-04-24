@@ -1,0 +1,811 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="description" content="Veil — зашифрованный мессенджер. Крипто в Rust, ключи не выходят из памяти.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'">
+  <title>Veil</title>
+  <style>
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    :root {
+      --bg:            #0c0c12;
+      --island:        #13131c;
+      --island-2:      #1a1a26;
+      --border:        #22223a;
+      --border-hi:     #2e2e50;
+      --primary:       #7c6bf5;
+      --primary-dim:   rgba(124, 107, 245, 0.10);
+      --primary-glow:  rgba(124, 107, 245, 0.20);
+      --text:          #ededf0;
+      --muted:         #7a7a90;
+      --green:         #34d399;
+      --radius:        14px;
+    }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
+    }
+
+    /* ─── Noise texture overlay ─────────────────────────── */
+    body::before {
+      content: '';
+      position: fixed;
+      inset: 0;
+      background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ─── Hero glow ────────────────────────────────────── */
+    .hero-glow {
+      position: fixed;
+      top: -30vh;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 80vw;
+      height: 80vh;
+      background: radial-gradient(ellipse at 50% 20%, rgba(124, 107, 245, 0.15) 0%, transparent 70%);
+      pointer-events: none;
+      z-index: 0;
+    }
+
+    /* ─── Layout ───────────────────────────────────────── */
+    .page {
+      position: relative;
+      z-index: 1;
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* ─── Nav ──────────────────────────────────────────── */
+    nav {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 28px 0 0;
+    }
+
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+    }
+
+    .logo-icon {
+      width: 32px;
+      height: 32px;
+      background: var(--primary);
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      font-weight: 700;
+      color: #fff;
+      letter-spacing: -0.5px;
+      box-shadow: 0 0 20px rgba(124, 107, 245, 0.4);
+    }
+
+    .logo-text {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+      letter-spacing: 0.04em;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 24px;
+      align-items: center;
+    }
+
+    .nav-links a {
+      color: var(--muted);
+      text-decoration: none;
+      font-size: 14px;
+      transition: color 0.15s;
+    }
+
+    .nav-links a:hover { color: var(--text); }
+
+    /* ─── Hero ─────────────────────────────────────────── */
+    .hero {
+      text-align: center;
+      padding: 110px 0 80px;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--primary-dim);
+      border: 1px solid rgba(124, 107, 245, 0.25);
+      border-radius: 100px;
+      padding: 5px 14px;
+      font-size: 12px;
+      color: #a89cf7;
+      letter-spacing: 0.05em;
+      margin-bottom: 32px;
+    }
+
+    .hero-badge span { color: var(--green); font-size: 8px; }
+
+    .hero h1 {
+      font-size: clamp(48px, 8vw, 88px);
+      font-weight: 700;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      margin-bottom: 24px;
+      background: linear-gradient(160deg, #ffffff 30%, #9d8fff 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .hero p {
+      font-size: 17px;
+      color: var(--muted);
+      max-width: 480px;
+      margin: 0 auto 40px;
+      line-height: 1.65;
+    }
+
+    .hero p strong {
+      color: var(--text);
+      font-weight: 500;
+    }
+
+    .hero-actions {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 11px 22px;
+      border-radius: 10px;
+      font-size: 14px;
+      font-weight: 500;
+      text-decoration: none;
+      transition: all 0.15s;
+      cursor: pointer;
+      border: none;
+    }
+
+    .btn-primary {
+      background: var(--primary);
+      color: #fff;
+      box-shadow: 0 0 0 1px rgba(124, 107, 245, 0.3), 0 4px 24px rgba(124, 107, 245, 0.3);
+    }
+
+    .btn-primary:hover {
+      background: #8d7ef6;
+      box-shadow: 0 0 0 1px rgba(124, 107, 245, 0.5), 0 6px 32px rgba(124, 107, 245, 0.4);
+      transform: translateY(-1px);
+    }
+
+    .btn-ghost {
+      background: rgba(255,255,255,0.04);
+      color: var(--muted);
+      border: 1px solid var(--border);
+    }
+
+    .btn-ghost:hover {
+      background: rgba(255,255,255,0.07);
+      color: var(--text);
+      border-color: var(--border-hi);
+    }
+
+    /* ─── Section header ───────────────────────────────── */
+    .section-label {
+      font-size: 11px;
+      letter-spacing: 0.15em;
+      color: var(--primary);
+      text-transform: uppercase;
+      margin-bottom: 10px;
+      font-weight: 600;
+    }
+
+    .section-title {
+      font-size: 30px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 8px;
+    }
+
+    .section-sub {
+      font-size: 15px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    /* ─── Features grid ────────────────────────────────── */
+    .features {
+      padding: 60px 0 80px;
+    }
+
+    .features-header {
+      margin-bottom: 48px;
+    }
+
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 16px;
+    }
+
+    .feature-card {
+      background: var(--island);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+      transition: border-color 0.2s, background 0.2s;
+    }
+
+    .feature-card:hover {
+      border-color: var(--border-hi);
+      background: var(--island-2);
+    }
+
+    .feature-icon {
+      width: 40px;
+      height: 40px;
+      background: var(--primary-dim);
+      border: 1px solid rgba(124, 107, 245, 0.2);
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      margin-bottom: 16px;
+    }
+
+    .feature-card h3 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 6px;
+      letter-spacing: -0.01em;
+    }
+
+    .feature-card p {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .feature-card .tag {
+      display: inline-block;
+      font-size: 10px;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      background: rgba(0,0,0,0.3);
+      color: #9d8fff;
+      padding: 2px 7px;
+      border-radius: 4px;
+      margin-top: 10px;
+      border: 1px solid rgba(124, 107, 245, 0.2);
+    }
+
+    /* ─── Crypto details block ─────────────────────────── */
+    .crypto-section {
+      padding: 0 0 80px;
+    }
+
+    .crypto-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 40px;
+    }
+
+    @media (max-width: 600px) {
+      .crypto-grid { grid-template-columns: 1fr; }
+    }
+
+    .crypto-side {
+      background: var(--island);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+
+    .crypto-side h4 {
+      font-size: 13px;
+      color: var(--muted);
+      font-weight: 500;
+      margin-bottom: 14px;
+      letter-spacing: 0.02em;
+    }
+
+    .crypto-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 9px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+      font-size: 13px;
+    }
+
+    .crypto-row:last-child { border-bottom: none; }
+
+    .crypto-row .name { color: var(--muted); }
+    .crypto-row .value {
+      color: var(--text);
+      font-family: 'SF Mono', 'Fira Code', monospace;
+      font-size: 12px;
+    }
+
+    /* ─── Download section ─────────────────────────────── */
+    .downloads {
+      padding: 0 0 100px;
+    }
+
+    .download-note {
+      background: var(--island);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 28px 32px;
+      margin-top: 40px;
+      display: flex;
+      align-items: flex-start;
+      gap: 20px;
+    }
+
+    .download-note .note-icon {
+      font-size: 24px;
+      flex-shrink: 0;
+      margin-top: 2px;
+    }
+
+    .download-note h3 {
+      font-size: 15px;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .download-note p {
+      font-size: 13px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+
+    .download-note a {
+      color: #a89cf7;
+      text-decoration: none;
+    }
+
+    .download-note a:hover { color: var(--primary); text-decoration: underline; }
+
+    .platform-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+      margin-top: 32px;
+    }
+
+    .platform-card {
+      background: var(--island);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--text);
+      transition: border-color 0.15s, background 0.15s, transform 0.15s;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .platform-card:hover {
+      border-color: var(--border-hi);
+      background: var(--island-2);
+      transform: translateY(-2px);
+    }
+
+    .platform-card.wip {
+      opacity: 0.55;
+      cursor: default;
+    }
+
+    .platform-card.wip:hover { transform: none; }
+
+    .platform-card .plat-icon { font-size: 28px; }
+
+    .platform-card .plat-name {
+      font-size: 14px;
+      font-weight: 600;
+    }
+
+    .platform-card .plat-sub {
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .wip-badge {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(251, 191, 36, 0.12);
+      border: 1px solid rgba(251, 191, 36, 0.2);
+      color: #fbbf24;
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+
+    .ready-badge {
+      position: absolute;
+      top: 12px;
+      right: 12px;
+      background: rgba(52, 211, 153, 0.1);
+      border: 1px solid rgba(52, 211, 153, 0.2);
+      color: var(--green);
+      font-size: 10px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      font-weight: 500;
+    }
+
+    /* ─── Self-host section ────────────────────────────── */
+    .selfhost {
+      padding: 0 0 80px;
+    }
+
+    .code-block {
+      background: #0a0a10;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 18px 20px;
+      margin-top: 12px;
+      font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+      font-size: 13px;
+      line-height: 1.7;
+      overflow-x: auto;
+    }
+
+    .code-block .comment { color: #4a4a68; }
+    .code-block .cmd { color: #ededf0; }
+    .code-block .arg { color: #9d8fff; }
+
+    /* ─── Footer ───────────────────────────────────────── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 36px 0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 16px;
+    }
+
+    footer .copy {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    footer .links {
+      display: flex;
+      gap: 20px;
+    }
+
+    footer .links a {
+      font-size: 13px;
+      color: var(--muted);
+      text-decoration: none;
+      transition: color 0.15s;
+    }
+
+    footer .links a:hover { color: var(--text); }
+
+    /* ─── Divider ──────────────────────────────────────── */
+    .divider {
+      height: 1px;
+      background: var(--border);
+      margin: 0 0 80px;
+    }
+
+    /* ─── Responsive ───────────────────────────────────── */
+    @media (max-width: 600px) {
+      .hero { padding: 70px 0 60px; }
+      .hero h1 { font-size: 52px; }
+      nav { flex-wrap: wrap; gap: 16px; }
+      .download-note { flex-direction: column; }
+      footer { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <div class="hero-glow"></div>
+
+  <div class="page">
+
+    <!-- Nav -->
+    <nav>
+      <a href="/" class="logo">
+        <div class="logo-icon">V</div>
+        <span class="logo-text">Veil</span>
+      </a>
+      <div class="nav-links">
+        <a href="#features">Возможности</a>
+        <a href="#crypto">Крипто</a>
+        <a href="#download">Скачать</a>
+        <a href="https://github.com/NaveLIL/veil" target="_blank" rel="noopener">GitHub ↗</a>
+      </div>
+    </nav>
+
+    <!-- Hero -->
+    <section class="hero">
+      <div class="hero-badge">
+        <span>●</span> MIT License · Open Source
+      </div>
+      <h1>Veil</h1>
+      <p>
+        E2EE мессенджер. <strong>Вся крипто в Rust</strong> —
+        ключи не пересекают FFI-границу, не оседают в JS heap,
+        не видны серверу. Никогда.
+      </p>
+      <div class="hero-actions">
+        <a href="#download" class="btn btn-primary">
+          Скачать
+        </a>
+        <a href="https://github.com/NaveLIL/veil" target="_blank" rel="noopener" class="btn btn-ghost">
+          Исходники ↗
+        </a>
+      </div>
+    </section>
+
+    <!-- Features -->
+    <section class="features" id="features">
+      <div class="features-header">
+        <div class="section-label">Возможности</div>
+        <div class="section-title">Построен правильно с нуля</div>
+        <div class="section-sub">Переписан после того, как предыдущий вырос до 22k LOC монолита с криптой на TweetNaCl в JS.</div>
+      </div>
+
+      <div class="features-grid">
+
+        <div class="feature-card">
+          <div class="feature-icon">🔐</div>
+          <h3>End-to-end шифрование</h3>
+          <p>X3DH для установки сессии, Double Ratchet для forward secrecy, Sender Keys для больших групп. Всё как у Signal — только в Rust.</p>
+          <span class="tag">XChaCha20-Poly1305</span>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">🦀</div>
+          <h3>Крипто только в Rust</h3>
+          <p>Ни одной криптографической операции в JS или TypeScript. UI получает plaintext и метаданные — больше ничего. mlock() для страниц с ключами, zeroize on drop.</p>
+          <span class="tag">native FFI</span>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">📱</div>
+          <h3>Desktop + Mobile</h3>
+          <p>Tauri v2 для десктопа, React Native для мобильного. Единое ядро на Rust через UniFFI bidings для Kotlin и Swift.</p>
+          <span class="tag">Tauri · Expo</span>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">🔍</div>
+          <h3>Локальный поиск</h3>
+          <p>Tantivy индекс живёт только на устройстве. Поисковые запросы не уходят на сервер. Cmd-K палитра для быстрой навигации.</p>
+          <span class="tag">Tantivy 0.22</span>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">📁</div>
+          <h3>Файлы до 2 ГБ</h3>
+          <p>tus.io resumable загрузки. Файл шифруется до отправки — chunked AEAD с привязкой каждого чанка к индексу и финальному флагу. Сервер хранит opaque blob.</p>
+          <span class="tag">chunked AEAD</span>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">🔔</div>
+          <h3>Push без FCM</h3>
+          <p>UnifiedPush + self-hosted ntfy. Payload зашифрован, заполнен до 2 КБ, с jitter задержкой. Ntfy-оператор видит только размер и тайминг.</p>
+          <span class="tag">UnifiedPush · ntfy</span>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">🗂️</div>
+          <h3>Серверы и каналы</h3>
+          <p>Discord-стиль: серверы, каналы, роли, инвайты. Группы с Sender Keys. Зашифрованы так же как и DM — сервер не видит контент.</p>
+          <span class="tag">Sender Keys</span>
+        </div>
+
+        <div class="feature-card">
+          <div class="feature-icon">🔗</div>
+          <h3>Secure Share</h3>
+          <p>Ссылки с TTL и счётчиком просмотров. Расшифровка происходит прямо в браузере через минимальный WASM-модуль (~50 KB). Сервер не видит ключ.</p>
+          <span class="tag">WASM · Argon2id</span>
+        </div>
+
+      </div>
+    </section>
+
+    <div class="divider"></div>
+
+    <!-- Crypto -->
+    <section class="crypto-section" id="crypto">
+      <div class="section-label">Криптография</div>
+      <div class="section-title">Что под капотом</div>
+      <div class="section-sub">Каждый алгоритм выбран с учётом forward secrecy и минимального доверия к серверу.</div>
+
+      <div class="crypto-grid">
+        <div class="crypto-side">
+          <h4>Протокол</h4>
+          <div class="crypto-row">
+            <span class="name">Симметричное шифрование</span>
+            <span class="value">XChaCha20-Poly1305</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Key derivation</span>
+            <span class="value">HKDF-SHA256</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Password hashing</span>
+            <span class="value">Argon2id</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Key exchange</span>
+            <span class="value">X25519 ECDH</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Подписи</span>
+            <span class="value">Ed25519</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Сессия (DM)</span>
+            <span class="value">X3DH + Double Ratchet</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Группы (≤500)</span>
+            <span class="value">Sender Keys</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Идентичность</span>
+            <span class="value">BIP39 (12 слов)</span>
+          </div>
+        </div>
+
+        <div class="crypto-side">
+          <h4>Гарантии</h4>
+          <div class="crypto-row">
+            <span class="name">Forward secrecy</span>
+            <span class="value">Double Ratchet</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Post-compromise</span>
+            <span class="value">Ratchet heal</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Хранение seed</span>
+            <span class="value">OS Keychain</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">БД на клиенте</span>
+            <span class="value">SQLCipher</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Memory protection</span>
+            <span class="value">mlock + zeroize</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Push preview</span>
+            <span class="value">K_push ≠ ratchet</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Загрузки</span>
+            <span class="value">chunked AEAD</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Сервер видит</span>
+            <span class="value">только ciphertext</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <div class="divider"></div>
+
+    <!-- Download -->
+    <section class="downloads" id="download">
+      <div class="section-label">Скачать</div>
+      <div class="section-title">Клиенты</div>
+      <div class="section-sub">Проект в активной разработке. Исходники на GitHub, сборки публиковать буду по мере готовности.</div>
+
+      <div class="platform-grid">
+        <a href="https://github.com/NaveLIL/veil/releases" target="_blank" rel="noopener" class="platform-card">
+          <span class="platform-card placeholder ready-badge">soon</span>
+          <div class="plat-icon">🐧</div>
+          <div class="plat-name">Linux</div>
+          <div class="plat-sub">AppImage · .deb</div>
+        </a>
+
+        <a href="https://github.com/NaveLIL/veil/releases" target="_blank" rel="noopener" class="platform-card wip">
+          <span class="wip-badge">в разработке</span>
+          <div class="plat-icon">🍎</div>
+          <div class="plat-name">macOS</div>
+          <div class="plat-sub">.dmg · Apple Silicon</div>
+        </a>
+
+        <a href="https://github.com/NaveLIL/veil/releases" target="_blank" rel="noopener" class="platform-card wip">
+          <span class="wip-badge">в разработке</span>
+          <div class="plat-icon">🪟</div>
+          <div class="plat-name">Windows</div>
+          <div class="plat-sub">.msi · x64</div>
+        </a>
+
+        <a href="https://github.com/NaveLIL/veil/releases" target="_blank" rel="noopener" class="platform-card wip">
+          <span class="wip-badge">в разработке</span>
+          <div class="plat-icon">📱</div>
+          <div class="plat-name">Android</div>
+          <div class="plat-sub">APK · без FCM</div>
+        </a>
+      </div>
+
+      <div class="download-note">
+        <div class="note-icon">🔎</div>
+        <div>
+          <h3>Собрать самому</h3>
+          <p>
+            Всё в одном репозитории. Rust workspace + Go сервер + Tauri desktop.
+            Подробнее в <a href="https://github.com/NaveLIL/veil#readme" target="_blank" rel="noopener">README</a>.
+            Сервер поднимается одной командой через Docker Compose.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <div class="divider"></div>
+
+    <!-- Self-host -->
+    <section class="selfhost">
+      <div class="section-label">Self-host</div>
+      <div class="section-title">Свой сервер за 2 минуты</div>
+      <div class="section-sub">Docker Compose включает PostgreSQL, gateway, ntfy-distributor для push и Prometheus.</div>
+
+      <div class="code-block">
+        <div><span class="comment"># клонируем</span></div>
+        <div><span class="cmd">git clone</span> <span class="arg">https://github.com/NaveLIL/veil</span></div>
+        <div><span class="cmd">cd</span> <span class="arg">veil</span></div>
+        <br>
+        <div><span class="comment"># ключи для upload-токенов и push-шифрования</span></div>
+        <div><span class="cmd">export</span> <span class="arg">VEIL_UPLOAD_TOKEN_KEY</span>="$(openssl rand -base64 32)"</div>
+        <div><span class="cmd">export</span> <span class="arg">VEIL_PUSH_TRANSPORT_KEY</span>="$(openssl rand -base64 32)"</div>
+        <div><span class="cmd">export</span> <span class="arg">VEIL_PUSH_HASH_SALT</span>="&lt;уникальная строка для деплоя&gt;"</div>
+        <br>
+        <div><span class="cmd">docker compose up</span> <span class="arg">-d</span></div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer>
+      <div class="copy">Veil · MIT License · 2025–2026</div>
+      <div class="links">
+        <a href="https://github.com/NaveLIL/veil" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/NaveLIL/veil/blob/master/VEIL_DESIGN.md" target="_blank" rel="noopener">Архитектура</a>
+        <a href="/health">Health</a>
+      </div>
+    </footer>
+
+  </div><!-- .page -->
+</body>
+</html>

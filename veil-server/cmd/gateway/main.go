@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	_ "embed"
 	"log"
 	"log/slog"
 	"net/http"
@@ -23,6 +24,9 @@ import (
 	"github.com/AegisSec/veil-server/internal/servers"
 	"github.com/AegisSec/veil-server/internal/uploads"
 )
+
+//go:embed web/index.html
+var landingHTML []byte
 
 func main() {
 	// Switch to structured JSON logging via slog (consumed by httpmw.AccessLog).
@@ -126,6 +130,14 @@ func main() {
 	} else {
 		log.Printf("uploads disabled (set VEIL_UPLOAD_TOKEN_KEY to enable)")
 	}
+
+	// Landing page — served at the root so opening IP:port in a browser shows
+	// the project page instead of a blank 404.
+	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Write(landingHTML)
+	})
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
