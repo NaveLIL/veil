@@ -1,0 +1,41 @@
+# Лендинг индексировать можно. Всё остальное — нет.
+User-agent: *
+Allow: /$
+Allow: /privacy
+Allow: /terms
+Allow: /.well-known/security.txt
+Disallow: /downloads/
+Disallow: /v1/
+Disallow: /ws
+Disallow: /health
+Disallow: /tus/
+
+# Жадные SEO-боты, которые не уважают rate-limit и не несут пользы.
+User-agent: AhrefsBot
+Disallow: /
+
+User-agent: SemrushBot
+Disallow: /
+
+User-agent: MJ12bot
+Disallow: /
+
+User-agent: DotBot
+Disallow: /
+
+User-agent: PetalBot
+Disallow: /
+
+User-agent: Bytespider
+Disallow: /
+
+User-agent: GPTBot
+Disallow: /
+
+User-agent: CCBot
+Disallow: /
+
+User-agent: ClaudeBot
+Disallow: /
+
+Sitemap: https://secret.erez.pro/sitemap.xml

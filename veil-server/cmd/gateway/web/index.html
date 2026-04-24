@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="description" content="Veil — зашифрованный мессенджер. Крипто в Rust, ключи не выходят из памяти.">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'">
   <title>Veil</title>
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
@@ -784,9 +784,11 @@
 
     <!-- Footer -->
     <footer>
-      <div class="copy">Veil · MIT License · 2025–2026</div>
+      <div class="copy">Veil · MIT License · 2025–2026 · сервер в Финляндии</div>
       <div class="links">
-        <a href="/health">Health</a>
+        <a href="/privacy">Конфиденциальность</a>
+        <a href="/terms">Условия</a>
+        <a href="/.well-known/security.txt">Security</a>
       </div>
     </footer>
 

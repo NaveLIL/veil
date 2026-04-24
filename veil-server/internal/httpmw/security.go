@@ -19,8 +19,15 @@ func SecurityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cross-Origin-Resource-Policy", "same-site")
+		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		// HSTS — 1 year, includeSubDomains. nginx тоже его выставляет, но
+		// дублируем на случай прямого подключения по https.
+		h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		// API never needs to be embedded; deny all powerful browser APIs.
-		h.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=()")
+		h.Set("Permissions-Policy", "geolocation=(), microphone=(), camera=(), payment=(), usb=(), magnetometer=(), gyroscope=(), accelerometer=(), interest-cohort=()")
+		// Прячем технологический стек.
+		h.Del("Server")
+		h.Del("X-Powered-By")
 		next.ServeHTTP(w, r)
 	})
 }

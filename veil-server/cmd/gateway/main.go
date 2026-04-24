@@ -28,6 +28,24 @@ import (
 //go:embed web/index.html
 var landingHTML []byte
 
+//go:embed web/privacy.html
+var privacyHTML []byte
+
+//go:embed web/terms.html
+var termsHTML []byte
+
+//go:embed web/legal.css
+var legalCSS []byte
+
+//go:embed web/security.txt
+var securityTxt []byte
+
+//go:embed web/robots.txt
+var robotsTxt []byte
+
+//go:embed web/sitemap.xml
+var sitemapXML []byte
+
 func main() {
 	// Switch to structured JSON logging via slog (consumed by httpmw.AccessLog).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
@@ -139,6 +157,43 @@ func main() {
 		w.Write(landingHTML)
 	})
 
+	// Юридические страницы (RU). noindex для всех вариантов URL.
+	staticHTML := func(body []byte) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "public, max-age=3600")
+			w.Header().Set("X-Robots-Tag", "noindex")
+			w.Write(body)
+		}
+	}
+	mux.HandleFunc("GET /privacy", staticHTML(privacyHTML))
+	mux.HandleFunc("GET /privacy/", staticHTML(privacyHTML))
+	mux.HandleFunc("GET /terms", staticHTML(termsHTML))
+	mux.HandleFunc("GET /terms/", staticHTML(termsHTML))
+
+	mux.HandleFunc("GET /legal.css", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Write(legalCSS)
+	})
+
+	// RFC 9116 — security.txt по обоим путям (root + .well-known).
+	textPlain := func(body []byte) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.Header().Set("Cache-Control", "public, max-age=86400")
+			w.Write(body)
+		}
+	}
+	mux.HandleFunc("GET /.well-known/security.txt", textPlain(securityTxt))
+	mux.HandleFunc("GET /security.txt", textPlain(securityTxt))
+	mux.HandleFunc("GET /robots.txt", textPlain(robotsTxt))
+	mux.HandleFunc("GET /sitemap.xml", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=86400")
+		w.Write(sitemapXML)
+	})
+
 	// Release artifacts (.deb, .AppImage, SHA256SUMS, …). Path is configurable
 	// so production deploys can mount a volume instead of baking the binaries
 	// into the image. Returns 404 silently when the directory is missing.
@@ -153,6 +208,17 @@ func main() {
 		fs := http.FileServer(http.Dir(downloadsDir))
 		stripped := http.StripPrefix("/downloads/", fs)
 		mux.Handle("GET /downloads/", dlRL.Wrap(func(w http.ResponseWriter, r *http.Request) {
+			// Запрещаем directory listing — корневой /downloads/ и любые
+			// пути, заканчивающиеся на /, всегда дают 404.
+			if strings.HasSuffix(r.URL.Path, "/") {
+				http.NotFound(w, r)
+				return
+			}
+			// Не индексируем релизные бинарники в поисковиках и не даём
+			// браузерам отображать AppImage как HTML.
+			w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+			w.Header().Set("X-Content-Type-Options", "nosniff")
+			w.Header().Set("Content-Disposition", "attachment")
 			stripped.ServeHTTP(w, r)
 		}))
 		log.Printf("downloads served from %s", downloadsDir)
