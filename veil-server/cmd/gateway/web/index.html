@@ -546,7 +546,6 @@
         <a href="#features">Возможности</a>
         <a href="#crypto">Крипто</a>
         <a href="#download">Скачать</a>
-        <a href="https://github.com/NaveLIL/veil" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
     </nav>
 
@@ -565,8 +564,8 @@
         <a href="#download" class="btn btn-primary">
           Скачать
         </a>
-        <a href="https://github.com/NaveLIL/veil" target="_blank" rel="noopener" class="btn btn-ghost">
-          Исходники ↗
+        <a href="#crypto" class="btn btn-ghost">
+          Как устроено
         </a>
       </div>
     </section>
@@ -729,46 +728,45 @@
     <section class="downloads" id="download">
       <div class="section-label">Скачать</div>
       <div class="section-title">Клиенты</div>
-      <div class="section-sub">Проект в активной разработке. Исходники на GitHub, сборки публиковать буду по мере готовности.</div>
+      <div class="section-sub">Проект в активной разработке. Сборки появятся здесь по мере готовности.</div>
 
       <div class="platform-grid">
-        <a href="https://github.com/NaveLIL/veil/releases" target="_blank" rel="noopener" class="platform-card wip">
+        <div class="platform-card wip">
           <span class="wip-badge">скоро</span>
           <div class="plat-icon">🐧</div>
           <div class="plat-name">Linux</div>
           <div class="plat-sub">AppImage · .deb</div>
-        </a>
+        </div>
 
-        <a href="https://github.com/NaveLIL/veil/releases" target="_blank" rel="noopener" class="platform-card wip">
+        <div class="platform-card wip">
           <span class="wip-badge">в разработке</span>
           <div class="plat-icon">🍎</div>
           <div class="plat-name">macOS</div>
           <div class="plat-sub">.dmg · Apple Silicon</div>
-        </a>
+        </div>
 
-        <a href="https://github.com/NaveLIL/veil/releases" target="_blank" rel="noopener" class="platform-card wip">
+        <div class="platform-card wip">
           <span class="wip-badge">в разработке</span>
           <div class="plat-icon">🪟</div>
           <div class="plat-name">Windows</div>
           <div class="plat-sub">.msi · x64</div>
-        </a>
+        </div>
 
-        <a href="https://github.com/NaveLIL/veil/releases" target="_blank" rel="noopener" class="platform-card wip">
+        <div class="platform-card wip">
           <span class="wip-badge">в разработке</span>
           <div class="plat-icon">📱</div>
           <div class="plat-name">Android</div>
           <div class="plat-sub">APK · без FCM</div>
-        </a>
+        </div>
       </div>
 
       <div class="download-note">
-        <div class="note-icon">🔎</div>
+        <div class="note-icon">📬</div>
         <div>
-          <h3>Собрать самому</h3>
+          <h3>Хотите получить ранний доступ?</h3>
           <p>
-            Всё в одном репозитории. Rust workspace + Go сервер + Tauri desktop.
-            Подробнее в <a href="https://github.com/NaveLIL/veil#readme" target="_blank" rel="noopener">README</a>.
-            Сервер поднимается одной командой через Docker Compose.
+            Бета-сборки пока раздаются точечно. Если интересно потестировать
+            до публичного релиза — напишите на адрес из футера.
           </p>
         </div>
       </div>
@@ -776,32 +774,10 @@
 
     <div class="divider"></div>
 
-    <!-- Self-host -->
-    <section class="selfhost">
-      <div class="section-label">Self-host</div>
-      <div class="section-title">Свой сервер за 2 минуты</div>
-      <div class="section-sub">Docker Compose включает PostgreSQL, gateway, ntfy-distributor для push и Prometheus.</div>
-
-      <div class="code-block">
-        <div><span class="comment"># клонируем</span></div>
-        <div><span class="cmd">git clone</span> <span class="arg">https://github.com/NaveLIL/veil</span></div>
-        <div><span class="cmd">cd</span> <span class="arg">veil</span></div>
-        <br>
-        <div><span class="comment"># ключи для upload-токенов и push-шифрования</span></div>
-        <div><span class="cmd">export</span> <span class="arg">VEIL_UPLOAD_TOKEN_KEY</span>="$(openssl rand -base64 32)"</div>
-        <div><span class="cmd">export</span> <span class="arg">VEIL_PUSH_TRANSPORT_KEY</span>="$(openssl rand -base64 32)"</div>
-        <div><span class="cmd">export</span> <span class="arg">VEIL_PUSH_HASH_SALT</span>="&lt;уникальная строка для деплоя&gt;"</div>
-        <br>
-        <div><span class="cmd">docker compose up</span> <span class="arg">-d</span></div>
-      </div>
-    </section>
-
     <!-- Footer -->
     <footer>
       <div class="copy">Veil · MIT License · 2025–2026</div>
       <div class="links">
-        <a href="https://github.com/NaveLIL/veil" target="_blank" rel="noopener">GitHub</a>
-        <a href="https://github.com/NaveLIL/veil/blob/master/VEIL_DESIGN.md" target="_blank" rel="noopener">Архитектура</a>
         <a href="/health">Health</a>
       </div>
     </footer>
