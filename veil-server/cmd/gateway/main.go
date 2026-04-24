@@ -139,6 +139,21 @@ func main() {
 		w.Write(landingHTML)
 	})
 
+	// Release artifacts (.deb, .AppImage, SHA256SUMS, …). Path is configurable
+	// so production deploys can mount a volume instead of baking the binaries
+	// into the image. Returns 404 silently when the directory is missing.
+	downloadsDir := os.Getenv("VEIL_DOWNLOADS_DIR")
+	if downloadsDir == "" {
+		downloadsDir = "cmd/gateway/downloads"
+	}
+	if st, err := os.Stat(downloadsDir); err == nil && st.IsDir() {
+		fs := http.FileServer(http.Dir(downloadsDir))
+		mux.Handle("GET /downloads/", http.StripPrefix("/downloads/", fs))
+		log.Printf("downloads served from %s", downloadsDir)
+	} else {
+		log.Printf("downloads disabled (no directory at %s)", downloadsDir)
+	}
+
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)

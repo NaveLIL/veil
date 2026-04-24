@@ -728,15 +728,22 @@
     <section class="downloads" id="download">
       <div class="section-label">Скачать</div>
       <div class="section-title">Клиенты</div>
-      <div class="section-sub">Проект в активной разработке. Сборки появятся здесь по мере готовности.</div>
+      <div class="section-sub">Linux уже готов. Остальные платформы — на подходе.</div>
 
       <div class="platform-grid">
-        <div class="platform-card wip">
-          <span class="wip-badge">скоро</span>
+        <a class="platform-card" href="/downloads/Veil_0.1.0_amd64.deb" download>
+          <span class="ready-badge">.deb</span>
           <div class="plat-icon">🐧</div>
-          <div class="plat-name">Linux</div>
-          <div class="plat-sub">AppImage · .deb</div>
-        </div>
+          <div class="plat-name">Linux · Debian/Ubuntu</div>
+          <div class="plat-sub">Veil_0.1.0_amd64.deb · ~13&nbsp;МБ</div>
+        </a>
+
+        <a class="platform-card" href="/downloads/Veil_0.1.0_amd64.AppImage" download>
+          <span class="ready-badge">AppImage</span>
+          <div class="plat-icon">🐧</div>
+          <div class="plat-name">Linux · универсально</div>
+          <div class="plat-sub">Veil_0.1.0_amd64.AppImage · ~113&nbsp;МБ</div>
+        </a>
 
         <div class="platform-card wip">
           <span class="wip-badge">в разработке</span>
@@ -761,12 +768,13 @@
       </div>
 
       <div class="download-note">
-        <div class="note-icon">📬</div>
+        <div class="note-icon">🔐</div>
         <div>
-          <h3>Хотите получить ранний доступ?</h3>
+          <h3>Проверка целостности</h3>
           <p>
-            Бета-сборки пока раздаются точечно. Если интересно потестировать
-            до публичного релиза — напишите на адрес из футера.
+            SHA-256 хеши для всех релизов лежат рядом с бинарями:
+            <a href="/downloads/SHA256SUMS" style="color: var(--primary);">SHA256SUMS</a>.
+            Для macOS, Windows и Android сборки появятся по мере готовности.
           </p>
         </div>
       </div>

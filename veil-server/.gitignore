@@ -1,2 +1,10 @@
 /gateway
 /veil-gateway
+
+# Release artifacts are large (~13 MB .deb, ~113 MB .AppImage) — keep the
+# directory tracked (.gitkeep, SHA256SUMS, README) but ignore the binaries.
+cmd/gateway/downloads/*.deb
+cmd/gateway/downloads/*.AppImage
+cmd/gateway/downloads/*.dmg
+cmd/gateway/downloads/*.msi
+cmd/gateway/downloads/*.apk
