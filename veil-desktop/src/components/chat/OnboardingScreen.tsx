@@ -132,6 +132,9 @@ export const OnboardingScreen: Component = () => {
       appStore.uploadPrekeys();
       appStore.setScreen("disclaimer");
       appStore.connectToServer();
+      // Phase 6 — initialise the local MLS client so subsequent
+      // upgrade-to-MLS actions and persistence have a place to land.
+      appStore.bootstrapMls().catch(() => {});
 
       // Clear sensitive inputs only after successful identity initialization.
       setMnemonic("");

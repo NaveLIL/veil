@@ -23,6 +23,7 @@ veil-crypto = { path = "../../veil-crypto" }
 veil-store = { path = "../../veil-store" }
 veil-client = { path = "../../veil-client" }
 veil-search = { path = "../../veil-search" }
+veil-mls = { path = "../../veil-mls" }
 hex = "0.4"
 rand = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread"] }

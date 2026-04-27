@@ -135,6 +135,23 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
     scrollToBottom();
   });
 
+  // Phase 6 — make sure the MLS client is up so the chat header can
+  // render the upgrade affordance. bootstrapMls() is idempotent; this
+  // covers paths that didn't run it (e.g. dev hot-reload).
+  createEffect(() => {
+    if (!appStore.mlsReady() && appStore.identity()) {
+      appStore.bootstrapMls().catch(() => {});
+    }
+  });
+
+  // Refresh the cached crypto_mode whenever the active conversation changes
+  // — ChannelSidebar shortcuts can switch convs without going through
+  // appStore.selectConversation().
+  createEffect(() => {
+    const id = conv()?.id;
+    if (id) appStore.refreshCryptoMode(id);
+  });
+
   const handleSend = () => {
     const text = inputText().trim();
     if (!text) return;
@@ -192,12 +209,37 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
                 <div>
                   <h3 class="text-[13px] font-semibold text-foreground/90 leading-tight">{displayName()}</h3>
                   <div class="flex items-center gap-1.5 mt-0.5">
-                    <Lock class="h-2.5 w-2.5 text-muted-foreground/30" />
-                    <span class="text-[10px] text-muted-foreground/40">Encrypted</span>
+                    <Show
+                      when={appStore.cryptoModeByConv()[c().id] === "mls"}
+                      fallback={
+                        <>
+                          <Lock class="h-2.5 w-2.5 text-muted-foreground/30" />
+                          <span class="text-[10px] text-muted-foreground/40">Encrypted</span>
+                        </>
+                      }
+                    >
+                      <Lock class="h-2.5 w-2.5 text-emerald-400/80" />
+                      <span class="text-[10px] font-medium text-emerald-400/80">MLS · forward-secure</span>
+                    </Show>
                   </div>
                 </div>
               </div>
               <div class="flex items-center gap-1">
+                <Show when={appStore.cryptoModeByConv()[c().id] !== "mls"}>
+                  <Tooltip content="Upgrade this conversation to MLS (forward secrecy)">
+                    <button
+                      class="flex items-center gap-1.5 px-2.5 h-7 rounded-md text-[11px] font-medium text-emerald-400/90 hover:text-emerald-300 bg-emerald-500/[0.08] hover:bg-emerald-500/[0.14] border border-emerald-500/20 transition-all cursor-pointer"
+                      onClick={() => {
+                        appStore.upgradeConversationToMls(c().id).then((ok) => {
+                          if (!ok) console.warn("MLS upgrade failed for", c().id);
+                        });
+                      }}
+                    >
+                      <Lock class="h-3 w-3" />
+                      <span>Upgrade to MLS</span>
+                    </button>
+                  </Tooltip>
+                </Show>
                 <Show when={!isChannel()}>
                   <Tooltip content="Voice call">
                     <button class="flex items-center justify-center w-8 h-8 rounded-lg text-muted-foreground/40 hover:text-foreground hover:bg-white/[0.05] transition-all cursor-pointer">

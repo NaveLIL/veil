@@ -311,6 +311,25 @@ type PushNotifier interface {
 // Safe to call before Run; not safe to swap mid-flight.
 func (h *Hub) SetPushNotifier(n PushNotifier) { h.pushNotifier = n }
 
+// NotifyMLSWelcome implements mls.Fanout. Phase 6 stub: a richer
+// real-time signal (new envelope variant or a dedicated WS event
+// channel) is tracked in INTEGRATION_ROADMAP.md. Today, recipients
+// discover queued welcomes by polling GET /v1/mls/welcomes on
+// reconnect, so this method intentionally no-ops at the wire level
+// while keeping a structured log entry for observability.
+func (h *Hub) NotifyMLSWelcome(recipientUserID, conversationID, welcomeID string) {
+	log.Printf("mls: queued welcome user=%s conv=%s id=%s",
+		recipientUserID, conversationID, welcomeID)
+}
+
+// NotifyMLSCommit implements mls.Fanout. Same caveat as
+// NotifyMLSWelcome: clients fetch via GET /v1/mls/commits/{id}?after_epoch=N
+// on reconnect or after each accepted commit. Logged for ops visibility.
+func (h *Hub) NotifyMLSCommit(conversationID string, epoch uint64, senderUserID string) {
+	log.Printf("mls: committed conv=%s epoch=%d sender=%s",
+		conversationID, epoch, senderUserID)
+}
+
 // fanoutMessageEvent dispatches a freshly produced MessageEvent to
 // every recipient. Recipients with at least one live WS session
 // receive the envelope through the regular send queue; recipients with

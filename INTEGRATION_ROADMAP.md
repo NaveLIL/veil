@@ -14,7 +14,7 @@
 | 4 | UnifiedPush / ntfy | сервер готов, мобильный клиент отложен |
 | 4A | Группы, серверы, роли | готово |
 | 5 | Мобильный UI | не начато |
-| 6 | OpenMLS | не начато |
+| 6 | OpenMLS | в работе (фундамент готов) |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | не начато |
 
@@ -171,6 +171,23 @@ Migration plan:
 - KeyPackage exhaustion: автопополнение при < 10 штук, иначе новые разговоры молча ломаются
 - Per-device leaf: каждое устройство — отдельный лист в дереве. Добавить новое устройство = Add commit. Не путать user и device
 - Migration determinism: "Upgrade to MLS" должен дать одинаковый результат независимо от того кто его нажал; порядок по user_id + server-assigned migration epoch
+
+### Что уже сделано (фундамент)
+
+- `veil-mls` crate (openmls 0.7.4): `MlsClient` с операциями create/restore, `generate_key_package`, `create_group`, `add_member`, `process_welcome`, `process_commit`, `encrypt`, `decrypt`, `export_secret`, `epoch`. Cipher suite зафиксирован константой. 2-сторонний round-trip тест проходит.
+- SQLCipher миграция (`veil-store/src/db.rs`): таблицы `mls_signer`, `mls_key_packages_local`, `mls_state` + колонка `conversations.crypto_mode` (через `ALTER ADD COLUMN`, идемпотентно).
+- PostgreSQL миграция `008_mls.sql`: колонка `crypto_mode` с CHECK-констрейнтом, таблицы `mls_key_packages`, `mls_welcomes`, `mls_commits` с индексами и наглядным TTL-планом.
+- Серверный пакет `internal/mls`: `Store` (батчевая публикация KP, атомарный consume через `DELETE … FOR UPDATE SKIP LOCKED`, append-only лог commits с `ErrEpochConflict` на 23505) и `Handler` с REST: `POST /v1/mls/keypackages`, `GET …/count`, `GET …/{user}/{device}`, `POST/GET/DELETE /v1/mls/welcomes`, `POST /v1/mls/commits`, `GET /v1/mls/commits/{conv}?after_epoch=N`. Интеграция с подписной middleware (`X-Veil-User/Timestamp/Signature`).
+- Hub реализует `mls.Fanout` (стабы с slog) — клиенты пока подбирают welcomes/commits через REST на reconnect; перевод на отдельный envelope-вариант WS — следующий шаг.
+
+### Что осталось
+
+- HTTP-клиент в `veil-client` для подписанных REST-запросов к `/v1/mls/*` (сейчас клиент целиком работает поверх WS protobuf).
+- Адаптер `MlsKeyStore` поверх `VeilDb` (сохранение `SignatureKeyPair` в SQLCipher).
+- Ветвление `send_text`/`receive` в `veil-client/src/api.rs` по `crypto_mode` разговора.
+- Tauri-команды `mls_create_group`, `mls_add_member`, `mls_upgrade_group` + UI-индикатор «MLS active» и кнопка «Upgrade to MLS» в настройках группы.
+- Полноценный WS-канал `mls.welcome`/`mls.commit` (новый вариант `pb.Envelope`) вместо текущего log-стаба.
+- Интеграционные тесты: catch-up Charlie оффлайн, авто-пополнение KP при count < 10, упорядоченное применение commits на трёх устройствах.
 
 ---
 

@@ -8,5 +8,6 @@ members = [
     "veil-share-viewer",
     "veil-search",
     "veil-uploads",
+    "veil-mls",
 ]
 resolver = "2"

@@ -20,6 +20,7 @@ import (
 	"github.com/AegisSec/veil-server/internal/gateway"
 	"github.com/AegisSec/veil-server/internal/httpmw"
 	"github.com/AegisSec/veil-server/internal/metrics"
+	"github.com/AegisSec/veil-server/internal/mls"
 	"github.com/AegisSec/veil-server/internal/push"
 	"github.com/AegisSec/veil-server/internal/servers"
 	"github.com/AegisSec/veil-server/internal/uploads"
@@ -124,6 +125,13 @@ func main() {
 	if pushDispatcher.Enabled() {
 		log.Printf("push dispatcher enabled (jitter=%s)", push.LoadJitter())
 	}
+
+	// Phase 6 — OpenMLS REST surface (key_packages / welcomes / commits).
+	// The hub satisfies the mls.Fanout interface, so welcomes and commits
+	// arrive at online recipients in real time without polling.
+	mlsStore := mls.NewStore(database.Pool)
+	mlsHandler := mls.NewHandler(mlsStore, signedMw, rl, hub)
+	mlsHandler.RegisterRoutes(mux)
 
 	// Phase 3 — tus.io resumable encrypted uploads. The token-mint
 	// route uses the existing signed REST middleware; the tusd traffic

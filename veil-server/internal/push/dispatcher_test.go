@@ -1,5 +1,4 @@
 package push
-package push
 
 import (
 	"context"
@@ -14,11 +13,11 @@ import (
 )
 
 type fakeStore struct {
-	mu       sync.Mutex
-	subs     []Subscription
-	deleted  []string
-	touched  []int64
-	listErr  error
+	mu      sync.Mutex
+	subs    []Subscription
+	deleted []string
+	touched []int64
+	listErr error
 }
 
 func (f *fakeStore) ListPushSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
@@ -151,9 +150,9 @@ func TestDispatcher_PrunesGoneEndpoints(t *testing.T) {
 
 func TestRedact_StripsPath(t *testing.T) {
 	cases := map[string]string{
-		"https://ntfy.sh/topic-secret":       "https://ntfy.sh/…",
-		"http://localhost:9081/abc":          "http://localhost:9081/…",
-		"http://no-path":                     "http://no-path",
+		"https://ntfy.sh/topic-secret": "https://ntfy.sh/…",
+		"http://localhost:9081/abc":    "http://localhost:9081/…",
+		"http://no-path":               "http://no-path",
 	}
 	for in, want := range cases {
 		if got := redact(in); got != want {

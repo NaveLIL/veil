@@ -212,9 +212,193 @@ impl VeilDb {
                 role_ids     TEXT NOT NULL DEFAULT '[]',  -- JSON array
                 joined_at    TEXT NOT NULL,
                 PRIMARY KEY (server_id, user_id)
+            );
+
+            -- ─── Phase 6: OpenMLS support ─────────────────────
+            -- Long-lived signature keypair (TLS-encoded SignatureKeyPair).
+            CREATE TABLE IF NOT EXISTS mls_signer (
+                leaf       BLOB PRIMARY KEY,
+                blob       BLOB NOT NULL,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- Locally generated KeyPackages awaiting publication / consumption.
+            -- After server confirms publish we set published=1; after the
+            -- server hands one out to a peer the peer's Welcome arrives and
+            -- the local copy is deleted (private state already inside openmls).
+            CREATE TABLE IF NOT EXISTS mls_key_packages_local (
+                id         TEXT PRIMARY KEY,
+                kp_blob    BLOB NOT NULL,
+                published  INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- Cached current epoch per MLS group, for cheap UI lookups.
+            CREATE TABLE IF NOT EXISTS mls_state (
+                group_id   BLOB PRIMARY KEY,
+                epoch      INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- Opaque byte snapshot of the openmls in-memory storage
+            -- (all groups, secrets and key material owned by this leaf).
+            -- Encrypted at rest by SQLCipher.
+            CREATE TABLE IF NOT EXISTS mls_provider_snapshot (
+                leaf       BLOB PRIMARY KEY,
+                snapshot   BLOB NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );",
             )
-            .map_err(|e| format!("migrations: {e}"))
+            .map_err(|e| format!("migrations: {e}"))?;
+
+        // Add `crypto_mode` to conversations if missing. Older DBs created
+        // before Phase 6 don't have this column. SQLite has no
+        // `ADD COLUMN IF NOT EXISTS`, so we attempt and ignore the error.
+        let _ = self.conn.execute_batch(
+            "ALTER TABLE conversations ADD COLUMN crypto_mode TEXT NOT NULL DEFAULT 'sender_key';",
+        );
+
+        Ok(())
+    }
+
+    // ─── CRUD: MLS ────────────────────────────────────────
+
+    pub fn mls_save_signer(&self, leaf: &[u8], blob: &[u8]) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO mls_signer (leaf, blob) VALUES (?1, ?2)
+                 ON CONFLICT(leaf) DO UPDATE SET blob = excluded.blob",
+                rusqlite::params![leaf, blob],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("mls_save_signer: {e}"))
+    }
+
+    pub fn mls_load_signer(&self, leaf: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        self.conn
+            .query_row(
+                "SELECT blob FROM mls_signer WHERE leaf = ?1",
+                rusqlite::params![leaf],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(format!("mls_load_signer: {other}")),
+            })
+    }
+
+    /// Persist an opaque storage snapshot for the given leaf identity.
+    /// Bytes are produced by `MlsClient::snapshot()` and contain raw
+    /// key material — only safe at rest because the SQLCipher database
+    /// is encrypted with the user's identity key.
+    pub fn mls_save_snapshot(&self, leaf: &[u8], snapshot: &[u8]) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO mls_provider_snapshot (leaf, snapshot) VALUES (?1, ?2)
+                 ON CONFLICT(leaf) DO UPDATE SET
+                    snapshot = excluded.snapshot,
+                    updated_at = datetime('now')",
+                rusqlite::params![leaf, snapshot],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("mls_save_snapshot: {e}"))
+    }
+
+    /// Load the most recent snapshot for the given leaf identity, if any.
+    pub fn mls_load_snapshot(&self, leaf: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        self.conn
+            .query_row(
+                "SELECT snapshot FROM mls_provider_snapshot WHERE leaf = ?1",
+                rusqlite::params![leaf],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(format!("mls_load_snapshot: {other}")),
+            })
+    }
+
+    pub fn mls_insert_local_kp(&self, id: &str, kp_blob: &[u8]) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO mls_key_packages_local (id, kp_blob) VALUES (?1, ?2)",
+                rusqlite::params![id, kp_blob],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("mls_insert_local_kp: {e}"))
+    }
+
+    pub fn mls_count_unpublished_kp(&self) -> Result<u32, String> {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM mls_key_packages_local WHERE published = 0",
+                [],
+                |row| row.get::<_, u32>(0),
+            )
+            .map_err(|e| format!("mls_count_unpublished_kp: {e}"))
+    }
+
+    pub fn mls_mark_published(&self, id: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE mls_key_packages_local SET published = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("mls_mark_published: {e}"))
+    }
+
+    pub fn mls_set_state(&self, group_id: &[u8], epoch: u64) -> Result<(), String> {
+        self.conn
+            .execute(
+                "INSERT INTO mls_state (group_id, epoch) VALUES (?1, ?2)
+                 ON CONFLICT(group_id) DO UPDATE SET
+                    epoch = excluded.epoch,
+                    updated_at = datetime('now')",
+                rusqlite::params![group_id, epoch as i64],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("mls_set_state: {e}"))
+    }
+
+    pub fn mls_get_epoch(&self, group_id: &[u8]) -> Result<Option<u64>, String> {
+        self.conn
+            .query_row(
+                "SELECT epoch FROM mls_state WHERE group_id = ?1",
+                rusqlite::params![group_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|v| Some(v as u64))
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(format!("mls_get_epoch: {other}")),
+            })
+    }
+
+    pub fn set_conversation_crypto_mode(&self, conv_id: &str, mode: &str) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE conversations SET crypto_mode = ?2 WHERE id = ?1",
+                rusqlite::params![conv_id, mode],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("set_conversation_crypto_mode: {e}"))
+    }
+
+    pub fn get_conversation_crypto_mode(&self, conv_id: &str) -> Result<Option<String>, String> {
+        self.conn
+            .query_row(
+                "SELECT crypto_mode FROM conversations WHERE id = ?1",
+                rusqlite::params![conv_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(format!("get_conversation_crypto_mode: {other}")),
+            })
     }
 
     /// Get a reference to the underlying connection (for advanced queries).

@@ -10,6 +10,9 @@ use veil_client::connection::ConnectionEvent;
 use veil_search::{Indexer, SearchHit};
 use veil_store::keychain;
 
+mod mls_cmd;
+use mls_cmd::MlsState;
+
 struct AppState {
     client: Mutex<VeilClient>,
     runtime: tokio::runtime::Runtime,
@@ -21,6 +24,8 @@ struct AppState {
     http: reqwest::Client,
     /// Local-only full-text index. Initialised lazily in `setup`.
     indexer: Arc<Indexer>,
+    /// Phase 6 — OpenMLS session state. Lazily initialised by `mls_init`.
+    mls: MlsState,
 }
 
 const KEYCHAIN_ACCOUNT: &str = "veil-default";
@@ -1861,6 +1866,43 @@ fn rotate_sender_key(
     client.rotate_sender_key(&conversation_id)
 }
 
+// ─── Phase 6: per-conversation crypto mode ───────────
+
+/// Read the cached `crypto_mode` for a conversation. Returns
+/// `"sender_key"` if missing or unset (default for legacy conversations).
+#[tauri::command]
+fn get_conversation_crypto_mode(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<String, String> {
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let mode = client
+        .db()
+        .ok_or_else(|| "db not initialised".to_string())?
+        .get_conversation_crypto_mode(&conversation_id)?
+        .unwrap_or_else(|| "sender_key".to_string());
+    Ok(mode)
+}
+
+/// Update the `crypto_mode` for a conversation. Accepts only
+/// `"sender_key"` or `"mls"`; the UI uses this as a marker so the chat
+/// header can render the "MLS active" badge after a successful upgrade.
+#[tauri::command]
+fn set_conversation_crypto_mode(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    mode: String,
+) -> Result<(), String> {
+    if mode != "sender_key" && mode != "mls" {
+        return Err(format!("unknown crypto mode: {mode}"));
+    }
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    client
+        .db()
+        .ok_or_else(|| "db not initialised".to_string())?
+        .set_conversation_crypto_mode(&conversation_id, &mode)
+}
+
 // ─── Friends & Presence ───────────────────────────────
 
 #[tauri::command]
@@ -2076,6 +2118,7 @@ pub fn run() {
                     .build()
                     .expect("reqwest client"),
                 indexer,
+                mls: MlsState::new(),
             });
             // System tray with menu
             let show = MenuItem::with_id(app, "show", "Show Veil", true, None::<&str>)?;
@@ -2201,6 +2244,19 @@ pub fn run() {
             hydrate_channel_sender_keys,
             distribute_sender_key,
             rotate_sender_key,
+            get_conversation_crypto_mode,
+            set_conversation_crypto_mode,
+            mls_cmd::mls_init,
+            mls_cmd::mls_ready,
+            mls_cmd::mls_generate_key_packages,
+            mls_cmd::mls_create_group,
+            mls_cmd::mls_add_member,
+            mls_cmd::mls_process_welcome,
+            mls_cmd::mls_process_commit,
+            mls_cmd::mls_encrypt,
+            mls_cmd::mls_decrypt,
+            mls_cmd::mls_epoch,
+            mls_cmd::mls_export_secret,
         ])
         .run(tauri::generate_context!())
         .expect("error while running veil");

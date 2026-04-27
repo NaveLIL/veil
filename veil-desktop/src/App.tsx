@@ -289,6 +289,9 @@ const App: Component = () => {
         if (!hasPin) {
           await appStore.loadConversations();
           await appStore.connectToServer();
+          // Phase 6 — bring up the MLS client (restores prior groups
+          // from SQLCipher snapshot if any). Fire-and-forget.
+          appStore.bootstrapMls().catch(() => {});
         }
       }
     } catch { appStore.setScreen("onboarding"); }

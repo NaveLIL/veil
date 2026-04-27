@@ -129,6 +129,15 @@ const [friendRequests, setFriendRequests] = createSignal<FriendRequest[]>([]);
 const [presenceMap, setPresenceMap] = createSignal<Record<string, number>>({});
 // identityKey → status
 
+// Phase 6 — per-conversation crypto mode cache. The chat header reads
+// from this signal to render the "MLS" badge instead of the legacy
+// "Encrypted" label. Populated lazily on conversation activation and
+// after a successful upgrade-to-MLS flow.
+const [cryptoModeByConv, setCryptoModeByConv] = createSignal<Record<string, "sender_key" | "mls">>({});
+// Whether the local MLS client (mls_init) has been initialised this
+// session. Driven by `bootstrapMls()` after identity init.
+const [mlsReady, setMlsReady] = createSignal(false);
+
 const AUTO_LOCK_SECONDS = 300; // 5 minutes
 let autoLockTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -231,6 +240,8 @@ export const appStore = {
   friends,
   friendRequests,
   presenceMap,
+  cryptoModeByConv,
+  mlsReady,
 
   activeConversation: () => {
     const id = activeConversationId();
@@ -260,6 +271,8 @@ export const appStore = {
     setActiveServerId(null);
     setActiveChannelId(null);
     setActiveConversationId(id);
+    // Lazily resolve crypto_mode for the chat header badge.
+    appStore.refreshCryptoMode(id);
   },
 
   addMessage: (msg: Message) => {
@@ -535,6 +548,9 @@ export const appStore = {
         if (!connected()) {
           appStore.connectToServer();
         }
+        // Phase 6: bring up the MLS client (restores prior groups
+        // from SQLCipher snapshot if any).
+        appStore.bootstrapMls().catch(() => {});
         // First-launch backfill of the local search index. Idempotent: backend
         // marks itself "done" and no-ops on subsequent launches.
         invoke<number>("ensure_search_backfill")
@@ -1652,5 +1668,76 @@ export const appStore = {
         }
       }
     });
+  },
+
+  // ─── Phase 6: OpenMLS orchestration ────────────────
+
+  /** Initialise the local MLS client. The leaf identity is derived
+   *  from the user's identity key + a fixed device label so the same
+   *  device gets the same MLS leaf across restarts (signer + group
+   *  state are restored from SQLCipher).
+   *
+   *  Idempotent: safe to call multiple times. Returns the hex-encoded
+   *  Ed25519 public signature key (or null on failure). */
+  bootstrapMls: async (): Promise<string | null> => {
+    try {
+      const ident = identity();
+      if (!ident) return null;
+      // The desktop binds one MLS leaf per device. We don't currently
+      // enumerate physical devices, so use a stable label.
+      const leafSeed = `${ident}::desktop`;
+      // Hash to 32 bytes via SubtleCrypto (SHA-256 is fine — leaf is
+      // an opaque identifier, not a credential).
+      const enc = new TextEncoder().encode(leafSeed);
+      const digest = await crypto.subtle.digest("SHA-256", enc);
+      const leafHex = Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
+      console.log("[veil-mls] invoking mls_init, leaf=", leafHex.slice(0, 8) + "…");
+      const pub = await invoke<string>("mls_init", { leafIdentityHex: leafHex });
+      console.log("[veil-mls] mls_init OK, pubkey=", pub.slice(0, 8) + "…");
+      setMlsReady(true);
+      return pub;
+    } catch (e) {
+      console.error("[veil-mls] bootstrap failed:", String(e));
+      setMlsReady(false);
+      return null;
+    }
+  },
+
+  /** Refresh the cached crypto_mode for a single conversation. */
+  refreshCryptoMode: async (conversationId: string): Promise<void> => {
+    try {
+      const mode = await invoke<string>("get_conversation_crypto_mode", { conversationId });
+      const normalized: "sender_key" | "mls" = mode === "mls" ? "mls" : "sender_key";
+      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: normalized }));
+    } catch (e) {
+      // Fall back to the legacy default — not fatal.
+      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: "sender_key" }));
+    }
+  },
+
+  /** Mark a conversation as MLS-encrypted in the local DB. Currently a
+   *  shallow flag — full upgrade-to-MLS over the network (KP fetch,
+   *  Welcome publication, commit broadcast) is implemented in a
+   *  follow-up; this lets the UI badge transition independently for
+   *  validation. */
+  upgradeConversationToMls: async (conversationId: string): Promise<boolean> => {
+    if (!mlsReady()) {
+      console.warn("upgradeConversationToMls: MLS not initialised; calling bootstrapMls first");
+      const pub = await appStore.bootstrapMls();
+      if (!pub) return false;
+    }
+    try {
+      // Group ID == hex(uuid bytes) — matches mls_create_group's contract.
+      const uuidHex = conversationId.replace(/-/g, "");
+      await invoke<number>("mls_create_group", { groupIdHex: uuidHex });
+      await invoke("set_conversation_crypto_mode", { conversationId, mode: "mls" });
+      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: "mls" }));
+      return true;
+    } catch (e) {
+      console.error("upgradeConversationToMls failed:", e);
+      return false;
+    }
   },
 };
