@@ -5,13 +5,24 @@
     "module": "commonjs",
     "moduleResolution": "bundler",
     "jsx": "react-jsx",
-    "lib": ["es2021"],
+    "lib": [
+      "es2021"
+    ],
     "skipLibCheck": true,
     "paths": {
-      "@/*": ["./src/*"]
+      "@/*": [
+        "./src/*"
+      ]
     },
     "baseUrl": "."
   },
-  "include": ["src", "index.ts", "App.tsx"],
-  "exclude": ["node_modules"]
+  "include": [
+    "src",
+    "index.ts",
+    "App.tsx"
+  ],
+  "exclude": [
+    "node_modules"
+  ],
+  "extends": "expo/tsconfig.base"
 }

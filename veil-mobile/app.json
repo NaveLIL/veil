@@ -4,7 +4,6 @@
     "slug": "veil",
     "version": "0.1.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
     "newArchEnabled": true,
     "scheme": "veil",
@@ -14,13 +13,19 @@
     },
     "android": {
       "package": "io.veil.mobile",
-      "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#0a0a0f"
-      }
+      "edgeToEdgeEnabled": true
     },
+    "androidStatusBar": {
+      "translucent": true,
+      "barStyle": "light-content"
+    },
+    "androidNavigationBar": {
+      "barStyle": "light-content"
+    },
+    "backgroundColor": "#111117",
     "plugins": [
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-system-ui"
     ]
   }
 }
