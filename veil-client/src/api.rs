@@ -15,6 +15,7 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSec
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::connection::{ConfirmedMutation, Connection, ConnectionConfig, ConnectionEvent};
+use crate::device_identity::DeviceIdentityV1;
 use crate::protocol::proto;
 
 // Wire header type tags
@@ -47,6 +48,16 @@ impl Drop for PendingOutgoingMessage {
     fn drop(&mut self) {
         self.plaintext.zeroize();
     }
+}
+
+/// Exact routing scope of one sealed Sender-Key distribution. The current
+/// protocol seals to a user's identity key; once independent device identities
+/// land, the target device binding must become part of this key as well.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct PendingSenderKeyEnvelopeKey {
+    conversation_id: String,
+    generation: u32,
+    target_identity_key: [u8; 32],
 }
 
 struct ReceiveCryptoSnapshot {
@@ -156,6 +167,21 @@ pub enum RemoteReconcileAction {
     SelfStateOnly,
 }
 
+/// Describes whether restoring Sender-Key state from durable storage already
+/// performed the mandatory fresh-generation transition for an offline sync.
+/// The desktop orchestration carries this value through backlog processing so
+/// distribution cannot accidentally rotate the same conversation twice.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OfflineSenderKeyRefresh {
+    /// No cold-restored outgoing generation was rotated. Offline sync must
+    /// create one fresh generation before distributing it to the live roster.
+    Required,
+    /// A persisted outgoing generation was restored and immediately rotated.
+    /// Distribution must reuse that fresh, still-pending generation.
+    AlreadyRotated,
+}
+
 /// Prekey set generated for uploading to the server.
 pub struct PreKeySet {
     pub spk_public: [u8; 32],
@@ -171,6 +197,9 @@ pub struct PreKeySet {
 /// Crypto operations happen in Rust, never exposed to UI layer.
 pub struct VeilClient {
     identity: Option<IdentityKeyPair>,
+    /// Independent per-install keypair loaded only after SQLCipher unlock.
+    /// It is deliberately not exposed through the renderer-facing API.
+    device_identity: Option<DeviceIdentityV1>,
     db: Option<VeilDb>,
     connection: Option<Connection>,
     /// Non-control events observed while installing the authenticated retained
@@ -213,7 +242,11 @@ pub struct VeilClient {
     /// Channels whose fresh outgoing key has not yet been delivered to the
     /// complete current member set. Sending remains blocked while present.
     sender_key_distribution_pending: HashSet<String>,
-    pending_sender_key_sequences: HashMap<u64, String>,
+    pending_sender_key_sequences: HashMap<u64, PendingSenderKeyEnvelopeKey>,
+    /// Process-local mirror of the SQLCipher exact-retry cache. Rows are
+    /// written durably before the first network send and survive transport
+    /// loss; this map also gives no-database test/embedded clients safe retry.
+    pending_sender_key_envelopes: HashMap<PendingSenderKeyEnvelopeKey, Vec<u8>>,
     failed_sender_key_distributions: HashSet<String>,
     /// Optional local-only full-text index. Index calls are best-effort and never fatal.
     indexer: Option<Arc<Indexer>>,
@@ -255,6 +288,7 @@ impl VeilClient {
         let device_id = random_device_id();
         Self {
             identity: None,
+            device_identity: None,
             db: None,
             connection: None,
             deferred_connection_events: VecDeque::new(),
@@ -277,6 +311,7 @@ impl VeilClient {
             authorized_conversation_senders: HashMap::new(),
             sender_key_distribution_pending: HashSet::new(),
             pending_sender_key_sequences: HashMap::new(),
+            pending_sender_key_envelopes: HashMap::new(),
             failed_sender_key_distributions: HashSet::new(),
             indexer: None,
         }
@@ -287,6 +322,7 @@ impl VeilClient {
         let device_id = random_device_id();
         Self {
             identity: Some(identity),
+            device_identity: None,
             db: None,
             connection: None,
             deferred_connection_events: VecDeque::new(),
@@ -309,6 +345,7 @@ impl VeilClient {
             authorized_conversation_senders: HashMap::new(),
             sender_key_distribution_pending: HashSet::new(),
             pending_sender_key_sequences: HashMap::new(),
+            pending_sender_key_envelopes: HashMap::new(),
             failed_sender_key_distributions: HashSet::new(),
             indexer: None,
         }
@@ -343,7 +380,25 @@ impl VeilClient {
 
         let db_key = Zeroizing::new(kdf::derive_db_key(mnemonic)?);
         let db = VeilDb::open(db_path, &db_key)?;
+        db.recover_unacknowledged_outgoing_messages()?;
         self.device_id = db.get_or_create_device_id(self.device_id)?;
+        let stored_device_identity = match db.load_device_identity_v1()? {
+            Some(stored) => stored,
+            None => {
+                // Legacy migration happens here, after the mnemonic-derived
+                // SQLCipher key has unlocked the DB and the account signer is
+                // resident in native Rust. Schema migration alone never
+                // creates or signs device credentials.
+                let generated = DeviceIdentityV1::generate_stored(&identity, self.device_id)?;
+                db.create_device_identity_v1(&generated)?;
+                db.load_device_identity_v1()?
+                    .ok_or("device identity creation committed no durable row")?
+            }
+        };
+        let device_identity = DeviceIdentityV1::from_stored(&identity, stored_device_identity)?;
+        if device_identity.binding().device_id != self.device_id {
+            return Err("device binding does not match the stable installation id".to_string());
+        }
 
         self.zeroize_prekey_secrets();
         for mut prekey in db.load_local_prekeys()? {
@@ -416,6 +471,7 @@ impl VeilClient {
             self.pending_initial_headers.insert(peer, header);
         }
 
+        self.device_identity = Some(device_identity);
         self.identity = Some(identity);
         self.db = Some(db);
         Ok(())
@@ -529,12 +585,16 @@ impl VeilClient {
     /// Returns the server-assigned user_id (UUID).
     pub async fn connect(&mut self, server_url: &str) -> Result<String, String> {
         let identity = self.identity.as_ref().ok_or("not initialized")?;
+        let device_identity = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is missing; unlock migration is required")?;
         let config = ConnectionConfig {
             server_url: server_url.to_string(),
         };
 
         let mut conn =
-            Connection::connect(&config, identity, &self.device_id, "veil-desktop").await?;
+            Connection::connect(&config, identity, device_identity, "veil-desktop").await?;
 
         // Drain the Authenticated event to get user_id
         let user_id = match conn.events.try_recv() {
@@ -549,17 +609,7 @@ impl VeilClient {
         // Sequence numbers restart for every WebSocket. Resolve all old
         // pending entries before installing the new connection so a new ACK
         // can never confirm an unrelated pre-reconnect message or mutation.
-        let mut stale_sequences: HashSet<u64> = self
-            .pending_outgoing_messages
-            .keys()
-            .chain(self.pending_mutations.keys())
-            .chain(self.pending_initial_sequences.keys())
-            .chain(self.pending_sender_key_sequences.keys())
-            .copied()
-            .collect();
-        for sequence in stale_sequences.drain() {
-            self.reject_pending_sequence(sequence)?;
-        }
+        self.mark_all_pending_sequences_unknown()?;
         // REST backlog is authoritative for anything not processed from the
         // previous socket. Never replay its deferred events in the new epoch.
         self.deferred_connection_events.clear();
@@ -645,16 +695,69 @@ impl VeilClient {
                     self.finalize_outgoing_message(*ref_seq, message_id, *server_timestamp)?;
                 *mutation = self.confirm_pending_mutation(*ref_seq, *server_timestamp)?;
                 self.confirm_initial_message(*ref_seq)?;
-                self.confirm_sender_key_distribution(*ref_seq);
+                self.confirm_sender_key_distribution(*ref_seq)?;
             }
             Some(ConnectionEvent::Error {
                 ref_seq: Some(ref_seq),
                 local_message_id,
                 ..
             }) => *local_message_id = self.reject_pending_sequence(*ref_seq)?,
+            Some(ConnectionEvent::Disconnected { reason }) => {
+                // There can be no trustworthy delivery conclusion once the
+                // socket epoch ends: a frame may have reached the gateway and
+                // only its ACK may have been lost. Preserve every local row as
+                // DeliveryUnknown instead of deleting it or inviting a blind
+                // retry that could duplicate the message.
+                self.connection = None;
+                if let Err(error) = self.mark_all_pending_sequences_unknown() {
+                    // The transport terminal event must still reach the UI so
+                    // it stops claiming that the socket is connected. Keep
+                    // the pending maps for a fail-closed retry before the next
+                    // connect; startup recovery is the final fallback.
+                    reason.push_str(&format!(
+                        "; local delivery-state persistence failed: {error}"
+                    ));
+                }
+            }
             _ => {}
         }
         Ok(event)
+    }
+
+    fn mark_all_pending_sequences_unknown(&mut self) -> Result<(), String> {
+        let stale_sequences: HashSet<u64> = self
+            .pending_outgoing_messages
+            .keys()
+            .chain(self.pending_mutations.keys())
+            .chain(self.pending_initial_sequences.keys())
+            .chain(self.pending_sender_key_sequences.keys())
+            .copied()
+            .collect();
+        let local_message_ids: Vec<String> = stale_sequences
+            .iter()
+            .filter_map(|sequence| {
+                self.pending_outgoing_messages
+                    .get(sequence)
+                    .map(|pending| pending.local_message_id.clone())
+            })
+            .collect();
+        if let Some(db) = self.db.as_ref() {
+            db.mark_outgoing_messages_unknown(&local_message_ids)?;
+        }
+        for sequence in stale_sequences {
+            self.pending_initial_sequences.remove(&sequence);
+            if let Some(ConfirmedMutation::Edit { new_text, .. }) =
+                self.pending_mutations.remove(&sequence).as_mut()
+            {
+                new_text.zeroize();
+            }
+            if let Some(pending) = self.pending_sender_key_sequences.remove(&sequence) {
+                self.failed_sender_key_distributions
+                    .insert(pending.conversation_id);
+            }
+            self.pending_outgoing_messages.remove(&sequence);
+        }
+        Ok(())
     }
 
     fn finalize_outgoing_message(
@@ -729,17 +832,37 @@ impl VeilClient {
         Ok(())
     }
 
-    fn confirm_sender_key_distribution(&mut self, sequence: u64) {
-        let Some(group_id) = self.pending_sender_key_sequences.remove(&sequence) else {
-            return;
+    fn confirm_sender_key_distribution(&mut self, sequence: u64) -> Result<(), String> {
+        let Some(pending) = self.pending_sender_key_sequences.get(&sequence).cloned() else {
+            return Ok(());
         };
-        let still_waiting = self
-            .pending_sender_key_sequences
-            .values()
-            .any(|pending_group| pending_group == &group_id);
-        if !still_waiting && !self.failed_sender_key_distributions.contains(&group_id) {
-            self.sender_key_distribution_pending.remove(&group_id);
+        let still_waiting =
+            self.pending_sender_key_sequences
+                .iter()
+                .any(|(pending_sequence, other)| {
+                    *pending_sequence != sequence
+                        && other.conversation_id == pending.conversation_id
+                        && other.generation == pending.generation
+                });
+        let completed = !still_waiting
+            && !self
+                .failed_sender_key_distributions
+                .contains(&pending.conversation_id);
+        if completed {
+            // Keep every recipient's exact envelope until the whole fan-out
+            // succeeds. If one ACK arrives and a later ACK is lost, desktop
+            // retries the full current roster and must reuse the earlier bytes.
+            self.clear_sender_key_envelope_generation(
+                &pending.conversation_id,
+                pending.generation,
+            )?;
         }
+        self.pending_sender_key_sequences.remove(&sequence);
+        if completed {
+            self.sender_key_distribution_pending
+                .remove(&pending.conversation_id);
+        }
+        Ok(())
     }
 
     fn confirm_pending_mutation(
@@ -816,21 +939,57 @@ impl VeilClient {
         {
             new_text.zeroize();
         }
-        if let Some(group_id) = self.pending_sender_key_sequences.remove(&sequence) {
-            self.failed_sender_key_distributions.insert(group_id);
+        if let Some(pending) = self.pending_sender_key_sequences.remove(&sequence) {
+            self.failed_sender_key_distributions
+                .insert(pending.conversation_id);
         }
         let Some(pending) = self.pending_outgoing_messages.get(&sequence) else {
             return Ok(None);
         };
         if let Some(db) = self.db.as_ref() {
-            db.delete_message(&pending.local_message_id)?;
-        }
-        if let Some(indexer) = self.indexer.as_ref() {
-            let _ = indexer.delete(&pending.local_message_id);
+            db.mark_outgoing_message_failed(&pending.local_message_id)?;
         }
         let local_message_id = pending.local_message_id.clone();
         self.pending_outgoing_messages.remove(&sequence);
         Ok(Some(local_message_id))
+    }
+
+    #[cfg(test)]
+    fn mark_pending_sequence_unknown(&mut self, sequence: u64) -> Result<Option<String>, String> {
+        self.pending_initial_sequences.remove(&sequence);
+        if let Some(ConfirmedMutation::Edit { new_text, .. }) =
+            self.pending_mutations.remove(&sequence).as_mut()
+        {
+            new_text.zeroize();
+        }
+        if let Some(pending) = self.pending_sender_key_sequences.remove(&sequence) {
+            // Retrying the exact Sender Key generation is safe and required
+            // when its durable-storage ACK was lost.
+            self.failed_sender_key_distributions
+                .insert(pending.conversation_id);
+        }
+        let Some(pending) = self.pending_outgoing_messages.get(&sequence) else {
+            return Ok(None);
+        };
+        if let Some(db) = self.db.as_ref() {
+            db.mark_outgoing_message_unknown(&pending.local_message_id)?;
+        }
+        let local_message_id = pending.local_message_id.clone();
+        self.pending_outgoing_messages.remove(&sequence);
+        Ok(Some(local_message_id))
+    }
+
+    pub fn discard_failed_outgoing_message(&self, local_message_id: &str) -> Result<(), String> {
+        let db = self.db.as_ref().ok_or("database not initialized")?;
+        if !db.is_discardable_outgoing_message(local_message_id)? {
+            return Err("failed or unknown outgoing message not found".to_string());
+        }
+        if let Some(indexer) = self.indexer.as_ref() {
+            indexer
+                .delete(local_message_id)
+                .map_err(|e| format!("remove local draft from search index: {e}"))?;
+        }
+        db.discard_failed_outgoing_message(local_message_id)
     }
 
     /// Send a text message to a conversation.
@@ -891,8 +1050,9 @@ impl VeilClient {
                 local_timestamp,
             ) {
                 if let Some(db) = self.db.as_ref() {
-                    db.delete_message(&local_message_id)?;
+                    db.mark_outgoing_message_failed(&local_message_id)?;
                 }
+                let _ = indexer.delete(&local_message_id);
                 return Err(format!("index pending outgoing message: {error}"));
             }
         }
@@ -922,9 +1082,8 @@ impl VeilClient {
             .await
         {
             if let Some(db) = self.db.as_ref() {
-                db.delete_message(&local_message_id)?;
-            }
-            if let Some(indexer) = self.indexer.as_ref() {
+                db.mark_outgoing_message_failed(&local_message_id)?;
+            } else if let Some(indexer) = self.indexer.as_ref() {
                 let _ = indexer.delete(&local_message_id);
             }
             return Err(error);
@@ -1151,13 +1310,19 @@ impl VeilClient {
                     "sender-key distribution is incomplete; channel send is blocked".to_string(),
                 );
             }
-            let our_key = self.identity_key()?;
-            // Make sure we have an outgoing sender key for this channel.
+            // Creating a fresh generation is itself a distribution event. It
+            // must never fall through to encryption in the same call: no
+            // recipient has durably received that generation yet. Keeping the
+            // pending flag set also makes retries distribute this exact state
+            // instead of rotating again.
             if !self.sender_keys.has_outgoing(conversation_id)
                 || self.sender_keys.needs_rotation(conversation_id)
             {
-                let _ = self.sender_keys.create_outgoing(conversation_id, &our_key);
-                self.persist_outgoing_sender_key(conversation_id)?;
+                self.rotate_sender_key(conversation_id)?;
+                return Err(
+                    "sender-key rotation requires distribution; channel send is blocked"
+                        .to_string(),
+                );
             }
 
             let identity = self.identity.as_ref().ok_or("not initialized")?;
@@ -1469,8 +1634,6 @@ impl VeilClient {
             .authorized_conversation_senders
             .get(conversation_id)
             .is_some_and(|current| current != &senders);
-        self.authorized_conversation_senders
-            .insert(conversation_id.to_string(), senders);
         if roster_changed && self.channel_conversations.contains(conversation_id) {
             // Reusing a distributed generation after any add/remove would let
             // former members decrypt future traffic (and would omit new
@@ -1479,6 +1642,11 @@ impl VeilClient {
             // is fully acknowledged.
             self.rotate_sender_key(conversation_id)?;
         }
+        // Commit the new authorization view only after cache invalidation and
+        // rotation succeed. A SQLCipher failure must leave both the old roster
+        // and old generation intact, with the caller receiving an error.
+        self.authorized_conversation_senders
+            .insert(conversation_id.to_string(), senders);
         Ok(())
     }
 
@@ -1526,12 +1694,50 @@ impl VeilClient {
         buf
     }
 
+    fn invalidate_sender_key_envelopes_for_conversation(
+        &mut self,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        if let Some(db) = self.db.as_ref() {
+            db.delete_pending_sender_key_envelopes_for_conversation(conversation_id)?;
+        }
+        self.pending_sender_key_envelopes.retain(|key, wire| {
+            let keep = key.conversation_id != conversation_id;
+            if !keep {
+                wire.zeroize();
+            }
+            keep
+        });
+        Ok(())
+    }
+
+    fn clear_sender_key_envelope_generation(
+        &mut self,
+        conversation_id: &str,
+        generation: u32,
+    ) -> Result<(), String> {
+        if let Some(db) = self.db.as_ref() {
+            db.delete_pending_sender_key_envelope_generation(conversation_id, generation)?;
+        }
+        self.pending_sender_key_envelopes.retain(|key, wire| {
+            let keep = key.conversation_id != conversation_id || key.generation != generation;
+            if !keep {
+                wire.zeroize();
+            }
+            keep
+        });
+        Ok(())
+    }
+
     /// Force-rotate our outgoing sender key for a channel (e.g. after a member leaves).
     pub fn rotate_sender_key(&mut self, conversation_id: &str) -> Result<(), String> {
         let our_key = self.identity_key()?;
+        // Invalidate before mutating the generation. A DB failure must leave
+        // the old state intact rather than permit cross-roster cache reuse.
+        self.invalidate_sender_key_envelopes_for_conversation(conversation_id)?;
         let _ = self.sender_keys.create_outgoing(conversation_id, &our_key);
         self.pending_sender_key_sequences
-            .retain(|_, group_id| group_id != conversation_id);
+            .retain(|_, pending| pending.conversation_id != conversation_id);
         self.failed_sender_key_distributions.remove(conversation_id);
         self.channel_conversations
             .insert(conversation_id.to_string());
@@ -1551,7 +1757,7 @@ impl VeilClient {
         if self
             .pending_sender_key_sequences
             .values()
-            .any(|group_id| group_id == conversation_id)
+            .any(|pending| pending.conversation_id == conversation_id)
         {
             return Err("sender-key acknowledgements are still pending".to_string());
         }
@@ -1577,6 +1783,21 @@ impl VeilClient {
         Ok(true)
     }
 
+    /// Begin the post-offline-sync fanout with exactly one fresh-generation
+    /// transition. Hydration may already have rotated a cold-restored key; in
+    /// that case reusing the pending generation is mandatory. Warm reconnects
+    /// and first-time conversations rotate here instead.
+    pub fn begin_offline_sender_key_distribution(
+        &mut self,
+        conversation_id: &str,
+        refresh: OfflineSenderKeyRefresh,
+    ) -> Result<bool, String> {
+        if refresh == OfflineSenderKeyRefresh::Required {
+            self.rotate_sender_key(conversation_id)?;
+        }
+        self.begin_sender_key_distribution(conversation_id)
+    }
+
     /// Mark distribution complete only after every current non-self member has
     /// received the fresh generation successfully.
     pub fn mark_sender_key_distributed(&mut self, conversation_id: &str) -> Result<(), String> {
@@ -1586,7 +1807,7 @@ impl VeilClient {
         if self
             .pending_sender_key_sequences
             .values()
-            .any(|group_id| group_id == conversation_id)
+            .any(|pending| pending.conversation_id == conversation_id)
         {
             return Err("sender-key acknowledgements are still pending".to_string());
         }
@@ -1602,6 +1823,137 @@ impl VeilClient {
             .insert(conversation_id.to_string());
     }
 
+    pub fn sender_key_distribution_status(&self, conversation_id: &str) -> &'static str {
+        if self
+            .failed_sender_key_distributions
+            .contains(conversation_id)
+        {
+            "error"
+        } else if self
+            .sender_key_distribution_pending
+            .contains(conversation_id)
+            || self
+                .pending_sender_key_sequences
+                .values()
+                .any(|pending| pending.conversation_id == conversation_id)
+        {
+            "pending"
+        } else if self.channel_conversations.contains(conversation_id)
+            && self.sender_keys.has_outgoing(conversation_id)
+        {
+            "ready"
+        } else {
+            "checking"
+        }
+    }
+
+    fn validate_cached_sender_key_envelope(
+        &self,
+        key: &PendingSenderKeyEnvelopeKey,
+        wire: &[u8],
+    ) -> Result<(), String> {
+        let metadata = veil_crypto::sender_key::inspect_skdm_metadata(wire)?;
+        if metadata.group_id != key.conversation_id || metadata.generation != key.generation {
+            return Err("cached SKDM scope does not match its conversation/generation".to_string());
+        }
+        if metadata.sender_identity_key != self.identity_key()?
+            || metadata.sender_signing_key != self.signing_key()?
+        {
+            return Err("cached SKDM sender binding does not match this identity".to_string());
+        }
+        Ok(())
+    }
+
+    /// Return the immutable sealed bytes for one generation/recipient,
+    /// creating and committing them to SQLCipher before the first transport
+    /// attempt. The recipient is currently a user identity because the gateway
+    /// does not yet expose independent cryptographic device identities.
+    fn prepare_sender_key_envelope(
+        &mut self,
+        conversation_id: &str,
+        peer_identity_key: &[u8; 32],
+    ) -> Result<(PendingSenderKeyEnvelopeKey, Vec<u8>), String> {
+        if !self.sender_keys.has_outgoing(conversation_id) {
+            self.rotate_sender_key(conversation_id)?;
+        }
+        let mut distribution = self.sender_keys.build_distribution(conversation_id)?;
+        let key = PendingSenderKeyEnvelopeKey {
+            conversation_id: conversation_id.to_string(),
+            generation: distribution.key_id,
+            target_identity_key: *peer_identity_key,
+        };
+        let our_identity_key = self.identity_key()?;
+
+        if let Some(db) = self.db.as_ref() {
+            if let Some(cached) = db.load_pending_sender_key_envelope(
+                conversation_id,
+                key.generation,
+                peer_identity_key,
+                &our_identity_key,
+            )? {
+                self.validate_cached_sender_key_envelope(&key, &cached)?;
+                if self
+                    .pending_sender_key_envelopes
+                    .get(&key)
+                    .is_some_and(|in_memory| in_memory != &cached)
+                {
+                    return Err("SQLCipher and in-memory SKDM caches disagree".to_string());
+                }
+                self.pending_sender_key_envelopes
+                    .insert(key.clone(), cached.clone());
+                distribution.zeroize();
+                return Ok((key, cached));
+            }
+        }
+
+        if let Some(cached) = self.pending_sender_key_envelopes.get(&key).cloned() {
+            self.validate_cached_sender_key_envelope(&key, &cached)?;
+            let canonical = if let Some(db) = self.db.as_ref() {
+                db.save_pending_sender_key_envelope(
+                    conversation_id,
+                    key.generation,
+                    peer_identity_key,
+                    &our_identity_key,
+                    &cached,
+                )?
+            } else {
+                cached
+            };
+            distribution.zeroize();
+            return Ok((key, canonical));
+        }
+
+        // Build the distribution directly so chain-key material never passes
+        // through a non-zeroizing serde_json::Value tree.
+        let json = Zeroizing::new(
+            serde_json::to_vec(&distribution).map_err(|e| format!("encode SKDM: {e}"))?,
+        );
+        distribution.zeroize();
+        let identity = self.identity.as_ref().ok_or("not initialized")?;
+        let sealed = veil_crypto::sender_key::seal_skdm_authenticated(
+            identity,
+            peer_identity_key,
+            conversation_id,
+            key.generation,
+            &json,
+        )?;
+        let canonical = if let Some(db) = self.db.as_ref() {
+            db.save_pending_sender_key_envelope(
+                conversation_id,
+                key.generation,
+                peer_identity_key,
+                &our_identity_key,
+                &sealed,
+            )?
+        } else {
+            sealed
+        };
+        self.validate_cached_sender_key_envelope(&key, &canonical)?;
+        self.pending_sender_key_envelopes
+            .insert(key.clone(), canonical.clone());
+        Ok((key, canonical))
+    }
+
     /// Distribute our current outgoing sender key for `conversation_id` to a single peer.
     /// Sends a sealed SKDM via the server's SenderKeyDistribution envelope.
     pub async fn send_sender_key_to(
@@ -1609,29 +1961,8 @@ impl VeilClient {
         conversation_id: &str,
         peer_identity_key: &[u8; 32],
     ) -> Result<u64, String> {
-        let our_key = self.identity_key()?;
-        // Make sure we have an outgoing key.
-        if !self.sender_keys.has_outgoing(conversation_id) {
-            let _ = self.sender_keys.create_outgoing(conversation_id, &our_key);
-            self.persist_outgoing_sender_key(conversation_id)?;
-        }
-
-        // Build the distribution directly so chain-key material never passes
-        // through a non-zeroizing serde_json::Value tree.
-        let dist = self.sender_keys.build_distribution(conversation_id)?;
-        let key_id = dist.key_id;
-        let json =
-            Zeroizing::new(serde_json::to_vec(&dist).map_err(|e| format!("encode SKDM: {e}"))?);
-
-        // Seal for the peer.
-        let identity = self.identity.as_ref().ok_or("not initialized")?;
-        let sealed = veil_crypto::sender_key::seal_skdm_authenticated(
-            identity,
-            peer_identity_key,
-            conversation_id,
-            key_id,
-            &json,
-        )?;
+        let (pending, sealed) =
+            self.prepare_sender_key_envelope(conversation_id, peer_identity_key)?;
 
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let seq = conn.next_seq().await;
@@ -1642,14 +1973,13 @@ impl VeilClient {
                 proto::SenderKeyDistribution {
                     conversation_id: conversation_id.to_string(),
                     sender_key_message: sealed,
-                    generation: key_id,
+                    generation: pending.generation,
                     target_identity_key: peer_identity_key.to_vec(),
                 },
             )),
         };
         conn.send_envelope(&env).await?;
-        self.pending_sender_key_sequences
-            .insert(seq, conversation_id.to_string());
+        self.pending_sender_key_sequences.insert(seq, pending);
         Ok(seq)
     }
 
@@ -1789,27 +2119,48 @@ impl VeilClient {
     }
 
     /// Hydrate sender keys (outgoing + all incoming) for a channel from the DB.
-    pub fn hydrate_channel_sender_keys(&mut self, conversation_id: &str) -> Result<(), String> {
+    pub fn hydrate_channel_sender_keys(
+        &mut self,
+        conversation_id: &str,
+    ) -> Result<OfflineSenderKeyRefresh, String> {
         self.channel_conversations
             .insert(conversation_id.to_string());
-        let our_key = self.identity_key().ok();
+        let our_key = self.identity_key()?;
+        let had_outgoing = self.sender_keys.has_outgoing(conversation_id);
+        let mut restored_outgoing = false;
         if let Some(db) = self.db.as_ref() {
             let rows = db.load_sender_keys_for_group(conversation_id)?;
             for (sender_ik, data, is_outgoing) in rows {
                 let data = Zeroizing::new(data);
-                if sender_ik.len() != 32 {
-                    continue;
-                }
-                let mut ik = [0u8; 32];
-                ik.copy_from_slice(&sender_ik);
-                if is_outgoing && Some(ik) == our_key {
-                    let _ = self.sender_keys.load_outgoing(conversation_id, &data);
+                let ik: [u8; 32] = sender_ik
+                    .try_into()
+                    .map_err(|_| "persisted sender-key identity has an invalid length")?;
+                if is_outgoing {
+                    if ik != our_key {
+                        return Err(
+                            "persisted outgoing sender key does not belong to this identity"
+                                .to_string(),
+                        );
+                    }
+                    self.sender_keys.load_outgoing(conversation_id, &data)?;
+                    restored_outgoing = true;
                 } else {
-                    let _ = self.sender_keys.load_incoming(conversation_id, &ik, &data);
+                    self.sender_keys
+                        .load_incoming(conversation_id, &ik, &data)?;
                 }
             }
         }
-        Ok(())
+        if !had_outgoing && restored_outgoing {
+            // The authoritative roster is not yet persisted across a native
+            // session. Continuing a restored generation after an offline
+            // membership/permission change could let a former member retain
+            // future access. Conservatively rotate exactly once on cold
+            // restore and keep sending blocked until the current roster has
+            // durably received the new generation.
+            self.rotate_sender_key(conversation_id)?;
+            return Ok(OfflineSenderKeyRefresh::AlreadyRotated);
+        }
+        Ok(OfflineSenderKeyRefresh::Required)
     }
 
     /// Authenticate, decrypt and persist one inbound network message as a
@@ -2721,6 +3072,10 @@ impl Drop for VeilClient {
                 new_text.zeroize();
             }
         }
+        for wire in self.pending_sender_key_envelopes.values_mut() {
+            wire.zeroize();
+        }
+        self.pending_sender_key_envelopes.clear();
     }
 }
 
@@ -2728,9 +3083,97 @@ impl Drop for VeilClient {
 mod tests {
     use super::*;
 
+    fn pending_sender_key(
+        client: &VeilClient,
+        conversation_id: &str,
+        target_identity_key: [u8; 32],
+    ) -> PendingSenderKeyEnvelopeKey {
+        let distribution = client
+            .sender_keys
+            .build_distribution(conversation_id)
+            .unwrap();
+        PendingSenderKeyEnvelopeKey {
+            conversation_id: conversation_id.to_string(),
+            generation: distribution.key_id,
+            target_identity_key,
+        }
+    }
+
     #[test]
     fn generated_device_id_is_never_the_legacy_zero_value() {
         assert_ne!(VeilClient::new().device_id, [0u8; 16]);
+    }
+
+    #[test]
+    fn per_device_binding_is_independent_and_stable_across_restart() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path =
+            std::env::temp_dir().join(format!("veil-device-binding-{}.db", uuid::Uuid::new_v4()));
+        let first_binding = {
+            let mut client = VeilClient::new();
+            client.init_with_mnemonic(&mnemonic, &path).unwrap();
+            let binding = client.device_identity.as_ref().unwrap().binding().clone();
+            assert_eq!(binding.device_id, client.device_id());
+            assert_ne!(binding.device_identity_key, client.identity_key().unwrap());
+            assert_ne!(binding.device_signing_key, client.signing_key().unwrap());
+            binding
+        };
+        let second_binding = {
+            let mut restored = VeilClient::new();
+            restored.init_with_mnemonic(&mnemonic, &path).unwrap();
+            restored.device_identity.as_ref().unwrap().binding().clone()
+        };
+        assert_eq!(second_binding, first_binding);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn corrupted_persisted_device_secret_blocks_restart() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path =
+            std::env::temp_dir().join(format!("veil-device-corrupt-{}.db", uuid::Uuid::new_v4()));
+        {
+            let mut client = VeilClient::new();
+            client.init_with_mnemonic(&mnemonic, &path).unwrap();
+        }
+
+        let db_key = Zeroizing::new(kdf::derive_db_key(&mnemonic).unwrap());
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let key_pragma = Zeroizing::new(format!(
+            "PRAGMA key = \"x'{}'\";",
+            hex::encode(db_key.as_slice())
+        ));
+        conn.execute_batch(&key_pragma).unwrap();
+        conn.execute(
+            "UPDATE device_identity_v1 SET x25519_secret = ?1 WHERE singleton = 1",
+            // Canonical but unrelated scalar: this exercises derived-public
+            // verification rather than only the canonical-encoding guard.
+            rusqlite::params![[0x40u8; 32].as_slice()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut restored = VeilClient::new();
+        let error = restored.init_with_mnemonic(&mnemonic, &path).unwrap_err();
+        assert!(error.contains("secret/public key mismatch"));
+        drop(restored);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[tokio::test]
+    async fn account_only_client_cannot_attempt_bound_websocket_auth() {
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        assert!(client
+            .connect("ws://127.0.0.1:1/ws")
+            .await
+            .unwrap_err()
+            .contains("per-device identity is missing"));
     }
 
     #[test]
@@ -3187,16 +3630,14 @@ mod tests {
     fn sender_key_send_unblocks_only_after_every_ack() {
         let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
         client.rotate_sender_key("group-1").unwrap();
-        client
-            .pending_sender_key_sequences
-            .insert(10, "group-1".to_string());
-        client
-            .pending_sender_key_sequences
-            .insert(11, "group-1".to_string());
+        let pending_10 = pending_sender_key(&client, "group-1", [10u8; 32]);
+        let pending_11 = pending_sender_key(&client, "group-1", [11u8; 32]);
+        client.pending_sender_key_sequences.insert(10, pending_10);
+        client.pending_sender_key_sequences.insert(11, pending_11);
 
-        client.confirm_sender_key_distribution(10);
+        client.confirm_sender_key_distribution(10).unwrap();
         assert!(client.sender_key_distribution_pending.contains("group-1"));
-        client.confirm_sender_key_distribution(11);
+        client.confirm_sender_key_distribution(11).unwrap();
         assert!(!client.sender_key_distribution_pending.contains("group-1"));
 
         let generation_before_reconnect = client.sender_keys.serialize_outgoing("group-1").unwrap();
@@ -3204,9 +3645,8 @@ mod tests {
         let generation_after_reconnect = client.sender_keys.serialize_outgoing("group-1").unwrap();
         assert_ne!(&*generation_before_reconnect, &*generation_after_reconnect);
         assert!(client.sender_key_distribution_pending.contains("group-1"));
-        client
-            .pending_sender_key_sequences
-            .insert(12, "group-1".to_string());
+        let pending_12 = pending_sender_key(&client, "group-1", [12u8; 32]);
+        client.pending_sender_key_sequences.insert(12, pending_12);
         client.reject_pending_sequence(12).unwrap();
         assert!(client.sender_key_distribution_pending.contains("group-1"));
         assert!(client.failed_sender_key_distributions.contains("group-1"));
@@ -3215,9 +3655,8 @@ mod tests {
         assert!(client.begin_sender_key_distribution("group-1").unwrap());
         let generation_after_retry = client.sender_keys.serialize_outgoing("group-1").unwrap();
         assert_eq!(&*generation_before_retry, &*generation_after_retry);
-        client
-            .pending_sender_key_sequences
-            .insert(13, "group-1".to_string());
+        let pending_13 = pending_sender_key(&client, "group-1", [13u8; 32]);
+        client.pending_sender_key_sequences.insert(13, pending_13);
         assert!(client.begin_sender_key_distribution("group-1").is_err());
 
         let our_identity = client.identity_key().unwrap();
@@ -3229,6 +3668,164 @@ mod tests {
             .require_currently_authorized_sender("group-1", &our_identity)
             .is_err());
         assert!(client.sender_key_distribution_pending.contains("group-1"));
+    }
+
+    #[test]
+    fn sender_key_lost_ack_retries_exact_persisted_envelopes() {
+        let identity = IdentityKeyPair::generate();
+        let sender_identity = identity.x25519_public_bytes();
+        let target_a = [0x31u8; 32];
+        let target_b = [0x32u8; 32];
+        let conversation_id = "group-lost-skdm-ack";
+        let mut client = VeilClient::from_identity(identity);
+        client.db = Some(VeilDb::open_memory(&[0x93u8; 32]).unwrap());
+        client.mark_channel_conversation(conversation_id);
+        client.rotate_sender_key(conversation_id).unwrap();
+
+        let (key_a, first_a) = client
+            .prepare_sender_key_envelope(conversation_id, &target_a)
+            .unwrap();
+        let (key_b, first_b) = client
+            .prepare_sender_key_envelope(conversation_id, &target_b)
+            .unwrap();
+        assert_eq!(key_a.generation, key_b.generation);
+        assert_ne!(first_a, first_b, "recipient binding must change the seal");
+        client
+            .pending_sender_key_sequences
+            .insert(101, key_a.clone());
+        client
+            .pending_sender_key_sequences
+            .insert(102, key_b.clone());
+
+        // One ACK arrives, then the connection dies before the second. The
+        // full roster will be retried, so even the acknowledged target's bytes
+        // must remain cached until the attempt completes as a whole.
+        client.confirm_sender_key_distribution(101).unwrap();
+        client.mark_pending_sequence_unknown(102).unwrap();
+        assert!(client
+            .failed_sender_key_distributions
+            .contains(conversation_id));
+        assert_eq!(
+            client
+                .db()
+                .unwrap()
+                .load_pending_sender_key_envelope(
+                    conversation_id,
+                    key_a.generation,
+                    &target_a,
+                    &sender_identity,
+                )
+                .unwrap()
+                .unwrap(),
+            first_a
+        );
+
+        assert!(client
+            .begin_sender_key_distribution(conversation_id)
+            .unwrap());
+        let (retry_key_a, retry_a) = client
+            .prepare_sender_key_envelope(conversation_id, &target_a)
+            .unwrap();
+        let (retry_key_b, retry_b) = client
+            .prepare_sender_key_envelope(conversation_id, &target_b)
+            .unwrap();
+        assert_eq!(retry_a, first_a);
+        assert_eq!(retry_b, first_b);
+        client.pending_sender_key_sequences.insert(103, retry_key_a);
+        client.pending_sender_key_sequences.insert(104, retry_key_b);
+        client.confirm_sender_key_distribution(103).unwrap();
+        assert!(client
+            .db()
+            .unwrap()
+            .load_pending_sender_key_envelope(
+                conversation_id,
+                key_a.generation,
+                &target_a,
+                &sender_identity,
+            )
+            .unwrap()
+            .is_some());
+        client.confirm_sender_key_distribution(104).unwrap();
+        assert!(!client
+            .sender_key_distribution_pending
+            .contains(conversation_id));
+        assert!(client.pending_sender_key_envelopes.is_empty());
+        assert!(client
+            .db()
+            .unwrap()
+            .load_pending_sender_key_envelope(
+                conversation_id,
+                key_a.generation,
+                &target_a,
+                &sender_identity,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn sender_key_retry_cache_survives_restart_until_rotation_invalidation() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path = std::env::temp_dir().join(format!(
+            "veil-client-pending-skdm-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let target = [0x41u8; 32];
+        let conversation_id = "group-restart-skdm";
+        let (generation, sender_identity, sealed) = {
+            let mut client = VeilClient::new();
+            client.init_with_mnemonic(&mnemonic, &path).unwrap();
+            client.mark_channel_conversation(conversation_id);
+            client.rotate_sender_key(conversation_id).unwrap();
+            let (key, sealed) = client
+                .prepare_sender_key_envelope(conversation_id, &target)
+                .unwrap();
+            (key.generation, client.identity_key().unwrap(), sealed)
+        };
+
+        let mut restored = VeilClient::new();
+        restored.init_with_mnemonic(&mnemonic, &path).unwrap();
+        assert_eq!(
+            restored
+                .db()
+                .unwrap()
+                .load_pending_sender_key_envelope(
+                    conversation_id,
+                    generation,
+                    &target,
+                    &sender_identity,
+                )
+                .unwrap()
+                .unwrap(),
+            sealed
+        );
+
+        // Until a rollback-resistant roster version is persisted, cold restore
+        // deliberately rotates. Rotation is the only non-ACK path allowed to
+        // invalidate the exact retry cache.
+        restored.mark_channel_conversation(conversation_id);
+        assert_eq!(
+            restored
+                .hydrate_channel_sender_keys(conversation_id)
+                .unwrap(),
+            OfflineSenderKeyRefresh::AlreadyRotated
+        );
+        assert!(restored
+            .db()
+            .unwrap()
+            .load_pending_sender_key_envelope(
+                conversation_id,
+                generation,
+                &target,
+                &sender_identity,
+            )
+            .unwrap()
+            .is_none());
+
+        drop(restored);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
     #[test]
@@ -3279,16 +3876,328 @@ mod tests {
         assert!(client
             .begin_sender_key_distribution(conversation_id)
             .unwrap());
-        client
-            .pending_sender_key_sequences
-            .insert(77, conversation_id.to_string());
+        let pending_77 = pending_sender_key(&client, conversation_id, remaining_member);
+        client.pending_sender_key_sequences.insert(77, pending_77);
         assert!(client
             .encrypt_outgoing(conversation_id, "still waiting")
             .is_err());
-        client.confirm_sender_key_distribution(77);
+        client.confirm_sender_key_distribution(77).unwrap();
         assert!(client
             .encrypt_outgoing(conversation_id, "fresh generation")
             .is_ok());
+    }
+
+    #[test]
+    fn sender_key_iteration_limit_rotates_once_and_blocks_until_distribution_complete() {
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        let conversation_id = "group-iteration-limit";
+        let our_identity = client.identity_key().unwrap();
+
+        client.mark_channel_conversation(conversation_id);
+        client
+            .replace_authorized_conversation_senders(conversation_id, [our_identity])
+            .unwrap();
+        client.rotate_sender_key(conversation_id).unwrap();
+        client.mark_sender_key_distributed(conversation_id).unwrap();
+
+        let initial_state = client
+            .sender_keys
+            .serialize_outgoing(conversation_id)
+            .unwrap();
+        let initial_generation = serde_json::from_slice::<serde_json::Value>(&initial_state)
+            .unwrap()["key_id"]
+            .as_u64()
+            .unwrap();
+
+        // Iterations 0..1999 are the complete allowed generation. The next
+        // application message must rotate, but must not produce ciphertext.
+        for _ in 0..2_000 {
+            client
+                .encrypt_outgoing(conversation_id, "within generation")
+                .unwrap();
+        }
+        assert!(client.sender_keys.needs_rotation(conversation_id));
+
+        let error = client
+            .encrypt_outgoing(conversation_id, "must wait for distribution")
+            .unwrap_err();
+        assert!(error.contains("rotation requires distribution"));
+        assert!(client
+            .sender_key_distribution_pending
+            .contains(conversation_id));
+
+        let rotated_state = client
+            .sender_keys
+            .serialize_outgoing(conversation_id)
+            .unwrap();
+        let rotated_json = serde_json::from_slice::<serde_json::Value>(&rotated_state).unwrap();
+        assert_eq!(
+            rotated_json["key_id"].as_u64().unwrap(),
+            initial_generation + 1
+        );
+        assert_eq!(rotated_json["iteration"].as_u64().unwrap(), 0);
+
+        // A retry while pending neither emits ciphertext nor rotates again.
+        assert!(client
+            .encrypt_outgoing(conversation_id, "still blocked")
+            .is_err());
+        assert_eq!(
+            &*client
+                .sender_keys
+                .serialize_outgoing(conversation_id)
+                .unwrap(),
+            &*rotated_state
+        );
+
+        // The normal distribution-complete transition unlocks this exact
+        // generation; the first ciphertext then advances it to iteration 1.
+        assert!(client
+            .begin_sender_key_distribution(conversation_id)
+            .unwrap());
+        client.mark_sender_key_distributed(conversation_id).unwrap();
+        let (_ciphertext, header) = client
+            .encrypt_outgoing(conversation_id, "fresh generation")
+            .unwrap();
+        assert_eq!(header, vec![HEADER_SENDER_KEY]);
+        let distributed_state = client
+            .sender_keys
+            .serialize_outgoing(conversation_id)
+            .unwrap();
+        let distributed_json =
+            serde_json::from_slice::<serde_json::Value>(&distributed_state).unwrap();
+        assert_eq!(
+            distributed_json["key_id"].as_u64().unwrap(),
+            initial_generation + 1
+        );
+        assert_eq!(distributed_json["iteration"].as_u64().unwrap(), 1);
+    }
+
+    #[test]
+    fn cold_restore_conservatively_rotates_once_when_roster_continuity_is_unknown() {
+        let identity = IdentityKeyPair::generate();
+        let our_identity = identity.x25519_public_bytes();
+        let removed_identity = [0xA7u8; 32];
+        let conversation_id = "channel-offline-removal";
+        let mut client = VeilClient::from_identity(identity);
+        client.db = Some(VeilDb::open_memory(&[0x51u8; 32]).unwrap());
+        client
+            .replace_authorized_conversation_senders(
+                conversation_id,
+                [our_identity, removed_identity],
+            )
+            .unwrap();
+        client.mark_channel_conversation(conversation_id);
+        client.rotate_sender_key(conversation_id).unwrap();
+        client.mark_sender_key_distributed(conversation_id).unwrap();
+
+        let persisted_state = client
+            .sender_keys
+            .serialize_outgoing(conversation_id)
+            .unwrap();
+        let persisted_generation = serde_json::from_slice::<serde_json::Value>(&persisted_state)
+            .unwrap()["key_id"]
+            .as_u64()
+            .unwrap();
+
+        // Simulate the process/session losing its in-memory roster and keys
+        // while the removed member disappears from the authoritative directory.
+        client.sender_keys = SenderKeyStore::new();
+        client.channel_conversations.clear();
+        client.authorized_conversation_senders.clear();
+        client.sender_key_distribution_pending.clear();
+        client
+            .replace_authorized_conversation_senders(conversation_id, [our_identity])
+            .unwrap();
+        client.mark_channel_conversation(conversation_id);
+        let refresh = client.hydrate_channel_sender_keys(conversation_id).unwrap();
+        assert_eq!(refresh, OfflineSenderKeyRefresh::AlreadyRotated);
+
+        let rotated_state = client
+            .sender_keys
+            .serialize_outgoing(conversation_id)
+            .unwrap();
+        let rotated_json = serde_json::from_slice::<serde_json::Value>(&rotated_state).unwrap();
+        assert_eq!(
+            rotated_json["key_id"].as_u64().unwrap(),
+            persisted_generation + 1
+        );
+        assert_eq!(rotated_json["iteration"].as_u64().unwrap(), 0);
+        assert!(client
+            .sender_key_distribution_pending
+            .contains(conversation_id));
+        assert!(client
+            .encrypt_outgoing(conversation_id, "must not reuse the restored generation")
+            .is_err());
+
+        // Repeated hydration in the same native session restores the same
+        // freshly persisted generation and cannot rotate forever.
+        assert_eq!(
+            client.hydrate_channel_sender_keys(conversation_id).unwrap(),
+            OfflineSenderKeyRefresh::Required
+        );
+        assert_eq!(
+            &*client
+                .sender_keys
+                .serialize_outgoing(conversation_id)
+                .unwrap(),
+            &*rotated_state
+        );
+
+        // This is the client-side unit boundary used by desktop offline-sync:
+        // hydration already created N+1, so preparing fanout must not create
+        // N+2. Sending remains fail-closed until distribution is completed.
+        assert!(client
+            .begin_offline_sender_key_distribution(conversation_id, refresh)
+            .unwrap());
+        assert_eq!(
+            &*client
+                .sender_keys
+                .serialize_outgoing(conversation_id)
+                .unwrap(),
+            &*rotated_state
+        );
+        assert!(client
+            .encrypt_outgoing(conversation_id, "still blocked before ACK")
+            .is_err());
+        client.mark_sender_key_distributed(conversation_id).unwrap();
+        assert!(client
+            .encrypt_outgoing(conversation_id, "new roster only")
+            .is_ok());
+    }
+
+    #[test]
+    fn asynchronous_send_rejection_keeps_plaintext_as_failed_local_draft() {
+        let identity = IdentityKeyPair::generate();
+        let our_identity = identity.x25519_public_bytes();
+        let mut client = VeilClient::from_identity(identity);
+        let db = VeilDb::open_memory(&[0x72u8; 32]).unwrap();
+        db.insert_conversation("dm-rejected", 0, None, Some(&[0x19u8; 32]), None)
+            .unwrap();
+        db.insert_outgoing_pending_message(
+            "local-rejected",
+            "dm-rejected",
+            &our_identity,
+            "do not lose this",
+            None,
+        )
+        .unwrap();
+        client.db = Some(db);
+        client.pending_outgoing_messages.insert(
+            91,
+            PendingOutgoingMessage {
+                local_message_id: "local-rejected".to_string(),
+                conversation_id: "dm-rejected".to_string(),
+                sender_identity_key: our_identity,
+                plaintext: "do not lose this".to_string(),
+            },
+        );
+
+        assert_eq!(
+            client.reject_pending_sequence(91).unwrap().as_deref(),
+            Some("local-rejected")
+        );
+        assert!(!client.pending_outgoing_messages.contains_key(&91));
+        let failed = client
+            .db()
+            .unwrap()
+            .get_messages("dm-rejected", 10)
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, veil_store::models::MessageStatus::Failed);
+        assert_eq!(failed[0].plaintext, "do not lose this");
+    }
+
+    #[test]
+    fn lost_ack_marks_delivery_unknown_instead_of_encouraging_blind_retry() {
+        let identity = IdentityKeyPair::generate();
+        let our_identity = identity.x25519_public_bytes();
+        let mut client = VeilClient::from_identity(identity);
+        let db = VeilDb::open_memory(&[0x73u8; 32]).unwrap();
+        db.insert_conversation("dm-unknown", 0, None, Some(&[0x29u8; 32]), None)
+            .unwrap();
+        db.insert_outgoing_pending_message(
+            "local-unknown",
+            "dm-unknown",
+            &our_identity,
+            "may already be delivered",
+            None,
+        )
+        .unwrap();
+        client.db = Some(db);
+        client.pending_outgoing_messages.insert(
+            92,
+            PendingOutgoingMessage {
+                local_message_id: "local-unknown".to_string(),
+                conversation_id: "dm-unknown".to_string(),
+                sender_identity_key: our_identity,
+                plaintext: "may already be delivered".to_string(),
+            },
+        );
+
+        assert_eq!(
+            client.mark_pending_sequence_unknown(92).unwrap().as_deref(),
+            Some("local-unknown")
+        );
+        let unknown = client.db().unwrap().get_messages("dm-unknown", 10).unwrap();
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(
+            unknown[0].status,
+            veil_store::models::MessageStatus::Unknown
+        );
+        assert_eq!(unknown[0].plaintext, "may already be delivered");
+    }
+
+    #[tokio::test]
+    async fn disconnected_event_marks_every_outstanding_message_delivery_unknown() {
+        let identity = IdentityKeyPair::generate();
+        let our_identity = identity.x25519_public_bytes();
+        let mut client = VeilClient::from_identity(identity);
+        let db = VeilDb::open_memory(&[0x74u8; 32]).unwrap();
+        db.insert_conversation("dm-disconnected", 0, None, Some(&[0x39u8; 32]), None)
+            .unwrap();
+        for (sequence, local_id, plaintext) in [
+            (93, "local-disconnected-a", "possibly sent a"),
+            (94, "local-disconnected-b", "possibly sent b"),
+        ] {
+            db.insert_outgoing_pending_message(
+                local_id,
+                "dm-disconnected",
+                &our_identity,
+                plaintext,
+                None,
+            )
+            .unwrap();
+            client.pending_outgoing_messages.insert(
+                sequence,
+                PendingOutgoingMessage {
+                    local_message_id: local_id.to_string(),
+                    conversation_id: "dm-disconnected".to_string(),
+                    sender_identity_key: our_identity,
+                    plaintext: plaintext.to_string(),
+                },
+            );
+        }
+        client.db = Some(db);
+        client
+            .deferred_connection_events
+            .push_back(ConnectionEvent::Disconnected {
+                reason: "ws write error: connection reset".to_string(),
+            });
+
+        assert!(matches!(
+            client.poll_event().await.unwrap(),
+            Some(ConnectionEvent::Disconnected { .. })
+        ));
+        assert!(client.pending_outgoing_messages.is_empty());
+        let messages = client
+            .db()
+            .unwrap()
+            .get_messages("dm-disconnected", 10)
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages
+            .iter()
+            .all(|message| message.status == veil_store::models::MessageStatus::Unknown));
     }
 
     #[test]

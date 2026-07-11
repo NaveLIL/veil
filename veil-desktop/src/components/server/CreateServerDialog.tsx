@@ -55,7 +55,7 @@ export const CreateServerDialog: Component<Props> = (props) => {
       onClose={close}
       title="Create Server"
       icon={<Plus size={15} />}
-      accent="#34d399"
+      accent="var(--veil-success)"
       closeDisabled={loading()}
     >
       <div style={ds.fieldGroup}>
@@ -77,7 +77,7 @@ export const CreateServerDialog: Component<Props> = (props) => {
         </Show>
 
         <button
-          style={ds.primaryBtn(enabled(), "#34d399")}
+          style={ds.primaryBtn(enabled(), "var(--veil-success)")}
           onClick={handleCreate}
           disabled={!enabled()}
         >

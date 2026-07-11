@@ -7,11 +7,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/AegisSec/veil-server/internal/auth"
 	"github.com/AegisSec/veil-server/internal/config"
+	"github.com/AegisSec/veil-server/internal/db"
 	integrationtest "github.com/AegisSec/veil-server/internal/integration"
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 	"golang.org/x/crypto/curve25519"
@@ -223,6 +225,95 @@ func TestSenderKeyDurableOfflineDeliveryAndValidation(t *testing.T) {
 		t.Fatalf("invalid distribution was stored: %+v", rows)
 	}
 
+	// A newer generation is appended instead of replacing the still-unacked
+	// generation. Both must be replayable to a device that was offline across
+	// the rotation boundary.
+	newerWire := makeSenderKeyEnvelopeV3(
+		aliceBobConversation, 8, alice.IdentityKey, alice.SigningKey, bob.IdentityKey,
+	)
+	sender.handleSenderKeyDist(ctx, 65, &pb.SenderKeyDistribution{
+		ConversationId:    aliceBobConversation,
+		SenderKeyMessage:  newerWire,
+		Generation:        8,
+		TargetIdentityKey: bob.IdentityKey,
+	})
+	newerAck := receiveGatewayEnvelope(t, sender.send)
+	if newerAck.GetMessageAck() == nil || newerAck.GetMessageAck().GetRefSeq() != 65 {
+		t.Fatalf("new retained generation was not ACKed: %v", newerAck)
+	}
+	for _, device := range []string{bobDevice1.ID, bobDevice2.ID} {
+		rows, err := h.DB.GetPendingSenderKeys(ctx, device)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 2 || rows[0].Generation != 7 || rows[1].Generation != 8 ||
+			!bytes.Equal(rows[0].EncryptedKey, validWire) || !bytes.Equal(rows[1].EncryptedKey, newerWire) {
+			t.Fatalf("device %s retained generations = %+v, want ordered [7, 8]", device, rows)
+		}
+	}
+
+	// Retrying exactly the same authenticated envelope is idempotent and does
+	// not add or mutate a retained row.
+	sender.handleSenderKeyDist(ctx, 66, &pb.SenderKeyDistribution{
+		ConversationId:    aliceBobConversation,
+		SenderKeyMessage:  newerWire,
+		Generation:        8,
+		TargetIdentityKey: bob.IdentityKey,
+	})
+	retryAck := receiveGatewayEnvelope(t, sender.send)
+	if retryAck.GetMessageAck() == nil || retryAck.GetMessageAck().GetRefSeq() != 66 {
+		t.Fatalf("exact equal-generation retry was not ACKed: %v", retryAck)
+	}
+
+	// A distinct but correctly signed/sealed envelope cannot replace the first
+	// commitment accepted for generation 8. Correction requires generation 9.
+	conflictingWire := makeSenderKeyEnvelopeV3WithMarker(
+		aliceBobConversation, 8, alice.IdentityKey, alice.SigningKey, bob.IdentityKey, 2,
+	)
+	sender.handleSenderKeyDist(ctx, 67, &pb.SenderKeyDistribution{
+		ConversationId:    aliceBobConversation,
+		SenderKeyMessage:  conflictingWire,
+		Generation:        8,
+		TargetIdentityKey: bob.IdentityKey,
+	})
+	conflict := receiveGatewayEnvelope(t, sender.send)
+	if conflict.GetError() == nil || conflict.GetError().GetCode() != 409 || conflict.GetMessageAck() != nil {
+		t.Fatalf("conflicting equal-generation response = %v, want 409 without ACK", conflict)
+	}
+	rows, err = h.DB.GetPendingSenderKeys(ctx, bobDevice1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 2 || rows[0].Generation != 7 || rows[1].Generation != 8 ||
+		!bytes.Equal(rows[1].EncryptedKey, newerWire) {
+		t.Fatalf("equal-generation conflict mutated retained state: %+v", rows)
+	}
+
+	// Multi-device fan-out is one transaction. A stale stream on an existing
+	// device must roll back a tentative write for a newly registered device.
+	bobDevice3, err := h.DB.CreateDevice(ctx, bob.ID, randomDeviceKey(t), "bob-device-3")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = h.DB.StoreSenderKeys(
+		ctx,
+		aliceBobConversation,
+		aliceDevice.ID,
+		[]string{bobDevice3.ID, bobDevice1.ID},
+		validWire,
+		7,
+	)
+	if !errors.Is(err, db.ErrStaleSenderKeyGeneration) {
+		t.Fatalf("mixed stale fan-out error = %v, want ErrStaleSenderKeyGeneration", err)
+	}
+	rows, err = h.DB.GetPendingSenderKeys(ctx, bobDevice3.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("atomic stale fan-out left a partial row for new device: %+v", rows)
+	}
+
 	// Durable state cannot be rolled back by a stale but otherwise valid v3
 	// envelope, and the stale request receives no ACK.
 	staleWire := makeSenderKeyEnvelopeV3(
@@ -242,8 +333,41 @@ func TestSenderKeyDurableOfflineDeliveryAndValidation(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].Generation != 7 {
+	if len(rows) != 2 || rows[0].Generation != 7 || rows[1].Generation != 8 {
 		t.Fatalf("stale distribution rewound durable state: %+v", rows)
+	}
+
+	// The high-water mark is independent from retained envelope collection.
+	// Once a future device receipt removes old rows, an attacker still cannot
+	// resurrect a lower generation.
+	if _, err := h.DB.Pool.Exec(ctx,
+		`DELETE FROM sender_keys WHERE target_device_id = $1::uuid`, bobDevice1.ID,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.DB.StoreSenderKey(
+		ctx, aliceBobConversation, aliceDevice.ID, bobDevice1.ID, validWire, 7,
+	); !errors.Is(err, db.ErrStaleSenderKeyGeneration) {
+		t.Fatalf("collected stream accepted rollback: %v", err)
+	}
+	rows, err = h.DB.GetPendingSenderKeys(ctx, bobDevice1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("rejected rollback recreated collected rows: %+v", rows)
+	}
+	if err := h.DB.StoreSenderKey(
+		ctx, aliceBobConversation, aliceDevice.ID, bobDevice1.ID, newerWire, 8,
+	); err != nil {
+		t.Fatalf("collected committed generation was not idempotent: %v", err)
+	}
+	rows, err = h.DB.GetPendingSenderKeys(ctx, bobDevice1.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 0 {
+		t.Fatalf("exact retry resurrected collected control state: %+v", rows)
 	}
 }
 

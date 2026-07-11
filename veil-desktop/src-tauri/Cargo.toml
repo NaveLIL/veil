@@ -31,3 +31,6 @@ base64 = "0.22"
 sha2 = "0.10"
 subtle = "2"
 zeroize = "1"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+tempfile = "3"

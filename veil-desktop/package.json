@@ -7,13 +7,17 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "test:a11y": "vitest run src/test/a11y-smoke.test.tsx",
+    "test:visual": "playwright test",
     "tauri": "tauri"
   },
   "dependencies": {
     "@kobalte/core": "^0.13.11",
     "@solidjs/router": "^0.15",
     "@tailwindcss/vite": "^4.2.2",
-    "@tauri-apps/api": "^2",
+    "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-os": "^2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -23,10 +27,17 @@
     "tailwindcss": "^4.2.2"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2",
+    "@playwright/test": "^1.61.1",
+    "@solidjs/testing-library": "^0.8.10",
+    "@tauri-apps/cli": "^2.11.4",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/user-event": "^14.6.1",
+    "axe-core": "^4.12.1",
+    "jsdom": "^29.1.1",
     "typescript": "^5.7",
     "vite": "^6.4.3",
-    "vite-plugin-solid": "^2"
+    "vite-plugin-solid": "^2",
+    "vitest": "^4.1.10"
   },
   "pnpm": {
     "overrides": {

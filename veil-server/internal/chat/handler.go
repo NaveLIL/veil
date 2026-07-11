@@ -17,6 +17,7 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/logsafe"
 	"github.com/google/uuid"
 )
 
@@ -68,6 +69,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/conversations", signed(h.ListConversations))
 	mux.HandleFunc("POST /v1/conversations/dm", signed(h.CreateDM))
 	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", signed(h.GetMembers))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/device-directory", signed(h.GetDeviceDirectory))
 
 	// Group endpoints
 	mux.HandleFunc("POST /v1/groups", signed(h.CreateGroup))
@@ -229,7 +231,7 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	for _, m := range msgs {
 		if len(m.SenderIdentityKey) != 32 || len(m.SenderSigningKey) != ed25519.PublicKeySize {
-			log.Printf("message %s sender %s has invalid public key material", m.ID, m.SenderID)
+			log.Printf("message_ref=%s sender_ref=%s has invalid public key material", logsafe.Ref("message", m.ID), logsafe.Ref("user", m.SenderID))
 			writeJSON(w, http.StatusInternalServerError, errorResp("sender cryptographic identity is invalid"))
 			return
 		}

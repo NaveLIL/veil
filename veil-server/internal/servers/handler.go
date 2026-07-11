@@ -6,10 +6,12 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/google/uuid"
 )
 
 // Handler exposes REST endpoints for servers/channels/roles/invites.
@@ -56,6 +58,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/servers/{serverID}/channels/reorder", signed(h.ReorderChannels))
 	mux.HandleFunc("PATCH /v1/channels/{channelID}", signed(h.UpdateChannel))
 	mux.HandleFunc("DELETE /v1/channels/{channelID}", signed(h.DeleteChannel))
+	mux.HandleFunc("GET /v1/channels/{channelID}/overwrites", signed(h.ListChannelOverwrites))
+	mux.HandleFunc("PUT /v1/channels/{channelID}/overwrites", signed(h.UpsertChannelOverwrite))
+	mux.HandleFunc("DELETE /v1/channels/{channelID}/overwrites/{targetType}/{targetID}", signed(h.DeleteChannelOverwrite))
 
 	// Roles
 	mux.HandleFunc("GET /v1/servers/{serverID}/roles", signed(h.ListRoles))
@@ -368,6 +373,93 @@ func (h *Handler) DeleteChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.svc.DeleteChannel(r.Context(), r.PathValue("channelID"), uid); err != nil {
 		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+type channelOverwriteJSON struct {
+	TargetID   string `json:"target_id"`
+	TargetType int16  `json:"target_type"`
+	Allow      uint64 `json:"allow"`
+	Deny       uint64 `json:"deny"`
+}
+
+func (h *Handler) ListChannelOverwrites(w http.ResponseWriter, r *http.Request) {
+	uid := requireUser(w, r)
+	if uid == "" {
+		return
+	}
+	overwrites, err := h.svc.ListChannelOverwrites(r.Context(), r.PathValue("channelID"), uid)
+	if err != nil {
+		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		return
+	}
+	result := make([]channelOverwriteJSON, 0, len(overwrites))
+	for _, overwrite := range overwrites {
+		result = append(result, channelOverwriteJSON{
+			TargetID: overwrite.TargetID, TargetType: overwrite.TargetType,
+			Allow: overwrite.Allow, Deny: overwrite.Deny,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"overwrites": result})
+}
+
+func (h *Handler) UpsertChannelOverwrite(w http.ResponseWriter, r *http.Request) {
+	uid := requireUser(w, r)
+	if uid == "" {
+		return
+	}
+	var req channelOverwriteJSON
+	if err := decodeRequestJSON(r, &req, false); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("invalid JSON"))
+		return
+	}
+	targetID, err := uuid.Parse(req.TargetID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("invalid overwrite target"))
+		return
+	}
+	err = h.svc.UpsertChannelOverwrite(r.Context(), uid, db.ChannelOverwrite{
+		ChannelID: r.PathValue("channelID"), TargetID: targetID.String(),
+		TargetType: req.TargetType, Allow: req.Allow, Deny: req.Deny,
+	})
+	if err != nil {
+		status := http.StatusForbidden
+		message := err.Error()
+		if errors.Is(err, db.ErrInvalidChannelOverwrite) {
+			status = http.StatusBadRequest
+			message = "invalid channel permission overwrite"
+		}
+		writeJSON(w, status, errResp(message))
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
+}
+
+func (h *Handler) DeleteChannelOverwrite(w http.ResponseWriter, r *http.Request) {
+	uid := requireUser(w, r)
+	if uid == "" {
+		return
+	}
+	targetID, err := uuid.Parse(r.PathValue("targetID"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("invalid overwrite target"))
+		return
+	}
+	targetType, err := strconv.ParseInt(r.PathValue("targetType"), 10, 16)
+	if err != nil || targetType < int64(db.ChannelOverwriteRole) || targetType > int64(db.ChannelOverwriteUser) {
+		writeJSON(w, http.StatusBadRequest, errResp("invalid overwrite target type"))
+		return
+	}
+	if err := h.svc.DeleteChannelOverwrite(
+		r.Context(), r.PathValue("channelID"), uid, targetID.String(), int16(targetType),
+	); err != nil {
+		status := http.StatusForbidden
+		if errors.Is(err, db.ErrInvalidChannelOverwrite) {
+			status = http.StatusBadRequest
+		}
+		writeJSON(w, status, errResp(err.Error()))
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})

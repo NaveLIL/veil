@@ -1,26 +1,73 @@
 import { Component, createSignal, Show, For, Switch, Match, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
+import { appearanceStore, THEME_OPTIONS, UI_SCALE_OPTIONS } from "@/stores/appearance";
+import { VeilMark } from "@/components/brand/VeilMark";
+import { IslandSelect } from "@/components/ui/IslandSelect";
+import { Switch as VeilSwitch } from "@/components/ui/switch";
+import { Z } from "@/lib/zIndex";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Bell,
+  Check,
+  Copy,
+  FileText,
+  ExternalLink,
+  Info,
+  Lock,
+  Network,
+  Palette,
+  Shield,
+  UserRound,
+  type LucideIcon,
+} from "lucide-solid";
 
 /* ═══════════════════════════════════════════════════════
    SETTINGS — Full-screen overlay with sidebar navigation
    ═══════════════════════════════════════════════════════ */
 
-type Section = "profile" | "security" | "network" | "notifications" | "about" | "privacy";
+type Section = "profile" | "appearance" | "security" | "network" | "notifications" | "about" | "privacy";
 
-const SECTIONS: { id: Section; label: string; icon: string }[] = [
-  { id: "profile", label: "Profile", icon: "\uD83D\uDC64" },
-  { id: "security", label: "Security", icon: "\uD83D\uDD12" },
-  { id: "network", label: "Network", icon: "\uD83C\uDF10" },
-  { id: "notifications", label: "Notifications", icon: "\uD83D\uDD14" },
-  { id: "about", label: "About", icon: "\u2139\uFE0F" },
-  { id: "privacy", label: "Privacy & Terms", icon: "\uD83D\uDCC4" },
+const SECTIONS: { id: Section; label: string; icon: LucideIcon }[] = [
+  { id: "profile", label: "Profile", icon: UserRound },
+  { id: "appearance", label: "Appearance", icon: Palette },
+  { id: "security", label: "Security", icon: Shield },
+  { id: "network", label: "Network", icon: Network },
+  { id: "notifications", label: "Notifications", icon: Bell },
+  { id: "about", label: "About", icon: Info },
+  { id: "privacy", label: "Privacy & Terms", icon: FileText },
 ];
+
+const WALLPAPER_FOCUS_POINTS = [
+  { x: 0, y: 0, label: "Top left" },
+  { x: 50, y: 0, label: "Top" },
+  { x: 100, y: 0, label: "Top right" },
+  { x: 0, y: 50, label: "Left" },
+  { x: 50, y: 50, label: "Center" },
+  { x: 100, y: 50, label: "Right" },
+  { x: 0, y: 100, label: "Bottom left" },
+  { x: 50, y: 100, label: "Bottom" },
+  { x: 100, y: 100, label: "Bottom right" },
+] as const;
 
 export const SettingsScreen: Component = () => {
   const [section, setSection] = createSignal<Section>("profile");
   const [entering, setEntering] = createSignal(true);
   const [copied, setCopied] = createSignal("");
+  const [appVersion, setAppVersion] = createSignal("0.1.0");
+  const [repositoryError, setRepositoryError] = createSignal("");
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  let closing = false;
+  const later = (callback: () => void, delayMs: number) => {
+    const timer = setTimeout(() => {
+      timers.delete(timer);
+      callback();
+    }, delayMs);
+    timers.add(timer);
+    return timer;
+  };
 
   // PIN state
   const [hasPin, setHasPin] = createSignal(false);
@@ -38,7 +85,8 @@ export const SettingsScreen: Component = () => {
 
   // Auto-lock
   const autoLockMin = () => appStore.autoLockSeconds() / 60;
-  const [autoLockOpen, setAutoLockOpen] = createSignal(false);
+  const [autoLockSaving, setAutoLockSaving] = createSignal(false);
+  const [autoLockError, setAutoLockError] = createSignal("");
 
   // Recovery phrase
   const [showRecovery, setShowRecovery] = createSignal(false);
@@ -100,46 +148,70 @@ export const SettingsScreen: Component = () => {
   };
 
   onMount(async () => {
-    setTimeout(() => setEntering(false), 30);
+    later(() => setEntering(false), 30);
+    void appearanceStore.initialize();
     try {
       const pin = await invoke<boolean>("has_pin");
       setHasPin(pin);
     } catch { /* ignore */ }
+    getVersion().then(setAppVersion).catch(() => {});
   });
 
   // Close on Escape
   const handleKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") {
-      if (autoLockOpen()) { setAutoLockOpen(false); return; }
+    if (e.key === "Escape" && !e.defaultPrevented) {
       goBack();
     }
   };
-  const handleClickOutside = () => {
-    if (autoLockOpen()) setAutoLockOpen(false);
-  };
   onMount(() => {
     document.addEventListener("keydown", handleKey);
-    document.addEventListener("click", handleClickOutside);
   });
   onCleanup(() => {
+    timers.forEach(clearTimeout);
+    timers.clear();
     if (recoveryHideTimer) clearTimeout(recoveryHideTimer);
     hideRecoveryPhrase();
     setPinInput("");
     setPinConfirm("");
     setCurrentPin("");
     document.removeEventListener("keydown", handleKey);
-    document.removeEventListener("click", handleClickOutside);
   });
 
+  const updateAutoLock = async (minutes: number) => {
+    if (autoLockSaving() || autoLockMin() === minutes) {
+      return;
+    }
+    setAutoLockSaving(true);
+    setAutoLockError("");
+    try {
+      await appStore.setAutoLockMinutes(minutes);
+    } catch (reason) {
+      setAutoLockError(String(reason).replace(/^Error:\s*/, ""));
+    } finally {
+      setAutoLockSaving(false);
+    }
+  };
+
   const goBack = () => {
+    if (closing) return;
+    closing = true;
     setEntering(true);
-    setTimeout(() => appStore.setScreen("chat"), 250);
+    later(() => appStore.setScreen("chat"), 250);
   };
 
   const copyText = async (text: string, label: string) => {
     await navigator.clipboard.writeText(text);
     setCopied(label);
-    setTimeout(() => setCopied(""), 2000);
+    later(() => setCopied(""), 2000);
+  };
+
+  const openRepository = async () => {
+    setRepositoryError("");
+    try {
+      await invoke("open_project_repository");
+    } catch (reason) {
+      setRepositoryError(String(reason));
+    }
   };
 
   const handleSetPin = async () => {
@@ -163,7 +235,7 @@ export const SettingsScreen: Component = () => {
       setPinConfirm("");
       setCurrentPin("");
       setPinMsg("PIN set successfully");
-      setTimeout(() => setPinMsg(""), 3000);
+      later(() => setPinMsg(""), 3000);
     } catch (e) {
       setPinMsg(String(e));
     }
@@ -179,7 +251,7 @@ export const SettingsScreen: Component = () => {
       setHasPin(false);
       setCurrentPin("");
       setPinMsg("PIN removed");
-      setTimeout(() => setPinMsg(""), 3000);
+      later(() => setPinMsg(""), 3000);
     } catch (e) {
       setPinMsg(String(e));
     }
@@ -202,7 +274,7 @@ export const SettingsScreen: Component = () => {
       appStore.setServerEndpoints(ws.toString(), http.toString());
       setNetworkError("");
       setNetworkSaved(true);
-      setTimeout(() => setNetworkSaved(false), 2000);
+      later(() => setNetworkSaved(false), 2000);
     } catch (e) {
       setNetworkSaved(false);
       setNetworkError(String(e));
@@ -211,22 +283,23 @@ export const SettingsScreen: Component = () => {
 
   const identityKey = () => appStore.identity() || "—";
   const userId = () => appStore.userId() || "—";
-  const veilLink = () => `veil://add/${identityKey()}`;
+  const veilLink = () => appStore.userId() ? `veil://add/${userId()}` : "Connect to a server to create your Add Me Link";
 
   // ─── Styles ─────────────────────────────────────────
   const S = {
     overlay: {
       position: "absolute" as const,
       inset: "0",
-      "z-index": "100",
+      "z-index": Z.FULLSCREEN,
       display: "flex",
-      background: "#1E1F22",
+      background: "var(--veil-window)",
+      "padding-top": "44px",
       transition: "opacity 0.25s ease, transform 0.25s ease",
     },
     sidebar: {
       width: "240px",
       "flex-shrink": "0",
-      background: "#2B2D31",
+      background: "var(--veil-island)",
       "border-radius": "12px",
       margin: "10px 0 10px 10px",
       display: "flex",
@@ -237,7 +310,7 @@ export const SettingsScreen: Component = () => {
     sidebarTitle: {
       "font-size": "11px",
       "font-weight": "700",
-      color: "rgba(255,255,255,0.25)",
+      color: "var(--veil-contrast-25)",
       "letter-spacing": "0.12em",
       "text-transform": "uppercase" as const,
       padding: "0 20px",
@@ -250,15 +323,15 @@ export const SettingsScreen: Component = () => {
       width: "100%",
       height: "36px",
       padding: "0 20px",
-      background: active ? "rgba(124,107,245,0.12)" : "transparent",
-      color: active ? "#c4b8fb" : "rgba(255,255,255,0.45)",
+      background: active ? "rgba(var(--veil-accent-rgb),0.12)" : "transparent",
+      color: active ? "var(--veil-accent-hi)" : "var(--veil-contrast-45)",
       border: "none",
       cursor: "pointer",
       "font-size": "13px",
       "font-weight": active ? "600" : "400",
       transition: "background 0.15s, color 0.15s",
       "text-align": "left" as const,
-      "border-left": active ? "3px solid #7c6bf5" : "3px solid transparent",
+      "border-left": active ? "3px solid var(--veil-accent)" : "3px solid transparent",
     }),
     content: {
       flex: "1",
@@ -269,25 +342,25 @@ export const SettingsScreen: Component = () => {
     heading: {
       "font-size": "22px",
       "font-weight": "700",
-      color: "#eee",
+      color: "var(--veil-text-strong)",
       "margin-bottom": "8px",
     },
     subHeading: {
       "font-size": "13px",
-      color: "rgba(255,255,255,0.3)",
+      color: "var(--veil-contrast-30)",
       "margin-bottom": "28px",
     },
     card: {
-      background: "#2B2D31",
+      background: "var(--veil-island)",
       "border-radius": "14px",
       padding: "20px 24px",
       "margin-bottom": "16px",
-      border: "1px solid rgba(255,255,255,0.04)",
+      border: "1px solid var(--veil-contrast-04)",
     },
     cardTitle: {
       "font-size": "12px",
       "font-weight": "700",
-      color: "rgba(255,255,255,0.25)",
+      color: "var(--veil-contrast-25)",
       "letter-spacing": "0.08em",
       "text-transform": "uppercase" as const,
       "margin-bottom": "14px",
@@ -297,30 +370,31 @@ export const SettingsScreen: Component = () => {
       "align-items": "center",
       "justify-content": "space-between",
       padding: "12px 0",
-      "border-bottom": "1px solid rgba(255,255,255,0.03)",
+      "border-bottom": "1px solid var(--veil-contrast-03)",
     },
     fieldLabel: {
       "font-size": "13px",
-      color: "rgba(255,255,255,0.7)",
+      color: "var(--veil-contrast-70)",
       "font-weight": "500",
     },
     fieldValue: {
       "font-size": "13px",
-      color: "rgba(255,255,255,0.4)",
+      color: "var(--veil-contrast-40)",
       "font-family": "monospace",
-      "max-width": "320px",
-      overflow: "hidden",
-      "text-overflow": "ellipsis",
-      "white-space": "nowrap" as const,
+      "max-width": "min(58vw, 620px)",
+      overflow: "visible",
+      "overflow-wrap": "anywhere" as const,
+      "white-space": "normal" as const,
+      "text-align": "right" as const,
       "user-select": "all" as const,
     },
     copyBtn: (active: boolean) => ({
       height: "30px",
       padding: "0 12px",
       "border-radius": "8px",
-      background: active ? "rgba(52,211,153,0.1)" : "rgba(255,255,255,0.04)",
-      color: active ? "#34d399" : "rgba(255,255,255,0.4)",
-      border: `1px solid ${active ? "rgba(52,211,153,0.2)" : "rgba(255,255,255,0.06)"}`,
+      background: active ? "var(--veil-success-surface)" : "var(--veil-contrast-04)",
+      color: active ? "var(--veil-success)" : "var(--veil-contrast-40)",
+      border: `1px solid ${active ? "var(--veil-success-border)" : "var(--veil-contrast-06)"}`,
       "font-size": "11px",
       "font-weight": "500",
       cursor: "pointer",
@@ -330,11 +404,11 @@ export const SettingsScreen: Component = () => {
       width: "100%",
       height: "38px",
       "border-radius": "10px",
-      background: "rgba(255,255,255,0.04)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--veil-contrast-04)",
+      border: "1px solid var(--veil-contrast-06)",
       padding: "0 14px",
       "font-size": "13px",
-      color: "rgba(255,255,255,0.8)",
+      color: "var(--veil-contrast-80)",
       outline: "none",
       "font-family": "monospace",
       transition: "border-color 0.2s",
@@ -342,23 +416,28 @@ export const SettingsScreen: Component = () => {
     btnPrimary: {
       height: "38px",
       padding: "0 20px",
+      display: "inline-flex",
+      "align-items": "center",
+      "justify-content": "center",
+      gap: "8px",
+      "white-space": "nowrap",
       "border-radius": "10px",
-      background: "linear-gradient(135deg, #7c6bf5 0%, #6955e0 100%)",
-      color: "#fff",
+      background: "linear-gradient(135deg, var(--veil-accent) 0%, var(--veil-accent-deep) 100%)",
+      color: "var(--veil-on-accent)",
       border: "none",
       "font-size": "13px",
       "font-weight": "600",
       cursor: "pointer",
       transition: "transform 0.15s, box-shadow 0.15s",
-      "box-shadow": "0 4px 16px rgba(124,107,245,0.2)",
+      "box-shadow": "0 4px 16px rgba(var(--veil-accent-rgb),0.2)",
     },
     btnDanger: {
       height: "38px",
       padding: "0 20px",
       "border-radius": "10px",
-      background: "rgba(240,72,72,0.08)",
-      color: "#f04848",
-      border: "1px solid rgba(240,72,72,0.15)",
+      background: "var(--veil-danger-surface)",
+      color: "var(--veil-danger)",
+      border: "1px solid var(--veil-danger-border)",
       "font-size": "13px",
       "font-weight": "500",
       cursor: "pointer",
@@ -367,44 +446,44 @@ export const SettingsScreen: Component = () => {
       height: "38px",
       padding: "0 20px",
       "border-radius": "10px",
-      background: "rgba(255,255,255,0.04)",
-      color: "rgba(255,255,255,0.5)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--veil-contrast-04)",
+      color: "var(--veil-contrast-50)",
+      border: "1px solid var(--veil-contrast-06)",
       "font-size": "13px",
       "font-weight": "500",
       cursor: "pointer",
     },
     successMsg: {
       "font-size": "12px",
-      color: "#34d399",
+      color: "var(--veil-success)",
       "margin-top": "8px",
     },
     errorMsg: {
       "font-size": "12px",
-      color: "#f04848",
+      color: "var(--veil-danger)",
       "margin-top": "8px",
     },
     backBtn: {
       position: "absolute" as const,
-      top: "18px",
+      top: "58px",
       right: "24px",
       width: "36px",
       height: "36px",
       "border-radius": "10px",
-      background: "rgba(255,255,255,0.04)",
-      border: "1px solid rgba(255,255,255,0.06)",
-      color: "rgba(255,255,255,0.4)",
+      background: "var(--veil-contrast-04)",
+      border: "1px solid var(--veil-contrast-06)",
+      color: "var(--veil-contrast-40)",
       cursor: "pointer",
       display: "flex",
       "align-items": "center",
       "justify-content": "center",
       "font-size": "16px",
       transition: "background 0.15s, color 0.15s",
-      "z-index": "10",
+      "z-index": Z.BASE,
     },
     separator: {
       height: "1px",
-      background: "rgba(255,255,255,0.04)",
+      background: "var(--veil-contrast-04)",
       margin: "16px 0",
     },
     badge: (color: string) => ({
@@ -414,14 +493,14 @@ export const SettingsScreen: Component = () => {
       height: "24px",
       padding: "0 10px",
       "border-radius": "6px",
-      background: `${color}15`,
+      background: `color-mix(in srgb, ${color} 8.2%, transparent)`,
       color: color,
       "font-size": "11px",
       "font-weight": "600",
     }),
     paragraph: {
       "font-size": "13px",
-      color: "rgba(255,255,255,0.4)",
+      color: "var(--veil-contrast-40)",
       "line-height": "1.7",
       "margin-bottom": "12px",
     },
@@ -471,9 +550,10 @@ export const SettingsScreen: Component = () => {
         <div style={{ ...S.field, "border-bottom": "none" }}>
           <span style={S.fieldLabel}>Add Me Link</span>
           <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-            <span style={{ ...S.fieldValue, color: "rgba(124,107,245,0.6)" }}>{veilLink()}</span>
+            <span style={{ ...S.fieldValue, color: "rgba(var(--veil-accent-rgb),0.72)" }}>{veilLink()}</span>
             <button
               style={S.copyBtn(copied() === "link")}
+              disabled={!appStore.userId()}
               onClick={() => copyText(veilLink(), "link")}
             >
               {copied() === "link" ? "\u2713 Copied" : "Copy"}
@@ -483,28 +563,190 @@ export const SettingsScreen: Component = () => {
       </div>
 
       <div style={S.card}>
-        <div style={S.cardTitle}>Share Your Identity</div>
+        <div style={S.cardTitle}>Share Your Profile</div>
         <div style={S.paragraph}>
-          Share your <strong style={{ color: "rgba(255,255,255,0.6)" }}>Identity Key</strong> or <strong style={{ color: "rgba(124,107,245,0.8)" }}>Add Me Link</strong> with
-          others so they can start an encrypted conversation with you. Your key is your identity on the Veil network — no phone number or email needed.
+          Share your <strong style={{ color: "rgba(var(--veil-accent-rgb),0.9)" }}>Add Me Link</strong> so someone can find your account and start an encrypted conversation. Use the Identity Key above only for out-of-band identity verification.
         </div>
         <div style={{ display: "flex", gap: "10px" }}>
           <button
             style={S.btnPrimary}
-            onClick={() => copyText(identityKey(), "ik")}
-          >
-            Copy Identity Key
-          </button>
-          <button
-            style={S.btnSecondary}
+            disabled={!appStore.userId()}
             onClick={() => copyText(veilLink(), "link")}
           >
-            Copy Add Me Link
+            {copied() === "link" ? <><Check size={14} strokeWidth={2.2} /> Copied</> : <><Copy size={14} strokeWidth={2} /> Copy Add Me Link</>}
           </button>
         </div>
       </div>
     </>
   );
+
+  const AppearanceSection = () => {
+    const appearance = () => appearanceStore.settings();
+    const wallpaper = () => appearanceStore.wallpaperUrl();
+    return (
+      <>
+        <div style={S.heading}>Appearance</div>
+        <div style={S.subHeading}>Personalize this device without changing message security</div>
+
+        <div style={S.card}>
+          <div style={S.cardTitle}>Color Theme</div>
+          <div style={{ display: "grid", "grid-template-columns": "repeat(auto-fit, minmax(150px, 1fr))", gap: "10px" }}>
+            <For each={THEME_OPTIONS}>
+              {(theme) => {
+                const active = () => appearance().themeId === theme.id;
+                return (
+                  <button
+                    type="button"
+                    aria-pressed={active()}
+                    disabled={appearanceStore.busy()}
+                    style={{
+                      padding: "12px",
+                      "border-radius": "12px",
+                      border: active() ? "1px solid var(--veil-accent)" : "1px solid var(--veil-contrast-06)",
+                      background: active() ? "rgba(var(--veil-accent-rgb),0.09)" : "var(--veil-contrast-025)",
+                      color: "var(--veil-text)",
+                      cursor: "pointer",
+                      "text-align": "left",
+                    }}
+                    onClick={() => appearanceStore.update({ themeId: theme.id }, true)}
+                  >
+                    <div style={{ display: "flex", gap: "5px", "margin-bottom": "10px" }}>
+                      <For each={theme.swatches}>
+                        {(swatch) => <span style={{ width: "22px", height: "22px", "border-radius": "7px", background: swatch, border: "1px solid var(--veil-contrast-08)" }} />}
+                      </For>
+                    </div>
+                    <div style={{ "font-size": "12px", "font-weight": "700" }}>{theme.name}</div>
+                    <div style={{ "font-size": "10px", color: "var(--veil-contrast-32)", "margin-top": "2px" }}>{theme.description}</div>
+                  </button>
+                );
+              }}
+            </For>
+          </div>
+        </div>
+
+        <div style={S.card}>
+          <div style={S.cardTitle}>Interface Scale</div>
+          <div style={{ ...S.field, "border-bottom": "none" }}>
+            <div style={{ "min-width": "0", "padding-right": "18px" }}>
+              <div style={S.fieldLabel}>UI scale</div>
+              <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "3px", "line-height": "1.45" }}>
+                Scales text and controls through the native WebView. Narrow layouts automatically move the members island over the chat instead of crushing it.
+              </div>
+            </div>
+            <IslandSelect
+              value={appearance().uiScale}
+              options={UI_SCALE_OPTIONS.map((value) => ({ value, label: `${value}%` }))}
+              width={130}
+              ariaLabel="UI scale"
+              onChange={(uiScale) => appearanceStore.update({ uiScale }, true)}
+              disabled={appearanceStore.busy()}
+            />
+          </div>
+        </div>
+
+        <div style={S.card} aria-busy={appearanceStore.busy()}>
+          <div style={S.cardTitle}>Local Wallpaper</div>
+          <div style={{
+            position: "relative",
+            height: "190px",
+            overflow: "hidden",
+            "border-radius": "14px",
+            background: "var(--veil-window)",
+            border: "1px solid var(--veil-contrast-06)",
+            "margin-bottom": "14px",
+          }}>
+            <Show when={wallpaper()} fallback={
+              <div style={{ position: "absolute", inset: "0", background: "radial-gradient(circle at 30% 20%, rgba(var(--veil-accent-rgb),0.18), transparent 45%), var(--veil-window)" }} />
+            }>
+              {(url) => <div style={{
+                position: "absolute",
+                inset: "-10px",
+                "background-image": `url(${url()})`,
+                "background-size": "cover",
+                "background-position": `${appearance().wallpaperPositionX}% ${appearance().wallpaperPositionY}%`,
+                filter: `blur(${appearance().wallpaperBlur}px)`,
+              }} />}
+            </Show>
+            <Show when={wallpaper()}>
+              <div style={{ position: "absolute", inset: "0", background: `rgba(0,0,0,${appearance().wallpaperDim / 100})` }} />
+            </Show>
+            <div style={{ position: "absolute", inset: "12px", display: "grid", "grid-template-columns": "56px 150px 1fr", gap: "8px" }}>
+              <div style={{ background: "color-mix(in srgb, var(--veil-island) 94%, transparent)", "border-radius": "10px", border: "1px solid var(--veil-contrast-05)" }} />
+              <div style={{ background: "color-mix(in srgb, var(--veil-island) 94%, transparent)", "border-radius": "10px", border: "1px solid var(--veil-contrast-05)" }} />
+              <div style={{ background: "color-mix(in srgb, var(--veil-island) 94%, transparent)", "border-radius": "10px", border: "1px solid var(--veil-contrast-05)", display: "flex", "align-items": "flex-end", padding: "12px" }}>
+                <div style={{ width: "100%", height: "28px", background: "var(--veil-composer)", "border-radius": "8px" }} />
+              </div>
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: "10px", "align-items": "center", "flex-wrap": "wrap", "margin-bottom": wallpaper() ? "18px" : "0" }}>
+            <button type="button" style={S.btnPrimary} disabled={appearanceStore.busy()} onClick={() => void appearanceStore.chooseWallpaper()}>
+              {appearanceStore.busy() ? "Working…" : wallpaper() ? "Replace Image" : "Choose Image"}
+            </button>
+            <Show when={wallpaper()}>
+              <button type="button" style={S.btnSecondary} disabled={appearanceStore.busy()} onClick={() => void appearanceStore.removeWallpaper()}>Remove</button>
+            </Show>
+            <button type="button" style={S.btnSecondary} disabled={appearanceStore.busy()} onClick={() => void appearanceStore.reset()}>Restore Defaults</button>
+            <span style={{ "font-size": "10px", color: "var(--veil-contrast-25)" }}>PNG, JPEG or WebP · re-encoded locally · never uploaded</span>
+          </div>
+
+          <div style={{ "font-size": "10px", color: "var(--veil-contrast-28)", "line-height": "1.5", "margin-bottom": wallpaper() ? "16px" : "0" }}>
+            The sanitized JPEG is stored in this device's app-data, outside the encrypted message database. Choose an image appropriate for the device's local users.
+          </div>
+
+          <Show when={wallpaper()}>
+            <div style={{ display: "grid", "grid-template-columns": "1fr 1fr", gap: "18px", "margin-bottom": "18px" }}>
+              <label style={{ display: "block" }}>
+                <div style={{ display: "flex", "justify-content": "space-between", "font-size": "11px", color: "var(--veil-contrast-45)", "margin-bottom": "7px" }}><span>Dim</span><span>{appearance().wallpaperDim}%</span></div>
+                <input aria-label="Wallpaper dim" type="range" min="20" max="85" value={appearance().wallpaperDim} disabled={appearanceStore.busy()} style={{ width: "100%", "accent-color": "var(--veil-accent)" }} onInput={(event) => appearanceStore.update({ wallpaperDim: Number(event.currentTarget.value) })} />
+              </label>
+              <label style={{ display: "block" }}>
+                <div style={{ display: "flex", "justify-content": "space-between", "font-size": "11px", color: "var(--veil-contrast-45)", "margin-bottom": "7px" }}><span>Blur</span><span>{appearance().wallpaperBlur}px</span></div>
+                <input aria-label="Wallpaper blur" type="range" min="0" max="24" value={appearance().wallpaperBlur} disabled={appearanceStore.busy()} style={{ width: "100%", "accent-color": "var(--veil-accent)" }} onInput={(event) => appearanceStore.update({ wallpaperBlur: Number(event.currentTarget.value) })} />
+              </label>
+            </div>
+
+            <div style={{ display: "flex", "align-items": "center", gap: "14px", "margin-bottom": "18px" }}>
+              <div>
+                <div style={{ "font-size": "11px", color: "var(--veil-contrast-45)", "margin-bottom": "7px" }}>Focus point</div>
+                <div style={{ display: "grid", "grid-template-columns": "repeat(3, 20px)", gap: "4px" }}>
+                  <For each={WALLPAPER_FOCUS_POINTS}>
+                    {(point) => {
+                      const active = () => appearance().wallpaperPositionX === point.x && appearance().wallpaperPositionY === point.y;
+                      return <button type="button" title={point.label} aria-label={point.label} aria-pressed={active()} disabled={appearanceStore.busy()} style={{ width: "20px", height: "20px", padding: "0", "border-radius": "5px", border: active() ? "1px solid var(--veil-accent)" : "1px solid var(--veil-contrast-08)", background: active() ? "rgba(var(--veil-accent-rgb),0.25)" : "var(--veil-contrast-03)", cursor: "pointer" }} onClick={() => appearanceStore.update({ wallpaperPositionX: point.x, wallpaperPositionY: point.y }, true)} />;
+                    }}
+                  </For>
+                </div>
+              </div>
+              <div style={{ "font-size": "11px", color: "var(--veil-contrast-28)", "line-height": "1.5", "max-width": "360px" }}>Choose where the important part of the image stays when the window changes shape.</div>
+            </div>
+          </Show>
+
+          <div style={{ ...S.field, "border-bottom": "none" }}>
+            <VeilSwitch
+              checked={appearance().showOnLockScreen}
+              onChange={(showOnLockScreen) => appearanceStore.update({ showOnLockScreen }, true)}
+              label="Show wallpaper while locked"
+              description="Off by default so a personal image is not exposed on the lock screen."
+              disabled={appearanceStore.busy()}
+            />
+          </div>
+          <div style={{ ...S.field, "border-bottom": "none", "border-top": "1px solid var(--veil-contrast-03)" }}>
+            <VeilSwitch
+              checked={appearance().reduceMotion}
+              onChange={(reduceMotion) => appearanceStore.update({ reduceMotion }, true)}
+              label="Reduce motion"
+              description="Minimizes island entrances, glow pulses and decorative movement."
+              disabled={appearanceStore.busy()}
+            />
+          </div>
+          <Show when={appearanceStore.error()}>
+            <div style={S.errorMsg} role="alert">{appearanceStore.error()}</div>
+          </Show>
+        </div>
+      </>
+    );
+  };
 
   const SecuritySection = () => (
     <>
@@ -516,8 +758,8 @@ export const SettingsScreen: Component = () => {
 
         <div style={S.field}>
           <span style={S.fieldLabel}>PIN Status</span>
-          <span style={S.badge(hasPin() ? "#34d399" : "#f59e0b")}>
-            {hasPin() ? "\uD83D\uDD12 Active" : "\u26A0 Not Set"}
+          <span style={S.badge(hasPin() ? "var(--veil-success)" : "var(--veil-warning)")}>
+            {hasPin() ? <><Lock size={12} strokeWidth={2} /> Active</> : <><Info size={12} strokeWidth={2} /> Not Set</>}
           </span>
         </div>
 
@@ -582,92 +824,19 @@ export const SettingsScreen: Component = () => {
         <div style={S.cardTitle}>Auto-Lock</div>
         <div style={S.field}>
           <span style={S.fieldLabel}>Lock after inactivity</span>
-          <div style={{ position: "relative" }}>
-            <button
-              style={{
-                height: "34px",
-                padding: "0 32px 0 14px",
-                "border-radius": "10px",
-                background: "rgba(255,255,255,0.04)",
-                border: "1px solid rgba(255,255,255,0.08)",
-                color: "rgba(255,255,255,0.6)",
-                "font-size": "13px",
-                cursor: "pointer",
-                "min-width": "130px",
-                "text-align": "left",
-                position: "relative" as const,
-                transition: "border-color 0.2s",
-              }}
-              onClick={(e) => { e.stopPropagation(); setAutoLockOpen(!autoLockOpen()); }}
-            >
-              {autoLockOptions.find(o => o.value === autoLockMin())?.label}
-              <span style={{
-                position: "absolute",
-                right: "10px",
-                top: "50%",
-                transform: autoLockOpen() ? "translateY(-50%) rotate(180deg)" : "translateY(-50%)",
-                "font-size": "10px",
-                color: "rgba(255,255,255,0.3)",
-                transition: "transform 0.2s",
-              }}>{"\u25BC"}</span>
-            </button>
-            <Show when={autoLockOpen()}>
-              <div style={{
-                position: "absolute",
-                top: "calc(100% + 4px)",
-                right: "0",
-                "min-width": "130px",
-                background: "#2B2D31",
-                border: "1px solid rgba(255,255,255,0.08)",
-                "border-radius": "10px",
-                padding: "4px",
-                "z-index": "50",
-                "box-shadow": "0 8px 24px rgba(0,0,0,0.4)",
-              }}>
-                <For each={autoLockOptions}>
-                  {(opt) => (
-                    <button
-                      style={{
-                        display: "block",
-                        width: "100%",
-                        height: "32px",
-                        padding: "0 12px",
-                        "border-radius": "8px",
-                        background: autoLockMin() === opt.value ? "rgba(124,107,245,0.15)" : "transparent",
-                        color: autoLockMin() === opt.value ? "#c4b8fb" : "rgba(255,255,255,0.5)",
-                        border: "none",
-                        cursor: "pointer",
-                        "font-size": "13px",
-                        "text-align": "left",
-                        transition: "background 0.15s, color 0.15s",
-                      }}
-                      onClick={() => {
-                        appStore.setAutoLockMinutes(opt.value).catch((e) =>
-                          console.error("auto-lock update failed:", e),
-                        );
-                        setAutoLockOpen(false);
-                      }}
-                      onMouseEnter={(e) => {
-                        if (autoLockMin() !== opt.value) {
-                          e.currentTarget.style.background = "rgba(255,255,255,0.04)";
-                          e.currentTarget.style.color = "rgba(255,255,255,0.7)";
-                        }
-                      }}
-                      onMouseLeave={(e) => {
-                        if (autoLockMin() !== opt.value) {
-                          e.currentTarget.style.background = "transparent";
-                          e.currentTarget.style.color = "rgba(255,255,255,0.5)";
-                        }
-                      }}
-                    >
-                      {opt.label}
-                    </button>
-                  )}
-                </For>
-              </div>
-            </Show>
-          </div>
+          <IslandSelect
+            value={autoLockMin()}
+            options={autoLockOptions}
+            width={130}
+            height={34}
+            ariaLabel="Lock after inactivity"
+            disabled={autoLockSaving()}
+            onChange={(minutes) => void updateAutoLock(minutes)}
+          />
         </div>
+        <Show when={autoLockError()}>
+          <div style={S.errorMsg} role="alert">{autoLockError()}</div>
+        </Show>
       </div>
 
       {/* Recovery Phrase */}
@@ -676,7 +845,7 @@ export const SettingsScreen: Component = () => {
 
         <Show when={!showRecovery()}>
           <div style={S.paragraph}>
-            Your 12-word recovery phrase is the <strong style={{ color: "rgba(251,191,36,0.8)" }}>only way</strong> to restore access to your account and messages on a new device. Keep it safe and never share it with anyone.
+            Your 12-word recovery phrase restores your cryptographic identity and account access on a new installation. It does <strong style={{ color: "color-mix(in srgb, var(--veil-warning) 80%, transparent)" }}>not</strong> back up this device's message database or ratchet history. Keep it safe and never share it with anyone.
           </div>
           <button style={S.btnDanger} onClick={() => setShowRecovery(true)}>
             Show Recovery Phrase
@@ -685,21 +854,21 @@ export const SettingsScreen: Component = () => {
 
         <Show when={showRecovery() && !recoveryConfirmed()}>
           <div style={{
-            background: "rgba(240,72,72,0.06)",
-            border: "1px solid rgba(240,72,72,0.15)",
+            background: "var(--veil-danger-surface)",
+            border: "1px solid var(--veil-danger-border)",
             "border-radius": "10px",
             padding: "16px 20px",
             "margin-bottom": "16px",
           }}>
             <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-bottom": "10px" }}>
-              <span style={{ "font-size": "18px" }}>{"\u26A0\uFE0F"}</span>
-              <span style={{ "font-size": "14px", "font-weight": "700", color: "#f04848" }}>Security Warning</span>
+              <AlertTriangle size={18} strokeWidth={2} color="var(--veil-danger)" />
+              <span style={{ "font-size": "14px", "font-weight": "700", color: "var(--veil-danger)" }}>Security Warning</span>
             </div>
-            <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.55)", "line-height": "1.7" }}>
-              <strong style={{ color: "rgba(255,255,255,0.7)" }}>Never share your recovery phrase with anyone.</strong>
-              {" "}Anyone with these 12 words will have <strong style={{ color: "#f04848" }}>full access</strong> to your account, messages, and identity. Veil support will never ask for your phrase.
+            <div style={{ "font-size": "13px", color: "var(--veil-contrast-55)", "line-height": "1.7" }}>
+              <strong style={{ color: "var(--veil-contrast-70)" }}>Never share your recovery phrase with anyone.</strong>
+              {" "}Anyone with these 12 words can take over your <strong style={{ color: "var(--veil-danger)" }}>identity and future account access</strong>. The phrase alone does not decrypt a separate device's local message history. Veil support will never ask for it.
             </div>
-            <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.55)", "line-height": "1.7", "margin-top": "8px" }}>
+            <div style={{ "font-size": "13px", color: "var(--veil-contrast-55)", "line-height": "1.7", "margin-top": "8px" }}>
               Make sure no one can see your screen right now.
             </div>
           </div>
@@ -732,12 +901,12 @@ export const SettingsScreen: Component = () => {
 
         <Show when={showRecovery() && recoveryConfirmed()}>
           <Show when={recoveryLoading()}>
-            <div style={{ ...S.paragraph, color: "rgba(255,255,255,0.3)" }}>Loading...</div>
+            <div style={{ ...S.paragraph, color: "var(--veil-contrast-30)" }}>Loading...</div>
           </Show>
           <Show when={!recoveryLoading() && recoveryPhrase()}>
             <div style={{
-              background: "rgba(240,72,72,0.04)",
-              border: "1px solid rgba(240,72,72,0.1)",
+              background: "color-mix(in srgb, var(--veil-danger) 4%, transparent)",
+              border: "1px solid var(--veil-danger-surface)",
               "border-radius": "12px",
               padding: "20px",
               "margin-bottom": "14px",
@@ -756,18 +925,18 @@ export const SettingsScreen: Component = () => {
                       height: "36px",
                       padding: "0 12px",
                       "border-radius": "8px",
-                      background: "rgba(255,255,255,0.03)",
-                      border: "1px solid rgba(255,255,255,0.05)",
+                      background: "var(--veil-contrast-03)",
+                      border: "1px solid var(--veil-contrast-05)",
                     }}>
                       <span style={{
                         "font-size": "11px",
-                        color: "rgba(255,255,255,0.2)",
+                        color: "var(--veil-contrast-20)",
                         "min-width": "18px",
                         "font-weight": "600",
                       }}>{i() + 1}</span>
                       <span style={{
                         "font-size": "13px",
-                        color: "rgba(255,255,255,0.8)",
+                        color: "var(--veil-contrast-80)",
                         "font-family": "monospace",
                         "font-weight": "500",
                       }}>{word}</span>
@@ -781,7 +950,7 @@ export const SettingsScreen: Component = () => {
                 Hide
               </button>
             </div>
-            <div style={{ ...S.paragraph, "margin-top": "10px", color: "rgba(251,191,36,0.65)" }}>
+            <div style={{ ...S.paragraph, "margin-top": "10px", color: "color-mix(in srgb, var(--veil-warning) 65%, transparent)" }}>
               Clipboard copy is disabled because Windows Clipboard History and cloud sync can retain a recovery phrase after the clipboard is cleared.
             </div>
           </Show>
@@ -799,7 +968,7 @@ export const SettingsScreen: Component = () => {
         </div>
         <div style={{ ...S.field, "border-bottom": "none" }}>
           <span style={S.fieldLabel}>Connection</span>
-          <span style={S.badge(appStore.connected() ? "#34d399" : "#555")}>
+          <span style={S.badge(appStore.connected() ? "var(--veil-success)" : "var(--veil-text-faint)")}>
             {appStore.connected() ? "Connected" : "Disconnected"}
           </span>
         </div>
@@ -816,7 +985,7 @@ export const SettingsScreen: Component = () => {
         <div style={S.cardTitle}>Server Configuration</div>
 
         <div style={{ "margin-bottom": "14px" }}>
-          <div style={{ "font-size": "12px", color: "rgba(255,255,255,0.3)", "margin-bottom": "6px" }}>WebSocket URL</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>WebSocket URL</div>
           <input
             style={S.input}
             value={wsUrl()}
@@ -826,7 +995,7 @@ export const SettingsScreen: Component = () => {
         </div>
 
         <div style={{ "margin-bottom": "18px" }}>
-          <div style={{ "font-size": "12px", color: "rgba(255,255,255,0.3)", "margin-bottom": "6px" }}>HTTP API URL</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>HTTP API URL</div>
           <input
             style={S.input}
             value={httpUrl()}
@@ -853,7 +1022,7 @@ export const SettingsScreen: Component = () => {
         <div style={S.cardTitle}>Status</div>
         <div style={S.field}>
           <span style={S.fieldLabel}>Connection</span>
-          <span style={S.badge(appStore.connected() ? "#34d399" : "#f04848")}>
+          <span style={S.badge(appStore.connected() ? "var(--veil-success)" : "var(--veil-danger)")}>
             {appStore.connected() ? "\u2022 Connected" : "\u2022 Disconnected"}
           </span>
         </div>
@@ -861,7 +1030,7 @@ export const SettingsScreen: Component = () => {
           <span style={S.fieldLabel}>User ID</span>
           <span style={{
             ...S.fieldValue,
-            color: appStore.userId() ? "rgba(255,255,255,0.4)" : "rgba(255,255,255,0.15)",
+            color: appStore.userId() ? "var(--veil-contrast-40)" : "var(--veil-contrast-15)",
             "font-style": appStore.userId() ? "normal" : ("italic" as const),
           }}>
             {appStore.userId() || "assigned after connecting"}
@@ -874,32 +1043,34 @@ export const SettingsScreen: Component = () => {
   const NotificationsSection = () => (
     <>
       <div style={S.heading}>Notifications</div>
-      <div style={S.subHeading}>Manage how you receive alerts</div>
+      <div style={S.subHeading}>Current Windows notification privacy behavior</div>
 
       <div style={S.card}>
         <div style={S.cardTitle}>Desktop Notifications</div>
         <div style={{ ...S.field, "border-bottom": "none" }}>
           <div>
             <div style={S.fieldLabel}>Message notifications</div>
-            <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.2)", "margin-top": "2px" }}>
-              Show a generic alert; sender and message text are never stored in Windows Action Center
+            <div style={{ "font-size": "11px", color: "var(--veil-contrast-20)", "margin-top": "2px" }}>
+              Incoming message alerts stay generic; sender and message text are not placed in Windows Action Center
             </div>
           </div>
-          <span style={S.badge("#34d399")}>Private preview</span>
+          <span style={S.badge("var(--veil-success)")}>Content hidden</span>
+        </div>
+        <div style={{ ...S.field, "border-bottom": "none" }}>
+          <div>
+            <div style={S.fieldLabel}>Friend requests</div>
+            <div style={{ "font-size": "11px", color: "var(--veil-contrast-20)", "margin-top": "2px" }}>
+              Shows a generic request alert without exposing identity keys
+            </div>
+          </div>
+          <span style={S.badge("var(--veil-success)")}>Content hidden</span>
         </div>
       </div>
 
       <div style={S.card}>
-        <div style={S.cardTitle}>Sound</div>
-        <div style={{ ...S.field, "border-bottom": "none" }}>
-          <div>
-            <div style={S.fieldLabel}>Notification sound</div>
-            <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.2)", "margin-top": "2px" }}>
-              Play a sound when messages arrive
-            </div>
-          </div>
-          <span style={S.badge("#555")}>Coming soon</span>
-        </div>
+        <div style={S.cardTitle}>Controls</div>
+        <div style={S.paragraph}>Notification enable/disable, sound, mute and DND controls will appear here only after the native runtime persists and enforces them. Windows currently controls sound and permission.</div>
+        <span style={S.badge("var(--veil-text-subtle)")}>System managed</span>
       </div>
     </>
   );
@@ -913,19 +1084,15 @@ export const SettingsScreen: Component = () => {
         <div style={{ display: "flex", "align-items": "center", gap: "16px", "margin-bottom": "20px" }}>
           <div style={{
             width: "52px", height: "52px", "border-radius": "16px",
-            background: "linear-gradient(135deg, rgba(124,107,245,0.25) 0%, rgba(124,107,245,0.08) 100%)",
-            border: "1px solid rgba(124,107,245,0.15)",
+            background: "linear-gradient(135deg, rgba(var(--veil-accent-rgb),0.25) 0%, rgba(var(--veil-accent-rgb),0.08) 100%)",
+            border: "1px solid rgba(var(--veil-accent-rgb),0.15)",
             display: "flex", "align-items": "center", "justify-content": "center",
           }}>
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none">
-              <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"
-                fill="rgba(124,107,245,0.3)" stroke="rgba(124,107,245,0.8)" stroke-width="1.5"/>
-              <path d="M9 12l2 2 4-4" stroke="#7c6bf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-            </svg>
+            <VeilMark size={24} style={{ color: "var(--veil-accent)" }} />
           </div>
           <div>
-            <div style={{ "font-size": "18px", "font-weight": "700", color: "#eee" }}>Veil</div>
-            <div style={{ "font-size": "12px", color: "rgba(255,255,255,0.3)", "margin-top": "2px" }}>Version 0.1.0 (Phase 2)</div>
+            <div style={{ "font-size": "18px", "font-weight": "700", color: "var(--veil-text-strong)" }}>Veil</div>
+            <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-top": "2px" }}>Version {appVersion()}</div>
           </div>
         </div>
 
@@ -933,7 +1100,7 @@ export const SettingsScreen: Component = () => {
 
         <div style={S.field}>
           <span style={S.fieldLabel}>Encryption</span>
-          <span style={{ ...S.fieldValue, "font-family": "inherit" }}>DM: X3DH + Double Ratchet; groups: Sender Keys</span>
+          <span style={{ ...S.fieldValue, "font-family": "inherit" }}>DM: X3DH + Double Ratchet; groups/channels: authenticated Sender Keys v5</span>
         </div>
         <div style={S.field}>
           <span style={S.fieldLabel}>Identity</span>
@@ -956,10 +1123,13 @@ export const SettingsScreen: Component = () => {
       <div style={S.card}>
         <div style={S.cardTitle}>Links</div>
         <div style={{ display: "flex", gap: "10px", "flex-wrap": "wrap" }}>
-          <button style={S.btnSecondary} onClick={() => copyText("https://github.com/NaveLIL/veil", "gh")}>
-            {copied() === "gh" ? "\u2713 Copied" : "\uD83D\uDCE6 GitHub Repository"}
+          <button type="button" style={S.btnSecondary} onClick={() => void openRepository()}>
+            <ExternalLink size={14} strokeWidth={2} /> Open GitHub Repository
           </button>
         </div>
+        <Show when={repositoryError()}>
+          <div style={S.errorMsg} role="alert">{repositoryError()}</div>
+        </Show>
       </div>
     </>
   );
@@ -981,7 +1151,7 @@ export const SettingsScreen: Component = () => {
         ]}>
           {(item) => (
             <div style={{ "margin-bottom": "16px" }}>
-              <div style={{ "font-size": "14px", "font-weight": "600", color: "rgba(255,255,255,0.75)", "margin-bottom": "4px" }}>
+              <div style={{ "font-size": "14px", "font-weight": "600", color: "var(--veil-contrast-75)", "margin-bottom": "4px" }}>
                 {item.title}
               </div>
               <div style={S.paragraph}>{item.desc}</div>
@@ -994,7 +1164,7 @@ export const SettingsScreen: Component = () => {
         <div style={S.cardTitle}>Terms of Use</div>
         <div style={S.paragraph}>
           Veil is provided as-is, without warranties of any kind. You are solely responsible for the security
-          of your recovery phrase. If you lose it, there is <strong style={{ color: "rgba(251,191,36,0.8)" }}>no way</strong> to recover your account or messages.
+          of your recovery phrase. If you lose both the phrase and your working installation, there is <strong style={{ color: "color-mix(in srgb, var(--veil-warning) 80%, transparent)" }}>no way</strong> to restore that cryptographic identity. Message history is local and requires its own future backup/transfer design.
         </div>
         <div style={S.paragraph}>
           Do not use Veil for illegal activities. While we cannot read your messages, we reserve the right to
@@ -1008,12 +1178,15 @@ export const SettingsScreen: Component = () => {
     <div style={{ ...S.overlay, ...animStyle() }}>
       {/* Close button */}
       <button
+        type="button"
         style={S.backBtn}
+        title="Back to chat"
+        aria-label="Back to chat"
         onClick={goBack}
-        onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.08)"; e.currentTarget.style.color = "rgba(255,255,255,0.7)"; }}
-        onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.04)"; e.currentTarget.style.color = "rgba(255,255,255,0.4)"; }}
+        onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-08)"; e.currentTarget.style.color = "var(--veil-contrast-70)"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-contrast-40)"; }}
       >
-        {"\u2715"}
+        <ArrowLeft size={17} strokeWidth={2} />
       </button>
 
       {/* Sidebar navigation */}
@@ -1024,44 +1197,23 @@ export const SettingsScreen: Component = () => {
             <button
               style={S.navItem(section() === s.id)}
               onClick={() => setSection(s.id)}
-              onMouseEnter={(e) => { if (section() !== s.id) e.currentTarget.style.background = "rgba(255,255,255,0.03)"; }}
+              onMouseEnter={(e) => { if (section() !== s.id) e.currentTarget.style.background = "var(--veil-contrast-03)"; }}
               onMouseLeave={(e) => { if (section() !== s.id) e.currentTarget.style.background = "transparent"; }}
             >
-              <span style={{ "font-size": "14px", width: "20px", "text-align": "center" }}>{s.icon}</span>
+              <span style={{ width: "20px", display: "inline-flex", "align-items": "center", "justify-content": "center" }}><s.icon size={15} strokeWidth={1.8} /></span>
               {s.label}
             </button>
           )}
         </For>
 
         <div style={{ flex: "1" }} />
-
-        <div style={{ padding: "0 14px" }}>
-          <button
-            style={{
-              width: "100%",
-              height: "36px",
-              "border-radius": "10px",
-              background: "rgba(240,72,72,0.05)",
-              border: "1px solid rgba(240,72,72,0.1)",
-              color: "rgba(240,72,72,0.6)",
-              "font-size": "12px",
-              "font-weight": "500",
-              cursor: "pointer",
-              transition: "background 0.15s",
-            }}
-            onClick={goBack}
-            onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(240,72,72,0.1)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(240,72,72,0.05)"; }}
-          >
-            {"\u2190"} Back to Chat
-          </button>
-        </div>
       </div>
 
       {/* Content area */}
       <div style={S.content}>
         <Switch>
           <Match when={section() === "profile"}><ProfileSection /></Match>
+          <Match when={section() === "appearance"}><AppearanceSection /></Match>
           <Match when={section() === "security"}><SecuritySection /></Match>
           <Match when={section() === "network"}><NetworkSection /></Match>
           <Match when={section() === "notifications"}><NotificationsSection /></Match>

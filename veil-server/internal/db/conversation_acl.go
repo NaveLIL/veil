@@ -38,11 +38,14 @@ func (db *DB) HasAllPermissions(ctx context.Context, serverID, userID string, re
 // the requested server role bits.
 func (db *DB) CanAccessConversation(ctx context.Context, conversationID, userID string, required uint64) (bool, error) {
 	var conversationType int16
-	var serverID *string
+	var channelID *string
 	err := db.Pool.QueryRow(ctx,
-		`SELECT conv_type, server_id FROM conversations WHERE id = $1::uuid`,
+		`SELECT conversation.conv_type, channel.id
+		 FROM conversations conversation
+		 LEFT JOIN channels channel ON channel.conversation_id = conversation.id
+		 WHERE conversation.id = $1::uuid`,
 		conversationID,
-	).Scan(&conversationType, &serverID)
+	).Scan(&conversationType, &channelID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
@@ -56,10 +59,10 @@ func (db *DB) CanAccessConversation(ctx context.Context, conversationID, userID 
 	if conversationType != 2 {
 		return true, nil
 	}
-	if serverID == nil {
+	if channelID == nil {
 		return false, nil
 	}
-	return db.HasAllPermissions(ctx, *serverID, userID, required)
+	return db.HasAllChannelPermissions(ctx, *channelID, userID, required)
 }
 
 // GetAuthorizedConversationMembers returns all current recipients for a
@@ -79,41 +82,39 @@ func (db *DB) GetAuthorizedConversationMembers(ctx context.Context, conversation
 	}
 
 	rows, err := db.Pool.Query(ctx,
-		`SELECT member.user_id::text
-		 FROM conversation_members member
-		 JOIN conversations conversation ON conversation.id = member.conversation_id
-		 JOIN servers server ON server.id = conversation.server_id AND server.deleted_at IS NULL
-		 JOIN server_members server_member
-		   ON server_member.server_id = server.id AND server_member.user_id = member.user_id
-		 LEFT JOIN roles role
-		   ON role.server_id = server.id
-		  AND (role.is_default = TRUE OR EXISTS (
-		    SELECT 1 FROM member_roles assignment
-		    WHERE assignment.server_id = server.id
-		      AND assignment.user_id = member.user_id
-		      AND assignment.role_id = role.id
-		  ))
-		 WHERE conversation.id = $1::uuid AND conversation.conv_type = 2
-		 GROUP BY member.user_id, server.owner_id
-		 HAVING server.owner_id = member.user_id
-		    OR (COALESCE(BIT_OR(role.permissions), 0) & $2::bigint) <> 0
-		    OR (COALESCE(BIT_OR(role.permissions), 0) & $3::bigint) = $3::bigint
-		 ORDER BY member.user_id`,
-		conversationID, int64(PermAdministrator), int64(required),
+		`SELECT user_id::text
+		 FROM conversation_members
+		 WHERE conversation_id = $1::uuid
+		 ORDER BY user_id`,
+		conversationID,
 	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	members := make([]string, 0)
+	candidates := make([]string, 0)
 	for rows.Next() {
 		var userID string
 		if err := rows.Scan(&userID); err != nil {
 			return nil, err
 		}
-		members = append(members, userID)
+		candidates = append(candidates, userID)
 	}
-	return members, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	members := make([]string, 0, len(candidates))
+	for _, userID := range candidates {
+		allowed, err := db.CanAccessConversation(ctx, conversationID, userID, required)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			members = append(members, userID)
+		}
+	}
+	return members, nil
 }
 
 // GetAuthorizedConversationMemberBindings returns the public cryptographic

@@ -13,11 +13,12 @@ import (
 	"github.com/AegisSec/veil-server/internal/httpmw"
 )
 
-func TestAccessLog_RecordsStatusAndUser(t *testing.T) {
+func TestAccessLog_RecordsStatusAndPseudonymousRefs(t *testing.T) {
 	var buf bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	secret := bytes.Repeat([]byte{0x42}, 32)
 
-	h := httpmw.AccessLog(logger)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h := httpmw.AccessLogWithPseudonymSecret(logger, secret)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Simulate auth middleware that propagates verified user.
 		r.Header.Set("X-User-ID", "user-42")
 		w.WriteHeader(http.StatusTeapot)
@@ -38,11 +39,16 @@ func TestAccessLog_RecordsStatusAndUser(t *testing.T) {
 		`path=/v1/things`,
 		`status=418`,
 		`bytes=5`,
-		`user=user-42`,
-		`ip=10.0.0.1`,
+		`user_ref=v1_`,
+		`ip_ref=v1_`,
 	} {
 		if !strings.Contains(line, want) {
 			t.Errorf("log missing %q in: %s", want, line)
+		}
+	}
+	for _, forbidden := range []string{"user-42", "10.0.0.1"} {
+		if strings.Contains(line, forbidden) {
+			t.Errorf("access log leaked raw identifier %q in: %s", forbidden, line)
 		}
 	}
 }
@@ -55,8 +61,43 @@ func TestAccessLog_AnonymousUser(t *testing.T) {
 	}))
 
 	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/health", nil))
-	if !strings.Contains(buf.String(), "user=-") {
-		t.Errorf("expected user=- for anon, got: %s", buf.String())
+	if !strings.Contains(buf.String(), "user_ref=-") {
+		t.Errorf("expected user_ref=- for anon, got: %s", buf.String())
+	}
+}
+
+func TestAccessLog_PseudonymsAreStableOnlyForSameSecret(t *testing.T) {
+	logOnce := func(secret []byte) string {
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		h := httpmw.AccessLogWithPseudonymSecret(logger, secret)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Header.Set("X-User-ID", "user-42")
+			w.WriteHeader(http.StatusNoContent)
+		}))
+		r := httptest.NewRequest(http.MethodGet, "/x", nil)
+		r.RemoteAddr = "10.0.0.1:5000"
+		h.ServeHTTP(httptest.NewRecorder(), r)
+		return buf.String()
+	}
+	field := func(line, name string) string {
+		prefix := name + "="
+		for _, part := range strings.Fields(line) {
+			if strings.HasPrefix(part, prefix) {
+				return strings.TrimPrefix(part, prefix)
+			}
+		}
+		t.Fatalf("missing %s in %q", name, line)
+		return ""
+	}
+
+	first := logOnce(bytes.Repeat([]byte{1}, 32))
+	second := logOnce(bytes.Repeat([]byte{1}, 32))
+	differentProcess := logOnce(bytes.Repeat([]byte{2}, 32))
+	if field(first, "user_ref") != field(second, "user_ref") || field(first, "ip_ref") != field(second, "ip_ref") {
+		t.Fatalf("same process secret/day must produce stable refs:\n%s\n%s", first, second)
+	}
+	if field(first, "user_ref") == field(differentProcess, "user_ref") || field(first, "ip_ref") == field(differentProcess, "ip_ref") {
+		t.Fatal("different process secrets must not produce linkable refs")
 	}
 }
 
@@ -104,6 +145,23 @@ func TestCORS_DisallowedOriginNoHeaders(t *testing.T) {
 
 	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
 		t.Errorf("evil origin should not get ACAO, got %q", got)
+	}
+}
+
+func TestCORS_DisallowedPreflightFailsClosed(t *testing.T) {
+	h := httpmw.CORS(nil)(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("disallowed preflight must not reach downstream")
+	}))
+	r := httptest.NewRequest(http.MethodOptions, "/v1/profile", nil)
+	r.Header.Set("Origin", "https://evil.example")
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("disallowed preflight: want 403, got %d", w.Code)
+	}
+	if got := w.Header().Get("Access-Control-Allow-Origin"); got != "" {
+		t.Fatalf("disallowed preflight exposed ACAO=%q", got)
 	}
 }
 

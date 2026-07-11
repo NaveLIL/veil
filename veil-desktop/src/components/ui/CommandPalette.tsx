@@ -13,6 +13,7 @@ import {
 interface Props {
   open: boolean;
   onClose: () => void;
+  onNavigate: (conversationId: string) => void | Promise<void>;
 }
 
 interface SearchHit {
@@ -39,7 +40,8 @@ function highlight(body: string, query: string) {
   return parts.map((p, i) =>
     i % 2 === 1 ? (
       <mark style={{
-        background: "rgba(124,107,245,0.35)", color: "#fff",
+        background: "color-mix(in srgb, var(--veil-accent) 35%, transparent)",
+        color: "var(--veil-text-strong)",
         padding: "0 2px", "border-radius": "3px",
       }}>{p}</mark>
     ) : p,
@@ -119,8 +121,8 @@ export const CommandPalette: Component<Props> = (props) => {
     return map;
   });
 
-  const openHit = (h: SearchHit) => {
-    appStore.selectConversation(h.conversationId);
+  const openHit = async (h: SearchHit) => {
+    await props.onNavigate(h.conversationId);
     props.onClose();
   };
 
@@ -154,7 +156,7 @@ export const CommandPalette: Component<Props> = (props) => {
       const h = hits()[active()];
       if (h) {
         e.preventDefault();
-        openHit(h);
+        void openHit(h);
       }
     }
   };
@@ -165,7 +167,7 @@ export const CommandPalette: Component<Props> = (props) => {
         <KDialog.Overlay
           style={{
             position: "fixed", inset: "0", "z-index": Z.DIALOG_BACKDROP,
-            background: "rgba(0,0,0,0.55)",
+            background: "var(--veil-backdrop)",
             "backdrop-filter": "blur(6px)",
             "-webkit-backdrop-filter": "blur(6px)",
             animation: "fadeIn 120ms ease-out",
@@ -182,12 +184,12 @@ export const CommandPalette: Component<Props> = (props) => {
               "pointer-events": "auto",
               width: "640px", "max-width": "calc(100vw - 32px)",
               display: "flex", "flex-direction": "column",
-              background: "#2B2D31",
+              background: "var(--veil-island)",
               "border-radius": "12px",
-              border: "1px solid rgba(255,255,255,0.05)",
-              "box-shadow": "0 20px 60px rgba(0,0,0,0.55)",
+              border: "1px solid var(--veil-border)",
+              "box-shadow": "0 20px 60px var(--veil-backdrop)",
               overflow: "hidden",
-              color: "#ddd",
+              color: "var(--veil-text)",
               "font-family": "'Inter', system-ui, sans-serif",
               animation: "fadeInScale 180ms ease-out",
               outline: "none",
@@ -197,10 +199,10 @@ export const CommandPalette: Component<Props> = (props) => {
             <div style={{
               display: "flex", "align-items": "center", gap: "10px",
               padding: "14px 18px",
-              "border-bottom": "1px solid rgba(255,255,255,0.04)",
+              "border-bottom": "1px solid var(--veil-border-soft)",
               "flex-shrink": "0",
             }}>
-              <Search size={16} color="#888" />
+              <Search size={16} color="var(--veil-text-muted)" />
               <input
                 autofocus
                 value={query()}
@@ -208,11 +210,11 @@ export const CommandPalette: Component<Props> = (props) => {
                 placeholder="Search messages…"
                 style={{
                   flex: "1", background: "transparent", border: "none", outline: "none",
-                  color: "#eee", "font-size": "14px",
+                  color: "var(--veil-text-strong)", "font-size": "14px",
                 }}
               />
               <Show when={loading()}>
-                <span style={{ "font-size": "11px", color: "#888" }}>…</span>
+                <span style={{ "font-size": "11px", color: "var(--veil-text-muted)" }}>…</span>
               </Show>
             </div>
 
@@ -226,7 +228,7 @@ export const CommandPalette: Component<Props> = (props) => {
                 fallback={
                   <div style={{
                     display: "flex", "flex-direction": "column", "align-items": "center",
-                    gap: "12px", padding: "40px 18px", color: "#888",
+                    gap: "12px", padding: "40px 18px", color: "var(--veil-text-muted)",
                     "font-size": "13px", "text-align": "center",
                   }}>
                     <Show
@@ -252,9 +254,9 @@ export const CommandPalette: Component<Props> = (props) => {
                           "margin-top": "4px",
                           display: "inline-flex", "align-items": "center", gap: "6px",
                           padding: "6px 12px", "border-radius": "8px",
-                          background: "rgba(124,107,245,0.15)",
-                          color: "#9d8df7",
-                          border: "1px solid rgba(124,107,245,0.3)",
+                          background: "color-mix(in srgb, var(--veil-accent) 15%, transparent)",
+                          color: "var(--veil-accent-hi)",
+                          border: "1px solid color-mix(in srgb, var(--veil-accent) 30%, transparent)",
                           cursor: rebuilding() ? "not-allowed" : "pointer",
                           "font-size": "12px", "font-weight": "500",
                           opacity: rebuilding() ? "0.5" : "1",
@@ -262,10 +264,10 @@ export const CommandPalette: Component<Props> = (props) => {
                         }}
                         onMouseEnter={(e) => {
                           if (rebuilding()) return;
-                          (e.currentTarget as HTMLElement).style.background = "rgba(124,107,245,0.25)";
+                          (e.currentTarget as HTMLElement).style.background = "color-mix(in srgb, var(--veil-accent) 25%, transparent)";
                         }}
                         onMouseLeave={(e) => {
-                          (e.currentTarget as HTMLElement).style.background = "rgba(124,107,245,0.15)";
+                          (e.currentTarget as HTMLElement).style.background = "color-mix(in srgb, var(--veil-accent) 15%, transparent)";
                         }}
                       >
                         <RefreshCw
@@ -289,22 +291,22 @@ export const CommandPalette: Component<Props> = (props) => {
                       <button
                         type="button"
                         onMouseEnter={() => setActive(i())}
-                        onClick={() => openHit(h)}
+                        onClick={() => void openHit(h)}
                         style={{
                           display: "block", width: "100%", "text-align": "left",
                           padding: "10px 18px", border: "none",
-                          background: active() === i() ? "rgba(124,107,245,0.16)" : "transparent",
-                          color: "#ddd", cursor: "pointer",
-                          "border-bottom": "1px solid rgba(255,255,255,0.03)",
+                          background: active() === i() ? "color-mix(in srgb, var(--veil-accent) 16%, transparent)" : "transparent",
+                          color: "var(--veil-text)", cursor: "pointer",
+                          "border-bottom": "1px solid var(--veil-border-soft)",
                           transition: "background 0.1s",
                         }}
                       >
                         <div style={{
                           display: "flex", "align-items": "center", gap: "8px",
-                          "font-size": "12px", color: "#888", "margin-bottom": "4px",
+                          "font-size": "12px", color: "var(--veil-text-muted)", "margin-bottom": "4px",
                         }}>
                           {convIcon(conv())}
-                          <span style={{ color: "#bbb", "font-weight": "500" }}>{title()}</span>
+                          <span style={{ color: "var(--veil-text)", "font-weight": "500" }}>{title()}</span>
                           <span style={{ "margin-left": "auto", "font-size": "11px" }}>
                             {new Date(h.ts).toLocaleString()}
                           </span>
@@ -326,12 +328,12 @@ export const CommandPalette: Component<Props> = (props) => {
             <div style={{
               display: "flex", "align-items": "center", gap: "16px",
               padding: "8px 18px",
-              "border-top": "1px solid rgba(255,255,255,0.04)",
-              "font-size": "11px", color: "#777", "flex-shrink": "0",
+              "border-top": "1px solid var(--veil-border-soft)",
+              "font-size": "11px", color: "var(--veil-text-faint)", "flex-shrink": "0",
             }}>
-              <span><kbd style={{ color: "#aaa" }}>↑</kbd> <kbd style={{ color: "#aaa" }}>↓</kbd> Navigate</span>
-              <span><kbd style={{ color: "#aaa" }}>↵</kbd> Open</span>
-              <span><kbd style={{ color: "#aaa" }}>Esc</kbd> Close</span>
+              <span><kbd style={{ color: "var(--veil-text-muted)" }}>↑</kbd> <kbd style={{ color: "var(--veil-text-muted)" }}>↓</kbd> Navigate</span>
+              <span><kbd style={{ color: "var(--veil-text-muted)" }}>↵</kbd> Open</span>
+              <span><kbd style={{ color: "var(--veil-text-muted)" }}>Esc</kbd> Close</span>
               <button
                 type="button"
                 onClick={rebuild}
@@ -340,17 +342,17 @@ export const CommandPalette: Component<Props> = (props) => {
                   "margin-left": "auto",
                   display: "inline-flex", "align-items": "center", gap: "4px",
                   background: "transparent", border: "none",
-                  color: "#777", cursor: rebuilding() ? "not-allowed" : "pointer",
+                  color: "var(--veil-text-faint)", cursor: rebuilding() ? "not-allowed" : "pointer",
                   "font-size": "11px",
                   opacity: rebuilding() ? "0.5" : "1",
                   transition: "color 0.15s",
                 }}
                 onMouseEnter={(e) => {
                   if (rebuilding()) return;
-                  (e.currentTarget as HTMLElement).style.color = "#ddd";
+                  (e.currentTarget as HTMLElement).style.color = "var(--veil-text)";
                 }}
                 onMouseLeave={(e) => {
-                  (e.currentTarget as HTMLElement).style.color = "#777";
+                  (e.currentTarget as HTMLElement).style.color = "var(--veil-text-faint)";
                 }}
                 title="Rebuild local search index from DB"
               >

@@ -1,0 +1,62 @@
+name: Desktop UI CI
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "veil-desktop/src/**"
+      - "veil-desktop/package.json"
+      - "veil-desktop/pnpm-lock.yaml"
+      - "veil-desktop/tsconfig.json"
+      - "veil-desktop/vite.config.ts"
+      - "veil-desktop/vitest.config.ts"
+      - "veil-desktop/playwright.config.ts"
+      - "veil-desktop/visual.html"
+      - "veil-desktop/visual-tests/**"
+      - "veil-desktop/public/visual/**"
+      - ".github/workflows/desktop-ui.yml"
+  pull_request:
+    branches: [master, main]
+    paths:
+      - "veil-desktop/src/**"
+      - "veil-desktop/package.json"
+      - "veil-desktop/pnpm-lock.yaml"
+      - "veil-desktop/tsconfig.json"
+      - "veil-desktop/vite.config.ts"
+      - "veil-desktop/vitest.config.ts"
+      - "veil-desktop/playwright.config.ts"
+      - "veil-desktop/visual.html"
+      - "veil-desktop/visual-tests/**"
+      - "veil-desktop/public/visual/**"
+      - ".github/workflows/desktop-ui.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Typecheck, unit and accessibility smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: veil-desktop
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.29.2
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: veil-desktop/pnpm-lock.yaml
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Run component and accessibility tests
+        run: pnpm test:run
+      - name: Build production renderer
+        run: pnpm build
+      - name: Install Playwright Chromium
+        run: pnpm exec playwright install --with-deps chromium
+      - name: Run AppShell visual regression matrix
+        run: pnpm test:visual

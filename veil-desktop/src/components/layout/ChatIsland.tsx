@@ -1,4 +1,4 @@
-import { Component, For, Show, createSignal, createEffect } from "solid-js";
+import { Component, For, Show, createSignal, createEffect, onCleanup } from "solid-js";
 import {
   Send,
   Paperclip,
@@ -113,7 +113,8 @@ export interface ChatIslandProps {
 
 export const ChatIsland: Component<ChatIslandProps> = (props) => {
   const [inputText, setInputText] = createSignal("");
-  let messagesEndRef: HTMLDivElement | undefined;
+  let messagesViewportRef: HTMLDivElement | undefined;
+  let messagesScrollFrame: number | undefined;
   let textareaRef: HTMLTextAreaElement | undefined;
 
   const conv = () => appStore.activeConversation();
@@ -126,13 +127,18 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
     return false;
   };
 
-  const scrollToBottom = () => {
-    messagesEndRef?.scrollIntoView({ behavior: "smooth" });
-  };
-
   createEffect(() => {
     appStore.messages();
-    scrollToBottom();
+    if (messagesScrollFrame !== undefined) cancelAnimationFrame(messagesScrollFrame);
+    messagesScrollFrame = requestAnimationFrame(() => {
+      messagesScrollFrame = undefined;
+      const viewport = messagesViewportRef;
+      if (!viewport?.isConnected) return;
+      viewport.scrollTo({ top: viewport.scrollHeight, behavior: "smooth" });
+    });
+  });
+  onCleanup(() => {
+    if (messagesScrollFrame !== undefined) cancelAnimationFrame(messagesScrollFrame);
   });
 
   const handleSend = () => {
@@ -220,7 +226,7 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
             </div>
 
             {/* Messages — scrollable zone */}
-            <div class="flex-1 overflow-y-auto min-h-0">
+            <div ref={messagesViewportRef} class="flex-1 overflow-y-auto min-h-0">
               <Show when={appStore.messages().length > 0}
                 fallback={<ChatBeginning name={displayName()} />}
               >
@@ -235,12 +241,11 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
                   </For>
                 </div>
               </Show>
-              <div ref={messagesEndRef} />
             </div>
 
             {/* Input area */}
             <div class="px-4 pb-4 pt-2 shrink-0">
-              <div class="flex items-end gap-2 rounded-xl bg-white/[0.03] border border-white/[0.06] px-2 py-1.5">
+              <div class="veil-message-composer flex items-end gap-2 rounded-xl bg-white/[0.03] border border-white/[0.06] px-2 py-1.5">
                 <Tooltip content="Attach file">
                   <button class="flex items-center justify-center w-8 h-8 shrink-0 rounded-lg text-muted-foreground/30 hover:text-foreground hover:bg-white/[0.05] transition-all cursor-pointer mb-0.5">
                     <Paperclip class="h-[17px] w-[17px]" />
@@ -250,7 +255,7 @@ export const ChatIsland: Component<ChatIslandProps> = (props) => {
                   <textarea
                     ref={textareaRef}
                     class={cn(
-                      "flex w-full bg-transparent px-1 py-2 text-[13px]",
+                      "veil-message-composer-input flex w-full bg-transparent px-1 py-2 text-[13px]",
                       "text-foreground placeholder:text-muted-foreground/25 resize-none",
                       "focus:outline-none",
                       "min-h-[36px] max-h-[160px] overflow-y-auto"

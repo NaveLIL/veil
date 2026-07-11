@@ -51,7 +51,12 @@ func CORS(allowedOrigins []string) func(http.Handler) http.Handler {
 			origin := r.Header.Get("Origin")
 			if origin != "" {
 				_, ok := allow[strings.ToLower(origin)]
-				if allowAll || ok {
+				allowed := allowAll || ok
+				if r.Method == http.MethodOptions && !allowed {
+					http.Error(w, "browser origin is not allowed", http.StatusForbidden)
+					return
+				}
+				if allowed {
 					w.Header().Set("Access-Control-Allow-Origin", origin)
 					w.Header().Set("Vary", "Origin")
 					w.Header().Set("Access-Control-Allow-Credentials", "true")

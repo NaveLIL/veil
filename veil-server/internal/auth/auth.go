@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/logsafe"
 )
 
 var (
@@ -96,10 +98,13 @@ func (s *Service) CreateChallenge(connID string) ([32]byte, error) {
 
 // AuthResult contains the result of a successful authentication.
 type AuthResult struct {
-	UserID   string
-	DeviceID string
-	Username string
-	IsNew    bool // true if user was just registered
+	UserID               string
+	DeviceID             string
+	Username             string
+	IsNew                bool // true if user was just registered
+	PerDeviceSecure      bool
+	DeviceBindingVersion uint64
+	DeviceBindingStatus  db.DeviceBindingStatus
 }
 
 // VerifyResponse validates the client's auth response:
@@ -108,6 +113,15 @@ type AuthResult struct {
 // 3. Verifies the domain-separated Ed25519 signature over public key + DH proof
 // 4. Finds or creates the user + device in the database
 func (s *Service) VerifyResponse(ctx context.Context, connID string, identityKey, signingKey, signature, deviceID []byte, deviceName string) (*AuthResult, error) {
+	return s.VerifyResponseV1(
+		ctx, connID, identityKey, signingKey, signature, deviceID, deviceName, nil, nil,
+	)
+}
+
+// VerifyResponseV1 extends account authentication with an optional
+// cryptographic per-device binding and proof of possession. A legacy device
+// may omit the extension only while it has never been cryptographically bound.
+func (s *Service) VerifyResponseV1(ctx context.Context, connID string, identityKey, signingKey, signature, deviceID []byte, deviceName string, binding *DeviceBindingInput, deviceSignature []byte) (*AuthResult, error) {
 	// --- Input validation ---
 	if len(identityKey) != 32 {
 		return nil, ErrBadKeyLength
@@ -121,6 +135,14 @@ func (s *Service) VerifyResponse(ctx context.Context, connID string, identityKey
 	deviceName, err := normalizeDeviceName(deviceName)
 	if err != nil {
 		return nil, err
+	}
+	if binding == nil {
+		if len(deviceSignature) != 0 {
+			return nil, ErrBadDeviceProof
+		}
+	} else if !bytes.Equal(binding.DeviceKey, deviceID) ||
+		len(deviceSignature) != ed25519.SignatureSize {
+		return nil, ErrBadDeviceProof
 	}
 
 	// --- Challenge lookup + expiry check ---
@@ -169,7 +191,7 @@ func (s *Service) VerifyResponse(ctx context.Context, connID string, identityKey
 			return nil, fmt.Errorf("create user: %w", err)
 		}
 		isNew = true
-		log.Printf("new user registered: %s (%x...)", user.Username, identityKey[:4])
+		log.Printf("new user registered: user_ref=%s", logsafe.Ref("user", user.ID))
 	} else if err := verifyRegisteredSigningKey(user, signingKey, signingMessage, signature); err != nil {
 		// The identity key is public and therefore is not authentication by
 		// itself.  An existing account must always authenticate with the
@@ -178,6 +200,29 @@ func (s *Service) VerifyResponse(ctx context.Context, connID string, identityKey
 		// would let anybody register a new device for a victim whose X25519
 		// identity key they know.
 		return nil, err
+	}
+
+	var bindingCommitment [32]byte
+	if binding != nil {
+		bindingCommitment, err = verifyAccountSignedDeviceBinding(user, binding)
+		if err != nil {
+			return nil, err
+		}
+		deviceSharedSecret, dhErr := curve25519.X25519(challenge.private[:], binding.DeviceIdentityKey)
+		if dhErr != nil || len(deviceSharedSecret) != 32 ||
+			subtle.ConstantTimeCompare(deviceSharedSecret, zeroSharedSecret[:]) == 1 {
+			clear(deviceSharedSecret)
+			return nil, ErrBadDeviceProof
+		}
+		deviceMessage, messageErr := DeviceAuthSigningMessage(
+			challenge.public[:], user.IdentityKey, user.SigningKey, binding, deviceSharedSecret,
+		)
+		clear(deviceSharedSecret)
+		if messageErr != nil || !ed25519.Verify(
+			ed25519.PublicKey(binding.DeviceSigningKey), deviceMessage, deviceSignature,
+		) {
+			return nil, ErrBadDeviceProof
+		}
 	}
 
 	// --- Database: find or create device ---
@@ -191,7 +236,7 @@ func (s *Service) VerifyResponse(ctx context.Context, connID string, identityKey
 		if err != nil {
 			return nil, fmt.Errorf("create device: %w", err)
 		}
-		log.Printf("new device registered: id=%s label=%q user_id=%s", device.ID, device.DeviceName, user.ID)
+		log.Printf("new device registered: device_ref=%s user_ref=%s", logsafe.Ref("device", device.ID), logsafe.Ref("user", user.ID))
 	} else {
 		// Device exists — verify it belongs to this user
 		if device.UserID != user.ID {
@@ -201,11 +246,47 @@ func (s *Service) VerifyResponse(ctx context.Context, connID string, identityKey
 		_ = s.db.TouchDevice(ctx, device.ID)
 	}
 
+	resultStatus := db.DeviceLegacyUnbound
+	var resultVersion uint64
+	perDeviceSecure := false
+	if binding == nil {
+		if _, bindingErr := s.db.GetLatestDeviceBinding(ctx, device.ID); bindingErr == nil {
+			return nil, ErrDeviceBindingRequired
+		} else if !errors.Is(bindingErr, db.ErrDeviceBindingUnavailable) {
+			return nil, fmt.Errorf("lookup device binding: %w", bindingErr)
+		}
+	} else {
+		stored, storeErr := s.db.StoreDeviceBinding(ctx, &db.DeviceBinding{
+			DeviceID:          device.ID,
+			UserID:            user.ID,
+			DeviceKey:         append([]byte(nil), binding.DeviceKey...),
+			DeviceIdentityKey: append([]byte(nil), binding.DeviceIdentityKey...),
+			DeviceSigningKey:  append([]byte(nil), binding.DeviceSigningKey...),
+			Version:           binding.Version,
+			Capabilities:      binding.Capabilities,
+			Status:            binding.Status,
+			AccountSignature:  append([]byte(nil), binding.AccountSignature...),
+			Commitment:        bindingCommitment[:],
+		})
+		if storeErr != nil {
+			return nil, storeErr
+		}
+		if stored.Status == db.DeviceBindingRevoked {
+			return nil, db.ErrDeviceBindingRevoked
+		}
+		resultStatus = stored.Status
+		resultVersion = stored.Version
+		perDeviceSecure = bindingIsPerDeviceSecure(stored)
+	}
+
 	return &AuthResult{
-		UserID:   user.ID,
-		DeviceID: device.ID,
-		Username: user.Username,
-		IsNew:    isNew,
+		UserID:               user.ID,
+		DeviceID:             device.ID,
+		Username:             user.Username,
+		IsNew:                isNew,
+		PerDeviceSecure:      perDeviceSecure,
+		DeviceBindingVersion: resultVersion,
+		DeviceBindingStatus:  resultStatus,
 	}, nil
 }
 

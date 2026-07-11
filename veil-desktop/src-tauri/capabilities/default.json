@@ -9,6 +9,7 @@
     "core:window:allow-toggle-maximize",
     "core:window:allow-close",
     "core:window:allow-start-dragging",
+    "core:webview:allow-set-webview-zoom",
     "core:event:allow-unlisten",
     "core:event:allow-listen",
     "deep-link:allow-get-current"

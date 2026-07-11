@@ -1,26 +1,53 @@
-# Дорожная карта
+# Дорожная карта Veil
 
-Восемь фаз интеграции. Из которых пять реально сделаны. Остальные — заметки на будущее, в той степени как я их обдумывал.
+> Актуально на 2026-07-11. Это основной продуктовый и интеграционный план.
+> [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
+> при расхождении приоритетов главным считается этот документ.
 
-Порядок выполнения сложился как: 1 → 2 → 4 → 3 (idея с tus пришла позже) → 4A → search/UI. Дальше нужны звонки (7), мобильный UI (5) и MLS (6) — хотя MLS это отдельный большой кусок работы с высоким риском.
+Базовый принцип Veil: интерфейс обязан правдиво показывать фактически
+используемый режим защиты. Нельзя молча откатываться на plaintext или более
+слабую криптосхему при ошибке распределения ключей. Если защищённая отправка
+невозможна, она блокируется с понятным состоянием для пользователя.
+
+Ближайший порядок работ:
+
+1. Довести начатую Phase 4B: visual regression, UI scale и cleanup AppShell.
+2. Продолжить Phase 4C по принятому ADR: immutable offline generations,
+   device receipts и rollback-resistant per-device roster.
+3. Провести формальный completion gate фаз 1–4C: незавершённую работу либо
+   закрыть проверяемым результатом, либо явно вынести в новую фазу, не называя
+   исходную фазу завершённой.
+4. Только после открытого gate начать Phase 4D: canonical identity directory,
+   Identity Island, текстовый профиль, затем изолированный avatar pipeline.
+5. На стабильном desktop/profile фундаменте начать Android foundation (5A),
+   после per-device модели подключить боевые сообщения Android (5B).
+6. Затем закрыть UI вложений/push, довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
 
 | # | Фаза | |
 |---|------|--|
-| 1 | Kobalte — headless UI | готово |
-| 2 | Tantivy — локальный поиск | готово |
-| 3 | tus.io — загрузка файлов | сервер + Rust, UI отложен |
-| 4 | UnifiedPush / ntfy | сервер готов, мобильный клиент отложен |
-| 4A | Группы, серверы, роли | готово |
-| 5 | Мобильный UI | не начато |
-| 6 | OpenMLS | в работе (фундамент готов) |
+| 1 | Kobalte — headless UI | фундамент готов, миграция активного UI частична |
+| 2 | Tantivy — локальный поиск | готово, индекс теперь только в RAM |
+| 3 | tus.io — загрузка файлов | сервер, ACL и Rust готовы; desktop UI отложен |
+| 4 | UnifiedPush / ntfy | сервер готов; desktop/mobile клиенты отложены |
+| 4A | Группы, серверы, роли | backend готов; desktop beta, IA/settings и multi-device matrix остаются |
+| 4B | Desktop UX & Appearance | в работе: tokens, PIN, темы и local wallpaper реализованы; visual QA/scale остаются |
+| 4C | Server Channel Crypto Decision | ADR принят; iteration gate исправлен, per-device/offline/ACK gaps остаются |
+| 4D | Identity Island & Profiles | запланировано; entry gate закрыт до формального завершения фаз 1–4C |
+| 5A | Android foundation | визуальный прототип есть, runtime не подключён |
+| 5B | Android messaging | не начато |
+| 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
-| 8 | Полировка, релиз | не начато |
+| 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
 
 ---
 
 ## Phase 1 — Kobalte
+
+**Статус:** базовые primitives готовы, но фаза не считается полностью закрытой,
+пока активные `App.tsx`, Settings и LockScreen содержат параллельные raw
+buttons/tabs/dropdowns и собственные overlay-реализации.
 
 Заменил self-rolled Dialog/Select/ContextMenu/Tooltip на Kobalte primitives. Смысл: a11y (focus trap, ARIA, клавиатурная навигация) бесплатно, не меняя визуал. Только `@kobalte/core` (unstyled) — не `@kobalte/elements`.
 
@@ -35,26 +62,32 @@
 - Drag-handle внутри диалога + focus trap: Kobalte поглощает pointerdown на тайтлбаре. Решение — `data-kb-focus-trap-exception` на ручку
 - Tooltip на тачскрине: спецификация Kobalte его игнорирует. Нужен long-press fallback через `@solid-primitives/event-listener` — пока не сделано
 
-Итог: `pnpm build` зелёный, 404 КБ JS, 54 КБ CSS.
+Критерий закрытия: один набор Dialog/Select/Tabs/Button, единый focus-management
+и отсутствие необоснованных raw z-index/overlay-дубликатов. Размер bundle не
+фиксируем в roadmap — его контролирует CI, а не быстро устаревающая цифра в
+документе.
 
 ---
 
 ## Phase 2 — Tantivy локальный поиск
 
-Полнотекстовый поиск по расшифрованным сообщениям. Индекс живёт только на устройстве, на сервер ничего не уходит. Поисковый трафик сервер не видит вообще.
+Полнотекстовый поиск по расшифрованным сообщениям. Индекс живёт только на
+устройстве, на сервер ничего не уходит. Поисковый трафик сервер не видит.
 
-Схема индекса: `id (STORED)`, `conversation_id (STORED + INDEXED)`, `sender_id (STORED + INDEXED)`, `body (TEXT)`, `timestamp (STORED + FAST для сортировки)`. Токенайзер — стандартный с lowercaser. Для кириллицы в v1 нормально. Потом можно будет прикрутить tantivy-tokenizer-api для multi-language.
+**Актуальная модель:** Tantivy использует `RamDirectory`. После unlock индекс
+перестраивается из SQLCipher, при lock исчезает вместе с процессной памятью;
+старый постоянный индекс удаляется. Отдельного plaintext-индекса, marker-файла,
+Windows ACL для search-директории и `search/v1`/`search/v2` больше нет.
 
-Tauri команды: `search_messages`, `rebuild_search_index`, `clear_search_index`, `ensure_search_backfill`.
+Схема индекса: `id (STORED)`, `conversation_id (STORED + INDEXED)`, `sender_id (STORED + INDEXED)`, `body (TEXT)`, `timestamp (STORED + FAST для сортировки)`. Токенайзер — стандартный с lowercaser. Для кириллицы в v1 достаточно; multi-language остаётся отдельным улучшением.
 
-Backfill: при первом запуске запускается async, не блокирует UI, идемпотентен через marker-файл `<index_dir>/.backfilled`.
+Tauri команды: `search_messages`, `rebuild_search_index`, `clear_search_index`, `ensure_search_backfill`. Backfill запускается после unlock, не блокирует UI и может быть безопасно повторён.
 
 Что надо помнить:
 - Ротация ratchet ключей не требует реиндексации — plaintext не меняется, это важно задокументировать
 - При удалении сообщения надо вызывать `Indexer::delete(id)` — сделано
-- Tantivy занимает ~30% от размера plaintext. Для активных пользователей заметно, надо будет добавить настройку лимита с LRU эвикцией по старым сегментам
-- Индекс содержит plaintext на диске. На Linux/macOS хватает прав ФС, на Windows нужно явно ACL директорию
-- Смена схемы = полный ребилд. Директории `search/v1/`, `search/v2/` решают проблему — при апгрейде старый индекс просто игнорируется, ребилд стартует
+- Индекс расходует RAM пропорционально истории. До большой публичной beta нужны лимит памяти, отменяемый rebuild и измерение на крупных профилях.
+- Смена схемы означает полный rebuild из SQLCipher; миграция отдельного search-файла не требуется.
 
 Что сделано: crate `veil-search`, подключён в `veil-client::api` в шести местах (outgoing + incoming: insert, edit, delete). UI: `CommandPalette` на Kobalte Dialog + Cmd/Ctrl+K, debounce, inline `<mark>` highlight, клавиатурная навигация.
 
@@ -72,28 +105,39 @@ Auth через bearer-token, не через X-Veil подпись на каж�
 
 Quota gate в `pre-create` через `db.SumTusBytesInWindow` за скользящие 24 ч. HTTP 413 до того как что-то легло на диск — нельзя сжечь квоту незавершёнными загрузками.
 
-Crate `veil-uploads` поверх `veil_crypto::chunked_aead`. Конструкция chunks: nonce = `(nonce_prefix || u64_be(chunk_index))`, AAD = `(nonce_prefix, chunk_index, is_final)`. Детектирует переставку чанков, обрезание, замену. Каждый чанк аутентифицирован отдельно.
+Crate `veil-uploads` поверх `veil_crypto::chunked_aead`. Обязательный pre-release format v2: nonce = `nonce_prefix || u64_be((chunk_index << 1) | is_final)`, AAD = `veil/file/v2 || nonce_prefix || chunk_index || is_final`, `chunk_index <= 2^63 - 1`. Версия хранится в metadata; старый v1 без версии отвергается без fallback. Детектирует переставку чанков, обрезание, замену. Каждый чанк аутентифицирован отдельно.
 
 Sweeper: горутина раз в `UPLOAD_SWEEP_INTERVAL` (1 ч по умолчанию) убивает просроченные блобы через tusd's Terminater + дропает строки. Abort TTL = `UPLOAD_ABORT_TTL` (24 ч), retention завершённых = `UPLOAD_RETENTION` (30 дней).
 
-Download: `GET /v1/uploads/blob/{file_id}` — свой эндпоинт с auth проверкой. В v1 только uploader скачивает; в Phase 6 расширится на участников разговора через MLS.
+Download: `GET /v1/uploads/blob/{file_id}` — отдельный эндпоинт с auth-проверкой.
+Attachment теперь привязан к сообщению/разговору; скачать может текущий участник,
+которому разрешена история этого разговора. Сервер всё равно хранит только
+ciphertext и не получает ключ файла.
 
 **Что отложено:**
 - Tauri команды + drag-drop UI + file bubble компонент
 - EXIF strip (клиентская сторона, до шифрования; `kamadak-exif` или ре-энкод через `image`)
 - `veilfile://` custom protocol для range-decrypt видео в `<video>` теге
-- K-wrapping для больших групп (зависит от Phase 6 MLS)
+- безопасный K-wrapping для больших roster; он не должен блокировать базовые
+  вложения в DM/маленьких группах, но обязан следовать принятой Phase 4C модели
 - Streaming uploader API (сейчас `encrypt_file_to_chunks` материализует весь список чанков в памяти; нужен async stream когда начнём пушить 2 ГБ видео)
 
 Важные грабли, которые надо помнить:
 - MIME spoofing: не доверять client-declared MIME. Ре-деривить на стороне получателя через `infer` crate перед рендером
 - Resume после долгого оффлайна с другим IP: bearer-токен привязан к пользователю, не IP. Достаточно заминтить новый токен
 - Disk fill от прерванных загрузок: `unfinished-upload-expiration` в tusd = 24 ч (UPLOAD_ABORT_TTL)
-- Per-recipient K в группах: не шифровать файл 50 раз для 50 человек. Шифруем один раз, потом K оборачиваем для всех в одном MLS commit (Phase 6)
+- Per-recipient K в группах: не шифровать файл заново для каждого участника.
+  Шифруется один blob; ключ оборачивается по правилам текущего crypto roster.
+  MLS exporter можно использовать только после реального включения MLS runtime.
 
 ---
 
 ## Phase 4 — UnifiedPush / ntfy push-уведомления
+
+**Статус:** server transport и encrypted envelope готовы. Полноценного
+desktop/mobile `K_push` workflow ещё нет, поэтому UI не должен обещать
+расшифрованные preview. До готовности показывается только нейтральное
+«Новое сообщение» и выполняется sync после unlock.
 
 Фоновые push без FCM/APNS в data path. Сервер отправляет только зашифрованный blob; устройство расшифровывает в notification extension.
 
@@ -119,6 +163,9 @@ Envelope: JSON с короткими именами полей, padding до р�
 - Android: `react-native-unifiedpush-connector` в `veil-mobile/`, distributor picker, notification listener с K_push из keychain
 - iOS: ntfy iOS app как APNS bridge, App Group для shared keychain между extension и основным приложением
 - Desktop: settings panel с list/add/delete subscriptions (Tauri команды + Kobalte Dialog)
+- Продуктовое решение для Android: UnifiedPush-only либо опциональный FCM wake-up
+  с полностью зашифрованным/нейтральным payload. Транспорт не должен получать
+  текст сообщения, имя отправителя или ключи.
 
 Грабли:
 - iOS App Group keychain: main app + extension обязаны использовать один access group. Без этого extension не расшифрует и будет вечно показывать "New message"
@@ -128,43 +175,427 @@ Envelope: JSON с короткими именами полей, padding до р�
 
 ---
 
-## Phase 5 — Mobile UI
+## Phase 4A — Группы, серверы и роли
 
-NativeWind v4 + React Native Reusables. Цель: feature-parity с desktop, тот же Island-стиль, нативные жесты.
+**Статус:** REST/DB/ACL, роли, инвайты, участники и desktop-потоки работают.
+Это backend-complete и desktop beta, но не завершённая продуктовая фаза:
+информационная архитектура и server/channel settings остаются сырыми, а принятое
+в Phase 4C криптографическое решение ещё не полностью реализовано.
 
-Shared tailwind конфиг: `tailwind.config.shared.js` в корне репо, оба проекта импортируют из него палитру и radii. Единый источник правды для цветов.
+Текущий runtime:
 
-`veil-mobile/src/components/ui/` зеркалит структуру `veil-desktop/src/components/ui/`:
-- `IslandView` ↔ `Island.tsx`
-- `IslandSheet` ↔ `IslandDialog.tsx` (на мобиле — bottom sheet)
-- `IslandSelect`, `IslandTextInput`, `IslandButton` и т.д.
+- DM: X3DH + Double Ratchet.
+- Приватные группы: authenticated Sender Keys v5.
+- Сервер — контейнер метаданных, ролей и каналов, а не одна криптогруппа.
+- Каждый text channel привязан к отдельной conversation и сейчас шифруется
+  Sender Keys. При незавершённой раздаче/ротации отправка блокируется.
+- Канальные `channel_epochs`/`channel_key_envelopes` присутствуют в старой SQL
+  миграции, но runtime их не использует. Поддерживать две модели нельзя.
 
-Стейт: `veil-desktop/src/stores/` → `packages/veil-shared-state/` (pnpm workspace). Desktop adapter: `@tauri-apps/api`. Mobile adapter: `expo-secure-store` + NativeModule bridge. Абстракция `Platform { invoke, listen, secureStore }`.
+Что осталось до закрытия 4A:
 
-Что будет больно:
-- NativeWind v4 — свежий, Metro bundler иногда глючит. Пинить версию
-- iOS keychain + Rust: `react-native-keychain` с biometric gate
-- Reanimated worklets не могут читать store напрямую. `useAnimatedReaction` как мост — легко накосячить, профилировать на реальном устройстве
-- State sync между push extension и основным приложением: shared SQLite в WAL mode + refresh при foreground
-- Android back button: надо проводить через navigation stack даже с Expo Router — сначала закрывает sheet/dialog, потом навигирует
+- Явно развести в UI «групповой чат» и «сервер».
+- Привязать crypto roster к фактическому доступу к каналу, а не просто ко всем
+  участникам сервера.
+- Реализовать `channel_overwrites` в runtime ACL: сейчас schema хранит user/role
+  overrides, но authoritative roster учитывает только membership и server-wide
+  role permissions.
+- Определить private/public channel, историю для нового участника и поведение
+  при role/access change.
+- Завершить server settings, channel settings и правдивые crypto indicators.
+- Добавить desktop/mobile integration matrix для create/join/leave/kick,
+  нескольких устройств и offline reconnect.
+
+---
+
+## Phase 4B — Desktop UX & Appearance
+
+**Цель:** сделать Windows desktop эталонным клиентом и получить один
+переиспользуемый визуальный фундамент для Android.
+
+**Статус 2026-07-11:** реализация начата. Введены semantic tokens и пять палитр,
+нативно валидируемые локальные обои, единая PIN-модель, keyboard focus/reduced
+motion, согласованные Lucide-иконки, честные Settings actions и безопасное
+сохранение черновика при ошибке отправки. До закрытия остаются visual-regression
+матрица, UI scale и окончательная декомпозиция AppShell.
+
+### 4B.1 — UI foundation
+
+1. Выбрать один активный AppShell/component path и убрать параллельный
+   монолит/неиспользуемый layout после миграции.
+2. Перевести цвета, поверхности, типографику, radii, elevation и motion на
+   semantic tokens. Статусы success/warning/error/online не зависят от accent.
+3. Сохранить фирменные цветные window controls, но добавить понятные символы,
+   полноценные hit-target, tooltip и accessible labels.
+4. Сохранить полноэкранную подачу Settings как часть дизайна. Внутри неё должны
+   оставаться доступными перенос окна и window actions; красный `Back to Chat`
+   заменить нейтральным и не дублировать одинаковые способы выхода.
+5. Ввести единое navigation state:
+   `friends | conversation(id) | serverChannel(serverId, channelId)`.
+   При переключении All/DMs/Groups закрывать несовместимые create-панели.
+6. Привести PIN к одной модели: новые PIN 6–12 цифр, legacy 4–5 принимаются
+   только для миграции; динамический progress, hidden numeric input,
+   физическая клавиатура/Backspace/Enter и native throttling.
+7. Унифицировать Lucide/собственные vector icons вместо случайных emoji.
+8. Убрать временные костыли Settings: повторное копирование, пустой раздел
+   Notifications, обрезанный About, GitHub action с неверной семантикой.
+9. Обеспечить стабильное масштабирование. Зафиксировать честный minimum window;
+   если композиция не помещается, поднимать minimum или убирать вторичную
+   панель осознанно, а не сжимать чат до нерабочей ширины.
+10. Добавить видимый keyboard focus, reduced motion и достаточный контраст,
+    сохранив текущий тёмный визуальный характер.
+
+### 4B.2 — Appearance
+
+- Раздел `Appearance` в Settings.
+- 4–5 проверенных тёмных палитр и отдельный accent.
+- Фон: solid / gradient / локальное PNG, JPEG или WebP.
+- Для картинки: `cover`, focal point, dim, blur, preview, replace/remove/reset.
+- Копирование валидированного изображения в app-data; без remote URL,
+  произвольного CSS, SVG и синхронизации на сервер.
+- `Show on lock screen` выключен по умолчанию.
+- Прозрачность/glass островов — только после contrast/performance QA.
+- Reduced-motion setting реализован; UI scale добавляется после breakpoint QA,
+  чтобы увеличение не ломало честный minimum window.
+
+### Критерии готовности 4B
+
+- Нет hardcoded theme colors в основном active UI за исключением иллюстраций.
+- PIN и основные сценарии работают мышью и клавиатурой.
+- Проверены Windows размеры 800×600, 1200×800 и 1440×900; для неподдерживаемого
+  размера приложение не допускает сломанную геометрию.
+- Theme/wallpaper переживают restart, не покидают устройство и по умолчанию не
+  видны до unlock.
+- Есть visual-regression screenshots и accessibility smoke tests.
+- `pnpm build`, Rust/Go tests и unsigned Windows bundle зелёные.
+
+---
+
+## Phase 4C — Server Channel Crypto Decision
+
+Это сначала ADR + threat model, а не третья параллельная реализация.
+
+**Статус 2026-07-11:** принят
+[`ADR-0001`](docs/adr/0001-authenticated-sender-keys-v5-for-server-channels.md):
+каждый text channel — отдельный Sender Keys v5 security domain, silent downgrade
+запрещён, история по умолчанию future-only. Исправлен iteration-limit gate:
+новое поколение не выпускает ciphertext до завершения distribution. При cold
+restore без persisted roster-version core консервативно ротирует восстановленную
+generation и блокирует отправку до distribution, но desktop sync затем может
+сделать ещё одну forced rotation: fail-closed поведение есть, end-to-end гарантия
+«ровно одна ротация» не доказана. Per-device identity, persisted
+rollback-resistant roster, несколько retained offline generations и immutable
+equal-generation retries/device receipt ACK ещё не реализованы.
+
+### Безопасный baseline ближайшего релиза
+
+- Сервер остаётся контейнером; каждый text channel — отдельный security domain.
+- Зашифрованные каналы продолжают использовать authenticated Sender Keys v5.
+- MLS не включается автоматически в server channels до готовой multi-device
+  orchestration и измерений churn/размера roster.
+- Plaintext/public channel не входит в baseline первого server-релиза. Если он
+  когда-либо появится, это будет отдельный явно выбранный профиль с заметной
+  маркировкой; silent downgrade в него запрещён.
+- Получатели ключей выводятся из channel ACL и устройств, а не из renderer cache.
+- Join/leave/kick/access change требует ротации; защищённая отправка блокируется
+  до подтверждённой раздачи нового ключа.
+- Пока roster snapshot/version не хранится локально, cold restore делает как
+  минимум одну защитную ротацию восстановленного outgoing key; текущая desktop
+  orchestration может следом сделать вторую forced rotation. Это безопасный
+  availability-cost workaround, а не завершённая roster-continuity модель.
+- Новый участник не получает старые ключи автоматически, пока отдельно не
+  спроектирован history-sharing protocol и UX согласия.
+
+### Что обязан зафиксировать ADR
+
+- Sender Keys, MLS или гибрид и точные границы режимов.
+- Per-device identity, device add/revoke и восстановление после офлайна.
+- Public/private channels, role overrides и одинаковые membership-set.
+- Историю при join, сроки хранения distributions/commits и recovery flow.
+- Wire version, capability negotiation, миграцию старых conversation.
+- Выбор одной модели: удалить неиспользуемые epoch tables либо реализовать их;
+  одновременно с Sender Keys они не остаются.
+- Матрицу тестов: join, leave, kick, role change, offline reconnect,
+  два устройства на пользователя, незавершённая ротация.
+
+Критерий безопасности: исключённое устройство не расшифровывает новые
+сообщения, а UI всегда различает encrypted, rotation pending и plaintext.
+
+---
+
+## Phase 4D — Identity Island & Profiles
+
+**Статус 2026-07-11:** запланировано, реализация не начата. Entry gate закрыт:
+предыдущие фазы ещё нельзя честно считать завершёнными. Проектирование ниже
+фиксирует границы будущей работы, но не разрешает параллельно начинать profile
+backend или массово менять avatar UI.
+
+Цель — дать одному человеку единое и узнаваемое представление во всех местах
+Veil: собственный footer, друзья, DM, группы, сообщения, server members и
+settings. Профиль называется **Identity Island** и продолжает язык Phase Shift,
+а не копирует banner/popover Discord.
+
+### Entry gate 4D
+
+Перед первым production-изменением Phase 4D нужен отдельный gate-review с
+ссылками на тесты и артефакты. Состояние на 2026-07-11:
+
+| Предыдущая фаза | Gate | Что не позволяет назвать её завершённой |
+|---|---|---|
+| 1 | закрыт | active UI всё ещё содержит параллельные raw controls/overlay paths |
+| 2 | пройден | RAM-only поиск и rebuild из SQLCipher работают; memory budget остаётся release hardening |
+| 3 | закрыт | server/crypto scope готов, но desktop attachments UI и streaming 2 ГБ явно отложены |
+| 4 | закрыт | server transport готов, но полноценные desktop/mobile `K_push` clients отсутствуют |
+| 4A | закрыт | server/group IA, channel-access roster, settings и multi-device/offline matrix не завершены |
+| 4B | закрыт | AppShell cleanup, breakpoint/UI-scale QA, visual regression и a11y smoke отсутствуют |
+| 4C | закрыт | immutable multi-generation retention, device ACK и rollback-resistant per-device roster отсутствуют |
+
+Фаза считается пройденной только по её опубликованным критериям. Если старый
+scope был слишком широк, его можно разделить отдельным изменением roadmap, но
+нельзя молча назвать незаконченный client/UI кусок завершённым. До такого review
+4D остаётся только планом.
+
+Отдельные обязательные prerequisites непосредственно для профилей:
+
+- исправить смешение `conversation_id` и peer `user_id` в DM;
+- сохранять авторитетные `user_id`, identity/signing key и отображаемое имя
+  автора вместе с локальной историей, чтобы после restart автор не менялся на
+  префикс ключа;
+- не выбрасывать identity/member metadata при построении group/server rows;
+- ввести canonical account locator как минимум
+  `(canonical_server_origin, user_id, identity_key)`; UUID пользователя не
+  считается глобальным между self-hosted инстансами;
+- определить account/device binding вместе с Phase 4C, прежде чем показывать
+  device trust или identity-change status.
+- закрыть W9 до rollout profile API: access logs не должны превращать lookup
+  профилей в открытый журнал социального графа с raw user ID.
+
+### Граница доверия
+
+Публичный профиль и криптографическая identity — разные сущности:
+
+- `display_name`, `about`, avatar и server nickname — изменяемые presentation
+  metadata конкретного server instance; оператор сервера их видит, они не E2EE;
+- `user_id`, X25519 identity, Ed25519 signing key, device bindings и fingerprint
+  относятся к security identity и не меняются через редактор профиля;
+- имя, avatar, роль или profile signature никогда не дают статус `Verified` и
+  не участвуют в выборе ключа, ACL либо crypto mode;
+- UI обязан прямо объяснять, что означает `Verified on this device`, и отдельно
+  показывать `Identity changed`; смена ключа сбрасывает локальную verification;
+- подпись HTTP-запроса владельцем обязательна. Дополнительный client-signed
+  profile manifest с monotonic revision допустим позже, но не заменяет
+  авторизацию REST и требует отдельной threat-model проверки replay/rollback.
+
+### 4D.1 — Canonical identity directory
+
+1. Ввести origin-scoped каталог профилей и общий `ProfileLocator`.
+2. Нормализовать данные self, DM peer, friend/request, message author,
+   group member и server member в одну account snapshot без потери исходных ID.
+3. Зафиксировать порядок доверия при merge: native/auth identity → подписанный
+   directory/member response → локальный SQLCipher cache → conversation
+   metadata → имя из message event только как неавторитетный fallback.
+4. Хранить profile cache в SQLCipher с server origin, profile version и временем
+   последней проверки. На lock очищать renderer state и object URLs.
+5. Для удалённого/бывшего участника сохранять историческую author snapshot, но
+   помечать её как `Former member`, а не приписывать текущие роли или presence.
+
+### 4D.2 — Phaseprint, UserAvatar и Identity Island
+
+- Один `UserAvatar` для footer, списков, header, сообщений, друзей и members.
+- До настоящих картинок использовать детерминированный **Phaseprint** из
+  identity key; fallback — user ID, затем username. Смена nickname не меняет
+  рисунок. Ошибка image decode возвращает Phaseprint без broken-image UI.
+- На широком desktop существующий правый остров морфит `Members → Identity`;
+  новый пятый остров не добавляется. Из members доступен `Back to Members`.
+- На узком desktop это focus-trapped right sheet, на mobile — bottom sheet.
+- Внутри три спокойных блока: `Person`, `Context`, `Identity Proof`. Без
+  декоративного banner, перекрывающего avatar, и без россыпи badges.
+- Точки открытия: собственный footer, DM row/header, author сообщения,
+  friend/request/search row, group/server member, server settings member и
+  context menus. Reply preview сохраняет навигацию к сообщению и не перехватывает
+  click ради профиля.
+- Server context показывает nickname первым, затем глобальное display name/
+  technical handle; owner и первые три роли показываются отдельно и не меняют
+  identity trust.
+
+### 4D.3 — Versioned text profile
+
+Первый сетевой релиз профилей не требует avatar upload:
+
+- PostgreSQL: `display_name`, короткий `about`, nullable `avatar_asset_id`,
+  `profile_version`, `profile_updated_at`; технический username остаётся
+  безопасным fallback, а не свободным display name;
+- v1 хранит plain text, не HTML/Markdown: NFC normalization, bounded UTF-8,
+  запрет управляющих/bidi-override символов, 64 grapheme для display name и
+  280 для about; renderer выводит их только как text content;
+- signed `GET /v1/users/{id}/profile` и self-only `PUT/PATCH /v1/users/me/profile`;
+- optimistic concurrency через `expected_version`; конфликт возвращает `409`,
+  update одной версии атомарен;
+- отдельный `ProfileUpdated { user_id, profile_version }` event. Он не является
+  roster/member event и не должен инициировать Sender Key rotation;
+- серверные nickname/roles остаются context-owned полями. Приоритет отображения:
+  server nickname → global display name → technical username;
+- profile endpoint не возвращает recovery data, private keys, email, IP,
+  presence history или device secrets.
+
+### 4D.4 — Isolated avatar asset pipeline
+
+Существующий tus attachment pipeline переиспользовать нельзя: он принимает E2EE
+ciphertext, имеет message ACL и retention, поэтому сервер не может очистить
+публично отображаемое изображение.
+
+Нужен отдельный signed ingest:
+
+- v1 принимает только PNG/JPEG; SVG, GIF/animation, remote URL и недоверенный
+  declared MIME отвергаются;
+- максимум 2 МиБ исходника, 4096×4096 и 16 MP; bounded decoder concurrency и
+  allocation limit;
+- server-side decode, orientation, crop/resize до 512×512 и повторное кодирование
+  с удалением EXIF/GPS/XMP/IPTC/ICC/имени файла; максимум 256 КиБ результата;
+- наружу выдаётся случайный opaque asset ID, digest хранится и проверяется
+  отдельно; raw content hash не используется как публичный cross-instance URL;
+- desktop загружает avatar нативным authenticated fetch только с текущего
+  origin, проверяет size/MIME/magic/dimensions/digest и передаёт renderer локальный
+  `blob:` URL. Нельзя расширять CSP до произвольного `img-src https:`;
+- object URL отзывается при replace, LRU eviction, lock и logout; старый asset
+  удаляется после короткого orphan grace period;
+- UI предупреждает: avatar и текст профиля видны оператору выбранного сервера и
+  не являются содержимым E2EE-сообщения.
+
+### 4D.5 — Local identity proof
+
+- Native API возвращает стабильный fingerprint в hex + визуальном/emoji формате.
+- SQLCipher хранит verification по server origin, account и наблюдаемой identity,
+  а не только по mutable имени.
+- Состояния: `Not compared`, `Verified on this device`, `Identity changed`,
+  `Identity unavailable in this context`.
+- Verification локальна конкретному устройству, не синхронизируется через
+  публичный профиль и не наследуется новым ключом.
+- Self profile не предлагает Verify; для отсутствующего authoritative key
+  действие заблокировано с объяснением.
+
+### Порядок реализации 4D
+
+1. Исправить identity mapping и persisted author metadata.
+2. Ввести origin-scoped directory, Phaseprint и общий `UserAvatar`.
+3. Ввести единый right-island state и Identity Island на уже доступных данных.
+4. Добавить versioned signed text profile API/cache/event.
+5. Добавить server context/nickname и все profile triggers.
+6. Реализовать local identity verification и identity-change flow.
+7. Только затем добавить изолированный avatar pipeline и mobile adaptation.
+
+### Критерии готовности 4D
+
+- Один и тот же account стабильно разрешается после restart во всех desktop
+  contexts; разные server origins никогда не смешиваются.
+- Display metadata не участвует в crypto trust/ACL, а смена профиля не запускает
+  group/channel key rotation.
+- API ownership, CAS/version rollback, malformed input, rate limits и
+  cross-origin cache isolation покрыты unit/integration tests.
+- Avatar fuzz/corpus tests покрывают decompression bombs, metadata stripping,
+  animation/polyglot rejection и bounded memory; arbitrary network image fetch
+  невозможен.
+- Identity-change тест сбрасывает verification и показывает blocking warning,
+  не подменяя его обычным profile update.
+- Все profile triggers доступны клавиатурой, возвращают focus и корректно
+  работают в wide/right-sheet/mobile-bottom-sheet вариантах.
+- UI явно раскрывает server-visible metadata model и не обещает E2EE для
+  display name/about/avatar.
+- Desktop build, Rust/Go tests, profile API integration tests и visual/a11y
+  matrix зелёные; независимый security review закрывает profile/avatar boundary.
+
+---
+
+## Phase 5 — Android
+
+**Текущее состояние:** существует качественный четырёхстраничный visual prototype
+`servers → channels/DM → chat → members` на React Navigation + PagerView.
+Island-компоненты, onboarding и локальные tokens уже есть. Это ещё не мессенджер:
+chat/server data захардкожены, сеть и SQLCipher отсутствуют, auth живёт только в
+Zustand, а `VeilCrypto` в dev возвращает mock identity/signatures.
+
+Текущие обязательные исправления проекта:
+
+- Исправить TypeScript config (`module: commonjs` несовместим с
+  `moduleResolution: bundler`).
+- Добавить реальный ESLint dependency/config и первые unit/component tests.
+- Mock crypto разрешён только в изолированном demo mode без сети/persistence;
+  production и connected dev обязаны fail closed.
+- Не мигрировать на NativeWind/Expo Router только ради совпадения со старым
+  планом. React Navigation + StyleSheet допустимы; общими должны быть semantic
+  tokens и поведение, а не конкретная CSS-библиотека.
+
+### Phase 5A — Android foundation
+
+1. Воспроизводимый Rust build для `arm64-v8a` и `x86_64`, Expo config plugin
+   либо versioned native Android project, плюс mobile CI.
+2. Высокоуровневый native `VeilMobileRuntime` поверх `veil-client`/`veil-store`:
+   JS вызывает `create/restore/unlock/lock/connect/list/send/sync`, но не получает
+   raw ratchet state, DB key или seed.
+3. Android Keystore-wrapped key, SQLCipher, native PIN throttle, biometric gate,
+   auto-lock и очистка чувствительного runtime при background/process death.
+4. Безопасный onboarding: убрать copy recovery phrase, включить `FLAG_SECURE` на
+   secret screens, скрывать preview в Recents и подтверждать несколько слов.
+5. Разделить состояния `identityExists`, `unlocked`, `connected`,
+   `directoryReady`; текущий `isAuthenticated` слишком грубый.
+6. Реальный endpoint config, certificate validation, signed REST/WS,
+   reconnect/offline outbox и атомарные crypto+message SQLCipher transactions.
+7. Enrollment второго устройства и revoke flow как prerequisite для групп,
+   server channels и MLS.
+8. Android Back закрывает dialog/sheet, затем возвращает pager на предыдущий
+   остров, и только потом покидает экран.
+9. Профилировать blur, HebrewRain и четыре смонтированных pager page на слабых
+   устройствах; respect reduced motion и battery saver.
+
+Результат 5A: подписанный internal APK запускается на чистом устройстве,
+создаёт/восстанавливает identity, переживает restart, безопасно lock/unlock и
+соединяется с тестовым gateway без доступа JS к секретному состоянию.
+
+### Phase 5B — Android messaging
+
+1. Сначала один честный Desktop ↔ Android DM: X3DH/Double Ratchet, history sync,
+   ack/outbox, reconnect, airplane mode и process death.
+2. Реальные DM list/chat, затем private groups на Sender Keys.
+3. Servers/channels подключать только после Phase 4C и per-device roster.
+4. Generic notification «Новое сообщение» + foreground sync. Encrypted preview
+   включать только после полного `K_push` lifecycle.
+5. Затем attachments, search, settings/Appearance и server management.
+6. Device/instrumentation tests, signed AAB и закрытый beta rollout.
+
+Оценка: закрытый Android DM-MVP — примерно 8–12 недель одного опытного
+разработчика. Groups/servers, push previews и attachments добавят ещё 4–8
+недель; полная desktop parity потребует отдельного многомесячного этапа и
+независимого security review.
 
 ---
 
 ## Phase 6 — OpenMLS
 
-Заменить `ratchet.rs` (DM) и `sender_key.rs` (маленькие группы) на [OpenMLS](https://github.com/openmls/openmls) (RFC 9420). Post-compromise security, forward secrecy при kick.
+Добавить [OpenMLS](https://github.com/openmls/openmls) (RFC 9420) как новый
+явный crypto mode для подходящих DM и небольших приватных групп. Существующие
+DM остаются на Double Ratchet, группы/каналы — на Sender Keys, пока пользователь
+или миграция явно не переключит совместимый разговор.
 
-Гибридная стратегия: MLS для 2–500 участников, Sender Keys для 500+. Хранится в `conversations.crypto_mode`. Обе crypto-стеки живут бесконечно — разные инструменты для разных масштабов.
+Универсальный порог участников пока не фиксируем: прежние документы
+противоречили друг другу (`>50`, `2–500`, «маленькие группы»). Граница MLS
+принимается после multi-device orchestration, churn benchmarks и Phase 4C ADR.
+Большие server channels продолжают использовать Sender Keys.
 
-Почему не MLS везде: каждый Commit должен обработать каждый член. На 1000 участников при активном churn — CPU bottleneck на клиентах. Wire/Webex деплоят MLS в сотнях, не тысячах. Для 10k+ каналов Sender Keys (Signal-style) остаётся.
+`conversations.crypto_mode` должен честно представлять текущие режимы.
+Существующий enum `sender_key | mls` недостаточен для DM на Double Ratchet;
+до runtime-включения MLS нужно добавить `double_ratchet` либо однозначно
+выводить legacy mode из типа conversation.
 
 Cipher suite: `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`. Один, не менять.
 
 Migration plan:
-1. `crypto_mode` DEFAULT `'sender_key'` — старые группы не трогаем
-2. Новые DM/маленькие группы = MLS, если клиент поддерживает (capability flag в профиле)
+1. Старые разговоры не меняют crypto mode автоматически.
+2. Новые совместимые DM/маленькие группы могут предложить MLS только если все
+   устройства поддерживают capability и имеют свежие KeyPackages.
 3. Кнопка "Upgrade to MLS" в настройках группы + system message "шифрование обновлено"
-4. `ratchet.rs` deprecated для новых разговоров через 2 релиза, код остаётся навсегда для старых данных
+4. Double Ratchet остаётся поддерживаемым. Решение о прекращении его использования
+   для новых DM принимается только после двух стабильных MLS-релизов,
+   multi-device тестов и независимого аудита.
 
 Проблемы которые точно вылезут:
 - Async member adds: Alice добавляет Bob пока Charlie оффлайн. Charlie возвращается и должен обработать commits по порядку. Сервер хранит все commits с last-seen-epoch, bounded 30 дней. После — re-join через Welcome
@@ -179,15 +610,20 @@ Migration plan:
 - PostgreSQL миграция `008_mls.sql`: колонка `crypto_mode` с CHECK-констрейнтом, таблицы `mls_key_packages`, `mls_welcomes`, `mls_commits` с индексами и наглядным TTL-планом.
 - Серверный пакет `internal/mls`: `Store` (батчевая публикация KP, атомарный consume через `DELETE … FOR UPDATE SKIP LOCKED`, append-only лог commits с `ErrEpochConflict` на 23505) и `Handler` с REST: `POST /v1/mls/keypackages`, `GET …/count`, `GET …/{user}/{device}`, `POST/GET/DELETE /v1/mls/welcomes`, `POST /v1/mls/commits`, `GET /v1/mls/commits/{conv}?after_epoch=N`. Интеграция с подписной middleware (`X-Veil-User/Timestamp/Signature`).
 - Hub реализует `mls.Fanout` (стабы с slog) — клиенты пока подбирают welcomes/commits через REST на reconnect; перевод на отдельный envelope-вариант WS — следующий шаг.
+- Tauri command implementations и renderer wrappers существуют, но не все
+  зарегистрированы в runtime handler; это ещё не пользовательская функция.
 
 ### Что осталось
 
 - HTTP-клиент в `veil-client` для подписанных REST-запросов к `/v1/mls/*` (сейчас клиент целиком работает поверх WS protobuf).
 - Адаптер `MlsKeyStore` поверх `VeilDb` (сохранение `SignatureKeyPair` в SQLCipher).
 - Ветвление `send_text`/`receive` в `veil-client/src/api.rs` по `crypto_mode` разговора.
-- Tauri-команды `mls_create_group`, `mls_add_member`, `mls_upgrade_group` + UI-индикатор «MLS active» и кнопка «Upgrade to MLS» в настройках группы.
+- Зарегистрировать и связать существующие Tauri-команды; добавить отсутствующий
+  `mls_upgrade_group`, UI-индикатор «MLS active» и кнопку Upgrade.
 - Полноценный WS-канал `mls.welcome`/`mls.commit` (новый вариант `pb.Envelope`) вместо текущего log-стаба.
 - Интеграционные тесты: catch-up Charlie оффлайн, авто-пополнение KP при count < 10, упорядоченное применение commits на трёх устройствах.
+- До всего перечисленного: формализовать per-device identity и capability
+  negotiation. Без этого MLS для Android/desktop multi-device не включается.
 
 ---
 
@@ -208,19 +644,32 @@ Compose: `livekit` + `coturn` (для ~10% за NAT). Codec: Opus + VP8. H.264 �
 
 ## Phase 8 — Полировка и релиз
 
+**Статус:** security CI, dependency locks и fail-closed Windows release/signing
+workflow уже есть. Без сертификата workflow не должен выпускать артефакт.
+Visual regression, updater, полный signed matrix и public beta ещё не готовы.
+
 - Grafana dashboard для метрик фаз 2-7, JSON в `grafana-dashboards/`
 - Playwright visual regression baseline, запускается в CI на каждом PR
-- Desktop: AppImage (Linux), .dmg (macOS), .msi (Windows) через `tauri build`
-- Mobile Android: AAB через `eas build --platform android --profile production`
+- Desktop: AppImage/.deb (Linux), .dmg (macOS), NSIS/MSI (Windows) через
+  воспроизводимый `tauri build`; каждый публичный артефакт подписан
 - Signed releases + Tauri updater (Ed25519)
 - SECURITY.md: поддерживаемые версии, disclosure policy, threat model
+- Android: reproducible signed AAB, internal track, crash-free/ANR monitoring
+  без содержимого сообщений, ключей и стабильных user identifiers
+- Release gate: desktop/mobile E2E, process-death/offline tests, restore drill,
+  secret scan, dependency review и проверка отсутствия mock crypto
 
 ---
 
 ## Открытые вопросы
 
-- P2: шифровать ли Tantivy index на диске? → пока нет, отложено на v2
-- P5: Expo Router сразу или после feature-parity? → сразу, потом мигрировать больно
-- P6: именование leaf per-device → `user_id::device_label`, blake3-хеш в credential identity field
+- P2: persistent Tantivy index больше не нужен; RAM-only считается текущим решением
+- P5: React Navigation + PagerView остаются текущей мобильной оболочкой;
+  миграция на Expo Router допустима только при конкретной пользе
+- P5: UnifiedPush-only либо опциональный FCM wake-up с generic encrypted payload?
+- P6: per-device credential — стабильный opaque device ID; человекочитаемый
+  label не входит в криптографическую identity и может меняться
+- P6: окончательный MLS threshold определяется benchmark/ADR, а не числом из старого roadmap
 - P7: свой coturn или внешний? → свой в compose, ради приватности
 - P8: code signing certs (macOS/Windows) → нужны до public beta, отдельный бюджетный вопрос
+- P8: Play Store internal/closed beta либо параллельный direct APK/F-Droid канал

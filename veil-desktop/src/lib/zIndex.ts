@@ -6,6 +6,8 @@
  *
  * Layer ordering (low → high):
  *   BASE      = chat layout, sidebar, header
+ *   FULLSCREEN = Settings/server settings content under the persistent chrome
+ *   WINDOW_CHROME = branded titlebar and window controls
  *   POPOVER   = dropdowns, tooltips, hover-cards
  *   DIALOG    = modal dialogs (IslandDialog), bottom sheets
  *   DROPDOWN  = select menus opened from inside a dialog
@@ -16,6 +18,9 @@
  */
 export const Z = {
   BASE: 1,
+  FULLSCREEN: 20,
+  WINDOW_CHROME: 30,
+  CONTENT_OVERLAY: 35,
   POPOVER: 40,
   DIALOG_BACKDROP: 60,
   DIALOG: 61,

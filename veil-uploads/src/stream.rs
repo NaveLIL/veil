@@ -1,10 +1,9 @@
 //! Streaming encryption helpers.
 //!
-//! The core function [`encrypt_file_to_chunks`] reads the source file
-//! in [`CHUNK_PLAINTEXT_SIZE`](veil_crypto::chunked_aead::CHUNK_PLAINTEXT_SIZE)
-//! steps and emits one [`EncryptedChunk`] per call. Callers feed those
-//! into the tus client (or any other transport) without needing to
-//! buffer the whole file.
+//! The legacy [`encrypt_file_to_chunks`] adapter reads the source file in
+//! [`CHUNK_PLAINTEXT_SIZE`](veil_crypto::chunked_aead::CHUNK_PLAINTEXT_SIZE)
+//! steps but returns every [`EncryptedChunk`] together. Large attachments must
+//! use the bounded-memory APIs in [`crate::streaming`].
 //!
 //! Decryption is the symmetric inverse: stream ciphertext chunks in
 //! and write plaintext to a destination file.
@@ -18,8 +17,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use zeroize::Zeroizing;
 
 use veil_crypto::chunked_aead::{
-    open_chunk, random_nonce_prefix, seal_chunk, ChunkedAeadError, CHUNK_PLAINTEXT_SIZE,
-    NONCE_PREFIX_LEN,
+    open_chunk, random_nonce_prefix, seal_chunk, ChunkedAeadError, CHUNK_FORMAT_VERSION,
+    CHUNK_PLAINTEXT_SIZE, NONCE_PREFIX_LEN,
 };
 
 /// The current public API returns all ciphertext chunks in a Vec and downloads
@@ -37,10 +36,13 @@ pub struct EncryptedChunk {
 }
 
 /// Metadata produced by [`encrypt_file_to_chunks`]. The receiver needs
-/// the same `nonce_prefix`, `chunk_count` and `plaintext_size` to
-/// decrypt; the server treats it as opaque ciphertext metadata.
+/// the same format version, `nonce_prefix`, `chunk_count` and
+/// `plaintext_size` to decrypt; the server treats it as opaque
+/// ciphertext metadata. The version is mandatory so a resumed stream
+/// can never mix nonce constructions under one key and prefix.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct EncryptedFileMeta {
+    pub format_version: u8,
     pub nonce_prefix: [u8; NONCE_PREFIX_LEN],
     pub chunk_count: u64,
     pub plaintext_size: u64,
@@ -63,11 +65,10 @@ pub enum StreamError {
     DestinationExists,
 }
 
-/// Encrypt `src` into a Vec of chunks plus the metadata the receiver
-/// needs to decrypt. The function reads the file into memory chunk by
-/// chunk; for very large files prefer the streaming variant
-/// (`encrypt_file_streaming`, exposed once the upload pipeline can
-/// consume an async stream — Phase 3 v1 ships this simpler API first).
+/// Encrypt `src` into a Vec of chunks plus the metadata the receiver needs to
+/// decrypt. The function reads the file chunk by chunk but retains all
+/// resulting ciphertext in memory. For larger files use
+/// [`crate::prepare_streaming_upload`] and [`crate::TusClient::upload_file_streaming`].
 pub async fn encrypt_file_to_chunks(
     key: &[u8; 32],
     src: &Path,
@@ -128,6 +129,7 @@ pub async fn encrypt_file_to_chunks(
     }
 
     let meta = EncryptedFileMeta {
+        format_version: CHUNK_FORMAT_VERSION,
         nonce_prefix,
         chunk_count: idx,
         plaintext_size,
@@ -254,6 +256,12 @@ fn validate_encrypted_file(
     actual_ciphertext_len: usize,
     tag_len: usize,
 ) -> Result<(), StreamError> {
+    if meta.format_version != CHUNK_FORMAT_VERSION {
+        return Err(StreamError::InvalidMetadata(format!(
+            "unsupported chunked-AEAD format version {} (expected {})",
+            meta.format_version, CHUNK_FORMAT_VERSION
+        )));
+    }
     if meta.plaintext_size > MAX_ONE_SHOT_FILE_BYTES {
         return Err(StreamError::FileTooLarge(MAX_ONE_SHOT_FILE_BYTES));
     }
@@ -293,6 +301,7 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     use tokio::io::AsyncWriteExt;
+    use veil_crypto::chunked_aead::TAG_LEN;
 
     fn key() -> [u8; 32] {
         [42u8; 32]
@@ -311,6 +320,7 @@ mod tests {
     async fn roundtrip_small_file() {
         let (_d, src) = write_tmp(b"hello veil uploads").await;
         let (chunks, meta) = encrypt_file_to_chunks(&key(), &src).await.unwrap();
+        assert_eq!(meta.format_version, CHUNK_FORMAT_VERSION);
         assert_eq!(meta.chunk_count, 1);
         assert!(chunks[0].is_final);
         let blob: Vec<u8> = chunks.iter().flat_map(|c| c.ciphertext.clone()).collect();
@@ -399,5 +409,37 @@ mod tests {
             .await
             .is_err());
         assert!(!tokio::fs::try_exists(&dst).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn unsupported_format_version_is_rejected_before_touching_destination() {
+        let (_d, src) = write_tmp(b"versioned").await;
+        let (chunks, mut meta) = encrypt_file_to_chunks(&key(), &src).await.unwrap();
+        let blob: Vec<u8> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.ciphertext.clone())
+            .collect();
+        meta.format_version = 1;
+        let dst = src.with_extension("legacy-dec");
+
+        let error = decrypt_stream_to_file(&key(), &meta, &blob, &dst)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, StreamError::InvalidMetadata(message) if message.contains("format version 1"))
+        );
+        assert!(!tokio::fs::try_exists(&dst).await.unwrap());
+    }
+
+    #[test]
+    fn metadata_without_format_version_fails_closed_during_deserialization() {
+        let old_metadata = serde_json::json!({
+            "nonce_prefix": vec![0u8; NONCE_PREFIX_LEN],
+            "chunk_count": 1,
+            "plaintext_size": 0,
+            "ciphertext_size": TAG_LEN,
+        });
+
+        assert!(serde_json::from_value::<EncryptedFileMeta>(old_metadata).is_err());
     }
 }

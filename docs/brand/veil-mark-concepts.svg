@@ -1,0 +1,97 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="608" viewBox="0 0 1200 608" role="img" aria-labelledby="board-title board-desc">
+  <title id="board-title">Veil minimal mark concepts</title>
+  <desc id="board-desc">Three geometric Veil mark studies named Fold, Route Knot, and Phase Shift, each constructed on a 24 by 24 grid with a sixteen pixel preview.</desc>
+
+  <rect width="1200" height="608" fill="#090A0F"/>
+  <path d="M0 78H1200" fill="none" stroke="#20222C"/>
+
+  <text x="48" y="39" fill="#F4F2FF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="21" font-weight="700" letter-spacing="0.2">VEIL / MARK STUDIES</text>
+  <text x="48" y="62" fill="#777A89" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="12">One-color geometry / 24 x 24 master grid / 16 px survival check</text>
+
+  <!-- Concept 01: Fold -->
+  <g aria-label="Fold concept">
+    <rect x="36" y="96" width="360" height="476" rx="24" fill="#111219" stroke="#272936"/>
+    <text x="60" y="129" fill="#8C8F9E" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="1.6">01</text>
+    <text x="60" y="154" fill="#F4F2FF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="19" font-weight="700">Fold</text>
+    <text x="60" y="174" fill="#777A89" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11">Two planes, one concealed seam</text>
+
+    <rect x="126" y="194" width="180" height="180" rx="40" fill="#191A22" stroke="#303342"/>
+    <path d="M5 0V120M10 0V120M15 0V120M20 0V120M25 0V120M30 0V120M35 0V120M40 0V120M45 0V120M50 0V120M55 0V120M60 0V120M65 0V120M70 0V120M75 0V120M80 0V120M85 0V120M90 0V120M95 0V120M100 0V120M105 0V120M110 0V120M115 0V120M0 5H120M0 10H120M0 15H120M0 20H120M0 25H120M0 30H120M0 35H120M0 40H120M0 45H120M0 50H120M0 55H120M0 60H120M0 65H120M0 70H120M0 75H120M0 80H120M0 85H120M0 90H120M0 95H120M0 100H120M0 105H120M0 110H120M0 115H120" transform="translate(156 224)" fill="none" stroke="#A78BFA" stroke-width="0.5" opacity="0.11" shape-rendering="crispEdges"/>
+    <rect x="156" y="224" width="120" height="120" fill="none" stroke="#A78BFA" opacity="0.16"/>
+    <g transform="translate(156 224) scale(5)" fill="#A78BFA">
+      <path d="M4 4H11V9H9V15H12V20H4Z"/>
+      <path d="M13 4H20V20H14V15H11V9H13Z"/>
+    </g>
+
+    <text x="60" y="408" fill="#8C8F9E" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" letter-spacing="1.2">16 PX PREVIEW</text>
+    <rect x="60" y="426" width="56" height="56" rx="14" fill="#191A22" stroke="#303342"/>
+    <g transform="translate(80 446) scale(0.6666667)" fill="#F4F2FF">
+      <path d="M4 4H11V9H9V15H12V20H4Z"/>
+      <path d="M13 4H20V20H14V15H11V9H13Z"/>
+    </g>
+    <text x="136" y="450" fill="#D5D2DF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11">Filled silhouette</text>
+    <text x="136" y="469" fill="#6F7280" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10">Asymmetric negative seam</text>
+    <path d="M60 511H372" fill="none" stroke="#242631"/>
+    <text x="60" y="536" fill="#A78BFA" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11" font-weight="600">Primary direction</text>
+    <text x="167" y="536" fill="#6F7280" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10">quiet / layered / recognisable</text>
+  </g>
+
+  <!-- Concept 02: Route Knot -->
+  <g aria-label="Route Knot concept">
+    <rect x="420" y="96" width="360" height="476" rx="24" fill="#111219" stroke="#272936"/>
+    <text x="444" y="129" fill="#8C8F9E" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="1.6">02</text>
+    <text x="444" y="154" fill="#F4F2FF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="19" font-weight="700">Route Knot</text>
+    <text x="444" y="174" fill="#777A89" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11">A local route disappears into its centre</text>
+
+    <rect x="510" y="194" width="180" height="180" rx="40" fill="#191A22" stroke="#303342"/>
+    <path d="M5 0V120M10 0V120M15 0V120M20 0V120M25 0V120M30 0V120M35 0V120M40 0V120M45 0V120M50 0V120M55 0V120M60 0V120M65 0V120M70 0V120M75 0V120M80 0V120M85 0V120M90 0V120M95 0V120M100 0V120M105 0V120M110 0V120M115 0V120M0 5H120M0 10H120M0 15H120M0 20H120M0 25H120M0 30H120M0 35H120M0 40H120M0 45H120M0 50H120M0 55H120M0 60H120M0 65H120M0 70H120M0 75H120M0 80H120M0 85H120M0 90H120M0 95H120M0 100H120M0 105H120M0 110H120M0 115H120" transform="translate(540 224)" fill="none" stroke="#A78BFA" stroke-width="0.5" opacity="0.11" shape-rendering="crispEdges"/>
+    <rect x="540" y="224" width="120" height="120" fill="none" stroke="#A78BFA" opacity="0.16"/>
+    <path d="M3 12H7V5H19V19H9V9H15V15H12" transform="translate(540 224) scale(5)" fill="none" stroke="#A78BFA" stroke-width="3" stroke-linecap="square" stroke-linejoin="miter"/>
+
+    <text x="444" y="408" fill="#8C8F9E" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" letter-spacing="1.2">16 PX PREVIEW</text>
+    <rect x="444" y="426" width="56" height="56" rx="14" fill="#191A22" stroke="#303342"/>
+    <path d="M3 12H7V5H19V19H9V9H15V15H12" transform="translate(464 446) scale(0.6666667)" fill="none" stroke="#F4F2FF" stroke-width="3" stroke-linecap="square" stroke-linejoin="miter"/>
+    <text x="520" y="450" fill="#D5D2DF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11">Single continuous route</text>
+    <text x="520" y="469" fill="#6F7280" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10">Square void, no security cliche</text>
+    <path d="M444 511H756" fill="none" stroke="#242631"/>
+    <text x="444" y="536" fill="#A78BFA" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11" font-weight="600">Mesh direction</text>
+    <text x="542" y="536" fill="#6F7280" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10">local / resilient / technical</text>
+  </g>
+
+  <!-- Concept 03: Phase Shift -->
+  <g aria-label="Phase Shift concept">
+    <rect x="804" y="96" width="360" height="476" rx="24" fill="#111219" stroke="#272936"/>
+    <text x="828" y="129" fill="#8C8F9E" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="1.6">03</text>
+    <text x="828" y="154" fill="#F4F2FF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="19" font-weight="700">Phase Shift</text>
+    <text x="828" y="174" fill="#777A89" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11">A signal reappears beyond layered planes</text>
+
+    <rect x="894" y="194" width="180" height="180" rx="40" fill="#191A22" stroke="#303342"/>
+    <path d="M5 0V120M10 0V120M15 0V120M20 0V120M25 0V120M30 0V120M35 0V120M40 0V120M45 0V120M50 0V120M55 0V120M60 0V120M65 0V120M70 0V120M75 0V120M80 0V120M85 0V120M90 0V120M95 0V120M100 0V120M105 0V120M110 0V120M115 0V120M0 5H120M0 10H120M0 15H120M0 20H120M0 25H120M0 30H120M0 35H120M0 40H120M0 45H120M0 50H120M0 55H120M0 60H120M0 65H120M0 70H120M0 75H120M0 80H120M0 85H120M0 90H120M0 95H120M0 100H120M0 105H120M0 110H120M0 115H120" transform="translate(924 224)" fill="none" stroke="#A78BFA" stroke-width="0.5" opacity="0.11" shape-rendering="crispEdges"/>
+    <rect x="924" y="224" width="120" height="120" fill="none" stroke="#A78BFA" opacity="0.16"/>
+    <g transform="translate(924 224) scale(5)" fill="#A78BFA">
+      <path d="M4 4H8V11.8L4 13Z"/>
+      <path d="M4 16L8 14.8V20H4Z"/>
+      <path d="M10 2H14V10.5L10 11.7Z"/>
+      <path d="M10 14.7L14 13.5V22H10Z"/>
+      <path d="M16 5H20V8.2L16 9.4Z"/>
+      <path d="M16 12.4L20 11.2V19H16Z"/>
+    </g>
+
+    <text x="828" y="408" fill="#8C8F9E" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10" font-weight="700" letter-spacing="1.2">16 PX PREVIEW</text>
+    <rect x="828" y="426" width="56" height="56" rx="14" fill="#191A22" stroke="#303342"/>
+    <g transform="translate(848 446) scale(0.6666667)" fill="#F4F2FF">
+      <path d="M4 4H8V11.8L4 13Z"/>
+      <path d="M4 16L8 14.8V20H4Z"/>
+      <path d="M10 2H14V10.5L10 11.7Z"/>
+      <path d="M10 14.7L14 13.5V22H10Z"/>
+      <path d="M16 5H20V8.2L16 9.4Z"/>
+      <path d="M16 12.4L20 11.2V19H16Z"/>
+    </g>
+    <text x="904" y="450" fill="#D5D2DF" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11">Six filled fragments</text>
+    <text x="904" y="469" fill="#6F7280" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10">Diagonal cut carries identity</text>
+    <path d="M828 511H1140" fill="none" stroke="#242631"/>
+    <text x="828" y="536" fill="#A78BFA" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="11" font-weight="600">Experimental direction</text>
+    <text x="970" y="536" fill="#6F7280" font-family="Inter, Segoe UI, Arial, sans-serif" font-size="10">quiet / strange / digital</text>
+  </g>
+</svg>

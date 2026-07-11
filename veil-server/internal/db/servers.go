@@ -31,6 +31,8 @@ const (
 		PermMentionEveryone | PermManageChannels | PermManageRoles | PermKickMembers |
 		PermBanMembers | PermCreateInvite | PermManageServer | PermReadMessageHistory |
 		PermAdministrator
+	AllChannelPermissions = PermViewChannel | PermSendMessages | PermManageMessages |
+		PermMentionEveryone | PermManageChannels | PermReadMessageHistory
 
 	// Default @everyone gets visibility + read + send + invite. No history by default.
 	DefaultEveryonePerms = PermViewChannel | PermReadMessageHistory | PermSendMessages | PermCreateInvite
@@ -82,6 +84,19 @@ type Channel struct {
 	NSFW           bool
 	SlowmodeSecs   int32
 	CreatedAt      time.Time
+}
+
+const (
+	ChannelOverwriteRole int16 = iota
+	ChannelOverwriteUser
+)
+
+type ChannelOverwrite struct {
+	ChannelID  string
+	TargetID   string
+	TargetType int16
+	Allow      uint64
+	Deny       uint64
 }
 
 type Invite struct {
@@ -526,6 +541,27 @@ func (db *DB) GetServerChannels(ctx context.Context, serverID string) ([]Channel
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// GetVisibleServerChannels returns only channels whose effective overwrite
+// result grants VIEW_CHANNEL to the requester. Authorization errors are
+// propagated so callers fail closed instead of leaking a partial channel tree.
+func (db *DB) GetVisibleServerChannels(ctx context.Context, serverID, userID string) ([]Channel, error) {
+	channels, err := db.GetServerChannels(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	visible := make([]Channel, 0, len(channels))
+	for _, channel := range channels {
+		allowed, err := db.HasAllChannelPermissions(ctx, channel.ID, userID, PermViewChannel)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			visible = append(visible, channel)
+		}
+	}
+	return visible, nil
 }
 
 // CreateChannel creates a new text/voice/category channel. For text, also creates a backing conversation.

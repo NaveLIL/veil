@@ -1,5 +1,6 @@
 import { Component, createSignal, For, Show, onMount, onCleanup } from "solid-js";
 import { Smile, Search, X } from "lucide-solid";
+import { Z } from "@/lib/zIndex";
 
 /* ── Emoji categories with curated sets ────────────── */
 const CATEGORIES = [
@@ -151,13 +152,13 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
         onClick={() => setOpen(!open())}
         style={{
           width: "32px", height: "32px", "border-radius": "8px",
-          border: "none", background: open() ? "rgba(124,107,245,0.15)" : "transparent",
-          color: open() ? "#7c6bf5" : "#666", cursor: "pointer",
+          border: "none", background: open() ? "color-mix(in srgb, var(--veil-accent) 15%, transparent)" : "transparent",
+          color: open() ? "var(--veil-accent)" : "var(--veil-text-faint)", cursor: "pointer",
           display: "flex", "align-items": "center", "justify-content": "center",
           transition: "background 0.2s, color 0.2s", "flex-shrink": "0",
         }}
         onMouseEnter={(e) => {
-          if (!open()) e.currentTarget.style.background = "rgba(255,255,255,0.06)";
+          if (!open()) e.currentTarget.style.background = "color-mix(in srgb, var(--veil-text-strong) 6%, transparent)";
         }}
         onMouseLeave={(e) => {
           if (!open()) e.currentTarget.style.background = "transparent";
@@ -177,13 +178,13 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
             right: "0",
             width: "352px",
             height: "420px",
-            background: "#2B2D31",
+            background: "var(--veil-island)",
             "border-radius": "12px",
-            "box-shadow": "0 8px 32px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06)",
+            "box-shadow": "0 8px 32px var(--veil-shadow-strong), 0 0 0 1px var(--veil-border)",
             display: "flex",
             "flex-direction": "column",
             overflow: "hidden",
-            "z-index": "1000",
+            "z-index": Z.DROPDOWN,
             animation: "emojiPickerIn 0.18s ease-out",
           }}
         >
@@ -191,14 +192,14 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
           <div style={{ padding: "12px 12px 8px", "flex-shrink": "0" }}>
             <div style={{
               display: "flex", "align-items": "center", gap: "8px",
-              background: "#1E1F22", "border-radius": "8px", padding: "0 10px",
+              background: "var(--veil-control)", "border-radius": "8px", padding: "0 10px",
               height: "34px",
             }}>
-              <Search size={14} color="#666" strokeWidth={2} style={{ "flex-shrink": "0" }} />
+              <Search size={14} color="var(--veil-text-faint)" strokeWidth={2} style={{ "flex-shrink": "0" }} />
               <input
                 style={{
                   flex: "1", background: "transparent", border: "none",
-                  color: "#ccc", "font-size": "13px", outline: "none",
+                  color: "var(--veil-text)", "font-size": "13px", outline: "none",
                 }}
                 placeholder="Search emoji..."
                 value={search()}
@@ -209,7 +210,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
                 <button
                   style={{
                     width: "18px", height: "18px", "border-radius": "4px",
-                    background: "transparent", border: "none", color: "#666",
+                    background: "transparent", border: "none", color: "var(--veil-text-faint)",
                     cursor: "pointer", display: "flex", "align-items": "center",
                     "justify-content": "center",
                   }}
@@ -224,7 +225,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
           {/* Category tabs */}
           <div style={{
             display: "flex", padding: "0 8px", gap: "2px", "flex-shrink": "0",
-            "border-bottom": "1px solid rgba(255,255,255,0.06)",
+            "border-bottom": "1px solid var(--veil-border)",
           }}>
             <For each={CATEGORIES as unknown as EmojiCategory[]}>
               {(cat) => (
@@ -238,8 +239,8 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
                   }}
                   style={{
                     flex: "1", height: "36px", border: "none", cursor: "pointer",
-                    background: activeCategory() === cat.id ? "rgba(124,107,245,0.12)" : "transparent",
-                    "border-bottom": activeCategory() === cat.id ? "2px solid #7c6bf5" : "2px solid transparent",
+                    background: activeCategory() === cat.id ? "color-mix(in srgb, var(--veil-accent) 12%, transparent)" : "transparent",
+                    "border-bottom": activeCategory() === cat.id ? "2px solid var(--veil-accent)" : "2px solid transparent",
                     "border-radius": "0", display: "flex", "align-items": "center",
                     "justify-content": "center", "font-size": "16px",
                     transition: "background 0.15s, border-color 0.15s",
@@ -247,7 +248,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
                     "padding-bottom": "2px",
                   }}
                   onMouseEnter={(e) => {
-                    if (activeCategory() !== cat.id) e.currentTarget.style.background = "rgba(255,255,255,0.04)";
+                    if (activeCategory() !== cat.id) e.currentTarget.style.background = "color-mix(in srgb, var(--veil-text-strong) 4%, transparent)";
                   }}
                   onMouseLeave={(e) => {
                     if (activeCategory() !== cat.id) e.currentTarget.style.background = "transparent";
@@ -287,7 +288,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
                 {(cat) => (
                   <div id={`emoji-cat-${cat.id}`} data-cat-id={cat.id}>
                     <div style={{
-                      "font-size": "11px", "font-weight": "600", color: "#777",
+                      "font-size": "11px", "font-weight": "600", color: "var(--veil-text-faint)",
                       "text-transform": "uppercase", "letter-spacing": "0.05em",
                       padding: "8px 4px 6px",
                     }}>
@@ -311,7 +312,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
                               transition: "background 0.12s, transform 0.12s",
                             }}
                             onMouseEnter={(e) => {
-                              e.currentTarget.style.background = "rgba(124,107,245,0.12)";
+                              e.currentTarget.style.background = "color-mix(in srgb, var(--veil-accent) 12%, transparent)";
                               e.currentTarget.style.transform = "scale(1.15)";
                             }}
                             onMouseLeave={(e) => {
@@ -354,7 +355,7 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
                             transition: "background 0.12s, transform 0.12s",
                           }}
                           onMouseEnter={(e) => {
-                            e.currentTarget.style.background = "rgba(124,107,245,0.12)";
+                            e.currentTarget.style.background = "color-mix(in srgb, var(--veil-accent) 12%, transparent)";
                             e.currentTarget.style.transform = "scale(1.15)";
                           }}
                           onMouseLeave={(e) => {

@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -13,6 +13,24 @@ pub struct LocalPreKey {
     pub signature: Option<[u8; 64]>,
 }
 
+/// Private per-install device identity stored only inside SQLCipher. Public
+/// fields and the account signature are duplicated deliberately: loading code
+/// can derive the public keys again and reject silent private-key corruption.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct LocalDeviceIdentityV1 {
+    pub device_id: [u8; 16],
+    pub version: u64,
+    pub x25519_secret: [u8; 32],
+    pub ed25519_secret: [u8; 32],
+    pub device_identity_key: [u8; 32],
+    pub device_signing_key: [u8; 32],
+    pub capabilities: u64,
+    pub status: u8,
+    pub account_identity_key: [u8; 32],
+    pub account_signing_key: [u8; 32],
+    pub account_signature: [u8; 64],
+}
+
 /// Encrypted SQLite database using SQLCipher.
 pub struct VeilDb {
     conn: Connection,
@@ -22,6 +40,13 @@ pub type PendingInitialHeaderRow = ([u8; 32], Vec<u8>);
 pub type MessageBinding = (String, Vec<u8>, bool, Option<i64>);
 pub type TrustedSigningKeyBinding = ([u8; 32], [u8; 32]);
 pub type StoredSenderKey = (Vec<u8>, Vec<u8>, bool);
+
+fn fixed_bytes<const N: usize>(label: &str, value: Vec<u8>) -> Result<[u8; N], String> {
+    let actual = value.len();
+    value
+        .try_into()
+        .map_err(|_| format!("invalid persisted {label} length: expected {N}, got {actual}"))
+}
 
 impl VeilDb {
     /// Open (or create) an encrypted database at the given path.
@@ -123,7 +148,7 @@ impl VeilDb {
                 msg_type INTEGER DEFAULT 0,
                 reply_to_id TEXT,
                 is_outgoing INTEGER DEFAULT 0,
-                status INTEGER DEFAULT 0,    -- 0=sending, 1=sent, 2=delivered, 3=read
+                status INTEGER DEFAULT 0,    -- 0=sending, 1=sent, 2=delivered, 3=read, 4=failed, 5=delivery unknown
                 expires_at TEXT,
                 server_timestamp INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -156,6 +181,26 @@ impl VeilDb {
             CREATE TABLE IF NOT EXISTS client_state (
                 key TEXT PRIMARY KEY,
                 value BLOB NOT NULL
+            );
+
+            -- Independent per-install X25519 + Ed25519 identity. Creation is
+            -- performed only by the unlocked client after the account identity
+            -- is available; schema migration itself never invents key material.
+            CREATE TABLE IF NOT EXISTS device_identity_v1 (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                device_id BLOB NOT NULL UNIQUE CHECK(length(device_id) = 16),
+                version BLOB NOT NULL CHECK(length(version) = 8),
+                x25519_secret BLOB NOT NULL CHECK(length(x25519_secret) = 32),
+                ed25519_secret BLOB NOT NULL CHECK(length(ed25519_secret) = 32),
+                device_identity_key BLOB NOT NULL CHECK(length(device_identity_key) = 32),
+                device_signing_key BLOB NOT NULL CHECK(length(device_signing_key) = 32),
+                capabilities BLOB NOT NULL CHECK(length(capabilities) = 8),
+                status INTEGER NOT NULL CHECK(status BETWEEN 1 AND 3),
+                account_identity_key BLOB NOT NULL CHECK(length(account_identity_key) = 32),
+                account_signing_key BLOB NOT NULL CHECK(length(account_signing_key) = 32),
+                account_signature BLOB NOT NULL CHECK(length(account_signature) = 64),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             CREATE TABLE IF NOT EXISTS local_prekeys (
@@ -209,6 +254,20 @@ impl VeilDb {
                 is_outgoing INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (group_id, sender_identity_key)
+            );
+
+            -- Exact authenticated SKDM bytes awaiting the gateway's durable
+            -- storage ACK. The first envelope for a generation/recipient is
+            -- immutable because a randomized re-seal of the same generation
+            -- would create conflicting receiver state.
+            CREATE TABLE IF NOT EXISTS pending_sender_key_envelopes (
+                conversation_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                target_identity_key BLOB NOT NULL CHECK(length(target_identity_key) = 32),
+                sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 4096),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (conversation_id, generation, target_identity_key)
             );
 
             CREATE TABLE IF NOT EXISTS reactions (
@@ -315,6 +374,16 @@ impl VeilDb {
         let _ = self.conn.execute_batch(
             "ALTER TABLE conversations ADD COLUMN crypto_mode TEXT NOT NULL DEFAULT 'sender_key';",
         );
+
+        // Legacy incoming rows used status=0 even though only locally-created
+        // outgoing rows can be in flight. Normalize them before any UI read so
+        // a disconnect can never label received history as DeliveryUnknown.
+        self.conn
+            .execute(
+                "UPDATE messages SET status = 2 WHERE is_outgoing = 0 AND status = 0",
+                [],
+            )
+            .map_err(|e| format!("normalize incoming message status: {e}"))?;
 
         Ok(())
     }
@@ -631,7 +700,7 @@ impl VeilDb {
                     sender_key,
                     plaintext,
                     is_outgoing as u8,
-                    if is_outgoing { 1u8 } else { 0u8 },
+                    if is_outgoing { 1u8 } else { 2u8 },
                     server_timestamp,
                     reply_to_id,
                 ],
@@ -1035,6 +1104,146 @@ impl VeilDb {
         tx.commit().map_err(|e| format!("commit message ACK: {e}"))
     }
 
+    /// Preserve plaintext for an asynchronously rejected send while making it
+    /// impossible to confuse the row with an in-flight message after restart.
+    pub fn mark_outgoing_message_failed(&self, local_message_id: &str) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE messages SET status = 4
+                 WHERE id = ?1 AND is_outgoing = 1 AND status = 0",
+                rusqlite::params![local_message_id],
+            )
+            .map_err(|e| format!("mark outgoing message failed: {e}"))?;
+        if changed != 1 {
+            return Err("pending outgoing message not found for failure".to_string());
+        }
+        Ok(())
+    }
+
+    /// An ACK lost to reconnect/crash is ambiguous: the server may already
+    /// have stored and fanned out the ciphertext. Preserve the local plaintext
+    /// without claiming either success or failure.
+    pub fn mark_outgoing_message_unknown(&self, local_message_id: &str) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE messages SET status = 5
+                 WHERE id = ?1 AND is_outgoing = 1 AND status = 0",
+                rusqlite::params![local_message_id],
+            )
+            .map_err(|e| format!("mark outgoing message delivery unknown: {e}"))?;
+        if changed != 1 {
+            return Err("pending outgoing message not found for unknown delivery".to_string());
+        }
+        Ok(())
+    }
+
+    /// Mark a whole terminated socket epoch ambiguous atomically. If any row
+    /// cannot be transitioned, none are changed; the client can then block a
+    /// reconnect and retry instead of leaving a mixture of Sending/Unknown.
+    pub fn mark_outgoing_messages_unknown(
+        &self,
+        local_message_ids: &[String],
+    ) -> Result<(), String> {
+        if local_message_ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin outgoing delivery-state transaction: {e}"))?;
+        for local_message_id in local_message_ids {
+            let changed = tx
+                .execute(
+                    "UPDATE messages SET status = 5
+                     WHERE id = ?1 AND is_outgoing = 1 AND status = 0",
+                    rusqlite::params![local_message_id],
+                )
+                .map_err(|e| format!("mark outgoing message delivery unknown: {e}"))?;
+            if changed != 1 {
+                return Err(format!(
+                    "pending outgoing message {local_message_id} not found for unknown delivery"
+                ));
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit outgoing delivery states: {e}"))
+    }
+
+    /// Process state contains the sequence-to-local-id correlation. After a
+    /// crash/restart that map is gone, so every surviving status=0 row must be
+    /// made explicitly ambiguous instead of pretending it is still sending.
+    pub fn recover_unacknowledged_outgoing_messages(&self) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "UPDATE messages SET status = 5 WHERE is_outgoing = 1 AND status = 0",
+                [],
+            )
+            .map_err(|e| format!("recover unacknowledged outgoing messages: {e}"))
+    }
+
+    pub fn discard_failed_outgoing_message(&self, local_message_id: &str) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin discard local message transaction: {e}"))?;
+        let conversation_id: String = tx
+            .query_row(
+                "SELECT conversation_id FROM messages
+                 WHERE id = ?1 AND is_outgoing = 1 AND status IN (4, 5)",
+                rusqlite::params![local_message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("find discarded message conversation: {e}"))?
+            .ok_or_else(|| "failed or unknown outgoing message not found".to_string())?;
+        let changed = tx
+            .execute(
+                "DELETE FROM messages WHERE id = ?1 AND is_outgoing = 1 AND status IN (4, 5)",
+                rusqlite::params![local_message_id],
+            )
+            .map_err(|e| format!("discard failed outgoing message: {e}"))?;
+        if changed != 1 {
+            return Err("failed or unknown outgoing message not found".to_string());
+        }
+        tx.execute(
+            "UPDATE conversations
+             SET last_message_at = (
+               SELECT CASE
+                 WHEN server_timestamp IS NOT NULL
+                   THEN strftime('%Y-%m-%d %H:%M:%f', server_timestamp / 1000.0, 'unixepoch')
+                 ELSE created_at
+               END
+               FROM messages
+               WHERE conversation_id = ?1
+               ORDER BY COALESCE(
+                 server_timestamp,
+                 CAST(strftime('%s', created_at) AS INTEGER) * 1000
+               ) DESC, rowid DESC
+               LIMIT 1
+             )
+             WHERE id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| format!("recalculate conversation last message: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit discarded local message: {e}"))
+    }
+
+    pub fn is_discardable_outgoing_message(&self, local_message_id: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM messages
+                   WHERE id = ?1 AND is_outgoing = 1 AND status IN (4, 5)
+                 )",
+                rusqlite::params![local_message_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("check discardable outgoing message: {e}"))
+    }
+
     pub fn get_messages(
         &self,
         conversation_id: &str,
@@ -1044,11 +1253,22 @@ impl VeilDb {
             .conn
             .prepare(
                 "SELECT id, conversation_id, sender_key, plaintext, msg_type, reply_to_id,
-                        is_outgoing, status, expires_at, server_timestamp, created_at
-                 FROM messages
-                 WHERE conversation_id = ?1
-                 ORDER BY server_timestamp ASC, created_at ASC
-                 LIMIT ?2",
+                        is_outgoing, status, expires_at, server_timestamp, created_at,
+                        effective_timestamp, local_order
+                 FROM (
+                   SELECT id, conversation_id, sender_key, plaintext, msg_type, reply_to_id,
+                          is_outgoing, status, expires_at, server_timestamp, created_at,
+                          COALESCE(
+                            server_timestamp,
+                            CAST(strftime('%s', created_at) AS INTEGER) * 1000
+                          ) AS effective_timestamp,
+                          rowid AS local_order
+                   FROM messages
+                   WHERE conversation_id = ?1
+                   ORDER BY effective_timestamp DESC, local_order DESC
+                   LIMIT ?2
+                 )
+                 ORDER BY effective_timestamp ASC, local_order ASC",
             )
             .map_err(|e| format!("prepare: {e}"))?;
 
@@ -1066,6 +1286,8 @@ impl VeilDb {
                         1 => crate::models::MessageStatus::Sent,
                         2 => crate::models::MessageStatus::Delivered,
                         3 => crate::models::MessageStatus::Read,
+                        4 => crate::models::MessageStatus::Failed,
+                        5 => crate::models::MessageStatus::Unknown,
                         _ => crate::models::MessageStatus::Sending,
                     },
                     expires_at: row.get(8)?,
@@ -1235,6 +1457,153 @@ impl VeilDb {
             )
             .map_err(|e| format!("repair all-zero device id: {e}"))?;
         Ok(proposed)
+    }
+
+    /// Load the durable device identity. A separate marker is committed in the
+    /// same transaction as the key row so deletion/corruption cannot be
+    /// mistaken for a legacy installation and silently generate a replacement.
+    pub fn load_device_identity_v1(&self) -> Result<Option<LocalDeviceIdentityV1>, String> {
+        let marker: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT value FROM client_state WHERE key = 'device_binding_v1_created'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("load device binding marker: {e}"))?;
+
+        type DeviceRow = (
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+        );
+        let row: Option<DeviceRow> = self
+            .conn
+            .query_row(
+                "SELECT device_id, version, x25519_secret, ed25519_secret,
+                        device_identity_key, device_signing_key, capabilities,
+                        status, account_identity_key, account_signing_key,
+                        account_signature
+                   FROM device_identity_v1 WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load device identity: {e}"))?;
+
+        match (marker, row) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(
+                "device binding marker exists but private device identity is missing".to_string(),
+            ),
+            (None, Some(_)) => {
+                Err("private device identity exists without its binding marker".to_string())
+            }
+            (Some(marker), Some(row)) => {
+                let device_id = fixed_bytes::<16>("device id", row.0)?;
+                let marker = fixed_bytes::<16>("device binding marker", marker)?;
+                if marker != device_id {
+                    return Err("device binding marker does not match device identity".to_string());
+                }
+                let version = u64::from_be_bytes(fixed_bytes::<8>("device version", row.1)?);
+                let capabilities =
+                    u64::from_be_bytes(fixed_bytes::<8>("device capabilities", row.6)?);
+                let status = u8::try_from(row.7)
+                    .map_err(|_| "persisted device status is out of range".to_string())?;
+                if !(1..=3).contains(&status) {
+                    return Err("persisted device status is invalid".to_string());
+                }
+                Ok(Some(LocalDeviceIdentityV1 {
+                    device_id,
+                    version,
+                    x25519_secret: fixed_bytes::<32>("device X25519 secret", row.2)?,
+                    ed25519_secret: fixed_bytes::<32>("device Ed25519 secret", row.3)?,
+                    device_identity_key: fixed_bytes::<32>("device identity key", row.4)?,
+                    device_signing_key: fixed_bytes::<32>("device signing key", row.5)?,
+                    capabilities,
+                    status,
+                    account_identity_key: fixed_bytes::<32>("account identity key", row.8)?,
+                    account_signing_key: fixed_bytes::<32>("account signing key", row.9)?,
+                    account_signature: fixed_bytes::<64>("device account signature", row.10)?,
+                }))
+            }
+        }
+    }
+
+    /// Commit the first device identity and its non-deletable-without-detection
+    /// marker atomically. Existing bindings are immutable through this API.
+    pub fn create_device_identity_v1(
+        &self,
+        identity: &LocalDeviceIdentityV1,
+    ) -> Result<(), String> {
+        if identity.device_id == [0u8; 16] || identity.version == 0 {
+            return Err("refusing an invalid device identity".to_string());
+        }
+        let persisted_device_id = self.get_or_create_device_id(identity.device_id)?;
+        if persisted_device_id != identity.device_id {
+            return Err("device identity does not match the stable installation id".to_string());
+        }
+        if self.load_device_identity_v1()?.is_some() {
+            return Err("device identity already exists and is immutable".to_string());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin device identity transaction: {e}"))?;
+        tx.execute(
+            "INSERT INTO device_identity_v1
+               (singleton, device_id, version, x25519_secret, ed25519_secret,
+                device_identity_key, device_signing_key, capabilities, status,
+                account_identity_key, account_signing_key, account_signature)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                identity.device_id.as_slice(),
+                identity.version.to_be_bytes().as_slice(),
+                identity.x25519_secret.as_slice(),
+                identity.ed25519_secret.as_slice(),
+                identity.device_identity_key.as_slice(),
+                identity.device_signing_key.as_slice(),
+                identity.capabilities.to_be_bytes().as_slice(),
+                identity.status,
+                identity.account_identity_key.as_slice(),
+                identity.account_signing_key.as_slice(),
+                identity.account_signature.as_slice(),
+            ],
+        )
+        .map_err(|e| format!("store device identity: {e}"))?;
+        tx.execute(
+            "INSERT INTO client_state (key, value)
+             VALUES ('device_binding_v1_created', ?1)",
+            rusqlite::params![identity.device_id.as_slice()],
+        )
+        .map_err(|e| format!("store device binding marker: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit device identity: {e}"))?;
+        Ok(())
     }
 
     /// Trust-on-authenticated-directory: insert the first observed Ed25519 key
@@ -1585,6 +1954,131 @@ impl VeilDb {
             .map_err(|e| format!("collect sender keys: {e}"))
     }
 
+    /// Persist the first sealed SKDM accepted locally for one exact
+    /// conversation/generation/recipient tuple. A retry may reuse the row only
+    /// when both the sender binding and the bytes are identical.
+    pub fn save_pending_sender_key_envelope(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+        target_identity_key: &[u8; 32],
+        sender_identity_key: &[u8; 32],
+        sealed_envelope: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if conversation_id.is_empty() || generation == 0 {
+            return Err("invalid pending sender-key envelope scope".to_string());
+        }
+        if sealed_envelope.is_empty() || sealed_envelope.len() > 4096 {
+            return Err("invalid pending sender-key envelope size".to_string());
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO pending_sender_key_envelopes
+                   (conversation_id, generation, target_identity_key,
+                    sender_identity_key, sealed_envelope)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    target_identity_key.as_slice(),
+                    sender_identity_key.as_slice(),
+                    sealed_envelope,
+                ],
+            )
+            .map_err(|e| format!("save pending sender-key envelope: {e}"))?;
+
+        let (stored_sender, stored_envelope): (Vec<u8>, Vec<u8>) = self
+            .conn
+            .query_row(
+                "SELECT sender_identity_key, sealed_envelope
+                 FROM pending_sender_key_envelopes
+                 WHERE conversation_id = ?1 AND generation = ?2
+                   AND target_identity_key = ?3",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    target_identity_key.as_slice(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| format!("verify pending sender-key envelope: {e}"))?;
+        if stored_sender.as_slice() != sender_identity_key.as_slice()
+            || stored_envelope.as_slice() != sealed_envelope
+        {
+            return Err(
+                "pending sender-key generation is already committed to different bytes".to_string(),
+            );
+        }
+        Ok(stored_envelope)
+    }
+
+    pub fn load_pending_sender_key_envelope(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+        target_identity_key: &[u8; 32],
+        expected_sender_identity_key: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT sender_identity_key, sealed_envelope
+                 FROM pending_sender_key_envelopes
+                 WHERE conversation_id = ?1 AND generation = ?2
+                   AND target_identity_key = ?3",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    target_identity_key.as_slice(),
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("load pending sender-key envelope: {e}"))?;
+        let Some((sender_identity_key, sealed_envelope)) = row else {
+            return Ok(None);
+        };
+        if sender_identity_key.as_slice() != expected_sender_identity_key.as_slice() {
+            return Err("pending sender-key envelope belongs to another sender".to_string());
+        }
+        if sealed_envelope.is_empty() || sealed_envelope.len() > 4096 {
+            return Err("persisted sender-key envelope has an invalid size".to_string());
+        }
+        Ok(Some(sealed_envelope))
+    }
+
+    /// Remove a completed generation only after all corresponding gateway
+    /// durable-storage ACKs have been observed by the client.
+    pub fn delete_pending_sender_key_envelope_generation(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_sender_key_envelopes
+                 WHERE conversation_id = ?1 AND generation = ?2",
+                rusqlite::params![conversation_id, i64::from(generation)],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("delete acknowledged sender-key envelopes: {e}"))
+    }
+
+    /// Rotation is a protocol boundary: cached envelopes from every older
+    /// roster/generation must be invalidated before the new key is created.
+    pub fn delete_pending_sender_key_envelopes_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_sender_key_envelopes WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("invalidate pending sender-key envelopes: {e}"))
+    }
+
     // ─── CRUD: Reactions ──────────────────────────────────
 
     pub fn add_reaction(
@@ -1862,6 +2356,26 @@ impl VeilDb {
             .map_err(|e| format!("collect channels: {e}"))
     }
 
+    /// Resolve a cached server/channel from its backing conversation without
+    /// loading or replacing any renderer channel lists. Search results can
+    /// reference channels that have not been opened in the current session.
+    pub fn find_channel_context_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        self.conn
+            .query_row(
+                "SELECT server_id, id
+                 FROM server_channels_cache
+                 WHERE conversation_id = ?1
+                 LIMIT 1",
+                rusqlite::params![conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("resolve channel conversation: {e}"))
+    }
+
     // ─── CRUD: Roles cache ────────────────────────────────
 
     pub fn replace_roles(
@@ -2050,6 +2564,22 @@ impl VeilDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_device_identity(device_id: [u8; 16]) -> LocalDeviceIdentityV1 {
+        LocalDeviceIdentityV1 {
+            device_id,
+            version: 1,
+            x25519_secret: [0x11; 32],
+            ed25519_secret: [0x22; 32],
+            device_identity_key: [0x33; 32],
+            device_signing_key: [0x44; 32],
+            capabilities: 3,
+            status: 1,
+            account_identity_key: [0x55; 32],
+            account_signing_key: [0x66; 32],
+            account_signature: [0x77; 64],
+        }
+    }
     use rusqlite::params;
 
     #[test]
@@ -2093,6 +2623,44 @@ mod tests {
     }
 
     #[test]
+    fn resolves_cached_channel_context_without_loading_channel_lists() {
+        let mut db = VeilDb::open_memory(&[42u8; 32]).unwrap();
+        db.replace_servers(&[crate::models::CachedServer {
+            id: "server-1".into(),
+            name: "Server".into(),
+            description: None,
+            icon_url: None,
+            owner_id: "owner".into(),
+            position: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }])
+        .unwrap();
+        db.upsert_channel(&crate::models::CachedChannel {
+            id: "channel-1".into(),
+            server_id: "server-1".into(),
+            conversation_id: Some("conversation-1".into()),
+            name: "general".into(),
+            channel_type: 0,
+            category_id: None,
+            position: 0,
+            topic: None,
+            nsfw: false,
+            slowmode_secs: 0,
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.find_channel_context_by_conversation("conversation-1")
+                .unwrap(),
+            Some(("server-1".into(), "channel-1".into()))
+        );
+        assert!(db
+            .find_channel_context_by_conversation("missing")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn device_id_is_stable_across_reinitialization() {
         let db = VeilDb::open_memory(&[7u8; 32]).unwrap();
         assert_eq!(db.get_or_create_device_id([1u8; 16]).unwrap(), [1u8; 16]);
@@ -2114,6 +2682,100 @@ mod tests {
     }
 
     #[test]
+    fn device_identity_is_created_only_explicitly_and_is_immutable() {
+        let db = VeilDb::open_memory(&[0x81u8; 32]).unwrap();
+        assert!(db.load_device_identity_v1().unwrap().is_none());
+
+        let identity = sample_device_identity([0x10; 16]);
+        db.create_device_identity_v1(&identity).unwrap();
+        let loaded = db.load_device_identity_v1().unwrap().unwrap();
+        assert_eq!(loaded.device_id, identity.device_id);
+        assert_eq!(loaded.version, identity.version);
+        assert_eq!(loaded.x25519_secret, identity.x25519_secret);
+        assert_eq!(loaded.ed25519_secret, identity.ed25519_secret);
+        assert_eq!(loaded.device_identity_key, identity.device_identity_key);
+        assert_eq!(loaded.device_signing_key, identity.device_signing_key);
+        assert_eq!(loaded.capabilities, identity.capabilities);
+        assert_eq!(loaded.status, identity.status);
+        assert_eq!(loaded.account_signature, identity.account_signature);
+        assert!(db.create_device_identity_v1(&identity).is_err());
+    }
+
+    #[test]
+    fn device_binding_marker_makes_missing_or_mismatched_material_fail_closed() {
+        let db = VeilDb::open_memory(&[0x82u8; 32]).unwrap();
+        let identity = sample_device_identity([0x20; 16]);
+        db.create_device_identity_v1(&identity).unwrap();
+        db.conn
+            .execute("DELETE FROM device_identity_v1 WHERE singleton = 1", [])
+            .unwrap();
+        assert!(db
+            .load_device_identity_v1()
+            .err()
+            .unwrap()
+            .contains("private device identity is missing"));
+
+        db.conn
+            .execute(
+                "UPDATE client_state SET value = ?1
+                 WHERE key = 'device_binding_v1_created'",
+                rusqlite::params![[0x21u8; 16].as_slice()],
+            )
+            .unwrap();
+        // Reinsert structurally valid material without changing the marker.
+        db.conn
+            .execute(
+                "INSERT INTO device_identity_v1
+                   (singleton, device_id, version, x25519_secret, ed25519_secret,
+                    device_identity_key, device_signing_key, capabilities, status,
+                    account_identity_key, account_signing_key, account_signature)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    identity.device_id.as_slice(),
+                    identity.version.to_be_bytes().as_slice(),
+                    identity.x25519_secret.as_slice(),
+                    identity.ed25519_secret.as_slice(),
+                    identity.device_identity_key.as_slice(),
+                    identity.device_signing_key.as_slice(),
+                    identity.capabilities.to_be_bytes().as_slice(),
+                    identity.status,
+                    identity.account_identity_key.as_slice(),
+                    identity.account_signing_key.as_slice(),
+                    identity.account_signature.as_slice(),
+                ],
+            )
+            .unwrap();
+        assert!(db
+            .load_device_identity_v1()
+            .err()
+            .unwrap()
+            .contains("marker does not match"));
+    }
+
+    #[test]
+    fn device_identity_survives_sqlcipher_restart() {
+        let path =
+            std::env::temp_dir().join(format!("veil-device-identity-{}.db", uuid::Uuid::new_v4()));
+        let db_key = [0x83u8; 32];
+        let identity = sample_device_identity([0x30; 16]);
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.create_device_identity_v1(&identity).unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            let loaded = reopened.load_device_identity_v1().unwrap().unwrap();
+            assert_eq!(loaded.device_id, identity.device_id);
+            assert_eq!(loaded.x25519_secret, identity.x25519_secret);
+            assert_eq!(loaded.ed25519_secret, identity.ed25519_secret);
+            assert_eq!(loaded.account_signature, identity.account_signature);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
     fn trusted_signing_key_is_pinned_per_identity() {
         let db = VeilDb::open_memory(&[9u8; 32]).unwrap();
         db.pin_trusted_signing_key(&[1u8; 32], &[2u8; 32]).unwrap();
@@ -2123,6 +2785,100 @@ mod tests {
             db.load_trusted_signing_keys().unwrap(),
             vec![([1u8; 32], [2u8; 32])]
         );
+    }
+
+    #[test]
+    fn pending_sender_key_envelope_is_first_write_immutable_and_scoped() {
+        let db = VeilDb::open_memory(&[0x91u8; 32]).unwrap();
+        let sender = [1u8; 32];
+        let target_a = [2u8; 32];
+        let target_b = [3u8; 32];
+        let first = b"sealed-generation-one";
+
+        assert_eq!(
+            db.save_pending_sender_key_envelope("group-cache", 7, &target_a, &sender, first)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            db.save_pending_sender_key_envelope("group-cache", 7, &target_a, &sender, first)
+                .unwrap(),
+            first
+        );
+        assert!(db
+            .save_pending_sender_key_envelope(
+                "group-cache",
+                7,
+                &target_a,
+                &sender,
+                b"different-randomized-seal",
+            )
+            .is_err());
+        assert_eq!(
+            db.load_pending_sender_key_envelope("group-cache", 7, &target_a, &sender)
+                .unwrap()
+                .unwrap(),
+            first
+        );
+
+        db.save_pending_sender_key_envelope("group-cache", 7, &target_b, &sender, b"target-b")
+            .unwrap();
+        db.save_pending_sender_key_envelope(
+            "group-cache",
+            8,
+            &target_a,
+            &sender,
+            b"generation-eight",
+        )
+        .unwrap();
+        db.delete_pending_sender_key_envelope_generation("group-cache", 7)
+            .unwrap();
+        assert!(db
+            .load_pending_sender_key_envelope("group-cache", 7, &target_a, &sender)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .load_pending_sender_key_envelope("group-cache", 7, &target_b, &sender)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .load_pending_sender_key_envelope("group-cache", 8, &target_a, &sender)
+            .unwrap()
+            .is_some());
+        db.delete_pending_sender_key_envelopes_for_conversation("group-cache")
+            .unwrap();
+        assert!(db
+            .load_pending_sender_key_envelope("group-cache", 8, &target_a, &sender)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn pending_sender_key_envelope_survives_sqlcipher_restart() {
+        let path =
+            std::env::temp_dir().join(format!("veil-pending-skdm-{}.db", uuid::Uuid::new_v4()));
+        let db_key = [0x92u8; 32];
+        let sender = [4u8; 32];
+        let target = [5u8; 32];
+        let sealed = b"exact-sealed-envelope-survives-restart";
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.save_pending_sender_key_envelope("group-restart", 19, &target, &sender, sealed)
+                .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened
+                    .load_pending_sender_key_envelope("group-restart", 19, &target, &sender,)
+                    .unwrap()
+                    .unwrap(),
+                sealed
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
 
     #[test]
@@ -2145,6 +2901,67 @@ mod tests {
         assert!(db
             .acknowledge_outgoing_message("local-id", "different-server-id", 1235)
             .is_err());
+    }
+
+    #[test]
+    fn rejected_outgoing_message_remains_failed_until_explicitly_discarded() {
+        let db = VeilDb::open_memory(&[0x62u8; 32]).unwrap();
+        db.insert_conversation("conv-failed", 1, Some("Group"), None, None)
+            .unwrap();
+        db.insert_outgoing_pending_message(
+            "local-failed",
+            "conv-failed",
+            &[5u8; 32],
+            "keep this draft",
+            None,
+        )
+        .unwrap();
+
+        db.mark_outgoing_message_failed("local-failed").unwrap();
+        let failed = db.get_messages("conv-failed", 10).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, crate::models::MessageStatus::Failed);
+        assert_eq!(failed[0].plaintext, "keep this draft");
+
+        db.discard_failed_outgoing_message("local-failed").unwrap();
+        assert!(db.get_messages("conv-failed", 10).unwrap().is_empty());
+        assert!(db
+            .get_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|conversation| conversation.id == "conv-failed")
+            .unwrap()
+            .last_message_at
+            .is_none());
+    }
+
+    #[test]
+    fn crash_recovery_marks_sending_rows_unknown_and_keeps_latest_window() {
+        let db = VeilDb::open_memory(&[0x63u8; 32]).unwrap();
+        db.insert_conversation("conv-unknown", 1, Some("Group"), None, None)
+            .unwrap();
+        for (id, text) in [
+            ("local-1", "first"),
+            ("local-2", "second"),
+            ("local-3", "possibly delivered"),
+        ] {
+            db.insert_outgoing_pending_message(id, "conv-unknown", &[6u8; 32], text, None)
+                .unwrap();
+        }
+
+        assert_eq!(db.recover_unacknowledged_outgoing_messages().unwrap(), 3);
+        let latest = db.get_messages("conv-unknown", 2).unwrap();
+        assert_eq!(
+            latest
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-2", "local-3"]
+        );
+        assert!(latest
+            .iter()
+            .all(|message| message.status == crate::models::MessageStatus::Unknown));
+        assert_eq!(latest[1].plaintext, "possibly delivered");
     }
 
     #[test]
@@ -2212,6 +3029,23 @@ mod tests {
         )
         .unwrap();
         assert!(db.message_exists("server-message").unwrap());
+        assert_eq!(
+            db.get_messages("sync-conv", 10).unwrap()[0].status,
+            crate::models::MessageStatus::Delivered
+        );
+
+        // Opening a pre-fix database normalizes legacy incoming status=0.
+        db.conn
+            .execute(
+                "UPDATE messages SET status = 0 WHERE id = 'server-message'",
+                [],
+            )
+            .unwrap();
+        db.run_migrations().unwrap();
+        assert_eq!(
+            db.get_messages("sync-conv", 10).unwrap()[0].status,
+            crate::models::MessageStatus::Delivered
+        );
     }
 
     #[test]

@@ -66,9 +66,11 @@ export const CreateChannelDialog: Component<Props> = (props) => {
     display: "flex" as const, "align-items": "center" as const, gap: "10px",
     width: "100%", padding: "9px 12px",
     "border-radius": "8px",
-    background: active ? "rgba(124,107,245,0.12)" : "rgba(255,255,255,0.03)",
-    border: `1px solid ${active ? "rgba(124,107,245,0.35)" : "rgba(255,255,255,0.05)"}`,
-    color: active ? "#7c6bf5" : "#bbb",
+    background: active
+      ? "color-mix(in srgb, var(--veil-accent) 12%, transparent)"
+      : "color-mix(in srgb, var(--veil-text-strong) 3%, transparent)",
+    border: `1px solid ${active ? "color-mix(in srgb, var(--veil-accent) 35%, transparent)" : "var(--veil-border)"}`,
+    color: active ? "var(--veil-accent)" : "var(--veil-text-muted)",
     cursor: "pointer", "text-align": "left" as const,
     transition: "background 0.15s, border-color 0.15s, color 0.15s",
     "font-family": "inherit",
@@ -80,7 +82,7 @@ export const CreateChannelDialog: Component<Props> = (props) => {
       onClose={close}
       title="Create Channel"
       icon={<Hash size={15} />}
-      accent="#34d399"
+      accent="var(--veil-success)"
       closeDisabled={loading()}
     >
       <div style={ds.fieldGroup}>
@@ -92,8 +94,8 @@ export const CreateChannelDialog: Component<Props> = (props) => {
                 <button style={typeBtn(type() === t.value)} onClick={() => setType(t.value)}>
                   <t.icon size={15} style={{ "flex-shrink": "0" }} />
                   <div style={{ flex: "1", "min-width": "0" }}>
-                    <div style={{ "font-size": "13px", "font-weight": "500", color: type() === t.value ? "#7c6bf5" : "#ddd" }}>{t.label}</div>
-                    <div style={{ "font-size": "11px", color: "#888", "margin-top": "1px" }}>{t.description}</div>
+                    <div style={{ "font-size": "13px", "font-weight": "500", color: type() === t.value ? "var(--veil-accent)" : "var(--veil-text)" }}>{t.label}</div>
+                    <div style={{ "font-size": "11px", color: "var(--veil-text-muted)", "margin-top": "1px" }}>{t.description}</div>
                   </div>
                 </button>
               )}
@@ -107,7 +109,7 @@ export const CreateChannelDialog: Component<Props> = (props) => {
             <Show when={type() === 0}>
               <span style={{
                 position: "absolute", left: "12px", top: "50%",
-                transform: "translateY(-50%)", color: "#666", "font-size": "13px",
+                transform: "translateY(-50%)", color: "var(--veil-text-faint)", "font-size": "13px",
                 "pointer-events": "none",
               }}>#</span>
             </Show>
@@ -128,7 +130,7 @@ export const CreateChannelDialog: Component<Props> = (props) => {
         </Show>
 
         <button
-          style={ds.primaryBtn(!!finalName() && !loading(), "#34d399")}
+          style={ds.primaryBtn(!!finalName() && !loading(), "var(--veil-success)")}
           onClick={handleCreate}
           disabled={loading() || !finalName()}
         >

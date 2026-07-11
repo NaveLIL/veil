@@ -10,17 +10,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AegisSec/veil-server/internal/logsafe"
 	"github.com/AegisSec/veil-server/internal/metrics"
 )
 
 // AccessLog wraps an http.Handler and emits one structured log line per
 // request after it completes. The log line includes the HTTP method, path,
-// status code, response size, duration, client IP and the authenticated
-// user ID (if any). Useful both for forensic audit and perf debugging.
+// status code, response size, duration, and short-lived pseudonymous
+// correlation references for the client IP and authenticated user (if any).
+// Raw stable identifiers are deliberately excluded from access logs.
 //
 // The middleware reads X-User-ID after the inner handler has run, so it
 // captures the value set by authmw.RequireSigned on success.
 func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
+	return accessLog(logger, logsafe.Ref)
+}
+
+// AccessLogWithPseudonymSecret is identical to AccessLog but accepts an
+// explicit 32-byte process secret. It exists for deterministic tests and for
+// deployments that need same-day correlation across rolling gateway workers.
+// The secret itself must come from a secret manager and must never be logged.
+func AccessLogWithPseudonymSecret(logger *slog.Logger, secret []byte) func(http.Handler) http.Handler {
+	pseudonyms, err := logsafe.New(secret)
+	if err != nil {
+		panic("httpmw: " + err.Error())
+	}
+	return accessLog(logger, pseudonyms.Ref)
+}
+
+func accessLog(logger *slog.Logger, pseudonymize func(domain, raw string) string) func(http.Handler) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -31,10 +49,8 @@ func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 			next.ServeHTTP(rw, r)
 			dur := time.Since(start)
 
-			user := r.Header.Get("X-User-ID")
-			if user == "" {
-				user = "-"
-			}
+			userRef := pseudonymize("user", r.Header.Get("X-User-ID"))
+			ipRef := pseudonymize("ip", clientIP(r))
 			logger.Info("http",
 				slog.String("method", r.Method),
 				slog.String("path", r.URL.Path),
@@ -42,8 +58,8 @@ func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 				slog.Int("bytes", rw.bytes),
 				slog.String("dur", dur.String()),
 				slog.String("dur_ms", strconv.FormatInt(dur.Milliseconds(), 10)),
-				slog.String("user", user),
-				slog.String("ip", clientIP(r)),
+				slog.String("user_ref", userRef),
+				slog.String("ip_ref", ipRef),
 			)
 
 			// Prometheus: use the matched route template (e.g.

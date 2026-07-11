@@ -60,6 +60,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/prekeys/{identityKey}", signed(h.GetPreKeyBundle))
 	mux.HandleFunc("GET /v1/prekeys/{identityKey}/count", signed(h.GetOPKCount))
 	mux.HandleFunc("GET /v1/devices/{userID}", signed(h.ListDevices))
+	mux.HandleFunc("GET /v1/device-bindings/{deviceKey}", signed(h.GetDeviceBinding))
+	mux.HandleFunc("PUT /v1/device-bindings/{deviceKey}", signed(h.PutDeviceBinding))
 	mux.HandleFunc("GET /v1/users/search", signed(h.SearchUser))
 	mux.HandleFunc("GET /v1/users/{identityKey}", signed(h.LookupUser))
 }

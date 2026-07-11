@@ -11,6 +11,10 @@ import (
 )
 
 func makeSenderKeyEnvelopeV3(group string, generation uint32, identity []byte, signingKey ed25519.PrivateKey, recipient []byte) []byte {
+	return makeSenderKeyEnvelopeV3WithMarker(group, generation, identity, signingKey, recipient, 1)
+}
+
+func makeSenderKeyEnvelopeV3WithMarker(group string, generation uint32, identity []byte, signingKey ed25519.PrivateKey, recipient []byte, marker byte) []byte {
 	const tailSize = 4 + 32 + 32 + 32 + 24 + 16 + 64
 	wire := make([]byte, 3+len(group)+tailSize)
 	wire[0] = 0x03
@@ -25,12 +29,13 @@ func makeSenderKeyEnvelopeV3(group string, generation uint32, identity []byte, s
 	copy(wire[cursor:cursor+32], signingPublic)
 	cursor += 32
 	ephemeral := wire[cursor : cursor+32]
-	ephemeral[0] = 1
+	ephemeral[0] = marker
 	cursor += 32
 	nonce := wire[cursor : cursor+24]
+	nonce[0] = marker
 	cursor += 24
 	ciphertext := wire[cursor : cursor+16]
-	ciphertext[0] = 1
+	ciphertext[0] = marker
 
 	const domain = "veil-sealed-skdm-v3"
 	aad := make([]byte, 0, len(domain)+1+2+len(group)+4+32*4)

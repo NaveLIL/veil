@@ -8,7 +8,7 @@ export type Screen = "onboarding" | "locked" | "disclaimer" | "chat" | "settings
 
 export interface Conversation {
   id: string;
-  type: "dm" | "group";
+  type: "dm" | "group" | "channel";
   name: string;
   peerKey?: string;
   avatarUrl?: string;
@@ -78,6 +78,8 @@ export interface Message {
   timestamp: number;
   isOwn: boolean;
   pending?: boolean;
+  failed?: boolean;
+  deliveryUnknown?: boolean;
   replyToId?: string;
 }
 
@@ -91,6 +93,7 @@ const [activeConversationId, setActiveConversationId] = createSignal<string | nu
 const [messages, setMessages] = createSignal<Message[]>([]);
 const [isSidebarCollapsed, setSidebarCollapsed] = createSignal(false);
 const [connected, setConnected] = createSignal(false);
+const [reconnecting, setReconnecting] = createSignal(false);
 
 const DEFAULT_SERVER_ENDPOINTS = {
   ws: "wss://secret.erez.pro/ws",
@@ -164,6 +167,8 @@ const [servers, setServers] = createSignal<Server[]>([]);
 const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
 const [channelsByServer, setChannelsByServer] = createSignal<Record<string, Channel[]>>({});
 const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
+export type SenderKeyStatus = "checking" | "pending" | "ready" | "error";
+const [senderKeyStatus, setSenderKeyStatus] = createSignal<Record<string, SenderKeyStatus>>({});
 const [serverMembers, setServerMembers] = createSignal<Record<string, ServerMember[]>>({});
 const [serverRoles, setServerRoles] = createSignal<Record<string, Role[]>>({});
 // Currently-open server settings overlay; null = closed.
@@ -175,6 +180,41 @@ let lastTypingSent = 0;
 // Reactions: messageId → { emoji → { userId, username }[] }
 export type ReactionMap = Record<string, { userId: string; username: string }[]>;
 const [reactions, setReactions] = createSignal<Record<string, ReactionMap>>({});
+const rejectedOutgoingMessageIds = new Set<string>();
+const acknowledgedOutgoingMessageIds = new Map<string, string>();
+const discardedOutgoingMessageIds = new Set<string>();
+const messageLoadGenerations = new Map<string, number>();
+
+function nextMessageLoadGeneration(conversationId: string): number {
+  const generation = (messageLoadGenerations.get(conversationId) ?? 0) + 1;
+  messageLoadGenerations.set(conversationId, generation);
+  return generation;
+}
+
+function messagePreview(message: Message): string {
+  if (message.failed) return `Not sent: ${message.text}`;
+  if (message.deliveryUnknown) return `Delivery unknown: ${message.text}`;
+  if (message.pending) return `Sending: ${message.text}`;
+  return message.text;
+}
+
+function updateConversationPreview(conversationId: string, snapshot = messages()): void {
+  const latest = snapshot
+    .filter((message) => message.conversationId === conversationId)
+    .reduce<Message | undefined>(
+      (current, candidate) => !current || candidate.timestamp >= current.timestamp ? candidate : current,
+      undefined,
+    );
+  setConversations((previous) => previous.map((conversation) =>
+    conversation.id === conversationId
+      ? {
+        ...conversation,
+        lastMessage: latest ? messagePreview(latest) : undefined,
+        lastMessageTime: latest?.timestamp,
+      }
+      : conversation,
+  ));
+}
 
 // Friends & Presence
 export interface Friend {
@@ -214,6 +254,43 @@ let lastActivityTouch = 0;
 let uiSessionEpoch = 0;
 let uiSessionActive = true;
 let connectionAttempt: Promise<string> | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectAttempt = 0;
+let eventListenersInitialized = false;
+
+const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const;
+
+function cancelReconnectTimer(resetAttempt = false): void {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  if (resetAttempt) reconnectAttempt = 0;
+}
+
+function scheduleReconnect(expectedEpoch: number, immediate = false): void {
+  if (
+    reconnectTimer
+    || connected()
+    || !isUiSessionEpochCurrent(expectedEpoch)
+  ) return;
+
+  const delay = immediate
+    ? 0
+    : RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+  if (!immediate) reconnectAttempt += 1;
+  setReconnecting(true);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (connected() || !isUiSessionEpochCurrent(expectedEpoch)) {
+      setReconnecting(false);
+      return;
+    }
+    void appStore.connectToServer().catch((error) => {
+      if (!(error instanceof StaleUiSessionError)) {
+        console.warn("secure reconnect failed:", error);
+      }
+    });
+  }, delay);
+}
 
 const setScreen: typeof setScreenRaw = ((value: Parameters<typeof setScreenRaw>[0]) => {
   const next = typeof value === "function" ? value(screen()) : value;
@@ -268,6 +345,8 @@ async function serializeConnectionAttempt(start: () => Promise<string>): Promise
 }
 
 function clearSensitiveUi(): void {
+  cancelReconnectTimer(true);
+  setReconnecting(false);
   uiSessionEpoch += 1;
   uiSessionActive = false;
   setScreen("locked");
@@ -276,11 +355,16 @@ function clearSensitiveUi(): void {
   setConnected(false);
   setConversations([]);
   setMessages([]);
+  rejectedOutgoingMessageIds.clear();
+  acknowledgedOutgoingMessageIds.clear();
+  discardedOutgoingMessageIds.clear();
+  messageLoadGenerations.clear();
   setActiveConversationId(null);
   setServers([]);
   setActiveServerId(null);
   setChannelsByServer({});
   setActiveChannelId(null);
+  setSenderKeyStatus({});
   setServerMembers({});
   setServerRoles({});
   setServerSettingsId(null);
@@ -374,6 +458,7 @@ export const appStore = {
   isSidebarCollapsed,
   setSidebarCollapsed,
   connected,
+  reconnecting,
   serverUrl,
   serverHttpUrl,
   setServerEndpoints,
@@ -384,6 +469,7 @@ export const appStore = {
   channelsByServer,
   activeChannelId,
   setActiveChannelId,
+  senderKeyStatus,
   serverMembers,
   serverRoles,
   serverSettingsId,
@@ -397,22 +483,24 @@ export const appStore = {
     const id = activeConversationId();
     if (!id) return null;
     const real = conversations().find((c) => c.id === id);
-    if (real) return real;
-    // Virtual conversation backed by an active text channel — keeps ChatIsland working
-    // before the channel beats its way into the conversations list (Phase E).
+    // An active server channel is an explicit security/UI kind even if its
+    // backing conversation has also arrived through the generic DB list.
     const sid = activeServerId();
     const cid = activeChannelId();
     if (sid && cid) {
       const ch = (channelsByServer()[sid] ?? []).find((c) => c.id === cid && c.conversationId === id);
       if (ch) {
         return {
+          ...real,
           id,
+          type: "channel",
           name: `# ${ch.name}`,
-          unreadCount: 0,
+          unreadCount: real?.unreadCount ?? 0,
           online: false,
-        } as Conversation;
+        } satisfies Conversation;
       }
     }
+    if (real) return real;
     return null;
   },
 
@@ -422,6 +510,29 @@ export const appStore = {
     setActiveServerId(null);
     setActiveChannelId(null);
     setActiveConversationId(id);
+  },
+
+  resolveChannelContext: async (conversationId: string): Promise<{ serverId: string; channelId: string } | null> => {
+    const findLoaded = () => {
+      for (const [serverId, channels] of Object.entries(channelsByServer())) {
+        const channel = channels.find((candidate) => candidate.conversationId === conversationId);
+        if (channel) return { serverId, channelId: channel.id };
+      }
+      return null;
+    };
+    const loaded = findLoaded();
+    if (loaded) return loaded;
+
+    // Search can return a channel whose server has not been opened in this
+    // renderer session. Use one read-only native lookup: replacing live
+    // channel lists with an older cache here would be a navigation race.
+    const sessionEpoch = captureUiSessionEpoch();
+    const context = await invoke<{ serverId: string; channelId: string } | null>(
+      "resolve_cached_channel_context",
+      { conversationId },
+    );
+    requireCurrentUiSession(sessionEpoch);
+    return context;
   },
 
   addMessage: (msg: Message) => {
@@ -440,6 +551,12 @@ export const appStore = {
   /** Connect to Veil gateway and start listening for events. */
   connectToServer: () => serializeConnectionAttempt(async () => {
     const sessionEpoch = captureUiSessionEpoch();
+    cancelReconnectTimer();
+    // Native connect replaces the transport and pauses offline dispatch. Keep
+    // the renderer honest throughout that transition instead of showing a
+    // stale Online state while sends are intentionally unavailable.
+    setConnected(false);
+    setReconnecting(true);
     try {
       const uid = await invoke<string>("connect_to_server", {
         serverUrl: serverUrl(),
@@ -452,6 +569,8 @@ export const appStore = {
       await invoke("upload_prekeys", { serverHttpUrl: serverHttpUrl() });
       requireCurrentUiSession(sessionEpoch);
       setConnected(true);
+      setReconnecting(false);
+      reconnectAttempt = 0;
       // Native connect completes authenticated keyset backlog sync before the
       // live event dispatcher starts. Refresh the Solid store from SQLCipher
       // once, avoiding per-message replay/duplicate UI events.
@@ -481,9 +600,18 @@ export const appStore = {
       console.error("connect failed:", e);
       setConnected(false);
       setUserId(null);
+      setReconnecting(true);
+      // Let serializeConnectionAttempt clear the rejected shared promise
+      // before the next attempt enters it.
+      setTimeout(() => scheduleReconnect(sessionEpoch), 0);
       throw e;
     }
   }),
+
+  ensureConnected: () => {
+    if (connected() || !acceptsSensitiveEvent()) return;
+    scheduleReconnect(captureUiSessionEpoch(), true);
+  },
 
   /** Send a text message to the active conversation. */
   sendMessage: async (text: string, replyToId?: string) => {
@@ -492,9 +620,11 @@ export const appStore = {
     if (!convId) return;
     try {
       const conversation = appStore.activeConversation();
-      if (conversation?.type === "group" && !activeServerId()) {
-        // Legacy groups have no reliable membership-change push event. Ask the
-        // native layer to fetch and authorize the current directory before send.
+      if (conversation?.type === "group" || conversation?.type === "channel") {
+        // Revalidate the exact permission-filtered roster before every group or
+        // server-channel send. The native command is a no-op when the current
+        // generation is already distributed, and creates/distributes a fresh
+        // generation when rotation is required.
         await appStore.distributeSenderKey(convId);
         requireCurrentUiSession(sessionEpoch);
       }
@@ -515,12 +645,44 @@ export const appStore = {
     } catch (e) {
       rethrowIfStale(e);
       console.error("send failed:", e);
+      // Failures after the durable insert are represented by a Failed row;
+      // refresh it before returning control to the composer. Failures before
+      // insertion simply leave the existing timeline unchanged.
+      await appStore.loadMessages(convId);
+      throw e;
+    }
+  },
+
+  discardFailedMessage: async (localMessageId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const existing = messages().find((message) => message.id === localMessageId);
+    const conversationId = existing?.conversationId;
+    discardedOutgoingMessageIds.add(localMessageId);
+    if (conversationId) nextMessageLoadGeneration(conversationId);
+    try {
+      await invoke("discard_failed_outgoing_message", { localMessageId });
+      requireCurrentUiSession(sessionEpoch);
+      rejectedOutgoingMessageIds.delete(localMessageId);
+      acknowledgedOutgoingMessageIds.delete(localMessageId);
+      const remaining = messages().filter((message) => message.id !== localMessageId);
+      setMessages(remaining);
+      if (conversationId) {
+        nextMessageLoadGeneration(conversationId);
+        updateConversationPreview(conversationId, remaining);
+      }
+      discardedOutgoingMessageIds.delete(localMessageId);
+    } catch (error) {
+      discardedOutgoingMessageIds.delete(localMessageId);
+      if (conversationId && isUiSessionEpochCurrent(sessionEpoch)) {
+        await appStore.loadMessages(conversationId);
+      }
+      throw error;
     }
   },
 
   editMessage: async (messageId: string, newText: string) => {
     const convId = activeConversationId();
-    if (!convId || messages().some((message) => message.id === messageId && message.pending)) return;
+    if (!convId || messages().some((message) => message.id === messageId && (message.pending || message.failed || message.deliveryUnknown))) return;
     try {
       await invoke("edit_message", { messageId, conversationId: convId, newText });
     } catch (e) {
@@ -530,7 +692,7 @@ export const appStore = {
 
   deleteMessage: async (messageId: string) => {
     const convId = activeConversationId();
-    if (!convId || messages().some((message) => message.id === messageId && message.pending)) return;
+    if (!convId || messages().some((message) => message.id === messageId && (message.pending || message.failed || message.deliveryUnknown))) return;
     try {
       await invoke("delete_message", { messageId, conversationId: convId });
     } catch (e) {
@@ -564,7 +726,9 @@ export const appStore = {
   toggleReaction: async (messageId: string, emoji: string) => {
     const convId = activeConversationId();
     const uid = userId();
-    if (!convId || !uid || messages().some((message) => message.id === messageId && message.pending)) return;
+    if (!convId || !uid || messages().some((message) =>
+      message.id === messageId && (message.pending || message.failed || message.deliveryUnknown)
+    )) return;
 
     // Check if we already reacted with this emoji
     const msgReactions = reactions()[messageId] ?? {};
@@ -684,10 +848,12 @@ export const appStore = {
   },
 
   /** Create a DM conversation with a peer (by their user_id). */
-  createDm: async (peerUserId: string, peerName?: string): Promise<string | null> => {
+  createDm: async (peerUserId: string, peerName?: string): Promise<string> => {
     const sessionEpoch = captureUiSessionEpoch();
     const ourId = userId();
-    if (!ourId) return null;
+    if (!ourId || !connected()) {
+      throw new Error("Connect to the Veil server before creating an encrypted conversation");
+    }
     try {
       const convId = await invoke<string>("create_dm", {
         serverHttpUrl: serverHttpUrl(),
@@ -713,7 +879,7 @@ export const appStore = {
     } catch (e) {
       rethrowIfStale(e);
       console.error("create DM failed:", e);
-      return null;
+      throw e;
     }
   },
 
@@ -736,7 +902,12 @@ export const appStore = {
     const ok = await invoke<boolean>("verify_pin", { pin });
     if (ok) {
       // Native PIN verification has already initialized the identity and
-      // SQLCipher database atomically; only non-secret UI/network work remains.
+      // SQLCipher database atomically. It also replaces the native VeilClient,
+      // so renderer transport state from a hot reload must never be trusted.
+      cancelReconnectTimer(true);
+      setConnected(false);
+      setReconnecting(false);
+      setUserId(null);
       const key = await invoke<string>("get_identity_key");
       if (!activateUiSession(unlockAttemptEpoch)) return false;
       setIdentity(key);
@@ -746,9 +917,10 @@ export const appStore = {
         await appStore.loadConversations();
         if (!isUiSessionEpochCurrent(unlockedEpoch)) return;
         appStore.startAutoLock();
-        if (!connected()) {
-          appStore.connectToServer().catch((e) => console.warn("secure connect failed:", e));
-        }
+        // Always reconcile transport state: verify_pin created a fresh native
+        // client even when a stale Solid signal claimed the old socket was live.
+        // ensureConnected coalesces with the chat-screen reconnect effect.
+        appStore.ensureConnected();
         // First-launch backfill of the local search index. Idempotent: backend
         // marks itself "done" and no-ops on subsequent launches.
         invoke<number>("ensure_search_backfill")
@@ -870,23 +1042,36 @@ export const appStore = {
   /** Load persisted messages for a conversation. */
   loadMessages: async (conversationId: string) => {
     const sessionEpoch = captureUiSessionEpoch();
+    const generation = nextMessageLoadGeneration(conversationId);
     try {
-      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; pending: boolean; timestamp: number; createdAt: string; replyToId?: string }>>(
+      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; pending: boolean; failed: boolean; deliveryUnknown: boolean; timestamp: number; createdAt: string; replyToId?: string }>>(
         "get_messages",
         { conversationId },
       );
       requireCurrentUiSession(sessionEpoch);
-      const loaded: Message[] = msgs.map(m => ({
-        id: m.id,
+      if (messageLoadGenerations.get(conversationId) !== generation) return;
+      const loaded: Message[] = msgs
+        .filter((message) => !discardedOutgoingMessageIds.has(message.id))
+        .map(m => {
+        const acknowledgedId = acknowledgedOutgoingMessageIds.get(m.id);
+        const rejected = rejectedOutgoingMessageIds.has(m.id);
+        return {
+        id: acknowledgedId ?? m.id,
         conversationId: m.conversationId,
         senderName: m.isOwn ? "You" : m.senderKey.slice(0, 8),
         senderKey: m.senderKey,
         text: m.text,
         timestamp: m.timestamp || new Date(m.createdAt).getTime(),
         isOwn: m.isOwn,
-        pending: m.pending,
-        replyToId: m.replyToId ?? undefined,
-      }));
+        pending: !acknowledgedId && !rejected && m.pending,
+        failed: !acknowledgedId && (m.failed || rejected),
+        deliveryUnknown: !acknowledgedId && !rejected && m.deliveryUnknown,
+        replyToId: m.replyToId
+          ? acknowledgedOutgoingMessageIds.get(m.replyToId) ?? m.replyToId
+          : undefined,
+      };
+      });
+      let merged: Message[] = [];
       setMessages(prev => {
         const loadedIds = new Set(loaded.map(m => m.id));
         // Keep messages from OTHER conversations untouched. For the current
@@ -894,12 +1079,16 @@ export const appStore = {
         // don't duplicate, and prepend the DB-loaded list.
         const otherConvs = prev.filter(m => m.conversationId !== conversationId);
         const localOnly = prev.filter(
-          m => m.conversationId === conversationId && m.pending && !loadedIds.has(m.id),
+          m => m.conversationId === conversationId && m.pending &&
+            !discardedOutgoingMessageIds.has(m.id) && !loadedIds.has(m.id),
         );
-        return [...otherConvs, ...loaded, ...localOnly];
+        merged = [...otherConvs, ...loaded, ...localOnly];
+        return merged;
       });
+      updateConversationPreview(conversationId, merged);
     } catch (e) {
       if (e instanceof StaleUiSessionError) return;
+      if (messageLoadGenerations.get(conversationId) !== generation) return;
       console.error("loadMessages failed:", e);
     }
   },
@@ -929,40 +1118,31 @@ export const appStore = {
 
   // ─── Groups ─────────────────────────────────────────
 
-  /** Create a new group. Works offline (local) or online (server). */
+  /** Create a group only after the server confirms its authenticated roster. */
   createGroup: async (name: string): Promise<string | null> => {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
-    // If connected and have userId — create on server
-    if (uid && connected()) {
-      try {
-        const convId = await invoke<string>("create_group", {
-          serverHttpUrl: serverHttpUrl(),
-          userId: uid,
-          name,
-        });
-        requireCurrentUiSession(sessionEpoch);
-        setConversations((prev) => [
-          ...prev,
-          { id: convId, type: "group" as const, name, unreadCount: 0 },
-        ]);
-        setActiveConversationId(convId);
-        return convId;
-      } catch (e) {
-        rethrowIfStale(e);
-        console.error("createGroup (server) failed:", e);
-        // Fall through to local creation
-      }
+    if (!uid || !connected()) {
+      throw new Error("Connect to the Veil server before creating an encrypted group");
     }
-    requireCurrentUiSession(sessionEpoch);
-    // Offline / fallback: create locally with a temp UUID
-    const localId = crypto.randomUUID();
-    setConversations((prev) => [
-      ...prev,
-      { id: localId, type: "group" as const, name, unreadCount: 0 },
-    ]);
-    setActiveConversationId(localId);
-    return localId;
+    try {
+      const convId = await invoke<string>("create_group", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        name,
+      });
+      requireCurrentUiSession(sessionEpoch);
+      setConversations((prev) => [
+        ...prev,
+        { id: convId, type: "group" as const, name, unreadCount: 0 },
+      ]);
+      setActiveConversationId(convId);
+      return convId;
+    } catch (e) {
+      rethrowIfStale(e);
+      console.error("createGroup failed:", e);
+      throw e;
+    }
   },
 
   /** Add a member to a group. */
@@ -1033,12 +1213,18 @@ export const appStore = {
 
   // ─── Servers / Channels / Roles / Invites ────────
 
-  selectServer: (serverId: string | null) => {
+  selectServer: (serverId: string | null, autoSelect = true) => {
     if (!acceptsSensitiveEvent()) return;
     setActiveServerId(serverId);
     if (serverId) {
       // Auto-select first text channel of the server, if any
       const chans = channelsByServer()[serverId] ?? [];
+      if (!autoSelect) {
+        setActiveChannelId(null);
+        setActiveConversationId(null);
+        if (chans.length === 0) appStore.loadChannels(serverId);
+        return;
+      }
       const firstText = chans.find((c) => c.channelType === 0);
       if (firstText) {
         appStore.selectChannel(firstText.id);
@@ -1196,13 +1382,66 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const selfUserId = userId();
     if (!selfUserId) throw new Error("sender-key distribution requires an authenticated user");
+    setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "checking" }));
+    try {
+      await invoke<number>("distribute_sender_key", {
+        conversationId,
+        serverHttpUrl: serverHttpUrl(),
+        userId: selfUserId,
+      });
+      requireCurrentUiSession(sessionEpoch);
+      let status = await appStore.refreshSenderKeyStatus(conversationId);
+      requireCurrentUiSession(sessionEpoch);
 
-    await invoke<number>("distribute_sender_key", {
+      // Distribution fan-out completes before every recipient ACK arrives.
+      // Keep the original Send action pending for a short bounded window so a
+      // normal online group does not make the user click Send twice. No message
+      // is persisted or transmitted until native reports the generation ready.
+      const deadline = Date.now() + 8_000;
+      while (status === "checking" || status === "pending") {
+        if (Date.now() >= deadline) {
+          throw new Error(
+            "Sender-key acknowledgement is still pending; your draft was kept and sending remains blocked",
+          );
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 250));
+        requireCurrentUiSession(sessionEpoch);
+        status = await appStore.refreshSenderKeyStatus(conversationId);
+        requireCurrentUiSession(sessionEpoch);
+      }
+      if (status !== "ready") {
+        throw new Error("Sender-key distribution failed; sending remains blocked");
+      }
+    } catch (error) {
+      requireCurrentUiSession(sessionEpoch);
+      try {
+        // Whatever native reports after the failed distribution attempt is
+        // authoritative. In particular, a final ACK may have made it ready
+        // between the command error and this refresh.
+        const refreshed = await appStore.refreshSenderKeyStatus(conversationId);
+        requireCurrentUiSession(sessionEpoch);
+        if (refreshed === "checking") {
+          setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "error" }));
+        }
+      } catch (refreshError) {
+        rethrowIfStale(refreshError);
+        setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "error" }));
+      }
+      throw error;
+    }
+  },
+
+  refreshSenderKeyStatus: async (conversationId: string): Promise<SenderKeyStatus> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const status = await invoke<SenderKeyStatus>("sender_key_distribution_status", {
       conversationId,
-      serverHttpUrl: serverHttpUrl(),
-      userId: selfUserId,
     });
     requireCurrentUiSession(sessionEpoch);
+    const normalized: SenderKeyStatus = ["checking", "pending", "ready", "error"].includes(status)
+      ? status
+      : "error";
+    setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: normalized }));
+    return normalized;
   },
 
   loadServerRoles: async (serverId: string) => {
@@ -1729,6 +1968,11 @@ export const appStore = {
 
   /** Set up Tauri event listeners for incoming server events. */
   setupEventListeners: async () => {
+    // App.tsx is hot-reloaded during development. Registering another copy of
+    // every native listener on each remount multiplies reconnects and REST
+    // refreshes, so the store owns one listener set for its lifetime.
+    if (eventListenersInitialized) return;
+    eventListenersInitialized = true;
     await listen("veil://locked", () => {
       // Native expiry already destroyed key/DB state. Clear renderer plaintext
       // synchronously before any fallible keychain or IPC operation.
@@ -1753,6 +1997,7 @@ export const appStore = {
       (event) => {
         if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
+        nextMessageLoadGeneration(d.conversationId);
         const isOwn = d.senderKey === identity();
         appStore.addMessage({
           id: d.messageId,
@@ -1786,6 +2031,26 @@ export const appStore = {
     await listen<{ reason: string }>("veil://disconnected", () => {
       if (!acceptsSensitiveEvent()) return;
       setConnected(false);
+      setReconnecting(true);
+      const affectedConversations = new Set<string>();
+      let disconnectedSnapshot: Message[] = [];
+      setMessages((previous) => {
+        disconnectedSnapshot = previous.map((message) => {
+          if (!message.isOwn || !message.pending) return message;
+          affectedConversations.add(message.conversationId);
+          return { ...message, pending: false, deliveryUnknown: true };
+        });
+        return disconnectedSnapshot;
+      });
+      for (const conversationId of affectedConversations) {
+        nextMessageLoadGeneration(conversationId);
+        updateConversationPreview(conversationId, disconnectedSnapshot);
+      }
+      const selectedConversation = activeConversationId();
+      if (selectedConversation) {
+        void appStore.loadMessages(selectedConversation).catch(() => {});
+      }
+      scheduleReconnect(captureUiSessionEpoch());
     });
 
     await listen("veil://membership-refresh-required", () => {
@@ -1802,16 +2067,27 @@ export const appStore = {
       (event) => {
         if (!acceptsSensitiveEvent()) return;
         const { messageId, localMessageId } = event.payload;
+        const active = appStore.activeConversation();
+        if (active?.type === "group" || active?.type === "channel") {
+          void appStore.refreshSenderKeyStatus(active.id).catch(() => {});
+        }
         if (!localMessageId || localMessageId === messageId) return;
+        acknowledgedOutgoingMessageIds.set(localMessageId, messageId);
+        rejectedOutgoingMessageIds.delete(localMessageId);
 
         // The native client inserts an optimistic local UUID before the
         // gateway assigns the durable message UUID. Keep the UI, reply
         // references and reaction cache on the same identity as the DB.
+        let acknowledgedConversationId: string | undefined;
+        let acknowledgedSnapshot: Message[] = [];
         setMessages((prev) => {
           const hasLocal = prev.some((message) => message.id === localMessageId);
           if (!hasLocal) return prev;
+          acknowledgedConversationId = prev.find(
+            (message) => message.id === localMessageId,
+          )?.conversationId;
           const hasServer = prev.some((message) => message.id === messageId);
-          return prev
+          acknowledgedSnapshot = prev
             .filter((message) => !hasServer || message.id !== localMessageId)
             .map((message) => ({
               ...message,
@@ -1819,7 +2095,12 @@ export const appStore = {
               pending: message.id === localMessageId ? false : message.pending,
               replyToId: message.replyToId === localMessageId ? messageId : message.replyToId,
             }));
+          return acknowledgedSnapshot;
         });
+        if (acknowledgedConversationId) {
+          nextMessageLoadGeneration(acknowledgedConversationId);
+          updateConversationPreview(acknowledgedConversationId, acknowledgedSnapshot);
+        }
 
         setReactions((prev) => {
           const local = prev[localMessageId];
@@ -1828,6 +2109,10 @@ export const appStore = {
           delete copy[localMessageId];
           return copy;
         });
+        const activeConversation = activeConversationId();
+        if (activeConversation) {
+          void appStore.loadMessages(activeConversation).catch(() => {});
+        }
       },
     );
 
@@ -1836,9 +2121,22 @@ export const appStore = {
       (event) => {
         if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
-        setMessages((prev) =>
-          prev.map((m) => (m.id === d.messageId ? { ...m, text: d.newText } : m))
-        );
+        nextMessageLoadGeneration(d.conversationId);
+        let editedSnapshot: Message[] = [];
+        let editedLocally = false;
+        setMessages((prev) => {
+          editedSnapshot = prev.map((m) => {
+            if (m.id !== d.messageId) return m;
+            editedLocally = true;
+            return { ...m, text: d.newText };
+          });
+          return editedSnapshot;
+        });
+        if (editedLocally) {
+          updateConversationPreview(d.conversationId, editedSnapshot);
+        } else if (activeConversationId() === d.conversationId) {
+          void appStore.loadMessages(d.conversationId).catch(() => {});
+        }
       },
     );
 
@@ -1847,7 +2145,19 @@ export const appStore = {
       (event) => {
         if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
-        setMessages((prev) => prev.filter((m) => m.id !== d.messageId));
+        nextMessageLoadGeneration(d.conversationId);
+        let remainingSnapshot: Message[] = [];
+        let deletedLocally = false;
+        setMessages((prev) => {
+          deletedLocally = prev.some((m) => m.id === d.messageId);
+          remainingSnapshot = prev.filter((m) => m.id !== d.messageId);
+          return remainingSnapshot;
+        });
+        if (deletedLocally) {
+          updateConversationPreview(d.conversationId, remainingSnapshot);
+        } else if (activeConversationId() === d.conversationId) {
+          void appStore.loadMessages(d.conversationId).catch(() => {});
+        }
       },
     );
 
@@ -1892,15 +2202,32 @@ export const appStore = {
     await listen<{ code: number; message: string; localMessageId?: string | null }>("veil://error", (event) => {
       if (!acceptsSensitiveEvent()) return;
       console.error("server error:", event.payload);
+      const active = appStore.activeConversation();
+      if (active?.type === "group" || active?.type === "channel") {
+        void appStore.refreshSenderKeyStatus(active.id).catch(() => {});
+      }
       const localMessageId = event.payload.localMessageId;
       if (localMessageId) {
-        setMessages((prev) => prev.filter((message) => message.id !== localMessageId));
-        setReactions((prev) => {
-          if (!prev[localMessageId]) return prev;
-          const copy = { ...prev };
-          delete copy[localMessageId];
-          return copy;
+        rejectedOutgoingMessageIds.add(localMessageId);
+        let found = false;
+        let failedConversationId: string | undefined;
+        let nextMessages: Message[] = [];
+        setMessages((previous) => {
+          nextMessages = previous.map((message) => {
+          if (message.id !== localMessageId) return message;
+          found = true;
+          failedConversationId = message.conversationId;
+          return { ...message, pending: false, failed: true, deliveryUnknown: false };
+          });
+          return nextMessages;
         });
+        if (failedConversationId) {
+          nextMessageLoadGeneration(failedConversationId);
+          updateConversationPreview(failedConversationId, nextMessages);
+        }
+        if (!found && activeConversationId()) {
+          void appStore.loadMessages(activeConversationId()!).catch(() => {});
+        }
       }
     });
 
@@ -2115,7 +2442,9 @@ export const appStore = {
             canonicalUuid.test(addUserId) &&
             window.confirm(`Start an encrypted conversation with user ${addUserId}?`)
           ) {
-            void appStore.createDm(addUserId);
+            void appStore.createDm(addUserId).catch((error) => {
+              console.warn("deep-link DM creation failed:", error);
+            });
           }
           // veil://share/{id} — future
         } catch {

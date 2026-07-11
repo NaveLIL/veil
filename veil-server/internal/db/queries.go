@@ -1,20 +1,26 @@
 package db
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 )
 
 var (
-	ErrStaleSenderKeyGeneration  = errors.New("stale sender key generation")
-	ErrSenderKeyConversationType = errors.New("sender keys require a group or channel conversation")
-	ErrReplyTargetMismatch       = errors.New("reply target does not belong to conversation")
-	ErrMessageMutationScope      = errors.New("message mutation scope mismatch")
-	ErrAttachmentScope           = errors.New("attachment is unavailable or not owned by sender")
+	ErrStaleSenderKeyGeneration    = errors.New("stale sender key generation")
+	ErrSenderKeyGenerationConflict = errors.New("sender key generation already has a different commitment")
+	ErrSenderKeyConversationType   = errors.New("sender keys require a group or channel conversation")
+	ErrSenderKeyReceiptMismatch    = errors.New("sender key receipt does not match an exact pending device distribution")
+	ErrReplyTargetMismatch         = errors.New("reply target does not belong to conversation")
+	ErrMessageMutationScope        = errors.New("message mutation scope mismatch")
+	ErrAttachmentScope             = errors.New("attachment is unavailable or not owned by sender")
 )
 
 const maxUnusedOneTimePreKeysPerDevice = 100
@@ -458,92 +464,89 @@ type ConversationDiscovery struct {
 }
 
 // ListUserConversations returns a keyset page of conversations belonging to
-// userID.  The initial membership filter is inside the CTE, so rows from a
-// different user's conversations can never enter the result before member
-// directory expansion.
+// userID. Channel candidates and their member directories are passed through
+// the same overwrite-aware ACL used by sync, live fan-out and sender keys.
 func (db *DB) ListUserConversations(ctx context.Context, userID string, after time.Time, afterID string, limit int) ([]ConversationDiscovery, error) {
-	predicate := ""
-	args := []any{userID, int64(PermAdministrator), int64(ChannelReadPermissions), limit}
-	limitPlaceholder := "$4"
-	if afterID != "" {
-		predicate = `AND (c.created_at, c.id) > ($4, $5::uuid)`
-		args = []any{userID, int64(PermAdministrator), int64(ChannelReadPermissions), after, afterID, limit}
-		limitPlaceholder = "$6"
+	if limit <= 0 {
+		return []ConversationDiscovery{}, nil
+	}
+	batchSize := limit * 2
+	if batchSize < 32 {
+		batchSize = 32
 	}
 
-	rows, err := db.Pool.Query(ctx,
-		`WITH effective_permissions AS (
-		   SELECT server_member.server_id, server_member.user_id,
-		          CASE WHEN server.owner_id = server_member.user_id THEN $2::bigint
-		               ELSE COALESCE(BIT_OR(role.permissions), 0) END AS permissions
-		   FROM server_members server_member
-		   JOIN servers server ON server.id = server_member.server_id AND server.deleted_at IS NULL
-		   LEFT JOIN roles role
-		     ON role.server_id = server.id
-		    AND (role.is_default = TRUE OR EXISTS (
-		      SELECT 1 FROM member_roles assignment
-		      WHERE assignment.server_id = server.id
-		        AND assignment.user_id = server_member.user_id
-		        AND assignment.role_id = role.id
-		    ))
-		   GROUP BY server_member.server_id, server_member.user_id, server.owner_id
-		 ), selected AS (
-		   SELECT c.id, c.conv_type, c.name, c.server_id, c.created_at
-		   FROM conversation_members mine
-		   JOIN conversations c ON c.id = mine.conversation_id
-		   LEFT JOIN effective_permissions mine_access
-		     ON mine_access.server_id = c.server_id AND mine_access.user_id = mine.user_id
-		   WHERE mine.user_id = $1::uuid
-		     AND (c.conv_type <> 2 OR (
-		       (mine_access.permissions & $2::bigint) <> 0
-		       OR (mine_access.permissions & $3::bigint) = $3::bigint
-		     )) `+predicate+`
-		   ORDER BY c.created_at ASC, c.id ASC
-		   LIMIT `+limitPlaceholder+`
-		 )
-		 SELECT selected.id, selected.conv_type, selected.name, selected.server_id, selected.created_at,
-		        u.id, u.username, u.identity_key, u.signing_key, member.role, member.joined_at
-		 FROM selected
-		 JOIN conversation_members member ON member.conversation_id = selected.id
-		 JOIN users u ON u.id = member.user_id
-		 LEFT JOIN effective_permissions member_access
-		   ON member_access.server_id = selected.server_id AND member_access.user_id = member.user_id
-		 WHERE selected.conv_type <> 2 OR (
-		   (member_access.permissions & $2::bigint) <> 0
-		   OR (member_access.permissions & $3::bigint) = $3::bigint
-		 )
-		 ORDER BY selected.created_at ASC, selected.id ASC, member.role DESC, member.joined_at ASC, u.id ASC`,
-		args...,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
+	conversations := make([]ConversationDiscovery, 0, limit)
+	scanAfter, scanAfterID := after, afterID
+	for len(conversations) < limit {
+		predicate := ""
+		args := []any{userID, batchSize}
+		limitPlaceholder := "$2"
+		if scanAfterID != "" {
+			predicate = `AND (conversation.created_at, conversation.id) > ($2, $3::uuid)`
+			args = []any{userID, scanAfter, scanAfterID, batchSize}
+			limitPlaceholder = "$4"
+		}
 
-	var conversations []ConversationDiscovery
-	for rows.Next() {
-		var (
-			conversation ConversationDiscovery
-			member       ConversationMemberBinding
+		rows, err := db.Pool.Query(ctx,
+			`SELECT conversation.id, conversation.conv_type, conversation.name,
+			        conversation.server_id, conversation.created_at
+			 FROM conversation_members mine
+			 JOIN conversations conversation ON conversation.id = mine.conversation_id
+			 WHERE mine.user_id = $1::uuid `+predicate+`
+			 ORDER BY conversation.created_at ASC, conversation.id ASC
+			 LIMIT `+limitPlaceholder,
+			args...,
 		)
-		if err := rows.Scan(
-			&conversation.ID, &conversation.ConvType, &conversation.Name,
-			&conversation.ServerID, &conversation.CreatedAt,
-			&member.UserID, &member.Username, &member.IdentityKey,
-			&member.SigningKey, &member.Role, &member.JoinedAt,
-		); err != nil {
+		if err != nil {
 			return nil, err
 		}
 
-		last := len(conversations) - 1
-		if last < 0 || conversations[last].ID != conversation.ID {
-			conversation.Members = []ConversationMemberBinding{member}
-			conversations = append(conversations, conversation)
-		} else {
-			conversations[last].Members = append(conversations[last].Members, member)
+		candidates := make([]ConversationDiscovery, 0, batchSize)
+		for rows.Next() {
+			var candidate ConversationDiscovery
+			if err := rows.Scan(
+				&candidate.ID, &candidate.ConvType, &candidate.Name,
+				&candidate.ServerID, &candidate.CreatedAt,
+			); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			candidates = append(candidates, candidate)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		rows.Close()
+		if len(candidates) == 0 {
+			break
+		}
+
+		for _, candidate := range candidates {
+			scanAfter, scanAfterID = candidate.CreatedAt, candidate.ID
+			allowed, err := db.CanAccessConversation(ctx, candidate.ID, userID, ChannelReadPermissions)
+			if err != nil {
+				return nil, err
+			}
+			if !allowed {
+				continue
+			}
+			candidate.Members, err = db.GetAuthorizedConversationMemberBindings(
+				ctx, candidate.ID, ChannelReadPermissions,
+			)
+			if err != nil {
+				return nil, err
+			}
+			conversations = append(conversations, candidate)
+			if len(conversations) == limit {
+				break
+			}
+		}
+		if len(candidates) < batchSize {
+			break
 		}
 	}
-	return conversations, rows.Err()
+	return conversations, nil
 }
 
 // FindOrCreateDM finds an existing DM conversation between two users, or
@@ -823,14 +826,74 @@ func (db *DB) StoreSenderKey(ctx context.Context, convID, ownerDeviceID, targetD
 	return db.StoreSenderKeys(ctx, convID, ownerDeviceID, []string{targetDeviceID}, encryptedKey, generation)
 }
 
-// StoreSenderKeys atomically persists the latest authenticated distribution
-// for every target device. Older generations can never rewind durable state;
-// equal generations are idempotent and may refresh the sealed envelope.
+type senderKeyWrite struct {
+	targetDeviceID       string
+	encryptedKey         []byte
+	rosterVersion        uint64
+	rosterCommitment     []byte
+	ownerBindingVersion  uint64
+	targetBindingVersion uint64
+	deviceRouted         bool
+}
+
+const senderKeyDeviceRouteDomainV1 = "veil-sender-key-device-route-v1\x00"
+
+func senderKeyDeviceRouteCommitment(envelopeCommitment [32]byte, write senderKeyWrite) [32]byte {
+	message := make([]byte, 0, len(senderKeyDeviceRouteDomainV1)+32+8+32+8+8)
+	message = append(message, senderKeyDeviceRouteDomainV1...)
+	message = append(message, envelopeCommitment[:]...)
+	var integer [8]byte
+	binary.BigEndian.PutUint64(integer[:], write.rosterVersion)
+	message = append(message, integer[:]...)
+	message = append(message, write.rosterCommitment...)
+	binary.BigEndian.PutUint64(integer[:], write.ownerBindingVersion)
+	message = append(message, integer[:]...)
+	binary.BigEndian.PutUint64(integer[:], write.targetBindingVersion)
+	message = append(message, integer[:]...)
+	return sha256.Sum256(message)
+}
+
+// StoreDeviceSenderKey appends one independently encrypted SKDM for one exact
+// eligible device and binds the retained row to the roster and both immutable
+// binding versions that authorized it.
+func (db *DB) StoreDeviceSenderKey(ctx context.Context, convID, ownerDeviceID, targetDeviceID string, encryptedKey []byte, generation uint32, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion uint64) error {
+	if rosterVersion == 0 || rosterVersion > math.MaxInt64 || len(rosterCommitment) != 32 ||
+		ownerBindingVersion == 0 || ownerBindingVersion > math.MaxInt64 ||
+		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 {
+		return errors.New("invalid sender key device route")
+	}
+	return db.storeSenderKeyWrites(ctx, convID, ownerDeviceID, generation, []senderKeyWrite{{
+		targetDeviceID:       targetDeviceID,
+		encryptedKey:         append([]byte(nil), encryptedKey...),
+		rosterVersion:        rosterVersion,
+		rosterCommitment:     append([]byte(nil), rosterCommitment...),
+		ownerBindingVersion:  ownerBindingVersion,
+		targetBindingVersion: targetBindingVersion,
+		deviceRouted:         true,
+	}})
+}
+
+// StoreSenderKeys atomically appends an authenticated distribution for every
+// target device. All unacknowledged generations remain retained for offline
+// delivery. A stream's high-water mark prevents rollback, and the first
+// envelope accepted for a generation is immutable: an equal-generation retry
+// succeeds only when both its commitment and bytes are exactly identical.
 func (db *DB) StoreSenderKeys(ctx context.Context, convID, ownerDeviceID string, targetDeviceIDs []string, encryptedKey []byte, generation uint32) error {
 	if len(targetDeviceIDs) == 0 {
 		return errors.New("at least one target device required")
 	}
-	if generation == 0 || len(encryptedKey) == 0 || len(encryptedKey) > 4*1024 {
+	writes := make([]senderKeyWrite, 0, len(targetDeviceIDs))
+	for _, targetDeviceID := range targetDeviceIDs {
+		writes = append(writes, senderKeyWrite{
+			targetDeviceID: targetDeviceID,
+			encryptedKey:   append([]byte(nil), encryptedKey...),
+		})
+	}
+	return db.storeSenderKeyWrites(ctx, convID, ownerDeviceID, generation, writes)
+}
+
+func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID string, generation uint32, writes []senderKeyWrite) error {
+	if convID == "" || ownerDeviceID == "" || len(writes) == 0 || generation == 0 {
 		return errors.New("invalid sender key distribution")
 	}
 
@@ -841,48 +904,195 @@ func (db *DB) StoreSenderKeys(ctx context.Context, convID, ownerDeviceID string,
 	defer tx.Rollback(ctx)
 	var conversationType int16
 	if err := tx.QueryRow(ctx,
-		`SELECT conv_type FROM conversations WHERE id = $1::uuid`, convID,
+		`SELECT conv_type FROM conversations WHERE id = $1::uuid FOR UPDATE`, convID,
 	).Scan(&conversationType); err != nil {
 		return fmt.Errorf("lookup sender key conversation: %w", err)
 	}
 	if conversationType != 1 && conversationType != 2 {
 		return ErrSenderKeyConversationType
 	}
-
-	seen := make(map[string]struct{}, len(targetDeviceIDs))
-	for _, targetDeviceID := range targetDeviceIDs {
-		if targetDeviceID == "" {
+	seen := make(map[string]struct{}, len(writes))
+	for _, write := range writes {
+		targetDeviceID := write.targetDeviceID
+		if targetDeviceID == "" || len(write.encryptedKey) == 0 || len(write.encryptedKey) > 4*1024 {
 			return errors.New("target device id required")
+		}
+		if write.deviceRouted {
+			if write.rosterVersion == 0 || write.rosterVersion > math.MaxInt64 ||
+				len(write.rosterCommitment) != 32 || write.ownerBindingVersion == 0 ||
+				write.ownerBindingVersion > math.MaxInt64 || write.targetBindingVersion == 0 ||
+				write.targetBindingVersion > math.MaxInt64 {
+				return errors.New("invalid sender key device route")
+			}
+		} else if write.rosterVersion != 0 || len(write.rosterCommitment) != 0 ||
+			write.ownerBindingVersion != 0 || write.targetBindingVersion != 0 {
+			return errors.New("partial sender key device route")
 		}
 		if _, duplicate := seen[targetDeviceID]; duplicate {
 			continue
 		}
 		seen[targetDeviceID] = struct{}{}
+		envelopeCommitment := sha256.Sum256(write.encryptedKey)
+		headCommitment := envelopeCommitment
+		if write.deviceRouted {
+			headCommitment = senderKeyDeviceRouteCommitment(envelopeCommitment, write)
+		}
 
-		tag, err := tx.Exec(ctx,
-			`INSERT INTO sender_keys (conversation_id, owner_device_id, target_device_id, encrypted_key, generation)
-			 VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)
-			 ON CONFLICT (conversation_id, owner_device_id, target_device_id)
-			 DO UPDATE SET encrypted_key = EXCLUDED.encrypted_key,
-			               generation = EXCLUDED.generation
-			 WHERE sender_keys.generation <= EXCLUDED.generation`,
-			convID, ownerDeviceID, targetDeviceID, encryptedKey, int64(generation),
-		)
-		if err != nil {
+		var currentGeneration int64
+		var currentCommitment []byte
+		err := tx.QueryRow(ctx,
+			`SELECT max_generation, max_commitment
+			 FROM sender_key_heads
+			 WHERE conversation_id = $1::uuid
+			   AND owner_device_id = $2::uuid
+			   AND target_device_id = $3::uuid
+			 FOR UPDATE`,
+			convID, ownerDeviceID, targetDeviceID,
+		).Scan(&currentGeneration, &currentCommitment)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO sender_key_heads (
+				   conversation_id, owner_device_id, target_device_id,
+				   max_generation, max_commitment
+				 ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)`,
+				convID, ownerDeviceID, targetDeviceID, int64(generation), headCommitment[:],
+			); err != nil {
+				return fmt.Errorf("create sender key head for device %s: %w", targetDeviceID, err)
+			}
+		case err != nil:
+			return fmt.Errorf("lookup sender key head for device %s: %w", targetDeviceID, err)
+		case int64(generation) < currentGeneration:
+			return ErrStaleSenderKeyGeneration
+		case int64(generation) == currentGeneration:
+			if !bytes.Equal(currentCommitment, headCommitment[:]) {
+				return ErrSenderKeyGenerationConflict
+			}
+			var retainedKey, retainedCommitment, retainedRosterCommitment []byte
+			var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion int64
+			err := tx.QueryRow(ctx,
+				`SELECT encrypted_key, envelope_commitment,
+				        COALESCE(roster_version, 0), COALESCE(roster_commitment, ''::bytea),
+				        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0)
+				 FROM sender_keys
+				 WHERE conversation_id = $1::uuid
+				   AND owner_device_id = $2::uuid
+				   AND target_device_id = $3::uuid
+				   AND generation = $4`,
+				convID, ownerDeviceID, targetDeviceID, int64(generation),
+			).Scan(&retainedKey, &retainedCommitment, &retainedRosterVersion,
+				&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion)
+			if errors.Is(err, pgx.ErrNoRows) {
+				// The row was explicitly collected after its stream head was
+				// committed. An exact retry remains idempotent but must not
+				// resurrect control state already acknowledged or expired.
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("verify sender key for device %s: %w", targetDeviceID, err)
+			}
+			if !senderKeyWriteMatches(write, retainedKey, retainedCommitment,
+				retainedRosterVersion, retainedRosterCommitment,
+				retainedOwnerBindingVersion, retainedTargetBindingVersion) {
+				return ErrSenderKeyGenerationConflict
+			}
+			continue
+		default:
+			if _, err := tx.Exec(ctx,
+				`UPDATE sender_key_heads
+				 SET max_generation = $4, max_commitment = $5, updated_at = now()
+				 WHERE conversation_id = $1::uuid
+				   AND owner_device_id = $2::uuid
+				   AND target_device_id = $3::uuid`,
+				convID, ownerDeviceID, targetDeviceID, int64(generation), headCommitment[:],
+			); err != nil {
+				return fmt.Errorf("advance sender key head for device %s: %w", targetDeviceID, err)
+			}
+		}
+
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO sender_keys (
+			   conversation_id, owner_device_id, target_device_id,
+			   encrypted_key, generation, envelope_commitment, roster_version,
+			   roster_commitment, owner_binding_version, target_binding_version
+			 ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10)
+			 ON CONFLICT (conversation_id, owner_device_id, target_device_id, generation)
+			 DO NOTHING`,
+			convID, ownerDeviceID, targetDeviceID, write.encryptedKey, int64(generation),
+			envelopeCommitment[:], nullableSenderKeyRoute(write.rosterVersion, write.deviceRouted),
+			nullableSenderKeyBytes(write.rosterCommitment, write.deviceRouted),
+			nullableSenderKeyRoute(write.ownerBindingVersion, write.deviceRouted),
+			nullableSenderKeyRoute(write.targetBindingVersion, write.deviceRouted),
+		); err != nil {
 			return fmt.Errorf("store sender key for device %s: %w", targetDeviceID, err)
 		}
-		if tag.RowsAffected() == 0 {
-			return ErrStaleSenderKeyGeneration
+
+		// ON CONFLICT is intentionally non-mutating. Verify the retained row so
+		// an inconsistent legacy row, or even a theoretical commitment collision,
+		// cannot make a generation replace authenticated state.
+		var retainedKey, retainedCommitment, retainedRosterCommitment []byte
+		var retainedRosterVersion, retainedOwnerBindingVersion, retainedTargetBindingVersion int64
+		if err := tx.QueryRow(ctx,
+			`SELECT encrypted_key, envelope_commitment,
+			        COALESCE(roster_version, 0), COALESCE(roster_commitment, ''::bytea),
+			        COALESCE(owner_binding_version, 0), COALESCE(target_binding_version, 0)
+			 FROM sender_keys
+			 WHERE conversation_id = $1::uuid
+			   AND owner_device_id = $2::uuid
+			   AND target_device_id = $3::uuid
+			   AND generation = $4`,
+			convID, ownerDeviceID, targetDeviceID, int64(generation),
+		).Scan(&retainedKey, &retainedCommitment, &retainedRosterVersion,
+			&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion); err != nil {
+			return fmt.Errorf("verify sender key for device %s: %w", targetDeviceID, err)
+		}
+		if !senderKeyWriteMatches(write, retainedKey, retainedCommitment,
+			retainedRosterVersion, retainedRosterCommitment,
+			retainedOwnerBindingVersion, retainedTargetBindingVersion) {
+			return ErrSenderKeyGenerationConflict
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+func nullableSenderKeyRoute(value uint64, present bool) any {
+	if !present {
+		return nil
+	}
+	return int64(value)
+}
+
+func nullableSenderKeyBytes(value []byte, present bool) any {
+	if !present {
+		return nil
+	}
+	return value
+}
+
+func senderKeyWriteMatches(write senderKeyWrite, retainedKey, retainedCommitment []byte, rosterVersion int64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion int64) bool {
+	envelopeCommitment := sha256.Sum256(write.encryptedKey)
+	if !bytes.Equal(retainedKey, write.encryptedKey) ||
+		!bytes.Equal(retainedCommitment, envelopeCommitment[:]) {
+		return false
+	}
+	if !write.deviceRouted {
+		return rosterVersion == 0 && len(rosterCommitment) == 0 &&
+			ownerBindingVersion == 0 && targetBindingVersion == 0
+	}
+	return rosterVersion == int64(write.rosterVersion) &&
+		bytes.Equal(rosterCommitment, write.rosterCommitment) &&
+		ownerBindingVersion == int64(write.ownerBindingVersion) &&
+		targetBindingVersion == int64(write.targetBindingVersion)
 }
 
 // GetPendingSenderKeys returns sender keys addressed to a specific device.
 func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) ([]SenderKeyRow, error) {
 	rows, err := db.Pool.Query(ctx,
 		`SELECT sk.conversation_id, sk.owner_device_id, sk.target_device_id,
-		        target_device.user_id, sk.encrypted_key, sk.generation
+		        target_device.user_id, sk.encrypted_key, sk.generation,
+		        COALESCE(sk.roster_version, 0), COALESCE(sk.roster_commitment, ''::bytea),
+		        COALESCE(sk.owner_binding_version, 0), COALESCE(sk.target_binding_version, 0),
+		        sk.envelope_commitment
 		 FROM sender_keys sk
 		 JOIN conversations conversation ON conversation.id = sk.conversation_id AND conversation.conv_type IN (1, 2)
 		 JOIN devices target_device ON target_device.id = sk.target_device_id
@@ -894,7 +1104,7 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		   ON owner_member.conversation_id = sk.conversation_id
 		  AND owner_member.user_id = owner_device.user_id
 		 WHERE sk.target_device_id = $1::uuid
-		 ORDER BY sk.conversation_id, sk.owner_device_id`,
+		 ORDER BY sk.conversation_id, sk.owner_device_id, sk.generation`,
 		targetDeviceID,
 	)
 	if err != nil {
@@ -904,11 +1114,17 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 	var keys []SenderKeyRow
 	for rows.Next() {
 		var k SenderKeyRow
+		var rosterVersion, ownerBindingVersion, targetBindingVersion int64
 		if err := rows.Scan(&k.ConversationID, &k.OwnerDeviceID, &k.TargetDeviceID,
-			&k.TargetUserID, &k.EncryptedKey, &k.Generation); err != nil {
+			&k.TargetUserID, &k.EncryptedKey, &k.Generation, &rosterVersion,
+			&k.RosterCommitment, &ownerBindingVersion, &targetBindingVersion,
+			&k.EnvelopeCommitment); err != nil {
 			rows.Close()
 			return nil, err
 		}
+		k.RosterVersion = uint64(rosterVersion)
+		k.OwnerBindingVersion = uint64(ownerBindingVersion)
+		k.TargetBindingVersion = uint64(targetBindingVersion)
 		keys = append(keys, k)
 	}
 	if err := rows.Err(); err != nil {
@@ -931,12 +1147,46 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 }
 
 type SenderKeyRow struct {
-	ConversationID string
-	OwnerDeviceID  string
-	TargetDeviceID string
-	TargetUserID   string
-	EncryptedKey   []byte
-	Generation     uint32
+	ConversationID       string
+	OwnerDeviceID        string
+	TargetDeviceID       string
+	TargetUserID         string
+	EncryptedKey         []byte
+	Generation           uint32
+	RosterVersion        uint64
+	RosterCommitment     []byte
+	OwnerBindingVersion  uint64
+	TargetBindingVersion uint64
+	EnvelopeCommitment   []byte
+}
+
+// AcknowledgeSenderKey removes only the exact pending row installed by the
+// authenticated target device. The stream head is deliberately retained so a
+// replay cannot resurrect or replace an acknowledged generation.
+func (db *DB) AcknowledgeSenderKey(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte) error {
+	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
+		generation == 0 || rosterVersion == 0 || rosterVersion > math.MaxInt64 ||
+		len(envelopeCommitment) != 32 {
+		return ErrSenderKeyReceiptMismatch
+	}
+	tag, err := db.Pool.Exec(ctx,
+		`DELETE FROM sender_keys
+		 WHERE conversation_id = $1::uuid
+		   AND owner_device_id = $2::uuid
+		   AND target_device_id = $3::uuid
+		   AND generation = $4
+		   AND roster_version = $5
+		   AND envelope_commitment = $6`,
+		conversationID, ownerDeviceID, targetDeviceID, int64(generation),
+		int64(rosterVersion), envelopeCommitment,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrSenderKeyReceiptMismatch
+	}
+	return nil
 }
 
 // --- Reactions ---

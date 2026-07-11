@@ -11,4 +11,5 @@
 
 pub mod api;
 pub mod connection;
+mod device_identity;
 pub mod protocol;

@@ -23,6 +23,7 @@ import (
 	"github.com/AegisSec/veil-server/internal/chat"
 	"github.com/AegisSec/veil-server/internal/db"
 	"github.com/AegisSec/veil-server/internal/httpmw"
+	"github.com/AegisSec/veil-server/internal/logsafe"
 	"github.com/AegisSec/veil-server/internal/metrics"
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 )
@@ -162,8 +163,12 @@ type Client struct {
 	authenticated bool
 	userID        string
 	deviceID      string
+	deviceKey     []byte
 	username      string
 	identityKey   []byte
+	perDeviceSecure      bool
+	deviceBindingVersion uint64
+	deviceBindingStatus  db.DeviceBindingStatus
 
 	// Rate limiting
 	authAttempts int
@@ -175,6 +180,9 @@ type Hub struct {
 	clients map[*Client]bool
 	// Index: userID → set of clients (for message fan-out)
 	userClients map[string]map[*Client]bool
+	// Index: database device UUID → authenticated connections for only that
+	// exact cryptographic device.
+	deviceClients map[string]map[*Client]bool
 	// Index: client IP → live connection count (per-IP cap enforcement)
 	ipConns map[string]int
 	mu      sync.RWMutex
@@ -197,6 +205,7 @@ func NewHub(authSvc *auth.Service, chatSvc *chat.Service) *Hub {
 	return &Hub{
 		clients:     make(map[*Client]bool),
 		userClients: make(map[string]map[*Client]bool),
+		deviceClients: make(map[string]map[*Client]bool),
 		ipConns:     make(map[string]int),
 		register:    make(chan *Client),
 		unregister:  make(chan *Client),
@@ -267,6 +276,14 @@ func (h *Hub) Run() {
 						}
 					}
 				}
+				if client.deviceID != "" {
+					if dc, ok := h.deviceClients[client.deviceID]; ok {
+						delete(dc, client)
+						if len(dc) == 0 {
+							delete(h.deviceClients, client.deviceID)
+						}
+					}
+				}
 			}
 			n := len(h.clients)
 			h.mu.Unlock()
@@ -286,6 +303,13 @@ func (h *Hub) indexClient(client *Client) {
 		h.userClients[client.userID] = make(map[*Client]bool)
 	}
 	h.userClients[client.userID][client] = true
+	if h.deviceClients == nil {
+		h.deviceClients = make(map[string]map[*Client]bool)
+	}
+	if h.deviceClients[client.deviceID] == nil {
+		h.deviceClients[client.deviceID] = make(map[*Client]bool)
+	}
+	h.deviceClients[client.deviceID][client] = true
 	h.mu.Unlock()
 }
 
@@ -318,6 +342,22 @@ func (h *Hub) sendToUser(userID string, data []byte) {
 	h.enqueueToUser(userID, data)
 }
 
+// enqueueToDevice sends only to sessions authenticated as one exact database
+// device UUID. It deliberately does not fall back to the account index.
+func (h *Hub) enqueueToDevice(deviceID string, data []byte) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	clients := h.deviceClients[deviceID]
+	online := len(clients) > 0
+	for client := range clients {
+		select {
+		case client.send <- data:
+		default:
+		}
+	}
+	return online
+}
+
 // PushNotifier is the seam between the gateway and the push package
 // (UnifiedPush + ntfy delivery). It is invoked when the message-event
 // fan-out finds no live WebSocket session for a recipient. Wiring is
@@ -338,16 +378,16 @@ func (h *Hub) SetPushNotifier(n PushNotifier) { h.pushNotifier = n }
 // reconnect, so this method intentionally no-ops at the wire level
 // while keeping a structured log entry for observability.
 func (h *Hub) NotifyMLSWelcome(recipientUserID, conversationID, welcomeID string) {
-	log.Printf("mls: queued welcome user=%s conv=%s id=%s",
-		recipientUserID, conversationID, welcomeID)
+	log.Printf("mls: queued welcome user_ref=%s conv_ref=%s welcome_ref=%s",
+		logsafe.Ref("user", recipientUserID), logsafe.Ref("conversation", conversationID), logsafe.Ref("welcome", welcomeID))
 }
 
 // NotifyMLSCommit implements mls.Fanout. Same caveat as
 // NotifyMLSWelcome: clients fetch via GET /v1/mls/commits/{id}?after_epoch=N
 // on reconnect or after each accepted commit. Logged for ops visibility.
 func (h *Hub) NotifyMLSCommit(conversationID string, epoch uint64, senderUserID string) {
-	log.Printf("mls: committed conv=%s epoch=%d sender=%s",
-		conversationID, epoch, senderUserID)
+	log.Printf("mls: committed conv_ref=%s epoch=%d sender_ref=%s",
+		logsafe.Ref("conversation", conversationID), epoch, logsafe.Ref("user", senderUserID))
 }
 
 // fanoutMessageEvent dispatches a freshly produced MessageEvent to
@@ -565,6 +605,32 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 
 // --- Auth ---
 
+func deviceBindingFromProto(binding *pb.DeviceBindingV1) (*auth.DeviceBindingInput, error) {
+	if binding == nil {
+		return nil, nil
+	}
+	// Protobuf enums can carry unknown int32 values. Validate before narrowing
+	// to the DB's byte-sized status, otherwise values such as 257 would wrap to
+	// ACTIVE and bypass the signed-state allow-list.
+	status := binding.GetStatus()
+	switch status {
+	case pb.DeviceBindingStatus_DEVICE_BINDING_STATUS_ACTIVE,
+		pb.DeviceBindingStatus_DEVICE_BINDING_STATUS_EXCLUDED,
+		pb.DeviceBindingStatus_DEVICE_BINDING_STATUS_REVOKED:
+	default:
+		return nil, auth.ErrBadDeviceBinding
+	}
+	return &auth.DeviceBindingInput{
+		DeviceKey:         append([]byte(nil), binding.GetDeviceId()...),
+		DeviceIdentityKey: append([]byte(nil), binding.GetDeviceIdentityKey()...),
+		DeviceSigningKey:  append([]byte(nil), binding.GetDeviceSigningKey()...),
+		Version:           binding.GetVersion(),
+		Capabilities:      binding.GetCapabilities(),
+		Status:            db.DeviceBindingStatus(status),
+		AccountSignature:  append([]byte(nil), binding.GetAccountSignature()...),
+	}, nil
+}
+
 func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthResponse) {
 	c.authAttempts++
 	if c.authAttempts > 3 {
@@ -573,10 +639,21 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 		return
 	}
 
-	result, err := c.hub.authSvc.VerifyResponse(
+	if resp == nil {
+		metrics.WSAuthFailuresTotal.Inc()
+		_ = c.sendAuthResult(seq, false, "", "missing authentication response")
+		return
+	}
+	deviceBinding, err := deviceBindingFromProto(resp.GetDeviceBinding())
+	if err != nil {
+		metrics.WSAuthFailuresTotal.Inc()
+		_ = c.sendAuthResult(seq, false, "", err.Error())
+		return
+	}
+	result, err := c.hub.authSvc.VerifyResponseV1(
 		ctx, c.connID,
 		resp.IdentityKey, resp.SigningKey, resp.Signature,
-		resp.DeviceId, resp.DeviceName,
+		resp.DeviceId, resp.DeviceName, deviceBinding, resp.GetDeviceSignature(),
 	)
 	if err != nil {
 		log.Printf("auth failed [%s]: %v", c.connID, err)
@@ -587,8 +664,12 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 
 	c.userID = result.UserID
 	c.deviceID = result.DeviceID
+	c.deviceKey = append([]byte(nil), resp.DeviceId...)
 	c.username = result.Username
 	c.identityKey = resp.IdentityKey
+	c.perDeviceSecure = result.PerDeviceSecure
+	c.deviceBindingVersion = result.DeviceBindingVersion
+	c.deviceBindingStatus = result.DeviceBindingStatus
 
 	// Restore durable sender-key state before declaring the session ready. A
 	// database failure forces a reconnect so the client cannot start sending
@@ -616,7 +697,7 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 			return
 		}
 	}
-	if err := c.sendAuthResult(seq, true, result.UserID, ""); err != nil {
+	if err := c.sendAuthResult(seq, true, result.UserID, "", result); err != nil {
 		log.Printf("auth result queue failed [%s]: %v", c.connID, err)
 		if c.conn != nil {
 			_ = c.conn.Close()
@@ -625,7 +706,7 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 	}
 	c.authenticated = true
 	c.hub.indexClient(c)
-	log.Printf("auth success [%s]: user=%s device=%s", c.connID, c.username, c.deviceID)
+	log.Printf("auth success [%s]: user_ref=%s device_ref=%s", c.connID, logsafe.Ref("user", c.userID), logsafe.Ref("device", c.deviceID))
 }
 
 // --- Chat ---
@@ -940,6 +1021,8 @@ func (c *Client) handleSenderKeyDist(ctx context.Context, seq uint64, skd *pb.Se
 			c.sendError(seq, 400, err.Error())
 		} else if errors.Is(err, db.ErrStaleSenderKeyGeneration) {
 			c.sendError(seq, 409, "stale sender key generation")
+		} else if errors.Is(err, db.ErrSenderKeyGenerationConflict) {
+			c.sendError(seq, 409, "sender key generation already committed")
 		} else {
 			log.Printf("sender-key durable store failed: %v", err)
 			c.sendError(seq, 500, "failed to store sender key distribution")
@@ -1171,7 +1254,7 @@ func (c *Client) handlePresence(ctx context.Context, ev *pb.PresenceUpdate) {
 	// Only broadcast presence to friends
 	friendIDs, err := c.hub.chatSvc.DB().GetFriendIDs(ctx, c.userID)
 	if err != nil {
-		log.Printf("presence: failed to get friends for %s: %v", c.userID, err)
+		log.Printf("presence: failed to get friends for user_ref=%s: %v", logsafe.Ref("user", c.userID), err)
 		return
 	}
 	data, _ := proto.Marshal(&pb.Envelope{
@@ -1502,10 +1585,15 @@ func (c *Client) sendError(refSeq uint64, code uint32, message string) {
 	})
 }
 
-func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string) error {
+func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string, authDetails ...*auth.AuthResult) error {
 	result := &pb.AuthResult{Success: success}
 	if success {
 		result.UserId = &userID
+		if len(authDetails) == 1 && authDetails[0] != nil {
+			result.PerDeviceSecure = authDetails[0].PerDeviceSecure
+			result.DeviceBindingVersion = authDetails[0].DeviceBindingVersion
+			result.DeviceBindingStatus = pb.DeviceBindingStatus(authDetails[0].DeviceBindingStatus)
+		}
 	}
 	if errMsg != "" {
 		result.ErrorMessage = &errMsg

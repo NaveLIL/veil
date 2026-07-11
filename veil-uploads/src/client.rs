@@ -28,6 +28,7 @@ use zeroize::Zeroizing;
 const TUS_VERSION: &str = "1.0.0";
 const DEFAULT_MAX_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_ENCRYPTED_METADATA_BYTES: usize = 4 * 1024;
+const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Error)]
 pub enum TusClientError {
@@ -105,7 +106,10 @@ impl TusClient {
                 // Location headers are validated explicitly by create_upload.
                 .redirect(reqwest::redirect::Policy::none())
                 .connect_timeout(Duration::from_secs(10))
-                .timeout(Duration::from_secs(60))
+                // Large downloads may legitimately take longer than a minute.
+                // Bound each period without response bytes instead of the
+                // lifetime of the complete streaming response.
+                .read_timeout(Duration::from_secs(60))
                 .build()
                 .map_err(TusClientError::Http)?,
             max_download_bytes,
@@ -126,6 +130,7 @@ impl TusClient {
         let mut request = self
             .http
             .post(url)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .header("Tus-Resumable", TUS_VERSION)
             .header("Upload-Length", total_bytes)
             .header(header::AUTHORIZATION, self.auth_header());
@@ -174,10 +179,21 @@ impl TusClient {
     /// this to resume after a disconnect: encrypt only the chunks
     /// whose end-offset is greater than the returned value.
     pub async fn current_offset(&self, handle: &TusUploadHandle) -> Result<u64, TusClientError> {
+        Ok(self.upload_state(handle).await?.offset)
+    }
+
+    /// HEAD the upload and require both immutable length and current offset.
+    /// The streaming pipeline uses this to prevent resuming a plan into a tus
+    /// resource created for different ciphertext geometry.
+    pub async fn upload_state(
+        &self,
+        handle: &TusUploadHandle,
+    ) -> Result<TusUploadState, TusClientError> {
         let url = self.validate_handle(handle)?;
         let resp = self
             .http
             .head(url)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .header("Tus-Resumable", TUS_VERSION)
             .header(header::AUTHORIZATION, self.auth_header())
             .send()
@@ -185,14 +201,25 @@ impl TusClient {
         if resp.status() != StatusCode::OK && resp.status() != StatusCode::NO_CONTENT {
             return Err(TusClientError::Status(resp.status()));
         }
-        let raw = resp
+        let raw_offset = resp
             .headers()
             .get("Upload-Offset")
             .ok_or(TusClientError::MissingHeader("Upload-Offset"))?
             .to_str()
             .map_err(|e| TusClientError::BadHeader("Upload-Offset", e.to_string()))?;
-        raw.parse::<u64>()
-            .map_err(|e| TusClientError::BadHeader("Upload-Offset", e.to_string()))
+        let offset = raw_offset
+            .parse::<u64>()
+            .map_err(|e| TusClientError::BadHeader("Upload-Offset", e.to_string()))?;
+        let raw_length = resp
+            .headers()
+            .get("Upload-Length")
+            .ok_or(TusClientError::MissingHeader("Upload-Length"))?
+            .to_str()
+            .map_err(|e| TusClientError::BadHeader("Upload-Length", e.to_string()))?;
+        let length = raw_length
+            .parse::<u64>()
+            .map_err(|e| TusClientError::BadHeader("Upload-Length", e.to_string()))?;
+        Ok(TusUploadState { offset, length })
     }
 
     /// PATCH one ciphertext chunk at `offset`. Returns the new server-
@@ -209,6 +236,7 @@ impl TusClient {
         let resp = self
             .http
             .patch(url)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .header("Tus-Resumable", TUS_VERSION)
             .header("Upload-Offset", offset)
             .header(header::CONTENT_TYPE, "application/offset+octet-stream")
@@ -238,6 +266,7 @@ impl TusClient {
         let mut resp = self
             .http
             .get(url)
+            .timeout(CONTROL_REQUEST_TIMEOUT)
             .header(header::AUTHORIZATION, self.auth_header())
             .send()
             .await?;
@@ -268,6 +297,24 @@ impl TusClient {
             body.extend_from_slice(&chunk);
         }
         Ok(body)
+    }
+
+    pub(crate) async fn download_stream_response(
+        &self,
+        file_id: &str,
+    ) -> Result<reqwest::Response, TusClientError> {
+        validate_file_id(file_id)?;
+        let url = self.endpoint(&["v1", "uploads", "blob", file_id])?;
+        let response = self
+            .http
+            .get(url)
+            .header(header::AUTHORIZATION, self.auth_header())
+            .send()
+            .await?;
+        if !response.status().is_success() {
+            return Err(TusClientError::Status(response.status()));
+        }
+        Ok(response)
     }
 
     fn auth_header(&self) -> String {
@@ -359,6 +406,12 @@ fn validate_file_id(file_id: &str) -> Result<(), TusClientError> {
 pub struct TusUploadHandle {
     pub file_id: String,
     pub absolute_url: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TusUploadState {
+    pub offset: u64,
+    pub length: u64,
 }
 
 /// Optional metadata already encrypted by the conversation layer. Plaintext

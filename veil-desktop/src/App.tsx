@@ -8,6 +8,7 @@ import {
   type GroupMember,
   type Message,
 } from "@/stores/app";
+import { appearanceStore } from "@/stores/appearance";
 import { OnboardingScreen } from "@/components/chat/OnboardingScreen";
 import { LockScreen } from "@/components/chat/LockScreen";
 import { SettingsScreen } from "@/components/chat/SettingsScreen";
@@ -16,6 +17,9 @@ import { CreateServerDialog } from "@/components/server/CreateServerDialog";
 import { JoinServerDialog } from "@/components/server/JoinServerDialog";
 import { CreateChannelDialog } from "@/components/server/CreateChannelDialog";
 import { CreateInviteDialog } from "@/components/server/CreateInviteDialog";
+import { MembersIsland } from "@/components/layout/MembersIsland";
+import { ServerRail } from "@/components/layout/ServerRail";
+import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 
 /** Detect emoji-only messages (1-3 emoji, no other text). */
 const EMOJI_ONLY_RE = /^(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}(?:\u{FE0F})?(?:\u{200D}\p{Extended_Pictographic}(?:\u{FE0F})?)*){1,3}$/u;
@@ -24,18 +28,17 @@ const isEmojiOnly = (text: string) => EMOJI_ONLY_RE.test(text.trim());
 import {
   ContextMenu, ContextMenuTrigger, ContextMenuContent,
   ContextMenuItem, ContextMenuSeparator, ContextMenuIcon, ContextMenuShortcut,
-  ContextMenuSub, ContextMenuSubTrigger, ContextMenuSubContent,
-  ContextMenuCheckboxItem,
 } from "@/components/ui/context-menu";
 import { EmojiPicker } from "@/components/ui/emoji-picker";
 import { MessageRenderer } from "@/components/chat/MessageRenderer";
 import { FriendsPanel } from "@/components/chat/FriendsPanel";
-import { ToastViewport } from "@/components/ui/toast";
+import { VeilMark } from "@/components/brand/VeilMark";
+import { toast, ToastViewport } from "@/components/ui/toast";
 import { CommandPalette, useCommandPaletteHotkey } from "@/components/ui/CommandPalette";
 import {
-  MessageCircle, Globe, Users, UserPlus, UserMinus, Settings, Lock,
+  MessageCircle, Users, UserPlus, UserMinus, Settings, Lock,
   ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
-  Volume2, MessageSquare, Eye, Shield,
+  Volume2, MessageSquare, Eye, Shield, Send,
 } from "lucide-solid";
 
 const appWindow = getCurrentWindow();
@@ -85,18 +88,22 @@ const TIPS = [
 const DisclaimerScreen: Component = () => {
   const [phase, setPhase] = createSignal<"in" | "hold" | "out">("in");
   const tip = TIPS[Math.floor(Math.random() * TIPS.length)];
+  const timers: ReturnType<typeof setTimeout>[] = [];
 
   onMount(() => {
-    setTimeout(() => setPhase("hold"), 50);
-    setTimeout(() => setPhase("out"), 4000);
-    setTimeout(() => appStore.setScreen("chat"), 4800);
+    timers.push(
+      setTimeout(() => setPhase("hold"), 50),
+      setTimeout(() => setPhase("out"), 4000),
+      setTimeout(() => appStore.setScreen("chat"), 4800),
+    );
   });
+  onCleanup(() => timers.forEach(clearTimeout));
 
   const opacity = () => phase() === "hold" ? "1" : "0";
   const ty = () => phase() === "in" ? "20px" : phase() === "out" ? "-12px" : "0";
 
   const iconSvg = () => {
-    const tint = "rgba(124,107,245,0.7)";
+    const tint = "rgba(var(--veil-accent-rgb),0.7)";
     if (tip.icon === "eye") return <Eye size={22} color={tint} strokeWidth={1.5} />;
     if (tip.icon === "lock") return <Lock size={22} color={tint} strokeWidth={1.5} />;
     return <Shield size={22} color={tint} strokeWidth={1.5} />;
@@ -106,12 +113,12 @@ const DisclaimerScreen: Component = () => {
     <div style={{
       flex: "1", display: "flex", "flex-direction": "column",
       "align-items": "center", "justify-content": "center",
-      background: "#111117", position: "relative", overflow: "hidden",
+      background: "var(--veil-background)", position: "relative", overflow: "hidden",
     }}>
       <div style={{
         position: "absolute", top: "35%", left: "50%", transform: "translate(-50%, -50%)",
         width: "500px", height: "500px", "border-radius": "50%",
-        background: "radial-gradient(circle, rgba(124,107,245,0.05) 0%, transparent 70%)",
+        background: "radial-gradient(circle, rgba(var(--veil-accent-rgb),0.05) 0%, transparent 70%)",
         filter: "blur(60px)", "pointer-events": "none",
         animation: "glowPulse 6s ease-in-out infinite",
       }} />
@@ -123,24 +130,24 @@ const DisclaimerScreen: Component = () => {
       }}>
         <div style={{
           width: "48px", height: "48px", margin: "0 auto 28px", "border-radius": "14px",
-          background: "rgba(124,107,245,0.08)", display: "flex",
+          background: "rgba(var(--veil-accent-rgb),0.08)", display: "flex",
           "align-items": "center", "justify-content": "center", position: "relative",
         }}>
           {iconSvg()}
         </div>
         <div style={{
-          "font-size": "20px", "font-weight": "400", color: "rgba(255,255,255,0.85)",
+          "font-size": "20px", "font-weight": "400", color: "var(--veil-contrast-85)",
           "line-height": "1.6", "letter-spacing": "0.01em",
           "font-style": "italic", "margin-bottom": "16px", "white-space": "pre-line",
         }}>
           "{tip.text}"
         </div>
-        <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.25)", "letter-spacing": "0.05em" }}>
+        <div style={{ "font-size": "13px", color: "var(--veil-contrast-25)", "letter-spacing": "0.05em" }}>
           {tip.sub}
         </div>
         <div style={{
           width: "40px", height: "2px", "border-radius": "1px",
-          background: "rgba(124,107,245,0.2)", margin: "28px auto 0",
+          background: "rgba(var(--veil-accent-rgb),0.2)", margin: "28px auto 0",
         }} />
       </div>
     </div>
@@ -152,17 +159,26 @@ const DisclaimerScreen: Component = () => {
    ═══════════════════════════════════════════════════════ */
 const App: Component = () => {
   const [inputText, setInputText] = createSignal("");
+  const [sendBusy, setSendBusy] = createSignal(false);
+  const [sendNotice, setSendNotice] = createSignal<"" | "security" | "error">("");
   const [search, setSearch] = createSignal("");
   const [showNewDm, setShowNewDm] = createSignal(false);
   const [showNewGroup, setShowNewGroup] = createSignal(false);
+  const [creatingDm, setCreatingDm] = createSignal(false);
+  const [creatingGroup, setCreatingGroup] = createSignal(false);
+  const [groupCreateError, setGroupCreateError] = createSignal("");
   const [newPeerId, setNewPeerId] = createSignal("");
   const [newGroupName, setNewGroupName] = createSignal("");
   const [sidebarTab, setSidebarTab] = createSignal<"all" | "dm" | "group">("all");
   const [memberPanelOpen, setMemberPanelOpen] = createSignal(false);
+  const [windowMaximized, setWindowMaximized] = createSignal(false);
   const [groupMembers, setGroupMembers] = createSignal<GroupMember[]>([]);
   const [replyingTo, setReplyingTo] = createSignal<Message | null>(null);
   const [editingMessage, setEditingMessage] = createSignal<Message | null>(null);
   const [editText, setEditText] = createSignal("");
+  const [deferredSendDrafts, setDeferredSendDrafts] = createSignal<
+    Record<string, { text: string; reply: Message | null; token: number }>
+  >({});
   const [deletingIds, setDeletingIds] = createSignal<Set<string>>(new Set());
   const [showFriendsPanel, setShowFriendsPanel] = createSignal(false);
   const MAX_MSG_LEN = 4000;
@@ -172,12 +188,44 @@ const App: Component = () => {
   const [cmdkOpen, setCmdkOpen] = useCommandPaletteHotkey();
   const [island3Vis, setIsland3Vis] = createSignal(false);
   const [island4Vis, setIsland4Vis] = createSignal(false);
-  let messagesEnd: HTMLDivElement | undefined;
+  let messagesViewport: HTMLDivElement | undefined;
+  let messagesScrollFrame: number | undefined;
   let inputRef: HTMLTextAreaElement | undefined;
+  let newGroupInputRef: HTMLInputElement | undefined;
+  let sendTokenCounter = 0;
+  let activeSendToken: number | null = null;
 
   const conv = () => appStore.activeConversation();
+  const encryptionLabel = () => {
+    const conversation = conv();
+    if (!conversation || conversation.type === "dm") return "End-to-end encryption enforced on send";
+    const status = appStore.senderKeyStatus()[conversation.id] ?? "checking";
+    const kind = conversation.type === "channel" ? "channel" : "group";
+    if (status === "ready") return `Encrypted ${conversation.type === "channel" ? "server channel" : "group"}`;
+    if (status === "pending") return `${kind[0].toUpperCase()}${kind.slice(1)} key update queued · sending blocked`;
+    if (status === "error") return "Encryption check failed · sending blocked";
+    return `Checking ${kind} encryption…`;
+  };
+  const encryptionTone = () => {
+    const conversation = conv();
+    if (!conversation || conversation.type === "dm") return "var(--veil-text-faint)";
+    const status = appStore.senderKeyStatus()[conversation.id] ?? "checking";
+    if (status === "error") return "var(--veil-danger)";
+    if (status === "pending") return "var(--veil-warning)";
+    return "var(--veil-text-faint)";
+  };
   const msgs = () => appStore.messages().filter((m) => m.conversationId === conv()?.id);
   const shortId = () => (appStore.userId() || appStore.identity() || "---").slice(0, 8);
+  const connectionLabel = () => appStore.connected()
+    ? "Online"
+    : appStore.reconnecting()
+      ? "Reconnecting…"
+      : "Offline";
+  const connectionColor = () => appStore.connected()
+    ? "var(--veil-success)"
+    : appStore.reconnecting()
+      ? "var(--veil-warning)"
+      : "var(--veil-text-subtle)";
 
   const filtered = () => {
     const q = search().toLowerCase();
@@ -189,20 +237,74 @@ const App: Component = () => {
     return list.filter((c) => c.name.toLowerCase().includes(q));
   };
 
-  createEffect(() => { msgs(); messagesEnd?.scrollIntoView({ behavior: "smooth" }); });
+  createEffect(() => {
+    const conversationId = conv()?.id;
+    msgs();
 
-  // Load messages when conversation changes
+    if (messagesScrollFrame !== undefined) cancelAnimationFrame(messagesScrollFrame);
+    messagesScrollFrame = requestAnimationFrame(() => {
+      messagesScrollFrame = undefined;
+      const viewport = messagesViewport;
+      if (!viewport?.isConnected || conv()?.id !== conversationId) return;
+
+      // scrollIntoView() walks every scrollable ancestor. A scaled wallpaper
+      // gives the app shell a small scroll range, so using it here could move
+      // the entire window instead of only the message history.
+      viewport.scrollTo({
+        top: viewport.scrollHeight,
+        behavior: "smooth",
+      });
+    });
+  });
+
+  let previousConversationId = appStore.activeConversationId();
+  // Load messages when conversation changes. Drafts intentionally do not cross
+  // a conversation boundary: carrying text to another recipient is an easy
+  // privacy mistake, especially while a send is still awaiting native ACKs.
   createEffect(() => {
     const id = appStore.activeConversationId();
-    if (id) appStore.loadMessages(id);
-    setMemberPanelOpen(false);
-    setReplyingTo(null);
-    setEditingMessage(null);
+    if (id !== previousConversationId) {
+      const deferred = id ? untrack(() => deferredSendDrafts()[id]) : undefined;
+      setInputText(deferred?.text ?? "");
+      setReplyingTo(deferred?.reply ?? null);
+      if (id && deferred && deferred.token !== activeSendToken) {
+        // A completed failure has now been restored into the composer. From
+        // here the composer owns it, so later navigation cannot overwrite a
+        // user's edits with the old snapshot.
+        setDeferredSendDrafts((previous) => {
+          const next = { ...previous };
+          delete next[id];
+          return next;
+        });
+      }
+      setSendNotice("");
+      if (inputRef) inputRef.style.height = "21px";
+      previousConversationId = id;
+      setMemberPanelOpen(false);
+      setEditingMessage(null);
+    }
+    if (id) untrack(() => void appStore.loadMessages(id));
   });
 
   // Trigger staggered entrance when chat screen appears
   createEffect(() => {
     const screen = appStore.screen();
+
+    if (screen === "locked" || screen === "onboarding") {
+      // The root component remains mounted on the lock screen. Scrub every
+      // component-local plaintext buffer as part of the renderer lock barrier.
+      setDeferredSendDrafts({});
+      setInputText("");
+      setReplyingTo(null);
+      setEditingMessage(null);
+      setEditText("");
+      setSearch("");
+      setNewPeerId("");
+      setNewGroupName("");
+      setGroupCreateError("");
+      activeSendToken = null;
+      setSendBusy(false);
+    }
 
     // Keep islands hidden outside chat so re-entry always starts from hidden state.
     if (screen !== "chat") {
@@ -224,18 +326,72 @@ const App: Component = () => {
     });
   });
 
-  const handleSend = () => {
+  const handleSend = async () => {
     const text = inputText().trim();
-    if (!text || !conv() || text.length > MAX_MSG_LEN) return;
+    const conversation = conv();
+    if (!text || !conversation || text.length > MAX_MSG_LEN || sendBusy()) return;
     const reply = replyingTo();
-    setInputText("");
-    setReplyingTo(null);
-    if (inputRef) inputRef.style.height = "21px";
-    appStore.sendMessage(text, reply?.id);
+    const conversationId = conversation.id;
+    const sendSessionEpoch = captureUiSessionEpoch();
+    const sendToken = ++sendTokenCounter;
+    activeSendToken = sendToken;
+    // Register before the first await. This covers A → B → A navigation while
+    // native validation or sender-key distribution is still in flight.
+    setDeferredSendDrafts((previous) => ({
+      ...previous,
+      [conversationId]: { text, reply, token: sendToken },
+    }));
+    setSendBusy(true);
+    setSendNotice("");
+    try {
+      await appStore.sendMessage(text, reply?.id);
+      setDeferredSendDrafts((previous) => {
+        if (!previous[conversationId]) return previous;
+        const next = { ...previous };
+        delete next[conversationId];
+        return next;
+      });
+      if (appStore.activeConversationId() === conversationId) {
+        setInputText("");
+        setReplyingTo(null);
+        if (inputRef) inputRef.style.height = "21px";
+      }
+    } catch (reason) {
+      if (!isUiSessionEpochCurrent(sendSessionEpoch) || appStore.screen() !== "chat") return;
+      if (appStore.activeConversationId() !== conversationId) {
+        // A pre-persistence failure (offline, sender-key gate, native input
+        // rejection) has no DB row to recover. Keep the draft with its
+        // original recipient until the user returns to that conversation.
+        return;
+      }
+      setInputText(text);
+      setReplyingTo(reply);
+      setDeferredSendDrafts((previous) => {
+        const next = { ...previous };
+        delete next[conversationId];
+        return next;
+      });
+      const detail = String(reason);
+      if (/sender[- ]key|distribution|rotation/i.test(detail)) {
+        setSendNotice("security");
+        toast.warning(
+          "Encryption update pending",
+          "Your draft is safe. Sending stays blocked while the key update is durably queued for the current roster.",
+        );
+      } else {
+        setSendNotice("error");
+        toast.error("Message not sent", "Your draft was kept. Check the connection and try again.");
+      }
+    } finally {
+      if (activeSendToken === sendToken) {
+        activeSendToken = null;
+        setSendBusy(false);
+      }
+    }
   };
 
   const startEdit = (msg: Message) => {
-    if (msg.pending) return;
+    if (msg.pending || msg.failed || msg.deliveryUnknown) return;
     setEditingMessage(msg);
     setEditText(msg.text);
     setReplyingTo(null);
@@ -253,7 +409,7 @@ const App: Component = () => {
   };
 
   const handleDelete = (msg: Message) => {
-    if (msg.pending) return;
+    if (msg.pending || msg.failed || msg.deliveryUnknown) return;
     const sessionEpoch = captureUiSessionEpoch();
     setDeletingIds((prev) => { const s = new Set(prev); s.add(msg.id); return s; });
     setTimeout(() => {
@@ -265,29 +421,196 @@ const App: Component = () => {
 
   const handleNewDm = async () => {
     const id = newPeerId().trim();
-    if (!id) return;
-    await appStore.createDm(id);
-    setNewPeerId(""); setShowNewDm(false);
+    if (!id || creatingDm()) return;
+    const sessionEpoch = captureUiSessionEpoch();
+    setCreatingDm(true);
+    try {
+      await appStore.createDm(id);
+      setNewPeerId("");
+      setShowNewDm(false);
+    } catch (reason) {
+      if (isUiSessionEpochCurrent(sessionEpoch)) {
+        toast.error("Conversation not created", String(reason).replace(/^Error:\s*/, ""));
+      }
+    } finally {
+      setCreatingDm(false);
+    }
   };
 
   const handleNewGroup = async () => {
     const name = newGroupName().trim();
-    if (!name) return;
-    await appStore.createGroup(name);
-    setNewGroupName(""); setShowNewGroup(false);
+    if (!name || creatingGroup()) return;
+    setCreatingGroup(true);
+    setGroupCreateError("");
+    try {
+      const conversationId = await appStore.createGroup(name);
+      if (!conversationId) throw new Error("The server did not confirm group creation");
+      setNewGroupName("");
+      setShowNewGroup(false);
+    } catch (reason) {
+      const message = String(reason).replace(/^Error:\s*/, "");
+      setGroupCreateError(message);
+      toast.error("Group not created", message);
+    } finally {
+      setCreatingGroup(false);
+    }
+  };
+
+  const restoreFailedDraft = (msg: Message) => {
+    if (inputText().trim() && inputText() !== msg.text) {
+      toast.warning("Draft not replaced", "The failed text remains in the timeline; clear the current composer first.");
+      return;
+    }
+    setInputText(msg.text);
+    const reply = msg.replyToId ? msgs().find((candidate) => candidate.id === msg.replyToId) : undefined;
+    setReplyingTo(reply ?? null);
+    setSendNotice(msg.deliveryUnknown ? "" : "error");
+    if (msg.deliveryUnknown) {
+      toast.warning(
+        "Delivery is unknown",
+        "Sending this text again may create a duplicate. Check with the recipient when possible.",
+      );
+    }
+    requestAnimationFrame(() => {
+      if (!inputRef) return;
+      inputRef.style.height = "21px";
+      inputRef.style.height = Math.min(inputRef.scrollHeight, 150) + "px";
+      inputRef.focus();
+    });
+  };
+
+  const deleteLocalMessageCopy = async (msg: Message) => {
+    const warning = msg.deliveryUnknown
+      ? "Delete the only local copy? The message may already have reached the recipient. This cannot be undone."
+      : "Delete the only local copy of this unsent message? This cannot be undone.";
+    if (!window.confirm(warning)) return;
+    try {
+      await appStore.discardFailedMessage(msg.id);
+    } catch (error) {
+      toast.error("Could not delete local copy", String(error));
+    }
+  };
+
+  const isLocalOnlyMessage = (msg: Message) =>
+    !!(msg.pending || msg.failed || msg.deliveryUnknown);
+
+  const closeHomeTransientUi = () => {
+    setShowNewDm(false);
+    setShowNewGroup(false);
+    setNewPeerId("");
+    setNewGroupName("");
+    setGroupCreateError("");
+  };
+
+  const clearIncompatibleConversation = (tab: "all" | "dm" | "group") => {
+    if (tab === "all") return;
+    const active = appStore.conversations().find(
+      (conversation) => conversation.id === appStore.activeConversationId(),
+    );
+    if (active && active.type !== tab) appStore.setActiveConversationId(null);
+  };
+
+  const openFriends = () => {
+    closeHomeTransientUi();
+    setShowFriendsPanel(true);
+    appStore.setActiveConversationId(null);
+  };
+
+  const toggleNewDm = () => {
+    const next = !showNewDm();
+    setShowFriendsPanel(false);
+    setSidebarTab("dm");
+    clearIncompatibleConversation("dm");
+    setShowNewGroup(false);
+    setNewGroupName("");
+    setShowNewDm(next);
+  };
+
+  const toggleNewGroup = () => {
+    const next = !showNewGroup();
+    setShowFriendsPanel(false);
+    setSidebarTab("group");
+    clearIncompatibleConversation("group");
+    setShowNewDm(false);
+    setNewPeerId("");
+    setGroupCreateError("");
+    setShowNewGroup(next);
+    if (next) requestAnimationFrame(() => newGroupInputRef?.focus());
+  };
+
+  const changeSidebarTab = (tab: "all" | "dm" | "group") => {
+    setSidebarTab(tab);
+    clearIncompatibleConversation(tab);
+    setShowFriendsPanel(false);
+    if (tab !== "dm") {
+      setShowNewDm(false);
+      setNewPeerId("");
+    }
+    if (tab !== "group") {
+      setShowNewGroup(false);
+      setNewGroupName("");
+      setGroupCreateError("");
+    }
+  };
+
+  const openConversation = (id: string) => {
+    closeHomeTransientUi();
+    setShowFriendsPanel(false);
+    setActiveServer("home");
+    appStore.selectConversation(id);
+    const selected = appStore.conversations().find((conversation) => conversation.id === id);
+    if (selected?.type === "group") {
+      void appStore.distributeSenderKey(id).catch((error) => {
+        console.warn("group encryption check failed:", error);
+      });
+    }
+  };
+
+  const selectServerContext = (serverId: string | null, autoSelect = true) => {
+    closeHomeTransientUi();
+    setShowFriendsPanel(false);
+    setActiveServer(serverId ?? "home");
+    appStore.selectServer(serverId, autoSelect);
+  };
+
+  const openSearchResult = async (conversationId: string) => {
+    const channel = await appStore.resolveChannelContext(conversationId);
+    if (channel) {
+      const loaded = appStore.channelsByServer()[channel.serverId] ?? [];
+      if (!loaded.some((candidate) => candidate.id === channel.channelId)) {
+        await appStore.loadChannels(channel.serverId);
+      }
+      if (!(appStore.channelsByServer()[channel.serverId] ?? []).some(
+        (candidate) => candidate.id === channel.channelId,
+      )) {
+        toast.error("Channel unavailable", "Its cached context is stale or you no longer have access.");
+        return;
+      }
+      selectServerContext(channel.serverId, false);
+      appStore.selectChannel(channel.channelId);
+      return;
+    }
+    if (appStore.conversations().some((conversation) => conversation.id === conversationId)) {
+      openConversation(conversationId);
+    } else {
+      toast.error("Conversation unavailable", "The search result no longer has a readable local context.");
+    }
   };
 
   onMount(async () => {
     // Suppress native WebKitGTK context menu globally — Kobalte handles its own
     document.addEventListener("contextmenu", (e) => e.preventDefault(), { capture: true });
+    await appearanceStore.initialize();
 
     try {
       const hasIdentity = await invoke<boolean>("has_stored_identity");
       if (!hasIdentity) {
         appStore.setScreen("onboarding");
       } else if (await appStore.hasPin()) {
-        // The native client stays uninitialized while the PIN screen is active.
-        appStore.setScreen("locked");
+        // Synchronize both sides of the lock boundary. During Vite HMR the
+        // renderer store can survive while verify_pin later replaces the native
+        // client; a UI-only lock would leave a stale "Online" signal behind.
+        await appStore.lock();
       } else {
         const key = await invoke<string>("init_from_seed");
         appStore.setIdentity(key);
@@ -306,31 +629,62 @@ const App: Component = () => {
     appStore.startAutoLock();
   });
 
+  let stopWindowResizeListener: (() => void) | undefined;
+  let windowListenerDisposed = false;
+  onMount(() => {
+    void appWindow.isMaximized().then(setWindowMaximized).catch(() => {});
+    void appWindow.onResized(async () => {
+      setWindowMaximized(await appWindow.isMaximized().catch(() => false));
+    }).then((unlisten) => {
+      if (windowListenerDisposed) unlisten();
+      else stopWindowResizeListener = unlisten;
+    }).catch(() => {});
+  });
+  onCleanup(() => {
+    windowListenerDisposed = true;
+    stopWindowResizeListener?.();
+    if (messagesScrollFrame !== undefined) cancelAnimationFrame(messagesScrollFrame);
+  });
+
+  createEffect(() => {
+    const screen = appStore.screen();
+
+    if (screen === "locked" || screen === "onboarding") {
+      setDeferredSendDrafts({});
+    }
+    void appearanceStore.setPrivacyLocked(screen === "locked" || screen === "onboarding");
+  });
+
+  // A transport can disappear while the WebView stays alive (network change,
+  // sleep, gateway restart). Re-enter the store's bounded reconnect loop as
+  // soon as an unlocked chat session observes the disconnected state.
+  createEffect(() => {
+    if (appStore.screen() === "chat" && !appStore.connected()) {
+      appStore.ensureConnected();
+    }
+  });
+
   const S = {
-    root: { height: "100vh", width: "100vw", display: "flex", "flex-direction": "column" as const, background: "#1E1F22", padding: "10px", overflow: "hidden", color: "#ddd", "font-family": "'Inter', system-ui, sans-serif" },
-    titlebar: { height: "36px", display: "flex", "align-items": "center", "justify-content": "space-between", padding: "0 8px", "margin-bottom": "8px", "flex-shrink": "0", "user-select": "none" as const },
+    root: { height: "100vh", width: "100vw", display: "flex", "flex-direction": "column" as const, position: "relative" as const, isolation: "isolate" as const, background: "transparent", padding: "10px", overflow: "hidden", color: "var(--veil-text)", "font-family": "'Inter', system-ui, sans-serif" },
     body: { flex: "1", display: "flex", gap: "8px", overflow: "hidden", "min-height": "0" },
-    island: (w?: string) => ({ width: w, "flex-shrink": w ? "0" : undefined, flex: w ? undefined : "1", background: "#2B2D31", "border-radius": "12px", overflow: "hidden", display: "flex", "flex-direction": "column" as const, "min-width": w ? undefined : "0" }),
+    island: (w?: string) => ({ width: w, "flex-shrink": w ? "0" : undefined, flex: w ? undefined : "1", background: "var(--veil-island)", "border-radius": "12px", overflow: "hidden", display: "flex", "flex-direction": "column" as const, "min-width": w ? undefined : "0" }),
     islandAnim: (vis: boolean, delay: number) => ({
       opacity: vis ? "1" : "0",
       transform: vis ? "translateY(0) scale(1)" : "translateY(16px) scale(0.97)",
       transition: `opacity 0.5s ease ${delay}ms, transform 0.5s ease ${delay}ms`,
     }),
-    rail: { display: "flex", "flex-direction": "column" as const, "align-items": "center", padding: "14px 0", gap: "8px", height: "100%" },
-    railBtn: (active: boolean) => ({ width: "42px", height: "42px", "border-radius": active ? "14px" : "21px", background: active ? "#7c6bf5" : "#36373D", color: active ? "#fff" : "#888", border: "none", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "12px", "font-weight": "700", transition: "border-radius 0.2s, background 0.2s" }),
     sidebarHeader: { padding: "18px 20px 14px", "flex-shrink": "0" },
-    searchBox: { width: "100%", height: "34px", background: "#1E1F22", border: "none", "border-radius": "8px", padding: "0 14px", color: "#ccc", "font-size": "13px", outline: "none" },
+    searchBox: { width: "100%", height: "34px", background: "var(--veil-control)", border: "none", "border-radius": "8px", padding: "0 14px", color: "var(--veil-text)", "font-size": "13px", outline: "none" },
     contactList: { flex: "1", "overflow-y": "auto" as const, padding: "6px 12px", "min-height": "0" },
-    contactBtn: (active: boolean) => ({ display: "flex", "align-items": "center", gap: "12px", width: "100%", padding: "10px 14px", background: active ? "rgba(255,255,255,0.06)" : "transparent", border: "none", "border-radius": "10px", cursor: "pointer", "text-align": "left" as const, "margin-bottom": "2px", transition: "background 0.15s", color: "#ddd" }),
-    avatar: (size: number) => ({ width: `${size}px`, height: `${size}px`, "border-radius": "50%", background: "#36373D", display: "flex", "align-items": "center", "justify-content": "center", "font-size": `${size * 0.38}px`, "font-weight": "600", color: "#999", "flex-shrink": "0" }),
-    userPanel: { padding: "14px 18px", "border-top": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0", display: "flex", "align-items": "center", gap: "12px" },
-    chatHeader: { height: "56px", padding: "0 24px", display: "flex", "align-items": "center", gap: "12px", "border-bottom": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" },
+    contactBtn: (active: boolean) => ({ display: "flex", "align-items": "center", gap: "12px", width: "100%", padding: "10px 14px", background: active ? "var(--veil-contrast-06)" : "transparent", border: "none", "border-radius": "10px", cursor: "pointer", "text-align": "left" as const, "margin-bottom": "2px", transition: "background 0.15s", color: "var(--veil-text)" }),
+    avatar: (size: number) => ({ width: `${size}px`, height: `${size}px`, "border-radius": "50%", background: "var(--veil-surface-raised)", display: "flex", "align-items": "center", "justify-content": "center", "font-size": `${size * 0.38}px`, "font-weight": "600", color: "var(--veil-text-muted)", "flex-shrink": "0" }),
+    userPanel: { padding: "14px 18px", "border-top": "1px solid var(--veil-contrast-04)", "flex-shrink": "0", display: "flex", "align-items": "center", gap: "12px" },
+    chatHeader: { height: "56px", padding: "0 24px", display: "flex", "align-items": "center", gap: "12px", "border-bottom": "1px solid var(--veil-contrast-04)", "flex-shrink": "0" },
     msgArea: { flex: "1", "overflow-y": "auto" as const, padding: "20px 24px", "min-height": "0" },
     inputWrap: { padding: "10px 20px 20px", "flex-shrink": "0" },
-    inputBar: { display: "flex", "align-items": "flex-end", gap: "10px", background: "#383A40", "border-radius": "12px", padding: "12px 16px" },
-    inputField: { flex: "1", background: "transparent", border: "none", color: "#ddd", "font-size": "13px", outline: "none", resize: "none" as const, "font-family": "inherit", "line-height": "1.45", "max-height": "150px", "overflow-y": "auto" as const, height: "21px" },
-    sendBtn: (hasText: boolean) => ({ width: "32px", height: "32px", "border-radius": "8px", border: "none", background: hasText ? "#7c6bf5" : "transparent", color: hasText ? "#fff" : "#555", cursor: hasText ? "pointer" : "default", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "14px", transition: "background 0.2s" }),
-    dot: (color: string) => ({ width: "14px", height: "14px", "border-radius": "50%", background: color, border: "none", cursor: "pointer" }),
+    inputBar: { display: "flex", "align-items": "flex-end", gap: "10px", background: "var(--veil-composer)", "border-radius": "12px", padding: "12px 16px" },
+    inputField: { flex: "1", background: "transparent", border: "none", color: "var(--veil-text)", "font-size": "13px", outline: "none", resize: "none" as const, "font-family": "inherit", "line-height": "1.45", "max-height": "150px", "overflow-y": "auto" as const, height: "21px" },
+    sendBtn: (hasText: boolean) => ({ width: "32px", height: "32px", "border-radius": "8px", border: "none", background: hasText ? "var(--veil-accent)" : "transparent", color: hasText ? "var(--veil-on-accent)" : "var(--veil-text-faint)", cursor: hasText ? "pointer" : "default", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "14px", transition: "background 0.2s" }),
   };
 
   const [activeServer, setActiveServer] = createSignal("home");
@@ -346,6 +700,8 @@ const App: Component = () => {
   createEffect(() => {
     if (appStore.screen() !== "locked") return;
     setInputText("");
+    setSendNotice("");
+    setSendBusy(false);
     setSearch("");
     setNewPeerId("");
     setNewGroupName("");
@@ -364,6 +720,7 @@ const App: Component = () => {
     setShowCreateChannel(false);
     setShowCreateInvite(false);
     setActiveServer("home");
+    toast.clear();
   });
   // Collapsed category IDs (per-server). Default: all expanded.
   const [collapsedCats, setCollapsedCats] = createSignal<Set<string>>(new Set());
@@ -380,6 +737,7 @@ const App: Component = () => {
   const [dropTarget, setDropTarget] = createSignal<
     { kind: "before"; id: string } | { kind: "category"; id: string | null } | null
   >(null);
+  const serverHydrationInFlight = new Set<string>();
 
   // Keep the local rail selection in sync with the global app store so that
   // newly-created servers / store-driven changes are reflected in the UI.
@@ -393,6 +751,7 @@ const App: Component = () => {
   createEffect(() => {
     const sid = appStore.activeServerId();
     if (!sid) return;
+    if (serverHydrationInFlight.has(sid)) return;
     const tasks: Promise<unknown>[] = [];
     if ((appStore.channelsByServer()[sid] ?? []).length === 0) {
       tasks.push(appStore.loadChannels(sid));
@@ -403,30 +762,38 @@ const App: Component = () => {
     if ((appStore.serverRoles()[sid] ?? []).length === 0) {
       tasks.push(appStore.loadServerRoles(sid));
     }
-    if (tasks.length > 0) Promise.all(tasks).catch(() => {});
+    if (tasks.length === 0) return;
+    serverHydrationInFlight.add(sid);
+    void Promise.allSettled(tasks).finally(() => serverHydrationInFlight.delete(sid));
   });
 
   return (
     <div
+      class="veil-app-shell"
       style={S.root}
       onPointerDown={() => appStore.touchActivity()}
       onKeyDown={() => appStore.touchActivity()}
+      onWheel={() => appStore.touchActivity()}
     >
+      <Show when={appearanceStore.wallpaperUrl()}>
+        {(url) => (
+          <div class="veil-wallpaper-host" aria-hidden="true">
+            <div class="veil-wallpaper-layer" style={{ "background-image": `url(${url()})` }} aria-hidden="true" />
+            <div class="veil-wallpaper-scrim" aria-hidden="true" />
+          </div>
+        )}
+      </Show>
 
       {/* ── TITLEBAR ── */}
-      <div style={S.titlebar} data-tauri-drag-region>
-        <div style={{ display: "flex", "align-items": "center", gap: "8px" }} data-tauri-drag-region>
-          <div style={{ width: "24px", height: "24px", "border-radius": "6px", background: "#7c6bf5", display: "flex", "align-items": "center", "justify-content": "center" }}>
-            <span style={{ "font-size": "11px", "font-weight": "800", color: "#fff" }}>V</span>
-          </div>
-          <span style={{ "font-size": "11px", "font-weight": "600", color: "#555", "letter-spacing": "0.15em" }} data-tauri-drag-region>VEIL</span>
-        </div>
-        <div style={{ display: "flex", "align-items": "center", gap: "10px" }}>
-          <button style={S.dot("#f59e0b")} onClick={async (e) => { e.stopPropagation(); await appWindow.minimize(); }} />
-          <button style={S.dot("#22c55e")} onClick={async (e) => { e.stopPropagation(); await appWindow.toggleMaximize(); }} />
-          <button style={S.dot("#ef4444")} onClick={async (e) => { e.stopPropagation(); await appWindow.close(); }} />
-        </div>
-      </div>
+      <WindowTitlebar
+        maximized={windowMaximized()}
+        onMinimize={() => appWindow.minimize()}
+        onToggleMaximize={async () => {
+          await appWindow.toggleMaximize();
+          setWindowMaximized(await appWindow.isMaximized());
+        }}
+        onClose={() => appWindow.close()}
+      />
 
       {/* ── CONTENT ── */}
       <Switch>
@@ -436,59 +803,20 @@ const App: Component = () => {
         <Match when={appStore.screen() === "settings"}><SettingsScreen /></Match>
         <Match when={appStore.screen() === "serverSettings"}><ServerSettingsScreen /></Match>
         <Match when={appStore.screen() === "chat"}>
-          <div style={S.body}>
+          <div class="veil-app-body" style={S.body}>
 
             {/* ISLAND 1 — Server Rail */}
-            <div style={{ ...S.island("68px"), ...S.islandAnim(island1Vis(), 0) }}>
-              <div style={S.rail}>
-                {/* Home — DMs & Groups */}
-                <button
-                  style={S.railBtn(activeServer() === "home")}
-                  onClick={() => { setActiveServer("home"); appStore.selectServer(null); }}
-                  title="Home"
-                >
-                  <MessageCircle size={20} strokeWidth={1.8} />
-                </button>
-
-                <div style={{ width: "28px", height: "2px", background: "rgba(255,255,255,0.06)", "border-radius": "1px" }} />
-
-                {/* Future servers will appear here */}
-                <For each={appStore.servers()}>
-                  {(s) => (
-                    <button
-                      style={S.railBtn(activeServer() === s.id)}
-                      onClick={() => { setActiveServer(s.id); appStore.selectServer(s.id); }}
-                      onContextMenu={(e) => {
-                        e.preventDefault();
-                        appStore.openServerSettings?.(s.id);
-                      }}
-                      title={s.name}
-                    >
-                      {s.name.charAt(0).toUpperCase()}
-                    </button>
-                  )}
-                </For>
-
-                {/* Create Server */}
-                <button
-                  style={{ ...S.railBtn(false), color: "#34d399", "font-size": "20px", "font-weight": "600" }}
-                  onClick={() => setShowCreateServer(true)}
-                  title="Create a server"
-                >+</button>
-
-                {/* Join Server */}
-                <button
-                  style={{ ...S.railBtn(false), color: "#7c6bf5", "font-size": "15px" }}
-                  onClick={() => setShowJoinServer(true)}
-                  title="Join a server with an invite"
-                >
-                  <Globe size={18} strokeWidth={1.8} />
-                </button>
-              </div>
-            </div>
-
+            <ServerRail
+              activeServerId={activeServer()}
+              servers={appStore.servers()}
+              visible={island1Vis()}
+              onSelectServer={(serverId) => selectServerContext(serverId)}
+              onOpenServerSettings={(serverId) => appStore.openServerSettings?.(serverId)}
+              onCreateServer={() => setShowCreateServer(true)}
+              onJoinServer={() => setShowJoinServer(true)}
+            />
             {/* ISLAND 2 — Sidebar */}
-            <div style={{ ...S.island("256px"), ...S.islandAnim(island2Vis(), 0) }}>
+            <div class="veil-sidebar-island" style={{ ...S.island("256px"), ...S.islandAnim(island2Vis(), 0) }}>
               {/* ── Server context: channels list ───────────────── */}
               <Show when={appStore.activeServerId()}>
                 {(sid) => {
@@ -498,15 +826,15 @@ const App: Component = () => {
                     .sort((a, b) => a.position - b.position);
                   const isOwner = () => server()?.ownerId === appStore.userId();
                   const channelIcon = (type: number) => {
-                    if (type === 1) return <Volume2 size={13} strokeWidth={2} style={{ color: "#666" }} />;
-                    if (type === 2) return <ChevronDown size={12} strokeWidth={2.5} style={{ color: "#666" }} />;
-                    return <span style={{ color: "#666" }}>#</span>;
+                    if (type === 1) return <Volume2 size={13} strokeWidth={2} style={{ color: "var(--veil-text-faint)" }} />;
+                    if (type === 2) return <ChevronDown size={12} strokeWidth={2.5} style={{ color: "var(--veil-text-faint)" }} />;
+                    return <span style={{ color: "var(--veil-text-faint)" }}>#</span>;
                   };
                   const headerBtn = (active = false) => ({
                     width: "26px", height: "26px", "border-radius": "6px",
-                    background: active ? "rgba(124,107,245,0.15)" : "transparent",
+                    background: active ? "rgba(var(--veil-accent-rgb),0.15)" : "transparent",
                     border: "none",
-                    color: active ? "#7c6bf5" : "#888",
+                    color: active ? "var(--veil-accent)" : "var(--veil-text-muted)",
                     cursor: "pointer",
                     display: "flex" as const, "align-items": "center" as const, "justify-content": "center" as const,
                     transition: "background 0.15s, color 0.15s",
@@ -516,23 +844,23 @@ const App: Component = () => {
                       {/* Server header */}
                       <div style={{
                         padding: "14px 16px",
-                        "border-bottom": "1px solid rgba(255,255,255,0.04)",
+                        "border-bottom": "1px solid var(--veil-contrast-04)",
                         display: "flex", "align-items": "center", gap: "8px",
                         "flex-shrink": "0",
                       }}>
                         <div style={{
                           width: "30px", height: "30px", "border-radius": "9px",
-                          background: "rgba(124,107,245,0.15)",
-                          color: "#7c6bf5",
+                          background: "rgba(var(--veil-accent-rgb),0.15)",
+                          color: "var(--veil-accent)",
                           display: "flex", "align-items": "center", "justify-content": "center",
                           "font-size": "13px", "font-weight": "700", "flex-shrink": "0",
                         }}>{(server()?.name ?? "?").charAt(0).toUpperCase()}</div>
                         <div style={{ flex: "1", "min-width": "0" }}>
                           <div style={{
-                            "font-size": "13px", "font-weight": "700", color: "#eee",
+                            "font-size": "13px", "font-weight": "700", color: "var(--veil-text-strong)",
                             "white-space": "nowrap", overflow: "hidden", "text-overflow": "ellipsis",
                           }}>{server()?.name ?? "Server"}</div>
-                          <div style={{ "font-size": "10px", color: "#555" }}>
+                          <div style={{ "font-size": "10px", color: "var(--veil-text-faint)" }}>
                             {(appStore.serverMembers()[sid()] ?? []).length} members
                           </div>
                         </div>
@@ -581,7 +909,7 @@ const App: Component = () => {
                           padding: "6px 10px 4px",
                         }}>
                           <span style={{
-                            "font-size": "10px", "font-weight": "700", color: "#666",
+                            "font-size": "10px", "font-weight": "700", color: "var(--veil-text-faint)",
                             "letter-spacing": "0.08em", "text-transform": "uppercase",
                           }}>Channels</span>
                           <Show when={isOwner()}>
@@ -589,7 +917,7 @@ const App: Component = () => {
                               style={{
                                 width: "20px", height: "20px", "border-radius": "5px",
                                 background: "transparent", border: "none",
-                                color: "#666", cursor: "pointer", "font-size": "16px",
+                                color: "var(--veil-text-faint)", cursor: "pointer", "font-size": "16px",
                                 display: "flex", "align-items": "center", "justify-content": "center",
                                 "line-height": "1",
                               }}
@@ -599,12 +927,12 @@ const App: Component = () => {
                           </Show>
                         </div>
                         <Show when={channels().length > 0} fallback={
-                          <div style={{ "text-align": "center", color: "#555", "font-size": "12px", padding: "20px 12px" }}>
+                          <div style={{ "text-align": "center", color: "var(--veil-text-faint)", "font-size": "12px", padding: "20px 12px" }}>
                             No channels yet
                             <Show when={isOwner()}>
                               <div style={{ "margin-top": "8px" }}>
                                 <button
-                                  style={{ background: "none", border: "none", color: "#7c6bf5", "font-size": "12px", cursor: "pointer" }}
+                                  style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
                                   onClick={() => setShowCreateChannel(true)}
                                 >Create channel {"\u2192"}</button>
                               </div>
@@ -722,7 +1050,7 @@ const App: Component = () => {
                                   <Show when={isDropBefore()}>
                                     <div style={{
                                       position: "absolute", top: "-1px", left: "8px", right: "8px",
-                                      height: "2px", background: "#7c6bf5", "border-radius": "2px",
+                                      height: "2px", background: "var(--veil-accent)", "border-radius": "2px",
                                       "pointer-events": "none",
                                     }} />
                                   </Show>
@@ -733,18 +1061,18 @@ const App: Component = () => {
                                           display: "flex", "align-items": "center", gap: "6px",
                                           width: "100%", padding: "6px 10px",
                                           "border-radius": "6px",
-                                          background: active() ? "rgba(255,255,255,0.06)" : "transparent",
-                                          color: active() ? "#eee" : "#888",
+                                          background: active() ? "var(--veil-contrast-06)" : "transparent",
+                                          color: active() ? "var(--veil-text-strong)" : "var(--veil-text-muted)",
                                           border: "none", cursor: "pointer",
                                           "text-align": "left", "margin-bottom": "1px",
                                           "font-family": "inherit",
                                           transition: "background 0.12s, color 0.12s",
                                         }}
                                         onClick={() => appStore.selectChannel(ch.id)}
-                                        onMouseEnter={(e) => { if (!active()) e.currentTarget.style.background = "rgba(255,255,255,0.03)"; }}
+                                        onMouseEnter={(e) => { if (!active()) e.currentTarget.style.background = "var(--veil-contrast-03)"; }}
                                         onMouseLeave={(e) => { if (!active()) e.currentTarget.style.background = "transparent"; }}
                                       >
-                                        <span style={{ "font-size": "14px", color: "#666", width: "16px", "text-align": "center", "flex-shrink": "0" }}>
+                                        <span style={{ "font-size": "14px", color: "var(--veil-text-faint)", width: "16px", "text-align": "center", "flex-shrink": "0" }}>
                                           {channelIcon(ch.channelType)}
                                         </span>
                                         <span style={{
@@ -779,7 +1107,7 @@ const App: Component = () => {
                                           }}
                                         >
                                           <ContextMenuIcon><Trash2 size={14} strokeWidth={2} /></ContextMenuIcon>
-                                          <span style={{ color: "#f87171" }}>Delete</span>
+                                          <span style={{ color: "var(--veil-danger-text)" }}>Delete</span>
                                         </ContextMenuItem>
                                       </Show>
                                     </ContextMenuContent>
@@ -824,15 +1152,15 @@ const App: Component = () => {
                                             display: "flex", "align-items": "center", gap: "4px",
                                             width: "100%", padding: "6px 6px 4px",
                                             background: "transparent", border: "none",
-                                            color: "#666", cursor: "pointer",
+                                            color: "var(--veil-text-faint)", cursor: "pointer",
                                             "text-align": "left",
                                             "font-family": "inherit",
                                             "font-size": "10px", "font-weight": "700",
                                             "letter-spacing": "0.08em", "text-transform": "uppercase",
                                             transition: "color 0.15s",
                                           }}
-                                          onMouseEnter={(e) => (e.currentTarget.style.color = "#bbb")}
-                                          onMouseLeave={(e) => (e.currentTarget.style.color = "#666")}
+                                          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--veil-text-muted)")}
+                                          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--veil-text-faint)")}
                                         >
                                           <ChevronDown
                                             size={10}
@@ -851,7 +1179,7 @@ const App: Component = () => {
                                                 setShowCreateChannel(true);
                                               }}
                                               style={{
-                                                "font-size": "14px", color: "#666",
+                                                "font-size": "14px", color: "var(--veil-text-faint)",
                                                 padding: "0 4px",
                                                 "line-height": "1",
                                               }}
@@ -873,20 +1201,20 @@ const App: Component = () => {
 
                       {/* User panel (same as home) */}
                       <div style={S.userPanel}>
-                        <div style={{ ...S.avatar(34), background: "rgba(124,107,245,0.15)", color: "#7c6bf5", "font-size": "11px", "font-weight": "800" }}>ME</div>
+                        <div style={{ ...S.avatar(34), background: "rgba(var(--veil-accent-rgb),0.15)", color: "var(--veil-accent)", "font-size": "11px", "font-weight": "800" }}>ME</div>
                         <div style={{ flex: "1", "min-width": "0" }}>
-                          <div style={{ "font-size": "12px", "font-weight": "500", color: "#bbb", "font-family": "monospace" }}>{shortId()}</div>
-                          <div style={{ "font-size": "10px", color: appStore.connected() ? "#34d399" : "#555", "margin-top": "1px" }}>
-                            {appStore.connected() ? "Online" : "Offline"}
+                          <div style={{ "font-size": "12px", "font-weight": "500", color: "var(--veil-text-muted)", "font-family": "monospace" }}>{shortId()}</div>
+                          <div style={{ "font-size": "10px", color: connectionColor(), "margin-top": "1px" }}>
+                            {connectionLabel()}
                           </div>
                         </div>
                         <button
-                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
+                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
                           onClick={() => appStore.setScreen("settings")}
                           title="Settings"
                         ><Settings size={15} strokeWidth={1.8} /></button>
                         <button
-                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
+                          style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
                           onClick={() => appStore.lock()}
                           title="Lock"
                         ><Lock size={14} strokeWidth={1.8} /></button>
@@ -904,22 +1232,19 @@ const App: Component = () => {
                 style={{
                   display: "flex", "align-items": "center", gap: "10px",
                   width: "100%", padding: "12px 20px", border: "none",
-                  background: showFriendsPanel() ? "rgba(124,107,245,0.1)" : "transparent",
-                  color: showFriendsPanel() ? "#7c6bf5" : "#999",
+                  background: showFriendsPanel() ? "rgba(var(--veil-accent-rgb),0.1)" : "transparent",
+                  color: showFriendsPanel() ? "var(--veil-accent)" : "var(--veil-text-muted)",
                   cursor: "pointer", "font-size": "13px", "font-weight": "600",
-                  "border-bottom": "1px solid rgba(255,255,255,0.04)",
+                  "border-bottom": "1px solid var(--veil-contrast-04)",
                   transition: "background 0.15s, color 0.15s",
                   "flex-shrink": "0",
                 }}
-                onClick={() => {
-                  setShowFriendsPanel(true);
-                  appStore.setActiveConversationId("");
-                }}
+                onClick={openFriends}
               >
                 <Users size={18} strokeWidth={1.8} />
                 Friends
                 <Show when={appStore.friendRequests().filter(r => !r.outgoing).length > 0}>
-                  <span style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "#7c6bf5", display: "inline-flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "#fff", "font-weight": "700", padding: "0 5px", "margin-left": "auto" }}>
+                  <span style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "var(--veil-accent)", display: "inline-flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "var(--veil-on-accent)", "font-weight": "700", padding: "0 5px", "margin-left": "auto" }}>
                     {appStore.friendRequests().filter(r => !r.outgoing).length}
                   </span>
                 </Show>
@@ -927,38 +1252,56 @@ const App: Component = () => {
 
               <div style={S.sidebarHeader}>
                 <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", "margin-bottom": "12px" }}>
-                  <span style={{ "font-size": "15px", "font-weight": "700", color: "#eee" }}>Messages</span>
+                  <span style={{ "font-size": "15px", "font-weight": "700", color: "var(--veil-text-strong)" }}>Messages</span>
                   <div style={{ display: "flex", gap: "4px" }}>
                     <button
-                      style={{ width: "26px", height: "26px", "border-radius": "6px", background: "rgba(255,255,255,0.04)", border: "none", color: "#888", cursor: "pointer", "font-size": "16px" }}
-                      onClick={() => { setShowNewDm(!showNewDm()); setShowNewGroup(false); }}
+                      type="button"
+                      aria-label="Start a direct message"
+                      style={{ height: "28px", padding: "0 8px", display: "inline-flex", "align-items": "center", gap: "4px", "border-radius": "7px", background: showNewDm() ? "rgba(var(--veil-accent-rgb),0.16)" : "var(--veil-contrast-04)", border: "none", color: showNewDm() ? "var(--veil-accent)" : "var(--veil-text-muted)", cursor: "pointer", "font-size": "10px", "font-weight": "650" }}
+                      onClick={toggleNewDm}
                       title="New DM"
-                    >+</button>
+                    ><MessageCircle size={12} strokeWidth={2} /> DM</button>
                     <button
-                      style={{ width: "26px", height: "26px", "border-radius": "6px", background: "rgba(255,255,255,0.04)", border: "none", color: "#888", cursor: "pointer", "font-size": "13px" }}
-                      onClick={() => { setShowNewGroup(!showNewGroup()); setShowNewDm(false); }}
+                      type="button"
+                      aria-label="Create an encrypted group"
+                      style={{ height: "28px", padding: "0 8px", display: "inline-flex", "align-items": "center", gap: "4px", "border-radius": "7px", background: showNewGroup() ? "rgba(var(--veil-accent-rgb),0.16)" : "var(--veil-contrast-04)", border: "none", color: showNewGroup() ? "var(--veil-accent)" : "var(--veil-text-muted)", cursor: "pointer", "font-size": "10px", "font-weight": "650" }}
+                      onClick={toggleNewGroup}
                       title="New Group"
-                    >{"\uD83D\uDC65"}</button>
+                    ><UserPlus size={12} strokeWidth={2} /> Group</button>
                   </div>
                 </div>
 
                 {/* Tabs: All / DM / Groups */}
-                <div style={{ display: "flex", gap: "2px", "margin-bottom": "10px", background: "#1E1F22", "border-radius": "8px", padding: "3px" }}>
+                <div style={{ display: "flex", gap: "2px", "margin-bottom": "10px", background: "var(--veil-window)", "border-radius": "8px", padding: "3px" }}>
                   <For each={[{ key: "all" as const, label: "All" }, { key: "dm" as const, label: "DMs" }, { key: "group" as const, label: "Groups" }]}>
                     {(t) => (
                       <button
                         style={{
                           flex: "1", padding: "5px 0", "border-radius": "6px", border: "none",
-                          background: sidebarTab() === t.key ? "rgba(124,107,245,0.15)" : "transparent",
-                          color: sidebarTab() === t.key ? "#7c6bf5" : "#666",
+                          background: sidebarTab() === t.key ? "rgba(var(--veil-accent-rgb),0.15)" : "transparent",
+                          color: sidebarTab() === t.key ? "var(--veil-accent)" : "var(--veil-text-faint)",
                           "font-size": "11px", "font-weight": "600", cursor: "pointer",
                           transition: "background 0.15s, color 0.15s",
                         }}
-                        onClick={() => setSidebarTab(t.key)}
+                        onClick={() => changeSidebarTab(t.key)}
                       >{t.label}</button>
                     )}
                   </For>
                 </div>
+
+                <Show when={sidebarTab() === "group" && !showNewGroup()}>
+                  <button
+                    type="button"
+                    onClick={toggleNewGroup}
+                    style={{
+                      width: "100%", height: "34px", "margin-bottom": "10px",
+                      display: "flex", "align-items": "center", "justify-content": "center", gap: "7px",
+                      "border-radius": "8px", border: "1px solid rgba(var(--veil-accent-rgb),0.22)",
+                      background: "rgba(var(--veil-accent-rgb),0.08)", color: "var(--veil-accent)",
+                      cursor: "pointer", "font-size": "11px", "font-weight": "650",
+                    }}
+                  ><UserPlus size={13} strokeWidth={2} /> Create encrypted group</button>
+                </Show>
 
                 <Show when={showNewDm()}>
                   <div style={{ display: "flex", gap: "8px", "margin-bottom": "10px" }}>
@@ -966,29 +1309,44 @@ const App: Component = () => {
                       style={{ ...S.searchBox, flex: "1" }}
                       placeholder="User ID..."
                       value={newPeerId()}
+                      disabled={creatingDm()}
                       onInput={(e) => setNewPeerId(e.currentTarget.value)}
                       onKeyDown={(e) => e.key === "Enter" && handleNewDm()}
                     />
                     <button
-                      style={{ height: "34px", padding: "0 12px", "border-radius": "8px", background: "#7c6bf5", border: "none", color: "#fff", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
+                      type="button"
+                      disabled={creatingDm() || !newPeerId().trim()}
+                      style={{ height: "34px", padding: "0 12px", "border-radius": "8px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", "font-size": "12px", "font-weight": "600", cursor: creatingDm() ? "wait" : "pointer", opacity: creatingDm() || !newPeerId().trim() ? "0.55" : "1" }}
                       onClick={handleNewDm}
-                    >Go</button>
+                    >{creatingDm() ? "Creating..." : "Go"}</button>
                   </div>
                 </Show>
 
                 <Show when={showNewGroup()}>
-                  <div style={{ display: "flex", gap: "8px", "margin-bottom": "10px" }}>
-                    <input
-                      style={{ ...S.searchBox, flex: "1" }}
-                      placeholder="Group name..."
-                      value={newGroupName()}
-                      onInput={(e) => setNewGroupName(e.currentTarget.value)}
-                      onKeyDown={(e) => e.key === "Enter" && handleNewGroup()}
-                    />
-                    <button
-                      style={{ height: "34px", padding: "0 12px", "border-radius": "8px", background: "#7c6bf5", border: "none", color: "#fff", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
-                      onClick={handleNewGroup}
-                    >Create</button>
+                  <div style={{ "margin-bottom": "10px" }}>
+                    <div style={{ display: "flex", gap: "8px" }}>
+                      <input
+                        ref={newGroupInputRef}
+                        aria-label="Encrypted group name"
+                        style={{ ...S.searchBox, flex: "1" }}
+                        placeholder="Encrypted group name..."
+                        value={newGroupName()}
+                        disabled={creatingGroup()}
+                        onInput={(e) => { setNewGroupName(e.currentTarget.value); setGroupCreateError(""); }}
+                        onKeyDown={(e) => e.key === "Enter" && void handleNewGroup()}
+                      />
+                      <button
+                        type="button"
+                        disabled={creatingGroup() || !newGroupName().trim()}
+                        style={{ height: "34px", padding: "0 12px", "border-radius": "8px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", "font-size": "12px", "font-weight": "600", cursor: creatingGroup() ? "wait" : "pointer", opacity: creatingGroup() || !newGroupName().trim() ? "0.55" : "1" }}
+                        onClick={() => void handleNewGroup()}
+                      >{creatingGroup() ? "Creating…" : "Create"}</button>
+                    </div>
+                    <Show when={groupCreateError()}>
+                      <div role="alert" style={{ "margin-top": "7px", color: "var(--veil-danger)", "font-size": "10px", "line-height": "1.35" }}>
+                        {groupCreateError()}
+                      </div>
+                    </Show>
                   </div>
                 </Show>
 
@@ -1004,16 +1362,16 @@ const App: Component = () => {
                 <Show
                   when={filtered().length > 0}
                   fallback={
-                    <div style={{ "text-align": "center", "padding-top": "40px", color: "#555" }}>
+                    <div style={{ "text-align": "center", "padding-top": "40px", color: "var(--veil-text-faint)" }}>
                       <p style={{ "font-size": "13px" }}>No conversations</p>
                       <div style={{ display: "flex", gap: "8px", "justify-content": "center", "margin-top": "8px" }}>
                         <button
-                          style={{ background: "none", border: "none", color: "#7c6bf5", "font-size": "12px", cursor: "pointer" }}
-                          onClick={() => setShowNewDm(true)}
+                          style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
+                          onClick={toggleNewDm}
                         >New DM {"\u2192"}</button>
                         <button
-                          style={{ background: "none", border: "none", color: "#7c6bf5", "font-size": "12px", cursor: "pointer" }}
-                          onClick={() => setShowNewGroup(true)}
+                          style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
+                          onClick={toggleNewGroup}
                         >New Group {"\u2192"}</button>
                       </div>
                     </div>
@@ -1027,38 +1385,38 @@ const App: Component = () => {
                         <ContextMenuTrigger>
                           <button
                             style={S.contactBtn(appStore.activeConversationId() === c.id)}
-                            onClick={() => { setShowFriendsPanel(false); appStore.selectConversation(c.id); }}
-                            onMouseEnter={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "rgba(255,255,255,0.03)"; }}
+                            onClick={() => openConversation(c.id)}
+                            onMouseEnter={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "var(--veil-contrast-03)"; }}
                             onMouseLeave={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "transparent"; }}
                           >
                             <div style={{
                               ...S.avatar(36),
                               "border-radius": c.type === "group" ? "10px" : "50%",
-                              background: c.type === "group" ? "rgba(124,107,245,0.12)" : "#36373D",
-                              color: c.type === "group" ? "#7c6bf5" : "#999",
+                              background: c.type === "group" ? "rgba(var(--veil-accent-rgb),0.12)" : "var(--veil-surface-raised)",
+                              color: c.type === "group" ? "var(--veil-accent)" : "var(--veil-text-muted)",
                             }}>
-                              {c.type === "group" ? "\uD83D\uDC65" : c.name.charAt(0).toUpperCase()}
+                              {c.type === "group" ? <Users size={16} strokeWidth={1.9} /> : c.name.charAt(0).toUpperCase()}
                             </div>
                             <div style={{ flex: "1", "min-width": "0" }}>
                               <div style={{ display: "flex", "align-items": "center", gap: "6px" }}>
                                 <span style={{ "font-size": "13px", "font-weight": "500", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{c.name}</span>
                                 <Show when={c.type === "group"}>
-                                  <span style={{ "font-size": "9px", "font-weight": "600", color: "#7c6bf5", background: "rgba(124,107,245,0.1)", padding: "1px 5px", "border-radius": "4px" }}>GRP</span>
+                                  <span style={{ "font-size": "9px", "font-weight": "600", color: "var(--veil-accent)", background: "rgba(var(--veil-accent-rgb),0.1)", padding: "1px 5px", "border-radius": "4px" }}>GRP</span>
                                 </Show>
                               </div>
                               <Show when={c.lastMessage}>
-                                <div style={{ "font-size": "11px", color: "#666", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "margin-top": "2px" }}>{c.lastMessage}</div>
+                                <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "margin-top": "2px" }}>{c.lastMessage}</div>
                               </Show>
                             </div>
                             <Show when={c.unreadCount > 0}>
-                              <div style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "#7c6bf5", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "#fff", "font-weight": "700", padding: "0 5px" }}>
+                              <div style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "var(--veil-accent)", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "var(--veil-on-accent)", "font-weight": "700", padding: "0 5px" }}>
                                 {c.unreadCount}
                               </div>
                             </Show>
                           </button>
                         </ContextMenuTrigger>
                         <ContextMenuContent>
-                          <ContextMenuItem onSelect={() => { setShowFriendsPanel(false); appStore.selectConversation(c.id); }}>
+                          <ContextMenuItem onSelect={() => openConversation(c.id)}>
                             <ContextMenuIcon><MessageSquare size={14} strokeWidth={2} /></ContextMenuIcon>
                             Open
                           </ContextMenuItem>
@@ -1087,49 +1445,49 @@ const App: Component = () => {
               </div>
 
               <div style={S.userPanel}>
-                <div style={{ ...S.avatar(34), background: "rgba(124,107,245,0.15)", color: "#7c6bf5", "font-size": "11px", "font-weight": "800" }}>ME</div>
+                <div style={{ ...S.avatar(34), background: "rgba(var(--veil-accent-rgb),0.15)", color: "var(--veil-accent)", "font-size": "11px", "font-weight": "800" }}>ME</div>
                 <div style={{ flex: "1", "min-width": "0" }}>
-                  <div style={{ "font-size": "12px", "font-weight": "500", color: "#bbb", "font-family": "monospace" }}>{shortId()}</div>
-                  <div style={{ "font-size": "10px", color: appStore.connected() ? "#34d399" : "#555", "margin-top": "1px" }}>
-                    {appStore.connected() ? "Online" : "Offline"}
+                  <div style={{ "font-size": "12px", "font-weight": "500", color: "var(--veil-text-muted)", "font-family": "monospace" }}>{shortId()}</div>
+                  <div style={{ "font-size": "10px", color: connectionColor(), "margin-top": "1px" }}>
+                    {connectionLabel()}
                   </div>
                 </div>
                 <button
-                  style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", "font-size": "14px" }}
+                  style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", "font-size": "14px" }}
                   onClick={() => appStore.setScreen("settings")}
                   title="Settings"
-                >{"\u2699\uFE0F"}</button>
+                ><Settings size={15} strokeWidth={1.9} /></button>
                 <button
-                  style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "#666", cursor: "pointer", "font-size": "13px" }}
+                  style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", "font-size": "13px" }}
                   onClick={() => appStore.lock()}
                   title="Lock"
-                >{"\uD83D\uDD12"}</button>
+                ><Lock size={14} strokeWidth={1.9} /></button>
               </div>
               </>
               </Show>
             </div>
 
             {/* ISLAND 3 — Chat or Friends */}
-            <div style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}>
+            <div class="veil-chat-island" style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}>
               <Show when={!showFriendsPanel()} fallback={<FriendsPanel onNavigate={() => setShowFriendsPanel(false)} />}>
               <Show when={conv()} fallback={
                 <div style={{ flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" }}>
-                  <div style={{ width: "56px", height: "56px", "border-radius": "16px", background: "rgba(124,107,245,0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" }}>
-                    <span style={{ "font-size": "24px", filter: "grayscale(0.3)" }}>{"\uD83D\uDEE1\uFE0F"}</span>
+                  <div style={{ width: "56px", height: "56px", "border-radius": "16px", background: "rgba(var(--veil-accent-rgb),0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" }}>
+                    <VeilMark size={24} style={{ color: "var(--veil-accent)" }} />
                   </div>
-                  <div style={{ "font-size": "16px", "font-weight": "500", color: "#aaa", "margin-bottom": "6px" }}>Veil Messenger</div>
-                  <div style={{ "font-size": "13px", color: "#555" }}>Select a conversation or start a new one</div>
+                  <div style={{ "font-size": "16px", "font-weight": "500", color: "var(--veil-text-muted)", "margin-bottom": "6px" }}>Veil Messenger</div>
+                  <div style={{ "font-size": "13px", color: "var(--veil-text-faint)" }}>Select a conversation or start a new one</div>
                   <div style={{ display: "flex", gap: "12px", "margin-top": "20px" }}>
                     <button
-                      style={{ padding: "8px 16px", "border-radius": "8px", background: "rgba(124,107,245,0.1)", border: "none", color: "#7c6bf5", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
-                      onClick={() => setShowNewDm(true)}
+                      style={{ padding: "8px 16px", "border-radius": "8px", background: "rgba(var(--veil-accent-rgb),0.1)", border: "none", color: "var(--veil-accent)", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
+                      onClick={toggleNewDm}
                     >New DM</button>
                     <button
-                      style={{ padding: "8px 16px", "border-radius": "8px", background: "rgba(124,107,245,0.1)", border: "none", color: "#7c6bf5", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
-                      onClick={() => setShowNewGroup(true)}
+                      style={{ padding: "8px 16px", "border-radius": "8px", background: "rgba(var(--veil-accent-rgb),0.1)", border: "none", color: "var(--veil-accent)", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
+                      onClick={toggleNewGroup}
                     >New Group</button>
                   </div>
-                  <div style={{ "font-size": "11px", color: "#444", "margin-top": "16px" }}>{"\uD83D\uDD12"} End-to-end encrypted</div>
+                  <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "16px", display: "inline-flex", "align-items": "center", gap: "5px" }}><Lock size={11} strokeWidth={2} /> End-to-end encrypted</div>
                 </div>
               }>
                 {(c) => (
@@ -1137,21 +1495,28 @@ const App: Component = () => {
                     <div style={S.chatHeader}>
                       <div style={{
                         ...S.avatar(32),
-                        "border-radius": c().type === "group" ? "10px" : "50%",
-                        background: c().type === "group" ? "rgba(124,107,245,0.12)" : "#36373D",
-                        color: c().type === "group" ? "#7c6bf5" : "#999",
+                        "border-radius": c().type !== "dm" ? "10px" : "50%",
+                        background: c().type !== "dm" ? "rgba(var(--veil-accent-rgb),0.12)" : "var(--veil-surface-raised)",
+                        color: c().type !== "dm" ? "var(--veil-accent)" : "var(--veil-text-muted)",
                       }}>
-                        {c().type === "group" ? "\uD83D\uDC65" : c().name.charAt(0).toUpperCase()}
+                        {c().type === "channel"
+                          ? <MessageSquare size={15} strokeWidth={1.9} />
+                          : c().type === "group"
+                            ? <Users size={15} strokeWidth={1.9} />
+                            : c().name.charAt(0).toUpperCase()}
                       </div>
                       <div style={{ flex: "1" }}>
-                        <div style={{ "font-size": "14px", "font-weight": "600", color: "#eee" }}>{c().name}</div>
-                        <div style={{ "font-size": "11px", color: "#555" }}>
-                          {c().type === "group" ? "\uD83D\uDD12 Encrypted group" : "\uD83D\uDD12 Encrypted"}
+                        <div style={{ "font-size": "14px", "font-weight": "600", color: "var(--veil-text-strong)" }}>{c().name}</div>
+                        <div style={{ "font-size": "11px", color: sendNotice() === "security" ? "var(--veil-warning)" : encryptionTone(), display: "flex", "align-items": "center", gap: "5px" }}>
+                          <Lock size={10} strokeWidth={2} />
+                          {sendNotice() === "security"
+                            ? "Encryption update pending"
+                            : encryptionLabel()}
                         </div>
                       </div>
                       <Show when={c().type === "group"}>
                         <button
-                          style={{ padding: "4px 10px", "border-radius": "6px", background: memberPanelOpen() ? "rgba(124,107,245,0.15)" : "rgba(255,255,255,0.04)", border: "none", color: memberPanelOpen() ? "#7c6bf5" : "#888", cursor: "pointer", "font-size": "11px", transition: "background 0.15s" }}
+                          style={{ padding: "4px 10px", "border-radius": "6px", background: memberPanelOpen() ? "rgba(var(--veil-accent-rgb),0.15)" : "var(--veil-contrast-04)", border: "none", color: memberPanelOpen() ? "var(--veil-accent)" : "var(--veil-text-muted)", cursor: "pointer", "font-size": "11px", transition: "background 0.15s" }}
                           onClick={async () => {
                             if (!memberPanelOpen()) {
                               try {
@@ -1172,15 +1537,15 @@ const App: Component = () => {
                             }
                           }}
                           title="Group members"
-                        >{"\uD83D\uDC65"} Members</button>
+                        ><Users size={12} strokeWidth={2} style={{ "margin-right": "5px", "vertical-align": "-2px" }} /> Members</button>
                       </Show>
                     </div>
 
-                    <div style={S.msgArea}>
+                    <div ref={messagesViewport} style={S.msgArea}>
                       <Show when={msgs().length === 0}>
                         <div style={{ "text-align": "center", "padding-top": "40px" }}>
-                          <div style={{ "font-size": "13px", color: "#555" }}>Start of conversation with {c().name}</div>
-                          <div style={{ "font-size": "11px", color: "#444", "margin-top": "6px" }}>{"\uD83D\uDD12"} End-to-end encrypted</div>
+                          <div style={{ "font-size": "13px", color: "var(--veil-text-faint)" }}>Start of conversation with {c().name}</div>
+                          <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "6px", display: "inline-flex", "align-items": "center", gap: "5px" }}><Lock size={11} strokeWidth={2} /> End-to-end encrypted</div>
                         </div>
                       </Show>
                       <For each={msgs()}>
@@ -1212,9 +1577,9 @@ const App: Component = () => {
                             }}>
                               <Show when={showDay()}>
                                 <div style={{ display: "flex", "align-items": "center", gap: "12px", margin: "20px 0 12px", padding: "0 8px" }}>
-                                  <div style={{ flex: "1", height: "1px", background: "rgba(255,255,255,0.04)" }} />
-                                  <span style={{ "font-size": "10px", color: "#555", "font-weight": "600", "white-space": "nowrap" }}>{dayLabel()}</span>
-                                  <div style={{ flex: "1", height: "1px", background: "rgba(255,255,255,0.04)" }} />
+                                  <div style={{ flex: "1", height: "1px", background: "var(--veil-contrast-04)" }} />
+                                  <span style={{ "font-size": "10px", color: "var(--veil-text-faint)", "font-weight": "600", "white-space": "nowrap" }}>{dayLabel()}</span>
+                                  <div style={{ flex: "1", height: "1px", background: "var(--veil-contrast-04)" }} />
                                 </div>
                               </Show>
                               <ContextMenu>
@@ -1226,8 +1591,8 @@ const App: Component = () => {
                                     <div style={{ flex: "1", "min-width": "0" }}>
                                       <Show when={gap()}>
                                         <div style={{ display: "flex", "align-items": "baseline", gap: "8px", "margin-bottom": "3px" }}>
-                                          <span style={{ "font-size": "13px", "font-weight": "600", color: msg.isOwn ? "#7c6bf5" : "#ddd" }}>{msg.senderName}</span>
-                                          <span style={{ "font-size": "10px", color: "#555", "font-family": "monospace" }}>{time()}</span>
+                                          <span style={{ "font-size": "13px", "font-weight": "600", color: msg.isOwn ? "var(--veil-accent)" : "var(--veil-text)" }}>{msg.senderName}</span>
+                                          <span style={{ "font-size": "10px", color: "var(--veil-text-faint)", "font-family": "monospace" }}>{time()}</span>
                                         </div>
                                       </Show>
                                       <Show when={msg.replyToId}>
@@ -1238,24 +1603,35 @@ const App: Component = () => {
                                               style={{
                                                 display: "flex", "align-items": "center", gap: "8px",
                                                 padding: "4px 10px", "margin-bottom": "4px",
-                                                "border-left": "2px solid #7c6bf5",
-                                                background: "rgba(124,107,245,0.06)", "border-radius": "0 6px 6px 0",
+                                                "border-left": "2px solid var(--veil-accent)",
+                                                background: "rgba(var(--veil-accent-rgb),0.06)", "border-radius": "0 6px 6px 0",
                                                 cursor: "pointer",
                                               }}
                                               onClick={() => {
                                                 const el = document.getElementById(`msg-${msg.replyToId}`);
                                                 if (el) {
-                                                  el.scrollIntoView({ behavior: "smooth", block: "center" });
-                                                  el.style.background = "rgba(124,107,245,0.12)";
+                                                  const viewport = messagesViewport;
+                                                  if (viewport) {
+                                                    const viewportRect = viewport.getBoundingClientRect();
+                                                    const messageRect = el.getBoundingClientRect();
+                                                    viewport.scrollTo({
+                                                      top: viewport.scrollTop
+                                                        + messageRect.top
+                                                        - viewportRect.top
+                                                        - ((viewportRect.height - messageRect.height) / 2),
+                                                      behavior: "smooth",
+                                                    });
+                                                  }
+                                                  el.style.background = "rgba(var(--veil-accent-rgb),0.12)";
                                                   setTimeout(() => { el.style.background = ""; }, 1500);
                                                 }
                                               }}
                                             >
-                                              <Reply size={12} color="#7c6bf5" strokeWidth={2} style={{ "flex-shrink": "0" }} />
-                                              <span style={{ "font-size": "11px", color: "#7c6bf5", "font-weight": "600", "flex-shrink": "0" }}>
+                                              <Reply size={12} color="var(--veil-accent)" strokeWidth={2} style={{ "flex-shrink": "0" }} />
+                                              <span style={{ "font-size": "11px", color: "var(--veil-accent)", "font-weight": "600", "flex-shrink": "0" }}>
                                                 {ref()?.senderName ?? "..."}
                                               </span>
-                                              <span style={{ "font-size": "11px", color: "#888", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                                              <span style={{ "font-size": "11px", color: "var(--veil-text-muted)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
                                                 {ref()?.text ?? "Message not found"}
                                               </span>
                                             </div>
@@ -1269,7 +1645,7 @@ const App: Component = () => {
                                               <div style={{
                                                 "font-size": "40px",
                                                 "line-height": "1.2",
-                                                color: "#ccc", "word-break": "break-word", "user-select": "text",
+                                                color: "var(--veil-text)", "word-break": "break-word", "user-select": "text",
                                               }}>{msg.text}</div>
                                             }
                                           >
@@ -1278,7 +1654,7 @@ const App: Component = () => {
                                               style={{
                                                 "font-size": "13.5px",
                                                 "line-height": "1.55",
-                                                color: "#ccc", "word-break": "break-word", "user-select": "text",
+                                                color: "var(--veil-text)", "word-break": "break-word", "user-select": "text",
                                               }}
                                             />
                                           </Show>
@@ -1287,8 +1663,8 @@ const App: Component = () => {
                                         <div style={{ display: "flex", gap: "8px", "align-items": "center" }}>
                                           <input
                                             style={{
-                                              flex: "1", background: "#383A40", border: "1px solid #7c6bf5",
-                                              "border-radius": "8px", padding: "6px 10px", color: "#ddd",
+                                              flex: "1", background: "var(--veil-composer)", border: "1px solid var(--veil-accent)",
+                                              "border-radius": "8px", padding: "6px 10px", color: "var(--veil-text)",
                                               "font-size": "13px", outline: "none",
                                             }}
                                             value={editText()}
@@ -1300,17 +1676,43 @@ const App: Component = () => {
                                             ref={(el) => setTimeout(() => el.focus(), 0)}
                                           />
                                           <button
-                                            style={{ padding: "4px 10px", "border-radius": "6px", background: "#7c6bf5", border: "none", color: "#fff", "font-size": "11px", "font-weight": "600", cursor: "pointer" }}
+                                            style={{ padding: "4px 10px", "border-radius": "6px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", "font-size": "11px", "font-weight": "600", cursor: "pointer" }}
                                             onClick={handleEditSave}
                                           >Save</button>
                                           <button
-                                            style={{ padding: "4px 10px", "border-radius": "6px", background: "transparent", border: "1px solid #555", color: "#888", "font-size": "11px", cursor: "pointer" }}
+                                            style={{ padding: "4px 10px", "border-radius": "6px", background: "transparent", border: "1px solid var(--veil-text-faint)", color: "var(--veil-text-muted)", "font-size": "11px", cursor: "pointer" }}
                                             onClick={() => setEditingMessage(null)}
                                           >Esc</button>
                                         </div>
                                       </Show>
                                       <Show when={msg.pending}>
-                                        <div style={{ "font-size": "10px", color: "#777", "margin-top": "2px" }}>Sending…</div>
+                                        <div style={{ "font-size": "10px", color: "var(--veil-text-subtle)", "margin-top": "2px" }}>Sending…</div>
+                                      </Show>
+                                      <Show when={msg.failed}>
+                                        <div
+                                          role="alert"
+                                          style={{
+                                            display: "flex", "align-items": "center", gap: "8px", "flex-wrap": "wrap",
+                                            "font-size": "10px", color: "var(--veil-danger)", "margin-top": "5px",
+                                          }}
+                                        >
+                                          <span>Not sent · kept locally</span>
+                                          <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-accent)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => restoreFailedDraft(msg)}>Restore draft</button>
+                                          <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-contrast-45)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => void deleteLocalMessageCopy(msg)}>Delete local copy</button>
+                                        </div>
+                                      </Show>
+                                      <Show when={msg.deliveryUnknown}>
+                                        <div
+                                          role="alert"
+                                          style={{
+                                            display: "flex", "align-items": "center", gap: "8px", "flex-wrap": "wrap",
+                                            "font-size": "10px", color: "var(--veil-warning)", "margin-top": "5px",
+                                          }}
+                                        >
+                                          <span>Delivery unknown · it may already have arrived</span>
+                                          <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-accent)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => restoreFailedDraft(msg)}>Copy to composer</button>
+                                          <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-contrast-45)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => void deleteLocalMessageCopy(msg)}>Delete local copy</button>
+                                        </div>
                                       </Show>
                                       {/* Reaction pills */}
                                       {(() => {
@@ -1324,19 +1726,22 @@ const App: Component = () => {
                                                   const isOwn = () => users.some((u) => u.userId === appStore.userId());
                                                   return (
                                                     <button
+                                                      type="button"
+                                                      disabled={isLocalOnlyMessage(msg)}
                                                       onClick={() => appStore.toggleReaction(msg.id, emoji)}
                                                       style={{
                                                         display: "inline-flex", "align-items": "center", gap: "4px",
                                                         padding: "2px 8px", "border-radius": "10px",
-                                                        background: isOwn() ? "rgba(124,107,245,0.2)" : "rgba(255,255,255,0.06)",
-                                                        border: isOwn() ? "1px solid rgba(124,107,245,0.4)" : "1px solid transparent",
-                                                        cursor: "pointer", "font-size": "12px", color: "#ccc",
+                                                        background: isOwn() ? "rgba(var(--veil-accent-rgb),0.2)" : "var(--veil-contrast-06)",
+                                                        border: isOwn() ? "1px solid rgba(var(--veil-accent-rgb),0.4)" : "1px solid transparent",
+                                                        cursor: isLocalOnlyMessage(msg) ? "not-allowed" : "pointer", "font-size": "12px", color: "var(--veil-text)",
+                                                        opacity: isLocalOnlyMessage(msg) ? "0.5" : "1",
                                                         transition: "background 0.15s, border 0.15s",
                                                       }}
                                                       title={users.map((u) => u.username).join(", ")}
                                                     >
                                                       <span>{emoji}</span>
-                                                      <span style={{ "font-size": "10px", color: isOwn() ? "#7c6bf5" : "#888" }}>{users.length}</span>
+                                                      <span style={{ "font-size": "10px", color: isOwn() ? "var(--veil-accent)" : "var(--veil-text-muted)" }}>{users.length}</span>
                                                     </button>
                                                   );
                                                 }}
@@ -1354,14 +1759,18 @@ const App: Component = () => {
                                     <For each={["👍", "❤️", "😂", "😮", "😢", "🔥", "👎"]}>
                                       {(emoji) => (
                                         <button
+                                          type="button"
+                                          disabled={isLocalOnlyMessage(msg)}
                                           onClick={() => appStore.toggleReaction(msg.id, emoji)}
                                           style={{
                                             width: "28px", height: "28px", "border-radius": "6px",
-                                            background: "transparent", border: "none", cursor: "pointer",
+                                            background: "transparent", border: "none",
+                                            cursor: isLocalOnlyMessage(msg) ? "not-allowed" : "pointer",
+                                            opacity: isLocalOnlyMessage(msg) ? "0.45" : "1",
                                             "font-size": "16px", display: "flex", "align-items": "center",
                                             "justify-content": "center", transition: "background 0.15s",
                                           }}
-                                          onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.08)"; }}
+                                          onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-08)"; }}
                                           onMouseLeave={(e) => { e.currentTarget.style.background = "transparent"; }}
                                         >
                                           {emoji}
@@ -1370,14 +1779,14 @@ const App: Component = () => {
                                     </For>
                                   </div>
                                   <ContextMenuSeparator />
-                                  <ContextMenuItem disabled={msg.pending} onSelect={() => setReplyingTo(msg)}>
+                                  <ContextMenuItem disabled={isLocalOnlyMessage(msg)} onSelect={() => setReplyingTo(msg)}>
                                     <ContextMenuIcon>
                                       <Reply size={16} strokeWidth={2} />
                                     </ContextMenuIcon>
                                     Reply
                                   </ContextMenuItem>
                                   <Show when={msg.isOwn}>
-                                    <ContextMenuItem disabled={msg.pending} onSelect={() => startEdit(msg)}>
+                                    <ContextMenuItem disabled={isLocalOnlyMessage(msg)} onSelect={() => startEdit(msg)}>
                                       <ContextMenuIcon>
                                         <Pencil size={16} strokeWidth={2} />
                                       </ContextMenuIcon>
@@ -1392,7 +1801,7 @@ const App: Component = () => {
                                     Copy text
                                     <ContextMenuShortcut>⌘C</ContextMenuShortcut>
                                   </ContextMenuItem>
-                                  <ContextMenuItem disabled={msg.pending} onSelect={() => navigator.clipboard.writeText(msg.id)}>
+                                  <ContextMenuItem disabled={isLocalOnlyMessage(msg)} onSelect={() => navigator.clipboard.writeText(msg.id)}>
                                     <ContextMenuIcon>
                                       <Link2 size={16} strokeWidth={2} />
                                     </ContextMenuIcon>
@@ -1400,7 +1809,7 @@ const App: Component = () => {
                                   </ContextMenuItem>
                                   <Show when={msg.isOwn}>
                                     <ContextMenuSeparator />
-                                    <ContextMenuItem disabled={msg.pending} variant="danger" onSelect={() => handleDelete(msg)}>
+                                    <ContextMenuItem disabled={isLocalOnlyMessage(msg)} variant="danger" onSelect={() => handleDelete(msg)}>
                                       <ContextMenuIcon>
                                         <Trash2 size={16} strokeWidth={2} />
                                       </ContextMenuIcon>
@@ -1413,7 +1822,6 @@ const App: Component = () => {
                           );
                         }}
                       </For>
-                      <div ref={messagesEnd} />
                     </div>
 
                     {(() => {
@@ -1434,32 +1842,58 @@ const App: Component = () => {
                         }}>
                           <div style={{ display: "flex", "align-items": "center", gap: "6px" }}>
                             <span style={{ display: "inline-flex", gap: "2px" }}>
-                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "#7c6bf5", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "0ms" }} />
-                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "#7c6bf5", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "200ms" }} />
-                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "#7c6bf5", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "400ms" }} />
+                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "var(--veil-accent)", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "0ms" }} />
+                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "var(--veil-accent)", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "200ms" }} />
+                              <span class="typing-dot" style={{ width: "4px", height: "4px", "border-radius": "50%", background: "var(--veil-accent)", animation: "typingBounce 1.2s ease-in-out infinite", "animation-delay": "400ms" }} />
                             </span>
-                            <span style={{ "font-size": "11px", color: "#888" }}>{label()}</span>
+                            <span style={{ "font-size": "11px", color: "var(--veil-text-muted)" }}>{label()}</span>
                           </div>
                         </div>
                       );
                     })()}
 
                     <div style={S.inputWrap}>
+                      <Show when={sendNotice()}>
+                        {(notice) => (
+                          <div
+                            id="message-send-status"
+                            role={notice() === "error" ? "alert" : "status"}
+                            aria-live="polite"
+                            style={{
+                              display: "flex",
+                              "align-items": "center",
+                              gap: "7px",
+                              padding: "8px 12px",
+                              "margin-bottom": "8px",
+                              "border-radius": "9px",
+                              background: notice() === "security" ? "var(--veil-warning-surface)" : "var(--veil-danger-surface)",
+                              border: `1px solid ${notice() === "security" ? "var(--veil-warning-border)" : "var(--veil-danger-border)"}`,
+                              color: notice() === "security" ? "var(--veil-warning)" : "var(--veil-danger-text)",
+                              "font-size": "11px",
+                            }}
+                          >
+                            {notice() === "security" ? <Lock size={12} strokeWidth={2} /> : <Shield size={12} strokeWidth={2} />}
+                            {notice() === "security"
+                              ? `The ${c().type === "channel" ? "channel" : "group"} key update is being durably queued for the current roster. Your draft is safe; try Send again shortly.`
+                              : "Message not sent. Your draft was kept; check the connection and try again."}
+                          </div>
+                        )}
+                      </Show>
                       <Show when={replyingTo()}>
                         {(reply) => (
                           <div style={{
                             display: "flex", "align-items": "center", gap: "10px",
                             padding: "8px 16px", "margin-bottom": "8px",
-                            background: "rgba(124,107,245,0.06)", "border-radius": "10px",
-                            "border-left": "3px solid #7c6bf5",
+                            background: "rgba(var(--veil-accent-rgb),0.06)", "border-radius": "10px",
+                            "border-left": "3px solid var(--veil-accent)",
                           }}>
-                            <Reply size={14} color="#7c6bf5" strokeWidth={2} style={{ "flex-shrink": "0" }} />
+                            <Reply size={14} color="var(--veil-accent)" strokeWidth={2} style={{ "flex-shrink": "0" }} />
                             <div style={{ flex: "1", "min-width": "0" }}>
-                              <div style={{ "font-size": "11px", "font-weight": "600", color: "#7c6bf5" }}>{reply().senderName}</div>
-                              <div style={{ "font-size": "12px", color: "#888", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{reply().text}</div>
+                              <div style={{ "font-size": "11px", "font-weight": "600", color: "var(--veil-accent)" }}>{reply().senderName}</div>
+                              <div style={{ "font-size": "12px", color: "var(--veil-text-muted)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{reply().text}</div>
                             </div>
                             <button
-                              style={{ width: "20px", height: "20px", "border-radius": "4px", background: "transparent", border: "none", color: "#666", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center", "flex-shrink": "0" }}
+                              style={{ width: "20px", height: "20px", "border-radius": "4px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center", "flex-shrink": "0" }}
                               onClick={() => setReplyingTo(null)}
                             >
                               <X size={14} strokeWidth={2} />
@@ -1467,12 +1901,15 @@ const App: Component = () => {
                           </div>
                         )}
                       </Show>
-                      <div style={S.inputBar}>
+                      <div class="veil-message-composer" style={S.inputBar}>
                         <textarea
+                          class="veil-message-composer-input"
                           ref={inputRef}
                           style={S.inputField}
                           placeholder={`Message ${c().name}...`}
                           value={inputText()}
+                          disabled={sendBusy()}
+                          aria-describedby={sendNotice() ? "message-send-status" : undefined}
                           maxLength={MAX_MSG_LEN}
                           rows={1}
                           onInput={(e) => {
@@ -1485,9 +1922,7 @@ const App: Component = () => {
                           onKeyDown={(e) => {
                             if (e.key === "Enter" && !e.shiftKey) {
                               e.preventDefault();
-                              handleSend();
-                              /* Reset height after send */
-                              if (inputRef) inputRef.style.height = "21px";
+                              void handleSend();
                             }
                           }}
                           onPaste={(e) => {
@@ -1500,31 +1935,39 @@ const App: Component = () => {
                           }}
                         />
                         <Show when={inputText().length > MAX_MSG_LEN * 0.9}>
-                          <span style={{ "font-size": "10px", color: inputText().length >= MAX_MSG_LEN ? "#f44" : "#666", "font-family": "monospace", "flex-shrink": "0", "margin-right": "4px" }}>
+                          <span style={{ "font-size": "10px", color: inputText().length >= MAX_MSG_LEN ? "var(--veil-danger-text)" : "var(--veil-text-faint)", "font-family": "monospace", "flex-shrink": "0", "margin-right": "4px" }}>
                             {inputText().length}/{MAX_MSG_LEN}
                           </span>
                         </Show>
-                        <EmojiPicker onSelect={(emoji) => {
-                          const el = inputRef;
-                          if (el) {
-                            const start = el.selectionStart ?? inputText().length;
-                            const end = el.selectionEnd ?? start;
-                            const val = inputText();
-                            const next = val.slice(0, start) + emoji + val.slice(end);
-                            if (next.length <= MAX_MSG_LEN) {
-                              setInputText(next);
-                              /* Restore cursor after emoji */
-                              requestAnimationFrame(() => {
-                                const pos = start + emoji.length;
-                                el.setSelectionRange(pos, pos);
-                                el.focus();
-                              });
+                        <div style={{ "pointer-events": sendBusy() ? "none" : "auto", opacity: sendBusy() ? "0.55" : "1" }}>
+                          <EmojiPicker onSelect={(emoji) => {
+                            const el = inputRef;
+                            if (el) {
+                              const start = el.selectionStart ?? inputText().length;
+                              const end = el.selectionEnd ?? start;
+                              const val = inputText();
+                              const next = val.slice(0, start) + emoji + val.slice(end);
+                              if (next.length <= MAX_MSG_LEN) {
+                                setInputText(next);
+                                /* Restore cursor after emoji */
+                                requestAnimationFrame(() => {
+                                  const pos = start + emoji.length;
+                                  el.setSelectionRange(pos, pos);
+                                  el.focus();
+                                });
+                              }
+                            } else {
+                              setInputText(inputText() + emoji);
                             }
-                          } else {
-                            setInputText(inputText() + emoji);
-                          }
-                        }} />
-                        <button style={S.sendBtn(!!inputText().trim() && inputText().length <= MAX_MSG_LEN)} onClick={handleSend}>{"\u27A4"}</button>
+                          }} />
+                        </div>
+                        <button
+                          type="button"
+                          style={S.sendBtn(!!inputText().trim() && inputText().length <= MAX_MSG_LEN && !sendBusy())}
+                          disabled={sendBusy() || !inputText().trim() || inputText().length > MAX_MSG_LEN}
+                          aria-label={sendBusy() ? "Sending message" : "Send message"}
+                          onClick={() => void handleSend()}
+                        ><Send size={14} strokeWidth={2.2} /></button>
                       </div>
                     </div>
 
@@ -1536,182 +1979,37 @@ const App: Component = () => {
             </div>
 
             {/* ISLAND 4 — Members Panel */}
-            <div style={{
-              width: memberPanelOpen() ? "240px" : "0px",
-              "margin-left": memberPanelOpen() ? "0px" : "-8px",
-              "flex-shrink": "0",
-              overflow: "hidden",
-              transition: "width 0.4s cubic-bezier(0.4,0,0.2,1), margin-left 0.4s cubic-bezier(0.4,0,0.2,1)",
-            }}>
-              <div style={{
-                width: "240px",
-                height: "100%",
-                background: "#2B2D31",
-                "border-radius": "12px",
-                display: "flex",
-                "flex-direction": "column",
-                overflow: "hidden",
-                opacity: island4Vis() ? "1" : "0",
-                transform: island4Vis() ? "translateY(0) scale(1)" : "translateY(12px) scale(0.97)",
-                transition: "opacity 0.4s ease 0.15s, transform 0.4s ease 0.15s",
-              }}>
-                <div style={{ display: "flex", "flex-direction": "column", flex: "1", "min-height": "0" }}>
-                  {(() => {
-                    const sid = () => appStore.activeServerId();
-                    const inServer = () => !!sid();
-                    const ownerId = () => appStore.servers().find((s) => s.id === sid())?.ownerId;
-                    const meId = () => appStore.userId();
-                    const iAmOwner = () => !!ownerId() && ownerId() === meId();
-                    const rolesForServer = () => (sid() ? (appStore.serverRoles()[sid()!] ?? []) : []);
-                    type Row =
-                      | { kind: "server"; userId: string; username: string; roleIds: string[]; isOwner: boolean }
-                      | { kind: "group"; username: string; role: number };
-                    const rows = (): Row[] => inServer()
-                      ? (appStore.serverMembers()[sid()!] ?? []).map((m): Row => ({
-                          kind: "server",
-                          userId: m.userId,
-                          username: m.nickname || m.username,
-                          roleIds: m.roleIds,
-                          isOwner: m.userId === ownerId(),
-                        }))
-                      : groupMembers().map((m): Row => ({ kind: "group", username: m.username, role: m.role }));
-                    const total = () => rows().length;
-
-                    const renderAvatarRow = (username: string, badgeText?: string, badgeColor?: string) => (
-                      <div style={{ display: "flex", "align-items": "center", gap: "10px", padding: "8px 6px", "border-radius": "8px", cursor: "default", transition: "background 0.12s" }}
-                        onMouseEnter={(e) => (e.currentTarget.style.background = "rgba(255,255,255,0.03)")}
-                        onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
-                      >
-                        <div style={{ ...S.avatar(30), "font-size": "11px" }}>{username.charAt(0).toUpperCase()}</div>
-                        <div style={{ flex: "1", "min-width": "0" }}>
-                          <div style={{ "font-size": "12px", "font-weight": "500", color: "#ddd", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{username}</div>
-                          <Show when={badgeText}>
-                            <div style={{ "font-size": "9px", color: badgeColor ?? "#7c6bf5", "font-weight": "600" }}>{badgeText}</div>
-                          </Show>
-                        </div>
-                      </div>
-                    );
-
-                    return (
-                      <>
-                        {/* Header */}
-                        <div style={{ padding: "16px 16px 14px", "border-bottom": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" }}>
-                          <div style={{ "font-size": "12px", "font-weight": "700", color: "#eee", "text-transform": "uppercase", "letter-spacing": "0.05em" }}>
-                            Members — {total()}
-                          </div>
-                        </div>
-                        {/* List */}
-                        <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 12px", "min-height": "0" }}>
-                          <For each={rows()}>
-                            {(m) => {
-                              if (m.kind === "group") {
-                                return renderAvatarRow(
-                                  m.username,
-                                  m.role > 0 ? (m.role === 2 ? "OWNER" : "ADMIN") : undefined,
-                                  m.role === 2 ? "#f59e0b" : "#7c6bf5",
-                                );
-                              }
-                              const isMe = () => m.userId === meId();
-                              const canKick = () => iAmOwner() && !isMe() && !m.isOwner;
-                              const canManageRoles = () => iAmOwner() && !m.isOwner;
-                              return (
-                                <ContextMenu>
-                                  <ContextMenuTrigger>
-                                    {renderAvatarRow(
-                                      m.username,
-                                      m.isOwner ? "OWNER" : undefined,
-                                      m.isOwner ? "#f59e0b" : "#7c6bf5",
-                                    )}
-                                  </ContextMenuTrigger>
-                                  <ContextMenuContent>
-                                    <Show when={!isMe()}>
-                                      <ContextMenuItem onSelect={() => { appStore.createDm(m.userId, m.username); }}>
-                                        <ContextMenuIcon>{"\uD83D\uDCAC"}</ContextMenuIcon>
-                                        Message
-                                      </ContextMenuItem>
-                                    </Show>
-                                    <ContextMenuItem onSelect={() => { void navigator.clipboard.writeText(m.userId); }}>
-                                      <ContextMenuIcon>{"\uD83D\uDCCB"}</ContextMenuIcon>
-                                      Copy User ID
-                                      <ContextMenuShortcut>{m.userId.slice(0, 6)}…</ContextMenuShortcut>
-                                    </ContextMenuItem>
-
-                                    <Show when={canManageRoles() && rolesForServer().length > 0}>
-                                      <ContextMenuSeparator />
-                                      <ContextMenuSub>
-                                        <ContextMenuSubTrigger>
-                                          <ContextMenuIcon>{"\uD83C\uDFAD"}</ContextMenuIcon>
-                                          Roles
-                                        </ContextMenuSubTrigger>
-                                        <ContextMenuSubContent>
-                                          <For each={rolesForServer().filter((r) => !r.isDefault)}>
-                                            {(r) => {
-                                              const assigned = () => m.roleIds.includes(r.id);
-                                              return (
-                                                <ContextMenuCheckboxItem
-                                                  checked={assigned()}
-                                                  onChange={(v) => {
-                                                    if (v) appStore.assignRole(sid()!, m.userId, r.id);
-                                                    else appStore.unassignRole(sid()!, m.userId, r.id);
-                                                  }}
-                                                >
-                                                  <span style={{
-                                                    display: "inline-block", width: "8px", height: "8px",
-                                                    "border-radius": "50%", "margin-right": "8px",
-                                                    background: r.color != null ? `#${(r.color & 0xffffff).toString(16).padStart(6, "0")}` : "#666",
-                                                  }} />
-                                                  {r.name}
-                                                </ContextMenuCheckboxItem>
-                                              );
-                                            }}
-                                          </For>
-                                        </ContextMenuSubContent>
-                                      </ContextMenuSub>
-                                    </Show>
-
-                                    <Show when={canKick()}>
-                                      <ContextMenuSeparator />
-                                      <ContextMenuItem
-                                        variant="danger"
-                                        onSelect={() => {
-                                          if (confirm(`Kick ${m.username} from the server?`)) {
-                                            appStore.kickMember(sid()!, m.userId);
-                                          }
-                                        }}
-                                      >
-                                        <ContextMenuIcon>{"\u2717"}</ContextMenuIcon>
-                                        Kick
-                                      </ContextMenuItem>
-                                    </Show>
-                                  </ContextMenuContent>
-                                </ContextMenu>
-                              );
-                            }}
-                          </For>
-                          <Show when={total() === 0}>
-                            <div style={{ "text-align": "center", padding: "20px 0", color: "#555", "font-size": "12px" }}>No members loaded</div>
-                          </Show>
-                        </div>
-                        {/* Invite button */}
-                        <Show when={inServer()}>
-                          <div style={{ padding: "12px", "border-top": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" }}>
-                            <button
-                              style={{
-                                width: "100%", padding: "8px", "border-radius": "8px",
-                                background: "rgba(124,107,245,0.1)", border: "none",
-                                color: "#7c6bf5", "font-size": "11px", "font-weight": "600",
-                                cursor: "pointer",
-                              }}
-                              onClick={() => setShowCreateInvite(true)}
-                            >+ Invite member</button>
-                          </div>
-                        </Show>
-                      </>
-                    );
-                  })()}
-                </div>
-              </div>
-            </div>
+            <MembersIsland
+              open={memberPanelOpen()}
+              visible={island4Vis()}
+              serverId={appStore.activeServerId()}
+              serverOwnerId={appStore.servers().find((server) => server.id === appStore.activeServerId())?.ownerId}
+              currentUserId={appStore.userId()}
+              serverMembers={appStore.activeServerId()
+                ? (appStore.serverMembers()[appStore.activeServerId()!] ?? [])
+                : []}
+              serverRoles={appStore.activeServerId()
+                ? (appStore.serverRoles()[appStore.activeServerId()!] ?? [])
+                : []}
+              groupMembers={groupMembers()}
+              onCreateDm={(userId, username) => {
+                void appStore.createDm(userId, username).catch((error) => {
+                  toast.error("Conversation not created", String(error).replace(/^Error:\s*/, ""));
+                });
+              }}
+              onAssignRole={(serverId, userId, roleId) => {
+                void appStore.assignRole(serverId, userId, roleId);
+              }}
+              onUnassignRole={(serverId, userId, roleId) => {
+                void appStore.unassignRole(serverId, userId, roleId);
+              }}
+              onKickMember={(serverId, userId, username) => {
+                if (confirm(`Kick ${username} from the server?`)) {
+                  void appStore.kickMember(serverId, userId);
+                }
+              }}
+              onInviteMember={() => setShowCreateInvite(true)}
+            />
 
           </div>
         </Match>
@@ -1732,7 +2030,7 @@ const App: Component = () => {
       {/* Phase 1: global toast viewport (Kobalte-backed). */}
       <ToastViewport />
       {/* Phase 2: Cmd/Ctrl+K command palette (Tantivy local search). */}
-      <CommandPalette open={cmdkOpen()} onClose={() => setCmdkOpen(false)} />
+      <CommandPalette open={cmdkOpen()} onClose={() => setCmdkOpen(false)} onNavigate={openSearchResult} />
     </div>
   );
 };

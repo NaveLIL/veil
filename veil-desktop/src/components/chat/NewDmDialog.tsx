@@ -20,16 +20,12 @@ export const NewDmDialog: Component<Props> = (props) => {
     setLoading(true);
     setError("");
     try {
-      const convId = await appStore.createDm(id, peerName().trim() || undefined);
-      if (convId) {
-        props.onClose();
-        setPeerId("");
-        setPeerName("");
-      } else {
-        setError("Failed to create conversation");
-      }
+      await appStore.createDm(id, peerName().trim() || undefined);
+      props.onClose();
+      setPeerId("");
+      setPeerName("");
     } catch (e) {
-      setError(String(e));
+      setError(String(e).replace(/^Error:\s*/, ""));
     } finally {
       setLoading(false);
     }

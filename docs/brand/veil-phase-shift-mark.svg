@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="#A78BFA" role="img" aria-labelledby="title desc">
+  <title id="title">Veil Phase Shift mark</title>
+  <desc id="desc">Six vertical fragments separated by one shifted diagonal seam.</desc>
+  <path d="M4 4H8V11.8L4 13Z"/>
+  <path d="M4 16L8 14.8V20H4Z"/>
+  <path d="M10 2H14V10.5L10 11.7Z"/>
+  <path d="M10 14.7L14 13.5V22H10Z"/>
+  <path d="M16 5H20V8.2L16 9.4Z"/>
+  <path d="M16 12.4L20 11.2V19H16Z"/>
+</svg>

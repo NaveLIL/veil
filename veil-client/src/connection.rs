@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{protocol::WebSocketConfig, Message as WsMessage},
@@ -15,6 +16,9 @@ use zeroize::Zeroize;
 use veil_crypto::signature;
 use veil_crypto::IdentityKeyPair;
 
+use crate::device_identity::{
+    DeviceBindingPublicV1, DeviceIdentityV1, DEVICE_BINDING_STATUS_ACTIVE,
+};
 use crate::protocol::proto;
 
 const MAX_RETAINED_SKDM_EVENTS: usize = 4_096;
@@ -74,6 +78,37 @@ fn websocket_auth_signature(
     shared.zeroize();
     proof.zeroize();
     Ok(signature)
+}
+
+fn validate_per_device_auth_result(
+    result: &proto::AuthResult,
+    expected: &DeviceBindingPublicV1,
+) -> Result<String, String> {
+    if !result.success {
+        return Err(format!(
+            "auth failed: {}",
+            result.error_message.clone().unwrap_or_default()
+        ));
+    }
+    if !result.per_device_secure {
+        return Err(
+            "server authenticated only the legacy account identity; per-device proof missing"
+                .to_string(),
+        );
+    }
+    if result.device_binding_version != expected.version {
+        return Err("server confirmed a different device binding version".to_string());
+    }
+    if result.device_binding_status != i32::from(DEVICE_BINDING_STATUS_ACTIVE)
+        || result.device_binding_status != i32::from(expected.status)
+    {
+        return Err("server did not confirm an active device binding".to_string());
+    }
+    let user_id = result.user_id.clone().unwrap_or_default();
+    if user_id.is_empty() {
+        return Err("server authenticated without a user id".to_string());
+    }
+    Ok(user_id)
 }
 
 /// Events emitted by the connection to the application layer.
@@ -289,13 +324,28 @@ pub struct Connection {
     read_task: tokio::task::AbortHandle,
 }
 
+async fn signal_disconnected(
+    events: &mpsc::Sender<ConnectionEvent>,
+    shutdown: &watch::Sender<bool>,
+    reported: &AtomicBool,
+    reason: String,
+) {
+    // Closing either half makes the split WebSocket unusable. Stop its peer
+    // immediately and emit exactly one terminal event for the connection.
+    let first_report = !reported.swap(true, Ordering::AcqRel);
+    let _ = shutdown.send(true);
+    if first_report {
+        let _ = events.send(ConnectionEvent::Disconnected { reason }).await;
+    }
+}
+
 impl Connection {
     /// Connect to the server, perform auth challenge-response, and start
     /// background read/write loops. Returns immediately after auth completes.
     pub async fn connect(
         config: &ConnectionConfig,
         identity: &IdentityKeyPair,
-        device_id: &[u8; 16],
+        device_identity: &DeviceIdentityV1,
         device_name: &str,
     ) -> Result<Self, String> {
         let url = &config.server_url;
@@ -355,6 +405,8 @@ impl Connection {
         // DH result into the Ed25519 signature prevents cross-protocol signing
         // and proves that the client owns the advertised X25519 identity.
         let sig = websocket_auth_signature(identity, &challenge)?;
+        let device_sig = device_identity.auth_signature(identity, &challenge)?;
+        let binding = device_identity.binding();
         let auth_resp = proto::Envelope {
             seq: 2,
             timestamp: 0,
@@ -363,9 +415,19 @@ impl Connection {
                     identity_key: identity.x25519_public_bytes().to_vec(),
                     signing_key: identity.ed25519_public_bytes().to_vec(),
                     signature: sig.to_vec(),
-                    device_id: device_id.to_vec(),
+                    device_id: binding.device_id.to_vec(),
                     device_name: device_name.to_string(),
                     client_version: "veil-desktop/0.1.0".to_string(),
+                    device_binding: Some(proto::DeviceBindingV1 {
+                        device_id: binding.device_id.to_vec(),
+                        device_identity_key: binding.device_identity_key.to_vec(),
+                        device_signing_key: binding.device_signing_key.to_vec(),
+                        version: binding.version,
+                        capabilities: binding.capabilities,
+                        status: i32::from(binding.status),
+                        account_signature: binding.account_signature.to_vec(),
+                    }),
+                    device_signature: device_sig.to_vec(),
                 },
             )),
         };
@@ -389,13 +451,7 @@ impl Connection {
                             .map_err(|e| format!("decode auth_result: {e}"))?;
                         match env.payload.as_ref() {
                             Some(proto::envelope::Payload::AuthResult(r)) => {
-                                if r.success {
-                                    return Ok::<_, String>(r.user_id.clone().unwrap_or_default());
-                                }
-                                return Err(format!(
-                                    "auth failed: {}",
-                                    r.error_message.clone().unwrap_or_default()
-                                ));
+                                return validate_per_device_auth_result(r, binding);
                             }
                             Some(proto::envelope::Payload::SenderKeyDist(skd)) => {
                                 if skd.conversation_id.is_empty()
@@ -462,11 +518,40 @@ impl Connection {
             })
             .await;
 
+        // Both halves share a terminal signal. A write failure must stop the
+        // reader as well (and vice versa), otherwise the application can keep
+        // treating a half-dead socket as connected indefinitely.
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let disconnect_reported = Arc::new(AtomicBool::new(false));
+
         // --- Background write loop ---
+        let write_events = event_tx.clone();
+        let write_shutdown = shutdown_tx.clone();
+        let mut write_shutdown_rx = shutdown_rx.clone();
+        let write_disconnect_reported = disconnect_reported.clone();
         let write_task = tokio::spawn(async move {
-            while let Some(data) = send_rx.recv().await {
-                if ws_write.send(WsMessage::Binary(data)).await.is_err() {
-                    break;
+            loop {
+                tokio::select! {
+                    changed = write_shutdown_rx.changed() => {
+                        if changed.is_err() || *write_shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                    data = send_rx.recv() => {
+                        let Some(data) = data else {
+                            break;
+                        };
+                        if let Err(error) = ws_write.send(WsMessage::Binary(data)).await {
+                            signal_disconnected(
+                                &write_events,
+                                &write_shutdown,
+                                &write_disconnect_reported,
+                                format!("ws write error: {error}"),
+                            )
+                            .await;
+                            break;
+                        }
+                    }
                 }
             }
         });
@@ -474,32 +559,48 @@ impl Connection {
 
         // --- Background read loop ---
         let evt = event_tx.clone();
+        let read_shutdown = shutdown_tx;
+        let mut read_shutdown_rx = shutdown_rx;
+        let read_disconnect_reported = disconnect_reported;
         let read_task = tokio::spawn(async move {
             loop {
-                match ws_read.next().await {
-                    Some(Ok(WsMessage::Binary(data))) => {
-                        if let Ok(env) = proto::Envelope::decode(data.as_ref()) {
-                            dispatch_event(&evt, env).await;
+                tokio::select! {
+                    changed = read_shutdown_rx.changed() => {
+                        if changed.is_err() || *read_shutdown_rx.borrow() {
+                            break;
                         }
                     }
-                    Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
-                    Some(Ok(WsMessage::Close(_))) | None => {
-                        let _ = evt
-                            .send(ConnectionEvent::Disconnected {
-                                reason: "server closed".into(),
-                            })
-                            .await;
-                        break;
+                    incoming = ws_read.next() => {
+                        match incoming {
+                            Some(Ok(WsMessage::Binary(data))) => {
+                                if let Ok(env) = proto::Envelope::decode(data.as_ref()) {
+                                    dispatch_event(&evt, env).await;
+                                }
+                            }
+                            Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
+                            Some(Ok(WsMessage::Close(_))) | None => {
+                                signal_disconnected(
+                                    &evt,
+                                    &read_shutdown,
+                                    &read_disconnect_reported,
+                                    "server closed".into(),
+                                )
+                                .await;
+                                break;
+                            }
+                            Some(Err(error)) => {
+                                signal_disconnected(
+                                    &evt,
+                                    &read_shutdown,
+                                    &read_disconnect_reported,
+                                    format!("ws read error: {error}"),
+                                )
+                                .await;
+                                break;
+                            }
+                            _ => continue,
+                        }
                     }
-                    Some(Err(e)) => {
-                        let _ = evt
-                            .send(ConnectionEvent::Disconnected {
-                                reason: format!("{e}"),
-                            })
-                            .await;
-                        break;
-                    }
-                    _ => continue,
                 }
             }
         });
@@ -549,7 +650,14 @@ impl Drop for Connection {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod url_policy_tests {
-    use super::{validate_websocket_url, websocket_auth_signature, Connection};
+    use super::{
+        signal_disconnected, validate_per_device_auth_result, validate_websocket_url,
+        websocket_auth_signature, Connection, ConnectionEvent,
+    };
+    use crate::device_identity::{
+        DeviceBindingPublicV1, DEVICE_BINDING_STATUS_ACTIVE, REQUIRED_DEVICE_CAPABILITIES,
+    };
+    use crate::protocol::proto;
     use veil_crypto::keys::IdentityKeyPair;
 
     #[test]
@@ -590,6 +698,42 @@ mod url_policy_tests {
         assert!(read_join.await.unwrap_err().is_cancelled());
     }
 
+    #[tokio::test]
+    async fn terminal_signal_stops_peer_and_emits_disconnected_once() {
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+        let reported = std::sync::atomic::AtomicBool::new(false);
+
+        signal_disconnected(
+            &event_tx,
+            &shutdown_tx,
+            &reported,
+            "ws write error: closed".to_string(),
+        )
+        .await;
+        // A concurrent failure in the reader cannot create a second terminal
+        // event for the same socket epoch.
+        signal_disconnected(
+            &event_tx,
+            &shutdown_tx,
+            &reported,
+            "ws read error: closed".to_string(),
+        )
+        .await;
+
+        shutdown_rx.changed().await.unwrap();
+        assert!(*shutdown_rx.borrow());
+        assert!(matches!(
+            event_rx.recv().await,
+            Some(ConnectionEvent::Disconnected { reason })
+                if reason == "ws write error: closed"
+        ));
+        assert!(matches!(
+            event_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     #[test]
     fn websocket_auth_signature_is_domain_separated_x25519_pop() {
         let identity = IdentityKeyPair::generate();
@@ -611,6 +755,43 @@ mod url_policy_tests {
             &signature,
         ));
         assert!(websocket_auth_signature(&identity, &[0u8; 31]).is_err());
+    }
+
+    #[test]
+    fn bound_client_rejects_legacy_or_mismatched_auth_results() {
+        let binding = DeviceBindingPublicV1 {
+            device_id: [1u8; 16],
+            device_identity_key: [2u8; 32],
+            device_signing_key: [3u8; 32],
+            version: 1,
+            capabilities: REQUIRED_DEVICE_CAPABILITIES,
+            status: DEVICE_BINDING_STATUS_ACTIVE,
+            account_signature: [4u8; 64],
+        };
+        let secure = proto::AuthResult {
+            success: true,
+            user_id: Some("user-1".to_string()),
+            error_message: None,
+            per_device_secure: true,
+            device_binding_version: 1,
+            device_binding_status: i32::from(DEVICE_BINDING_STATUS_ACTIVE),
+        };
+        assert_eq!(
+            validate_per_device_auth_result(&secure, &binding).unwrap(),
+            "user-1"
+        );
+
+        let mut legacy = secure.clone();
+        legacy.per_device_secure = false;
+        assert!(validate_per_device_auth_result(&legacy, &binding).is_err());
+
+        let mut wrong_version = secure.clone();
+        wrong_version.device_binding_version = 2;
+        assert!(validate_per_device_auth_result(&wrong_version, &binding).is_err());
+
+        let mut excluded = secure;
+        excluded.device_binding_status = 2;
+        assert!(validate_per_device_auth_result(&excluded, &binding).is_err());
     }
 }
 

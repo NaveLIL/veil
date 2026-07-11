@@ -1,6 +1,19 @@
 import { Component, createSignal, createMemo, Show, For, Switch, Match, onMount, onCleanup, createEffect, on } from "solid-js";
 import { appStore, type Channel, type Role, type ServerMember } from "@/stores/app";
 import { IslandSelect } from "@/components/ui/IslandSelect";
+import { Popover as KPopover } from "@kobalte/core/popover";
+import { Z } from "@/lib/zIndex";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  FileText,
+  Hash,
+  Mail,
+  Settings,
+  Shield,
+  Users,
+  type LucideIcon,
+} from "lucide-solid";
 
 /* ═══════════════════════════════════════════════════════
    SERVER SETTINGS — Full-screen overlay, mirrors SettingsScreen
@@ -16,14 +29,14 @@ type Section =
   | "audit"
   | "danger";
 
-const SECTIONS: { id: Section; label: string; icon: string; ownerOnly?: boolean }[] = [
-  { id: "overview", label: "Overview", icon: "\u2699\uFE0F" },
-  { id: "channels", label: "Channels", icon: "#\uFE0F\u20E3" },
-  { id: "roles", label: "Roles", icon: "\uD83C\uDFAD" },
-  { id: "members", label: "Members", icon: "\uD83D\uDC65" },
-  { id: "invites", label: "Invites", icon: "\u2709\uFE0F" },
-  { id: "audit", label: "Audit Log", icon: "\uD83D\uDCDC" },
-  { id: "danger", label: "Danger Zone", icon: "\u26A0\uFE0F" },
+const SECTIONS: { id: Section; label: string; icon: LucideIcon; ownerOnly?: boolean }[] = [
+  { id: "overview", label: "Overview", icon: Settings },
+  { id: "channels", label: "Channels", icon: Hash },
+  { id: "roles", label: "Roles", icon: Shield },
+  { id: "members", label: "Members", icon: Users },
+  { id: "invites", label: "Invites", icon: Mail },
+  { id: "audit", label: "Audit Log", icon: FileText },
+  { id: "danger", label: "Danger Zone", icon: AlertTriangle },
 ];
 
 // Forward-looking permission bits. Backend stores `permissions u64`;
@@ -41,6 +54,9 @@ const PERMISSIONS: { bit: number; label: string; desc: string }[] = [
   { bit: 1 << 8, label: "Send Messages", desc: "Send messages in text channels." },
   { bit: 1 << 9, label: "Manage Messages", desc: "Delete or pin other users' messages." },
 ];
+
+const portalHost = () =>
+  (typeof document !== "undefined" && document.getElementById("island-portal")) || undefined;
 
 // Discord-style role color palette. Stored as 24-bit int in DB; rendered via colorToHex().
 const ROLE_COLORS: number[] = [
@@ -70,6 +86,16 @@ export const ServerSettingsScreen: Component = () => {
   const [section, setSection] = createSignal<Section>("overview");
   const [entering, setEntering] = createSignal(true);
   const [copied, setCopied] = createSignal("");
+  const timers = new Set<ReturnType<typeof setTimeout>>();
+  let closing = false;
+  const later = (callback: () => void, delayMs: number) => {
+    const timer = setTimeout(() => {
+      timers.delete(timer);
+      callback();
+    }, delayMs);
+    timers.add(timer);
+    return timer;
+  };
 
   // ─── Reactive context ──────────────────────────────
   const sid = () => appStore.serverSettingsId();
@@ -104,10 +130,12 @@ export const ServerSettingsScreen: Component = () => {
 
   // ─── Lifecycle ─────────────────────────────────────
   onMount(() => {
-    setTimeout(() => setEntering(false), 30);
+    later(() => setEntering(false), 30);
     document.addEventListener("keydown", handleKey);
   });
   onCleanup(() => {
+    timers.forEach(clearTimeout);
+    timers.clear();
     document.removeEventListener("keydown", handleKey);
   });
 
@@ -123,8 +151,10 @@ export const ServerSettingsScreen: Component = () => {
   }));
 
   const goBack = () => {
+    if (closing) return;
+    closing = true;
     setEntering(true);
-    setTimeout(() => appStore.closeServerSettings(), 250);
+    later(() => appStore.closeServerSettings(), 250);
   };
 
   const handleKey = (e: KeyboardEvent) => {
@@ -134,7 +164,7 @@ export const ServerSettingsScreen: Component = () => {
   const copyText = async (text: string, label: string) => {
     await navigator.clipboard.writeText(text);
     setCopied(label);
-    setTimeout(() => setCopied(""), 2000);
+    later(() => setCopied(""), 2000);
   };
 
   // ─── Styles (kept identical to SettingsScreen) ──────
@@ -142,15 +172,16 @@ export const ServerSettingsScreen: Component = () => {
     overlay: {
       position: "absolute" as const,
       inset: "0",
-      "z-index": "100",
+      "z-index": Z.FULLSCREEN,
       display: "flex",
-      background: "#1E1F22",
+      background: "var(--veil-window)",
+      "padding-top": "44px",
       transition: "opacity 0.25s ease, transform 0.25s ease",
     },
     sidebar: {
       width: "240px",
       "flex-shrink": "0",
-      background: "#2B2D31",
+      background: "var(--veil-island)",
       "border-radius": "12px",
       margin: "10px 0 10px 10px",
       display: "flex",
@@ -161,7 +192,7 @@ export const ServerSettingsScreen: Component = () => {
     sidebarTitle: {
       "font-size": "11px",
       "font-weight": "700",
-      color: "rgba(255,255,255,0.25)",
+      color: "var(--veil-contrast-25)",
       "letter-spacing": "0.12em",
       "text-transform": "uppercase" as const,
       padding: "0 20px",
@@ -170,7 +201,7 @@ export const ServerSettingsScreen: Component = () => {
     sidebarServerName: {
       "font-size": "14px",
       "font-weight": "700",
-      color: "rgba(255,255,255,0.85)",
+      color: "var(--veil-contrast-85)",
       padding: "0 20px",
       "margin-bottom": "16px",
       "white-space": "nowrap" as const,
@@ -186,16 +217,16 @@ export const ServerSettingsScreen: Component = () => {
       padding: "0 20px",
       background: active
         ? danger
-          ? "rgba(240,72,72,0.10)"
-          : "rgba(124,107,245,0.12)"
+          ? "var(--veil-danger-surface)"
+          : "rgba(var(--veil-accent-rgb),0.12)"
         : "transparent",
       color: active
         ? danger
-          ? "#f04848"
-          : "#c4b8fb"
+          ? "var(--veil-danger)"
+          : "var(--veil-accent-hi)"
         : danger
-          ? "rgba(240,72,72,0.55)"
-          : "rgba(255,255,255,0.45)",
+          ? "color-mix(in srgb, var(--veil-danger) 55%, transparent)"
+          : "var(--veil-contrast-45)",
       border: "none",
       cursor: "pointer",
       "font-size": "13px",
@@ -203,7 +234,7 @@ export const ServerSettingsScreen: Component = () => {
       transition: "background 0.15s, color 0.15s",
       "text-align": "left" as const,
       "border-left": active
-        ? `3px solid ${danger ? "#f04848" : "#7c6bf5"}`
+        ? `3px solid ${danger ? "var(--veil-danger)" : "var(--veil-accent)"}`
         : "3px solid transparent",
     }),
     content: {
@@ -215,25 +246,25 @@ export const ServerSettingsScreen: Component = () => {
     heading: {
       "font-size": "22px",
       "font-weight": "700",
-      color: "#eee",
+      color: "var(--veil-text-strong)",
       "margin-bottom": "8px",
     },
     subHeading: {
       "font-size": "13px",
-      color: "rgba(255,255,255,0.3)",
+      color: "var(--veil-contrast-30)",
       "margin-bottom": "28px",
     },
     card: {
-      background: "#2B2D31",
+      background: "var(--veil-island)",
       "border-radius": "14px",
       padding: "20px 24px",
       "margin-bottom": "16px",
-      border: "1px solid rgba(255,255,255,0.04)",
+      border: "1px solid var(--veil-contrast-04)",
     },
     cardTitle: {
       "font-size": "12px",
       "font-weight": "700",
-      color: "rgba(255,255,255,0.25)",
+      color: "var(--veil-contrast-25)",
       "letter-spacing": "0.08em",
       "text-transform": "uppercase" as const,
       "margin-bottom": "14px",
@@ -243,16 +274,16 @@ export const ServerSettingsScreen: Component = () => {
       "align-items": "center",
       "justify-content": "space-between",
       padding: "12px 0",
-      "border-bottom": "1px solid rgba(255,255,255,0.03)",
+      "border-bottom": "1px solid var(--veil-contrast-03)",
     },
     fieldLabel: {
       "font-size": "13px",
-      color: "rgba(255,255,255,0.7)",
+      color: "var(--veil-contrast-70)",
       "font-weight": "500",
     },
     fieldValue: {
       "font-size": "13px",
-      color: "rgba(255,255,255,0.4)",
+      color: "var(--veil-contrast-40)",
       "font-family": "monospace",
       "max-width": "320px",
       overflow: "hidden",
@@ -264,9 +295,9 @@ export const ServerSettingsScreen: Component = () => {
       height: "30px",
       padding: "0 12px",
       "border-radius": "8px",
-      background: active ? "rgba(52,211,153,0.1)" : "rgba(255,255,255,0.04)",
-      color: active ? "#34d399" : "rgba(255,255,255,0.4)",
-      border: `1px solid ${active ? "rgba(52,211,153,0.2)" : "rgba(255,255,255,0.06)"}`,
+      background: active ? "var(--veil-success-surface)" : "var(--veil-contrast-04)",
+      color: active ? "var(--veil-success)" : "var(--veil-contrast-40)",
+      border: `1px solid ${active ? "var(--veil-success-border)" : "var(--veil-contrast-06)"}`,
       "font-size": "11px",
       "font-weight": "500",
       cursor: "pointer",
@@ -276,11 +307,11 @@ export const ServerSettingsScreen: Component = () => {
       width: "100%",
       height: "38px",
       "border-radius": "10px",
-      background: "rgba(255,255,255,0.04)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--veil-contrast-04)",
+      border: "1px solid var(--veil-contrast-06)",
       padding: "0 14px",
       "font-size": "13px",
-      color: "rgba(255,255,255,0.8)",
+      color: "var(--veil-contrast-80)",
       outline: "none",
       "font-family": "monospace",
       transition: "border-color 0.2s",
@@ -289,11 +320,11 @@ export const ServerSettingsScreen: Component = () => {
       width: "100%",
       "min-height": "76px",
       "border-radius": "10px",
-      background: "rgba(255,255,255,0.04)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--veil-contrast-04)",
+      border: "1px solid var(--veil-contrast-06)",
       padding: "10px 14px",
       "font-size": "13px",
-      color: "rgba(255,255,255,0.8)",
+      color: "var(--veil-contrast-80)",
       outline: "none",
       "font-family": "inherit",
       resize: "vertical" as const,
@@ -303,22 +334,22 @@ export const ServerSettingsScreen: Component = () => {
       height: "38px",
       padding: "0 20px",
       "border-radius": "10px",
-      background: "linear-gradient(135deg, #7c6bf5 0%, #6955e0 100%)",
-      color: "#fff",
+      background: "linear-gradient(135deg, var(--veil-accent) 0%, var(--veil-accent-deep) 100%)",
+      color: "var(--veil-on-accent)",
       border: "none",
       "font-size": "13px",
       "font-weight": "600",
       cursor: "pointer",
       transition: "transform 0.15s, box-shadow 0.15s",
-      "box-shadow": "0 4px 16px rgba(124,107,245,0.2)",
+      "box-shadow": "0 4px 16px rgba(var(--veil-accent-rgb),0.2)",
     },
     btnDanger: {
       height: "38px",
       padding: "0 20px",
       "border-radius": "10px",
-      background: "rgba(240,72,72,0.08)",
-      color: "#f04848",
-      border: "1px solid rgba(240,72,72,0.15)",
+      background: "var(--veil-danger-surface)",
+      color: "var(--veil-danger)",
+      border: "1px solid var(--veil-danger-border)",
       "font-size": "13px",
       "font-weight": "500",
       cursor: "pointer",
@@ -327,9 +358,9 @@ export const ServerSettingsScreen: Component = () => {
       height: "38px",
       padding: "0 20px",
       "border-radius": "10px",
-      background: "rgba(255,255,255,0.04)",
-      color: "rgba(255,255,255,0.5)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--veil-contrast-04)",
+      color: "var(--veil-contrast-50)",
+      border: "1px solid var(--veil-contrast-06)",
       "font-size": "13px",
       "font-weight": "500",
       cursor: "pointer",
@@ -338,9 +369,9 @@ export const ServerSettingsScreen: Component = () => {
       height: "28px",
       padding: "0 10px",
       "border-radius": "8px",
-      background: "rgba(255,255,255,0.04)",
-      color: "rgba(255,255,255,0.55)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--veil-contrast-04)",
+      color: "var(--veil-contrast-55)",
+      border: "1px solid var(--veil-contrast-06)",
       "font-size": "11px",
       "font-weight": "500",
       cursor: "pointer",
@@ -349,44 +380,44 @@ export const ServerSettingsScreen: Component = () => {
       height: "28px",
       padding: "0 10px",
       "border-radius": "8px",
-      background: "rgba(240,72,72,0.06)",
-      color: "rgba(240,72,72,0.8)",
-      border: "1px solid rgba(240,72,72,0.12)",
+      background: "var(--veil-danger-surface)",
+      color: "color-mix(in srgb, var(--veil-danger) 80%, transparent)",
+      border: "1px solid var(--veil-danger-surface)",
       "font-size": "11px",
       "font-weight": "500",
       cursor: "pointer",
     },
     successMsg: {
       "font-size": "12px",
-      color: "#34d399",
+      color: "var(--veil-success)",
       "margin-top": "8px",
     },
     errorMsg: {
       "font-size": "12px",
-      color: "#f04848",
+      color: "var(--veil-danger)",
       "margin-top": "8px",
     },
     backBtn: {
       position: "absolute" as const,
-      top: "18px",
+      top: "58px",
       right: "24px",
       width: "36px",
       height: "36px",
       "border-radius": "10px",
-      background: "rgba(255,255,255,0.04)",
-      border: "1px solid rgba(255,255,255,0.06)",
-      color: "rgba(255,255,255,0.4)",
+      background: "var(--veil-contrast-04)",
+      border: "1px solid var(--veil-contrast-06)",
+      color: "var(--veil-contrast-40)",
       cursor: "pointer",
       display: "flex",
       "align-items": "center",
       "justify-content": "center",
       "font-size": "16px",
       transition: "background 0.15s, color 0.15s",
-      "z-index": "10",
+      "z-index": Z.BASE,
     },
     separator: {
       height: "1px",
-      background: "rgba(255,255,255,0.04)",
+      background: "var(--veil-contrast-04)",
       margin: "16px 0",
     },
     badge: (color: string) => ({
@@ -396,14 +427,14 @@ export const ServerSettingsScreen: Component = () => {
       height: "24px",
       padding: "0 10px",
       "border-radius": "6px",
-      background: `${color}15`,
+      background: `color-mix(in srgb, ${color} 8.2%, transparent)`,
       color: color,
       "font-size": "11px",
       "font-weight": "600",
     }),
     paragraph: {
       "font-size": "13px",
-      color: "rgba(255,255,255,0.4)",
+      color: "var(--veil-contrast-40)",
       "line-height": "1.7",
       "margin-bottom": "12px",
     },
@@ -413,8 +444,8 @@ export const ServerSettingsScreen: Component = () => {
       gap: "12px",
       padding: "10px 14px",
       "border-radius": "10px",
-      background: "rgba(255,255,255,0.02)",
-      border: "1px solid rgba(255,255,255,0.04)",
+      background: "var(--veil-contrast-02)",
+      border: "1px solid var(--veil-contrast-04)",
       "margin-bottom": "8px",
     },
   };
@@ -450,7 +481,7 @@ export const ServerSettingsScreen: Component = () => {
       if (Object.keys(patch).length === 0) return;
       await appStore.updateServer(srv.id, patch);
       setOvSaved(true);
-      setTimeout(() => setOvSaved(false), 2000);
+      later(() => setOvSaved(false), 2000);
     } catch (e) {
       setOvError(String(e));
     }
@@ -465,7 +496,7 @@ export const ServerSettingsScreen: Component = () => {
         <div style={S.cardTitle}>Server Profile</div>
 
         <div style={{ "margin-bottom": "14px" }}>
-          <div style={{ "font-size": "12px", color: "rgba(255,255,255,0.3)", "margin-bottom": "6px" }}>Server Name</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>Server Name</div>
           <input
             style={{ ...S.input, "font-family": "inherit" }}
             value={ovName()}
@@ -476,7 +507,7 @@ export const ServerSettingsScreen: Component = () => {
         </div>
 
         <div style={{ "margin-bottom": "14px" }}>
-          <div style={{ "font-size": "12px", color: "rgba(255,255,255,0.3)", "margin-bottom": "6px" }}>Description</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>Description</div>
           <textarea
             style={S.textarea}
             value={ovDesc()}
@@ -488,7 +519,7 @@ export const ServerSettingsScreen: Component = () => {
         </div>
 
         <div style={{ "margin-bottom": "18px" }}>
-          <div style={{ "font-size": "12px", color: "rgba(255,255,255,0.3)", "margin-bottom": "6px" }}>Icon URL</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>Icon URL</div>
           <input
             style={S.input}
             value={ovIcon()}
@@ -507,7 +538,7 @@ export const ServerSettingsScreen: Component = () => {
           </div>
         </Show>
         <Show when={!isOwner()}>
-          <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.25)" }}>
+          <div style={{ "font-size": "11px", color: "var(--veil-contrast-25)" }}>
             You need <strong>Manage Server</strong> permission to edit these fields.
           </div>
         </Show>
@@ -581,7 +612,7 @@ export const ServerSettingsScreen: Component = () => {
   const channelTypeLabel = (t: number) =>
     t === 0 ? "Text" : t === 1 ? "Voice" : t === 2 ? "Category" : `Type ${t}`;
   const channelTypeColor = (t: number) =>
-    t === 0 ? "#7c6bf5" : t === 1 ? "#34d399" : "#888";
+    t === 0 ? "var(--veil-accent)" : t === 1 ? "var(--veil-success)" : "var(--veil-text-muted)";
 
   const ChannelsSection = () => (
     <>
@@ -603,11 +634,11 @@ export const ServerSettingsScreen: Component = () => {
                   fallback={
                     <>
                       <div style={{ flex: "1", "min-width": "0" }}>
-                        <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.85)", "font-weight": "600" }}>
+                        <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600" }}>
                           {c.channelType === 0 ? "#" : ""}{c.name}
                         </div>
                         <Show when={c.topic}>
-                          <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.35)", "margin-top": "2px", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                          <div style={{ "font-size": "11px", color: "var(--veil-contrast-35)", "margin-top": "2px", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
                             {c.topic}
                           </div>
                         </Show>
@@ -748,16 +779,16 @@ export const ServerSettingsScreen: Component = () => {
                   <div style={{
                     width: "12px", height: "12px", "border-radius": "50%",
                     background: colorToHex(r.color),
-                    border: "1px solid rgba(255,255,255,0.1)",
+                    border: "1px solid var(--veil-contrast-10)",
                   }} />
                   <div style={{ flex: "1", "min-width": "0" }}>
-                    <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.85)", "font-weight": "600" }}>
+                    <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600" }}>
                       {r.name}
                       <Show when={r.isDefault}>
-                        <span style={{ ...S.badge("#888"), "margin-left": "8px" }}>Default</span>
+                        <span style={{ ...S.badge("var(--veil-text-muted)"), "margin-left": "8px" }}>Default</span>
                       </Show>
                     </div>
-                    <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.3)", "margin-top": "2px" }}>
+                    <div style={{ "font-size": "11px", color: "var(--veil-contrast-30)", "margin-top": "2px" }}>
                       Position {r.position} · Perms 0x{r.permissions.toString(16)}
                     </div>
                   </div>
@@ -785,9 +816,9 @@ export const ServerSettingsScreen: Component = () => {
                 </div>
 
                 <Show when={editingRole() === r.id}>
-                  <div style={{ "padding-top": "14px", "margin-top": "12px", "border-top": "1px solid rgba(255,255,255,0.04)", display: "flex", "flex-direction": "column", gap: "12px" }}>
+                  <div style={{ "padding-top": "14px", "margin-top": "12px", "border-top": "1px solid var(--veil-contrast-04)", display: "flex", "flex-direction": "column", gap: "12px" }}>
                     <div>
-                      <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.4)", "margin-bottom": "6px" }}>Name</div>
+                      <div style={{ "font-size": "11px", color: "var(--veil-contrast-40)", "margin-bottom": "6px" }}>Name</div>
                       <input
                         style={{ ...S.input, height: "32px", "font-family": "inherit" }}
                         value={roleName()}
@@ -796,7 +827,7 @@ export const ServerSettingsScreen: Component = () => {
                       />
                     </div>
                     <div>
-                      <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.4)", "margin-bottom": "6px" }}>Color</div>
+                      <div style={{ "font-size": "11px", color: "var(--veil-contrast-40)", "margin-bottom": "6px" }}>Color</div>
                       <div style={{ display: "flex", "flex-wrap": "wrap", gap: "6px", "align-items": "center" }}>
                         <For each={ROLE_COLORS}>
                           {(c) => {
@@ -809,7 +840,7 @@ export const ServerSettingsScreen: Component = () => {
                                 style={{
                                   width: "22px", height: "22px", "border-radius": "7px",
                                   background: colorToHex(c),
-                                  border: active() ? "2px solid #fff" : "2px solid rgba(255,255,255,0.04)",
+                                  border: active() ? "2px solid var(--veil-on-accent)" : "2px solid var(--veil-contrast-04)",
                                   cursor: "pointer",
                                   padding: "0",
                                   "box-shadow": active() ? `0 0 0 2px ${colorToHex(c)}55` : "none",
@@ -830,9 +861,9 @@ export const ServerSettingsScreen: Component = () => {
                           style={{
                             width: "96px", height: "26px", padding: "0 8px",
                             "border-radius": "7px",
-                            background: "#1E1F22",
-                            border: "1px solid rgba(255,255,255,0.06)",
-                            color: "#ddd",
+                            background: "var(--veil-control)",
+                            border: "1px solid var(--veil-contrast-06)",
+                            color: "var(--veil-text)",
                             "font-family": "ui-monospace, SFMono-Regular, Menlo, monospace",
                             "font-size": "12px",
                             outline: "none",
@@ -842,7 +873,7 @@ export const ServerSettingsScreen: Component = () => {
                       </div>
                     </div>
                     <div>
-                      <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.4)", "margin-bottom": "8px" }}>
+                      <div style={{ "font-size": "11px", color: "var(--veil-contrast-40)", "margin-bottom": "8px" }}>
                         Permissions
                       </div>
                       <div style={{ display: "flex", "flex-direction": "column", gap: "4px" }}>
@@ -858,9 +889,9 @@ export const ServerSettingsScreen: Component = () => {
                                   gap: "10px",
                                   padding: "8px 10px",
                                   "border-radius": "8px",
-                                  background: enabled() ? "rgba(124,107,245,0.08)" : "rgba(255,255,255,0.02)",
-                                  border: `1px solid ${enabled() ? "rgba(124,107,245,0.18)" : "rgba(255,255,255,0.04)"}`,
-                                  color: enabled() ? "rgba(196,184,251,0.95)" : "rgba(255,255,255,0.55)",
+                                  background: enabled() ? "rgba(var(--veil-accent-rgb),0.08)" : "var(--veil-contrast-02)",
+                                  border: `1px solid ${enabled() ? "rgba(var(--veil-accent-rgb),0.18)" : "var(--veil-contrast-04)"}`,
+                                  color: enabled() ? "color-mix(in srgb, var(--veil-accent-hi) 95%, transparent)" : "var(--veil-contrast-55)",
                                   cursor: "pointer",
                                   "text-align": "left" as const,
                                   "font-size": "12px",
@@ -869,16 +900,16 @@ export const ServerSettingsScreen: Component = () => {
                               >
                                 <div style={{
                                   width: "14px", height: "14px", "border-radius": "4px",
-                                  background: enabled() ? "#7c6bf5" : "transparent",
-                                  border: `1px solid ${enabled() ? "#7c6bf5" : "rgba(255,255,255,0.2)"}`,
+                                  background: enabled() ? "var(--veil-accent)" : "transparent",
+                                  border: `1px solid ${enabled() ? "var(--veil-accent)" : "var(--veil-contrast-20)"}`,
                                   display: "flex", "align-items": "center", "justify-content": "center",
-                                  "font-size": "10px", color: "#fff", "flex-shrink": "0",
+                                  "font-size": "10px", color: "var(--veil-on-accent)", "flex-shrink": "0",
                                 }}>
                                   {enabled() ? "\u2713" : ""}
                                 </div>
                                 <div style={{ flex: "1", "min-width": "0" }}>
                                   <div style={{ "font-weight": "600" }}>{p.label}</div>
-                                  <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.3)", "margin-top": "1px" }}>
+                                  <div style={{ "font-size": "11px", color: "var(--veil-contrast-30)", "margin-top": "1px" }}>
                                     {p.desc}
                                   </div>
                                 </div>
@@ -900,7 +931,6 @@ export const ServerSettingsScreen: Component = () => {
 
   // ─── MEMBERS ───────────────────────────────────────
   const [memberSearch, setMemberSearch] = createSignal("");
-  const [openRolePicker, setOpenRolePicker] = createSignal<string | null>(null);
   const filteredMembers = createMemo(() => {
     const q = memberSearch().trim().toLowerCase();
     const list = [...members()].sort((a, b) =>
@@ -966,51 +996,48 @@ export const ServerSettingsScreen: Component = () => {
                 <div style={S.listRow}>
                   <div style={{
                     width: "32px", height: "32px", "border-radius": "50%",
-                    background: "rgba(124,107,245,0.18)",
-                    color: "#c4b8fb",
+                    background: "rgba(var(--veil-accent-rgb),0.18)",
+                    color: "var(--veil-accent-hi)",
                     display: "flex", "align-items": "center", "justify-content": "center",
                     "font-size": "12px", "font-weight": "700", "flex-shrink": "0",
                   }}>
                     {(m.nickname || m.username || "?").slice(0, 2).toUpperCase()}
                   </div>
                   <div style={{ flex: "1", "min-width": "0" }}>
-                    <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.85)", "font-weight": "600" }}>
+                    <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600" }}>
                       {m.nickname || m.username}
                       <Show when={isServerOwner()}>
-                        <span style={{ ...S.badge("#fbbf24"), "margin-left": "8px" }}>Owner</span>
+                        <span style={{ ...S.badge("var(--veil-warning)"), "margin-left": "8px" }}>Owner</span>
                       </Show>
                       <Show when={isMe() && !isServerOwner()}>
-                        <span style={{ ...S.badge("#7c6bf5"), "margin-left": "8px" }}>You</span>
+                        <span style={{ ...S.badge("var(--veil-accent)"), "margin-left": "8px" }}>You</span>
                       </Show>
                     </div>
-                    <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.3)", "margin-top": "2px", "font-family": "monospace" }}>
+                    <div style={{ "font-size": "11px", color: "var(--veil-contrast-30)", "margin-top": "2px", "font-family": "monospace" }}>
                       {m.userId.slice(0, 16)}…
                     </div>
                   </div>
 
                   <Show when={isOwner() && !isServerOwner()}>
-                    <div style={{ position: "relative" }}>
-                      <button
-                        style={S.btnGhostSm}
-                        onClick={(e) => { e.stopPropagation(); setOpenRolePicker(openRolePicker() === m.userId ? null : m.userId); }}
-                      >
+                    <KPopover placement="bottom-end" gutter={6}>
+                      <KPopover.Trigger style={S.btnGhostSm}>
                         Roles ({m.roleIds.length})
-                      </button>
-                      <Show when={openRolePicker() === m.userId}>
-                        <div style={{
-                          position: "absolute",
-                          right: "0",
-                          top: "calc(100% + 6px)",
+                      </KPopover.Trigger>
+                      <KPopover.Portal mount={portalHost()}>
+                        <KPopover.Content style={{
                           "min-width": "200px",
-                          background: "#2B2D31",
-                          border: "1px solid rgba(255,255,255,0.08)",
+                          background: "var(--veil-island)",
+                          border: "1px solid var(--veil-contrast-08)",
                           "border-radius": "10px",
                           padding: "6px",
-                          "z-index": "60",
-                          "box-shadow": "0 8px 24px rgba(0,0,0,0.4)",
+                          "z-index": Z.DROPDOWN,
+                          "box-shadow": "0 8px 24px var(--veil-shadow)",
                           "max-height": "240px",
                           "overflow-y": "auto" as const,
                         }}>
+                          <KPopover.Title style={{ padding: "4px 10px 7px", "font-size": "11px", "font-weight": "600", color: "var(--veil-text-muted)" }}>
+                            Roles for {m.nickname || m.username}
+                          </KPopover.Title>
                           <For each={roles().filter((r) => !r.isDefault)}>
                             {(r) => {
                               const has = () => m.roleIds.includes(r.id);
@@ -1023,14 +1050,15 @@ export const ServerSettingsScreen: Component = () => {
                                     width: "100%",
                                     padding: "6px 10px",
                                     "border-radius": "6px",
-                                    background: has() ? "rgba(124,107,245,0.12)" : "transparent",
-                                    color: has() ? "#c4b8fb" : "rgba(255,255,255,0.6)",
+                                    background: has() ? "rgba(var(--veil-accent-rgb),0.12)" : "transparent",
+                                    color: has() ? "var(--veil-accent-hi)" : "var(--veil-contrast-60)",
                                     border: "none",
                                     cursor: "pointer",
                                     "text-align": "left" as const,
                                     "font-size": "12px",
                                   }}
-                                  onClick={(e) => { e.stopPropagation(); toggleMemberRole(m, r); }}
+                                  aria-pressed={has()}
+                                  onClick={() => void toggleMemberRole(m, r)}
                                 >
                                   <div style={{
                                     width: "10px", height: "10px", "border-radius": "50%",
@@ -1045,13 +1073,13 @@ export const ServerSettingsScreen: Component = () => {
                             }}
                           </For>
                           <Show when={roles().filter((r) => !r.isDefault).length === 0}>
-                            <div style={{ padding: "8px 10px", "font-size": "11px", color: "rgba(255,255,255,0.3)" }}>
+                            <div style={{ padding: "8px 10px", "font-size": "11px", color: "var(--veil-contrast-30)" }}>
                               No assignable roles. Create one in Roles tab.
                             </div>
                           </Show>
-                        </div>
-                      </Show>
-                    </div>
+                        </KPopover.Content>
+                      </KPopover.Portal>
+                    </KPopover>
                     <button style={S.btnDangerSm} onClick={() => kickMember(m)}>Kick</button>
                   </Show>
                 </div>
@@ -1183,10 +1211,10 @@ export const ServerSettingsScreen: Component = () => {
             return (
               <div style={S.listRow}>
                 <div style={{ flex: "1", "min-width": "0" }}>
-                  <div style={{ "font-size": "13px", color: "rgba(255,255,255,0.85)", "font-weight": "600", "font-family": "monospace" }}>
+                  <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600", "font-family": "monospace" }}>
                     {code}
                   </div>
-                  <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.3)", "margin-top": "2px" }}>
+                  <div style={{ "font-size": "11px", color: "var(--veil-contrast-30)", "margin-top": "2px" }}>
                     Uses: {uses}{maxUses > 0 ? ` / ${maxUses}` : " (unlimited)"}
                     {expiresAt ? ` · Expires ${new Date(expiresAt).toLocaleString()}` : " · Never expires"}
                   </div>
@@ -1216,7 +1244,7 @@ export const ServerSettingsScreen: Component = () => {
 
       <div style={S.card}>
         <div style={{ display: "flex", "align-items": "center", gap: "10px", "margin-bottom": "12px" }}>
-          <span style={S.badge("#888")}>Coming soon</span>
+          <span style={S.badge("var(--veil-text-muted)")}>Coming soon</span>
         </div>
         <div style={S.paragraph}>
           The audit log will record server-altering actions — channel/role/member changes,
@@ -1263,7 +1291,7 @@ export const ServerSettingsScreen: Component = () => {
         <div style={S.card}>
           <div style={S.cardTitle}>Leave Server</div>
           <div style={S.paragraph}>
-            You will lose access to all channels and messages in <strong style={{ color: "rgba(255,255,255,0.7)" }}>{server()?.name}</strong>. You can rejoin later only if someone gives you a new invite.
+            You will lose access to all channels and messages in <strong style={{ color: "var(--veil-contrast-70)" }}>{server()?.name}</strong>. You can rejoin later only if someone gives you a new invite.
           </div>
           <button style={S.btnDanger} onClick={handleLeave}>Leave Server</button>
         </div>
@@ -1273,7 +1301,7 @@ export const ServerSettingsScreen: Component = () => {
         <div style={S.card}>
           <div style={S.cardTitle}>Delete Server</div>
           <div style={S.paragraph}>
-            Permanently delete <strong style={{ color: "#f04848" }}>{server()?.name}</strong>, all its channels, and all messages within. This action <strong style={{ color: "#f04848" }}>cannot be undone</strong> and will affect every member.
+            Permanently delete <strong style={{ color: "var(--veil-danger)" }}>{server()?.name}</strong>, all its channels, and all messages within. This action <strong style={{ color: "var(--veil-danger)" }}>cannot be undone</strong> and will affect every member.
           </div>
           <button style={S.btnDanger} onClick={handleDelete}>Delete Server Permanently</button>
         </div>
@@ -1285,19 +1313,22 @@ export const ServerSettingsScreen: Component = () => {
   return (
     <Show when={server()} fallback={
       <div style={{ ...S.overlay, ...animStyle(), "align-items": "center", "justify-content": "center" }}>
-        <div style={{ color: "rgba(255,255,255,0.4)", "font-size": "13px" }}>Server not found.</div>
-        <button style={{ ...S.backBtn, position: "absolute" as const }} onClick={goBack}>{"\u2715"}</button>
+        <div style={{ color: "var(--veil-contrast-40)", "font-size": "13px" }}>Server not found.</div>
+        <button type="button" style={{ ...S.backBtn, position: "absolute" as const }} onClick={goBack} title="Back to chat" aria-label="Back to chat"><ArrowLeft size={17} strokeWidth={1.8} /></button>
       </div>
     }>
       <div style={{ ...S.overlay, ...animStyle() }}>
         {/* Close button */}
         <button
+          type="button"
           style={S.backBtn}
           onClick={goBack}
-          onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.08)"; e.currentTarget.style.color = "rgba(255,255,255,0.7)"; }}
-          onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.04)"; e.currentTarget.style.color = "rgba(255,255,255,0.4)"; }}
+          title="Back to chat"
+          aria-label="Back to chat"
+          onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-08)"; e.currentTarget.style.color = "var(--veil-contrast-70)"; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-contrast-40)"; }}
         >
-          {"\u2715"}
+          <ArrowLeft size={17} strokeWidth={1.8} />
         </button>
 
         {/* Sidebar navigation */}
@@ -1309,45 +1340,20 @@ export const ServerSettingsScreen: Component = () => {
               <button
                 style={S.navItem(section() === s.id, s.id === "danger")}
                 onClick={() => setSection(s.id)}
-                onMouseEnter={(e) => { if (section() !== s.id) e.currentTarget.style.background = "rgba(255,255,255,0.03)"; }}
+                onMouseEnter={(e) => { if (section() !== s.id) e.currentTarget.style.background = "var(--veil-contrast-03)"; }}
                 onMouseLeave={(e) => { if (section() !== s.id) e.currentTarget.style.background = "transparent"; }}
               >
-                <span style={{ "font-size": "14px", width: "20px", "text-align": "center" }}>{s.icon}</span>
+                <s.icon size={15} strokeWidth={1.8} style={{ width: "20px", "flex-shrink": "0" }} />
                 {s.label}
               </button>
             )}
           </For>
 
           <div style={{ flex: "1" }} />
-
-          <div style={{ padding: "0 14px" }}>
-            <button
-              style={{
-                width: "100%",
-                height: "36px",
-                "border-radius": "10px",
-                background: "rgba(255,255,255,0.04)",
-                border: "1px solid rgba(255,255,255,0.06)",
-                color: "rgba(255,255,255,0.5)",
-                "font-size": "12px",
-                "font-weight": "500",
-                cursor: "pointer",
-                transition: "background 0.15s",
-              }}
-              onClick={goBack}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.08)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
-            >
-              {"\u2190"} Back to Chat
-            </button>
-          </div>
         </div>
 
         {/* Content area */}
-        <div
-          style={S.content}
-          onClick={() => { if (openRolePicker()) setOpenRolePicker(null); }}
-        >
+        <div style={S.content}>
           <Switch>
             <Match when={section() === "overview"}><OverviewSection /></Match>
             <Match when={section() === "channels"}><ChannelsSection /></Match>

@@ -1,5 +1,7 @@
-import { Component, createSignal, Show, For, onMount } from "solid-js";
+import { Component, createSignal, Show, For, onCleanup, onMount } from "solid-js";
 import { appStore } from "@/stores/app";
+import { appearanceStore } from "@/stores/appearance";
+import { VeilMark } from "@/components/brand/VeilMark";
 
 /* ═══════════════════════════════════════════════════════
    LOCK SCREEN — Hebrew rain + PIN numpad + transitions
@@ -19,6 +21,11 @@ interface RainDrop {
   duration: number; size: number; opacity: number;
 }
 
+const LEGACY_MIN_PIN = 4;
+const STANDARD_MIN_PIN = 6;
+const MAX_PIN = 12;
+const PIN_PROGRESS_SLOTS = Array.from({ length: MAX_PIN }, (_, index) => index);
+
 export const LockScreen: Component = () => {
   const [pin, setPin] = createSignal("");
   const [error, setError] = createSignal(false);
@@ -28,9 +35,29 @@ export const LockScreen: Component = () => {
   const [success, setSuccess] = createSignal(false);
   const [rainDrops, setRainDrops] = createSignal<RainDrop[]>([]);
   const [entering, setEntering] = createSignal(true);
+  const [inputFocused, setInputFocused] = createSignal(false);
   let submitting = false;
+  let pinInput: HTMLInputElement | undefined;
+  const timers = new Set<ReturnType<typeof setTimeout>>();
 
-  const MAX_PIN = 12;
+  const later = (callback: () => void, delayMs: number) => {
+    const timer = setTimeout(() => {
+      timers.delete(timer);
+      callback();
+    }, delayMs);
+    timers.add(timer);
+  };
+
+  const inputDisabled = () => loading() || error() || success();
+
+  const focusPinInput = () => {
+    if (inputDisabled() || submitting) return;
+    requestAnimationFrame(() => {
+      pinInput?.focus({ preventScroll: true });
+      const end = pin().length;
+      pinInput?.setSelectionRange(end, end);
+    });
+  };
 
   onMount(() => {
     const drops: RainDrop[] = Array.from({ length: 40 }, (_, i) => ({
@@ -43,11 +70,19 @@ export const LockScreen: Component = () => {
       opacity: 0.03 + Math.random() * 0.06,
     }));
     setRainDrops(drops);
-    setTimeout(() => setEntering(false), 50);
+    later(() => {
+      setEntering(false);
+      focusPinInput();
+    }, 50);
+  });
+
+  onCleanup(() => {
+    for (const timer of timers) clearTimeout(timer);
+    timers.clear();
   });
 
   const handleSubmit = async (currentPin: string) => {
-    if (submitting || currentPin.length < 4) return;
+    if (submitting || currentPin.length < LEGACY_MIN_PIN) return;
     submitting = true;
     setLoading(true);
 
@@ -56,73 +91,113 @@ export const LockScreen: Component = () => {
       if (ok) {
         setSuccess(true);
         // Show green dots briefly, then go straight to chat
-        setTimeout(() => appStore.setScreen("chat"), 600);
+        later(() => appStore.setScreen("chat"), 600);
       } else {
         setError(true);
         setErrorMsg("Incorrect PIN");
         setShake(true);
-        setTimeout(() => setShake(false), 600);
-        setTimeout(() => {
+        later(() => setShake(false), 600);
+        later(() => {
           setPin("");
           setError(false);
           setErrorMsg("");
+          focusPinInput();
         }, 800);
       }
     } catch (e) {
       setError(true);
       setErrorMsg(String(e).slice(0, 60));
       setShake(true);
-      setTimeout(() => { setShake(false); setPin(""); setError(false); }, 1500);
+      later(() => {
+        setShake(false);
+        setPin("");
+        setError(false);
+        setErrorMsg("");
+        focusPinInput();
+      }, 1500);
     } finally {
       setLoading(false);
       submitting = false;
     }
   };
 
-  const handleDigit = (d: string) => {
-    if (loading() || pin().length >= MAX_PIN || success()) return;
-    const next = pin() + d;
+  const updatePin = (rawValue: string) => {
+    if (inputDisabled()) return;
+    const next = rawValue.replace(/\D/g, "").slice(0, MAX_PIN);
     setPin(next);
     setError(false);
     setErrorMsg("");
 
-    // Auto-submit only when max length is reached
+    // Twelve digits are unambiguous because this is the maximum length.
     if (next.length === MAX_PIN && !submitting) {
-      setTimeout(() => handleSubmit(next), 150);
+      later(() => {
+        if (pin() === next && !inputDisabled() && !submitting) {
+          void handleSubmit(next);
+        }
+      }, 150);
     }
+  };
+
+  const handleDigit = (d: string) => {
+    if (inputDisabled() || pin().length >= MAX_PIN) return;
+    updatePin(pin() + d);
+    focusPinInput();
   };
 
   const handleConfirm = () => {
     const current = pin();
-    if (current.length >= 4 && !submitting) {
-      handleSubmit(current);
+    if (current.length >= LEGACY_MIN_PIN && !inputDisabled() && !submitting) {
+      void handleSubmit(current);
     }
   };
 
   const handleDelete = () => {
-    if (loading() || success()) return;
-    setPin((p) => p.slice(0, -1));
-    setError(false);
+    if (inputDisabled()) return;
+    updatePin(pin().slice(0, -1));
+    focusPinInput();
+  };
+
+  const handleInputKeyDown = (event: KeyboardEvent) => {
+    if (event.key === "Enter") {
+      event.preventDefault();
+      handleConfirm();
+      return;
+    }
+    if (event.key === "Backspace") {
+      event.preventDefault();
+      handleDelete();
+    }
+  };
+
+  const progressHint = () => {
+    const length = pin().length;
+    if (loading()) return "Checking PIN…";
+    if (success()) return "Unlocked";
+    if (length === 0) return "Enter 6–12 digits · legacy 4–5 supported";
+    if (length < LEGACY_MIN_PIN) return `${length} of at least ${LEGACY_MIN_PIN} digits`;
+    if (length < STANDARD_MIN_PIN) return "Legacy 4–5 digit PIN · press Enter to unlock";
+    if (length < MAX_PIN) return `${length} of ${MAX_PIN} digits · press Enter to unlock`;
+    return `${MAX_PIN} of ${MAX_PIN} digits`;
   };
 
   // ─── Styles ─────────────────────────────────────────
   const S = {
     root: {
       position: "relative" as const, width: "100%", height: "100%", overflow: "hidden",
-      background: "#111117", display: "flex", "flex-direction": "column" as const,
+      background: "var(--veil-background)", display: "flex", "flex-direction": "column" as const,
       "justify-content": "center", "align-items": "center",
     },
     glow1: {
       position: "absolute" as const, top: "15%", left: "35%",
       width: "400px", height: "400px", "border-radius": "50%",
-      background: "radial-gradient(circle, rgba(124,107,245,0.06) 0%, transparent 70%)",
+      background: "radial-gradient(circle, rgba(var(--veil-accent-rgb),0.06) 0%, transparent 70%)",
       filter: "blur(60px)", "pointer-events": "none" as const,
       animation: "glowPulse 6s ease-in-out infinite",
     },
     glow2: {
       position: "absolute" as const, bottom: "15%", right: "25%",
       width: "350px", height: "350px", "border-radius": "50%",
-      background: "radial-gradient(circle, rgba(124,107,245,0.04) 0%, transparent 70%)",
+      background: "radial-gradient(circle, rgba(var(--veil-accent-rgb),0.04) 0%, transparent 70%)",
       filter: "blur(80px)", "pointer-events": "none" as const,
       animation: "glowPulse 8s ease-in-out infinite 2s",
     },
@@ -132,7 +207,7 @@ export const LockScreen: Component = () => {
     },
     rainDrop: (d: RainDrop) => ({
       position: "absolute" as const, left: `${d.x}%`, top: "-40px",
-      "font-size": `${d.size}px`, color: `rgba(124,107,245,${d.opacity})`,
+      "font-size": `${d.size}px`, color: `rgba(var(--veil-accent-rgb),${d.opacity})`,
       "font-family": "'Noto Sans Hebrew', 'David Libre', serif",
       "writing-mode": "vertical-rl" as const, "white-space": "nowrap" as const,
       animation: `hebrewRain ${d.duration}s linear ${d.delay}s infinite`,
@@ -142,68 +217,92 @@ export const LockScreen: Component = () => {
       position: "relative" as const, "z-index": "2",
       display: "flex", "flex-direction": "column" as const,
       "align-items": "center",
-      background: "rgba(30,31,34,0.85)", "backdrop-filter": "blur(20px)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "color-mix(in srgb, var(--veil-window) 85%, transparent)", "backdrop-filter": "blur(20px)",
+      border: "1px solid var(--veil-contrast-06)",
       "border-radius": "24px", padding: "40px 48px",
-      "box-shadow": "0 8px 40px rgba(0,0,0,0.4), 0 0 80px rgba(124,107,245,0.04)",
+      "box-shadow": "0 8px 40px var(--veil-shadow), 0 0 80px rgba(var(--veil-accent-rgb),0.04)",
       transition: "opacity 0.35s ease, transform 0.35s ease",
     },
     logoIcon: {
       width: "56px", height: "56px", "border-radius": "18px",
-      background: "linear-gradient(135deg, rgba(124,107,245,0.25) 0%, rgba(124,107,245,0.08) 100%)",
-      border: "1px solid rgba(124,107,245,0.15)",
+      background: "linear-gradient(135deg, rgba(var(--veil-accent-rgb),0.25) 0%, rgba(var(--veil-accent-rgb),0.08) 100%)",
+      border: "1px solid rgba(var(--veil-accent-rgb),0.15)",
       display: "flex", "align-items": "center", "justify-content": "center",
       position: "relative" as const, "margin-bottom": "14px",
     },
     logoGlow: {
       position: "absolute" as const, inset: "-8px", "border-radius": "22px",
-      background: "rgba(124,107,245,0.12)", filter: "blur(16px)",
+      background: "rgba(var(--veil-accent-rgb),0.12)", filter: "blur(16px)",
       animation: "glowPulse 4s ease-in-out infinite",
     },
     title: {
-      "font-size": "18px", "font-weight": "600", color: "rgba(255,255,255,0.85)",
+      "font-size": "18px", "font-weight": "600", color: "var(--veil-contrast-85)",
       "letter-spacing": "0.2em", "margin-bottom": "6px",
     },
     subtitle: {
       display: "flex", "align-items": "center", gap: "6px",
-      "font-size": "12px", color: "rgba(255,255,255,0.25)", "margin-bottom": "28px",
+      "font-size": "12px", color: "var(--veil-contrast-25)", "margin-bottom": "28px",
     },
+    hiddenInput: {
+      position: "absolute" as const,
+      width: "1px", height: "1px", padding: "0", margin: "-1px",
+      overflow: "hidden", clip: "rect(0, 0, 0, 0)",
+      "clip-path": "inset(50%)", "white-space": "nowrap" as const,
+      border: "0", opacity: "0",
+    },
+    progressWrap: (focused: boolean) => ({
+      width: "228px", padding: "10px 12px 8px", "margin-bottom": "20px",
+      "border-radius": "14px",
+      border: focused
+        ? "1px solid rgba(var(--veil-accent-rgb),0.24)"
+        : "1px solid var(--veil-contrast-04)",
+      background: focused
+        ? "rgba(var(--veil-accent-rgb),0.035)"
+        : "var(--veil-contrast-015)",
+      "box-shadow": focused ? "0 0 0 3px rgba(var(--veil-accent-rgb),0.05)" : "none",
+      transition: "border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease",
+    }),
     dotsRow: {
-      display: "flex", gap: "12px", "margin-bottom": "28px", height: "16px",
-      "align-items": "center",
+      display: "flex", gap: "7px", height: "12px",
+      "align-items": "center", "justify-content": "center",
     },
     dot: (filled: boolean, isError: boolean, isSuccess: boolean) => ({
-      width: filled ? "12px" : "10px",
-      height: filled ? "12px" : "10px",
+      width: filled ? "10px" : "8px",
+      height: filled ? "10px" : "8px",
       "border-radius": "50%",
       background: isSuccess
-        ? "#34d399"
+        ? "var(--veil-success)"
         : isError
-          ? "#f04848"
+          ? "var(--veil-danger)"
           : filled
-            ? "#7c6bf5"
-            : "rgba(255,255,255,0.06)",
+            ? "var(--veil-accent)"
+            : "var(--veil-contrast-06)",
       border: filled
         ? "none"
-        : "1px solid rgba(255,255,255,0.06)",
+        : "1px solid var(--veil-contrast-06)",
       transition: "all 0.2s ease",
       "box-shadow": isSuccess
-        ? "0 0 12px rgba(52,211,153,0.4)"
+        ? "0 0 12px color-mix(in srgb, var(--veil-success) 40%, transparent)"
         : isError
-          ? "0 0 12px rgba(240,72,72,0.3)"
+          ? "0 0 12px color-mix(in srgb, var(--veil-danger) 30%, transparent)"
           : filled
-            ? "0 0 10px rgba(124,107,245,0.3)"
+            ? "0 0 10px rgba(var(--veil-accent-rgb),0.3)"
             : "none",
     }),
+    progressHint: {
+      "font-size": "10px", color: "var(--veil-contrast-28)",
+      "text-align": "center" as const, "margin-top": "8px", height: "14px",
+      "white-space": "nowrap" as const,
+    },
     numGrid: {
       display: "grid", "grid-template-columns": "repeat(3, 1fr)",
       gap: "10px",
     },
     numBtn: {
       width: "64px", height: "64px", "border-radius": "18px",
-      background: "rgba(255,255,255,0.03)",
-      border: "1px solid rgba(255,255,255,0.05)",
-      color: "rgba(255,255,255,0.75)", "font-size": "20px", "font-weight": "500",
+      background: "var(--veil-contrast-03)",
+      border: "1px solid var(--veil-contrast-05)",
+      color: "var(--veil-contrast-75)", "font-size": "20px", "font-weight": "500",
       cursor: "pointer", display: "flex", "align-items": "center",
       "justify-content": "center",
       transition: "all 0.15s ease",
@@ -212,13 +311,13 @@ export const LockScreen: Component = () => {
     deleteBtn: {
       width: "64px", height: "64px", "border-radius": "18px",
       background: "transparent", border: "none",
-      color: "rgba(255,255,255,0.25)", "font-size": "18px",
+      color: "var(--veil-contrast-25)", "font-size": "18px",
       cursor: "pointer", display: "flex", "align-items": "center",
       "justify-content": "center", transition: "color 0.15s",
     },
     emptyCell: { width: "64px", height: "64px" },
     errorMsg: {
-      "font-size": "12px", color: "rgba(240,72,72,0.7)",
+      "font-size": "12px", color: "color-mix(in srgb, var(--veil-danger) 70%, transparent)",
       "margin-top": "16px", height: "18px",
       transition: "opacity 0.2s",
     },
@@ -231,7 +330,7 @@ export const LockScreen: Component = () => {
   });
 
   return (
-    <div style={S.root}>
+    <div style={{ ...S.root, background: appearanceStore.wallpaperUrl() ? "transparent" : "var(--veil-background)" }}>
       <div style={S.glow1} />
       <div style={S.glow2} />
 
@@ -241,15 +340,32 @@ export const LockScreen: Component = () => {
         </For>
       </div>
 
-      <div style={{ ...S.island, ...animStyle() }}>
+      <div style={{ ...S.island, ...animStyle() }} onClick={() => focusPinInput()}>
+        <input
+          ref={pinInput}
+          type="password"
+          inputmode="numeric"
+          pattern="[0-9]*"
+          autocomplete="current-password"
+          maxlength={MAX_PIN}
+          value={pin()}
+          disabled={inputDisabled()}
+          style={S.hiddenInput}
+          aria-label="Unlock PIN, 4 to 12 digits. New PINs use 6 to 12 digits."
+          aria-describedby="pin-progress-status pin-error-status"
+          aria-errormessage={error() ? "pin-error-status" : undefined}
+          aria-invalid={error() ? "true" : "false"}
+          aria-busy={loading() ? "true" : "false"}
+          onInput={(event) => updatePin(event.currentTarget.value)}
+          onKeyDown={handleInputKeyDown}
+          onFocus={() => setInputFocused(true)}
+          onBlur={() => setInputFocused(false)}
+        />
+
         {/* Logo */}
         <div style={S.logoIcon}>
           <div style={S.logoGlow} />
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" style={{ position: "relative", "z-index": "1" }}>
-            <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z"
-              fill="rgba(124,107,245,0.3)" stroke="rgba(124,107,245,0.8)" stroke-width="1.5"/>
-            <path d="M9 12l2 2 4-4" stroke="#7c6bf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
+          <VeilMark size={28} style={{ position: "relative", "z-index": "1", color: "var(--veil-accent)" }} />
         </div>
 
         <div style={S.title}>VEIL</div>
@@ -261,11 +377,24 @@ export const LockScreen: Component = () => {
           Enter PIN to unlock
         </div>
 
-        {/* PIN dots */}
-        <div style={S.dotsRow}>
-          {[0, 1, 2, 3, 4, 5].map((i) => (
-            <div style={S.dot(i < pin().length, error(), success())} />
-          ))}
+        {/* PIN progress: all 12 supported positions remain visible. */}
+        <div style={S.progressWrap(inputFocused())}>
+          <div
+            style={S.dotsRow}
+            role="progressbar"
+            aria-label="PIN length"
+            aria-valuemin="0"
+            aria-valuemax={MAX_PIN}
+            aria-valuenow={pin().length}
+            aria-valuetext={progressHint()}
+          >
+            <For each={PIN_PROGRESS_SLOTS}>
+              {(index) => <div style={S.dot(index < pin().length, error(), success())} />}
+            </For>
+          </div>
+          <div id="pin-progress-status" style={S.progressHint} aria-live="polite">
+            {progressHint()}
+          </div>
         </div>
 
         {/* Numpad */}
@@ -273,19 +402,21 @@ export const LockScreen: Component = () => {
           <For each={["1", "2", "3", "4", "5", "6", "7", "8", "9"]}>
             {(d) => (
               <button
+                type="button"
                 style={S.numBtn}
                 onClick={() => handleDigit(d)}
-                disabled={loading()}
+                disabled={inputDisabled()}
+                aria-label={`Digit ${d}`}
                 onMouseEnter={(e) => {
-                  e.currentTarget.style.background = "rgba(124,107,245,0.08)";
-                  e.currentTarget.style.borderColor = "rgba(124,107,245,0.15)";
-                  e.currentTarget.style.color = "rgba(255,255,255,0.9)";
+                  e.currentTarget.style.background = "rgba(var(--veil-accent-rgb),0.08)";
+                  e.currentTarget.style.borderColor = "rgba(var(--veil-accent-rgb),0.15)";
+                  e.currentTarget.style.color = "var(--veil-contrast-90)";
                   e.currentTarget.style.transform = "scale(0.97)";
                 }}
                 onMouseLeave={(e) => {
-                  e.currentTarget.style.background = "rgba(255,255,255,0.03)";
-                  e.currentTarget.style.borderColor = "rgba(255,255,255,0.05)";
-                  e.currentTarget.style.color = "rgba(255,255,255,0.75)";
+                  e.currentTarget.style.background = "var(--veil-contrast-03)";
+                  e.currentTarget.style.borderColor = "var(--veil-contrast-05)";
+                  e.currentTarget.style.color = "var(--veil-contrast-75)";
                   e.currentTarget.style.transform = "scale(1)";
                 }}
                 onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.93)"; }}
@@ -297,19 +428,21 @@ export const LockScreen: Component = () => {
           </For>
           <div style={S.emptyCell} />
           <button
+            type="button"
             style={S.numBtn}
             onClick={() => handleDigit("0")}
-            disabled={loading()}
+            disabled={inputDisabled()}
+            aria-label="Digit 0"
             onMouseEnter={(e) => {
-              e.currentTarget.style.background = "rgba(124,107,245,0.08)";
-              e.currentTarget.style.borderColor = "rgba(124,107,245,0.15)";
-              e.currentTarget.style.color = "rgba(255,255,255,0.9)";
+              e.currentTarget.style.background = "rgba(var(--veil-accent-rgb),0.08)";
+              e.currentTarget.style.borderColor = "rgba(var(--veil-accent-rgb),0.15)";
+              e.currentTarget.style.color = "var(--veil-contrast-90)";
               e.currentTarget.style.transform = "scale(0.97)";
             }}
             onMouseLeave={(e) => {
-              e.currentTarget.style.background = "rgba(255,255,255,0.03)";
-              e.currentTarget.style.borderColor = "rgba(255,255,255,0.05)";
-              e.currentTarget.style.color = "rgba(255,255,255,0.75)";
+              e.currentTarget.style.background = "var(--veil-contrast-03)";
+              e.currentTarget.style.borderColor = "var(--veil-contrast-05)";
+              e.currentTarget.style.color = "var(--veil-contrast-75)";
               e.currentTarget.style.transform = "scale(1)";
             }}
             onMouseDown={(e) => { e.currentTarget.style.transform = "scale(0.93)"; }}
@@ -318,14 +451,17 @@ export const LockScreen: Component = () => {
             0
           </button>
           <button
+            type="button"
             style={{
               ...S.deleteBtn,
-              opacity: pin().length > 0 && !loading() ? "1" : "0",
-              "pointer-events": pin().length > 0 && !loading() ? "auto" : ("none" as const),
+              opacity: pin().length > 0 && !inputDisabled() ? "1" : "0",
+              "pointer-events": pin().length > 0 && !inputDisabled() ? "auto" : ("none" as const),
             }}
             onClick={handleDelete}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.25)"; }}
+            disabled={pin().length === 0 || inputDisabled()}
+            aria-label="Delete last PIN digit"
+            onMouseEnter={(e) => { e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-contrast-25)"; }}
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/>
@@ -335,34 +471,40 @@ export const LockScreen: Component = () => {
           </button>
         </div>
 
-        {/* Confirm button — visible when 4-5 digits entered */}
-        <Show when={pin().length >= 4 && pin().length < MAX_PIN && !loading() && !success()}>
+        {/* 4–5 digits remain available only for legacy PIN compatibility. */}
+        <Show when={pin().length >= LEGACY_MIN_PIN && pin().length < MAX_PIN && !inputDisabled()}>
           <button
+            type="button"
             style={{
               "margin-top": "16px",
               height: "40px",
               padding: "0 28px",
               "border-radius": "12px",
-              background: "linear-gradient(135deg, #7c6bf5 0%, #6955e0 100%)",
-              color: "#fff",
+              background: "linear-gradient(135deg, var(--veil-accent) 0%, var(--veil-accent-deep) 100%)",
+              color: "var(--veil-on-accent)",
               border: "none",
               "font-size": "13px",
               "font-weight": "600",
               cursor: "pointer",
               transition: "transform 0.15s, box-shadow 0.15s",
-              "box-shadow": "0 4px 16px rgba(124,107,245,0.25)",
+              "box-shadow": "0 4px 16px rgba(var(--veil-accent-rgb),0.25)",
             }}
             onClick={handleConfirm}
-            onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 24px rgba(124,107,245,0.35)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 16px rgba(124,107,245,0.25)"; }}
+            onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 24px rgba(var(--veil-accent-rgb),0.35)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 16px rgba(var(--veil-accent-rgb),0.25)"; }}
           >
-            Unlock
+            {pin().length < STANDARD_MIN_PIN ? "Unlock legacy PIN" : "Unlock"}
           </button>
         </Show>
 
         {/* Error / status message */}
-        <div style={{ ...S.errorMsg, opacity: error() ? "1" : "0" }}>
-          {errorMsg() || "Incorrect PIN"}
+        <div
+          id="pin-error-status"
+          style={{ ...S.errorMsg, opacity: error() ? "1" : "0" }}
+          role="alert"
+          aria-live="assertive"
+        >
+          {error() ? errorMsg() || "Incorrect PIN" : "\u00A0"}
         </div>
       </div>
     </div>

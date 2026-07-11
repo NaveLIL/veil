@@ -9,6 +9,7 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/logsafe"
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 )
 
@@ -361,7 +362,7 @@ func (s *Service) HandlePreKeyRequest(ctx context.Context, requesterUserID strin
 	// Check OPK count and warn
 	remaining, _ := s.db.CountUnusedOPKs(ctx, device.ID)
 	if remaining < s.cfg.PreKeyLowWarning {
-		log.Printf("WARNING: device %s has only %d OPKs remaining", device.ID, remaining)
+		log.Printf("WARNING: device_ref=%s has only %d OPKs remaining", logsafe.Ref("device", device.ID), remaining)
 	}
 
 	return bundle, nil

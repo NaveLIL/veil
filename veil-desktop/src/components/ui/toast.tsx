@@ -12,7 +12,7 @@
  * Built on @kobalte/core/toast — handles ARIA live region, dismissal,
  * keyboard focus management, and queueing automatically.
  *
- * Visual language: Island materials (#2B2D31 fill, 12px radius, blur shadow).
+ * Visual language: themed island materials with a 12px radius and blur shadow.
  */
 
 import { Toast as KToast, toaster } from "@kobalte/core/toast";
@@ -32,10 +32,10 @@ interface ShowOpts {
 }
 
 const variantAccent: Record<ToastVariant, string> = {
-  info: "#7c6bf5",
-  success: "#22c55e",
-  warning: "#f59e0b",
-  error: "#ef4444",
+  info: "var(--veil-accent)",
+  success: "var(--veil-success)",
+  warning: "var(--veil-warning)",
+  error: "var(--veil-danger)",
 };
 
 const variantIcon = (v: ToastVariant): JSX.Element => {
@@ -116,14 +116,14 @@ const ToastCard: Component<CardProps> = (props) => {
           gap: "12px",
           "align-items": "flex-start",
           padding: "12px 14px",
-          background: "#2B2D31",
+          background: "var(--veil-island)",
           "border-radius": "12px",
-          border: "1px solid rgba(255,255,255,0.06)",
+          border: "1px solid var(--veil-border)",
           "border-left": `3px solid ${accent()}`,
-          "box-shadow": "0 12px 32px rgba(0,0,0,0.45)",
+          "box-shadow": "0 12px 32px var(--veil-shadow-strong)",
           "min-width": "280px",
           "max-width": "380px",
-          color: "#ddd",
+          color: "var(--veil-text)",
           "font-family": "'Inter', system-ui, sans-serif",
           animation: "fadeInScale 180ms ease-out",
         }}
@@ -144,7 +144,7 @@ const ToastCard: Component<CardProps> = (props) => {
             style={{
               "font-size": "13px",
               "font-weight": "600",
-              color: "#eee",
+              color: "var(--veil-text-strong)",
               margin: "0",
               "letter-spacing": "0.01em",
             }}
@@ -155,7 +155,7 @@ const ToastCard: Component<CardProps> = (props) => {
             <KToast.Description
               style={{
                 "font-size": "12px",
-                color: "#999",
+                color: "var(--veil-text-muted)",
                 margin: "4px 0 0",
                 "line-height": "1.45",
               }}
@@ -171,7 +171,7 @@ const ToastCard: Component<CardProps> = (props) => {
             "border-radius": "6px",
             background: "transparent",
             border: "none",
-            color: "#666",
+            color: "var(--veil-text-faint)",
             cursor: "pointer",
             display: "flex",
             "align-items": "center",
@@ -181,13 +181,13 @@ const ToastCard: Component<CardProps> = (props) => {
           }}
           onMouseEnter={(e) => {
             const el = e.currentTarget as HTMLElement;
-            el.style.background = "rgba(255,255,255,0.06)";
-            el.style.color = "#ddd";
+            el.style.background = "color-mix(in srgb, var(--veil-text-strong) 6%, transparent)";
+            el.style.color = "var(--veil-text)";
           }}
           onMouseLeave={(e) => {
             const el = e.currentTarget as HTMLElement;
             el.style.background = "transparent";
-            el.style.color = "#666";
+            el.style.color = "var(--veil-text-faint)";
           }}
         >
           <X size={13} />

@@ -21,6 +21,112 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Bit values carried in DeviceBindingV1.capabilities. Values may be ORed.
+type DeviceCapability int32
+
+const (
+	DeviceCapability_DEVICE_CAPABILITY_UNSPECIFIED    DeviceCapability = 0
+	DeviceCapability_DEVICE_CAPABILITY_SENDER_KEY_V5  DeviceCapability = 1
+	DeviceCapability_DEVICE_CAPABILITY_SEALED_SKDM_V3 DeviceCapability = 2
+)
+
+// Enum value maps for DeviceCapability.
+var (
+	DeviceCapability_name = map[int32]string{
+		0: "DEVICE_CAPABILITY_UNSPECIFIED",
+		1: "DEVICE_CAPABILITY_SENDER_KEY_V5",
+		2: "DEVICE_CAPABILITY_SEALED_SKDM_V3",
+	}
+	DeviceCapability_value = map[string]int32{
+		"DEVICE_CAPABILITY_UNSPECIFIED":    0,
+		"DEVICE_CAPABILITY_SENDER_KEY_V5":  1,
+		"DEVICE_CAPABILITY_SEALED_SKDM_V3": 2,
+	}
+)
+
+func (x DeviceCapability) Enum() *DeviceCapability {
+	p := new(DeviceCapability)
+	*p = x
+	return p
+}
+
+func (x DeviceCapability) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DeviceCapability) Descriptor() protoreflect.EnumDescriptor {
+	return file_veil_v1_auth_proto_enumTypes[0].Descriptor()
+}
+
+func (DeviceCapability) Type() protoreflect.EnumType {
+	return &file_veil_v1_auth_proto_enumTypes[0]
+}
+
+func (x DeviceCapability) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DeviceCapability.Descriptor instead.
+func (DeviceCapability) EnumDescriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{0}
+}
+
+type DeviceBindingStatus int32
+
+const (
+	DeviceBindingStatus_DEVICE_BINDING_STATUS_UNSPECIFIED DeviceBindingStatus = 0
+	DeviceBindingStatus_DEVICE_BINDING_STATUS_ACTIVE      DeviceBindingStatus = 1
+	DeviceBindingStatus_DEVICE_BINDING_STATUS_EXCLUDED    DeviceBindingStatus = 2
+	DeviceBindingStatus_DEVICE_BINDING_STATUS_REVOKED     DeviceBindingStatus = 3
+	// Response-only transitional state. It is never a valid signed binding.
+	DeviceBindingStatus_DEVICE_BINDING_STATUS_LEGACY_UNBOUND DeviceBindingStatus = 4
+)
+
+// Enum value maps for DeviceBindingStatus.
+var (
+	DeviceBindingStatus_name = map[int32]string{
+		0: "DEVICE_BINDING_STATUS_UNSPECIFIED",
+		1: "DEVICE_BINDING_STATUS_ACTIVE",
+		2: "DEVICE_BINDING_STATUS_EXCLUDED",
+		3: "DEVICE_BINDING_STATUS_REVOKED",
+		4: "DEVICE_BINDING_STATUS_LEGACY_UNBOUND",
+	}
+	DeviceBindingStatus_value = map[string]int32{
+		"DEVICE_BINDING_STATUS_UNSPECIFIED":    0,
+		"DEVICE_BINDING_STATUS_ACTIVE":         1,
+		"DEVICE_BINDING_STATUS_EXCLUDED":       2,
+		"DEVICE_BINDING_STATUS_REVOKED":        3,
+		"DEVICE_BINDING_STATUS_LEGACY_UNBOUND": 4,
+	}
+)
+
+func (x DeviceBindingStatus) Enum() *DeviceBindingStatus {
+	p := new(DeviceBindingStatus)
+	*p = x
+	return p
+}
+
+func (x DeviceBindingStatus) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (DeviceBindingStatus) Descriptor() protoreflect.EnumDescriptor {
+	return file_veil_v1_auth_proto_enumTypes[1].Descriptor()
+}
+
+func (DeviceBindingStatus) Type() protoreflect.EnumType {
+	return &file_veil_v1_auth_proto_enumTypes[1]
+}
+
+func (x DeviceBindingStatus) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use DeviceBindingStatus.Descriptor instead.
+func (DeviceBindingStatus) EnumDescriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{1}
+}
+
 // Сервер отправляет challenge при подключении
 type AuthChallenge struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
@@ -68,15 +174,17 @@ func (x *AuthChallenge) GetChallenge() []byte {
 
 // Клиент подписывает challenge и отправляет identity
 type AuthResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	IdentityKey   []byte                 `protobuf:"bytes,1,opt,name=identity_key,json=identityKey,proto3" json:"identity_key,omitempty"`       // X25519 public key (32 bytes)
-	SigningKey    []byte                 `protobuf:"bytes,2,opt,name=signing_key,json=signingKey,proto3" json:"signing_key,omitempty"`          // Ed25519 public key (32 bytes)
-	Signature     []byte                 `protobuf:"bytes,3,opt,name=signature,proto3" json:"signature,omitempty"`                              // Ed25519 signature of challenge
-	DeviceId      []byte                 `protobuf:"bytes,4,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`                // Unique device ID (16 bytes UUID)
-	DeviceName    string                 `protobuf:"bytes,5,opt,name=device_name,json=deviceName,proto3" json:"device_name,omitempty"`          // Human-readable: "Pixel 9", "MacBook Pro"
-	ClientVersion string                 `protobuf:"bytes,6,opt,name=client_version,json=clientVersion,proto3" json:"client_version,omitempty"` // "veil-desktop/1.0.0"
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	IdentityKey     []byte                 `protobuf:"bytes,1,opt,name=identity_key,json=identityKey,proto3" json:"identity_key,omitempty"`             // X25519 public key (32 bytes)
+	SigningKey      []byte                 `protobuf:"bytes,2,opt,name=signing_key,json=signingKey,proto3" json:"signing_key,omitempty"`                // Ed25519 public key (32 bytes)
+	Signature       []byte                 `protobuf:"bytes,3,opt,name=signature,proto3" json:"signature,omitempty"`                                    // Ed25519 signature of challenge
+	DeviceId        []byte                 `protobuf:"bytes,4,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`                      // Unique device ID (16 bytes UUID)
+	DeviceName      string                 `protobuf:"bytes,5,opt,name=device_name,json=deviceName,proto3" json:"device_name,omitempty"`                // Human-readable: "Pixel 9", "MacBook Pro"
+	ClientVersion   string                 `protobuf:"bytes,6,opt,name=client_version,json=clientVersion,proto3" json:"client_version,omitempty"`       // "veil-desktop/1.0.0"
+	DeviceBinding   *DeviceBindingV1       `protobuf:"bytes,7,opt,name=device_binding,json=deviceBinding,proto3" json:"device_binding,omitempty"`       // Present only for cryptographic per-device auth.
+	DeviceSignature []byte                 `protobuf:"bytes,8,opt,name=device_signature,json=deviceSignature,proto3" json:"device_signature,omitempty"` // Ed25519 signature over veil-device-auth-v1 preimage.
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *AuthResponse) Reset() {
@@ -151,14 +259,31 @@ func (x *AuthResponse) GetClientVersion() string {
 	return ""
 }
 
+func (x *AuthResponse) GetDeviceBinding() *DeviceBindingV1 {
+	if x != nil {
+		return x.DeviceBinding
+	}
+	return nil
+}
+
+func (x *AuthResponse) GetDeviceSignature() []byte {
+	if x != nil {
+		return x.DeviceSignature
+	}
+	return nil
+}
+
 // Результат аутентификации
 type AuthResult struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Success       bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
-	UserId        *string                `protobuf:"bytes,2,opt,name=user_id,json=userId,proto3,oneof" json:"user_id,omitempty"`
-	ErrorMessage  *string                `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3,oneof" json:"error_message,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Success              bool                   `protobuf:"varint,1,opt,name=success,proto3" json:"success,omitempty"`
+	UserId               *string                `protobuf:"bytes,2,opt,name=user_id,json=userId,proto3,oneof" json:"user_id,omitempty"`
+	ErrorMessage         *string                `protobuf:"bytes,3,opt,name=error_message,json=errorMessage,proto3,oneof" json:"error_message,omitempty"`
+	PerDeviceSecure      bool                   `protobuf:"varint,4,opt,name=per_device_secure,json=perDeviceSecure,proto3" json:"per_device_secure,omitempty"`
+	DeviceBindingVersion uint64                 `protobuf:"varint,5,opt,name=device_binding_version,json=deviceBindingVersion,proto3" json:"device_binding_version,omitempty"`
+	DeviceBindingStatus  DeviceBindingStatus    `protobuf:"varint,6,opt,name=device_binding_status,json=deviceBindingStatus,proto3,enum=veil.v1.DeviceBindingStatus" json:"device_binding_status,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *AuthResult) Reset() {
@@ -212,6 +337,322 @@ func (x *AuthResult) GetErrorMessage() string {
 	return ""
 }
 
+func (x *AuthResult) GetPerDeviceSecure() bool {
+	if x != nil {
+		return x.PerDeviceSecure
+	}
+	return false
+}
+
+func (x *AuthResult) GetDeviceBindingVersion() uint64 {
+	if x != nil {
+		return x.DeviceBindingVersion
+	}
+	return 0
+}
+
+func (x *AuthResult) GetDeviceBindingStatus() DeviceBindingStatus {
+	if x != nil {
+		return x.DeviceBindingStatus
+	}
+	return DeviceBindingStatus_DEVICE_BINDING_STATUS_UNSPECIFIED
+}
+
+// Account-authorized immutable version of one cryptographic device binding.
+// device_id is the existing stable 16-byte device identifier. Key replacement
+// requires a new device_id; later versions may change only capabilities/status.
+type DeviceBindingV1 struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	DeviceId          []byte                 `protobuf:"bytes,1,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`                              // 16 bytes
+	DeviceIdentityKey []byte                 `protobuf:"bytes,2,opt,name=device_identity_key,json=deviceIdentityKey,proto3" json:"device_identity_key,omitempty"` // X25519 public key, 32 bytes
+	DeviceSigningKey  []byte                 `protobuf:"bytes,3,opt,name=device_signing_key,json=deviceSigningKey,proto3" json:"device_signing_key,omitempty"`    // Ed25519 public key, 32 bytes
+	Version           uint64                 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`                                               // 1..2^63-1; advances exactly by one
+	Capabilities      uint64                 `protobuf:"varint,5,opt,name=capabilities,proto3" json:"capabilities,omitempty"`                                     // DeviceCapability mask; bit 63 is reserved
+	Status            DeviceBindingStatus    `protobuf:"varint,6,opt,name=status,proto3,enum=veil.v1.DeviceBindingStatus" json:"status,omitempty"`
+	AccountSignature  []byte                 `protobuf:"bytes,7,opt,name=account_signature,json=accountSignature,proto3" json:"account_signature,omitempty"` // Account Ed25519 signature, 64 bytes
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *DeviceBindingV1) Reset() {
+	*x = DeviceBindingV1{}
+	mi := &file_veil_v1_auth_proto_msgTypes[3]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeviceBindingV1) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeviceBindingV1) ProtoMessage() {}
+
+func (x *DeviceBindingV1) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_auth_proto_msgTypes[3]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeviceBindingV1.ProtoReflect.Descriptor instead.
+func (*DeviceBindingV1) Descriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{3}
+}
+
+func (x *DeviceBindingV1) GetDeviceId() []byte {
+	if x != nil {
+		return x.DeviceId
+	}
+	return nil
+}
+
+func (x *DeviceBindingV1) GetDeviceIdentityKey() []byte {
+	if x != nil {
+		return x.DeviceIdentityKey
+	}
+	return nil
+}
+
+func (x *DeviceBindingV1) GetDeviceSigningKey() []byte {
+	if x != nil {
+		return x.DeviceSigningKey
+	}
+	return nil
+}
+
+func (x *DeviceBindingV1) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *DeviceBindingV1) GetCapabilities() uint64 {
+	if x != nil {
+		return x.Capabilities
+	}
+	return 0
+}
+
+func (x *DeviceBindingV1) GetStatus() DeviceBindingStatus {
+	if x != nil {
+		return x.Status
+	}
+	return DeviceBindingStatus_DEVICE_BINDING_STATUS_UNSPECIFIED
+}
+
+func (x *DeviceBindingV1) GetAccountSignature() []byte {
+	if x != nil {
+		return x.AccountSignature
+	}
+	return nil
+}
+
+type DeviceDirectoryEntry struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	UserId             string                 `protobuf:"bytes,1,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	Username           string                 `protobuf:"bytes,2,opt,name=username,proto3" json:"username,omitempty"`
+	DeviceId           []byte                 `protobuf:"bytes,3,opt,name=device_id,json=deviceId,proto3" json:"device_id,omitempty"`
+	Binding            *DeviceBindingV1       `protobuf:"bytes,4,opt,name=binding,proto3,oneof" json:"binding,omitempty"`
+	Eligible           bool                   `protobuf:"varint,5,opt,name=eligible,proto3" json:"eligible,omitempty"`
+	ExclusionReason    *string                `protobuf:"bytes,6,opt,name=exclusion_reason,json=exclusionReason,proto3,oneof" json:"exclusion_reason,omitempty"`
+	AccountIdentityKey []byte                 `protobuf:"bytes,7,opt,name=account_identity_key,json=accountIdentityKey,proto3" json:"account_identity_key,omitempty"` // Account X25519 public key, 32 bytes
+	AccountSigningKey  []byte                 `protobuf:"bytes,8,opt,name=account_signing_key,json=accountSigningKey,proto3" json:"account_signing_key,omitempty"`    // Account Ed25519 public key, 32 bytes
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *DeviceDirectoryEntry) Reset() {
+	*x = DeviceDirectoryEntry{}
+	mi := &file_veil_v1_auth_proto_msgTypes[4]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *DeviceDirectoryEntry) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*DeviceDirectoryEntry) ProtoMessage() {}
+
+func (x *DeviceDirectoryEntry) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_auth_proto_msgTypes[4]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use DeviceDirectoryEntry.ProtoReflect.Descriptor instead.
+func (*DeviceDirectoryEntry) Descriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{4}
+}
+
+func (x *DeviceDirectoryEntry) GetUserId() string {
+	if x != nil {
+		return x.UserId
+	}
+	return ""
+}
+
+func (x *DeviceDirectoryEntry) GetUsername() string {
+	if x != nil {
+		return x.Username
+	}
+	return ""
+}
+
+func (x *DeviceDirectoryEntry) GetDeviceId() []byte {
+	if x != nil {
+		return x.DeviceId
+	}
+	return nil
+}
+
+func (x *DeviceDirectoryEntry) GetBinding() *DeviceBindingV1 {
+	if x != nil {
+		return x.Binding
+	}
+	return nil
+}
+
+func (x *DeviceDirectoryEntry) GetEligible() bool {
+	if x != nil {
+		return x.Eligible
+	}
+	return false
+}
+
+func (x *DeviceDirectoryEntry) GetExclusionReason() string {
+	if x != nil && x.ExclusionReason != nil {
+		return *x.ExclusionReason
+	}
+	return ""
+}
+
+func (x *DeviceDirectoryEntry) GetAccountIdentityKey() []byte {
+	if x != nil {
+		return x.AccountIdentityKey
+	}
+	return nil
+}
+
+func (x *DeviceDirectoryEntry) GetAccountSigningKey() []byte {
+	if x != nil {
+		return x.AccountSigningKey
+	}
+	return nil
+}
+
+type ConversationDeviceDirectory struct {
+	state                protoimpl.MessageState  `protogen:"open.v1"`
+	ConversationId       string                  `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`
+	RosterVersion        uint64                  `protobuf:"varint,2,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
+	RosterCommitment     []byte                  `protobuf:"bytes,3,opt,name=roster_commitment,json=rosterCommitment,proto3" json:"roster_commitment,omitempty"`
+	Ready                bool                    `protobuf:"varint,4,opt,name=ready,proto3" json:"ready,omitempty"`
+	Reason               *string                 `protobuf:"bytes,5,opt,name=reason,proto3,oneof" json:"reason,omitempty"`
+	RequiredCapabilities uint64                  `protobuf:"varint,6,opt,name=required_capabilities,json=requiredCapabilities,proto3" json:"required_capabilities,omitempty"`
+	MemberUserIds        []string                `protobuf:"bytes,7,rep,name=member_user_ids,json=memberUserIds,proto3" json:"member_user_ids,omitempty"`
+	Devices              []*DeviceDirectoryEntry `protobuf:"bytes,8,rep,name=devices,proto3" json:"devices,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *ConversationDeviceDirectory) Reset() {
+	*x = ConversationDeviceDirectory{}
+	mi := &file_veil_v1_auth_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ConversationDeviceDirectory) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ConversationDeviceDirectory) ProtoMessage() {}
+
+func (x *ConversationDeviceDirectory) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_auth_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ConversationDeviceDirectory.ProtoReflect.Descriptor instead.
+func (*ConversationDeviceDirectory) Descriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *ConversationDeviceDirectory) GetConversationId() string {
+	if x != nil {
+		return x.ConversationId
+	}
+	return ""
+}
+
+func (x *ConversationDeviceDirectory) GetRosterVersion() uint64 {
+	if x != nil {
+		return x.RosterVersion
+	}
+	return 0
+}
+
+func (x *ConversationDeviceDirectory) GetRosterCommitment() []byte {
+	if x != nil {
+		return x.RosterCommitment
+	}
+	return nil
+}
+
+func (x *ConversationDeviceDirectory) GetReady() bool {
+	if x != nil {
+		return x.Ready
+	}
+	return false
+}
+
+func (x *ConversationDeviceDirectory) GetReason() string {
+	if x != nil && x.Reason != nil {
+		return *x.Reason
+	}
+	return ""
+}
+
+func (x *ConversationDeviceDirectory) GetRequiredCapabilities() uint64 {
+	if x != nil {
+		return x.RequiredCapabilities
+	}
+	return 0
+}
+
+func (x *ConversationDeviceDirectory) GetMemberUserIds() []string {
+	if x != nil {
+		return x.MemberUserIds
+	}
+	return nil
+}
+
+func (x *ConversationDeviceDirectory) GetDevices() []*DeviceDirectoryEntry {
+	if x != nil {
+		return x.Devices
+	}
+	return nil
+}
+
 // Регистрация нового устройства (link existing account)
 type RegisterDevice struct {
 	state       protoimpl.MessageState `protogen:"open.v1"`
@@ -227,7 +668,7 @@ type RegisterDevice struct {
 
 func (x *RegisterDevice) Reset() {
 	*x = RegisterDevice{}
-	mi := &file_veil_v1_auth_proto_msgTypes[3]
+	mi := &file_veil_v1_auth_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -239,7 +680,7 @@ func (x *RegisterDevice) String() string {
 func (*RegisterDevice) ProtoMessage() {}
 
 func (x *RegisterDevice) ProtoReflect() protoreflect.Message {
-	mi := &file_veil_v1_auth_proto_msgTypes[3]
+	mi := &file_veil_v1_auth_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -252,7 +693,7 @@ func (x *RegisterDevice) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RegisterDevice.ProtoReflect.Descriptor instead.
 func (*RegisterDevice) Descriptor() ([]byte, []int) {
-	return file_veil_v1_auth_proto_rawDescGZIP(), []int{3}
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RegisterDevice) GetIdentityKey() []byte {
@@ -296,7 +737,7 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\n" +
 	"\x12veil/v1/auth.proto\x12\aveil.v1\"-\n" +
 	"\rAuthChallenge\x12\x1c\n" +
-	"\tchallenge\x18\x01 \x01(\fR\tchallenge\"\xd5\x01\n" +
+	"\tchallenge\x18\x01 \x01(\fR\tchallenge\"\xc1\x02\n" +
 	"\fAuthResponse\x12!\n" +
 	"\fidentity_key\x18\x01 \x01(\fR\videntityKey\x12\x1f\n" +
 	"\vsigning_key\x18\x02 \x01(\fR\n" +
@@ -305,15 +746,50 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\tdevice_id\x18\x04 \x01(\fR\bdeviceId\x12\x1f\n" +
 	"\vdevice_name\x18\x05 \x01(\tR\n" +
 	"deviceName\x12%\n" +
-	"\x0eclient_version\x18\x06 \x01(\tR\rclientVersion\"\x8c\x01\n" +
+	"\x0eclient_version\x18\x06 \x01(\tR\rclientVersion\x12?\n" +
+	"\x0edevice_binding\x18\a \x01(\v2\x18.veil.v1.DeviceBindingV1R\rdeviceBinding\x12)\n" +
+	"\x10device_signature\x18\b \x01(\fR\x0fdeviceSignature\"\xc0\x02\n" +
 	"\n" +
 	"AuthResult\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1c\n" +
 	"\auser_id\x18\x02 \x01(\tH\x00R\x06userId\x88\x01\x01\x12(\n" +
-	"\rerror_message\x18\x03 \x01(\tH\x01R\ferrorMessage\x88\x01\x01B\n" +
+	"\rerror_message\x18\x03 \x01(\tH\x01R\ferrorMessage\x88\x01\x01\x12*\n" +
+	"\x11per_device_secure\x18\x04 \x01(\bR\x0fperDeviceSecure\x124\n" +
+	"\x16device_binding_version\x18\x05 \x01(\x04R\x14deviceBindingVersion\x12P\n" +
+	"\x15device_binding_status\x18\x06 \x01(\x0e2\x1c.veil.v1.DeviceBindingStatusR\x13deviceBindingStatusB\n" +
 	"\n" +
 	"\b_user_idB\x10\n" +
-	"\x0e_error_message\"\xd1\x01\n" +
+	"\x0e_error_message\"\xad\x02\n" +
+	"\x0fDeviceBindingV1\x12\x1b\n" +
+	"\tdevice_id\x18\x01 \x01(\fR\bdeviceId\x12.\n" +
+	"\x13device_identity_key\x18\x02 \x01(\fR\x11deviceIdentityKey\x12,\n" +
+	"\x12device_signing_key\x18\x03 \x01(\fR\x10deviceSigningKey\x12\x18\n" +
+	"\aversion\x18\x04 \x01(\x04R\aversion\x12\"\n" +
+	"\fcapabilities\x18\x05 \x01(\x04R\fcapabilities\x124\n" +
+	"\x06status\x18\x06 \x01(\x0e2\x1c.veil.v1.DeviceBindingStatusR\x06status\x12+\n" +
+	"\x11account_signature\x18\a \x01(\fR\x10accountSignature\"\xf0\x02\n" +
+	"\x14DeviceDirectoryEntry\x12\x17\n" +
+	"\auser_id\x18\x01 \x01(\tR\x06userId\x12\x1a\n" +
+	"\busername\x18\x02 \x01(\tR\busername\x12\x1b\n" +
+	"\tdevice_id\x18\x03 \x01(\fR\bdeviceId\x127\n" +
+	"\abinding\x18\x04 \x01(\v2\x18.veil.v1.DeviceBindingV1H\x00R\abinding\x88\x01\x01\x12\x1a\n" +
+	"\beligible\x18\x05 \x01(\bR\beligible\x12.\n" +
+	"\x10exclusion_reason\x18\x06 \x01(\tH\x01R\x0fexclusionReason\x88\x01\x01\x120\n" +
+	"\x14account_identity_key\x18\a \x01(\fR\x12accountIdentityKey\x12.\n" +
+	"\x13account_signing_key\x18\b \x01(\fR\x11accountSigningKeyB\n" +
+	"\n" +
+	"\b_bindingB\x13\n" +
+	"\x11_exclusion_reason\"\xee\x02\n" +
+	"\x1bConversationDeviceDirectory\x12'\n" +
+	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12%\n" +
+	"\x0eroster_version\x18\x02 \x01(\x04R\rrosterVersion\x12+\n" +
+	"\x11roster_commitment\x18\x03 \x01(\fR\x10rosterCommitment\x12\x14\n" +
+	"\x05ready\x18\x04 \x01(\bR\x05ready\x12\x1b\n" +
+	"\x06reason\x18\x05 \x01(\tH\x00R\x06reason\x88\x01\x01\x123\n" +
+	"\x15required_capabilities\x18\x06 \x01(\x04R\x14requiredCapabilities\x12&\n" +
+	"\x0fmember_user_ids\x18\a \x03(\tR\rmemberUserIds\x127\n" +
+	"\adevices\x18\b \x03(\v2\x1d.veil.v1.DeviceDirectoryEntryR\adevicesB\t\n" +
+	"\a_reason\"\xd1\x01\n" +
 	"\x0eRegisterDevice\x12!\n" +
 	"\fidentity_key\x18\x01 \x01(\fR\videntityKey\x12\x1f\n" +
 	"\vsigning_key\x18\x02 \x01(\fR\n" +
@@ -322,7 +798,17 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\vdevice_name\x18\x04 \x01(\tR\n" +
 	"deviceName\x12*\n" +
 	"\x0elink_signature\x18\x05 \x01(\fH\x00R\rlinkSignature\x88\x01\x01B\x11\n" +
-	"\x0f_link_signatureB.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\x0f_link_signature*\x80\x01\n" +
+	"\x10DeviceCapability\x12!\n" +
+	"\x1dDEVICE_CAPABILITY_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fDEVICE_CAPABILITY_SENDER_KEY_V5\x10\x01\x12$\n" +
+	" DEVICE_CAPABILITY_SEALED_SKDM_V3\x10\x02*\xcf\x01\n" +
+	"\x13DeviceBindingStatus\x12%\n" +
+	"!DEVICE_BINDING_STATUS_UNSPECIFIED\x10\x00\x12 \n" +
+	"\x1cDEVICE_BINDING_STATUS_ACTIVE\x10\x01\x12\"\n" +
+	"\x1eDEVICE_BINDING_STATUS_EXCLUDED\x10\x02\x12!\n" +
+	"\x1dDEVICE_BINDING_STATUS_REVOKED\x10\x03\x12(\n" +
+	"$DEVICE_BINDING_STATUS_LEGACY_UNBOUND\x10\x04B.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_auth_proto_rawDescOnce sync.Once
@@ -336,19 +822,30 @@ func file_veil_v1_auth_proto_rawDescGZIP() []byte {
 	return file_veil_v1_auth_proto_rawDescData
 }
 
-var file_veil_v1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_veil_v1_auth_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_veil_v1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_veil_v1_auth_proto_goTypes = []any{
-	(*AuthChallenge)(nil),  // 0: veil.v1.AuthChallenge
-	(*AuthResponse)(nil),   // 1: veil.v1.AuthResponse
-	(*AuthResult)(nil),     // 2: veil.v1.AuthResult
-	(*RegisterDevice)(nil), // 3: veil.v1.RegisterDevice
+	(DeviceCapability)(0),               // 0: veil.v1.DeviceCapability
+	(DeviceBindingStatus)(0),            // 1: veil.v1.DeviceBindingStatus
+	(*AuthChallenge)(nil),               // 2: veil.v1.AuthChallenge
+	(*AuthResponse)(nil),                // 3: veil.v1.AuthResponse
+	(*AuthResult)(nil),                  // 4: veil.v1.AuthResult
+	(*DeviceBindingV1)(nil),             // 5: veil.v1.DeviceBindingV1
+	(*DeviceDirectoryEntry)(nil),        // 6: veil.v1.DeviceDirectoryEntry
+	(*ConversationDeviceDirectory)(nil), // 7: veil.v1.ConversationDeviceDirectory
+	(*RegisterDevice)(nil),              // 8: veil.v1.RegisterDevice
 }
 var file_veil_v1_auth_proto_depIdxs = []int32{
-	0, // [0:0] is the sub-list for method output_type
-	0, // [0:0] is the sub-list for method input_type
-	0, // [0:0] is the sub-list for extension type_name
-	0, // [0:0] is the sub-list for extension extendee
-	0, // [0:0] is the sub-list for field type_name
+	5, // 0: veil.v1.AuthResponse.device_binding:type_name -> veil.v1.DeviceBindingV1
+	1, // 1: veil.v1.AuthResult.device_binding_status:type_name -> veil.v1.DeviceBindingStatus
+	1, // 2: veil.v1.DeviceBindingV1.status:type_name -> veil.v1.DeviceBindingStatus
+	5, // 3: veil.v1.DeviceDirectoryEntry.binding:type_name -> veil.v1.DeviceBindingV1
+	6, // 4: veil.v1.ConversationDeviceDirectory.devices:type_name -> veil.v1.DeviceDirectoryEntry
+	5, // [5:5] is the sub-list for method output_type
+	5, // [5:5] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_veil_v1_auth_proto_init() }
@@ -357,19 +854,22 @@ func file_veil_v1_auth_proto_init() {
 		return
 	}
 	file_veil_v1_auth_proto_msgTypes[2].OneofWrappers = []any{}
-	file_veil_v1_auth_proto_msgTypes[3].OneofWrappers = []any{}
+	file_veil_v1_auth_proto_msgTypes[4].OneofWrappers = []any{}
+	file_veil_v1_auth_proto_msgTypes[5].OneofWrappers = []any{}
+	file_veil_v1_auth_proto_msgTypes[6].OneofWrappers = []any{}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_veil_v1_auth_proto_rawDesc), len(file_veil_v1_auth_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   4,
+			NumEnums:      2,
+			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
 		GoTypes:           file_veil_v1_auth_proto_goTypes,
 		DependencyIndexes: file_veil_v1_auth_proto_depIdxs,
+		EnumInfos:         file_veil_v1_auth_proto_enumTypes,
 		MessageInfos:      file_veil_v1_auth_proto_msgTypes,
 	}.Build()
 	File_veil_v1_auth_proto = out.File

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/logsafe"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 )
 
@@ -76,7 +77,7 @@ func (h *hooks) PreCreate(event tusd.HookEvent) (tusd.HTTPResponse, tusd.FileInf
 			return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
 				rejectError("quota exceeded", 413)
 		}
-		h.logger.Warn("uploads: create row failed", "err", err, "user", userID)
+		h.logger.Warn("uploads: create row failed", "err", err, "user_ref", logsafe.Ref("user", userID))
 		return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
 			rejectError("could not create upload", 500)
 	}

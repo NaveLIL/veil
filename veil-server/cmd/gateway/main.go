@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	_ "embed"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
@@ -267,10 +269,14 @@ func main() {
 		mux.Handle("GET /metrics", metrics.Handler())
 	}
 
+	corsOrigins, err := parseCORSOrigins()
+	if err != nil {
+		log.Fatalf("CORS configuration error: %v", err)
+	}
 	publicHandler := http.HandlerFunc(preAuthRL.Wrap(mux.ServeHTTP))
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
-		Handler:      httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(parseCORSOrigins()), httpmw.AccessLog(slog.Default()))(publicHandler),
+		Handler:      httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(corsOrigins), httpmw.AccessLog(slog.Default()))(publicHandler),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
@@ -346,22 +352,31 @@ func metricsBindAddr() (addr string, exposePublic bool) {
 }
 
 // parseCORSOrigins reads VEIL_CORS_ORIGINS (comma-separated) and returns the
-// allow-list. Defaults to "*" (any origin) when unset, matching the previous
-// permissive behaviour for desktop/mobile clients on first deploy.
-func parseCORSOrigins() []string {
+// allow-list. Empty configuration is fail-closed for browser origins; native
+// Tauri/mobile HTTP clients do not send Origin and are unaffected. An explicit
+// "*" remains available for isolated development only.
+func parseCORSOrigins() ([]string, error) {
 	raw := strings.TrimSpace(os.Getenv("VEIL_CORS_ORIGINS"))
 	if raw == "" {
-		return []string{"*"}
+		return nil, nil
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
-		if v := strings.TrimSpace(p); v != "" {
-			out = append(out, v)
+		v := strings.TrimSpace(p)
+		if v == "" {
+			continue
 		}
+		if v == "*" {
+			log.Printf("WARN: VEIL_CORS_ORIGINS=* allows every browser origin; development only")
+			out = append(out, v)
+			continue
+		}
+		parsed, err := url.Parse(v)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return nil, fmt.Errorf("invalid browser origin %q", v)
+		}
+		out = append(out, strings.ToLower(v))
 	}
-	if len(out) == 0 {
-		return []string{"*"}
-	}
-	return out
+	return out, nil
 }

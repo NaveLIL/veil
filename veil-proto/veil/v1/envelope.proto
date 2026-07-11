@@ -43,6 +43,7 @@ message Envelope {
     PreKeyBundle prekey_bundle = 30;
     PreKeyRequest prekey_request = 31;
     SenderKeyDistribution sender_key_dist = 32;
+    SenderKeyReceipt sender_key_receipt = 33;
 
     // Presence
     PresenceUpdate presence_update = 40;

@@ -7,12 +7,13 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
-use veil_client::api::VeilClient;
+use veil_client::api::{OfflineSenderKeyRefresh, VeilClient};
 use veil_client::connection::ConnectionEvent;
 use veil_search::{Indexer, SearchHit};
 use veil_store::keychain;
 use zeroize::{Zeroize, Zeroizing};
 
+mod appearance;
 mod pin_throttle;
 use pin_throttle::PinThrottle;
 
@@ -22,6 +23,9 @@ struct AppState {
     /// prevents a stale pending lock event from firing after a successful PIN
     /// unlock and orders live events before the lock that destroys their keys.
     session_transition: Mutex<()>,
+    /// Monotonic native session identity. Commands that cross an async boundary
+    /// must reject work captured before any intervening lock or unlock.
+    session_epoch: AtomicU64,
     /// Prevent overlapping reconnect workflows from rebinding the signed REST
     /// authority underneath an authenticated backlog sync.
     connect_transition: Mutex<()>,
@@ -33,6 +37,9 @@ struct AppState {
     /// initialized client, but this flag prevents reopening the keychain/DB
     /// through IPC while the PIN screen is active.
     unlocked: AtomicBool,
+    /// Process-local PIN policy loaded from secure storage at setup and
+    /// changed only by serialized, durable PIN mutations.
+    pin_configured: AtomicBool,
     /// A single app-lifetime dispatcher follows whichever authenticated
     /// connection is currently installed in `client`. Reconnects must not
     /// create competing consumers for the same event queue.
@@ -48,6 +55,9 @@ struct AppState {
     /// every command that verifies the application PIN.
     pin_throttle: Mutex<PinThrottle>,
     runtime: tokio::runtime::Runtime,
+    /// Validated auto-lock policy loaded once from secure storage. Runtime
+    /// expiry checks must never perform blocking keychain I/O.
+    auto_lock_seconds: AtomicU64,
     last_activity: Mutex<Instant>,
     db_dir: PathBuf,
     /// Shared HTTP client — reuses TCP/TLS connections + HTTP/2 streams across
@@ -71,6 +81,9 @@ const AUTO_LOCK_ACCOUNT: &str = "veil-auto-lock-seconds";
 const DEFAULT_AUTO_LOCK_SECONDS: u64 = 5 * 60;
 static LAST_REST_TIMESTAMP_MS: AtomicI64 = AtomicI64::new(0);
 const MAX_REST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const PROJECT_REPOSITORY_URL: &str = "https://github.com/NaveLIL/veil";
+const LEGACY_MIN_PIN_LEN: usize = 4;
+const MAX_PIN_LEN: usize = 12;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RestOrigin {
@@ -126,7 +139,11 @@ fn init_identity(state: State<'_, AppState>, mnemonic: String) -> Result<String,
         return Err("application locked while initializing identity".to_string());
     }
     let key = initialize_client(&state, &mnemonic)?;
-    publish_unlocked_session(&state.lock_event_pending, &state.unlocked);
+    publish_unlocked_session(
+        &state.lock_event_pending,
+        &state.unlocked,
+        &state.session_epoch,
+    );
     Ok(key)
 }
 
@@ -177,23 +194,81 @@ fn has_stored_identity() -> Result<bool, String> {
     keychain::has_seed(KEYCHAIN_ACCOUNT)
 }
 
-fn require_unlocked(state: &AppState) -> Result<(), String> {
+#[tauri::command]
+fn open_project_repository() -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("rundll32.exe")
+            .args(["url.dll,FileProtocolHandler", PROJECT_REPOSITORY_URL])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .map_err(|e| format!("open project repository: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(PROJECT_REPOSITORY_URL)
+            .spawn()
+            .map_err(|e| format!("open project repository: {e}"))?;
+        return Ok(());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(PROJECT_REPOSITORY_URL)
+            .spawn()
+            .map_err(|e| format!("open project repository: {e}"))?;
+        return Ok(());
+    }
+
+    #[allow(unreachable_code)]
+    Err("opening the project repository is unsupported on this platform".to_string())
+}
+
+fn configured_auto_lock_seconds(state: &AppState) -> u64 {
+    state.auto_lock_seconds.load(Ordering::Acquire)
+}
+
+fn configured_pin(state: &AppState) -> bool {
+    state.pin_configured.load(Ordering::Acquire)
+}
+
+fn inactivity_expired(state: &AppState) -> Result<bool, String> {
+    if !configured_pin(state) {
+        return Ok(false);
+    }
+    Ok(state
+        .last_activity
+        .lock()
+        .map_err(|e| e.to_string())?
+        .elapsed()
+        .as_secs()
+        >= configured_auto_lock_seconds(state))
+}
+
+/// Validate the native security boundary while the caller holds
+/// `session_transition`. Expiry and sensitive-state reset are one transition,
+/// so a concurrent policy update or activity touch cannot land between them.
+fn require_unlocked_locked(state: &AppState) -> Result<(), String> {
     if !state.unlocked.load(Ordering::SeqCst) {
         return Err("application is locked".into());
     }
-    let expired = has_pin_material()?
-        && state
-            .last_activity
-            .lock()
-            .map_err(|e| e.to_string())?
-            .elapsed()
-            .as_secs()
-            >= get_auto_lock_seconds();
-    if expired {
-        reset_sensitive_state(state)?;
+    if inactivity_expired(state)? {
+        reset_sensitive_state_locked(state)?;
         return Err("application auto-locked due to inactivity".into());
     }
     Ok(())
+}
+
+fn require_unlocked(state: &AppState) -> Result<(), String> {
+    let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    require_unlocked_locked(state)
 }
 
 /// Final non-blocking guard for commands that still hold the client/DB mutex.
@@ -217,6 +292,18 @@ fn require_live_transport_ready(state: &AppState) -> Result<(), String> {
     }
 }
 
+/// Re-check the live-send barrier after acquiring `state.client`. This variant
+/// must stay non-blocking: `require_unlocked` may reset the client on idle
+/// expiry and therefore cannot be called while the client mutex is held.
+fn require_live_transport_still_ready(state: &AppState) -> Result<(), String> {
+    require_session_still_unlocked(state)?;
+    if state.offline_sync_ready.load(Ordering::Acquire) {
+        Ok(())
+    } else {
+        Err("authenticated directory refresh started while preparing the send".to_string())
+    }
+}
+
 fn consume_pending_lock_event(pending: &AtomicBool, unlocked: &AtomicBool) -> bool {
     pending.swap(false, Ordering::AcqRel) && !unlocked.load(Ordering::Acquire)
 }
@@ -224,18 +311,15 @@ fn consume_pending_lock_event(pending: &AtomicBool, unlocked: &AtomicBool) -> bo
 /// Publish a successfully initialized session while the caller holds
 /// `session_transition`. Clearing first prevents an older lock request from
 /// being emitted after the new session becomes visible.
-fn publish_unlocked_session(pending: &AtomicBool, unlocked: &AtomicBool) {
+fn publish_unlocked_session(pending: &AtomicBool, unlocked: &AtomicBool, epoch: &AtomicU64) {
+    epoch.fetch_add(1, Ordering::SeqCst);
     pending.store(false, Ordering::Release);
     unlocked.store(true, Ordering::SeqCst);
 }
 
-fn reset_sensitive_state(state: &AppState) -> Result<(), String> {
-    let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
-    reset_sensitive_state_locked(state)
-}
-
 /// Reset body for callers already holding `session_transition`.
 fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
+    state.session_epoch.fetch_add(1, Ordering::SeqCst);
     state.unlocked.store(false, Ordering::SeqCst);
     state.offline_sync_ready.store(false, Ordering::SeqCst);
     state.lock_event_pending.store(true, Ordering::Release);
@@ -370,7 +454,16 @@ fn clear_persistent_pin_throttle() -> Result<(), String> {
     Ok(())
 }
 
-async fn verify_pin_throttled(state: &AppState, pin: String) -> Result<bool, String> {
+fn valid_unlock_pin(pin: &str) -> bool {
+    (LEGACY_MIN_PIN_LEN..=MAX_PIN_LEN).contains(&pin.len())
+        && pin.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+async fn verify_pin_throttled(state: &AppState, mut pin: String) -> Result<bool, String> {
+    if !valid_unlock_pin(&pin) {
+        pin.zeroize();
+        return Err("PIN must contain 4 to 12 digits (4–5 only for legacy PINs)".to_string());
+    }
     // Read keychain material before reserving a permit so an OS keychain
     // failure cannot strand the single verification slot.
     let persistent = load_persistent_pin_throttle()?;
@@ -389,7 +482,6 @@ async fn verify_pin_throttled(state: &AppState, pin: String) -> Result<bool, Str
         .begin_attempt(Instant::now())
         .map_err(|e| e.to_string())?;
 
-    let mut pin = pin;
     let verification = match tokio::task::spawn_blocking(move || {
         let result = verify_pin_material(&pin, &stored_hash, &stored_salt);
         pin.zeroize();
@@ -441,7 +533,7 @@ async fn set_pin(
     if pin.len() < 6 || pin.len() > 12 || !pin.bytes().all(|b| b.is_ascii_digit()) {
         return Err("new PIN must contain 6 to 12 digits".into());
     }
-    if has_pin_material()? {
+    if configured_pin(&state) {
         let current = current_pin.ok_or("current PIN is required")?;
         let valid = verify_pin_throttled(&state, current).await?;
         if !valid {
@@ -486,18 +578,23 @@ async fn set_pin(
     if !state.unlocked.load(Ordering::Acquire) {
         return Err("application locked while changing PIN".to_string());
     }
-    let store_result = keychain::store_seed(PIN_MATERIAL_ACCOUNT, &material);
-    store_result?;
+    // Installing or changing the PIN starts a fresh inactivity window. Lock
+    // every fallible in-process guard and clear the durable throttle before
+    // the PIN write. Once the new credential is durable, the command has no
+    // remaining fallible step that could report failure while the PIN is
+    // actually active.
+    let mut last_activity = state.last_activity.lock().map_err(|e| e.to_string())?;
+    let mut throttle = state.pin_throttle.lock().map_err(|e| e.to_string())?;
+    clear_persistent_pin_throttle()?;
+    keychain::store_seed(PIN_MATERIAL_ACCOUNT, &material)?;
+    state.pin_configured.store(true, Ordering::Release);
+    *last_activity = Instant::now();
+    throttle.reset();
+    drop(last_activity);
     // Best-effort cleanup after the new atomic credential is durable. A
     // cleanup failure is harmless because reads always prefer v2.
     let _ = keychain::delete_seed(PIN_HASH_ACCOUNT);
     let _ = keychain::delete_seed(PIN_SALT_ACCOUNT);
-    clear_persistent_pin_throttle()?;
-    state
-        .pin_throttle
-        .lock()
-        .map_err(|e| e.to_string())?
-        .reset();
     Ok(())
 }
 
@@ -538,15 +635,19 @@ async fn verify_pin(state: State<'_, AppState>, pin: String) -> Result<bool, Str
         // Clear a lock notification created by a command-side expiry before
         // publishing the unlocked state, under the same transition mutex used
         // by the watchdog's check-and-emit path.
-        publish_unlocked_session(&state.lock_event_pending, &state.unlocked);
+        publish_unlocked_session(
+            &state.lock_event_pending,
+            &state.unlocked,
+            &state.session_epoch,
+        );
     }
 
     Ok(matches)
 }
 
 #[tauri::command]
-fn has_pin() -> Result<bool, String> {
-    has_pin_material()
+fn has_pin(state: State<'_, AppState>) -> bool {
+    configured_pin(&state)
 }
 
 #[tauri::command]
@@ -568,6 +669,9 @@ async fn clear_pin(state: State<'_, AppState>, current_pin: String) -> Result<()
     if !state.unlocked.load(Ordering::Acquire) {
         return Err("application locked while clearing PIN".to_string());
     }
+    // Acquire every fallible in-process guard before deleting credentials so
+    // a successful deletion has no later mutex failure before cache update.
+    let mut throttle = state.pin_throttle.lock().map_err(|e| e.to_string())?;
     if keychain::has_seed(PIN_MATERIAL_ACCOUNT)? {
         // Remove stale legacy credentials first while the authoritative v2
         // credential still guarantees that an interrupted cleanup is usable.
@@ -582,18 +686,15 @@ async fn clear_pin(state: State<'_, AppState>, current_pin: String) -> Result<()
         keychain::delete_seed(PIN_HASH_ACCOUNT)?;
         keychain::delete_seed(PIN_SALT_ACCOUNT)?;
     }
-    state
-        .pin_throttle
-        .lock()
-        .map_err(|e| e.to_string())?
-        .reset();
+    throttle.reset();
+    state.pin_configured.store(false, Ordering::Release);
     Ok(())
 }
 
 #[tauri::command]
 async fn reveal_recovery_phrase(state: State<'_, AppState>, pin: String) -> Result<String, String> {
     require_unlocked(&state)?;
-    if !has_pin_material()? {
+    if !configured_pin(&state) {
         return Err("set a PIN before revealing the recovery phrase".into());
     }
     let valid = verify_pin_throttled(&state, pin).await?;
@@ -614,21 +715,24 @@ async fn reveal_recovery_phrase(state: State<'_, AppState>, pin: String) -> Resu
 
 #[tauri::command]
 fn lock_app(state: State<'_, AppState>) -> Result<(), String> {
-    if !has_pin_material()? {
+    let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    if !configured_pin(&state) {
         return Err("configure a PIN before locking the application".into());
     }
-    let result = reset_sensitive_state(&state);
+    let result = reset_sensitive_state_locked(&state);
     // Renderer-initiated lock already cleared its own state.
-    if let Ok(_transition) = state.session_transition.lock() {
-        if !state.unlocked.load(Ordering::Acquire) {
-            state.lock_event_pending.store(false, Ordering::Release);
-        }
+    if !state.unlocked.load(Ordering::Acquire) {
+        state.lock_event_pending.store(false, Ordering::Release);
     }
     result
 }
 
 #[tauri::command]
 fn touch_activity(state: State<'_, AppState>) {
+    // Keep activity refresh ordered with the watchdog's expiry check/reset.
+    let Ok(_transition) = state.session_transition.lock() else {
+        return;
+    };
     if state.unlocked.load(Ordering::SeqCst) {
         if let Ok(mut t) = state.last_activity.lock() {
             *t = Instant::now();
@@ -650,22 +754,42 @@ fn valid_auto_lock_seconds(seconds: u64) -> bool {
     matches!(seconds, 60 | 300 | 900 | 1800 | 3600)
 }
 
+fn resolve_auto_lock_seconds(stored: Result<Option<String>, String>) -> Result<u64, String> {
+    let Some(value) = stored? else {
+        return Ok(DEFAULT_AUTO_LOCK_SECONDS);
+    };
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "stored auto-lock setting is not a valid number of seconds".to_string())?;
+    if !valid_auto_lock_seconds(seconds) {
+        return Err(
+            "stored auto-lock setting must be 60, 300, 900, 1800 or 3600 seconds".to_string(),
+        );
+    }
+    Ok(seconds)
+}
+
+fn load_auto_lock_seconds() -> Result<u64, String> {
+    resolve_auto_lock_seconds(keychain::get_optional_seed(AUTO_LOCK_ACCOUNT))
+}
+
 #[tauri::command]
-fn get_auto_lock_seconds() -> u64 {
-    keychain::get_seed(AUTO_LOCK_ACCOUNT)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .filter(|seconds| valid_auto_lock_seconds(*seconds))
-        .unwrap_or(DEFAULT_AUTO_LOCK_SECONDS)
+fn get_auto_lock_seconds(state: State<'_, AppState>) -> u64 {
+    configured_auto_lock_seconds(&state)
 }
 
 #[tauri::command]
 fn set_auto_lock_seconds(state: State<'_, AppState>, seconds: u64) -> Result<(), String> {
-    require_unlocked(&state)?;
+    let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    require_unlocked_locked(&state)?;
     if !valid_auto_lock_seconds(seconds) {
         return Err("auto-lock must be 1, 5, 15, 30 or 60 minutes".to_string());
     }
-    keychain::store_seed(AUTO_LOCK_ACCOUNT, &seconds.to_string())
+    let mut last_activity = state.last_activity.lock().map_err(|e| e.to_string())?;
+    keychain::store_seed(AUTO_LOCK_ACCOUNT, &seconds.to_string())?;
+    state.auto_lock_seconds.store(seconds, Ordering::Release);
+    *last_activity = Instant::now();
+    Ok(())
 }
 
 // ─── DB Persistence ───────────────────────────────────
@@ -674,7 +798,7 @@ fn set_auto_lock_seconds(state: State<'_, AppState>, seconds: u64) -> Result<(),
 /// Async so the heavy Argon2id work runs off the main thread.
 #[tauri::command]
 async fn init_from_seed(state: State<'_, AppState>) -> Result<String, String> {
-    if has_pin_material()? {
+    if configured_pin(&state) {
         require_unlocked(&state)?;
     }
     let mnemonic = Zeroizing::new(keychain::get_seed(KEYCHAIN_ACCOUNT)?);
@@ -683,7 +807,11 @@ async fn init_from_seed(state: State<'_, AppState>) -> Result<String, String> {
         return Err("application locked while restoring identity".to_string());
     }
     let key = initialize_client(&state, &mnemonic)?;
-    publish_unlocked_session(&state.lock_event_pending, &state.unlocked);
+    publish_unlocked_session(
+        &state.lock_event_pending,
+        &state.unlocked,
+        &state.session_epoch,
+    );
     Ok(key)
 }
 
@@ -734,7 +862,9 @@ fn get_messages(
                 "senderKey": hex::encode(&m.sender_key),
                 "text": m.plaintext,
                 "isOwn": m.is_outgoing,
-                "pending": m.status == veil_store::models::MessageStatus::Sending,
+                "pending": m.is_outgoing && m.status == veil_store::models::MessageStatus::Sending,
+                "failed": m.is_outgoing && m.status == veil_store::models::MessageStatus::Failed,
+                "deliveryUnknown": m.is_outgoing && m.status == veil_store::models::MessageStatus::Unknown,
                 "timestamp": m.server_timestamp.unwrap_or(0),
                 "createdAt": m.created_at,
                 "replyToId": m.reply_to_id,
@@ -1130,7 +1260,13 @@ fn pin_and_persist_sync_conversation(
     state: &AppState,
     authenticated_user_id: &str,
     conversation: &SyncConversation,
-) -> Result<std::collections::HashMap<String, PinnedDirectoryMember>, String> {
+) -> Result<
+    (
+        std::collections::HashMap<String, PinnedDirectoryMember>,
+        Option<OfflineSenderKeyRefresh>,
+    ),
+    String,
+> {
     if conversation.id.is_empty() || conversation.created_at.is_empty() {
         return Err("server returned an incomplete conversation directory entry".to_string());
     }
@@ -1248,16 +1384,17 @@ fn pin_and_persist_sync_conversation(
         )?;
     }
 
-    if let Some(peer_identity_key) = peer_identity_key {
+    let sender_key_refresh = if let Some(peer_identity_key) = peer_identity_key {
         client.bind_dm_conversation(&conversation.id, peer_identity_key);
+        None
     } else {
         // Group/channel history is Sender-Key ciphertext. Marking first blocks
         // outgoing sends until a fresh distribution, while hydration restores
         // the incoming ratchets required for the backlog.
         client.mark_channel_conversation(&conversation.id);
-        client.hydrate_channel_sender_keys(&conversation.id)?;
-    }
-    Ok(directory)
+        Some(client.hydrate_channel_sender_keys(&conversation.id)?)
+    };
+    Ok((directory, sender_key_refresh))
 }
 
 fn sync_conversation_messages(
@@ -1546,9 +1683,9 @@ fn sync_offline_state(
                     conversation.id
                 ));
             }
-            let directory =
+            let (directory, sender_key_refresh) =
                 pin_and_persist_sync_conversation(state, authenticated_user_id, conversation)?;
-            directories.push((conversation.id.clone(), directory));
+            directories.push((conversation.id.clone(), directory, sender_key_refresh));
             stats.conversations += 1;
         }
 
@@ -1578,7 +1715,7 @@ fn sync_offline_state(
 
     // All identities are pinned and all FK parents/groups are installed before
     // consuming any ratchet state from the ciphertext backlog.
-    for (conversation_id, directory) in &directories {
+    for (conversation_id, directory, _) in &directories {
         sync_conversation_messages(
             state,
             server_http_url,
@@ -1601,7 +1738,7 @@ fn sync_offline_state(
         .map_err(|e| e.to_string())?
         .identity_key()?;
     let mut total_recipients = 0usize;
-    for (conversation_id, directory) in &directories {
+    for (conversation_id, directory, _) in &directories {
         let sender_key_mode = state
             .client
             .lock()
@@ -1623,19 +1760,19 @@ fn sync_offline_state(
             "offline sender-key refresh exceeds {MAX_SYNC_SENDER_KEY_RECIPIENTS} recipients"
         ));
     }
-    for (conversation_id, directory) in directories {
-        let sender_key_mode = state
-            .client
-            .lock()
-            .map_err(|e| e.to_string())?
-            .is_channel_conversation(&conversation_id);
-        if !sender_key_mode {
+    for (conversation_id, directory, sender_key_refresh) in directories {
+        let Some(sender_key_refresh) = sender_key_refresh else {
             continue;
-        }
+        };
         let recipients = directory
             .values()
             .map(|member| (hex::encode(member.identity_key), member.identity_key));
-        distribute_pinned_sender_key(state, &conversation_id, recipients, true)?;
+        distribute_pinned_sender_key(
+            state,
+            &conversation_id,
+            recipients,
+            SenderKeyDistributionPreparation::OfflineRefresh(sender_key_refresh),
+        )?;
     }
     Ok(stats)
 }
@@ -1681,21 +1818,12 @@ fn connect_to_server(
     // concurrent native lock. A reconnect starts with no binding, so an old
     // authenticated origin cannot authorize requests for the new session.
     {
-        let session_transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+        let _session_transition = state.session_transition.lock().map_err(|e| e.to_string())?;
         if !state.unlocked.load(Ordering::Acquire) {
             return Err("application locked while authenticating".to_string());
         }
-        let expired = has_pin_material()?
-            && state
-                .last_activity
-                .lock()
-                .map_err(|e| e.to_string())?
-                .elapsed()
-                .as_secs()
-                >= get_auto_lock_seconds();
-        if expired {
-            drop(session_transition);
-            reset_sensitive_state(&state)?;
+        if inactivity_expired(&state)? {
+            reset_sensitive_state_locked(&state)?;
             return Err("application auto-locked while authenticating".to_string());
         }
         *state
@@ -2506,9 +2634,20 @@ fn send_message(
 ) -> Result<u64, String> {
     require_live_transport_ready(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state
         .runtime
         .block_on(client.send_message(&conversation_id, &text, reply_to_id.as_deref()))
+}
+
+#[tauri::command]
+fn discard_failed_outgoing_message(
+    state: State<'_, AppState>,
+    local_message_id: String,
+) -> Result<(), String> {
+    require_unlocked(&state)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    client.discard_failed_outgoing_message(&local_message_id)
 }
 
 #[tauri::command]
@@ -2520,6 +2659,7 @@ fn edit_message(
 ) -> Result<u64, String> {
     require_live_transport_ready(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state
         .runtime
         .block_on(client.edit_message(&message_id, &conversation_id, &new_text))
@@ -2533,6 +2673,7 @@ fn delete_message(
 ) -> Result<u64, String> {
     require_live_transport_ready(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state
         .runtime
         .block_on(client.delete_message(&message_id, &conversation_id))
@@ -2546,6 +2687,7 @@ fn send_typing(
 ) -> Result<(), String> {
     require_live_transport_ready(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state
         .runtime
         .block_on(client.send_typing(&conversation_id, started))
@@ -2562,6 +2704,7 @@ fn toggle_reaction(
 ) -> Result<(), String> {
     require_live_transport_ready(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     if user_id != client.authenticated_user_id()? {
         return Err("reaction user id does not match authenticated session".to_string());
     }
@@ -4072,6 +4215,26 @@ fn cache_load_channels(
 }
 
 #[tauri::command]
+fn resolve_cached_channel_context(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<Option<serde_json::Value>, String> {
+    require_unlocked(&state)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("db not initialized")?;
+    let result = db
+        .find_channel_context_by_conversation(&conversation_id)?
+        .map(|(server_id, channel_id)| {
+            serde_json::json!({
+                "serverId": server_id,
+                "channelId": channel_id,
+            })
+        });
+    require_session_still_unlocked(&state)?;
+    Ok(result)
+}
+
+#[tauri::command]
 fn cache_save_channels(
     state: State<'_, AppState>,
     server_id: String,
@@ -4205,24 +4368,49 @@ fn hydrate_channel_sender_keys(
 ) -> Result<(), String> {
     require_unlocked(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    client.hydrate_channel_sender_keys(&conversation_id)
+    client
+        .hydrate_channel_sender_keys(&conversation_id)
+        .map(|_| ())
+}
+
+#[tauri::command]
+fn sender_key_distribution_status(
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<String, String> {
+    require_unlocked(&state)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    Ok(client
+        .sender_key_distribution_status(&conversation_id)
+        .to_string())
 }
 
 /// Distribute our outgoing sender key to a list of channel members
 /// (sealed envelope per recipient identity key, sent via SenderKeyDist envelope).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderKeyDistributionPreparation {
+    ReusePendingGeneration,
+    OfflineRefresh(OfflineSenderKeyRefresh),
+}
+
 fn distribute_pinned_sender_key(
     state: &AppState,
     conversation_id: &str,
     recipients: impl IntoIterator<Item = (String, [u8; 32])>,
-    force_rotate: bool,
+    preparation: SenderKeyDistributionPreparation,
 ) -> Result<u32, String> {
     require_unlocked(state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     client.mark_channel_conversation(conversation_id);
-    if force_rotate {
-        client.rotate_sender_key(conversation_id)?;
-    }
-    if !client.begin_sender_key_distribution(conversation_id)? {
+    let should_distribute = match preparation {
+        SenderKeyDistributionPreparation::ReusePendingGeneration => {
+            client.begin_sender_key_distribution(conversation_id)?
+        }
+        SenderKeyDistributionPreparation::OfflineRefresh(refresh) => {
+            client.begin_offline_sender_key_distribution(conversation_id, refresh)?
+        }
+    };
+    if !should_distribute {
         return Ok(0);
     }
 
@@ -4288,7 +4476,12 @@ fn distribute_sender_key(
         let peer_ik = decode_lower_hex_32("authorized member identity_key", hex_key)?;
         recipients.push((hex_key.to_string(), peer_ik));
     }
-    distribute_pinned_sender_key(&state, &conversation_id, recipients, false)
+    distribute_pinned_sender_key(
+        &state,
+        &conversation_id,
+        recipients,
+        SenderKeyDistributionPreparation::ReusePendingGeneration,
+    )
 }
 
 /// Force-rotate our outgoing sender key for a channel (e.g. on member kick).
@@ -4551,19 +4744,23 @@ pub fn run() {
             let indexer =
                 Arc::new(Indexer::in_memory().expect("failed to create in-memory search index"));
             let pin_configured = has_pin_material().map_err(std::io::Error::other)?;
+            let auto_lock_seconds = load_auto_lock_seconds().map_err(std::io::Error::other)?;
 
             app.manage(AppState {
                 client: Mutex::new(VeilClient::new()),
                 session_transition: Mutex::new(()),
+                session_epoch: AtomicU64::new(0),
                 connect_transition: Mutex::new(()),
                 authenticated_rest_origin: Mutex::new(None),
                 rest_binding_generation: AtomicU64::new(0),
                 unlocked: AtomicBool::new(!pin_configured),
+                pin_configured: AtomicBool::new(pin_configured),
                 event_poller_started: AtomicBool::new(false),
                 offline_sync_ready: AtomicBool::new(false),
                 lock_event_pending: AtomicBool::new(false),
                 pin_throttle: Mutex::new(PinThrottle::default()),
                 runtime: tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
+                auto_lock_seconds: AtomicU64::new(auto_lock_seconds),
                 last_activity: Mutex::new(Instant::now()),
                 db_dir: data_dir,
                 http: reqwest::Client::builder()
@@ -4583,27 +4780,20 @@ pub fn run() {
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
                 let state = watchdog_app.state::<AppState>();
+                let mut emit_locked = false;
                 if let Ok(_transition) = state.session_transition.lock() {
-                    if consume_pending_lock_event(&state.lock_event_pending, &state.unlocked) {
-                        let _ = watchdog_app.emit("veil://locked", serde_json::json!({}));
+                    emit_locked =
+                        consume_pending_lock_event(&state.lock_event_pending, &state.unlocked);
+                    if state.unlocked.load(Ordering::Acquire)
+                        && inactivity_expired(&state).unwrap_or(true)
+                        && reset_sensitive_state_locked(&state).is_ok()
+                    {
+                        state.lock_event_pending.store(false, Ordering::Release);
+                        emit_locked = true;
                     }
                 }
-                if !state.unlocked.load(Ordering::Acquire) {
-                    continue;
-                }
-                let expired = has_pin_material().unwrap_or(true)
-                    && state
-                        .last_activity
-                        .lock()
-                        .map(|last| last.elapsed().as_secs() >= get_auto_lock_seconds())
-                        .unwrap_or(true);
-                if expired && reset_sensitive_state(&state).is_ok() {
-                    if let Ok(_transition) = state.session_transition.lock() {
-                        if !state.unlocked.load(Ordering::Acquire) {
-                            state.lock_event_pending.store(false, Ordering::Release);
-                            let _ = watchdog_app.emit("veil://locked", serde_json::json!({}));
-                        }
-                    }
+                if emit_locked {
+                    let _ = watchdog_app.emit("veil://locked", serde_json::json!({}));
                 }
             });
             // System tray with menu
@@ -4651,45 +4841,27 @@ pub fn run() {
                                 // PIN changes use this same transition, so the
                                 // policy check and possible lock are atomic
                                 // with clear_pin/set_pin.
-                                match has_pin_material() {
-                                    Ok(true) => {
-                                        // Clear native plaintext/key state and
-                                        // renderer plaintext in one ordered
-                                        // transition before hiding to tray.
-                                        let reset = reset_sensitive_state_locked(&state);
-                                        state.lock_event_pending.store(false, Ordering::Release);
-                                        let _ =
-                                            app_handle.emit("veil://locked", serde_json::json!({}));
-                                        if let Err(error) = reset {
-                                            let _ = app_handle.emit(
-                                                "veil://error",
-                                                serde_json::json!({
-                                                    "code": 5001,
-                                                    "message": format!(
-                                                        "close-to-tray cleanup failed: {error}"
-                                                    ),
-                                                }),
-                                            );
-                                        }
-                                        let _ = w.hide();
-                                    }
-                                    Ok(false) => {
-                                        let _ = w.hide();
-                                    }
-                                    Err(error) => {
-                                        // A keychain failure means we cannot
-                                        // know that hiding an unlocked window
-                                        // is safe.
+                                if configured_pin(&state) {
+                                    // Clear native plaintext/key state and
+                                    // renderer plaintext in one ordered
+                                    // transition before hiding to tray.
+                                    let reset = reset_sensitive_state_locked(&state);
+                                    state.lock_event_pending.store(false, Ordering::Release);
+                                    let _ = app_handle.emit("veil://locked", serde_json::json!({}));
+                                    if let Err(error) = reset {
                                         let _ = app_handle.emit(
                                             "veil://error",
                                             serde_json::json!({
                                                 "code": 5001,
                                                 "message": format!(
-                                                    "could not determine close-to-tray lock policy: {error}"
+                                                    "close-to-tray cleanup failed: {error}"
                                                 ),
                                             }),
                                         );
                                     }
+                                    let _ = w.hide();
+                                } else {
+                                    let _ = w.hide();
                                 }
                             }
                             Err(error) => {
@@ -4720,6 +4892,7 @@ pub fn run() {
             fingerprint_peer,
             store_seed,
             has_stored_identity,
+            open_project_repository,
             set_pin,
             verify_pin,
             has_pin,
@@ -4737,6 +4910,7 @@ pub fn run() {
             establish_session,
             connect_to_server,
             send_message,
+            discard_failed_outgoing_message,
             edit_message,
             delete_message,
             send_typing,
@@ -4748,6 +4922,11 @@ pub fn run() {
             clear_search_index,
             rebuild_search_index,
             ensure_search_backfill,
+            appearance::get_appearance_settings,
+            appearance::save_appearance_settings,
+            appearance::choose_appearance_wallpaper,
+            appearance::load_appearance_wallpaper,
+            appearance::remove_appearance_wallpaper,
             create_group,
             add_group_member,
             remove_group_member,
@@ -4787,6 +4966,7 @@ pub fn run() {
             cache_save_servers,
             cache_delete_server,
             cache_load_channels,
+            resolve_cached_channel_context,
             cache_save_channels,
             cache_delete_channel,
             cache_load_roles,
@@ -4795,6 +4975,7 @@ pub fn run() {
             cache_save_server_members,
             mark_channel_conversation,
             hydrate_channel_sender_keys,
+            sender_key_distribution_status,
             distribute_sender_key,
             rotate_sender_key,
         ])
@@ -4806,9 +4987,10 @@ pub fn run() {
 mod e2ee_rest_tests {
     use super::{
         consume_pending_lock_event, offline_sync_url, parse_prekey_bundle,
-        publish_unlocked_session, rest_api_url, rest_authority, rest_canonical, rest_origin,
-        rest_request_target, validate_next_cursor, validate_rest_url,
-        validate_server_endpoint_pair,
+        publish_unlocked_session, resolve_auto_lock_seconds, rest_api_url, rest_authority,
+        rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
+        valid_unlock_pin, validate_next_cursor, validate_rest_url, validate_server_endpoint_pair,
+        DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
 
@@ -4830,6 +5012,48 @@ mod e2ee_rest_tests {
         assert_eq!(bundle.signed_prekey_id, 7);
         assert_eq!(bundle.one_time_prekey_id, Some(9));
         assert!(parse_prekey_bundle(value, &[8u8; 32]).is_err());
+    }
+
+    #[test]
+    fn native_unlock_pin_boundary_matches_legacy_and_current_ui() {
+        assert!(valid_unlock_pin("1234"));
+        assert!(valid_unlock_pin("12345"));
+        assert!(valid_unlock_pin("123456"));
+        assert!(valid_unlock_pin("123456789012"));
+        assert!(!valid_unlock_pin("123"));
+        assert!(!valid_unlock_pin("1234567890123"));
+        assert!(!valid_unlock_pin("１２３４５６"));
+        assert!(!valid_unlock_pin("12a456"));
+    }
+
+    #[test]
+    fn auto_lock_whitelist_matches_the_renderer_contract() {
+        for seconds in [60, 300, 900, 1800, 3600] {
+            assert!(valid_auto_lock_seconds(seconds));
+        }
+        for seconds in [0, 1, 59, 61, 299, 301, 3599, 3601, u64::MAX] {
+            assert!(!valid_auto_lock_seconds(seconds));
+        }
+    }
+
+    #[test]
+    fn auto_lock_loader_defaults_only_for_a_missing_credential() {
+        assert_eq!(
+            resolve_auto_lock_seconds(Ok(None)).unwrap(),
+            DEFAULT_AUTO_LOCK_SECONDS
+        );
+        assert_eq!(
+            resolve_auto_lock_seconds(Ok(Some("900".to_string()))).unwrap(),
+            900
+        );
+        assert!(resolve_auto_lock_seconds(Ok(Some("invalid".to_string()))).is_err());
+        assert!(resolve_auto_lock_seconds(Ok(Some("120".to_string()))).is_err());
+
+        let backend_error = "credential store unavailable".to_string();
+        assert_eq!(
+            resolve_auto_lock_seconds(Err(backend_error.clone())).unwrap_err(),
+            backend_error
+        );
     }
 
     #[test]
@@ -4925,13 +5149,15 @@ mod e2ee_rest_tests {
 
     #[test]
     fn successful_unlock_suppresses_a_stale_pending_lock_event() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
         let pending = AtomicBool::new(true);
         let unlocked = AtomicBool::new(false);
+        let epoch = AtomicU64::new(7);
         // All identity-init/unlock paths call this while holding the same
         // transition mutex as the watchdog's consume/check/emit operation.
-        publish_unlocked_session(&pending, &unlocked);
+        publish_unlocked_session(&pending, &unlocked, &epoch);
+        assert_eq!(epoch.load(Ordering::Acquire), 8);
         assert!(!consume_pending_lock_event(&pending, &unlocked));
 
         pending.store(true, Ordering::Release);

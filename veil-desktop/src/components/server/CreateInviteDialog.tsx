@@ -94,8 +94,12 @@ export const CreateInviteDialog: Component<Props> = (props) => {
       padding: "0 14px", height: "38px",
       "border-radius": "8px",
       "font-size": "13px", "font-weight": "600",
-      background: copied() ? "rgba(52,211,153,0.15)" : enabled ? "#7c6bf5" : "rgba(255,255,255,0.04)",
-      color: copied() ? "#34d399" : enabled ? "#fff" : "#555",
+      background: copied()
+        ? "var(--veil-success-border)"
+        : enabled
+          ? "var(--veil-accent)"
+          : "color-mix(in srgb, var(--veil-text-strong) 4%, transparent)",
+      color: copied() ? "var(--veil-success)" : enabled ? "var(--veil-on-accent)" : "var(--veil-text-faint)",
       border: "none",
       cursor: enabled ? "pointer" : "not-allowed",
       "white-space": "nowrap" as const,
@@ -110,7 +114,7 @@ export const CreateInviteDialog: Component<Props> = (props) => {
       onClose={close}
       title="Invite People"
       icon={<UserPlus size={15} />}
-      accent="#7c6bf5"
+      accent="var(--veil-accent)"
       width={460}
       closeDisabled={loading()}
     >
@@ -123,9 +127,9 @@ export const CreateInviteDialog: Component<Props> = (props) => {
               flex: "1", "min-width": "0", display: "flex", "align-items": "center",
               padding: "0 12px", height: "38px",
               "border-radius": "8px",
-              background: "#1E1F22",
-              border: "1px solid rgba(255,255,255,0.05)",
-              "font-size": "13px", color: "#ddd",
+              background: "var(--veil-control)",
+              border: "1px solid var(--veil-border)",
+              "font-size": "13px", color: "var(--veil-text)",
               "font-family": "ui-monospace, SFMono-Regular, Menlo, monospace",
               overflow: "hidden",
             }}>

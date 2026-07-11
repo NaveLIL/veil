@@ -1,6 +1,9 @@
 import { Component, createSignal, Show, For, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { appStore } from "@/stores/app";
+import { AlertTriangle, Eye, EyeOff } from "lucide-solid";
+import { VeilMark } from "@/components/brand/VeilMark";
+import { Z } from "@/lib/zIndex";
 
 /* ═══════════════════════════════════════════════════════
    ONBOARDING — Hebrew rain + bottom island + transitions
@@ -18,8 +21,8 @@ const HEBREW_WORDS = [
 ];
 
 const TAGLINES = [
-  { text: "Zero-knowledge encryption", sub: "Your keys never leave this device" },
-  { text: "No phone number required", sub: "True anonymity by design" },
+  { text: "End-to-end encryption", sub: "Your identity private key stays on this device" },
+  { text: "No phone number required", sub: "No email required; anonymity is not guaranteed" },
   { text: "Open protocol", sub: "Transparent and auditable" },
   { text: "Forward secrecy", sub: "Every message has a unique key" },
   { text: "Decentralized identity", sub: "You own your cryptographic identity" },
@@ -144,20 +147,20 @@ export const OnboardingScreen: Component = () => {
   const S = {
     root: {
       position: "relative" as const, width: "100%", height: "100%", overflow: "hidden",
-      background: "#111117", display: "flex", "flex-direction": "column" as const,
+      background: "var(--veil-background)", display: "flex", "flex-direction": "column" as const,
       "justify-content": "flex-end", "align-items": "center",
     },
     glow1: {
       position: "absolute" as const, top: "15%", left: "30%",
       width: "500px", height: "500px", "border-radius": "50%",
-      background: "radial-gradient(circle, rgba(124,107,245,0.06) 0%, transparent 70%)",
+      background: "radial-gradient(circle, rgba(var(--veil-accent-rgb),0.06) 0%, transparent 70%)",
       filter: "blur(60px)", "pointer-events": "none" as const,
       animation: "glowPulse 6s ease-in-out infinite",
     },
     glow2: {
       position: "absolute" as const, bottom: "10%", right: "20%",
       width: "400px", height: "400px", "border-radius": "50%",
-      background: "radial-gradient(circle, rgba(124,107,245,0.04) 0%, transparent 70%)",
+      background: "radial-gradient(circle, rgba(var(--veil-accent-rgb),0.04) 0%, transparent 70%)",
       filter: "blur(80px)", "pointer-events": "none" as const,
       animation: "glowPulse 8s ease-in-out infinite 2s",
     },
@@ -167,7 +170,7 @@ export const OnboardingScreen: Component = () => {
     },
     rainDrop: (d: RainDrop) => ({
       position: "absolute" as const, left: `${d.x}%`, top: "-40px",
-      "font-size": `${d.size}px`, color: `rgba(124,107,245,${d.opacity})`,
+      "font-size": `${d.size}px`, color: `rgba(var(--veil-accent-rgb),${d.opacity})`,
       "font-family": "'Noto Sans Hebrew', 'David Libre', serif",
       "writing-mode": "vertical-rl" as const, "white-space": "nowrap" as const,
       animation: `hebrewRain ${d.duration}s linear ${d.delay}s infinite`,
@@ -176,22 +179,22 @@ export const OnboardingScreen: Component = () => {
     welcomeIsland: {
       position: "relative" as const, "z-index": "2",
       width: "calc(100% - 48px)", "max-width": "860px",
-      background: "rgba(30,31,34,0.85)", "backdrop-filter": "blur(20px)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "color-mix(in srgb, var(--veil-window) 85%, transparent)", "backdrop-filter": "blur(20px)",
+      border: "1px solid var(--veil-contrast-06)",
       "border-radius": "20px", padding: "36px 40px",
       "margin-bottom": "32px",
       display: "flex", "align-items": "center", gap: "36px",
-      "box-shadow": "0 8px 40px rgba(0,0,0,0.4), 0 0 80px rgba(124,107,245,0.04)",
+      "box-shadow": "0 8px 40px var(--veil-shadow), 0 0 80px rgba(var(--veil-accent-rgb),0.04)",
       transition: "opacity 0.35s ease, transform 0.35s ease",
     },
     centerIsland: {
       position: "relative" as const, "z-index": "2",
       width: "calc(100% - 48px)", "max-width": "560px",
-      background: "rgba(30,31,34,0.9)", "backdrop-filter": "blur(20px)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "color-mix(in srgb, var(--veil-window) 90%, transparent)", "backdrop-filter": "blur(20px)",
+      border: "1px solid var(--veil-contrast-06)",
       "border-radius": "20px", padding: "36px 40px",
       margin: "auto",
-      "box-shadow": "0 8px 40px rgba(0,0,0,0.4), 0 0 80px rgba(124,107,245,0.04)",
+      "box-shadow": "0 8px 40px var(--veil-shadow), 0 0 80px rgba(var(--veil-accent-rgb),0.04)",
       transition: "opacity 0.35s ease, transform 0.35s ease",
     },
     logo: {
@@ -200,19 +203,19 @@ export const OnboardingScreen: Component = () => {
     },
     logoIcon: {
       width: "52px", height: "52px", "border-radius": "16px",
-      background: "linear-gradient(135deg, rgba(124,107,245,0.25) 0%, rgba(124,107,245,0.08) 100%)",
-      border: "1px solid rgba(124,107,245,0.15)",
+      background: "linear-gradient(135deg, rgba(var(--veil-accent-rgb),0.25) 0%, rgba(var(--veil-accent-rgb),0.08) 100%)",
+      border: "1px solid rgba(var(--veil-accent-rgb),0.15)",
       display: "flex", "align-items": "center", "justify-content": "center",
       position: "relative" as const,
     },
     logoGlow: {
       position: "absolute" as const, inset: "-8px", "border-radius": "20px",
-      background: "rgba(124,107,245,0.12)", filter: "blur(16px)",
+      background: "rgba(var(--veil-accent-rgb),0.12)", filter: "blur(16px)",
       animation: "glowPulse 4s ease-in-out infinite",
     },
     divider: {
       width: "1px", "align-self": "stretch",
-      background: "rgba(255,255,255,0.06)", "flex-shrink": "0",
+      background: "var(--veil-contrast-06)", "flex-shrink": "0",
     },
     taglineArea: {
       flex: "1", "min-width": "0", display: "flex",
@@ -225,11 +228,11 @@ export const OnboardingScreen: Component = () => {
     }),
     progressTrack: {
       width: "100%", height: "3px", "border-radius": "2px",
-      background: "rgba(255,255,255,0.04)", overflow: "hidden",
+      background: "var(--veil-contrast-04)", overflow: "hidden",
     },
     progressBar: (pct: number) => ({
       height: "100%", "border-radius": "2px",
-      background: "linear-gradient(90deg, #7c6bf5 0%, #9b8afb 100%)",
+      background: "linear-gradient(90deg, var(--veil-accent) 0%, var(--veil-accent-hi) 100%)",
       width: `${pct}%`, transition: "width 0.6s ease",
     }),
     btnCol: {
@@ -239,23 +242,23 @@ export const OnboardingScreen: Component = () => {
     btnPrimary: {
       display: "flex", "align-items": "center", "justify-content": "center",
       gap: "10px", height: "46px", "border-radius": "12px",
-      background: "linear-gradient(135deg, #7c6bf5 0%, #6955e0 100%)",
-      color: "#fff", border: "none", "font-size": "13px", "font-weight": "600",
+      background: "linear-gradient(135deg, var(--veil-accent) 0%, var(--veil-accent-deep) 100%)",
+      color: "var(--veil-on-accent)", border: "none", "font-size": "13px", "font-weight": "600",
       cursor: "pointer", transition: "transform 0.15s, box-shadow 0.15s",
-      "box-shadow": "0 4px 20px rgba(124,107,245,0.25)",
+      "box-shadow": "0 4px 20px rgba(var(--veil-accent-rgb),0.25)",
       "letter-spacing": "0.01em",
     },
     btnSecondary: {
       display: "flex", "align-items": "center", "justify-content": "center",
       gap: "10px", height: "46px", "border-radius": "12px",
-      background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.6)",
-      border: "1px solid rgba(255,255,255,0.06)", "font-size": "13px",
+      background: "var(--veil-contrast-04)", color: "var(--veil-contrast-60)",
+      border: "1px solid var(--veil-contrast-06)", "font-size": "13px",
       "font-weight": "500", cursor: "pointer", transition: "background 0.15s, color 0.15s",
     },
     errorBox: {
       display: "flex", "align-items": "center", gap: "10px",
       padding: "10px 14px", "border-radius": "10px",
-      background: "rgba(240,72,72,0.08)", border: "1px solid rgba(240,72,72,0.2)",
+      background: "var(--veil-danger-surface)", border: "1px solid var(--veil-danger-border)",
     },
     wordGrid: {
       display: "grid", "grid-template-columns": "repeat(3, 1fr)", gap: "8px",
@@ -263,40 +266,40 @@ export const OnboardingScreen: Component = () => {
     wordCell: {
       display: "flex", "align-items": "center", gap: "8px",
       padding: "10px 14px", "border-radius": "10px",
-      background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.04)",
+      background: "var(--veil-contrast-03)", border: "1px solid var(--veil-contrast-04)",
     },
     wordNum: {
-      "font-size": "10px", color: "rgba(255,255,255,0.2)",
+      "font-size": "10px", color: "var(--veil-contrast-20)",
       "font-family": "monospace", width: "16px", "text-align": "right" as const,
     },
     wordText: {
-      "font-size": "13px", color: "rgba(255,255,255,0.8)", "font-family": "monospace",
+      "font-size": "13px", color: "var(--veil-contrast-80)", "font-family": "monospace",
       "font-weight": "500",
     },
     textarea: {
       width: "100%", "min-height": "140px", "border-radius": "14px",
-      background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--veil-contrast-04)", border: "1px solid var(--veil-contrast-06)",
       padding: "18px 20px", "font-size": "15px", "font-family": "monospace",
-      color: "rgba(255,255,255,0.8)", resize: "none" as const, "line-height": "1.8",
+      color: "var(--veil-contrast-80)", resize: "none" as const, "line-height": "1.8",
       outline: "none", transition: "border-color 0.2s, background 0.2s",
     },
     warningBox: {
       display: "flex", "align-items": "flex-start", gap: "10px",
       padding: "14px 16px", "border-radius": "12px",
-      background: "rgba(251,191,36,0.05)", border: "1px solid rgba(251,191,36,0.12)",
+      background: "var(--veil-warning-surface)", border: "1px solid var(--veil-warning-surface)",
     },
     backBtn: {
       display: "flex", "align-items": "center", "justify-content": "center",
       gap: "6px", height: "36px", background: "transparent", border: "none",
-      color: "rgba(255,255,255,0.3)", "font-size": "12px", cursor: "pointer",
+      color: "var(--veil-contrast-30)", "font-size": "12px", cursor: "pointer",
       transition: "color 0.15s", "margin-top": "4px", width: "100%",
     },
     sectionTitle: {
-      "font-size": "18px", "font-weight": "600", color: "rgba(255,255,255,0.9)",
+      "font-size": "18px", "font-weight": "600", color: "var(--veil-contrast-90)",
       "margin-bottom": "4px",
     },
     sectionSub: {
-      "font-size": "13px", color: "rgba(255,255,255,0.35)", "margin-bottom": "20px",
+      "font-size": "13px", color: "var(--veil-contrast-35)", "margin-bottom": "20px",
     },
   };
 
@@ -318,10 +321,10 @@ export const OnboardingScreen: Component = () => {
       </div>
 
       <Show when={error()}>
-        <div style={{ position: "absolute", top: "24px", left: "50%", transform: "translateX(-50%)", "z-index": "10" }}>
+        <div style={{ position: "absolute", top: "24px", left: "50%", transform: "translateX(-50%)", "z-index": Z.CONTENT_OVERLAY }}>
           <div style={S.errorBox}>
-            <span style={{ color: "rgba(240,72,72,0.7)", "font-size": "14px" }}>{"\u26A0"}</span>
-            <span style={{ "font-size": "12px", color: "rgba(240,72,72,0.8)" }}>{error()}</span>
+            <AlertTriangle size={14} strokeWidth={2} color="color-mix(in srgb, var(--veil-danger) 70%, transparent)" />
+            <span style={{ "font-size": "12px", color: "color-mix(in srgb, var(--veil-danger) 80%, transparent)" }}>{error()}</span>
           </div>
         </div>
       </Show>
@@ -332,14 +335,11 @@ export const OnboardingScreen: Component = () => {
           <div style={S.logo}>
             <div style={S.logoIcon}>
               <div style={S.logoGlow} />
-              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" style={{ position: "relative", "z-index": "1" }}>
-                <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z" fill="rgba(124,107,245,0.3)" stroke="rgba(124,107,245,0.8)" stroke-width="1.5"/>
-                <path d="M9 12l2 2 4-4" stroke="#7c6bf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
+              <VeilMark size={26} style={{ position: "relative", "z-index": "1", color: "var(--veil-accent)" }} />
             </div>
             <div>
-              <div style={{ "font-size": "16px", "font-weight": "600", color: "rgba(255,255,255,0.85)", "letter-spacing": "0.2em", "text-align": "center" }}>VEIL</div>
-              <div style={{ "font-size": "10px", color: "rgba(255,255,255,0.25)", "text-align": "center", "margin-top": "2px" }}>Encrypted messenger</div>
+              <div style={{ "font-size": "16px", "font-weight": "600", color: "var(--veil-contrast-85)", "letter-spacing": "0.2em", "text-align": "center" }}>VEIL</div>
+              <div style={{ "font-size": "10px", color: "var(--veil-contrast-25)", "text-align": "center", "margin-top": "2px" }}>Encrypted messenger</div>
             </div>
           </div>
 
@@ -347,10 +347,10 @@ export const OnboardingScreen: Component = () => {
 
           <div style={S.taglineArea}>
             <div style={S.tagText(taglineFade())}>
-              <div style={{ "font-size": "16px", "font-weight": "500", color: "rgba(255,255,255,0.85)", "margin-bottom": "4px" }}>
+              <div style={{ "font-size": "16px", "font-weight": "500", color: "var(--veil-contrast-85)", "margin-bottom": "4px" }}>
                 {tagline().text}
               </div>
-              <div style={{ "font-size": "12px", color: "rgba(255,255,255,0.35)" }}>
+              <div style={{ "font-size": "12px", color: "var(--veil-contrast-35)" }}>
                 {tagline().sub}
               </div>
             </div>
@@ -362,7 +362,7 @@ export const OnboardingScreen: Component = () => {
                 {(_, i) => (
                   <div style={{
                     width: "6px", height: "6px", "border-radius": "3px",
-                    background: i() === taglineIdx() ? "#7c6bf5" : "rgba(255,255,255,0.08)",
+                    background: i() === taglineIdx() ? "var(--veil-accent)" : "var(--veil-contrast-08)",
                     transition: "background 0.3s",
                   }} />
                 )}
@@ -377,8 +377,8 @@ export const OnboardingScreen: Component = () => {
               style={S.btnPrimary}
               onClick={generateMnemonic}
               disabled={loading()}
-              onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(124,107,245,0.35)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(124,107,245,0.25)"; }}
+              onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(var(--veil-accent-rgb),0.35)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(var(--veil-accent-rgb),0.25)"; }}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
@@ -388,8 +388,8 @@ export const OnboardingScreen: Component = () => {
             <button
               style={S.btnSecondary}
               onClick={() => transitionTo("restore")}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.07)"; e.currentTarget.style.color = "rgba(255,255,255,0.8)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.04)"; e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-07)"; e.currentTarget.style.color = "var(--veil-contrast-80)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
@@ -426,23 +426,25 @@ export const OnboardingScreen: Component = () => {
               style={{
                 position: "absolute", top: "8px", right: "8px",
                 width: "32px", height: "32px", "border-radius": "8px",
-                background: "rgba(255,255,255,0.04)", border: "none",
-                color: "rgba(255,255,255,0.3)", cursor: "pointer",
+                background: "var(--veil-contrast-04)", border: "none",
+                color: "var(--veil-contrast-30)", cursor: "pointer",
                 display: "flex", "align-items": "center", "justify-content": "center",
                 "font-size": "14px", transition: "background 0.15s",
               }}
               onClick={() => setShowPhrase(!showPhrase())}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.08)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
+              aria-label={showPhrase() ? "Hide recovery phrase" : "Show recovery phrase"}
+              title={showPhrase() ? "Hide recovery phrase" : "Show recovery phrase"}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-08)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; }}
             >
-              {showPhrase() ? "\uD83D\uDC41" : "\uD83D\uDE48"}
+              {showPhrase() ? <EyeOff size={15} strokeWidth={1.9} /> : <Eye size={15} strokeWidth={1.9} />}
             </button>
           </div>
 
           <div style={{ ...S.warningBox, "margin-top": "16px" }}>
-            <span style={{ "font-size": "14px", "flex-shrink": "0", "margin-top": "1px" }}>{"\u26A0\uFE0F"}</span>
-            <span style={{ "font-size": "12px", color: "rgba(251,191,36,0.6)", "line-height": "1.5" }}>
-              Write these 12 words down or save them directly in a trusted password manager. Clipboard copy is disabled because Windows may retain secrets in Clipboard History or cloud sync. They are the <strong style={{ color: "rgba(251,191,36,0.85)" }}>only way</strong> to recover your identity.
+            <AlertTriangle size={14} strokeWidth={2} style={{ "flex-shrink": "0", "margin-top": "1px" }} />
+            <span style={{ "font-size": "12px", color: "color-mix(in srgb, var(--veil-warning) 60%, transparent)", "line-height": "1.5" }}>
+              Write these 12 words down or save them directly in a trusted password manager. Clipboard copy is disabled because Windows may retain secrets in Clipboard History or cloud sync. They are the <strong style={{ color: "color-mix(in srgb, var(--veil-warning) 85%, transparent)" }}>only way</strong> to recover your identity.
             </span>
           </div>
 
@@ -456,8 +458,8 @@ export const OnboardingScreen: Component = () => {
             }}
             onClick={() => initIdentity(mnemonic())}
             disabled={loading() || !mnemonic().trim()}
-            onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(124,107,245,0.35)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(124,107,245,0.25)"; }}
+            onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(var(--veil-accent-rgb),0.35)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(var(--veil-accent-rgb),0.25)"; }}
           >
             {loading() ? "Initializing..." : "I've saved my phrase \u2192"}
           </button>
@@ -465,8 +467,8 @@ export const OnboardingScreen: Component = () => {
           <button
             style={S.backBtn}
             onClick={() => transitionTo("welcome")}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.3)"; }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-contrast-30)"; }}
           >
             {"\u2190 Back"}
           </button>
@@ -490,14 +492,14 @@ export const OnboardingScreen: Component = () => {
               setRestoreInput(e.currentTarget.value);
               if (error()) setError("");
             }}
-            onFocus={(e) => { e.currentTarget.style.borderColor = "rgba(124,107,245,0.3)"; e.currentTarget.style.background = "rgba(255,255,255,0.06)"; }}
-            onBlur={(e) => { e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"; e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
+            onFocus={(e) => { e.currentTarget.style.borderColor = "rgba(var(--veil-accent-rgb),0.3)"; e.currentTarget.style.background = "var(--veil-contrast-06)"; }}
+            onBlur={(e) => { e.currentTarget.style.borderColor = "var(--veil-contrast-06)"; e.currentTarget.style.background = "var(--veil-contrast-04)"; }}
           />
 
           <div style={{
             "font-size": "11px", "margin-top": "8px", "margin-bottom": "16px",
             color: restoreInput().trim().split(/\s+/).filter(Boolean).length === 12
-              ? "rgba(52,211,153,0.6)" : "rgba(255,255,255,0.2)",
+              ? "color-mix(in srgb, var(--veil-success) 60%, transparent)" : "var(--veil-contrast-20)",
             transition: "color 0.2s",
           }}>
             {restoreInput().trim() ? `${restoreInput().trim().split(/\s+/).filter(Boolean).length} / 12 words` : ""}
@@ -511,8 +513,8 @@ export const OnboardingScreen: Component = () => {
             }}
             onClick={() => initIdentity(restoreInput())}
             disabled={loading() || !restoreInput().trim()}
-            onMouseEnter={(e) => { if (restoreInput().trim()) { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(124,107,245,0.35)"; } }}
-            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(124,107,245,0.25)"; }}
+            onMouseEnter={(e) => { if (restoreInput().trim()) { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(var(--veil-accent-rgb),0.35)"; } }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(var(--veil-accent-rgb),0.25)"; }}
           >
             {loading() ? "Restoring..." : "Restore Identity \u2192"}
           </button>
@@ -520,8 +522,8 @@ export const OnboardingScreen: Component = () => {
           <button
             style={S.backBtn}
             onClick={() => transitionTo("welcome")}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.3)"; }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-contrast-30)"; }}
           >
             {"\u2190 Back"}
           </button>

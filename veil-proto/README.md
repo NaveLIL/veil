@@ -4,6 +4,9 @@ Protocol Buffer definitions for the Veil encrypted messenger.
 
 All Veil components (clients, server, bots) depend on this repository as the single source of truth for the wire protocol.
 
+Normative byte encodings for cryptographic device identity and conversation
+device rosters are documented in [DEVICE_BINDING_V1.md](DEVICE_BINDING_V1.md).
+
 ## Structure
 
 ```

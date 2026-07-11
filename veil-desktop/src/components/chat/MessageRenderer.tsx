@@ -237,14 +237,14 @@ const RenderNode: Component<{ node: Node }> = (props) => {
 
     case "bold":
       return (
-        <strong style={{ "font-weight": "600", color: "#e0e0e0" }}>
+        <strong style={{ "font-weight": "600", color: "var(--veil-text-strong)" }}>
           <For each={props.node.children}>{(n) => <RenderNode node={n} />}</For>
         </strong>
       );
 
     case "italic":
       return (
-        <em style={{ "font-style": "italic", color: "#c0c0d0" }}>
+        <em style={{ "font-style": "italic", color: "var(--veil-text-muted)" }}>
           <For each={props.node.children}>{(n) => <RenderNode node={n} />}</For>
         </em>
       );

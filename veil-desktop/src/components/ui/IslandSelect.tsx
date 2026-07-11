@@ -16,6 +16,7 @@ interface Props<T extends string | number> {
   width?: number | string;
   height?: number;
   disabled?: boolean;
+  ariaLabel?: string;
 }
 
 const portalHost = () =>
@@ -53,13 +54,13 @@ export function IslandSelect<T extends string | number>(props: Props<T>): JSX.El
             padding: "8px 10px",
             "border-radius": "6px",
             "font-size": "13px",
-            color: "#ddd",
+            color: "var(--veil-text)",
             cursor: "pointer",
             outline: "none",
             "user-select": "none",
           }}
           onMouseEnter={(e) => {
-            (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.06)";
+            (e.currentTarget as HTMLElement).style.background = "color-mix(in srgb, var(--veil-text-strong) 6%, transparent)";
           }}
           onMouseLeave={(e) => {
             (e.currentTarget as HTMLElement).style.background = "transparent";
@@ -67,12 +68,13 @@ export function IslandSelect<T extends string | number>(props: Props<T>): JSX.El
         >
           <KSelect.ItemLabel>{itemProps.item.rawValue.label}</KSelect.ItemLabel>
           <KSelect.ItemIndicator>
-            <Check size={14} color="#7c6bf5" />
+            <Check size={14} color="var(--veil-accent)" />
           </KSelect.ItemIndicator>
         </KSelect.Item>
       )}
     >
       <KSelect.Trigger
+        aria-label={props.ariaLabel}
         style={{
           display: "flex",
           "align-items": "center",
@@ -84,9 +86,9 @@ export function IslandSelect<T extends string | number>(props: Props<T>): JSX.El
           "box-sizing": "border-box",
           "border-radius": "8px",
           "font-size": "13px",
-          background: "#1E1F22",
-          color: "#ddd",
-          border: "1px solid rgba(255,255,255,0.05)",
+          background: "var(--veil-control)",
+          color: "var(--veil-text)",
+          border: "1px solid var(--veil-border)",
           outline: "none",
           cursor: props.disabled ? "not-allowed" : "pointer",
           "font-family": "inherit",
@@ -102,7 +104,7 @@ export function IslandSelect<T extends string | number>(props: Props<T>): JSX.El
                 overflow: "hidden",
                 "text-overflow": "ellipsis",
                 "min-width": "0",
-                color: state.selectedOption() ? "#ddd" : "#666",
+                color: state.selectedOption() ? "var(--veil-text)" : "var(--veil-text-faint)",
               }}
             >
               {state.selectedOption()?.label ?? props.placeholder ?? ""}
@@ -110,17 +112,17 @@ export function IslandSelect<T extends string | number>(props: Props<T>): JSX.El
           )}
         </KSelect.Value>
         <KSelect.Icon>
-          <ChevronDown size={14} color="#888" />
+          <ChevronDown size={14} color="var(--veil-text-muted)" />
         </KSelect.Icon>
       </KSelect.Trigger>
       <KSelect.Portal mount={portalHost()}>
         <KSelect.Content
           style={{
             "z-index": Z.DROPDOWN,
-            background: "#2B2D31",
-            border: "1px solid rgba(255,255,255,0.06)",
+            background: "var(--veil-island)",
+            border: "1px solid var(--veil-border)",
             "border-radius": "10px",
-            "box-shadow": "0 12px 36px rgba(0,0,0,0.5)",
+            "box-shadow": "0 12px 36px var(--veil-shadow-deep)",
             padding: "6px",
             "min-width": "var(--kb-popper-anchor-width)",
             "max-height": "240px",

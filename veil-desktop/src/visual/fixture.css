@@ -1,0 +1,43 @@
+html[data-visual-fixture="true"] .veil-message-composer-input {
+  caret-color: transparent;
+}
+
+html[data-visual-fixture="true"] body {
+  background: var(--veil-window);
+}
+
+.visual-channel-button {
+  width: 100%;
+  min-height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 8px;
+  color: var(--veil-text-muted);
+  background: transparent;
+  text-align: left;
+}
+
+.visual-channel-button[aria-current="page"] {
+  color: var(--veil-text-strong);
+  background: var(--veil-contrast-06);
+}
+
+.visual-icon-button {
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 7px;
+  color: var(--veil-text-muted);
+  background: transparent;
+}
+
+.visual-icon-button.is-active {
+  color: var(--veil-accent);
+  background: rgba(var(--veil-accent-rgb), 0.14);
+}

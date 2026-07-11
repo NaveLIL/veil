@@ -713,9 +713,9 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("VIEW_CHANNEL member list status=%d, want 200", status)
 		}
-		status, _, _ = h.Do(mallory, http.MethodGet, "/v1/servers/"+serverID+"/channels", nil)
-		if status != http.StatusForbidden {
-			t.Fatalf("no-view member list status=%d, want 403", status)
+		status, _, hiddenChannels := h.Do(mallory, http.MethodGet, "/v1/servers/"+serverID+"/channels", nil)
+		if status != http.StatusOK || len(hiddenChannels["channels"].([]any)) != 0 {
+			t.Fatalf("no-view member channel list leaked metadata: status=%d body=%v", status, hiddenChannels)
 		}
 		status, _, _ = h.Do(bob, http.MethodGet, "/v1/conversations/"+conversationID+"/members", nil)
 		if status != http.StatusForbidden {
@@ -794,6 +794,191 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		status, _, directory = h.Do(alice, http.MethodGet, "/v1/conversations/"+conversationID+"/members", nil)
 		if status != http.StatusOK || len(directory["members"].([]any)) != 1 {
 			t.Fatalf("revoked member remained in directory: status=%d body=%v", status, directory)
+		}
+	})
+
+	t.Run("channel overwrites gate channel list directory sync send and retained sender keys", func(t *testing.T) {
+		ctx := context.Background()
+		serverID := mkServer(t, h, alice, "security-channel-overwrites")
+		invite := mkInviteCode(t, h, alice, serverID)
+		joinViaInvite(t, h, bob, invite)
+		joinViaInvite(t, h, mallory, invite)
+		outsider := h.CreateUser("security-overwrite-outsider")
+
+		status, _, channelsBody := h.Do(alice, http.MethodGet, "/v1/servers/"+serverID+"/channels", nil)
+		if status != http.StatusOK {
+			t.Fatalf("owner list channels status=%d body=%v", status, channelsBody)
+		}
+		general := channelsBody["channels"].([]any)[0].(map[string]any)
+		channelID := general["id"].(string)
+		conversationID := general["conversation_id"].(string)
+
+		status, _, rolesBody := h.Do(alice, http.MethodGet, "/v1/servers/"+serverID+"/roles", nil)
+		if status != http.StatusOK {
+			t.Fatalf("list roles status=%d body=%v", status, rolesBody)
+		}
+		var defaultRole string
+		for _, raw := range rolesBody["roles"].([]any) {
+			role := raw.(map[string]any)
+			if role["is_default"] == true {
+				defaultRole = role["id"].(string)
+			}
+		}
+		if defaultRole == "" {
+			t.Fatal("default role not found")
+		}
+
+		status, _, readerBody := h.Do(alice, http.MethodPost,
+			"/v1/servers/"+serverID+"/roles", map[string]any{
+				"name": "channel-reader", "permissions": uint64(0),
+			})
+		if status != http.StatusCreated {
+			t.Fatalf("create reader role status=%d body=%v", status, readerBody)
+		}
+		readerRole := readerBody["id"].(string)
+		status, _, _ = h.Do(alice, http.MethodPut,
+			"/v1/servers/"+serverID+"/members/"+bob.ID+"/roles/"+readerRole, nil)
+		if status != http.StatusOK {
+			t.Fatalf("assign reader role status=%d", status)
+		}
+
+		channelReadSend := db.ChannelReadPermissions | db.PermSendMessages
+		status, _, body := h.Do(alice, http.MethodPut,
+			"/v1/channels/"+channelID+"/overwrites", map[string]any{
+				"target_id": defaultRole, "target_type": db.ChannelOverwriteRole,
+				"allow": uint64(0), "deny": channelReadSend,
+			})
+		if status != http.StatusOK {
+			t.Fatalf("deny @everyone overwrite status=%d body=%v", status, body)
+		}
+		status, _, body = h.Do(alice, http.MethodPut,
+			"/v1/channels/"+channelID+"/overwrites", map[string]any{
+				"target_id": readerRole, "target_type": db.ChannelOverwriteRole,
+				"allow": db.ChannelReadPermissions, "deny": db.PermSendMessages,
+			})
+		if status != http.StatusOK {
+			t.Fatalf("reader role overwrite status=%d body=%v", status, body)
+		}
+
+		status, _, bobChannels := h.Do(bob, http.MethodGet, "/v1/servers/"+serverID+"/channels", nil)
+		if status != http.StatusOK || len(bobChannels["channels"].([]any)) != 1 {
+			t.Fatalf("role-authorized channel list status=%d body=%v", status, bobChannels)
+		}
+		status, _, malloryChannels := h.Do(mallory, http.MethodGet, "/v1/servers/"+serverID+"/channels", nil)
+		if status != http.StatusOK || len(malloryChannels["channels"].([]any)) != 0 {
+			t.Fatalf("hidden channel leaked in list: status=%d body=%v", status, malloryChannels)
+		}
+		status, _, directory := h.Do(bob, http.MethodGet, "/v1/conversations/"+conversationID+"/members", nil)
+		if status != http.StatusOK || len(directory["members"].([]any)) != 2 {
+			t.Fatalf("role-authorized directory status=%d body=%v", status, directory)
+		}
+		status, _, _ = h.Do(mallory, http.MethodGet, "/v1/conversations/"+conversationID+"/members", nil)
+		if status != http.StatusForbidden {
+			t.Fatalf("hidden member directory status=%d, want 403", status)
+		}
+		status, _, _ = h.Do(bob, http.MethodGet, "/v1/messages/"+conversationID, nil)
+		if status != http.StatusOK {
+			t.Fatalf("role-authorized message sync status=%d", status)
+		}
+		if _, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
+			ConversationId: conversationID, Ciphertext: []byte("blocked by role overwrite"),
+		}); !errors.Is(err, chat.ErrNotMember) {
+			t.Fatalf("role send deny error=%v, want ErrNotMember", err)
+		}
+		status, _, _ = h.Do(bob, http.MethodGet, "/v1/channels/"+channelID+"/overwrites", nil)
+		if status != http.StatusForbidden {
+			t.Fatalf("non-manager overwrite list status=%d, want 403", status)
+		}
+
+		status, _, body = h.Do(alice, http.MethodPut,
+			"/v1/channels/"+channelID+"/overwrites", map[string]any{
+				"target_id": bob.ID, "target_type": db.ChannelOverwriteUser,
+				"allow": db.PermSendMessages, "deny": uint64(0),
+			})
+		if status != http.StatusOK {
+			t.Fatalf("member send allow status=%d body=%v", status, body)
+		}
+		_, _, recipients, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
+			ConversationId: conversationID, Ciphertext: []byte("allowed by member overwrite"),
+		})
+		if err != nil || len(recipients) != 1 || recipients[0] != alice.ID {
+			t.Fatalf("member send allow err=%v recipients=%v", err, recipients)
+		}
+
+		bobDevice, err := h.DB.CreateDevice(ctx, bob.ID, randomBytes(t, 16), "overwrite-bob-device")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.DB.StoreSenderKey(
+			ctx, conversationID, aliceDevice.ID, bobDevice.ID, []byte("sealed-skdm"), 1,
+		); err != nil {
+			t.Fatal(err)
+		}
+		pending, err := h.DB.GetPendingSenderKeys(ctx, bobDevice.ID)
+		if err != nil || len(pending) != 1 {
+			t.Fatalf("authorized retained sender keys=%v err=%v", pending, err)
+		}
+
+		status, _, body = h.Do(alice, http.MethodPut,
+			"/v1/channels/"+channelID+"/overwrites", map[string]any{
+				"target_id": bob.ID, "target_type": db.ChannelOverwriteUser,
+				"allow": db.PermSendMessages, "deny": db.PermReadMessageHistory,
+			})
+		if status != http.StatusOK {
+			t.Fatalf("member history deny status=%d body=%v", status, body)
+		}
+		status, _, _ = h.Do(bob, http.MethodGet, "/v1/conversations/"+conversationID+"/members", nil)
+		if status != http.StatusForbidden {
+			t.Fatalf("history-denied directory status=%d, want 403", status)
+		}
+		status, _, _ = h.Do(bob, http.MethodGet, "/v1/messages/"+conversationID, nil)
+		if status != http.StatusForbidden {
+			t.Fatalf("history-denied sync status=%d, want 403", status)
+		}
+		status, _, discovery := h.Do(bob, http.MethodGet, "/v1/conversations", nil)
+		if status != http.StatusOK {
+			t.Fatalf("history-denied discovery status=%d body=%v", status, discovery)
+		}
+		for _, raw := range discovery["conversations"].([]any) {
+			if raw.(map[string]any)["id"] == conversationID {
+				t.Fatalf("history-denied channel leaked in discovery: %v", discovery)
+			}
+		}
+		pending, err = h.DB.GetPendingSenderKeys(ctx, bobDevice.ID)
+		if err != nil || len(pending) != 0 {
+			t.Fatalf("history-denied retained sender keys=%v err=%v", pending, err)
+		}
+		if _, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
+			ConversationId: conversationID, Ciphertext: []byte("send without history"),
+		}); err != nil {
+			t.Fatalf("independent send permission was lost: %v", err)
+		}
+
+		status, _, _ = h.Do(alice, http.MethodDelete,
+			fmt.Sprintf("/v1/channels/%s/overwrites/%d/%s", channelID, db.ChannelOverwriteUser, bob.ID), nil)
+		if status != http.StatusOK {
+			t.Fatalf("delete member overwrite status=%d", status)
+		}
+		pending, err = h.DB.GetPendingSenderKeys(ctx, bobDevice.ID)
+		if err != nil || len(pending) != 1 {
+			t.Fatalf("restored retained sender keys=%v err=%v", pending, err)
+		}
+
+		status, _, _ = h.Do(alice, http.MethodPut,
+			"/v1/channels/"+channelID+"/overwrites", map[string]any{
+				"target_id": bob.ID, "target_type": db.ChannelOverwriteUser,
+				"allow": db.PermViewChannel, "deny": db.PermViewChannel,
+			})
+		if status != http.StatusBadRequest {
+			t.Fatalf("overlapping allow/deny status=%d, want 400", status)
+		}
+		status, _, _ = h.Do(alice, http.MethodPut,
+			"/v1/channels/"+channelID+"/overwrites", map[string]any{
+				"target_id": outsider.ID, "target_type": db.ChannelOverwriteUser,
+				"allow": db.PermViewChannel, "deny": uint64(0),
+			})
+		if status != http.StatusBadRequest {
+			t.Fatalf("foreign-server overwrite target status=%d, want 400", status)
 		}
 	})
 

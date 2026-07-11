@@ -68,14 +68,18 @@ func (s *Service) memberIDs(ctx context.Context, serverID string) []string {
 // channelViewerIDs returns only members allowed to learn channel metadata.
 // Message-history is intentionally not required for channel create/update
 // events, but VIEW_CHANNEL is always enforced.
-func (s *Service) channelViewerIDs(ctx context.Context, serverID string) []string {
-	members, err := s.db.GetServerMembers(ctx, serverID)
+func (s *Service) channelViewerIDs(ctx context.Context, channelID string) []string {
+	channel, err := s.db.GetChannel(ctx, channelID)
+	if err != nil {
+		return nil
+	}
+	members, err := s.db.GetServerMembers(ctx, channel.ServerID)
 	if err != nil {
 		return nil
 	}
 	ids := make([]string, 0, len(members))
 	for _, member := range members {
-		allowed, permissionErr := s.db.HasAllPermissions(ctx, serverID, member.UserID, db.PermViewChannel)
+		allowed, permissionErr := s.db.HasAllChannelPermissions(ctx, channelID, member.UserID, db.PermViewChannel)
 		if permissionErr == nil && allowed {
 			ids = append(ids, member.UserID)
 		}
@@ -246,11 +250,11 @@ func (s *Service) ListChannels(ctx context.Context, serverID, requesterID string
 	if err != nil || !ok {
 		return nil, errors.New("not a server member")
 	}
-	canView, err := s.db.HasAllPermissions(ctx, serverID, requesterID, db.PermViewChannel)
-	if err != nil || !canView {
+	channels, err := s.db.GetVisibleServerChannels(ctx, serverID, requesterID)
+	if err != nil {
 		return nil, errors.New("insufficient permissions")
 	}
-	return s.db.GetServerChannels(ctx, serverID)
+	return channels, nil
 }
 
 func (s *Service) CreateChannel(ctx context.Context, serverID, requesterID, name string, channelType int16, categoryID, topic *string) (*db.Channel, error) {
@@ -268,7 +272,7 @@ func (s *Service) CreateChannel(ctx context.Context, serverID, requesterID, name
 	if err != nil {
 		return nil, err
 	}
-	s.broadcastChannelEvent(ctx, serverID, pb.ChannelEvent_CREATED, channelToInfo(ch))
+	s.broadcastChannelEvent(ctx, ch.ID, pb.ChannelEvent_CREATED, channelToInfo(ch))
 	return ch, nil
 }
 
@@ -277,7 +281,7 @@ func (s *Service) UpdateChannel(ctx context.Context, channelID, requesterID stri
 	if err != nil {
 		return errors.New("channel not found")
 	}
-	can, err := s.db.HasPermission(ctx, ch.ServerID, requesterID, db.PermManageChannels)
+	can, err := s.db.HasAllChannelPermissions(ctx, ch.ID, requesterID, db.PermManageChannels)
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
 	}
@@ -289,7 +293,7 @@ func (s *Service) UpdateChannel(ctx context.Context, channelID, requesterID stri
 	}
 	updated, _ := s.db.GetChannel(ctx, channelID)
 	if updated != nil {
-		s.broadcastChannelEvent(ctx, ch.ServerID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
+		s.broadcastChannelEvent(ctx, ch.ID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
 	}
 	return nil
 }
@@ -361,6 +365,10 @@ func (s *Service) ReorderChannels(ctx context.Context, serverID, requesterID str
 		if ch.ServerID != serverID {
 			return errors.New("channel does not belong to server")
 		}
+		canManage, permissionErr := s.db.HasAllChannelPermissions(ctx, ch.ID, requesterID, db.PermManageChannels)
+		if permissionErr != nil || !canManage {
+			return errors.New("insufficient permissions")
+		}
 		pos := it.Position
 		if err := s.db.UpdateChannel(ctx, it.ChannelID, nil, nil, nil, nil, &pos, it.CategoryID, it.ClearCategory); err != nil {
 			return err
@@ -369,7 +377,7 @@ func (s *Service) ReorderChannels(ctx context.Context, serverID, requesterID str
 	// Broadcast a single UPDATED per channel so clients refresh the tree.
 	for _, it := range items {
 		if updated, _ := s.db.GetChannel(ctx, it.ChannelID); updated != nil {
-			s.broadcastChannelEvent(ctx, serverID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
+			s.broadcastChannelEvent(ctx, updated.ID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
 		}
 	}
 	return nil
@@ -380,18 +388,96 @@ func (s *Service) DeleteChannel(ctx context.Context, channelID, requesterID stri
 	if err != nil {
 		return errors.New("channel not found")
 	}
-	can, err := s.db.HasPermission(ctx, ch.ServerID, requesterID, db.PermManageChannels)
+	can, err := s.db.HasAllChannelPermissions(ctx, ch.ID, requesterID, db.PermManageChannels)
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
 	}
+	viewers := s.channelViewerIDs(ctx, ch.ID)
 	if err := s.db.DeleteChannel(ctx, channelID); err != nil {
 		return err
 	}
-	s.broadcastChannelEvent(ctx, ch.ServerID, pb.ChannelEvent_DELETED, channelToInfo(ch))
+	s.broadcastChannelEventTo(ctx, viewers, ch.ServerID, pb.ChannelEvent_DELETED, channelToInfo(ch))
 	return nil
 }
 
 // ─── Roles ───────────────────────────────────────────
+
+func (s *Service) authorizeChannelOverwriteManager(ctx context.Context, channelID, requesterID string, allow uint64) (*db.Channel, error) {
+	channel, err := s.db.GetChannel(ctx, channelID)
+	if err != nil {
+		return nil, errors.New("channel not found")
+	}
+	permissions, err := s.db.GetChannelPermissions(ctx, channelID, requesterID)
+	if err != nil || permissions&db.PermAdministrator == 0 && permissions&db.PermManageChannels == 0 {
+		return nil, errors.New("insufficient permissions")
+	}
+	if permissions&db.PermAdministrator == 0 && allow&^permissions != 0 {
+		return nil, errors.New("cannot grant channel permissions the requester does not possess")
+	}
+	return channel, nil
+}
+
+func (s *Service) ListChannelOverwrites(ctx context.Context, channelID, requesterID string) ([]db.ChannelOverwrite, error) {
+	if _, err := s.authorizeChannelOverwriteManager(ctx, channelID, requesterID, 0); err != nil {
+		return nil, err
+	}
+	return s.db.GetChannelOverwrites(ctx, channelID)
+}
+
+func (s *Service) UpsertChannelOverwrite(ctx context.Context, requesterID string, overwrite db.ChannelOverwrite) error {
+	channel, err := s.authorizeChannelOverwriteManager(ctx, overwrite.ChannelID, requesterID, overwrite.Allow)
+	if err != nil {
+		return err
+	}
+	before := s.channelViewerIDs(ctx, overwrite.ChannelID)
+	if err := s.db.UpsertChannelOverwrite(ctx, overwrite); err != nil {
+		if errors.Is(err, db.ErrInvalidChannelOverwrite) {
+			return err
+		}
+		return db.ErrInvalidChannelOverwrite
+	}
+	after := s.channelViewerIDs(ctx, overwrite.ChannelID)
+	s.broadcastChannelEventTo(
+		ctx, unionUserIDs(before, after), channel.ServerID,
+		pb.ChannelEvent_UPDATED, channelToInfo(channel),
+	)
+	return nil
+}
+
+func (s *Service) DeleteChannelOverwrite(ctx context.Context, channelID, requesterID, targetID string, targetType int16) error {
+	channel, err := s.authorizeChannelOverwriteManager(ctx, channelID, requesterID, 0)
+	if err != nil {
+		return err
+	}
+	before := s.channelViewerIDs(ctx, channelID)
+	if err := s.db.DeleteChannelOverwrite(ctx, channelID, targetID, targetType); err != nil {
+		if errors.Is(err, db.ErrInvalidChannelOverwrite) {
+			return err
+		}
+		return errors.New("channel overwrite not found")
+	}
+	after := s.channelViewerIDs(ctx, channelID)
+	s.broadcastChannelEventTo(
+		ctx, unionUserIDs(before, after), channel.ServerID,
+		pb.ChannelEvent_UPDATED, channelToInfo(channel),
+	)
+	return nil
+}
+
+func unionUserIDs(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	result := make([]string, 0)
+	for _, group := range groups {
+		for _, userID := range group {
+			if _, exists := seen[userID]; exists {
+				continue
+			}
+			seen[userID] = struct{}{}
+			result = append(result, userID)
+		}
+	}
+	return result
+}
 
 type roleManager struct {
 	owner       bool
@@ -698,8 +784,15 @@ func (s *Service) broadcastServerEvent(ctx context.Context, serverID string, _ p
 	})
 }
 
-func (s *Service) broadcastChannelEvent(ctx context.Context, serverID string, evType pb.ChannelEvent_EventType, info *pb.ChannelInfo) {
-	memberIDs := s.channelViewerIDs(ctx, serverID)
+func (s *Service) broadcastChannelEvent(ctx context.Context, channelID string, evType pb.ChannelEvent_EventType, info *pb.ChannelInfo) {
+	channel, err := s.db.GetChannel(ctx, channelID)
+	if err != nil {
+		return
+	}
+	s.broadcastChannelEventTo(ctx, s.channelViewerIDs(ctx, channelID), channel.ServerID, evType, info)
+}
+
+func (s *Service) broadcastChannelEventTo(_ context.Context, memberIDs []string, serverID string, evType pb.ChannelEvent_EventType, info *pb.ChannelInfo) {
 	if len(memberIDs) == 0 {
 		return
 	}

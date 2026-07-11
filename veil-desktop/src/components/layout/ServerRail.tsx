@@ -1,145 +1,123 @@
-import { Component, For, Show, createSignal } from "solid-js";
-import { Shield, Plus, Compass } from "lucide-solid";
-import { Tooltip } from "@/components/ui/tooltip";
-import { cn } from "@/lib/utils";
-import { appStore } from "@/stores/app";
-import { CreateServerDialog } from "@/components/server/CreateServerDialog";
-import { JoinServerDialog } from "@/components/server/JoinServerDialog";
+import type { Component } from "solid-js";
+import { For } from "solid-js";
+import { Globe, MessageCircle } from "lucide-solid";
+import type { Server } from "@/stores/app";
 
-// ─── Server Icon Button ──────────────────────────────
-
-interface ServerIconProps {
-  name: string;
-  iconUrl?: string;
-  isActive?: boolean;
-  isHome?: boolean;
-  onClick?: () => void;
+export interface ServerRailProps {
+  activeServerId: string;
+  servers: readonly Server[];
+  visible: boolean;
+  onSelectServer: (serverId: string | null) => void;
+  onOpenServerSettings: (serverId: string) => void;
+  onCreateServer: () => void;
+  onJoinServer: () => void;
 }
 
-const ServerIcon: Component<ServerIconProps> = (props) => {
-  const initials = () => {
-    return props.name
-      .split(/\s+/)
-      .map((w) => w[0])
-      .slice(0, 2)
-      .join("")
-      .toUpperCase();
-  };
-
-  return (
-    <div class="relative flex items-center justify-center group px-3">
-      {/* Active pill indicator */}
-      <div
-        class={cn(
-          "absolute left-0 w-1 rounded-r-full bg-foreground transition-all duration-200",
-          props.isActive ? "h-10" : "h-0 group-hover:h-5",
-        )}
-      />
-
-      <Tooltip content={props.name} side="right">
-        <button
-          class={cn(
-            "flex items-center justify-center transition-all duration-200 cursor-pointer overflow-hidden",
-            props.isHome
-              ? "w-12 h-12 rounded-2xl"
-              : "w-12 h-12 rounded-3xl group-hover:rounded-2xl",
-            props.isActive && "!rounded-2xl",
-            props.isHome
-              ? "bg-primary/15 hover:bg-primary/25"
-              : "bg-white/[0.06] hover:bg-primary/25",
-          )}
-          onClick={props.onClick}
-        >
-          <Show when={props.isHome}>
-            <Shield class="h-5 w-5 text-primary" />
-          </Show>
-          <Show when={!props.isHome && props.iconUrl}>
-            <img src={props.iconUrl} alt={props.name} class="w-full h-full object-cover" />
-          </Show>
-          <Show when={!props.isHome && !props.iconUrl}>
-            <span
-              class={cn(
-                "text-sm font-semibold transition-colors duration-200",
-                props.isActive
-                  ? "text-foreground"
-                  : "text-muted-foreground group-hover:text-foreground",
-              )}
-            >
-              {initials()}
-            </span>
-          </Show>
-        </button>
-      </Tooltip>
-    </div>
-  );
+const islandStyle = {
+  width: "68px",
+  "flex-shrink": "0",
+  background: "var(--veil-island)",
+  "border-radius": "12px",
+  overflow: "hidden",
+  display: "flex",
+  "flex-direction": "column" as const,
 };
 
-// ─── Separator ───────────────────────────────────────
+const railStyle = {
+  display: "flex",
+  "flex-direction": "column" as const,
+  "align-items": "center",
+  padding: "14px 0",
+  gap: "8px",
+  height: "100%",
+};
 
-const RailSeparator: Component = () => (
-  <div class="flex justify-center px-3 py-0.5">
-    <div class="w-8 h-0.5 rounded-full bg-white/[0.06]" />
+const railButtonStyle = (active: boolean) => ({
+  width: "42px",
+  height: "42px",
+  "border-radius": active ? "14px" : "21px",
+  background: active ? "var(--veil-accent)" : "var(--veil-surface-raised)",
+  color: active ? "var(--veil-text-strong)" : "var(--veil-text-muted)",
+  border: "none",
+  cursor: "pointer",
+  display: "flex",
+  "align-items": "center",
+  "justify-content": "center",
+  "font-size": "12px",
+  "font-weight": "700",
+  transition: "border-radius 0.2s, background 0.2s",
+});
+
+export const ServerRail: Component<ServerRailProps> = (props) => (
+  <div
+    class="veil-server-rail-island"
+    inert={!props.visible}
+    style={{
+      ...islandStyle,
+      opacity: props.visible ? "1" : "0",
+      transform: props.visible ? "translateY(0) scale(1)" : "translateY(16px) scale(0.97)",
+      transition: "opacity 0.5s ease 0ms, transform 0.5s ease 0ms",
+    }}
+  >
+    <nav style={railStyle} aria-label="Servers">
+      <button
+        type="button"
+        style={railButtonStyle(props.activeServerId === "home")}
+        aria-label="Home — direct messages and groups"
+        aria-current={props.activeServerId === "home" ? "page" : undefined}
+        title="Home"
+        onClick={() => props.onSelectServer(null)}
+      >
+        <MessageCircle size={20} strokeWidth={1.8} aria-hidden="true" />
+      </button>
+
+      <div
+        role="separator"
+        aria-orientation="horizontal"
+        style={{ width: "28px", height: "2px", background: "var(--veil-border)", "border-radius": "1px" }}
+      />
+
+      <For each={props.servers}>
+        {(server) => {
+          const active = () => props.activeServerId === server.id;
+          return (
+            <button
+              type="button"
+              style={railButtonStyle(active())}
+              aria-label={server.name}
+              aria-current={active() ? "page" : undefined}
+              onClick={() => props.onSelectServer(server.id)}
+              onContextMenu={(event) => {
+                event.preventDefault();
+                props.onOpenServerSettings(server.id);
+              }}
+              title={server.name}
+            >
+              <span aria-hidden="true">{server.name.charAt(0).toUpperCase()}</span>
+            </button>
+          );
+        }}
+      </For>
+
+      <button
+        type="button"
+        style={{ ...railButtonStyle(false), color: "var(--veil-success)", "font-size": "20px", "font-weight": "600" }}
+        onClick={props.onCreateServer}
+        aria-label="Create a server"
+        title="Create a server"
+      >
+        <span aria-hidden="true">+</span>
+      </button>
+
+      <button
+        type="button"
+        style={{ ...railButtonStyle(false), color: "var(--veil-accent)", "font-size": "15px" }}
+        onClick={props.onJoinServer}
+        aria-label="Join a server with an invite"
+        title="Join a server with an invite"
+      >
+        <Globe size={18} strokeWidth={1.8} aria-hidden="true" />
+      </button>
+    </nav>
   </div>
 );
-
-// ─── Server Rail ─────────────────────────────────────
-
-export const ServerRail: Component = () => {
-  const [showCreate, setShowCreate] = createSignal(false);
-  const [showJoin, setShowJoin] = createSignal(false);
-
-  const isHome = () => appStore.activeServerId() === null;
-
-  return (
-    <div class="flex flex-col items-center h-full w-[72px] py-3 gap-2">
-      {/* Home button — DMs */}
-      <ServerIcon
-        name="Direct Messages"
-        isHome
-        isActive={isHome()}
-        onClick={() => appStore.selectServer(null)}
-      />
-
-      <RailSeparator />
-
-      {/* Server list — scrollable */}
-      <div class="flex-1 overflow-y-auto flex flex-col items-center gap-2 min-h-0 w-full scrollbar-hide">
-        <For each={appStore.servers()}>
-          {(server) => (
-            <ServerIcon
-              name={server.name}
-              iconUrl={server.iconUrl}
-              isActive={appStore.activeServerId() === server.id}
-              onClick={() => appStore.selectServer(server.id)}
-            />
-          )}
-        </For>
-      </div>
-
-      <RailSeparator />
-
-      {/* Add server */}
-      <Tooltip content="Create a server" side="right">
-        <button
-          class="flex items-center justify-center w-12 h-12 rounded-3xl bg-white/[0.06] hover:rounded-2xl hover:bg-online/20 transition-all duration-200 cursor-pointer group"
-          onClick={() => setShowCreate(true)}
-        >
-          <Plus class="h-5 w-5 text-online transition-colors duration-200" />
-        </button>
-      </Tooltip>
-
-      <Tooltip content="Join a server" side="right">
-        <button
-          class="flex items-center justify-center w-12 h-12 rounded-3xl bg-white/[0.06] hover:rounded-2xl hover:bg-primary/20 transition-all duration-200 cursor-pointer group"
-          onClick={() => setShowJoin(true)}
-        >
-          <Compass class="h-5 w-5 text-primary transition-colors duration-200" />
-        </button>
-      </Tooltip>
-
-      <CreateServerDialog open={showCreate()} onClose={() => setShowCreate(false)} />
-      <JoinServerDialog open={showJoin()} onClose={() => setShowJoin(false)} />
-    </div>
-  );
-};
-

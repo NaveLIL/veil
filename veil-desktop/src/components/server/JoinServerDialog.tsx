@@ -92,7 +92,7 @@ export const JoinServerDialog: Component<Props> = (props) => {
       onClose={close}
       title="Join a Server"
       icon={<Compass size={15} />}
-      accent="#7c6bf5"
+      accent="var(--veil-accent)"
       closeDisabled={busy()}
     >
       <div style={ds.fieldGroup}>
@@ -114,23 +114,23 @@ export const JoinServerDialog: Component<Props> = (props) => {
               display: "flex", "align-items": "center", gap: "12px",
               padding: "10px 12px",
               "border-radius": "10px",
-              background: "rgba(255,255,255,0.03)",
-              border: "1px solid rgba(255,255,255,0.05)",
+              background: "color-mix(in srgb, var(--veil-text-strong) 3%, transparent)",
+              border: "1px solid var(--veil-border)",
             }}>
               <div style={{
                 width: "38px", height: "38px", "border-radius": "12px",
-                background: "rgba(124,107,245,0.15)", color: "#7c6bf5",
+                background: "color-mix(in srgb, var(--veil-accent) 15%, transparent)", color: "var(--veil-accent)",
                 display: "flex", "align-items": "center", "justify-content": "center",
                 "font-size": "13px", "font-weight": "600", "flex-shrink": "0",
               }}>
                 {(p().server_name || "?").split(/\s+/).map((w) => w[0]).slice(0, 2).join("").toUpperCase()}
               </div>
               <div style={{ flex: "1", "min-width": "0" }}>
-                <div style={{ "font-size": "13px", "font-weight": "600", color: "#eee", "white-space": "nowrap", overflow: "hidden", "text-overflow": "ellipsis" }}>
+                <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", "white-space": "nowrap", overflow: "hidden", "text-overflow": "ellipsis" }}>
                   {p().server_name || "Unnamed server"}
                 </div>
                 <Show when={typeof p().member_count === "number"}>
-                  <div style={{ display: "flex", "align-items": "center", gap: "4px", "font-size": "11px", color: "#888", "margin-top": "2px" }}>
+                  <div style={{ display: "flex", "align-items": "center", gap: "4px", "font-size": "11px", color: "var(--veil-text-muted)", "margin-top": "2px" }}>
                     <Users size={11} /> {p().member_count} {p().member_count === 1 ? "member" : "members"}
                   </div>
                 </Show>
@@ -147,7 +147,7 @@ export const JoinServerDialog: Component<Props> = (props) => {
           when={preview()}
           fallback={
             <button
-              style={ds.primaryBtn(code().trim().length > 0 && !previewing(), "#7c6bf5")}
+              style={ds.primaryBtn(code().trim().length > 0 && !previewing(), "var(--veil-accent)")}
               onClick={handlePreview}
               disabled={previewing() || !code().trim()}
             >
@@ -158,7 +158,7 @@ export const JoinServerDialog: Component<Props> = (props) => {
           }
         >
           <button
-            style={ds.primaryBtn(!joining(), "#34d399")}
+            style={ds.primaryBtn(!joining(), "var(--veil-success)")}
             onClick={handleJoin}
             disabled={joining()}
           >

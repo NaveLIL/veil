@@ -1,32 +1,34 @@
 import { Component, For, Show, createSignal, type JSX } from "solid-js";
 import { appStore, type Friend, type FriendRequest } from "@/stores/app";
+import { Inbox, MessageCircle, UserMinus, Users } from "lucide-solid";
+import { toast } from "@/components/ui/toast";
 
 /* ─── Inline styles matching the app design system ─── */
 
 const S = {
-  header: { height: "56px", padding: "0 24px", display: "flex", "align-items": "center", gap: "12px", "border-bottom": "1px solid rgba(255,255,255,0.04)", "flex-shrink": "0" } as JSX.CSSProperties,
+  header: { height: "56px", padding: "0 24px", display: "flex", "align-items": "center", gap: "12px", "border-bottom": "1px solid var(--veil-contrast-04)", "flex-shrink": "0" } as JSX.CSSProperties,
   content: { flex: "1", "overflow-y": "auto", padding: "20px 24px", "min-height": "0" } as JSX.CSSProperties,
-  avatar: (size: number) => ({ width: `${size}px`, height: `${size}px`, "border-radius": "50%", background: "#36373D", display: "flex", "align-items": "center", "justify-content": "center", "font-size": `${size * 0.38}px`, "font-weight": "600", color: "#999", "flex-shrink": "0" } as JSX.CSSProperties),
-  tabBar: { display: "flex", gap: "2px", background: "#1E1F22", "border-radius": "8px", padding: "3px" } as JSX.CSSProperties,
-  tab: (active: boolean) => ({ flex: "1", padding: "5px 10px", "border-radius": "6px", border: "none", background: active ? "rgba(124,107,245,0.15)" : "transparent", color: active ? "#7c6bf5" : "#666", "font-size": "11px", "font-weight": "600", cursor: "pointer", transition: "background 0.15s, color 0.15s", "white-space": "nowrap" } as JSX.CSSProperties),
-  searchBox: { width: "100%", height: "34px", background: "#1E1F22", border: "none", "border-radius": "8px", padding: "0 14px", color: "#ccc", "font-size": "13px", outline: "none" } as JSX.CSSProperties,
-  actionBtn: { height: "34px", padding: "0 14px", "border-radius": "8px", background: "#7c6bf5", border: "none", color: "#fff", "font-size": "12px", "font-weight": "600", cursor: "pointer", "flex-shrink": "0" } as JSX.CSSProperties,
-  rowBtn: (active: boolean) => ({ display: "flex", "align-items": "center", gap: "12px", width: "100%", padding: "10px 14px", background: active ? "rgba(255,255,255,0.06)" : "transparent", border: "none", "border-radius": "10px", cursor: "pointer", "text-align": "left", "margin-bottom": "2px", transition: "background 0.15s", color: "#ddd" } as JSX.CSSProperties),
+  avatar: (size: number) => ({ width: `${size}px`, height: `${size}px`, "border-radius": "50%", background: "var(--veil-surface-raised)", display: "flex", "align-items": "center", "justify-content": "center", "font-size": `${size * 0.38}px`, "font-weight": "600", color: "var(--veil-text-muted)", "flex-shrink": "0" } as JSX.CSSProperties),
+  tabBar: { display: "flex", gap: "2px", background: "var(--veil-control)", "border-radius": "8px", padding: "3px" } as JSX.CSSProperties,
+  tab: (active: boolean) => ({ flex: "1", padding: "5px 10px", "border-radius": "6px", border: "none", background: active ? "rgba(var(--veil-accent-rgb),0.15)" : "transparent", color: active ? "var(--veil-accent)" : "var(--veil-text-faint)", "font-size": "11px", "font-weight": "600", cursor: "pointer", transition: "background 0.15s, color 0.15s", "white-space": "nowrap" } as JSX.CSSProperties),
+  searchBox: { width: "100%", height: "34px", background: "var(--veil-control)", border: "none", "border-radius": "8px", padding: "0 14px", color: "var(--veil-text)", "font-size": "13px", outline: "none" } as JSX.CSSProperties,
+  actionBtn: { height: "34px", padding: "0 14px", "border-radius": "8px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", "font-size": "12px", "font-weight": "600", cursor: "pointer", "flex-shrink": "0" } as JSX.CSSProperties,
+  rowBtn: (active: boolean) => ({ display: "flex", "align-items": "center", gap: "12px", width: "100%", padding: "10px 14px", background: active ? "var(--veil-contrast-06)" : "transparent", border: "none", "border-radius": "10px", cursor: "pointer", "text-align": "left", "margin-bottom": "2px", transition: "background 0.15s", color: "var(--veil-text)" } as JSX.CSSProperties),
   smallBtn: (bg: string, fg: string) => ({ width: "30px", height: "30px", "border-radius": "8px", background: bg, border: "none", color: fg, cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "14px", transition: "opacity 0.15s" } as JSX.CSSProperties),
-  badge: { "min-width": "18px", height: "18px", "border-radius": "9px", background: "rgba(124,107,245,0.2)", color: "#7c6bf5", "font-size": "10px", "font-weight": "700", display: "inline-flex", "align-items": "center", "justify-content": "center", padding: "0 5px", "margin-left": "6px" } as JSX.CSSProperties,
-  sectionLabel: { "font-size": "10px", "font-weight": "600", color: "#555", "text-transform": "uppercase", "letter-spacing": "0.1em", "margin-bottom": "8px" } as JSX.CSSProperties,
+  badge: { "min-width": "18px", height: "18px", "border-radius": "9px", background: "rgba(var(--veil-accent-rgb),0.2)", color: "var(--veil-accent)", "font-size": "10px", "font-weight": "700", display: "inline-flex", "align-items": "center", "justify-content": "center", padding: "0 5px", "margin-left": "6px" } as JSX.CSSProperties,
+  sectionLabel: { "font-size": "10px", "font-weight": "600", color: "var(--veil-text-faint)", "text-transform": "uppercase", "letter-spacing": "0.1em", "margin-bottom": "8px" } as JSX.CSSProperties,
   emptyWrap: { flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" } as JSX.CSSProperties,
-  emptyIcon: { width: "56px", height: "56px", "border-radius": "16px", background: "rgba(124,107,245,0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" } as JSX.CSSProperties,
+  emptyIcon: { width: "56px", height: "56px", "border-radius": "16px", background: "rgba(var(--veil-accent-rgb),0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" } as JSX.CSSProperties,
 };
 
 /* ─── Status helpers ─── */
 
 const statusColor = (s: number) => {
   switch (s) {
-    case 1: return "#22c55e";
-    case 3: return "#f59e0b";
-    case 4: return "#ef4444";
-    default: return "#555";
+    case 1: return "var(--veil-success)";
+    case 3: return "var(--veil-warning)";
+    case 4: return "var(--veil-danger)";
+    default: return "var(--veil-text-faint)";
   }
 };
 
@@ -90,7 +92,7 @@ const AddFriendSection: Component = () => {
 
   return (
     <div>
-      <div style={{ "font-size": "13px", color: "#666", "margin-bottom": "12px" }}>Find a friend by their username</div>
+      <div style={{ "font-size": "13px", color: "var(--veil-text-faint)", "margin-bottom": "12px" }}>Find a friend by their username</div>
       <div style={{ display: "flex", gap: "8px" }}>
         <input
           style={{ ...S.searchBox, flex: "1" }}
@@ -109,27 +111,27 @@ const AddFriendSection: Component = () => {
       </div>
 
       <Show when={status() === "found" && foundUser()}>
-        <div style={{ display: "flex", "align-items": "center", gap: "12px", "margin-top": "16px", padding: "12px 14px", background: "rgba(255,255,255,0.03)", "border-radius": "10px", border: "1px solid rgba(255,255,255,0.06)" }}>
+        <div style={{ display: "flex", "align-items": "center", gap: "12px", "margin-top": "16px", padding: "12px 14px", background: "var(--veil-contrast-03)", "border-radius": "10px", border: "1px solid var(--veil-contrast-06)" }}>
           <div style={S.avatar(36)}>{foundUser()!.username.charAt(0).toUpperCase()}</div>
           <div style={{ flex: "1", "min-width": "0" }}>
-            <div style={{ "font-size": "13px", "font-weight": "600", color: "#eee" }}>{foundUser()!.username}</div>
-            <div style={{ "font-size": "11px", color: "#555", "font-family": "monospace", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{foundUser()!.userId.slice(0, 16)}...</div>
+            <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)" }}>{foundUser()!.username}</div>
+            <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "font-family": "monospace", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{foundUser()!.userId.slice(0, 16)}...</div>
           </div>
           <button style={S.actionBtn} onClick={sendRequest}>Add</button>
         </div>
       </Show>
 
       <Show when={status() === "sent"}>
-        <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-top": "16px", padding: "12px 14px", background: "rgba(34,197,94,0.08)", "border-radius": "10px", border: "1px solid rgba(34,197,94,0.15)" }}>
-          <span style={{ color: "#22c55e", "font-size": "14px" }}>{"\u2713"}</span>
-          <span style={{ "font-size": "13px", color: "#22c55e" }}>Friend request sent!</span>
+        <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-top": "16px", padding: "12px 14px", background: "var(--veil-success-surface)", "border-radius": "10px", border: "1px solid var(--veil-success-border)" }}>
+          <span style={{ color: "var(--veil-success)", "font-size": "14px" }}>{"\u2713"}</span>
+          <span style={{ "font-size": "13px", color: "var(--veil-success)" }}>Friend request sent!</span>
         </div>
       </Show>
 
       <Show when={status() === "error"}>
-        <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-top": "16px", padding: "12px 14px", background: "rgba(239,68,68,0.08)", "border-radius": "10px", border: "1px solid rgba(239,68,68,0.15)" }}>
-          <span style={{ color: "#ef4444", "font-size": "14px" }}>{"\u2717"}</span>
-          <span style={{ "font-size": "13px", color: "#ef4444" }}>{errorMsg()}</span>
+        <div style={{ display: "flex", "align-items": "center", gap: "8px", "margin-top": "16px", padding: "12px 14px", background: "var(--veil-danger-surface)", "border-radius": "10px", border: "1px solid var(--veil-danger-border)" }}>
+          <span style={{ color: "var(--veil-danger)", "font-size": "14px" }}>{"\u2717"}</span>
+          <span style={{ "font-size": "13px", color: "var(--veil-danger)" }}>{errorMsg()}</span>
         </div>
       </Show>
     </div>
@@ -168,23 +170,23 @@ const RequestItem: Component<{ request: FriendRequest }> = (props) => {
       <div style={S.avatar(36)}>{props.request.fromUsername.charAt(0).toUpperCase()}</div>
       <div style={{ flex: "1", "min-width": "0" }}>
         <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-          <span style={{ "font-size": "13px", "font-weight": "600", color: "#eee", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.request.fromUsername}</span>
+          <span style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.request.fromUsername}</span>
           <Show when={props.request.outgoing}>
-            <span style={{ "font-size": "10px", color: "#666", background: "rgba(255,255,255,0.04)", padding: "2px 6px", "border-radius": "4px" }}>Outgoing</span>
+            <span style={{ "font-size": "10px", color: "var(--veil-text-faint)", background: "var(--veil-contrast-04)", padding: "2px 6px", "border-radius": "4px" }}>Outgoing</span>
           </Show>
         </div>
-        <span style={{ "font-size": "11px", color: "#555" }}>{timeAgo()}</span>
+        <span style={{ "font-size": "11px", color: "var(--veil-text-faint)" }}>{timeAgo()}</span>
       </div>
       <Show when={!props.request.outgoing}>
         <div style={{ display: "flex", gap: "6px" }}>
           <button
-            style={S.smallBtn("rgba(34,197,94,0.12)", "#22c55e")}
+            style={S.smallBtn("var(--veil-success-surface)", "var(--veil-success)")}
             onClick={accept}
             disabled={responding()}
             title="Accept"
           >{"\u2713"}</button>
           <button
-            style={S.smallBtn("rgba(239,68,68,0.12)", "#ef4444")}
+            style={S.smallBtn("var(--veil-danger-surface)", "var(--veil-danger)")}
             onClick={reject}
             disabled={responding()}
             title="Decline"
@@ -217,24 +219,26 @@ const FriendItem: Component<{
           position: "absolute", bottom: "-1px", right: "-1px",
           width: "12px", height: "12px", "border-radius": "50%",
           background: statusColor(props.friend.status),
-          border: "2.5px solid #2B2D31",
+          border: "2.5px solid var(--veil-island)",
         }} />
       </div>
       <div style={{ flex: "1", "min-width": "0" }}>
-        <div style={{ "font-size": "13px", "font-weight": "600", color: "#eee", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.friend.username}</div>
+        <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.friend.username}</div>
         <div style={{ "font-size": "11px", color: statusColor(props.friend.status) }}>{statusLabel(props.friend.status)}</div>
       </div>
       <div style={{ display: "flex", gap: "4px", opacity: hovered() ? 1 : 0, transition: "opacity 0.15s" }}>
         <button
-          style={S.smallBtn("rgba(255,255,255,0.06)", "#999")}
+          style={S.smallBtn("var(--veil-contrast-06)", "var(--veil-text-muted)")}
           onClick={() => props.onMessage(props.friend)}
           title="Message"
-        >{"\uD83D\uDCAC"}</button>
+          aria-label={`Message ${props.friend.username}`}
+        ><MessageCircle size={14} strokeWidth={2} /></button>
         <button
-          style={S.smallBtn("rgba(239,68,68,0.1)", "#ef4444")}
+          style={S.smallBtn("var(--veil-danger-surface)", "var(--veil-danger)")}
           onClick={() => props.onRemove(props.friend)}
           title="Remove"
-        >{"\u2717"}</button>
+          aria-label={`Remove ${props.friend.username}`}
+        ><UserMinus size={14} strokeWidth={2} /></button>
       </div>
     </div>
   );
@@ -258,8 +262,12 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
   };
 
   const handleMessage = async (friend: Friend) => {
-    await appStore.createDm(friend.userId, friend.username);
-    props.onNavigate?.();
+    try {
+      await appStore.createDm(friend.userId, friend.username);
+      props.onNavigate?.();
+    } catch (error) {
+      toast.error("Conversation not created", String(error).replace(/^Error:\s*/, ""));
+    }
   };
 
   const handleRemove = async (friend: Friend) => {
@@ -278,7 +286,7 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
 
       {/* ── Header ── */}
       <div style={S.header}>
-        <span style={{ "font-size": "15px", "font-weight": "700", color: "#eee" }}>Friends</span>
+        <span style={{ "font-size": "15px", "font-weight": "700", color: "var(--veil-text-strong)" }}>Friends</span>
         <div style={{ flex: "1" }} />
         <div style={S.tabBar}>
           <For each={tabs}>
@@ -309,9 +317,9 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
             fallback={
               <div style={S.emptyWrap}>
                 <div style={S.emptyIcon}>
-                  <span style={{ "font-size": "24px", filter: "grayscale(0.3)" }}>{"\uD83D\uDC4B"}</span>
+                  <Inbox size={24} strokeWidth={1.6} color="var(--veil-accent)" />
                 </div>
-                <div style={{ "font-size": "14px", "font-weight": "500", color: "#777" }}>No pending requests</div>
+                <div style={{ "font-size": "14px", "font-weight": "500", color: "var(--veil-text-subtle)" }}>No pending requests</div>
               </div>
             }
           >
@@ -331,14 +339,14 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
             fallback={
               <div style={S.emptyWrap}>
                 <div style={S.emptyIcon}>
-                  <span style={{ "font-size": "24px", filter: "grayscale(0.3)" }}>{"\uD83D\uDC65"}</span>
+                  <Users size={24} strokeWidth={1.6} color="var(--veil-accent)" />
                 </div>
-                <div style={{ "font-size": "14px", "font-weight": "500", color: "#777", "margin-bottom": "6px" }}>
+                <div style={{ "font-size": "14px", "font-weight": "500", color: "var(--veil-text-subtle)", "margin-bottom": "6px" }}>
                   {activeTab() === "online" ? "No friends online" : "No friends yet"}
                 </div>
                 <Show when={activeTab() === "all"}>
                   <button
-                    style={{ background: "none", border: "none", color: "#7c6bf5", "font-size": "12px", cursor: "pointer", padding: "4px 8px" }}
+                    style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer", padding: "4px 8px" }}
                     onClick={() => setActiveTab("add")}
                   >
                     Add your first friend {"\u2192"}
