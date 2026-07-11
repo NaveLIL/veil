@@ -1,6 +1,6 @@
 # ADR-0001: Authenticated Sender Keys v5 for server channels
 
-- Status: Accepted baseline; implementation gaps are listed below
+- Status: Accepted and implemented Phase 4C baseline; residual risks are listed below
 - Date: 2026-07-11
 - Scope: text channels and group conversations
 - Owners: Veil client, desktop, crypto, and server maintainers
@@ -19,25 +19,27 @@ channel share key lifecycle, history, and blast radius even when its permissions
 differ.
 
 The current group/channel implementation uses one outgoing Sender Key state per
-sender and conversation. A raw symmetric v4 message proves possession of the
-chain key, but every recipient knows that key and could therefore impersonate the
-sender. Veil wraps the v4 ciphertext in a v5 envelope signed by the sender's
-pinned Ed25519 identity. Sender Key Distribution Messages (SKDMs) use the signed,
-sealed v3 format.
+sender device and conversation. A raw symmetric v4 message proves possession of
+the chain key, but every recipient knows that key and could therefore impersonate
+the sender. Veil wraps the v4 ciphertext in a v5 envelope signed by the sender's
+pinned device Ed25519 identity, whose versioned binding is account-authorized.
+Sender Key Distribution Messages (SKDMs) use the signed, sealed v3 format.
 
 The database also contains an older, unused `channel_epochs` design. No runtime
 code reads or writes `channel_epochs`, `channel_key_envelopes`, or
 `messages.channel_epoch`. That design conflicts with the active per-sender model
 and must not become an accidental second channel crypto protocol.
 
-The current roster is user-oriented. The gateway expands a target user identity
-to all registered device rows and stores the same user-sealed SKDM for each row.
-That is useful durable fan-out, but it is not cryptographic per-device delivery:
-devices do not yet have independently bound E2EE identities and capabilities.
+The Phase 4C roster is cryptographically per-device. Each installation has
+independent X25519 and Ed25519 keys authorized by an account signature. The
+gateway resolves an exact, versioned conversation roster and retains a distinct
+sealed SKDM for each target device. Sender, target, binding versions, roster
+version/commitment, and the immutable envelope commitment travel as one route
+tuple.
 
-This ADR defines the accepted baseline, names current conformance gaps, and sets
-the migration target. Acceptance of the ADR does **not** mean every target item
-is already implemented.
+This ADR defines the implemented Sender Keys v5 baseline and the remaining
+trust, migration, and resource-policy boundaries. Acceptance does **not** claim
+identity transparency or activate future crypto profiles such as MLS.
 
 ## Threat and trust boundary
 
@@ -49,9 +51,13 @@ The service remains authoritative for account authentication, current
 membership, roles, channel permissions, routing, and availability. Consequently,
 E2EE does not hide metadata and does not by itself prevent a malicious service
 from omitting members, presenting inconsistent rosters, withholding ciphertext,
-or causing denial of service. Continuity pinning detects unexpected identity
-replacement after a binding has been observed; a future per-device design must
-add account-signed device bindings and rollback-resistant roster versions.
+or causing denial of service. Continuity pinning detects unexpected account or
+device-key replacement, binding rollback, same-version equivocation, and
+revoked-device resurrection after a binding has been observed. A first
+historical observation for a former sender is still service-mediated TOFU: the
+account-signed chain is pinned atomically, but without transparency or
+out-of-band verification the service can misattribute a previously unseen
+identity. The UI MUST NOT label that state as verified.
 
 A recipient that already learned plaintext or a generation key cannot be made to
 forget it. Rotation limits future access; it is not retroactive erasure.
@@ -103,9 +109,17 @@ For current Sender Key distribution:
 
 - the wire envelope MUST be signed and sealed SKDM v3;
 - public v3 metadata is an untrusted routing hint only;
-- the recipient MUST locate an already authenticated/pinned sender binding, then
-  verify the signature and AEAD and cross-check conversation, sender identity,
-  signing identity, recipient identity, and generation before installation;
+- live traffic MUST resolve the sender and target against the exact current,
+  pinned device roster before verifying the signature and AEAD;
+- retained traffic MAY carry the exact historical account-authorized sender
+  binding that authenticated the route when it was committed. A first
+  historical observation MUST be pinned atomically as unverified
+  service-mediated TOFU; any conflict with an existing account/device pin MUST
+  fail closed;
+- after route proof is resolved, the recipient MUST cross-check conversation,
+  sender account/device identities and binding version, signing identity,
+  recipient account/device identities and binding version, roster version and
+  commitment, generation, and immutable envelope commitment before installation;
 - a generation older than installed state MUST be rejected; the same generation
   MAY be accepted idempotently only when it represents the same authenticated
   state;
@@ -137,22 +151,23 @@ wire header or a failed decryption attempt.
 #### Current state
 
 The server derives a user roster from conversation membership plus current
-server membership, role permissions, and channel overwrites. The client validates
-and pins each user's X25519/Ed25519 binding. A sender distributes once per
-non-self user identity; the gateway atomically stores that envelope for every
-currently registered target device row before acknowledging it.
-
-This is the accepted transitional behavior, not the final multi-device model.
+server membership, role permissions, and channel overwrites, then expands it to
+active account-authorized device bindings. The client verifies and pins the
+canonical roster commitment, monotonic roster version, account keys, independent
+device keys, capability bits, binding status/version, and account signature. A
+sender seals once per exact non-self target device. The gateway commits that
+immutable route before its transport ACK and retained replay preserves the
+original account-authorized sender proof even after later roster churn.
 
 #### Per-device target
 
-The cryptographic roster MUST become a versioned expansion of each authorized
-user into active devices. Every entry MUST contain at least:
+The cryptographic roster is a versioned expansion of each authorized user into
+active devices. Every entry MUST contain at least:
 
 - `user_id` and stable `device_id`;
 - an independent device encryption identity;
 - an independent device signing identity;
-- the device's current pre-key/session binding;
+- a monotonic device-binding version and applicable capability bits;
 - supported crypto profiles and versions;
 - active, revoked, or excluded status;
 - an account-authorized binding that clients can verify against the pinned user
@@ -188,15 +203,22 @@ channel indefinitely. Therefore:
   exact snapshot are committed durably and monotonically;
 - such an ACK means **stored by the transport**, not installed or read by the
   recipient;
-- device receipt/install ACKs SHOULD be added for queue garbage collection,
-  diagnostics, and honest delivery status, but are not the online sending gate;
+- device receipt/install ACKs permit exact retained-row garbage collection and
+  diagnostics, but are not the online sending gate;
 - the UI MUST NOT call a transport ACK "delivered to device" or "read".
 
-Today the client tracks transport ACKs by request sequence and the gateway ACKs
-after atomic fan-out to current device rows. This approximates the durable gate
-at user granularity. The target protocol must bind ACKs explicitly to generation,
-roster version, sender device, and target devices rather than relying only on a
-connection-local sequence number.
+The client associates each request sequence with an immutable
+`(conversation, generation, roster, target-device, envelope-commitment)` tuple
+and accepts an ACK only when its explicit metadata matches. The gateway ACKs an
+outbound SKDM only after the exact per-device row is durable. A recipient queues
+its install receipt only after SQLCipher commits the generation, historical
+route proof, account signing pin, and device-binding anchor; the gateway prunes
+only the matching retained row.
+
+An installation receipt attests only that this exact SKDM is durably installed.
+It does not attest that every later REST history row exists or decrypts, and it
+MUST NOT be delayed on that unrelated condition: doing so would turn a missing
+history row into a retained-key storage denial of service.
 
 ### 6. Rotation
 
@@ -224,6 +246,12 @@ message and membership/device changes are stronger lifecycle boundaries. A
 deployment MAY add a time limit, but it must use the same monotonic generation
 and complete-distribution gate.
 
+A locally prepared roster-triggered generation is a pending current-head
+transition, not permission to send. If later history sync quarantines that
+conversation, the client invalidates its live roster proof and suppresses
+fan-out, but retains the immutable pending generation. Reconnect MUST reuse that
+exact generation and retry tuple rather than create another rotation.
+
 ### 7. History and offline devices
 
 The default channel history policy is **future-only key admission**:
@@ -247,6 +275,15 @@ generation N merely because N+1 arrived before the device acknowledged N. A
 device receipt ACK may permit collection of older retained envelopes. A bounded
 retention policy is allowed, but expiry MUST be explicit and surface history as
 unavailable; it MUST NOT silently present ciphertext as corrupt.
+
+The implemented Phase 4C bound is 128 unacknowledged generations per exact
+server stream and 128 retained generations per client
+`(conversation, sender-device)`. The 129th admission fails before mutating
+durable or in-memory key state and before queuing a receipt; it is not resolved
+by silently evicting an older generation. Retained restore is all-or-nothing
+within one conversation and isolated between conversations, so a malformed,
+expired, oversized, or conflicting backlog cannot partially install that
+conversation or prevent healthy conversations from restoring.
 
 Removed or no-longer-authorized devices MUST NOT receive queued SKDMs. Deleting a
 queued envelope does not erase a key already installed on that device.
@@ -304,87 +341,91 @@ decision.
 | --- | --- |
 | Text channel has a unique backing conversation | [`servers.go`](../../veil-server/internal/db/servers.go) creates `conv_type = 2`, copies members, and assigns `channels.conversation_id`; [`001_initial.sql`](../../veil-server/migrations/001_initial.sql) makes it unique. |
 | Channel access is dynamic, not membership-row-only | [`conversation_acl.go`](../../veil-server/internal/db/conversation_acl.go) combines conversation membership with current server membership, roles, and channel permissions. |
+| Channel overwrite resolution is deterministic and fail-closed | [`channel_overwrites.go`](../../veil-server/internal/db/channel_overwrites.go) applies `@everyone`, aggregate role, then member tiers; [`016_channel_permission_invariants.sql`](../../veil-server/migrations/016_channel_permission_invariants.sql), [`channel_overwrites_test.go`](../../veil-server/internal/db/channel_overwrites_test.go), and [`channel_acl_parity_integration_test.go`](../../veil-server/internal/integration/channel_acl_parity_integration_test.go) lock database/runtime parity and concurrent mutation behavior. |
 | Server stores/routes opaque ciphertext | [`chat.go`](../../veil-server/internal/chat/chat.go) authorizes and fans out messages without decrypting them. |
 | v5 sender authentication and context binding | [`sender_key.rs`](../../veil-crypto/src/sender_key.rs) signs the exact group, sender identity, and inner v4 bytes, and verifies before transactional ratchet advancement. |
 | Signed/sealed SKDM v3 | [`sender_key.rs`](../../veil-crypto/src/sender_key.rs) binds sender, signing key, recipient, group, generation, ephemeral key, signature, and AEAD context. |
 | Conversation type is selected before wire parsing | [`api.rs`](../../veil-client/src/api.rs) checks that the E2E header agrees with the pinned conversation mode and rejects unknown headers/plaintext. |
-| Membership changes rotate and block | [`api.rs`](../../veil-client/src/api.rs) rotates on authoritative live-session roster replacement, conservatively rotates a restored outgoing generation when cold-start roster continuity is unavailable, and tracks pending distribution; [`lib.rs`](../../veil-desktop/src-tauri/src/lib.rs) refreshes/invalidates rosters on server events. The desktop offline-sync path may currently add a second forced rotation, so exact-once restore rotation is not claimed. |
+| Account-authorized per-device identities and immutable history | [`013_device_bindings.sql`](../../veil-server/migrations/013_device_bindings.sql) introduces signed, versioned device bindings; [`device_bindings.go`](../../veil-server/internal/db/device_bindings.go) and [`device_identity.rs`](../../veil-client/src/device_identity.rs) build and verify them. [`019_cryptographic_identity_history.sql`](../../veil-server/migrations/019_cryptographic_identity_history.sql) makes account keys, device route keys, device crypto keys, and historical binding versions immutable. |
+| Monotonic, canonical per-conversation device roster | [`017_conversation_roster_linearization.sql`](../../veil-server/migrations/017_conversation_roster_linearization.sql), [`device_roster.go`](../../veil-server/internal/db/device_roster.go), and [`runtime_roster.go`](../../veil-server/internal/gateway/runtime_roster.go) linearize revisions and commitments; [`api.rs`](../../veil-client/src/api.rs) verifies canonical entries, account signatures, rollback, same-version equivocation, and current authorization. |
+| Exact per-device route and historical proof | [`chat.proto`](../../veil-proto/veil/v1/chat.proto) fields 4–18 bind the target device, both binding versions, roster version/commitment, immutable envelope commitment, and historical sender proof. [`sender_key_device_routing.go`](../../veil-server/internal/gateway/sender_key_device_routing.go), [`connection.rs`](../../veil-client/src/connection.rs), and [`api.rs`](../../veil-client/src/api.rs) enforce the tuple on the server, wire barrier, and client. |
+| Membership or device-roster changes rotate and block | [`api.rs`](../../veil-client/src/api.rs) rotates on authoritative roster replacement, including an empty target set, and keeps sending blocked until the exact durable ACK set completes. The `changed_roster_rotates_even_when_old_generation_is_still_prepared_and_zero_targets_complete` regression covers stale prepared state and the zero-target transition. |
+| Rotation persistence is atomic | [`db.rs`](../../veil-store/src/db.rs) commits the new outgoing state and invalidates old retry envelopes in one SQLCipher transaction. The client prepares state on a clone and publishes it in memory only after commit; injected-failure tests prove rollback preserves both the old live generation and immutable cache. `cold_restore_conservatively_rotates_once_when_roster_continuity_is_unknown` and `cold_restore_early_hydration_cannot_cause_a_second_rotation` prove pending `N+1` is reused rather than replaced by `N+2`. Generation exhaustion fails without wrap/reuse. |
 | Iteration-limit rotation uses the same send gate | [`api.rs`](../../veil-client/src/api.rs) rotates into pending state and returns without ciphertext; the boundary regression test proves retries reuse that generation until distribution completes. |
-| Durable gateway fan-out | [`hub.go`](../../veil-server/internal/gateway/hub.go) validates routing metadata and current ACL, resolves target devices, stores before ACK, and then performs best-effort live fan-out. |
-| Monotonic retained distribution | [`queries.go`](../../veil-server/internal/db/queries.go) atomically upserts distributions and rejects stale generations; [`009_security_constraints.sql`](../../veil-server/migrations/009_security_constraints.sql) constrains the generation range and foreign keys. |
-| Retained SKDM precedes offline ciphertext sync | [`lib.rs`](../../veil-desktop/src-tauri/src/lib.rs) installs retained control state after authenticated directories are pinned and before backlog decryption. |
-| DM rejects Sender Keys | [`sender_key_integration_test.go`](../../veil-server/internal/gateway/sender_key_integration_test.go) covers DM rejection, durable device fan-out, replay, malformed metadata, and stale generation behavior. |
+| Immutable multi-generation retained distribution | [`014_sender_key_device_routing.sql`](../../veil-server/migrations/014_sender_key_device_routing.sql) and [`015_sender_key_retention_policy.sql`](../../veil-server/migrations/015_sender_key_retention_policy.sql) preserve an exact row per generation and make expiry fail closed rather than destructive. [`queries.go`](../../veil-server/internal/db/queries.go) serializes admission, rejects stale/equivocating retries, and never replaces an accepted commitment. [`sender_key_integration_test.go`](../../veil-server/internal/gateway/sender_key_integration_test.go) covers two-generation restore, retry immutability, expiry, receipts, and the bound. |
+| Exact transport ACK and installation receipt | [`sender_key_device_routing.go`](../../veil-server/internal/gateway/sender_key_device_routing.go) emits an ACK only after the exact row commits; [`sender_key_receipt.go`](../../veil-server/internal/gateway/sender_key_receipt.go) collects only the receipt's exact route. [`api.rs`](../../veil-client/src/api.rs) matches ACK metadata to its immutable request cache and queues a receipt only after SQLCipher commits the key, route, proof, and pins. |
+| Retained restore is conversation-atomic and conversation-isolated | [`queries.go`](../../veil-server/internal/db/queries.go) reports bounded backlog metadata per conversation and [`sender_key_integration_test.go`](../../veil-server/internal/gateway/sender_key_integration_test.go) proves one unavailable conversation does not suppress a healthy one. Client savepoints and runtime snapshots in [`api.rs`](../../veil-client/src/api.rs) are covered by `retained_conversation_batch_rolls_back_an_earlier_success_before_diagnosing` and `retained_failure_is_isolated_to_its_conversation`. |
+| Multi-generation state survives restart and decrypts both eras | [`db.rs`](../../veil-store/src/db.rs) persists incoming keys by conversation, sender device, and generation; [`sender_key.rs`](../../veil-crypto/src/sender_key.rs) selects the authenticated generation. The client regression `exact_device_skdm_restores_and_decrypts_two_generations_after_restart` exercises a file-backed SQLCipher restart. |
+| Bounded history fails closed without cross-conversation mutation | The server enforces 128 generations per exact stream plus target-wide row/byte bounds in [`queries.go`](../../veil-server/internal/db/queries.go); `TestSenderKeyRetentionDeadlineAndBound`, `TestSenderKeyTargetWideBacklogBound`, and its concurrent-admission variant exercise them. Client tests `live_sender_key_generation_cap_blocks_only_the_affected_conversation` and `hydration_rejects_oversized_generation_history_without_partial_heap_state` in [`api.rs`](../../veil-client/src/api.rs), crypto test `retained_generation_cap_rejects_129th_without_mutating_other_conversations` in [`sender_key.rs`](../../veil-crypto/src/sender_key.rs), and store test `incoming_sender_key_generation_retention_cap_is_fail_closed_and_scoped` in [`db.rs`](../../veil-store/src/db.rs) prove rejection happens before partial durable/heap state or a receipt and another conversation remains usable. |
+| Retained TOFU is explicit and transactional | [`api.rs`](../../veil-client/src/api.rs) labels first-seen historical identity as unverified service-mediated TOFU and atomically stores the account/device pins with the key and route. `retained_first_seen_tofu_conflict_rolls_back_key_route_and_receipt` proves a conflicting pin leaves none of those artifacts behind. |
+| AuthResult is a hard live/retained barrier | [`connection.rs`](../../veil-client/src/connection.rs) sends only pre-AuthResult retained rows through historical processing; post-barrier events stay in live FIFO and require the exact current roster. `first_post_barrier_skdm_stays_live_fifo_and_requires_exact_current_roster` locks in the race boundary. |
+| Message rows preserve their security era | [`018_message_security_context.sql`](../../veil-server/migrations/018_message_security_context.sql) adds fail-closed profile, era, roster, and sender-device context. [`migration_upgrade_integration_test.go`](../../veil-server/internal/integration/migration_upgrade_integration_test.go) verifies upgrades and structural constraints; [`security_integration_test.go`](../../veil-server/internal/integration/security_integration_test.go) exercises authorization and message-context boundaries. |
+| DM rejects Sender Keys | [`sender_key_integration_test.go`](../../veil-server/internal/gateway/sender_key_integration_test.go) covers DM rejection alongside exact device routing, replay, malformed metadata, retained restore, and receipts. |
 | MLS is not the active runtime baseline | [`008_mls.sql`](../../veil-server/migrations/008_mls.sql) and the experimental MLS crates provide groundwork; the current support boundary is also documented in [`veil-server/README.md`](../../veil-server/README.md). |
 | Channel epochs are unused | [`005_servers.sql`](../../veil-server/migrations/005_servers.sql) is the only current source reference for those objects. |
 
-## Known conformance gaps found during this audit
+## Residual risks and future work
 
-These are implementation work, not alternative decisions. Item 1 was resolved
-while adopting this ADR; the remaining items are still open:
+The obsolete per-device fan-out, multi-generation retention, immutable retry,
+exact receipt, and duplicate-rotation gaps are closed by the Phase 4C baseline.
+The following boundaries remain deliberately open:
 
-1. **Iteration-limit rotation gate — resolved 2026-07-11.**
-   `VeilClient::encrypt_outgoing` now rotates through the same pending-state
-   transition as membership changes and returns without ciphertext. A regression
-   test advances exactly 2,000 messages, proves that generation N+1 is created
-   only once, and keeps sending blocked until distribution completes.
-2. **Fan-out is not cryptographically per-device.** Device rows receive copies of
-   an envelope sealed to the shared user identity. Independent device identities,
-   account-authorized bindings, capabilities, and per-device SKDMs are missing.
-3. **Retained storage keeps only the latest generation per
-   `(conversation, owner_device, target_device)`.** A device offline across
-   multiple rotations can lose an intermediate SKDM before reconnect and then be
-   unable to decrypt messages from that interval. Retention must include
-   generation until receipt/expiry.
-4. **Equal-generation retries are not provably immutable.** The server currently
-   permits an equal generation to replace its sealed envelope, while an already
-   initialized client treats that generation as idempotent without comparing the
-   chain key. A buggy or malicious sender can therefore create different state
-   for devices under one generation. Retention must make the first accepted
-   generation immutable or bind a signed key commitment that every retry and
-   recipient verifies; correction requires a higher generation.
-5. **There is no device receipt ACK.** Current rows remain available for
-   idempotent replay and a server ACK proves durable transport only. The target
-   needs authenticated device installation ACKs and explicit garbage collection.
-6. **Crypto-profile capability/cutover is not wired end to end.** The database
-   has `crypto_mode` and MLS scaffolding, but the desktop Sender Key path does not
-   yet consume a versioned, authenticated profile with migration epochs.
-7. **Directory consistency is service-dependent.** Current pinning detects later
-   key replacement, but account-signed device bindings, monotonic roster proofs,
-   and equivocation/transparency defenses remain target work. The current
-   user-roster snapshot/version is not persisted locally; until it is, cold
-   restore rotates the recovered outgoing generation and blocks on
-   redistribution. The desktop offline-sync orchestration can then call a
-   second forced rotation, so an end-to-end regression must prove and reduce
-   this to one intended transition. The current behavior closes the offline
-   removal confidentiality gap conservatively, but can impose two rotations
-   after a native restart and is not a substitute for rollback-resistant roster
-   continuity.
+1. **Service-mediated TOFU has no transparency proof.** Account signatures,
+   immutable binding history, monotonic roster versions, and continuity pins
+   detect rollback or replacement after observation, but a malicious service can
+   still misattribute a previously unseen account/device chain. Phase 4D needs
+   out-of-band verification and, separately, an auditable transparency or
+   consistency design. Until then, first-seen historical identities remain
+   explicitly unverified.
+2. **Future crypto-profile migration is not implemented.** The active baseline
+   is only `sender_key_v5 + sealed_skdm_v3`. MLS or any successor still requires
+   the two-phase, authenticated migration epoch described above, complete device
+   capability agreement, historical-era decoding, and no decrypt-failure
+   fallback.
+3. **Resource policy is bounded but not operationally complete.** Phase 4C caps
+   each exact stream/client sender history at 128 generations and the server also
+   caps each target device's aggregate retained rows and bytes. It does not yet
+   define deployment-wide/account-wide storage budgets, quota observability, or
+   a complete user/operator remediation flow when expiry or a bound makes history
+   unavailable. Remediation MUST be explicit and MUST NOT silently evict keys or
+   acknowledge an SKDM that was not durably installed.
+4. **Device and account-key recovery needs a versioned ceremony and UI.** The
+   baseline intentionally makes current account keys, device route keys, and
+   historical bindings immutable. Lost-device replacement, account-key rotation,
+   durable local binding-head repair, revocation/exclusion diagnostics, and
+   history-unavailable UX need an explicit forward-only protocol; in-place key
+   rewriting remains forbidden.
+5. **Deprecated channel-epoch objects still require an operator-safe cleanup.**
+   They remain unused by production Sender Keys, but may be removed only after
+   the audit and reversible migration preconditions in section 9 are satisfied.
 
-Until retained multi-generation offline delivery (gap 3) is fixed and tested,
-offline behavior must not be described as fully conformant to this ADR.
+## Completed Phase 4C sequence and next migrations
 
-## Migration sequence
-
-1. Freeze the deprecated channel-epoch path and add conformance tests around
-   existing v5/v3 parsing, ACL, rotation, and offline ordering.
-2. **Completed:** fix iteration-limit rotation so generation creation always
-   enters the exact roster distribution gate before any application ciphertext
-   is produced.
-3. Change retained SKDM storage to preserve every required unacknowledged,
-   immutable generation; bind retries to the same state (or retain first-write),
-   then add authenticated device receipt ACK and bounded, observable GC.
-4. Introduce account-authorized device identities, prekeys, capabilities, and a
-   rollback-resistant per-conversation device roster version.
-5. Dual-read transitional user/device records, but create new SKDMs only in the
-   explicit profile selected for that conversation. Never infer compatibility
-   from decryption failure.
-6. Move distribution and ACK tracking to per-device tuples. Rotate once when the
-   migrated roster becomes authoritative and block until its durable ACK set is
-   complete.
-7. Add the two-phase profile migration state machine before enabling MLS or any
-   successor profile in desktop channels.
-8. Audit deployed databases, then remove deprecated channel-epoch objects in a
-   dedicated reversible migration if and only if they contain no required data.
+1. **Completed:** freeze the deprecated channel-epoch path and add conformance
+   coverage for v5/v3 parsing, ACL, rotation, migration, and offline ordering.
+2. **Completed:** route iteration-limit and roster-change rotations through one
+   pending generation and the exact distribution gate before ciphertext.
+3. **Completed:** retain immutable generations independently, add exact durable
+   route commitments and authenticated installation receipts, and enforce the
+   fail-closed 128-generation bound without silent eviction.
+4. **Completed:** introduce account-authorized independent device identities,
+   capability/status bindings, append-only binding history, and a monotonic,
+   canonical per-conversation device roster.
+5. **Completed:** make exact per-device v5/v3 routing the only live channel path;
+   retained restore carries its historical proof and neither live nor retained
+   failure falls back to account-routed, raw v4, DM, or plaintext handling.
+6. **Completed:** bind immutable retry, transport ACK, install receipt, rotation,
+   and restored state to the exact device/generation/roster/commitment tuple;
+   prove conversation-atomic restore and multi-generation restart recovery.
+7. **Next profile work:** implement the two-phase crypto-profile migration state
+   machine before enabling MLS or any successor in desktop channels.
+8. **Next identity work (Phase 4D):** design out-of-band verification and a
+   transparency/consistency model without overstating TOFU as verification.
+9. **Next operations work:** specify aggregate storage budgets and explicit
+   device/history remediation for expired, over-bound, lost, or revoked state.
+10. **Later cleanup:** audit deployed databases, then remove deprecated
+    channel-epoch objects in a dedicated reversible migration only when no
+    required data exists.
 
 ## Consequences
 

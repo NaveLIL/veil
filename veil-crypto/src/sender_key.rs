@@ -32,6 +32,7 @@
 use crate::aead;
 use crate::kdf;
 use crate::keys::IdentityKeyPair;
+use ed25519_dalek::{Signer, SigningKey};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -44,6 +45,10 @@ const MAX_CHAIN_ITERATIONS: u32 = 2000;
 const MAX_SKIPPED_KEYS_PER_SENDER: usize = MAX_CHAIN_ITERATIONS as usize;
 /// Process-wide bound across all group senders.
 const MAX_TOTAL_SKIPPED_SENDER_KEYS: usize = 10_000;
+/// Historical generations are never silently evicted; exceeding this bound
+/// makes only the affected conversation/sender unavailable until retention is
+/// explicitly resolved by a future protocol policy.
+pub const MAX_RETAINED_GENERATIONS_PER_SENDER: usize = 128;
 const PERSISTED_INCOMING_SENDER_KEY_VERSION: u8 = 0x01;
 const ED25519_SIGNATURE_SIZE: usize = 64;
 
@@ -55,6 +60,8 @@ const SENDER_KEY_MESSAGE_DOMAIN: &[u8] = b"veil-sender-key-message-v4";
 const SIGNED_SENDER_KEY_VERSION: u8 = 0x05;
 const SIGNED_SENDER_KEY_DOMAIN: &[u8] = b"veil-sender-key-message-v5\0";
 const MAX_SIGNED_SENDER_KEY_INNER_SIZE: usize = 16 * 1024 * 1024;
+const SENDER_KEY_DISTRIBUTION_COMMITMENT_DOMAIN: &[u8] =
+    b"veil-sender-key-distribution-commitment-v1\0";
 
 /// A Sender Key state for one member in a group.
 #[derive(Clone, Zeroize, ZeroizeOnDrop, Serialize, Deserialize)]
@@ -71,6 +78,15 @@ pub struct SenderKeyState {
     /// persisted states deserialize as `None` and must be redistributed.
     #[serde(default)]
     owner_identity_key: Option<[u8; 32]>,
+    /// Monotonic local receive-state revision. Unlike `iteration`, this also
+    /// advances when an authenticated skipped message consumes a cached key.
+    #[serde(default)]
+    #[zeroize(skip)]
+    revision: u64,
+    /// Immutable commitment to the generation's initial distribution. Legacy
+    /// persisted states lack it and therefore reject equal-generation retry.
+    #[serde(default)]
+    distribution_commitment: Option<[u8; 32]>,
 }
 
 /// A sender key distribution message — sent to each group member
@@ -88,6 +104,19 @@ pub struct SenderKeyDistribution {
     pub key_id: u32,
     /// Initial chain key (encrypted per-recipient via ratchet session).
     pub chain_key: [u8; 32],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncomingSenderKeyMetadata {
+    pub generation: u32,
+    pub iteration: u32,
+    pub revision: u64,
+    pub distribution_commitment: Option<[u8; 32]>,
+}
+
+pub struct DecryptedSenderKeyMessage {
+    pub generation: u32,
+    pub plaintext: Zeroizing<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -127,8 +156,9 @@ struct PersistedSkippedSenderKey {
 pub struct SenderKeyStore {
     /// Our outgoing sender keys per group: group_id → SenderKeyState
     outgoing: std::collections::HashMap<String, SenderKeyState>,
-    /// Incoming sender keys: (group_id, sender_ik_hex) → SenderKeyState
-    incoming: std::collections::HashMap<(String, [u8; 32]), SenderKeyState>,
+    /// Incoming sender keys retained by exact generation so offline ciphertext
+    /// from N remains decryptable after the authenticated N+1 SKDM is replayed.
+    incoming: std::collections::HashMap<(String, [u8; 32], u32), SenderKeyState>,
     /// Out-of-order message keys, retained until authenticated consumption.
     /// Persistence is scoped to each encrypted incoming-state row.
     skipped_message_keys: BTreeMap<SkippedSenderKeyId, [u8; 32]>,
@@ -158,6 +188,8 @@ impl SenderKeyState {
             chain_key,
             iteration: 0,
             owner_identity_key: None,
+            revision: 0,
+            distribution_commitment: None,
         }
     }
 
@@ -175,6 +207,8 @@ impl SenderKeyState {
             chain_key,
             iteration: 0,
             owner_identity_key: None,
+            revision: 0,
+            distribution_commitment: None,
         }
     }
 
@@ -182,12 +216,15 @@ impl SenderKeyState {
         key_id: u32,
         chain_key: [u8; 32],
         sender_identity_key: [u8; 32],
+        distribution_commitment: [u8; 32],
     ) -> Self {
         Self {
             key_id,
             chain_key,
             iteration: 0,
             owner_identity_key: Some(sender_identity_key),
+            revision: 0,
+            distribution_commitment: Some(distribution_commitment),
         }
     }
 
@@ -198,11 +235,25 @@ impl SenderKeyState {
 
     /// Advance the chain key forward (irreversible).
     fn ratchet(&mut self) -> Result<(), String> {
-        self.chain_key = kdf::hmac_sha256(&self.chain_key, b"\x02");
-        self.iteration = self
+        let next_iteration = self
             .iteration
             .checked_add(1)
             .ok_or("sender key iteration overflow".to_string())?;
+        let next_revision = self
+            .revision
+            .checked_add(1)
+            .ok_or("sender key state revision overflow".to_string())?;
+        self.chain_key = kdf::hmac_sha256(&self.chain_key, b"\x02");
+        self.iteration = next_iteration;
+        self.revision = next_revision;
+        Ok(())
+    }
+
+    fn record_skipped_receive(&mut self) -> Result<(), String> {
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or("sender key state revision overflow".to_string())?;
         Ok(())
     }
 
@@ -256,6 +307,20 @@ impl SenderKeyState {
     }
 }
 
+fn sender_key_distribution_commitment(dist: &SenderKeyDistribution) -> Result<[u8; 32], String> {
+    let group_len = u32::try_from(dist.group_id.len())
+        .map_err(|_| "sender-key distribution group id too large".to_string())?;
+    let mut context = Zeroizing::new(Vec::with_capacity(
+        SENDER_KEY_DISTRIBUTION_COMMITMENT_DOMAIN.len() + 4 + dist.group_id.len() + 32 + 4,
+    ));
+    context.extend_from_slice(SENDER_KEY_DISTRIBUTION_COMMITMENT_DOMAIN);
+    context.extend_from_slice(&group_len.to_be_bytes());
+    context.extend_from_slice(dist.group_id.as_bytes());
+    context.extend_from_slice(&dist.sender_identity_key);
+    context.extend_from_slice(&dist.key_id.to_be_bytes());
+    Ok(kdf::hmac_sha256(&dist.chain_key, &context))
+}
+
 fn sender_message_aad(
     group_id: &str,
     sender_identity_key: &[u8; 32],
@@ -290,11 +355,11 @@ struct ParsedSignedSenderKey<'a> {
     signature: [u8; ED25519_SIGNATURE_SIZE],
 }
 
-fn encode_signed_sender_key(
-    signer: &IdentityKeyPair,
+fn encode_signed_sender_key_with_signer(
     group_id: &str,
     sender_identity_key: &[u8; 32],
     inner_v4: &[u8],
+    signer: impl FnOnce(&[u8]) -> [u8; ED25519_SIGNATURE_SIZE],
 ) -> Result<Vec<u8>, String> {
     if group_id.is_empty() {
         return Err("signed sender-key group id must not be empty".to_string());
@@ -323,9 +388,21 @@ fn encode_signed_sender_key(
     let mut signature_input = Vec::with_capacity(SIGNED_SENDER_KEY_DOMAIN.len() + wire.len());
     signature_input.extend_from_slice(SIGNED_SENDER_KEY_DOMAIN);
     signature_input.extend_from_slice(&wire);
-    let signature = crate::signature::sign(signer, &signature_input);
+    let signature = signer(&signature_input);
+    signature_input.zeroize();
     wire.extend_from_slice(&signature);
     Ok(wire)
+}
+
+fn encode_signed_sender_key(
+    signer: &IdentityKeyPair,
+    group_id: &str,
+    sender_identity_key: &[u8; 32],
+    inner_v4: &[u8],
+) -> Result<Vec<u8>, String> {
+    encode_signed_sender_key_with_signer(group_id, sender_identity_key, inner_v4, |message| {
+        crate::signature::sign(signer, message)
+    })
 }
 
 fn parse_signed_sender_key(wire: &[u8]) -> Result<ParsedSignedSenderKey<'_>, String> {
@@ -397,6 +474,76 @@ fn parse_signed_sender_key(wire: &[u8]) -> Result<ParsedSignedSenderKey<'_>, Str
     })
 }
 
+/// Structural routing hint used only to locate an already persisted exact
+/// generation before signature/AEAD verification. Callers must still use
+/// `decrypt_signed_with_metadata`; this value is not authenticated by itself.
+pub fn inspect_signed_sender_key_generation(wire: &[u8]) -> Result<u32, String> {
+    Ok(inspect_signed_sender_key_metadata(wire)?.generation)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnverifiedSignedSenderKeyMetadata {
+    pub generation: u32,
+    pub sender_identity_key: [u8; 32],
+}
+
+/// Structural routing metadata only. The sender identity and generation are
+/// authenticated exclusively by `decrypt_signed_with_metadata` with an
+/// independently pinned device signing key.
+pub fn inspect_signed_sender_key_metadata(
+    wire: &[u8],
+) -> Result<UnverifiedSignedSenderKeyMetadata, String> {
+    let parsed = parse_signed_sender_key(wire)?;
+    let generation = u32::from_le_bytes(
+        parsed.inner_v4[1..5]
+            .try_into()
+            .map_err(|_| "signed sender-key generation is truncated")?,
+    );
+    if generation == 0 {
+        return Err("sender-key generation must be non-zero".to_string());
+    }
+    Ok(UnverifiedSignedSenderKeyMetadata {
+        generation,
+        sender_identity_key: parsed.sender_identity_key,
+    })
+}
+
+/// Verify the outer v5 device signature and all static group/sender bindings
+/// without consuming the symmetric Sender-Key receive chain. This is used to
+/// authenticate duplicate/metadata-only REST rows before reconciliation.
+pub fn verify_signed_sender_key_envelope(
+    expected_group_id: &str,
+    expected_sender_identity_key: &[u8; 32],
+    expected_sender_signing_key: &[u8; 32],
+    wire: &[u8],
+) -> Result<u32, String> {
+    let parsed = parse_signed_sender_key(wire)?;
+    if parsed.group_id != expected_group_id {
+        return Err("signed sender-key group binding mismatch".to_string());
+    }
+    if !bool::from(
+        parsed
+            .sender_identity_key
+            .ct_eq(expected_sender_identity_key),
+    ) {
+        return Err("signed sender-key device identity mismatch".to_string());
+    }
+    let mut signature_input =
+        Vec::with_capacity(SIGNED_SENDER_KEY_DOMAIN.len() + parsed.signed_portion.len());
+    signature_input.extend_from_slice(SIGNED_SENDER_KEY_DOMAIN);
+    signature_input.extend_from_slice(parsed.signed_portion);
+    let valid = crate::signature::verify(
+        expected_sender_signing_key,
+        &signature_input,
+        &parsed.signature,
+    );
+    signature_input.zeroize();
+    if !valid {
+        return Err("invalid signed sender-key device signature".to_string());
+    }
+    inspect_signed_sender_key_generation(wire)
+}
+
 impl SenderKeyStore {
     pub fn new() -> Self {
         Self::default()
@@ -409,6 +556,18 @@ impl SenderKeyStore {
         group_id: &str,
         our_identity_key: &[u8; 32],
     ) -> SenderKeyDistribution {
+        self.try_create_outgoing(group_id, our_identity_key)
+            .expect("sender key generation exhausted")
+    }
+
+    /// Fallible counterpart used by protocol/runtime code. Generation
+    /// exhaustion is a permanent fail-closed boundary: it must never wrap to
+    /// generation zero or reuse an earlier generation.
+    pub fn try_create_outgoing(
+        &mut self,
+        group_id: &str,
+        our_identity_key: &[u8; 32],
+    ) -> Result<SenderKeyDistribution, String> {
         let generation = self
             .outgoing
             .get(group_id)
@@ -416,11 +575,11 @@ impl SenderKeyStore {
                 state
                     .key_id
                     .checked_add(1)
-                    .expect("sender key generation exhausted")
+                    .ok_or("sender key generation exhausted")
             })
+            .transpose()?
             .unwrap_or(1);
         self.create_outgoing_at_generation(group_id, our_identity_key, generation)
-            .expect("validated sender key generation")
     }
 
     /// Create or rotate an outgoing sender key at an authoritative generation
@@ -454,31 +613,59 @@ impl SenderKeyStore {
 
     /// Process an authenticated sender key distribution.
     ///
-    /// Generations are strictly monotonic per sender and group. Re-delivery of
-    /// the current generation is idempotent and cannot rewind an advanced
-    /// receiving chain; older generations are rejected as replays.
+    /// Generations are strictly monotonic per sender and group, but prior
+    /// installed generations remain available for queued offline ciphertext.
+    /// Re-delivery of the current generation is idempotent only when its
+    /// immutable initial-distribution commitment is identical.
     pub fn process_distribution(&mut self, dist: &SenderKeyDistribution) -> Result<bool, String> {
         if dist.key_id == 0 {
             return Err("sender key generation must be non-zero".to_string());
         }
-        let lookup = (dist.group_id.clone(), dist.sender_identity_key);
+        let highest = self
+            .incoming
+            .keys()
+            .filter(|(group, sender, _)| {
+                group == &dist.group_id && sender == &dist.sender_identity_key
+            })
+            .map(|(_, _, generation)| *generation)
+            .max();
+        if highest.is_some_and(|highest| dist.key_id < highest) {
+            return Err("stale sender key distribution rejected".to_string());
+        }
+
+        let lookup = (dist.group_id.clone(), dist.sender_identity_key, dist.key_id);
+        let commitment = sender_key_distribution_commitment(dist)?;
         if let Some(current) = self.incoming.get(&lookup) {
-            if dist.key_id < current.key_id {
-                return Err("stale sender key distribution rejected".to_string());
+            let Some(current_commitment) = current.distribution_commitment else {
+                return Err(
+                    "equal-generation retry cannot be verified for legacy sender-key state"
+                        .to_string(),
+                );
+            };
+            if !bool::from(current_commitment.ct_eq(&commitment)) {
+                return Err(
+                    "equal-generation sender-key distribution changed immutable state".to_string(),
+                );
             }
-            if dist.key_id == current.key_id {
-                return Ok(false);
-            }
+            return Ok(false);
+        }
+        let retained_generations = self
+            .incoming
+            .keys()
+            .filter(|(group, sender, _)| {
+                group == &dist.group_id && sender == &dist.sender_identity_key
+            })
+            .count();
+        if retained_generations >= MAX_RETAINED_GENERATIONS_PER_SENDER {
+            return Err("incoming sender-key generation retention limit reached".to_string());
         }
 
         let state = SenderKeyState::from_distribution_for_sender(
             dist.key_id,
             dist.chain_key,
             dist.sender_identity_key,
+            commitment,
         );
-        // A generation change makes every cached message key from the previous
-        // generation invalid and potentially replayable.
-        self.purge_skipped_keys(&dist.group_id, &dist.sender_identity_key);
         self.incoming.insert(lookup, state);
         Ok(true)
     }
@@ -544,6 +731,45 @@ impl SenderKeyStore {
         encode_signed_sender_key(sender_identity, group_id, &sender_identity_key, &inner_v4)
     }
 
+    /// Device-domain counterpart of [`Self::encrypt_signed`]. The caller must
+    /// supply the independently account-authorized device X25519 identity and
+    /// its matching Ed25519 signing key. The ownership check runs before the
+    /// symmetric chain advances, so an account key cannot be substituted for
+    /// a device-owned Sender-Key generation.
+    pub fn encrypt_signed_with_device(
+        &mut self,
+        group_id: &str,
+        sender_device_identity_key: &[u8; 32],
+        sender_device_signing_key: &SigningKey,
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if group_id.is_empty() {
+            return Err("signed sender-key group id must not be empty".to_string());
+        }
+        u16::try_from(group_id.len())
+            .map_err(|_| "signed sender-key group id is too long".to_string())?;
+        if plaintext.len() > MAX_SIGNED_SENDER_KEY_INNER_SIZE.saturating_sub(512) {
+            return Err("signed sender-key plaintext is too large".to_string());
+        }
+        if sender_device_signing_key.verifying_key().to_bytes() == [0u8; 32] {
+            return Err("invalid sender device signing key".to_string());
+        }
+
+        let state = self.outgoing.get_mut(group_id).ok_or_else(|| {
+            "no sender key for this group — call create_outgoing first".to_string()
+        })?;
+        if state.owner_identity_key.as_ref() != Some(sender_device_identity_key) {
+            return Err("sender device identity does not own this sender key".to_string());
+        }
+        let inner_v4 = state.encrypt_bound(group_id, sender_device_identity_key, plaintext)?;
+        encode_signed_sender_key_with_signer(
+            group_id,
+            sender_device_identity_key,
+            &inner_v4,
+            |message| sender_device_signing_key.sign(message).to_bytes(),
+        )
+    }
+
     /// Decrypt a raw v4 group message from a peer.
     ///
     /// This authenticates possession of the symmetric chain key, not the
@@ -571,18 +797,11 @@ impl SenderKeyStore {
             return Err("sender key iteration exceeds generation limit".to_string());
         }
 
-        let lookup = (group_id.to_string(), *sender_ik);
+        let lookup = (group_id.to_string(), *sender_ik, key_id);
         let state = self.incoming.get(&lookup).ok_or_else(|| {
-            "no sender key from this peer — key distribution required".to_string()
+            format!("no sender key generation {key_id} from this peer — key distribution required")
         })?;
-
-        // Verify key_id matches
-        if state.key_id != key_id {
-            return Err(format!(
-                "sender key id mismatch: expected {}, got {}",
-                state.key_id, key_id
-            ));
-        }
+        debug_assert_eq!(state.key_id, key_id);
 
         let aad = sender_message_aad(group_id, sender_ik, &wire[..9])?;
         let skipped_id = SkippedSenderKeyId {
@@ -603,6 +822,10 @@ impl SenderKeyStore {
             if let Some(mut consumed) = self.skipped_message_keys.remove(&skipped_id) {
                 consumed.zeroize();
             }
+            self.incoming
+                .get_mut(&lookup)
+                .ok_or("sender key generation disappeared during skipped receive")?
+                .record_skipped_receive()?;
             return Ok(plaintext);
         }
 
@@ -618,7 +841,7 @@ impl SenderKeyStore {
         // before derivation and nothing is committed until the target frame
         // authenticates.
         let skip = iteration - candidate.iteration;
-        self.ensure_skipped_capacity(group_id, sender_ik, skip as usize)?;
+        self.ensure_skipped_capacity(group_id, sender_ik, key_id, skip as usize)?;
         let mut pending_skipped = Vec::with_capacity(skip as usize);
         for _ in 0..skip {
             let skipped_iteration = candidate.iteration;
@@ -670,6 +893,22 @@ impl SenderKeyStore {
         pinned_sender_signing_key: &[u8; 32],
         signed_wire: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.decrypt_signed_with_metadata(
+            group_id,
+            sender_ik,
+            pinned_sender_signing_key,
+            signed_wire,
+        )
+        .map(|mut decrypted| std::mem::take(&mut *decrypted.plaintext))
+    }
+
+    pub fn decrypt_signed_with_metadata(
+        &mut self,
+        group_id: &str,
+        sender_ik: &[u8; 32],
+        pinned_sender_signing_key: &[u8; 32],
+        signed_wire: &[u8],
+    ) -> Result<DecryptedSenderKeyMessage, String> {
         let parsed = parse_signed_sender_key(signed_wire)?;
         if parsed.group_id != group_id {
             return Err("signed sender-key group binding mismatch".to_string());
@@ -690,19 +929,33 @@ impl SenderKeyStore {
             return Err("invalid signed sender-key Ed25519 signature".to_string());
         }
 
-        self.decrypt(group_id, sender_ik, parsed.inner_v4)
+        let generation = u32::from_le_bytes(
+            parsed.inner_v4[1..5]
+                .try_into()
+                .map_err(|_| "signed sender-key generation is truncated")?,
+        );
+        let plaintext = self.decrypt(group_id, sender_ik, parsed.inner_v4)?;
+        Ok(DecryptedSenderKeyMessage {
+            generation,
+            plaintext: Zeroizing::new(plaintext),
+        })
     }
 
     fn ensure_skipped_capacity(
         &self,
         group_id: &str,
         sender_ik: &[u8; 32],
+        generation: u32,
         additional: usize,
     ) -> Result<(), String> {
         let per_sender = self
             .skipped_message_keys
             .keys()
-            .filter(|id| id.group_id == group_id && id.sender_identity_key == *sender_ik)
+            .filter(|id| {
+                id.group_id == group_id
+                    && id.sender_identity_key == *sender_ik
+                    && id.generation == generation
+            })
             .count();
         if per_sender.saturating_add(additional) > MAX_SKIPPED_KEYS_PER_SENDER {
             return Err("sender skipped-key cache limit exceeded".to_string());
@@ -718,6 +971,18 @@ impl SenderKeyStore {
     fn purge_skipped_keys(&mut self, group_id: &str, sender_ik: &[u8; 32]) {
         self.skipped_message_keys.retain(|id, message_key| {
             let remove = id.group_id == group_id && id.sender_identity_key == *sender_ik;
+            if remove {
+                message_key.zeroize();
+            }
+            !remove
+        });
+    }
+
+    fn purge_skipped_generation(&mut self, group_id: &str, sender_ik: &[u8; 32], generation: u32) {
+        self.skipped_message_keys.retain(|id, message_key| {
+            let remove = id.group_id == group_id
+                && id.sender_identity_key == *sender_ik
+                && id.generation == generation;
             if remove {
                 message_key.zeroize();
             }
@@ -795,11 +1060,39 @@ impl SenderKeyStore {
         self.outgoing.contains_key(group_id)
     }
 
+    pub fn outgoing_owner_identity_key(&self, group_id: &str) -> Option<[u8; 32]> {
+        self.outgoing
+            .get(group_id)
+            .and_then(|state| state.owner_identity_key)
+    }
+
     /// Check whether an incoming sender key is already loaded without
     /// serializing secret state as a probe.
     pub fn has_incoming(&self, group_id: &str, sender_ik: &[u8; 32]) -> bool {
         self.incoming
-            .contains_key(&(group_id.to_string(), *sender_ik))
+            .keys()
+            .any(|(group, sender, _)| group == group_id && sender == sender_ik)
+    }
+
+    pub fn has_incoming_generation(
+        &self,
+        group_id: &str,
+        sender_ik: &[u8; 32],
+        generation: u32,
+    ) -> bool {
+        self.incoming
+            .contains_key(&(group_id.to_string(), *sender_ik, generation))
+    }
+
+    pub fn incoming_generations(&self, group_id: &str, sender_ik: &[u8; 32]) -> Vec<u32> {
+        let mut generations: Vec<_> = self
+            .incoming
+            .keys()
+            .filter(|(group, sender, _)| group == group_id && sender == sender_ik)
+            .map(|(_, _, generation)| *generation)
+            .collect();
+        generations.sort_unstable();
+        generations
     }
 
     /// Build a zeroizing distribution view of the current outgoing state.
@@ -825,13 +1118,14 @@ impl SenderKeyStore {
     /// Remove all keys for a group (when leaving).
     pub fn remove_group(&mut self, group_id: &str) {
         self.outgoing.remove(group_id);
-        self.incoming.retain(|(gid, _), _| gid != group_id);
+        self.incoming.retain(|(gid, _, _), _| gid != group_id);
         self.purge_group_skipped_keys(group_id);
     }
 
     /// Remove a single incoming key (e.g. when a member leaves the group).
     pub fn remove_incoming(&mut self, group_id: &str, sender_ik: &[u8; 32]) {
-        self.incoming.remove(&(group_id.to_string(), *sender_ik));
+        self.incoming
+            .retain(|(group, sender, _), _| group != group_id || sender != sender_ik);
         self.purge_skipped_keys(group_id, sender_ik);
     }
 
@@ -849,11 +1143,27 @@ impl SenderKeyStore {
         group_id: &str,
         sender_ik: &[u8; 32],
     ) -> Option<Zeroizing<Vec<u8>>> {
-        let state = self.incoming.get(&(group_id.to_string(), *sender_ik))?;
+        let generation = self.incoming_generations(group_id, sender_ik).pop()?;
+        self.serialize_incoming_generation(group_id, sender_ik, generation)
+    }
+
+    pub fn serialize_incoming_generation(
+        &self,
+        group_id: &str,
+        sender_ik: &[u8; 32],
+        generation: u32,
+    ) -> Option<Zeroizing<Vec<u8>>> {
+        let state = self
+            .incoming
+            .get(&(group_id.to_string(), *sender_ik, generation))?;
         let skipped_keys = self
             .skipped_message_keys
             .iter()
-            .filter(|(id, _)| id.group_id == group_id && id.sender_identity_key == *sender_ik)
+            .filter(|(id, _)| {
+                id.group_id == group_id
+                    && id.sender_identity_key == *sender_ik
+                    && id.generation == generation
+            })
             .map(|(id, message_key)| PersistedSkippedSenderKey {
                 generation: id.generation,
                 iteration: id.iteration,
@@ -867,6 +1177,23 @@ impl SenderKeyStore {
         })
         .ok()
         .map(Zeroizing::new)
+    }
+
+    pub fn incoming_generation_metadata(
+        &self,
+        group_id: &str,
+        sender_ik: &[u8; 32],
+        generation: u32,
+    ) -> Option<IncomingSenderKeyMetadata> {
+        let state = self
+            .incoming
+            .get(&(group_id.to_string(), *sender_ik, generation))?;
+        Some(IncomingSenderKeyMetadata {
+            generation: state.key_id,
+            iteration: state.iteration,
+            revision: state.revision,
+            distribution_commitment: state.distribution_commitment,
+        })
     }
 
     /// Restore an outgoing key state from persisted bytes.
@@ -887,6 +1214,18 @@ impl SenderKeyStore {
         sender_ik: &[u8; 32],
         data: &[u8],
     ) -> Result<(), String> {
+        self.load_incoming_generation(group_id, sender_ik, None, None, data)
+            .map(|_| ())
+    }
+
+    pub fn load_incoming_generation(
+        &mut self,
+        group_id: &str,
+        sender_ik: &[u8; 32],
+        expected_generation: Option<u32>,
+        expected_commitment: Option<[u8; 32]>,
+        data: &[u8],
+    ) -> Result<IncomingSenderKeyMetadata, String> {
         let (state, skipped_keys) = match serde_json::from_slice::<PersistedIncomingSenderKey>(data)
         {
             Ok(persisted) => {
@@ -917,6 +1256,20 @@ impl SenderKeyStore {
         if state.key_id == 0 || state.iteration > MAX_CHAIN_ITERATIONS {
             return Err("persisted sender key state is outside generation bounds".to_string());
         }
+        if expected_generation.is_some_and(|generation| generation != state.key_id) {
+            return Err("persisted sender key generation does not match its database key".into());
+        }
+        if let Some(expected_commitment) = expected_commitment {
+            match state.distribution_commitment {
+                Some(commitment) if bool::from(commitment.ct_eq(&expected_commitment)) => {}
+                None if expected_commitment == [0u8; 32] => {}
+                _ => {
+                    return Err(
+                        "persisted sender key commitment does not match its database key".into(),
+                    )
+                }
+            }
+        }
         if skipped_keys.len() > MAX_SKIPPED_KEYS_PER_SENDER {
             return Err("persisted sender skipped-key cache exceeds per-sender limit".to_string());
         }
@@ -934,20 +1287,36 @@ impl SenderKeyStore {
             }
         }
 
-        let existing_for_sender = self
+        let existing_for_generation = self
             .skipped_message_keys
             .keys()
-            .filter(|id| id.group_id == group_id && id.sender_identity_key == *sender_ik)
+            .filter(|id| {
+                id.group_id == group_id
+                    && id.sender_identity_key == *sender_ik
+                    && id.generation == state.key_id
+            })
             .count();
         let retained_total = self
             .skipped_message_keys
             .len()
-            .saturating_sub(existing_for_sender);
+            .saturating_sub(existing_for_generation);
         if retained_total.saturating_add(skipped_keys.len()) > MAX_TOTAL_SKIPPED_SENDER_KEYS {
             return Err("persisted sender skipped-key cache exceeds global limit".to_string());
         }
 
-        self.purge_skipped_keys(group_id, sender_ik);
+        let lookup = (group_id.to_string(), *sender_ik, state.key_id);
+        if self.incoming.contains_key(&lookup) {
+            return Err("incoming sender-key generation is already loaded".to_string());
+        }
+        let retained_generations = self
+            .incoming
+            .keys()
+            .filter(|(group, sender, _)| group == group_id && sender == sender_ik)
+            .count();
+        if retained_generations >= MAX_RETAINED_GENERATIONS_PER_SENDER {
+            return Err("incoming sender-key generation retention limit reached".to_string());
+        }
+        self.purge_skipped_generation(group_id, sender_ik, state.key_id);
         for skipped in &skipped_keys {
             self.skipped_message_keys.insert(
                 SkippedSenderKeyId {
@@ -959,9 +1328,14 @@ impl SenderKeyStore {
                 skipped.message_key,
             );
         }
-        self.incoming
-            .insert((group_id.to_string(), *sender_ik), state);
-        Ok(())
+        let metadata = IncomingSenderKeyMetadata {
+            generation: state.key_id,
+            iteration: state.iteration,
+            revision: state.revision,
+            distribution_commitment: state.distribution_commitment,
+        };
+        self.incoming.insert(lookup, state);
+        Ok(metadata)
     }
 }
 
@@ -1178,6 +1552,7 @@ mod tests {
                 distribution.key_id,
                 distribution.chain_key,
                 alice_ik,
+                sender_key_distribution_commitment(&distribution).unwrap(),
             ),
         );
         let forged_inner = mallory_sender.encrypt(group, b"forged as Alice").unwrap();
@@ -1312,7 +1687,7 @@ mod tests {
             );
         }
         assert!(per_sender
-            .ensure_skipped_capacity(group, &sender_ik, 1)
+            .ensure_skipped_capacity(group, &sender_ik, 99, 1)
             .is_err());
         assert_eq!(
             per_sender.skipped_message_keys.len(),
@@ -1332,7 +1707,7 @@ mod tests {
             );
         }
         assert!(global
-            .ensure_skipped_capacity("another-group", &[255u8; 32], 1)
+            .ensure_skipped_capacity("another-group", &[255u8; 32], 1, 1)
             .is_err());
         assert_eq!(
             global.skipped_message_keys.len(),
@@ -1341,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn test_generation_rotation_purges_skipped_keys() {
+    fn retained_generations_decrypt_queued_ciphertext_from_both_epochs() {
         let alice_ik = [1u8; 32];
         let group = "rotated-gap-group";
         let mut alice = SenderKeyStore::new();
@@ -1356,11 +1731,108 @@ mod tests {
 
         let generation_two = alice.create_outgoing(group, &alice_ik);
         bob.process_distribution(&generation_two).unwrap();
-        assert!(bob.skipped_message_keys.is_empty());
-        assert!(bob.decrypt(group, &alice_ik, &old_first).is_err());
+        assert_eq!(bob.incoming_generations(group, &alice_ik), vec![1, 2]);
+        assert_eq!(bob.skipped_message_keys.len(), 1);
+        assert_eq!(
+            bob.decrypt(group, &alice_ik, &old_first).unwrap(),
+            b"old-first"
+        );
 
         let fresh = alice.encrypt(group, b"fresh").unwrap();
         assert_eq!(bob.decrypt(group, &alice_ik, &fresh).unwrap(), b"fresh");
+    }
+
+    #[test]
+    fn retained_generation_cap_rejects_129th_without_mutating_other_conversations() {
+        let sender = [0xD1; 32];
+        let group = "bounded-generations";
+        let other_group = "independent-generations";
+        let mut source = SenderKeyStore::new();
+        let mut live = SenderKeyStore::new();
+        let mut hydrated = SenderKeyStore::new();
+
+        for generation in 1..=MAX_RETAINED_GENERATIONS_PER_SENDER as u32 {
+            let distribution = source
+                .create_outgoing_at_generation(group, &sender, generation)
+                .unwrap();
+            assert!(live.process_distribution(&distribution).unwrap());
+            let data = live
+                .serialize_incoming_generation(group, &sender, generation)
+                .unwrap();
+            let commitment = live
+                .incoming_generation_metadata(group, &sender, generation)
+                .unwrap()
+                .distribution_commitment
+                .unwrap();
+            hydrated
+                .load_incoming_generation(group, &sender, Some(generation), Some(commitment), &data)
+                .unwrap();
+        }
+        let generation_129 = MAX_RETAINED_GENERATIONS_PER_SENDER as u32 + 1;
+        let distribution_129 = source
+            .create_outgoing_at_generation(group, &sender, generation_129)
+            .unwrap();
+        assert!(live
+            .process_distribution(&distribution_129)
+            .unwrap_err()
+            .contains("retention limit"));
+        assert_eq!(
+            live.incoming_generations(group, &sender).len(),
+            MAX_RETAINED_GENERATIONS_PER_SENDER,
+        );
+
+        let mut single = SenderKeyStore::new();
+        single.process_distribution(&distribution_129).unwrap();
+        let data_129 = single
+            .serialize_incoming_generation(group, &sender, generation_129)
+            .unwrap();
+        let commitment_129 = single
+            .incoming_generation_metadata(group, &sender, generation_129)
+            .unwrap()
+            .distribution_commitment
+            .unwrap();
+        assert!(hydrated
+            .load_incoming_generation(
+                group,
+                &sender,
+                Some(generation_129),
+                Some(commitment_129),
+                &data_129,
+            )
+            .unwrap_err()
+            .contains("retention limit"));
+        assert_eq!(
+            hydrated.incoming_generations(group, &sender).len(),
+            MAX_RETAINED_GENERATIONS_PER_SENDER,
+        );
+
+        let other = source
+            .create_outgoing_at_generation(other_group, &sender, 1)
+            .unwrap();
+        assert!(live.process_distribution(&other).unwrap());
+        assert_eq!(live.incoming_generations(other_group, &sender), vec![1]);
+    }
+
+    #[test]
+    fn equal_generation_retry_is_immutable_even_after_chain_advance() {
+        let alice_ik = [0x61u8; 32];
+        let group = "immutable-equal-generation";
+        let mut alice = SenderKeyStore::new();
+        let mut bob = SenderKeyStore::new();
+        let generation = alice.create_outgoing(group, &alice_ik);
+        assert!(bob.process_distribution(&generation).unwrap());
+        let wire = alice.encrypt(group, b"advance receiver").unwrap();
+        assert_eq!(
+            bob.decrypt(group, &alice_ik, &wire).unwrap(),
+            b"advance receiver"
+        );
+
+        assert!(!bob.process_distribution(&generation).unwrap());
+        let mut conflicting = generation.clone();
+        conflicting.chain_key[0] ^= 0x80;
+        let error = bob.process_distribution(&conflicting).unwrap_err();
+        assert!(error.contains("changed immutable state"));
+        assert_eq!(bob.incoming_generations(group, &alice_ik), vec![1]);
     }
 
     #[test]
@@ -1370,6 +1842,22 @@ mod tests {
         let mut store = SenderKeyStore::new();
         store.create_outgoing(group, &ik);
         assert!(!store.needs_rotation(group));
+    }
+
+    #[test]
+    fn generation_exhaustion_fails_without_reusing_or_replacing_state() {
+        let ik = [0xA5u8; 32];
+        let group = "generation-exhaustion";
+        let mut store = SenderKeyStore::new();
+        store
+            .create_outgoing_at_generation(group, &ik, u32::MAX)
+            .unwrap();
+        let before = store.serialize_outgoing(group).unwrap();
+
+        let error = store.try_create_outgoing(group, &ik).err().unwrap();
+        assert!(error.contains("generation exhausted"));
+        assert_eq!(store.build_distribution(group).unwrap().key_id, u32::MAX);
+        assert_eq!(&*store.serialize_outgoing(group).unwrap(), &*before);
     }
 
     #[test]
@@ -1659,12 +2147,14 @@ fn parse_skdm_wire(wire: &[u8]) -> Result<ParsedSkdm<'_>, String> {
 /// Ed25519 identities, recipient X25519 identity, and ephemeral key. The
 /// recipient must still obtain `expected_sender_signing_key` from an
 /// independently authenticated identity record.
-pub fn seal_skdm_authenticated(
-    sender: &IdentityKeyPair,
+fn seal_skdm_authenticated_with_signer(
+    sender_ik: &[u8; 32],
+    sender_signing_key: &[u8; 32],
     recipient_ik: &[u8; 32],
     group_id: &str,
     generation: u32,
     skdm_json: &[u8],
+    signer: impl FnOnce(&[u8]) -> [u8; ED25519_SIGNATURE_SIZE],
 ) -> Result<Vec<u8>, String> {
     if group_id.is_empty() {
         return Err("SKDM group id must not be empty".to_string());
@@ -1673,8 +2163,6 @@ pub fn seal_skdm_authenticated(
         return Err("SKDM generation must be non-zero".to_string());
     }
 
-    let sender_ik = sender.x25519_public_bytes();
-    let sender_signing_key = sender.ed25519_public_bytes();
     let mut eph_secret_bytes = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut eph_secret_bytes);
     let eph_secret = X25519Secret::from(eph_secret_bytes);
@@ -1690,8 +2178,8 @@ pub fn seal_skdm_authenticated(
     let aad = sealed_skdm_aad(
         group_id,
         generation,
-        &sender_ik,
-        &sender_signing_key,
+        sender_ik,
+        sender_signing_key,
         recipient_ik,
         eph_pub.as_bytes(),
     )?;
@@ -1708,7 +2196,8 @@ pub fn seal_skdm_authenticated(
     signed.extend_from_slice(&aad);
     signed.extend_from_slice(&nonce);
     signed.extend_from_slice(&ct);
-    let signature = crate::signature::sign(sender, &signed);
+    let signature = signer(&signed);
+    signed.zeroize();
 
     let group_bytes = group_id.as_bytes();
     let mut wire = Vec::with_capacity(
@@ -1718,8 +2207,8 @@ pub fn seal_skdm_authenticated(
     wire.extend_from_slice(&(group_bytes.len() as u16).to_be_bytes());
     wire.extend_from_slice(group_bytes);
     wire.extend_from_slice(&generation.to_be_bytes());
-    wire.extend_from_slice(&sender_ik);
-    wire.extend_from_slice(&sender_signing_key);
+    wire.extend_from_slice(sender_ik);
+    wire.extend_from_slice(sender_signing_key);
     wire.extend_from_slice(eph_pub.as_bytes());
     wire.extend_from_slice(&nonce);
     wire.extend_from_slice(&ct);
@@ -1727,9 +2216,52 @@ pub fn seal_skdm_authenticated(
     Ok(wire)
 }
 
+pub fn seal_skdm_authenticated(
+    sender: &IdentityKeyPair,
+    recipient_ik: &[u8; 32],
+    group_id: &str,
+    generation: u32,
+    skdm_json: &[u8],
+) -> Result<Vec<u8>, String> {
+    let sender_ik = sender.x25519_public_bytes();
+    let sender_signing_key = sender.ed25519_public_bytes();
+    seal_skdm_authenticated_with_signer(
+        &sender_ik,
+        &sender_signing_key,
+        recipient_ik,
+        group_id,
+        generation,
+        skdm_json,
+        |message| crate::signature::sign(sender, message),
+    )
+}
+
+/// Seal an exact-device SKDM whose authenticated owner is a device binding,
+/// not the account identity used for membership and display.
+pub fn seal_skdm_authenticated_with_device(
+    sender_device_identity_key: &[u8; 32],
+    sender_device_signing_key: &SigningKey,
+    recipient_device_identity_key: &[u8; 32],
+    group_id: &str,
+    generation: u32,
+    skdm_json: &[u8],
+) -> Result<Vec<u8>, String> {
+    let public_signing_key = sender_device_signing_key.verifying_key().to_bytes();
+    seal_skdm_authenticated_with_signer(
+        sender_device_identity_key,
+        &public_signing_key,
+        recipient_device_identity_key,
+        group_id,
+        generation,
+        skdm_json,
+        |message| sender_device_signing_key.sign(message).to_bytes(),
+    )
+}
+
 /// Verify and open an authenticated SKDM envelope.
-pub fn open_skdm_authenticated(
-    recipient: &IdentityKeyPair,
+fn open_skdm_authenticated_with_recipient(
+    recipient_secret: &X25519Secret,
+    recipient_ik: &[u8; 32],
     expected_sender_ik: &[u8; 32],
     expected_sender_signing_key: &[u8; 32],
     expected_group_id: &str,
@@ -1756,13 +2288,12 @@ pub fn open_skdm_authenticated(
         return Err("SKDM signing-key binding mismatch".to_string());
     }
 
-    let recipient_ik = recipient.x25519_public_bytes();
     let aad = sealed_skdm_aad(
         &metadata.group_id,
         metadata.generation,
         &metadata.sender_identity_key,
         &metadata.sender_signing_key,
-        &recipient_ik,
+        recipient_ik,
         &parsed.ephemeral_public,
     )?;
     let mut signed = Vec::with_capacity(aad.len() + parsed.nonce.len() + parsed.ciphertext.len());
@@ -1774,7 +2305,7 @@ pub fn open_skdm_authenticated(
     }
 
     let eph_pub = X25519PublicKey::from(parsed.ephemeral_public);
-    let shared = recipient.x25519_secret().diffie_hellman(&eph_pub);
+    let shared = recipient_secret.diffie_hellman(&eph_pub);
     if bool::from(shared.as_bytes().ct_eq(&[0u8; 32])) {
         return Err("invalid SKDM ephemeral key".to_string());
     }
@@ -1792,6 +2323,48 @@ pub fn open_skdm_authenticated(
         generation: metadata.generation,
         payload: Zeroizing::new(result?),
     })
+}
+
+pub fn open_skdm_authenticated(
+    recipient: &IdentityKeyPair,
+    expected_sender_ik: &[u8; 32],
+    expected_sender_signing_key: &[u8; 32],
+    expected_group_id: &str,
+    expected_generation: u32,
+    wire: &[u8],
+) -> Result<AuthenticatedSkdm, String> {
+    let recipient_ik = recipient.x25519_public_bytes();
+    open_skdm_authenticated_with_recipient(
+        recipient.x25519_secret(),
+        &recipient_ik,
+        expected_sender_ik,
+        expected_sender_signing_key,
+        expected_group_id,
+        expected_generation,
+        wire,
+    )
+}
+
+/// Open an exact-device SKDM using the receiving device binding. Account
+/// identity keys are intentionally not accepted by this API.
+pub fn open_skdm_authenticated_with_device(
+    recipient_device_secret: &X25519Secret,
+    recipient_device_identity_key: &[u8; 32],
+    expected_sender_device_identity_key: &[u8; 32],
+    expected_sender_device_signing_key: &[u8; 32],
+    expected_group_id: &str,
+    expected_generation: u32,
+    wire: &[u8],
+) -> Result<AuthenticatedSkdm, String> {
+    open_skdm_authenticated_with_recipient(
+        recipient_device_secret,
+        recipient_device_identity_key,
+        expected_sender_device_identity_key,
+        expected_sender_device_signing_key,
+        expected_group_id,
+        expected_generation,
+        wire,
+    )
 }
 
 /// The unauthenticated v1 sealing API is retained only to make upgrades fail

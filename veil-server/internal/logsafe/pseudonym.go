@@ -3,11 +3,16 @@
 package logsafe
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
 	"time"
 )
 
@@ -51,7 +56,7 @@ func (p *Pseudonymizer) Ref(domain, raw string) string {
 var process = func() *Pseudonymizer {
 	p, err := New(nil)
 	if err != nil {
-		panic("logsafe: cannot initialize process pseudonymizer: " + err.Error())
+		panic(fmt.Errorf("logsafe: initialize process pseudonymizer: %w", err))
 	}
 	return p
 }()
@@ -59,4 +64,62 @@ var process = func() *Pseudonymizer {
 // Ref is stable only within one UTC day and one gateway process.
 func Ref(domain, raw string) string {
 	return process.Ref(domain, raw)
+}
+
+// ErrorClass returns a bounded operational label without ever rendering the
+// error text. Database drivers, URL errors and filesystem errors routinely
+// embed query values, secret endpoint paths or local filenames in Error();
+// those strings must not cross the production logging boundary.
+func ErrorClass(err error) string {
+	switch {
+	case err == nil:
+		return "-"
+	case errors.Is(err, context.Canceled):
+		return "context_canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "context_deadline"
+	}
+
+	var sqlErr interface{ SQLState() string }
+	if errors.As(err, &sqlErr) {
+		if state := sqlErr.SQLState(); validSQLState(state) {
+			return "database_" + state
+		}
+		return "database_error"
+	}
+
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return "filesystem_error"
+	}
+
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		if urlErr.Timeout() {
+			return "network_timeout"
+		}
+		return "network_error"
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "network_timeout"
+		}
+		return "network_error"
+	}
+
+	return "internal_error"
+}
+
+func validSQLState(state string) bool {
+	if len(state) != 5 {
+		return false
+	}
+	for _, c := range state {
+		if (c < '0' || c > '9') && (c < 'A' || c > 'Z') {
+			return false
+		}
+	}
+	return true
 }

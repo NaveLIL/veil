@@ -48,6 +48,7 @@ pub struct DeviceIdentityV1 {
     binding: DeviceBindingPublicV1,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn device_binding_signing_bytes(
     account_identity_key: &[u8; 32],
     account_signing_key: &[u8; 32],
@@ -156,9 +157,9 @@ impl DeviceIdentityV1 {
         if stored.device_id == [0u8; 16] {
             return Err("persisted device id is all zero".to_string());
         }
-        if stored.version != DEVICE_BINDING_VERSION_V1 {
+        if stored.version == 0 || stored.version > MAX_DEVICE_V1_INTEGER {
             return Err(format!(
-                "unsupported persisted device binding version {}",
+                "invalid persisted device binding version {}",
                 stored.version
             ));
         }
@@ -240,6 +241,14 @@ impl DeviceIdentityV1 {
 
     pub fn binding(&self) -> &DeviceBindingPublicV1 {
         &self.binding
+    }
+
+    pub(crate) fn x25519_secret(&self) -> &X25519StaticSecret {
+        &self.x25519_secret
+    }
+
+    pub(crate) fn ed25519_signing_key(&self) -> &SigningKey {
+        &self.ed25519_signing
     }
 
     /// Sign the device-auth proof over the server ephemeral and device DH.

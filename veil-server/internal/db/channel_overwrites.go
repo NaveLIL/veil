@@ -17,6 +17,13 @@ var ErrInvalidChannelOverwrite = errors.New("invalid channel permission overwrit
 // Server owners and members with the server-wide Administrator bit bypass
 // channel overwrites.
 func (db *DB) GetChannelPermissions(ctx context.Context, channelID, userID string) (uint64, error) {
+	return getChannelPermissions(ctx, db.Pool, channelID, userID)
+}
+
+// getChannelPermissions keeps permission resolution available to security-
+// sensitive callers that must evaluate ACL state inside their own transaction.
+// Both pgx.Pool and pgx.Tx satisfy bindingQuerier.
+func getChannelPermissions(ctx context.Context, query bindingQuerier, channelID, userID string) (uint64, error) {
 	var (
 		owner                       bool
 		basePermissions             int64
@@ -25,7 +32,7 @@ func (db *DB) GetChannelPermissions(ctx context.Context, channelID, userID strin
 		roleAllow, roleDeny         int64
 		memberAllow, memberDeny     int64
 	)
-	err := db.Pool.QueryRow(ctx,
+	err := query.QueryRow(ctx,
 		`WITH channel_scope AS (
 		   SELECT channel.id AS channel_id, channel.server_id, server.owner_id
 		   FROM channels channel
@@ -100,16 +107,45 @@ func (db *DB) GetChannelPermissions(ctx context.Context, channelID, userID strin
 		return 0, err
 	}
 
-	permissions := uint64(basePermissions)
-	if owner || permissions&PermAdministrator != 0 {
-		return permissions | PermAdministrator, nil
+	if !isKnownSignedPermissionMask(basePermissions, AllRolePermissions) ||
+		!isKnownSignedPermissionMask(everyoneAllow, AllChannelPermissions) ||
+		!isKnownSignedPermissionMask(everyoneDeny, AllChannelPermissions) ||
+		!isKnownSignedPermissionMask(roleAllow, AllChannelPermissions) ||
+		!isKnownSignedPermissionMask(roleDeny, AllChannelPermissions) ||
+		!isKnownSignedPermissionMask(memberAllow, AllChannelPermissions) ||
+		!isKnownSignedPermissionMask(memberDeny, AllChannelPermissions) {
+		return 0, fmt.Errorf("%w: database contains an invalid permission mask", ErrInvalidChannelOverwrite)
+	}
+
+	return resolveChannelPermissions(
+		owner, uint64(basePermissions), defaultRoleCount,
+		uint64(everyoneAllow), uint64(everyoneDeny),
+		uint64(roleAllow), uint64(roleDeny),
+		uint64(memberAllow), uint64(memberDeny),
+	)
+}
+
+func isKnownSignedPermissionMask(value int64, known uint64) bool {
+	return value >= 0 && uint64(value)&^known == 0
+}
+
+func resolveChannelPermissions(
+	owner bool,
+	basePermissions uint64,
+	defaultRoleCount int64,
+	everyoneAllow, everyoneDeny uint64,
+	roleAllow, roleDeny uint64,
+	memberAllow, memberDeny uint64,
+) (uint64, error) {
+	if owner || basePermissions&PermAdministrator != 0 {
+		return basePermissions | PermAdministrator, nil
 	}
 	if defaultRoleCount != 1 {
 		return 0, fmt.Errorf("%w: server must have exactly one default role", ErrInvalidChannelOverwrite)
 	}
-	permissions = applyChannelOverwrite(permissions, uint64(everyoneAllow), uint64(everyoneDeny))
-	permissions = applyChannelOverwrite(permissions, uint64(roleAllow), uint64(roleDeny))
-	permissions = applyChannelOverwrite(permissions, uint64(memberAllow), uint64(memberDeny))
+	permissions := applyChannelOverwrite(basePermissions, everyoneAllow, everyoneDeny)
+	permissions = applyChannelOverwrite(permissions, roleAllow, roleDeny)
+	permissions = applyChannelOverwrite(permissions, memberAllow, memberDeny)
 	return permissions, nil
 }
 
@@ -164,11 +200,8 @@ func (db *DB) GetChannelOverwrites(ctx context.Context, channelID string) ([]Cha
 }
 
 func (db *DB) UpsertChannelOverwrite(ctx context.Context, overwrite ChannelOverwrite) error {
-	if overwrite.TargetType != ChannelOverwriteRole && overwrite.TargetType != ChannelOverwriteUser ||
-		overwrite.Allow&^AllChannelPermissions != 0 ||
-		overwrite.Deny&^AllChannelPermissions != 0 ||
-		overwrite.Allow&overwrite.Deny != 0 {
-		return ErrInvalidChannelOverwrite
+	if err := validateChannelOverwrite(overwrite); err != nil {
+		return err
 	}
 	result, err := db.Pool.Exec(ctx,
 		`INSERT INTO channel_overwrites (channel_id, target_id, target_type, allow, deny)
@@ -193,6 +226,16 @@ func (db *DB) UpsertChannelOverwrite(ctx context.Context, overwrite ChannelOverw
 		return fmt.Errorf("%w: %v", ErrInvalidChannelOverwrite, err)
 	}
 	if result.RowsAffected() != 1 {
+		return ErrInvalidChannelOverwrite
+	}
+	return nil
+}
+
+func validateChannelOverwrite(overwrite ChannelOverwrite) error {
+	if overwrite.TargetType != ChannelOverwriteRole && overwrite.TargetType != ChannelOverwriteUser ||
+		overwrite.Allow&^AllChannelPermissions != 0 ||
+		overwrite.Deny&^AllChannelPermissions != 0 ||
+		overwrite.Allow&overwrite.Deny != 0 {
 		return ErrInvalidChannelOverwrite
 	}
 	return nil

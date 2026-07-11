@@ -24,6 +24,7 @@ hex = "0.4"
 rand = "0.8"
 zeroize = { version = "1", features = ["derive"] }
 subtle = "2"
+sha2 = "0.10"
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }

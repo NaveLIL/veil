@@ -15,6 +15,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/AegisSec/veil-server/internal/logsafe"
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 	"google.golang.org/protobuf/proto"
 )
@@ -137,14 +138,14 @@ func (d *Dispatcher) NotifyOffline(ctx context.Context, userID string, env *pb.E
 			d.deliver(context.Background(), userID, env)
 		}()
 	default:
-		d.log.Warn("push: delivery queue saturated", "user", userID)
+		d.log.Warn("push: delivery queue saturated", "user_ref", logsafe.Ref("user", userID))
 	}
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, userID string, env *pb.Envelope) {
 	subs, err := d.store.ListPushSubscriptions(ctx, userID)
 	if err != nil {
-		d.log.Warn("push: list subscriptions failed", "user", userID, "err", err)
+		d.log.Warn("push: list subscriptions failed", "user_ref", logsafe.Ref("user", userID), "error_class", logsafe.ErrorClass(err))
 		return
 	}
 	if len(subs) == 0 {
@@ -170,11 +171,11 @@ func (d *Dispatcher) deliver(ctx context.Context, userID string, env *pb.Envelop
 		)
 		sealed, err := EncodeAndSeal(d.transportKey, envelope)
 		if err != nil {
-			d.log.Warn("push: seal failed", "err", err)
+			d.log.Warn("push: seal failed", "error_class", logsafe.ErrorClass(err))
 			continue
 		}
 		if err := d.post(ctx, sub, sealed); err != nil {
-			d.log.Warn("push: dispatch failed", "endpoint", redact(sub.EndpointURL), "err", err)
+			d.log.Warn("push: dispatch failed", "endpoint_ref", logsafe.Ref("push_endpoint", sub.EndpointURL), "error_class", logsafe.ErrorClass(err))
 			continue
 		}
 		_ = d.store.TouchPushSubscription(ctx, sub.ID)
@@ -219,7 +220,7 @@ func (d *Dispatcher) post(ctx context.Context, sub Subscription, sealed []byte) 
 		// Endpoint is dead — drop the subscription so we stop
 		// hammering ntfy. The user's *other* devices are unaffected.
 		if err := d.store.DeletePushSubscriptionByEndpoint(ctx, sub.UserID, sub.EndpointURL); err != nil {
-			d.log.Warn("push: prune dead subscription failed", "err", err)
+			d.log.Warn("push: prune dead subscription failed", "error_class", logsafe.ErrorClass(err))
 		}
 		return fmt.Errorf("endpoint gone (HTTP %d)", resp.StatusCode)
 	default:
@@ -261,8 +262,9 @@ func jitter(max time.Duration) time.Duration {
 	return time.Duration(n % uint64(max))
 }
 
-// redact strips the path of an endpoint URL for safe logging — ntfy
-// topic IDs are sometimes secret.
+// redact strips the path of an endpoint URL for display. It is deliberately
+// not used by production logs: even the retained origin can be a stable user
+// identifier, so logs must use logsafe.Ref("push_endpoint", raw) instead.
 func redact(u string) string {
 	if i := strings.Index(u, "://"); i >= 0 {
 		host := u[i+3:]

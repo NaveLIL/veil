@@ -1,5 +1,15 @@
 import { Dialog as KDialog } from "@kobalte/core/dialog";
-import { Component, For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js";
+import {
+  Component,
+  For,
+  Show,
+  createEffect,
+  createMemo,
+  createSignal,
+  createUniqueId,
+  onCleanup,
+  onMount,
+} from "solid-js";
 import { Search, MessageCircle, Users, RefreshCw } from "lucide-solid";
 import { invoke } from "@tauri-apps/api/core";
 import { Z } from "@/lib/zIndex";
@@ -61,8 +71,48 @@ export const CommandPalette: Component<Props> = (props) => {
   const [loading, setLoading] = createSignal(false);
   const [rebuilding, setRebuilding] = createSignal(false);
   const [rebuildMsg, setRebuildMsg] = createSignal<string | null>(null);
+  const listboxId = `message-search-${createUniqueId()}`;
 
   let timer: number | undefined;
+  let inputRef: HTMLInputElement | undefined;
+  let previouslyFocused: HTMLElement | null = null;
+  let wasOpen = false;
+  let focusEpoch = 0;
+
+  const captureFocus = () => {
+    if (previouslyFocused) return;
+    const activeElement = typeof document !== "undefined" ? document.activeElement : null;
+    if (activeElement instanceof HTMLElement && activeElement !== document.body) {
+      previouslyFocused = activeElement;
+    }
+  };
+
+  const restoreFocus = () => {
+    const target = previouslyFocused;
+    if (!target) return;
+    previouslyFocused = null;
+    const epoch = ++focusEpoch;
+    queueMicrotask(() => {
+      if (
+        epoch !== focusEpoch
+        || !target?.isConnected
+        || target.hasAttribute("disabled")
+        || target.getAttribute("aria-disabled") === "true"
+      ) return;
+      target.focus({ preventScroll: true });
+    });
+  };
+
+  createEffect(() => {
+    const open = props.open;
+    if (open && !wasOpen) {
+      focusEpoch += 1;
+      captureFocus();
+    } else if (!open && wasOpen) {
+      restoreFocus();
+    }
+    wasOpen = open;
+  });
 
   const runSearch = async (q: string) => {
     if (!q.trim()) {
@@ -115,6 +165,11 @@ export const CommandPalette: Component<Props> = (props) => {
     props.onClose();
   });
 
+  onCleanup(() => {
+    if (timer) window.clearTimeout(timer);
+    if (wasOpen) restoreFocus();
+  });
+
   const conversationsById = createMemo(() => {
     const map = new Map<string, Conversation>();
     for (const c of appStore.conversations()) map.set(c.id, c);
@@ -145,13 +200,26 @@ export const CommandPalette: Component<Props> = (props) => {
     }
   };
 
+  const focusOption = (index: number) => {
+    setActive(index);
+    queueMicrotask(() => {
+      document.getElementById(`${listboxId}-option-${index}`)?.scrollIntoView({ block: "nearest" });
+    });
+  };
+
   const onKeyDown = (e: KeyboardEvent) => {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActive((i) => Math.min(i + 1, Math.max(0, hits().length - 1)));
+      focusOption(Math.min(active() + 1, Math.max(0, hits().length - 1)));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
-      setActive((i) => Math.max(0, i - 1));
+      focusOption(Math.max(0, active() - 1));
+    } else if (e.key === "Home" && hits().length > 0) {
+      e.preventDefault();
+      focusOption(0);
+    } else if (e.key === "End" && hits().length > 0) {
+      e.preventDefault();
+      focusOption(hits().length - 1);
     } else if (e.key === "Enter") {
       const h = hits()[active()];
       if (h) {
@@ -179,7 +247,15 @@ export const CommandPalette: Component<Props> = (props) => {
           "padding-top": "12vh", "pointer-events": "none",
         }}>
           <KDialog.Content
-            onKeyDown={onKeyDown}
+            onOpenAutoFocus={(event) => {
+              captureFocus();
+              event.preventDefault();
+              queueMicrotask(() => inputRef?.focus());
+            }}
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              restoreFocus();
+            }}
             style={{
               "pointer-events": "auto",
               width: "640px", "max-width": "calc(100vw - 32px)",
@@ -195,6 +271,14 @@ export const CommandPalette: Component<Props> = (props) => {
               outline: "none",
             }}
           >
+            <KDialog.Title style={{
+              position: "absolute", width: "1px", height: "1px", padding: "0",
+              margin: "-1px", overflow: "hidden", clip: "rect(0, 0, 0, 0)",
+              "white-space": "nowrap", border: "0",
+            }}>
+              Search messages
+            </KDialog.Title>
+
             {/* Search input row */}
             <div style={{
               display: "flex", "align-items": "center", gap: "10px",
@@ -204,9 +288,17 @@ export const CommandPalette: Component<Props> = (props) => {
             }}>
               <Search size={16} color="var(--veil-text-muted)" />
               <input
-                autofocus
+                ref={inputRef}
+                role="combobox"
+                aria-label="Search messages"
+                aria-autocomplete="list"
+                aria-haspopup="listbox"
+                aria-controls={listboxId}
+                aria-expanded={hits().length > 0}
+                aria-activedescendant={hits().length > 0 ? `${listboxId}-option-${active()}` : undefined}
                 value={query()}
                 onInput={(e) => setQuery(e.currentTarget.value)}
+                onKeyDown={onKeyDown}
                 placeholder="Search messages…"
                 style={{
                   flex: "1", background: "transparent", border: "none", outline: "none",
@@ -216,6 +308,21 @@ export const CommandPalette: Component<Props> = (props) => {
               <Show when={loading()}>
                 <span style={{ "font-size": "11px", color: "var(--veil-text-muted)" }}>…</span>
               </Show>
+              <span
+                role="status"
+                aria-live="polite"
+                style={{
+                  position: "absolute", width: "1px", height: "1px", padding: "0",
+                  margin: "-1px", overflow: "hidden", clip: "rect(0, 0, 0, 0)",
+                  "white-space": "nowrap", border: "0",
+                }}
+              >
+                {loading()
+                  ? "Searching messages"
+                  : query().trim()
+                    ? `${hits().length} search result${hits().length === 1 ? "" : "s"}`
+                    : ""}
+              </span>
             </div>
 
             {/* Results / empty state */}
@@ -223,9 +330,57 @@ export const CommandPalette: Component<Props> = (props) => {
               "flex": "1 1 auto", "min-height": "180px", "max-height": "60vh",
               "overflow-y": "auto",
             }}>
-              <Show
-                when={hits().length > 0}
-                fallback={
+              <div
+                id={listboxId}
+                role="listbox"
+                aria-label="Message search results"
+                aria-busy={loading()}
+                style={{ display: hits().length > 0 ? "block" : "none" }}
+              >
+                <For each={hits()}>
+                  {(h, i) => {
+                    const conv = () => conversationsById().get(h.conversationId);
+                    const title = () => conv()?.name || h.conversationId.slice(0, 8);
+                    return (
+                      <div
+                        id={`${listboxId}-option-${i()}`}
+                        role="option"
+                        aria-selected={active() === i()}
+                        onMouseEnter={() => setActive(i())}
+                        onMouseDown={(event) => event.preventDefault()}
+                        onClick={() => void openHit(h)}
+                        style={{
+                          display: "block", width: "100%", "text-align": "left",
+                          padding: "10px 18px", border: "none",
+                          background: active() === i() ? "color-mix(in srgb, var(--veil-accent) 16%, transparent)" : "transparent",
+                          color: "var(--veil-text)", cursor: "pointer",
+                          "border-bottom": "1px solid var(--veil-border-soft)",
+                          transition: "background 0.1s",
+                        }}
+                      >
+                        <div style={{
+                          display: "flex", "align-items": "center", gap: "8px",
+                          "font-size": "12px", color: "var(--veil-text-muted)", "margin-bottom": "4px",
+                        }}>
+                          {convIcon(conv())}
+                          <span style={{ color: "var(--veil-text)", "font-weight": "500" }}>{title()}</span>
+                          <span style={{ "margin-left": "auto", "font-size": "11px" }}>
+                            {new Date(h.ts).toLocaleString()}
+                          </span>
+                        </div>
+                        <div style={{
+                          "font-size": "13px", "line-height": "1.45",
+                          "white-space": "pre-wrap", "word-break": "break-word",
+                        }}>
+                          {highlight(h.body, query())}
+                        </div>
+                      </div>
+                    );
+                  }}
+                </For>
+              </div>
+
+              <Show when={hits().length === 0}>
                   <div style={{
                     display: "flex", "flex-direction": "column", "align-items": "center",
                     gap: "12px", padding: "40px 18px", color: "var(--veil-text-muted)",
@@ -281,46 +436,6 @@ export const CommandPalette: Component<Props> = (props) => {
                       </Show>
                     </Show>
                   </div>
-                }
-              >
-                <For each={hits()}>
-                  {(h, i) => {
-                    const conv = () => conversationsById().get(h.conversationId);
-                    const title = () => conv()?.name || h.conversationId.slice(0, 8);
-                    return (
-                      <button
-                        type="button"
-                        onMouseEnter={() => setActive(i())}
-                        onClick={() => void openHit(h)}
-                        style={{
-                          display: "block", width: "100%", "text-align": "left",
-                          padding: "10px 18px", border: "none",
-                          background: active() === i() ? "color-mix(in srgb, var(--veil-accent) 16%, transparent)" : "transparent",
-                          color: "var(--veil-text)", cursor: "pointer",
-                          "border-bottom": "1px solid var(--veil-border-soft)",
-                          transition: "background 0.1s",
-                        }}
-                      >
-                        <div style={{
-                          display: "flex", "align-items": "center", gap: "8px",
-                          "font-size": "12px", color: "var(--veil-text-muted)", "margin-bottom": "4px",
-                        }}>
-                          {convIcon(conv())}
-                          <span style={{ color: "var(--veil-text)", "font-weight": "500" }}>{title()}</span>
-                          <span style={{ "margin-left": "auto", "font-size": "11px" }}>
-                            {new Date(h.ts).toLocaleString()}
-                          </span>
-                        </div>
-                        <div style={{
-                          "font-size": "13px", "line-height": "1.45",
-                          "white-space": "pre-wrap", "word-break": "break-word",
-                        }}>
-                          {highlight(h.body, query())}
-                        </div>
-                      </button>
-                    );
-                  }}
-                </For>
               </Show>
             </div>
 

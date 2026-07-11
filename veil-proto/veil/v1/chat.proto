@@ -113,6 +113,12 @@ message MessageEvent {
   bytes roster_commitment = 16;
   bytes sender_device_id = 17;
   bytes target_device_id = 18;
+
+  // Persisted security context for NEW group/channel ciphertext. Empty/zero
+  // means an explicitly legacy/unknown row, never an inferred downgrade.
+  string crypto_profile = 19;        // "sender_key_v5"
+  uint64 crypto_era = 20;            // profile-era version, currently 1
+  uint64 sender_binding_version = 21;
 }
 
 // Клиент → сервер: добавить/убрать реакцию
@@ -164,6 +170,18 @@ message SenderKeyDistribution {
   bytes roster_commitment = 9;     // SHA-256, 32 bytes
   uint64 sender_binding_version = 10;
   uint64 target_binding_version = 11;
+
+  // Exact historical account-authorized sender-device binding. Retained SKDM
+  // restore includes this proof even after the sender account/device left the
+  // conversation, so a recipient can first-install without trusting current
+  // directory membership or accepting a compatibility fallback.
+  bytes sender_account_identity_key = 12;
+  bytes sender_account_signing_key = 13;
+  bytes sender_device_identity_key = 14;
+  bytes sender_device_signing_key = 15;
+  uint64 sender_device_capabilities = 16;
+  uint32 sender_device_binding_status = 17;
+  bytes sender_account_signature = 18;
 }
 
 // Recipient -> server acknowledgement after the exact device installed one

@@ -9,6 +9,7 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/publicerr"
 )
 
 // Handler exposes the REST surface for managing push subscriptions.
@@ -76,7 +77,9 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := validateSubscriptionRequest(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_push_subscription", "invalid push subscription", err,
+		))
 		return
 	}
 	endpoint, err := h.policy.ValidateEndpoint(r.Context(), req.Endpoint)

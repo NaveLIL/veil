@@ -10,6 +10,7 @@ import (
 	"strconv"
 
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/publicerr"
 )
 
 type deviceBindingRequest struct {
@@ -159,7 +160,9 @@ func (h *Handler) PutDeviceBinding(w http.ResponseWriter, r *http.Request) {
 	}
 	bindingInput, err := decodeDeviceBindingRequest(deviceKey, request)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_device_binding", "invalid device binding", err,
+		))
 		return
 	}
 	user, err := h.svc.db.FindUserByID(r.Context(), requesterID)
@@ -169,7 +172,9 @@ func (h *Handler) PutDeviceBinding(w http.ResponseWriter, r *http.Request) {
 	}
 	commitment, err := verifyAccountSignedDeviceBinding(user, bindingInput)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_device_binding_signature", "invalid device binding signature", err,
+		))
 		return
 	}
 	stored, err := h.svc.db.StoreDeviceBinding(r.Context(), &db.DeviceBinding{
@@ -193,7 +198,20 @@ func (h *Handler) PutDeviceBinding(w http.ResponseWriter, r *http.Request) {
 			!errors.Is(err, db.ErrDeviceBindingRevoked) {
 			status = http.StatusBadRequest
 		}
-		writeJSON(w, status, errorResp(err.Error()))
+		mapped := err
+		switch {
+		case errors.Is(err, db.ErrDeviceBindingStale):
+			mapped = publicerr.New(status, "device_binding_stale", "device binding is stale", err)
+		case errors.Is(err, db.ErrDeviceBindingVersionGap):
+			mapped = publicerr.New(status, "device_binding_version_gap", "device binding version is not contiguous", err)
+		case errors.Is(err, db.ErrDeviceKeyReplacement):
+			mapped = publicerr.New(status, "device_key_replacement", "device key replacement is not permitted", err)
+		case errors.Is(err, db.ErrDeviceBindingConflict):
+			mapped = publicerr.New(status, "device_binding_conflict", "device binding conflicts with stored state", err)
+		case errors.Is(err, db.ErrDeviceBindingRevoked):
+			mapped = publicerr.New(status, "device_binding_revoked", "device binding is revoked", err)
+		}
+		publicerr.Write(w, status, mapped)
 		return
 	}
 	writeJSON(w, http.StatusOK, bindingResponse(stored))

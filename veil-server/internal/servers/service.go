@@ -403,18 +403,34 @@ func (s *Service) DeleteChannel(ctx context.Context, channelID, requesterID stri
 // ─── Roles ───────────────────────────────────────────
 
 func (s *Service) authorizeChannelOverwriteManager(ctx context.Context, channelID, requesterID string, allow uint64) (*db.Channel, error) {
+	if allow&^db.AllChannelPermissions != 0 {
+		return nil, db.ErrInvalidChannelOverwrite
+	}
 	channel, err := s.db.GetChannel(ctx, channelID)
 	if err != nil {
 		return nil, errors.New("channel not found")
 	}
 	permissions, err := s.db.GetChannelPermissions(ctx, channelID, requesterID)
-	if err != nil || permissions&db.PermAdministrator == 0 && permissions&db.PermManageChannels == 0 {
+	if err != nil {
 		return nil, errors.New("insufficient permissions")
 	}
-	if permissions&db.PermAdministrator == 0 && allow&^permissions != 0 {
-		return nil, errors.New("cannot grant channel permissions the requester does not possess")
+	if err := validateChannelOverwriteGrant(permissions, allow); err != nil {
+		return nil, err
 	}
 	return channel, nil
+}
+
+func validateChannelOverwriteGrant(permissions, allow uint64) error {
+	if allow&^db.AllChannelPermissions != 0 {
+		return db.ErrInvalidChannelOverwrite
+	}
+	if permissions&db.PermAdministrator == 0 && permissions&db.PermManageChannels == 0 {
+		return errors.New("insufficient permissions")
+	}
+	if permissions&db.PermAdministrator == 0 && allow&^permissions != 0 {
+		return errors.New("cannot grant channel permissions the requester does not possess")
+	}
+	return nil
 }
 
 func (s *Service) ListChannelOverwrites(ctx context.Context, channelID, requesterID string) ([]db.ChannelOverwrite, error) {

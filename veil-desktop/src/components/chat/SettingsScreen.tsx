@@ -310,7 +310,7 @@ export const SettingsScreen: Component = () => {
     sidebarTitle: {
       "font-size": "11px",
       "font-weight": "700",
-      color: "var(--veil-contrast-25)",
+      color: "var(--veil-text-faint)",
       "letter-spacing": "0.12em",
       "text-transform": "uppercase" as const,
       padding: "0 20px",
@@ -324,7 +324,7 @@ export const SettingsScreen: Component = () => {
       height: "36px",
       padding: "0 20px",
       background: active ? "rgba(var(--veil-accent-rgb),0.12)" : "transparent",
-      color: active ? "var(--veil-accent-hi)" : "var(--veil-contrast-45)",
+      color: active ? "var(--veil-accent-hi)" : "var(--veil-text-muted)",
       border: "none",
       cursor: "pointer",
       "font-size": "13px",
@@ -347,7 +347,7 @@ export const SettingsScreen: Component = () => {
     },
     subHeading: {
       "font-size": "13px",
-      color: "var(--veil-contrast-30)",
+      color: "var(--veil-text-faint)",
       "margin-bottom": "28px",
     },
     card: {
@@ -360,7 +360,7 @@ export const SettingsScreen: Component = () => {
     cardTitle: {
       "font-size": "12px",
       "font-weight": "700",
-      color: "var(--veil-contrast-25)",
+      color: "var(--veil-text-faint)",
       "letter-spacing": "0.08em",
       "text-transform": "uppercase" as const,
       "margin-bottom": "14px",
@@ -379,7 +379,7 @@ export const SettingsScreen: Component = () => {
     },
     fieldValue: {
       "font-size": "13px",
-      color: "var(--veil-contrast-40)",
+      color: "var(--veil-text-muted)",
       "font-family": "monospace",
       "max-width": "min(58vw, 620px)",
       overflow: "visible",
@@ -393,7 +393,7 @@ export const SettingsScreen: Component = () => {
       padding: "0 12px",
       "border-radius": "8px",
       background: active ? "var(--veil-success-surface)" : "var(--veil-contrast-04)",
-      color: active ? "var(--veil-success)" : "var(--veil-contrast-40)",
+      color: active ? "var(--veil-success)" : "var(--veil-text-muted)",
       border: `1px solid ${active ? "var(--veil-success-border)" : "var(--veil-contrast-06)"}`,
       "font-size": "11px",
       "font-weight": "500",
@@ -472,7 +472,7 @@ export const SettingsScreen: Component = () => {
       "border-radius": "10px",
       background: "var(--veil-contrast-04)",
       border: "1px solid var(--veil-contrast-06)",
-      color: "var(--veil-contrast-40)",
+      color: "var(--veil-text-muted)",
       cursor: "pointer",
       display: "flex",
       "align-items": "center",
@@ -500,7 +500,7 @@ export const SettingsScreen: Component = () => {
     }),
     paragraph: {
       "font-size": "13px",
-      color: "var(--veil-contrast-40)",
+      color: "var(--veil-text-muted)",
       "line-height": "1.7",
       "margin-bottom": "12px",
     },
@@ -616,7 +616,7 @@ export const SettingsScreen: Component = () => {
                       </For>
                     </div>
                     <div style={{ "font-size": "12px", "font-weight": "700" }}>{theme.name}</div>
-                    <div style={{ "font-size": "10px", color: "var(--veil-contrast-32)", "margin-top": "2px" }}>{theme.description}</div>
+                    <div style={{ "font-size": "10px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>{theme.description}</div>
                   </button>
                 );
               }}
@@ -687,7 +687,7 @@ export const SettingsScreen: Component = () => {
               <button type="button" style={S.btnSecondary} disabled={appearanceStore.busy()} onClick={() => void appearanceStore.removeWallpaper()}>Remove</button>
             </Show>
             <button type="button" style={S.btnSecondary} disabled={appearanceStore.busy()} onClick={() => void appearanceStore.reset()}>Restore Defaults</button>
-            <span style={{ "font-size": "10px", color: "var(--veil-contrast-25)" }}>PNG, JPEG or WebP · re-encoded locally · never uploaded</span>
+            <span style={{ "font-size": "10px", color: "var(--veil-text-faint)" }}>PNG, JPEG or WebP · re-encoded locally · never uploaded</span>
           </div>
 
           <div style={{ "font-size": "10px", color: "var(--veil-contrast-28)", "line-height": "1.5", "margin-bottom": wallpaper() ? "16px" : "0" }}>
@@ -697,18 +697,18 @@ export const SettingsScreen: Component = () => {
           <Show when={wallpaper()}>
             <div style={{ display: "grid", "grid-template-columns": "1fr 1fr", gap: "18px", "margin-bottom": "18px" }}>
               <label style={{ display: "block" }}>
-                <div style={{ display: "flex", "justify-content": "space-between", "font-size": "11px", color: "var(--veil-contrast-45)", "margin-bottom": "7px" }}><span>Dim</span><span>{appearance().wallpaperDim}%</span></div>
+                <div style={{ display: "flex", "justify-content": "space-between", "font-size": "11px", color: "var(--veil-text-muted)", "margin-bottom": "7px" }}><span>Dim</span><span>{appearance().wallpaperDim}%</span></div>
                 <input aria-label="Wallpaper dim" type="range" min="20" max="85" value={appearance().wallpaperDim} disabled={appearanceStore.busy()} style={{ width: "100%", "accent-color": "var(--veil-accent)" }} onInput={(event) => appearanceStore.update({ wallpaperDim: Number(event.currentTarget.value) })} />
               </label>
               <label style={{ display: "block" }}>
-                <div style={{ display: "flex", "justify-content": "space-between", "font-size": "11px", color: "var(--veil-contrast-45)", "margin-bottom": "7px" }}><span>Blur</span><span>{appearance().wallpaperBlur}px</span></div>
+                <div style={{ display: "flex", "justify-content": "space-between", "font-size": "11px", color: "var(--veil-text-muted)", "margin-bottom": "7px" }}><span>Blur</span><span>{appearance().wallpaperBlur}px</span></div>
                 <input aria-label="Wallpaper blur" type="range" min="0" max="24" value={appearance().wallpaperBlur} disabled={appearanceStore.busy()} style={{ width: "100%", "accent-color": "var(--veil-accent)" }} onInput={(event) => appearanceStore.update({ wallpaperBlur: Number(event.currentTarget.value) })} />
               </label>
             </div>
 
             <div style={{ display: "flex", "align-items": "center", gap: "14px", "margin-bottom": "18px" }}>
               <div>
-                <div style={{ "font-size": "11px", color: "var(--veil-contrast-45)", "margin-bottom": "7px" }}>Focus point</div>
+                <div style={{ "font-size": "11px", color: "var(--veil-text-muted)", "margin-bottom": "7px" }}>Focus point</div>
                 <div style={{ display: "grid", "grid-template-columns": "repeat(3, 20px)", gap: "4px" }}>
                   <For each={WALLPAPER_FOCUS_POINTS}>
                     {(point) => {
@@ -901,7 +901,7 @@ export const SettingsScreen: Component = () => {
 
         <Show when={showRecovery() && recoveryConfirmed()}>
           <Show when={recoveryLoading()}>
-            <div style={{ ...S.paragraph, color: "var(--veil-contrast-30)" }}>Loading...</div>
+            <div style={{ ...S.paragraph, color: "var(--veil-text-faint)" }}>Loading...</div>
           </Show>
           <Show when={!recoveryLoading() && recoveryPhrase()}>
             <div style={{
@@ -985,7 +985,7 @@ export const SettingsScreen: Component = () => {
         <div style={S.cardTitle}>Server Configuration</div>
 
         <div style={{ "margin-bottom": "14px" }}>
-          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>WebSocket URL</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-bottom": "6px" }}>WebSocket URL</div>
           <input
             style={S.input}
             value={wsUrl()}
@@ -995,7 +995,7 @@ export const SettingsScreen: Component = () => {
         </div>
 
         <div style={{ "margin-bottom": "18px" }}>
-          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>HTTP API URL</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-bottom": "6px" }}>HTTP API URL</div>
           <input
             style={S.input}
             value={httpUrl()}
@@ -1030,7 +1030,7 @@ export const SettingsScreen: Component = () => {
           <span style={S.fieldLabel}>User ID</span>
           <span style={{
             ...S.fieldValue,
-            color: appStore.userId() ? "var(--veil-contrast-40)" : "var(--veil-contrast-15)",
+            color: appStore.userId() ? "var(--veil-text-muted)" : "var(--veil-text-faint)",
             "font-style": appStore.userId() ? "normal" : ("italic" as const),
           }}>
             {appStore.userId() || "assigned after connecting"}
@@ -1092,7 +1092,7 @@ export const SettingsScreen: Component = () => {
           </div>
           <div>
             <div style={{ "font-size": "18px", "font-weight": "700", color: "var(--veil-text-strong)" }}>Veil</div>
-            <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-top": "2px" }}>Version {appVersion()}</div>
+            <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>Version {appVersion()}</div>
           </div>
         </div>
 
@@ -1184,17 +1184,19 @@ export const SettingsScreen: Component = () => {
         aria-label="Back to chat"
         onClick={goBack}
         onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-08)"; e.currentTarget.style.color = "var(--veil-contrast-70)"; }}
-        onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-contrast-40)"; }}
+        onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-text-muted)"; }}
       >
         <ArrowLeft size={17} strokeWidth={2} />
       </button>
 
       {/* Sidebar navigation */}
-      <div style={S.sidebar}>
+      <div style={S.sidebar} role="navigation" aria-label="Settings">
         <div style={S.sidebarTitle}>Settings</div>
         <For each={SECTIONS}>
           {(s) => (
             <button
+              type="button"
+              aria-current={section() === s.id ? "page" : undefined}
               style={S.navItem(section() === s.id)}
               onClick={() => setSection(s.id)}
               onMouseEnter={(e) => { if (section() !== s.id) e.currentTarget.style.background = "var(--veil-contrast-03)"; }}

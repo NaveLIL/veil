@@ -2,6 +2,12 @@ package logsafe
 
 import (
 	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -32,5 +38,59 @@ func TestEmptyIdentifiersStayAnonymous(t *testing.T) {
 	}
 	if got := p.Ref("user", ""); got != "-" {
 		t.Fatalf("empty ref = %q", got)
+	}
+}
+
+type sensitiveSQLStateError struct {
+	state string
+	text  string
+}
+
+func (e sensitiveSQLStateError) Error() string    { return e.text }
+func (e sensitiveSQLStateError) SQLState() string { return e.state }
+
+func TestErrorClassNeverRendersSensitiveErrorText(t *testing.T) {
+	const raw = "42a565c5-9767-40ea-87fd-please-never-log"
+	tests := []struct {
+		name string
+		err  error
+		want string
+	}{
+		{name: "nil", want: "-"},
+		{name: "canceled", err: fmt.Errorf("user %s: %w", raw, context.Canceled), want: "context_canceled"},
+		{name: "deadline", err: fmt.Errorf("user %s: %w", raw, context.DeadlineExceeded), want: "context_deadline"},
+		{
+			name: "database",
+			err:  fmt.Errorf("insert %s: %w", raw, sensitiveSQLStateError{state: "23505", text: "Key (user_id)=(" + raw + ") already exists"}),
+			want: "database_23505",
+		},
+		{
+			name: "invalid database state",
+			err:  sensitiveSQLStateError{state: raw, text: raw},
+			want: "database_error",
+		},
+		{
+			name: "secret endpoint path",
+			err:  &url.Error{Op: "Post", URL: "https://push.example/" + raw, Err: errors.New(raw)},
+			want: "network_error",
+		},
+		{
+			name: "filesystem path",
+			err:  &os.PathError{Op: "open", Path: "C:/uploads/" + raw, Err: errors.New(raw)},
+			want: "filesystem_error",
+		},
+		{name: "generic", err: errors.New(raw), want: "internal_error"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ErrorClass(tc.err)
+			if got != tc.want {
+				t.Fatalf("ErrorClass() = %q, want %q", got, tc.want)
+			}
+			if strings.Contains(got, raw) {
+				t.Fatalf("ErrorClass leaked raw error data: %q", got)
+			}
+		})
 	}
 }

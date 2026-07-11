@@ -6,6 +6,10 @@ html[data-visual-fixture="true"] body {
   background: var(--veil-window);
 }
 
+html[data-visual-fixture="true"] .veil-lock-rain {
+  visibility: hidden;
+}
+
 .visual-channel-button {
   width: 100%;
   min-height: 34px;

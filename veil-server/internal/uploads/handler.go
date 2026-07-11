@@ -3,6 +3,7 @@ package uploads
 import (
 	"context"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -12,8 +13,11 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/logsafe"
+	"github.com/AegisSec/veil-server/internal/publicerr"
 	"github.com/tus/tusd/v2/pkg/filestore"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
+	expslog "golang.org/x/exp/slog"
 )
 
 // headerVeilUser is the hop-by-hop header bearerMiddleware writes onto
@@ -55,11 +59,17 @@ func New(cfg Config, tokenKey []byte, store Store, logger *slog.Logger) (*Servic
 	h := &hooks{store: store, cfg: cfg, logger: logger}
 
 	tusHandle, err := tusd.NewHandler(tusd.Config{
-		BasePath:                cfg.BasePath,
-		StoreComposer:           composer,
-		MaxSize:                 cfg.MaxUploadSize,
-		DisableDownload:         true,
-		DisableConcatenation:    true,
+		BasePath:             cfg.BasePath,
+		StoreComposer:        composer,
+		MaxSize:              cfg.MaxUploadSize,
+		DisableDownload:      true,
+		DisableConcatenation: true,
+		// tusd's default logger records the raw request path, upload ID,
+		// generated URL and unfiltered storage errors. The gateway access log
+		// already provides bounded route-template observability, while the
+		// hooks below emit pseudonymous failure references, so disable the
+		// third-party request logger at this privacy boundary.
+		Logger:                  expslog.New(expslog.NewTextHandler(io.Discard, nil)),
 		PreUploadCreateCallback: h.PreCreate,
 		PreFinishResponseCallback: func(e tusd.HookEvent) (tusd.HTTPResponse, error) {
 			return h.PreFinish(e)
@@ -110,10 +120,11 @@ func (s *Service) RegisterRoutes(mux *http.ServeMux, signedMw *authmw.Middleware
 	// HEAD/PATCH/DELETE. We mount it via http.StripPrefix so paths
 	// match what tusd expects.
 	tusRoot := strings.TrimSuffix(s.cfg.BasePath, "/")
+	safeTus := publicerr.SanitizeServerErrors(http.StripPrefix(tusRoot, s.tusHandle))
 	mux.Handle(s.cfg.BasePath,
-		s.bearerMiddleware(http.StripPrefix(tusRoot, s.tusHandle)))
+		s.bearerMiddleware(safeTus))
 	mux.Handle(tusRoot,
-		s.bearerMiddleware(http.StripPrefix(tusRoot, s.tusHandle)))
+		s.bearerMiddleware(safeTus))
 
 	// Encrypted-blob download. The stock tusd GET extension would also
 	// work, but we want our own auth gate (cross-user reads must be
@@ -155,8 +166,7 @@ func (s *Service) handleIssueToken(w http.ResponseWriter, r *http.Request) {
 	}
 	tok, exp, err := IssueToken(s.tokenKey, userID, ttl)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError,
-			map[string]string{"error": err.Error()})
+		publicerr.Write(w, http.StatusInternalServerError, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, tokenResponse{
@@ -190,8 +200,9 @@ func (s *Service) bearerMiddleware(next http.Handler) http.HandlerFunc {
 		}
 		userID, err := VerifyToken(s.tokenKey, strings.TrimPrefix(auth, prefix))
 		if err != nil {
-			writeJSON(w, http.StatusUnauthorized,
-				map[string]string{"error": err.Error()})
+			publicerr.Write(w, http.StatusUnauthorized, publicerr.New(
+				http.StatusUnauthorized, "invalid_upload_bearer", "invalid or expired bearer", err,
+			))
 			return
 		}
 		if requiresTusOwnerCheck(r.Method) {
@@ -246,7 +257,7 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 		r.Context(), fileID, r.Header.Get(headerVeilUser),
 	)
 	if err != nil {
-		s.logger.Warn("uploads: download authorization failed", "id", fileID, "err", err)
+		s.logger.Warn("uploads: download authorization failed", "file_ref", logsafe.Ref("file", fileID), "error_class", logsafe.ErrorClass(err))
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "authorization failed"})
 		return
 	}
@@ -299,16 +310,16 @@ func (s *Service) Sweeper(ctx context.Context) {
 func (s *Service) sweepOnce(ctx context.Context) {
 	rows, err := s.store.ListExpiredTusUploads(ctx, time.Now(), 100)
 	if err != nil {
-		s.logger.Warn("uploads: sweep list failed", "err", err)
+		s.logger.Warn("uploads: sweep list failed", "error_class", logsafe.ErrorClass(err))
 		return
 	}
 	for _, row := range rows {
 		if err := s.terminateBlob(ctx, row); err != nil {
-			s.logger.Warn("uploads: terminate failed", "id", row.ID, "err", err)
+			s.logger.Warn("uploads: terminate failed", "file_ref", logsafe.Ref("file", row.ID), "error_class", logsafe.ErrorClass(err))
 			continue
 		}
 		if err := s.store.DeleteTusUpload(ctx, row.ID); err != nil {
-			s.logger.Warn("uploads: delete row failed", "id", row.ID, "err", err)
+			s.logger.Warn("uploads: delete row failed", "file_ref", logsafe.Ref("file", row.ID), "error_class", logsafe.ErrorClass(err))
 		}
 	}
 }

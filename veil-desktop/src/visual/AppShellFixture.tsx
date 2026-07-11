@@ -12,6 +12,7 @@ import {
 import { MembersIsland } from "@/components/layout/MembersIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
+import { LockScreen } from "@/components/chat/LockScreen";
 import type { Role, Server, ServerMember } from "@/stores/app";
 
 const WALLPAPER_URL = "/visual/wallpaper.svg";
@@ -285,6 +286,24 @@ const Sidebar: Component<{ membersOpen: boolean; onToggleMembers: () => void }> 
 
 const Chat: Component<{ focusState: boolean }> = (props) => {
   const [draft, setDraft] = createSignal(props.focusState ? "Draft stays aligned" : "");
+  const [timeline, setTimeline] = createSignal(messages);
+  let composerInput: HTMLTextAreaElement | undefined;
+  let messagesViewport: HTMLDivElement | undefined;
+
+  const sendDraft = () => {
+    const text = draft().trim();
+    if (!text) return;
+    setTimeline((current) => [
+      ...current,
+      { author: "Northern Light", initial: "N", time: "09:51", text },
+    ]);
+    setDraft("");
+    if (composerInput) composerInput.style.height = "21px";
+    requestAnimationFrame(() => {
+      messagesViewport?.scrollTo({ top: messagesViewport.scrollHeight });
+      composerInput?.focus();
+    });
+  };
 
   return (
     <main class="visual-chat-island" data-testid="chat-island" style={islandStyle()}>
@@ -325,7 +344,11 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
         </div>
       </header>
 
-      <div style={{ flex: "1", "overflow-y": "auto", padding: "20px 24px", "min-height": "0" }}>
+      <div
+        ref={messagesViewport}
+        data-testid="messages-viewport"
+        style={{ flex: "1", "overflow-y": "auto", padding: "20px 24px", "min-height": "0" }}
+      >
         <div
           style={{
             display: "flex",
@@ -340,7 +363,7 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
           Today
           <div style={{ height: "1px", background: "var(--veil-border-soft)", flex: "1" }} />
         </div>
-        <For each={messages}>
+        <For each={timeline()}>
           {(message) => (
             <article style={{ display: "flex", gap: "12px", padding: "8px 0" }}>
               <div
@@ -381,6 +404,7 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
       <div style={{ padding: "10px 20px 20px", "flex-shrink": "0" }}>
         <div class="veil-message-composer" data-testid="composer" style={composerStyle}>
           <textarea
+            ref={composerInput}
             class="veil-message-composer-input"
             data-testid="composer-input"
             aria-label="Message secure-lab"
@@ -393,6 +417,12 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
               event.currentTarget.style.height = "21px";
               event.currentTarget.style.height = `${Math.min(event.currentTarget.scrollHeight, 150)}px`;
             }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" && !event.shiftKey) {
+                event.preventDefault();
+                sendDraft();
+              }
+            }}
           />
           <button type="button" class="visual-icon-button" aria-label="Choose emoji">
             <Smile size={16} strokeWidth={1.8} />
@@ -401,6 +431,7 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
             type="button"
             aria-label="Send message"
             disabled={!draft().trim()}
+            onClick={sendDraft}
             style={{
               width: "32px",
               height: "32px",
@@ -425,7 +456,8 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
 export const AppShellFixture: Component = () => {
   const params = new URLSearchParams(window.location.search);
   const state = params.get("state") ?? "wallpaper";
-  const wallpaper = state !== "plain";
+  const lockScreen = state === "lock";
+  const wallpaper = !lockScreen && state !== "plain";
   const [membersOpen, setMembersOpen] = createSignal(state === "members");
 
   return (
@@ -449,34 +481,41 @@ export const AppShellFixture: Component = () => {
         onClose={() => undefined}
       />
 
-      <div class="veil-app-body" data-testid="app-body" style={bodyStyle}>
-        <ServerRail
-          activeServerId="secure-lab"
-          servers={servers}
-          visible={true}
-          onSelectServer={() => undefined}
-          onOpenServerSettings={() => undefined}
-          onCreateServer={() => undefined}
-          onJoinServer={() => undefined}
-        />
-        <Sidebar membersOpen={membersOpen()} onToggleMembers={() => setMembersOpen((open) => !open)} />
-        <Chat focusState={state === "focus"} />
-        <MembersIsland
-          open={membersOpen()}
-          visible={membersOpen()}
-          serverId="secure-lab"
-          serverOwnerId="user-current"
-          currentUserId="user-current"
-          serverMembers={members}
-          serverRoles={roles}
-          groupMembers={[]}
-          onCreateDm={() => undefined}
-          onAssignRole={() => undefined}
-          onUnassignRole={() => undefined}
-          onKickMember={() => undefined}
-          onInviteMember={() => undefined}
-        />
-      </div>
+      <Show
+        when={lockScreen}
+        fallback={(
+          <div class="veil-app-body" data-testid="app-body" style={bodyStyle}>
+            <ServerRail
+              activeServerId="secure-lab"
+              servers={servers}
+              visible={true}
+              onSelectServer={() => undefined}
+              onOpenServerSettings={() => undefined}
+              onCreateServer={() => undefined}
+              onJoinServer={() => undefined}
+            />
+            <Sidebar membersOpen={membersOpen()} onToggleMembers={() => setMembersOpen((open) => !open)} />
+            <Chat focusState={state === "focus"} />
+            <MembersIsland
+              open={membersOpen()}
+              visible={membersOpen()}
+              serverId="secure-lab"
+              serverOwnerId="user-current"
+              currentUserId="user-current"
+              serverMembers={members}
+              serverRoles={roles}
+              groupMembers={[]}
+              onCreateDm={() => undefined}
+              onAssignRole={() => undefined}
+              onUnassignRole={() => undefined}
+              onKickMember={() => undefined}
+              onInviteMember={() => undefined}
+            />
+          </div>
+        )}
+      >
+        <LockScreen />
+      </Show>
     </div>
   );
 };

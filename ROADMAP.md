@@ -1,25 +1,26 @@
 # Security & infrastructure notes (historical companion)
 
-> Status refreshed: 2026-07-11. The canonical product/integration roadmap is
+> Status refreshed: 2026-07-12. The canonical product/integration roadmap is
 > [`INTEGRATION_ROADMAP.md`](INTEGRATION_ROADMAP.md). This file preserves the
 > April hardening notes and design rationale; its old “Next candidates” order
 > is historical and must not override the canonical roadmap.
 
 ## Current status of the W-items
 
-| Item | Status on 2026-07-11 |
+| Item | Status on 2026-07-12 |
 |---|---|
 | W1 — single-process Hub | open; sharding/distributed broker deferred until measured load requires it |
 | W2 — handler coverage | original gap closed with unit/security/integration suites; coverage threshold still open |
 | W3 — `allowUnsigned` bypass | closed; branch/parameter removed and signed REST enforced |
 | W4 — public metrics | closed; metrics use the internal listener |
-| W5 — frontend tests | open; desktop harness and meaningful Android tests are absent |
+| W5 — frontend tests | partial; desktop Vitest/Playwright/a11y/visual harness is active, live-gateway E2E and Android remain |
 | W6 — single-host deploy | open; redundancy, remote backup and restore drill required before public scale |
 | W7 — permissive WS Origin | closed in code/Compose with fail-closed configuration |
-| W8 — Sender-Key rotation | crypto rotation/blocking implemented; cold restore may rotate twice and user-facing UX remains open |
-| W9 — raw user IDs in logs | open; replace with short-lived pseudonymous correlation IDs |
+| W8 — Sender-Key rotation | exact-device rotation, retention, durable receipts and scoped quarantine implemented; transparency/manual-device UX remain |
+| W9 — raw user IDs in logs | closed; HMAC refs, bounded error classes and safe tusd logging are enforced |
 | W10 — WS message rate limit | closed; abuse alerting/auto-disconnect remain optional follow-ups |
 | W11 — profile/avatar privacy boundary | planned in Phase 4D; server-visible profile metadata and a separate sanitized avatar pipeline are required |
+| W12 — internal errors in client responses | closed; fail-closed `publicerr` HTTP/WS/tusd boundary plus AST regression |
 
 The sections below are retained as an engineering journal. Statements such as
 “chat/servers have zero tests”, “allowUnsigned=true” or “Origin defaults to *”
@@ -267,12 +268,12 @@ scaling or compliance milestone hits.
   get lockdown automatically; `/debug/pprof/*` is the obvious next
   thing to register on the same internal mux when needed.
 
-### W5. No frontend tests (desktop or mobile)
-- **Symptom**: state is non-trivial (optimistic message inserts,
-  reconnect with replay, sender-key distribution timing, presence
-  fan-in). Right now any regression is caught by the user.
-- **Ideal fix**: **Vitest + React Testing Library** for store logic
-  and pure components, **Playwright** for end-to-end flows running
+### W5. Frontend test coverage — **PARTIAL**
+- Desktop now has Vitest component/security regressions and Playwright visual,
+  geometry, wallpaper-scroll, keyboard, breakpoint and contrast matrices.
+  The 800×600/125% PIN path and draft/send composer geometry are blocking gates,
+  so those regressions are no longer delegated to the user.
+- Remaining: Playwright end-to-end flows running
   against a disposable gateway (`docker compose -f
   docker-compose.test.yml up`). Target the four flows that hurt most
   on regression: onboarding (mnemonic → keychain → first connect),
@@ -296,24 +297,32 @@ scaling or compliance milestone hits.
 - Deployment smoke tests must continue to verify the production environment
   before each gateway rollout.
 
-### W8. Sender-Key rotation UX — **PARTIAL**
-- Runtime rotation, roster invalidation and fail-closed blocking are present;
-  cold restore rotates at least once because the authoritative roster
-  snapshot/version is not persisted; desktop sync may then force a second
-  rotation, so exact end-to-end behavior still needs a regression test.
-- Remaining work: align channel access with the Phase 4C per-device roster,
-  surface “encryption updated/rotation pending”, and document exact guarantees.
+### W8. Sender-Key rotation UX — **CORE DONE / PRODUCT PARTIAL**
+- Exact-device roster revisions/commitments, immutable retry envelopes,
+  multi-generation retention, durable exact receipts and rollback-resistant
+  binding history are implemented and tested across Go/Rust/SQLCipher.
+- Outgoing replacement/cache invalidation and retained conversation recovery
+  are transactional. A bad conversation quarantines only itself; other DM/group
+  traffic remains usable and the draft stays local.
+- Remaining product/security work: key transparency beyond service-mediated
+  TOFU, manual physical multi-device evidence, device remediation UX and global
+  retention budget/compaction.
 
-### W9. Logging may leak high-cardinality user data
-- **Symptom**: `httpmw.AccessLog` writes `user=<userID>` on every
-  request. In high volume that's a per-user activity ledger sitting
-  in `docker logs`. For a privacy-first messenger that's an
-  uncomfortable artifact.
-- **Ideal fix**: log a per-process **HMAC of the userID** (key
-  derived from a server-side secret rotated daily). Operators can
-  still correlate within a day's worth of logs; an attacker
-  exfiltrating logs cannot tie entries back to user accounts.
-  Configure log retention at 7 days max in compose / journald.
+### W9. Logging may leak high-cardinality user data — **DONE 2026-07-12**
+- Access/runtime logs use short-lived HMAC refs for account, IP, device,
+  conversation, message, file and push endpoint values.
+- Unknown database/network/filesystem causes are logged only as bounded
+  `error_class`; tusd's raw path/upload logger is disabled behind the safe outer
+  route-template access log.
+- Remaining ops policy: reverse proxy/Postgres must disable raw URI and bind-
+  parameter/error-detail logs; production retention stays a deployment concern.
+
+### W12. Internal error disclosure — **DONE 2026-07-12**
+- Shared `publicerr` maps known domain failures to stable safe status/code/message
+  and converts unknown causes to generic responses without changing status.
+- HTTP, WebSocket auth/chat/servers/MLS/push/uploads and tusd 5xx bodies use the
+  boundary. Canary tests include SQL constraints, UUIDs, Windows paths and secret
+  URLs; an AST test forbids `.Error()` calls in transport writers.
 
 ### W10. No rate-limit on WS message types — **DONE 2026-04-23**
 - See "W10 — Per-(user, kind) WS message rate limiting" above.

@@ -31,14 +31,15 @@ import (
 // user runs 4 devices on one account they'll share the bucket. That's
 // intentional — the limit defends the gateway, not the device.
 var wsBucketLimits = map[string]wsLimit{
-	"send_message":    {cap: 120, window: time.Minute}, // 2 msg/s sustained
-	"edit_message":    {cap: 60, window: time.Minute},
-	"delete_message":  {cap: 60, window: time.Minute},
-	"reaction":        {cap: 240, window: time.Minute},
-	"typing":          {cap: 120, window: time.Minute},
-	"presence":        {cap: 60, window: time.Minute},
-	"sender_key_dist": {cap: 60, window: time.Minute},
-	"prekey_request":  {cap: 60, window: time.Minute},
+	"send_message":       {cap: 120, window: time.Minute}, // 2 msg/s sustained
+	"edit_message":       {cap: 60, window: time.Minute},
+	"delete_message":     {cap: 60, window: time.Minute},
+	"reaction":           {cap: 240, window: time.Minute},
+	"typing":             {cap: 120, window: time.Minute},
+	"presence":           {cap: 60, window: time.Minute},
+	"sender_key_dist":    {cap: 60, window: time.Minute},
+	"sender_key_receipt": {cap: 240, window: time.Minute},
+	"prekey_request":     {cap: 60, window: time.Minute},
 	// Friend ops: rare enough that we cap aggressively to make brute-force
 	// scraping cost prohibitive.
 	"friend_request":      {cap: 30, window: time.Minute},

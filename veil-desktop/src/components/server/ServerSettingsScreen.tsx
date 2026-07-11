@@ -3,6 +3,7 @@ import { appStore, type Channel, type Role, type ServerMember } from "@/stores/a
 import { IslandSelect } from "@/components/ui/IslandSelect";
 import { Popover as KPopover } from "@kobalte/core/popover";
 import { Z } from "@/lib/zIndex";
+import { alertDecision, confirmDecision, promptDecision } from "@/lib/decisionDialog";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -192,7 +193,7 @@ export const ServerSettingsScreen: Component = () => {
     sidebarTitle: {
       "font-size": "11px",
       "font-weight": "700",
-      color: "var(--veil-contrast-25)",
+      color: "var(--veil-text-faint)",
       "letter-spacing": "0.12em",
       "text-transform": "uppercase" as const,
       padding: "0 20px",
@@ -226,7 +227,7 @@ export const ServerSettingsScreen: Component = () => {
           : "var(--veil-accent-hi)"
         : danger
           ? "color-mix(in srgb, var(--veil-danger) 55%, transparent)"
-          : "var(--veil-contrast-45)",
+          : "var(--veil-text-muted)",
       border: "none",
       cursor: "pointer",
       "font-size": "13px",
@@ -251,7 +252,7 @@ export const ServerSettingsScreen: Component = () => {
     },
     subHeading: {
       "font-size": "13px",
-      color: "var(--veil-contrast-30)",
+      color: "var(--veil-text-faint)",
       "margin-bottom": "28px",
     },
     card: {
@@ -264,7 +265,7 @@ export const ServerSettingsScreen: Component = () => {
     cardTitle: {
       "font-size": "12px",
       "font-weight": "700",
-      color: "var(--veil-contrast-25)",
+      color: "var(--veil-text-faint)",
       "letter-spacing": "0.08em",
       "text-transform": "uppercase" as const,
       "margin-bottom": "14px",
@@ -283,7 +284,7 @@ export const ServerSettingsScreen: Component = () => {
     },
     fieldValue: {
       "font-size": "13px",
-      color: "var(--veil-contrast-40)",
+      color: "var(--veil-text-muted)",
       "font-family": "monospace",
       "max-width": "320px",
       overflow: "hidden",
@@ -296,7 +297,7 @@ export const ServerSettingsScreen: Component = () => {
       padding: "0 12px",
       "border-radius": "8px",
       background: active ? "var(--veil-success-surface)" : "var(--veil-contrast-04)",
-      color: active ? "var(--veil-success)" : "var(--veil-contrast-40)",
+      color: active ? "var(--veil-success)" : "var(--veil-text-muted)",
       border: `1px solid ${active ? "var(--veil-success-border)" : "var(--veil-contrast-06)"}`,
       "font-size": "11px",
       "font-weight": "500",
@@ -406,7 +407,7 @@ export const ServerSettingsScreen: Component = () => {
       "border-radius": "10px",
       background: "var(--veil-contrast-04)",
       border: "1px solid var(--veil-contrast-06)",
-      color: "var(--veil-contrast-40)",
+      color: "var(--veil-text-muted)",
       cursor: "pointer",
       display: "flex",
       "align-items": "center",
@@ -434,7 +435,7 @@ export const ServerSettingsScreen: Component = () => {
     }),
     paragraph: {
       "font-size": "13px",
-      color: "var(--veil-contrast-40)",
+      color: "var(--veil-text-muted)",
       "line-height": "1.7",
       "margin-bottom": "12px",
     },
@@ -496,7 +497,7 @@ export const ServerSettingsScreen: Component = () => {
         <div style={S.cardTitle}>Server Profile</div>
 
         <div style={{ "margin-bottom": "14px" }}>
-          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>Server Name</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-bottom": "6px" }}>Server Name</div>
           <input
             style={{ ...S.input, "font-family": "inherit" }}
             value={ovName()}
@@ -507,7 +508,7 @@ export const ServerSettingsScreen: Component = () => {
         </div>
 
         <div style={{ "margin-bottom": "14px" }}>
-          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>Description</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-bottom": "6px" }}>Description</div>
           <textarea
             style={S.textarea}
             value={ovDesc()}
@@ -519,7 +520,7 @@ export const ServerSettingsScreen: Component = () => {
         </div>
 
         <div style={{ "margin-bottom": "18px" }}>
-          <div style={{ "font-size": "12px", color: "var(--veil-contrast-30)", "margin-bottom": "6px" }}>Icon URL</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-bottom": "6px" }}>Icon URL</div>
           <input
             style={S.input}
             value={ovIcon()}
@@ -538,7 +539,7 @@ export const ServerSettingsScreen: Component = () => {
           </div>
         </Show>
         <Show when={!isOwner()}>
-          <div style={{ "font-size": "11px", color: "var(--veil-contrast-25)" }}>
+          <div style={{ "font-size": "11px", color: "var(--veil-text-faint)" }}>
             You need <strong>Manage Server</strong> permission to edit these fields.
           </div>
         </Show>
@@ -601,11 +602,16 @@ export const ServerSettingsScreen: Component = () => {
   const removeChannel = async (c: Channel) => {
     const srv = server();
     if (!srv) return;
-    if (!confirm(`Delete channel "#${c.name}"? This cannot be undone.`)) return;
+    if (!await confirmDecision({
+      title: "Delete channel?",
+      message: `Delete #${c.name}? This cannot be undone.`,
+      confirmLabel: "Delete channel",
+      danger: true,
+    })) return;
     try {
       await appStore.deleteChannel(srv.id, c.id);
     } catch (e) {
-      alert(String(e));
+      await alertDecision({ title: "Channel not deleted", message: String(e) });
     }
   };
 
@@ -638,7 +644,7 @@ export const ServerSettingsScreen: Component = () => {
                           {c.channelType === 0 ? "#" : ""}{c.name}
                         </div>
                         <Show when={c.topic}>
-                          <div style={{ "font-size": "11px", color: "var(--veil-contrast-35)", "margin-top": "2px", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                          <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
                             {c.topic}
                           </div>
                         </Show>
@@ -716,12 +722,23 @@ export const ServerSettingsScreen: Component = () => {
   const removeRole = async (r: Role) => {
     const srv = server();
     if (!srv) return;
-    if (r.isDefault) { alert("Cannot delete the default @everyone role."); return; }
-    if (!confirm(`Delete role "${r.name}"?`)) return;
+    if (r.isDefault) {
+      await alertDecision({
+        title: "Role cannot be deleted",
+        message: "The default @everyone role is required by every server.",
+      });
+      return;
+    }
+    if (!await confirmDecision({
+      title: "Delete role?",
+      message: `Delete the role “${r.name}”? Members assigned only to this role may lose permissions.`,
+      confirmLabel: "Delete role",
+      danger: true,
+    })) return;
     try {
       await appStore.deleteRole(srv.id, r.id);
     } catch (e) {
-      alert(String(e));
+      await alertDecision({ title: "Role not deleted", message: String(e) });
     }
   };
   const createNewRole = async () => {
@@ -788,7 +805,7 @@ export const ServerSettingsScreen: Component = () => {
                         <span style={{ ...S.badge("var(--veil-text-muted)"), "margin-left": "8px" }}>Default</span>
                       </Show>
                     </div>
-                    <div style={{ "font-size": "11px", color: "var(--veil-contrast-30)", "margin-top": "2px" }}>
+                    <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>
                       Position {r.position} · Perms 0x{r.permissions.toString(16)}
                     </div>
                   </div>
@@ -818,7 +835,7 @@ export const ServerSettingsScreen: Component = () => {
                 <Show when={editingRole() === r.id}>
                   <div style={{ "padding-top": "14px", "margin-top": "12px", "border-top": "1px solid var(--veil-contrast-04)", display: "flex", "flex-direction": "column", gap: "12px" }}>
                     <div>
-                      <div style={{ "font-size": "11px", color: "var(--veil-contrast-40)", "margin-bottom": "6px" }}>Name</div>
+                      <div style={{ "font-size": "11px", color: "var(--veil-text-muted)", "margin-bottom": "6px" }}>Name</div>
                       <input
                         style={{ ...S.input, height: "32px", "font-family": "inherit" }}
                         value={roleName()}
@@ -827,7 +844,7 @@ export const ServerSettingsScreen: Component = () => {
                       />
                     </div>
                     <div>
-                      <div style={{ "font-size": "11px", color: "var(--veil-contrast-40)", "margin-bottom": "6px" }}>Color</div>
+                      <div style={{ "font-size": "11px", color: "var(--veil-text-muted)", "margin-bottom": "6px" }}>Color</div>
                       <div style={{ display: "flex", "flex-wrap": "wrap", gap: "6px", "align-items": "center" }}>
                         <For each={ROLE_COLORS}>
                           {(c) => {
@@ -873,7 +890,7 @@ export const ServerSettingsScreen: Component = () => {
                       </div>
                     </div>
                     <div>
-                      <div style={{ "font-size": "11px", color: "var(--veil-contrast-40)", "margin-bottom": "8px" }}>
+                      <div style={{ "font-size": "11px", color: "var(--veil-text-muted)", "margin-bottom": "8px" }}>
                         Permissions
                       </div>
                       <div style={{ display: "flex", "flex-direction": "column", gap: "4px" }}>
@@ -909,7 +926,7 @@ export const ServerSettingsScreen: Component = () => {
                                 </div>
                                 <div style={{ flex: "1", "min-width": "0" }}>
                                   <div style={{ "font-weight": "600" }}>{p.label}</div>
-                                  <div style={{ "font-size": "11px", color: "var(--veil-contrast-30)", "margin-top": "1px" }}>
+                                  <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "1px" }}>
                                     {p.desc}
                                   </div>
                                 </div>
@@ -947,12 +964,18 @@ export const ServerSettingsScreen: Component = () => {
   const kickMember = async (m: ServerMember) => {
     const srv = server();
     if (!srv) return;
-    const reason = prompt(`Kick ${m.nickname || m.username}? Optional reason:`);
+    const reason = await promptDecision({
+      title: "Remove server member?",
+      message: `Kick ${m.nickname || m.username} from this server? You may add an optional reason.`,
+      placeholder: "Optional reason",
+      confirmLabel: "Kick member",
+      danger: true,
+    });
     if (reason === null) return;
     try {
       await appStore.kickMember(srv.id, m.userId, reason || undefined);
     } catch (e) {
-      alert(String(e));
+      await alertDecision({ title: "Member not removed", message: String(e) });
     }
   };
   const toggleMemberRole = async (m: ServerMember, r: Role) => {
@@ -965,7 +988,7 @@ export const ServerSettingsScreen: Component = () => {
         await appStore.assignRole(srv.id, m.userId, r.id);
       }
     } catch (e) {
-      alert(String(e));
+      await alertDecision({ title: "Role assignment failed", message: String(e) });
     }
   };
 
@@ -1013,7 +1036,7 @@ export const ServerSettingsScreen: Component = () => {
                         <span style={{ ...S.badge("var(--veil-accent)"), "margin-left": "8px" }}>You</span>
                       </Show>
                     </div>
-                    <div style={{ "font-size": "11px", color: "var(--veil-contrast-30)", "margin-top": "2px", "font-family": "monospace" }}>
+                    <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px", "font-family": "monospace" }}>
                       {m.userId.slice(0, 16)}…
                     </div>
                   </div>
@@ -1073,7 +1096,7 @@ export const ServerSettingsScreen: Component = () => {
                             }}
                           </For>
                           <Show when={roles().filter((r) => !r.isDefault).length === 0}>
-                            <div style={{ padding: "8px 10px", "font-size": "11px", color: "var(--veil-contrast-30)" }}>
+                            <div style={{ padding: "8px 10px", "font-size": "11px", color: "var(--veil-text-faint)" }}>
                               No assignable roles. Create one in Roles tab.
                             </div>
                           </Show>
@@ -1141,12 +1164,17 @@ export const ServerSettingsScreen: Component = () => {
     }
   };
   const revokeInvite = async (code: string) => {
-    if (!confirm(`Revoke invite ${code}?`)) return;
+    if (!await confirmDecision({
+      title: "Revoke invite?",
+      message: `Revoke invite ${code}? Anyone who has not used it will no longer be able to join.`,
+      confirmLabel: "Revoke invite",
+      danger: true,
+    })) return;
     try {
       await appStore.revokeInvite(code);
       await refreshInvites();
     } catch (e) {
-      alert(String(e));
+      await alertDecision({ title: "Invite not revoked", message: String(e) });
     }
   };
 
@@ -1214,7 +1242,7 @@ export const ServerSettingsScreen: Component = () => {
                   <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600", "font-family": "monospace" }}>
                     {code}
                   </div>
-                  <div style={{ "font-size": "11px", color: "var(--veil-contrast-30)", "margin-top": "2px" }}>
+                  <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>
                     Uses: {uses}{maxUses > 0 ? ` / ${maxUses}` : " (unlimited)"}
                     {expiresAt ? ` · Expires ${new Date(expiresAt).toLocaleString()}` : " · Never expires"}
                   </div>
@@ -1259,26 +1287,35 @@ export const ServerSettingsScreen: Component = () => {
   const handleLeave = async () => {
     const srv = server();
     if (!srv) return;
-    if (!confirm(`Leave server "${srv.name}"? You'll need a new invite to rejoin.`)) return;
+    if (!await confirmDecision({
+      title: "Leave server?",
+      message: `Leave “${srv.name}”? You will need a new invite to rejoin.`,
+      confirmLabel: "Leave server",
+      danger: true,
+    })) return;
     try {
       await appStore.leaveServer(srv.id);
       goBack();
     } catch (e) {
-      alert(String(e));
+      await alertDecision({ title: "Could not leave server", message: String(e) });
     }
   };
   const handleDelete = async () => {
     const srv = server();
     if (!srv) return;
-    const confirmation = prompt(
-      `This will permanently delete "${srv.name}" and all its channels and messages.\n\nType the server name to confirm:`,
-    );
+    const confirmation = await promptDecision({
+      title: "Delete server permanently?",
+      message: `This permanently deletes “${srv.name}”, all channels, and all messages for every member.`,
+      requiredValue: srv.name,
+      confirmLabel: "Delete server",
+      danger: true,
+    });
     if (confirmation !== srv.name) return;
     try {
       await appStore.deleteServer(srv.id);
       goBack();
     } catch (e) {
-      alert(String(e));
+      await alertDecision({ title: "Server not deleted", message: String(e) });
     }
   };
 
@@ -1313,7 +1350,7 @@ export const ServerSettingsScreen: Component = () => {
   return (
     <Show when={server()} fallback={
       <div style={{ ...S.overlay, ...animStyle(), "align-items": "center", "justify-content": "center" }}>
-        <div style={{ color: "var(--veil-contrast-40)", "font-size": "13px" }}>Server not found.</div>
+        <div style={{ color: "var(--veil-text-muted)", "font-size": "13px" }}>Server not found.</div>
         <button type="button" style={{ ...S.backBtn, position: "absolute" as const }} onClick={goBack} title="Back to chat" aria-label="Back to chat"><ArrowLeft size={17} strokeWidth={1.8} /></button>
       </div>
     }>
@@ -1326,18 +1363,20 @@ export const ServerSettingsScreen: Component = () => {
           title="Back to chat"
           aria-label="Back to chat"
           onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-08)"; e.currentTarget.style.color = "var(--veil-contrast-70)"; }}
-          onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-contrast-40)"; }}
+          onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-text-muted)"; }}
         >
           <ArrowLeft size={17} strokeWidth={1.8} />
         </button>
 
         {/* Sidebar navigation */}
-        <div style={S.sidebar}>
+        <nav style={S.sidebar} aria-label="Server settings">
           <div style={S.sidebarTitle}>Server</div>
           <div style={S.sidebarServerName}>{server()?.name}</div>
           <For each={SECTIONS}>
             {(s) => (
               <button
+                type="button"
+                aria-current={section() === s.id ? "page" : undefined}
                 style={S.navItem(section() === s.id, s.id === "danger")}
                 onClick={() => setSection(s.id)}
                 onMouseEnter={(e) => { if (section() !== s.id) e.currentTarget.style.background = "var(--veil-contrast-03)"; }}
@@ -1350,10 +1389,10 @@ export const ServerSettingsScreen: Component = () => {
           </For>
 
           <div style={{ flex: "1" }} />
-        </div>
+        </nav>
 
         {/* Content area */}
-        <div style={S.content}>
+        <main style={S.content} id={`server-settings-${section()}`}>
           <Switch>
             <Match when={section() === "overview"}><OverviewSection /></Match>
             <Match when={section() === "channels"}><ChannelsSection /></Match>
@@ -1363,7 +1402,7 @@ export const ServerSettingsScreen: Component = () => {
             <Match when={section() === "audit"}><AuditSection /></Match>
             <Match when={section() === "danger"}><DangerSection /></Match>
           </Switch>
-        </div>
+        </main>
       </div>
     </Show>
   );

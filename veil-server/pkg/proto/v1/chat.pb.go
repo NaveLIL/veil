@@ -693,8 +693,13 @@ type MessageEvent struct {
 	RosterCommitment []byte `protobuf:"bytes,16,opt,name=roster_commitment,json=rosterCommitment,proto3" json:"roster_commitment,omitempty"`
 	SenderDeviceId   []byte `protobuf:"bytes,17,opt,name=sender_device_id,json=senderDeviceId,proto3" json:"sender_device_id,omitempty"`
 	TargetDeviceId   []byte `protobuf:"bytes,18,opt,name=target_device_id,json=targetDeviceId,proto3" json:"target_device_id,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Persisted security context for NEW group/channel ciphertext. Empty/zero
+	// means an explicitly legacy/unknown row, never an inferred downgrade.
+	CryptoProfile        string `protobuf:"bytes,19,opt,name=crypto_profile,json=cryptoProfile,proto3" json:"crypto_profile,omitempty"` // "sender_key_v5"
+	CryptoEra            uint64 `protobuf:"varint,20,opt,name=crypto_era,json=cryptoEra,proto3" json:"crypto_era,omitempty"`            // profile-era version, currently 1
+	SenderBindingVersion uint64 `protobuf:"varint,21,opt,name=sender_binding_version,json=senderBindingVersion,proto3" json:"sender_binding_version,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *MessageEvent) Reset() {
@@ -851,6 +856,27 @@ func (x *MessageEvent) GetTargetDeviceId() []byte {
 		return x.TargetDeviceId
 	}
 	return nil
+}
+
+func (x *MessageEvent) GetCryptoProfile() string {
+	if x != nil {
+		return x.CryptoProfile
+	}
+	return ""
+}
+
+func (x *MessageEvent) GetCryptoEra() uint64 {
+	if x != nil {
+		return x.CryptoEra
+	}
+	return 0
+}
+
+func (x *MessageEvent) GetSenderBindingVersion() uint64 {
+	if x != nil {
+		return x.SenderBindingVersion
+	}
+	return 0
 }
 
 // Клиент → сервер: добавить/убрать реакцию
@@ -1159,8 +1185,19 @@ type SenderKeyDistribution struct {
 	RosterCommitment        []byte                 `protobuf:"bytes,9,opt,name=roster_commitment,json=rosterCommitment,proto3" json:"roster_commitment,omitempty"` // SHA-256, 32 bytes
 	SenderBindingVersion    uint64                 `protobuf:"varint,10,opt,name=sender_binding_version,json=senderBindingVersion,proto3" json:"sender_binding_version,omitempty"`
 	TargetBindingVersion    uint64                 `protobuf:"varint,11,opt,name=target_binding_version,json=targetBindingVersion,proto3" json:"target_binding_version,omitempty"`
-	unknownFields           protoimpl.UnknownFields
-	sizeCache               protoimpl.SizeCache
+	// Exact historical account-authorized sender-device binding. Retained SKDM
+	// restore includes this proof even after the sender account/device left the
+	// conversation, so a recipient can first-install without trusting current
+	// directory membership or accepting a compatibility fallback.
+	SenderAccountIdentityKey  []byte `protobuf:"bytes,12,opt,name=sender_account_identity_key,json=senderAccountIdentityKey,proto3" json:"sender_account_identity_key,omitempty"`
+	SenderAccountSigningKey   []byte `protobuf:"bytes,13,opt,name=sender_account_signing_key,json=senderAccountSigningKey,proto3" json:"sender_account_signing_key,omitempty"`
+	SenderDeviceIdentityKey   []byte `protobuf:"bytes,14,opt,name=sender_device_identity_key,json=senderDeviceIdentityKey,proto3" json:"sender_device_identity_key,omitempty"`
+	SenderDeviceSigningKey    []byte `protobuf:"bytes,15,opt,name=sender_device_signing_key,json=senderDeviceSigningKey,proto3" json:"sender_device_signing_key,omitempty"`
+	SenderDeviceCapabilities  uint64 `protobuf:"varint,16,opt,name=sender_device_capabilities,json=senderDeviceCapabilities,proto3" json:"sender_device_capabilities,omitempty"`
+	SenderDeviceBindingStatus uint32 `protobuf:"varint,17,opt,name=sender_device_binding_status,json=senderDeviceBindingStatus,proto3" json:"sender_device_binding_status,omitempty"`
+	SenderAccountSignature    []byte `protobuf:"bytes,18,opt,name=sender_account_signature,json=senderAccountSignature,proto3" json:"sender_account_signature,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *SenderKeyDistribution) Reset() {
@@ -1268,6 +1305,55 @@ func (x *SenderKeyDistribution) GetTargetBindingVersion() uint64 {
 		return x.TargetBindingVersion
 	}
 	return 0
+}
+
+func (x *SenderKeyDistribution) GetSenderAccountIdentityKey() []byte {
+	if x != nil {
+		return x.SenderAccountIdentityKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderAccountSigningKey() []byte {
+	if x != nil {
+		return x.SenderAccountSigningKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceIdentityKey() []byte {
+	if x != nil {
+		return x.SenderDeviceIdentityKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceSigningKey() []byte {
+	if x != nil {
+		return x.SenderDeviceSigningKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceCapabilities() uint64 {
+	if x != nil {
+		return x.SenderDeviceCapabilities
+	}
+	return 0
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceBindingStatus() uint32 {
+	if x != nil {
+		return x.SenderDeviceBindingStatus
+	}
+	return 0
+}
+
+func (x *SenderKeyDistribution) GetSenderAccountSignature() []byte {
+	if x != nil {
+		return x.SenderAccountSignature
+	}
+	return nil
 }
 
 // Recipient -> server acknowledgement after the exact device installed one
@@ -1420,7 +1506,7 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rDeleteMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12'\n" +
-	"\x0fconversation_id\x18\x02 \x01(\tR\x0econversationId\"\xa2\a\n" +
+	"\x0fconversation_id\x18\x02 \x01(\tR\x0econversationId\"\x9e\b\n" +
 	"\fMessageEvent\x12>\n" +
 	"\n" +
 	"event_type\x18\x01 \x01(\x0e2\x1f.veil.v1.MessageEvent.EventTypeR\teventType\x12\x1d\n" +
@@ -1445,7 +1531,11 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x0eroster_version\x18\x0f \x01(\x04R\rrosterVersion\x12+\n" +
 	"\x11roster_commitment\x18\x10 \x01(\fR\x10rosterCommitment\x12(\n" +
 	"\x10sender_device_id\x18\x11 \x01(\fR\x0esenderDeviceId\x12(\n" +
-	"\x10target_device_id\x18\x12 \x01(\fR\x0etargetDeviceId\"-\n" +
+	"\x10target_device_id\x18\x12 \x01(\fR\x0etargetDeviceId\x12%\n" +
+	"\x0ecrypto_profile\x18\x13 \x01(\tR\rcryptoProfile\x12\x1d\n" +
+	"\n" +
+	"crypto_era\x18\x14 \x01(\x04R\tcryptoEra\x124\n" +
+	"\x16sender_binding_version\x18\x15 \x01(\x04R\x14senderBindingVersion\"-\n" +
 	"\tEventType\x12\a\n" +
 	"\x03NEW\x10\x00\x12\n" +
 	"\n" +
@@ -1484,7 +1574,7 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rPreKeyRequest\x12.\n" +
 	"\x13target_identity_key\x18\x01 \x01(\fR\x11targetIdentityKey\x12-\n" +
 	"\x10target_device_id\x18\x02 \x01(\fH\x00R\x0etargetDeviceId\x88\x01\x01B\x13\n" +
-	"\x11_target_device_id\"\x8f\x04\n" +
+	"\x11_target_device_id\"\xbc\a\n" +
 	"\x15SenderKeyDistribution\x12'\n" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12,\n" +
 	"\x12sender_key_message\x18\x02 \x01(\fR\x10senderKeyMessage\x12\x1e\n" +
@@ -1499,7 +1589,14 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x11roster_commitment\x18\t \x01(\fR\x10rosterCommitment\x124\n" +
 	"\x16sender_binding_version\x18\n" +
 	" \x01(\x04R\x14senderBindingVersion\x124\n" +
-	"\x16target_binding_version\x18\v \x01(\x04R\x14targetBindingVersion\"\x85\x02\n" +
+	"\x16target_binding_version\x18\v \x01(\x04R\x14targetBindingVersion\x12=\n" +
+	"\x1bsender_account_identity_key\x18\f \x01(\fR\x18senderAccountIdentityKey\x12;\n" +
+	"\x1asender_account_signing_key\x18\r \x01(\fR\x17senderAccountSigningKey\x12;\n" +
+	"\x1asender_device_identity_key\x18\x0e \x01(\fR\x17senderDeviceIdentityKey\x129\n" +
+	"\x19sender_device_signing_key\x18\x0f \x01(\fR\x16senderDeviceSigningKey\x12<\n" +
+	"\x1asender_device_capabilities\x18\x10 \x01(\x04R\x18senderDeviceCapabilities\x12?\n" +
+	"\x1csender_device_binding_status\x18\x11 \x01(\rR\x19senderDeviceBindingStatus\x128\n" +
+	"\x18sender_account_signature\x18\x12 \x01(\fR\x16senderAccountSignature\"\x85\x02\n" +
 	"\x10SenderKeyReceipt\x12'\n" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12&\n" +
 	"\x0fowner_device_id\x18\x02 \x01(\fR\rownerDeviceId\x12(\n" +

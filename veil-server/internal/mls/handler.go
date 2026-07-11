@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/AegisSec/veil-server/internal/authmw"
+	"github.com/AegisSec/veil-server/internal/publicerr"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -258,7 +259,12 @@ func (h *Handler) uploadCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.store.InsertCommit(r.Context(), req.ConversationID, req.Epoch, senderUserID, blob); err != nil {
-		writeJSONErr(w, httpStatusForErr(err), err.Error())
+		status := httpStatusForErr(err)
+		mapped := err
+		if errors.Is(err, ErrEpochConflict) {
+			mapped = publicerr.New(status, "mls_epoch_conflict", "MLS epoch already committed", err)
+		}
+		publicerr.Write(w, status, mapped)
 		return
 	}
 	if h.hub != nil {

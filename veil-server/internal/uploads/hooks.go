@@ -77,7 +77,7 @@ func (h *hooks) PreCreate(event tusd.HookEvent) (tusd.HTTPResponse, tusd.FileInf
 			return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
 				rejectError("quota exceeded", 413)
 		}
-		h.logger.Warn("uploads: create row failed", "err", err, "user_ref", logsafe.Ref("user", userID))
+		h.logger.Warn("uploads: create row failed", "error_class", logsafe.ErrorClass(err), "user_ref", logsafe.Ref("user", userID))
 		return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
 			rejectError("could not create upload", 500)
 	}
@@ -92,7 +92,7 @@ func (h *hooks) PreFinish(event tusd.HookEvent) (tusd.HTTPResponse, error) {
 	defer cancel()
 	retainUntil := time.Now().Add(h.cfg.RetentionAfterFinish)
 	if err := h.store.FinishTusUpload(ctx, event.Upload.ID, retainUntil); err != nil {
-		h.logger.Warn("uploads: finish row failed", "err", err, "id", event.Upload.ID)
+		h.logger.Warn("uploads: finish row failed", "error_class", logsafe.ErrorClass(err), "file_ref", logsafe.Ref("file", event.Upload.ID))
 		// Do not acknowledge a completed tus upload until its authorization
 		// row is complete too. A 5xx lets the client retry the final PATCH.
 		return tusd.HTTPResponse{}, rejectError("could not finalize upload", 500)
@@ -120,7 +120,7 @@ func rejectError(msg string, status int) error {
 func generateFileID() (string, error) {
 	b := make([]byte, 16)
 	if _, err := rand.Read(b); err != nil {
-		return "", errors.New("rand: " + err.Error())
+		return "", fmt.Errorf("generate upload id: %w", err)
 	}
 	return hex.EncodeToString(b), nil
 }

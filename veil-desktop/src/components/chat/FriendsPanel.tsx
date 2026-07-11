@@ -1,3 +1,4 @@
+import { Tabs as KTabs } from "@kobalte/core/tabs";
 import { Component, For, Show, createSignal, type JSX } from "solid-js";
 import { appStore, type Friend, type FriendRequest } from "@/stores/app";
 import { Inbox, MessageCircle, UserMinus, Users } from "lucide-solid";
@@ -256,11 +257,6 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
   const incomingRequests = () => appStore.friendRequests().filter((r) => !r.outgoing);
   const onlineFriends = () => appStore.friends().filter((f) => f.status === 1);
 
-  const displayedFriends = () => {
-    if (activeTab() === "online") return onlineFriends();
-    return appStore.friends();
-  };
-
   const handleMessage = async (friend: Friend) => {
     try {
       await appStore.createDm(friend.userId, friend.username);
@@ -282,36 +278,36 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
   ];
 
   return (
-    <div style={{ display: "flex", "flex-direction": "column", height: "100%" }}>
+    <KTabs
+      value={activeTab()}
+      onChange={(value) => setActiveTab(value as FriendsTab)}
+      activationMode="automatic"
+      style={{ display: "flex", "flex-direction": "column", height: "100%" }}
+    >
 
       {/* ── Header ── */}
       <div style={S.header}>
         <span style={{ "font-size": "15px", "font-weight": "700", color: "var(--veil-text-strong)" }}>Friends</span>
         <div style={{ flex: "1" }} />
-        <div style={S.tabBar}>
+        <KTabs.List aria-label="Friends filters" style={S.tabBar}>
           <For each={tabs}>
             {(t) => (
-              <button style={S.tab(activeTab() === t.key)} onClick={() => setActiveTab(t.key)}>
+              <KTabs.Trigger value={t.key} style={S.tab(activeTab() === t.key)}>
                 {t.label}
                 <Show when={t.badge && t.badge() > 0}>
                   <span style={S.badge}>{t.badge!()}</span>
                 </Show>
-              </button>
+              </KTabs.Trigger>
             )}
           </For>
-        </div>
+        </KTabs.List>
       </div>
 
-      {/* ── Content ── */}
-      <div style={S.content}>
-
-        {/* Add Friend tab */}
-        <Show when={activeTab() === "add"}>
+      <KTabs.Content value="add" style={S.content}>
           <AddFriendSection />
-        </Show>
+      </KTabs.Content>
 
-        {/* Pending tab */}
-        <Show when={activeTab() === "pending"}>
+      <KTabs.Content value="pending" style={S.content}>
           <Show
             when={appStore.friendRequests().length > 0}
             fallback={
@@ -330,22 +326,24 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
               {(req) => <RequestItem request={req} />}
             </For>
           </Show>
-        </Show>
+      </KTabs.Content>
 
-        {/* All / Online tabs */}
-        <Show when={activeTab() === "all" || activeTab() === "online"}>
+      <For each={["all", "online"] as const}>
+        {(panel) => (
+          <KTabs.Content value={panel} style={S.content}>
           <Show
-            when={displayedFriends().length > 0}
+            when={(panel === "online" ? onlineFriends() : appStore.friends()).length > 0}
             fallback={
               <div style={S.emptyWrap}>
                 <div style={S.emptyIcon}>
                   <Users size={24} strokeWidth={1.6} color="var(--veil-accent)" />
                 </div>
                 <div style={{ "font-size": "14px", "font-weight": "500", color: "var(--veil-text-subtle)", "margin-bottom": "6px" }}>
-                  {activeTab() === "online" ? "No friends online" : "No friends yet"}
+                  {panel === "online" ? "No friends online" : "No friends yet"}
                 </div>
-                <Show when={activeTab() === "all"}>
+                <Show when={panel === "all"}>
                   <button
+                    type="button"
                     style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer", padding: "4px 8px" }}
                     onClick={() => setActiveTab("add")}
                   >
@@ -356,11 +354,11 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
             }
           >
             <div style={S.sectionLabel}>
-              {activeTab() === "online"
+              {panel === "online"
                 ? `Online \u2014 ${onlineFriends().length}`
                 : `All friends \u2014 ${appStore.friends().length}`}
             </div>
-            <For each={displayedFriends()}>
+            <For each={panel === "online" ? onlineFriends() : appStore.friends()}>
               {(friend) => (
                 <FriendItem
                   friend={friend}
@@ -370,8 +368,9 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
               )}
             </For>
           </Show>
-        </Show>
-      </div>
-    </div>
+          </KTabs.Content>
+        )}
+      </For>
+    </KTabs>
   );
 };

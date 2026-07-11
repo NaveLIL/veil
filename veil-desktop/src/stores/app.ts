@@ -1,5 +1,6 @@
 import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
+import { confirmDecision } from "@/lib/decisionDialog";
 import { listen } from "@tauri-apps/api/event";
 
 // ─── Types ───────────────────────────────────────────
@@ -81,6 +82,12 @@ export interface Message {
   failed?: boolean;
   deliveryUnknown?: boolean;
   replyToId?: string;
+}
+
+export interface ConversationCryptoDiagnostic {
+  conversationId: string;
+  code: string;
+  detail: string;
 }
 
 // ─── Global App State ────────────────────────────────
@@ -169,6 +176,9 @@ const [channelsByServer, setChannelsByServer] = createSignal<Record<string, Chan
 const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
 export type SenderKeyStatus = "checking" | "pending" | "ready" | "error";
 const [senderKeyStatus, setSenderKeyStatus] = createSignal<Record<string, SenderKeyStatus>>({});
+const [conversationCryptoDiagnostics, setConversationCryptoDiagnostics] = createSignal<
+  Record<string, ConversationCryptoDiagnostic>
+>({});
 const [serverMembers, setServerMembers] = createSignal<Record<string, ServerMember[]>>({});
 const [serverRoles, setServerRoles] = createSignal<Record<string, Role[]>>({});
 // Currently-open server settings overlay; null = closed.
@@ -365,6 +375,7 @@ function clearSensitiveUi(): void {
   setChannelsByServer({});
   setActiveChannelId(null);
   setSenderKeyStatus({});
+  setConversationCryptoDiagnostics({});
   setServerMembers({});
   setServerRoles({});
   setServerSettingsId(null);
@@ -442,6 +453,38 @@ function roleFromJSON(v: any): Role {
   };
 }
 
+function cryptoDiagnosticFromJSON(value: any): ConversationCryptoDiagnostic | null {
+  if (
+    !value
+    || typeof value.conversationId !== "string"
+    || typeof value.code !== "string"
+    || typeof value.detail !== "string"
+  ) return null;
+  return {
+    conversationId: value.conversationId,
+    code: value.code,
+    detail: value.detail,
+  };
+}
+
+function replaceConversationCryptoDiagnostics(values: unknown[]): void {
+  const next: Record<string, ConversationCryptoDiagnostic> = {};
+  for (const value of values) {
+    const diagnostic = cryptoDiagnosticFromJSON(value);
+    if (diagnostic) next[diagnostic.conversationId] = diagnostic;
+  }
+  setConversationCryptoDiagnostics(next);
+}
+
+function upsertConversationCryptoDiagnostic(value: unknown): void {
+  const diagnostic = cryptoDiagnosticFromJSON(value);
+  if (!diagnostic) return;
+  setConversationCryptoDiagnostics((previous) => ({
+    ...previous,
+    [diagnostic.conversationId]: diagnostic,
+  }));
+}
+
 export const appStore = {
   screen,
   setScreen,
@@ -470,6 +513,11 @@ export const appStore = {
   activeChannelId,
   setActiveChannelId,
   senderKeyStatus,
+  conversationCryptoDiagnostics,
+  activeConversationCryptoDiagnostic: () => {
+    const conversationId = activeConversationId();
+    return conversationId ? conversationCryptoDiagnostics()[conversationId] ?? null : null;
+  },
   serverMembers,
   serverRoles,
   serverSettingsId,
@@ -564,6 +612,11 @@ export const appStore = {
       });
       requireCurrentUiSession(sessionEpoch);
       setUserId(uid);
+      const diagnostics = await invoke<ConversationCryptoDiagnostic[]>(
+        "get_conversation_crypto_diagnostics",
+      );
+      requireCurrentUiSession(sessionEpoch);
+      replaceConversationCryptoDiagnostics(diagnostics);
       // An authenticated transport without published X3DH prekeys cannot
       // safely receive new DMs. Treat prekey publication as part of connect.
       await invoke("upload_prekeys", { serverHttpUrl: serverHttpUrl() });
@@ -613,11 +666,26 @@ export const appStore = {
     scheduleReconnect(captureUiSessionEpoch(), true);
   },
 
+  refreshConversationCryptoDiagnostics: async (): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const diagnostics = await invoke<ConversationCryptoDiagnostic[]>(
+      "get_conversation_crypto_diagnostics",
+    );
+    requireCurrentUiSession(sessionEpoch);
+    replaceConversationCryptoDiagnostics(diagnostics);
+  },
+
   /** Send a text message to the active conversation. */
   sendMessage: async (text: string, replyToId?: string) => {
     const sessionEpoch = captureUiSessionEpoch();
     const convId = activeConversationId();
     if (!convId) return;
+    const quarantine = conversationCryptoDiagnostics()[convId];
+    if (quarantine) {
+      throw new Error(
+        `Conversation cryptography is unavailable (${quarantine.code}): ${quarantine.detail}`,
+      );
+    }
     try {
       const conversation = appStore.activeConversation();
       if (conversation?.type === "group" || conversation?.type === "channel") {
@@ -1132,10 +1200,16 @@ export const appStore = {
         name,
       });
       requireCurrentUiSession(sessionEpoch);
-      setConversations((prev) => [
-        ...prev,
-        { id: convId, type: "group" as const, name, unreadCount: 0 },
-      ]);
+      try {
+        await appStore.refreshConversationCryptoDiagnostics();
+      } catch (diagnosticError) {
+        rethrowIfStale(diagnosticError);
+        console.warn("created group diagnostic refresh failed:", diagnosticError);
+      }
+      requireCurrentUiSession(sessionEpoch);
+      setConversations((prev) => prev.some((conversation) => conversation.id === convId)
+        ? prev
+        : [...prev, { id: convId, type: "group" as const, name, unreadCount: 0 }]);
       setActiveConversationId(convId);
       return convId;
     } catch (e) {
@@ -1247,7 +1321,7 @@ export const appStore = {
       setActiveConversationId(null);
       return;
     }
-    // Bind the channel's underlying conversation so ChatIsland renders it.
+    // Bind the channel's underlying conversation so the active chat renders it.
     const sid = activeServerId();
     if (!sid) return;
     const ch = (channelsByServer()[sid] ?? []).find((c) => c.id === channelId);
@@ -1980,15 +2054,24 @@ export const appStore = {
       invoke("lock_app").catch((error) => console.error("native auto-lock follow-up failed:", error));
     });
 
-    await listen<{ conversations: number; messages: number; duplicates: number; unavailableHistory: number; retainedSenderKeys: number; edits: number; tombstones: number }>(
+    await listen<{ conversations: number; messages: number; duplicates: number; unavailableHistory: number; retainedSenderKeys: number; edits: number; tombstones: number; unavailableConversations: ConversationCryptoDiagnostic[] }>(
       "veil://sync-complete",
       (event) => {
         if (!acceptsSensitiveEvent()) return;
+        replaceConversationCryptoDiagnostics(event.payload.unavailableConversations ?? []);
         if (event.payload.unavailableHistory > 0) {
           console.warn(
             `offline sync skipped ${event.payload.unavailableHistory} historical message(s) from former members whose identity was never pinned on this device`,
           );
         }
+      },
+    );
+
+    await listen<ConversationCryptoDiagnostic>(
+      "veil://conversation-crypto-unavailable",
+      (event) => {
+        if (!acceptsSensitiveEvent()) return;
+        upsertConversationCryptoDiagnostic(event.payload);
       },
     );
 
@@ -2427,7 +2510,7 @@ export const appStore = {
 
     // Deep links are untrusted OS input. Never create conversations or claim
     // prekeys without an explicit in-app user decision.
-    await listen<string[]>("deep-link://new-url", (event) => {
+    await listen<string[]>("deep-link://new-url", async (event) => {
       if (!acceptsSensitiveEvent()) return;
       const urls = event.payload;
       for (const raw of urls) {
@@ -2440,7 +2523,11 @@ export const appStore = {
             url.protocol === "veil:" &&
             addUserId &&
             canonicalUuid.test(addUserId) &&
-            window.confirm(`Start an encrypted conversation with user ${addUserId}?`)
+            await confirmDecision({
+              title: "Open encrypted conversation?",
+              message: `Veil received a link asking to start a conversation with ${addUserId}. Continue only if you expected this link.`,
+              confirmLabel: "Start conversation",
+            })
           ) {
             void appStore.createDm(addUserId).catch((error) => {
               console.warn("deep-link DM creation failed:", error);

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/AegisSec/veil-server/internal/httpmw"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func TestAccessLog_RecordsStatusAndPseudonymousRefs(t *testing.T) {
@@ -36,7 +37,7 @@ func TestAccessLog_RecordsStatusAndPseudonymousRefs(t *testing.T) {
 	line := buf.String()
 	for _, want := range []string{
 		`method=POST`,
-		`path=/v1/things`,
+		`path=<unmatched>`,
 		`status=418`,
 		`bytes=5`,
 		`user_ref=v1_`,
@@ -50,6 +51,62 @@ func TestAccessLog_RecordsStatusAndPseudonymousRefs(t *testing.T) {
 		if strings.Contains(line, forbidden) {
 			t.Errorf("access log leaked raw identifier %q in: %s", forbidden, line)
 		}
+	}
+}
+
+func TestAccessLog_UsesRouteTemplateWithoutRawPathIdentifiers(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	const rawID = "5a636f65-3ab4-48b9-84b8-f4996ab73c88"
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/users/{userID}", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})
+	h := httpmw.AccessLogWithPseudonymSecret(logger, bytes.Repeat([]byte{0x51}, 32))(mux)
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/users/"+rawID, nil))
+
+	line := buf.String()
+	if !strings.Contains(line, `path=/v1/users/{userID}`) {
+		t.Fatalf("access log missing matched template: %s", line)
+	}
+	if strings.Contains(line, rawID) {
+		t.Fatalf("access log leaked raw path identifier: %s", line)
+	}
+
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundTemplate := false
+	for _, family := range families {
+		if family.GetName() != "veil_http_requests_total" {
+			continue
+		}
+		for _, metric := range family.GetMetric() {
+			for _, label := range metric.GetLabel() {
+				if strings.Contains(label.GetValue(), rawID) {
+					t.Fatalf("HTTP metric label leaked raw path identifier: %s", label.GetValue())
+				}
+				if label.GetName() == "path" && label.GetValue() == "/v1/users/{userID}" {
+					foundTemplate = true
+				}
+			}
+		}
+	}
+	if !foundTemplate {
+		t.Fatal("HTTP metrics did not record the matched route template")
+	}
+}
+
+func TestAccessLog_UnmatchedIdentifierPathIsCollapsed(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	const rawID = "deec5a64-c948-4138-a39f-2f6509da4729"
+	h := httpmw.AccessLog(logger)(http.NotFoundHandler())
+	h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/v1/users/"+rawID, nil))
+	if line := buf.String(); !strings.Contains(line, `path=<unmatched>`) || strings.Contains(line, rawID) {
+		t.Fatalf("unsafe unmatched access log: %s", line)
 	}
 }
 

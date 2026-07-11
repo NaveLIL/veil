@@ -8,22 +8,46 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var (
-	ErrStaleSenderKeyGeneration    = errors.New("stale sender key generation")
-	ErrSenderKeyGenerationConflict = errors.New("sender key generation already has a different commitment")
-	ErrSenderKeyConversationType   = errors.New("sender keys require a group or channel conversation")
-	ErrSenderKeyReceiptMismatch    = errors.New("sender key receipt does not match an exact pending device distribution")
-	ErrReplyTargetMismatch         = errors.New("reply target does not belong to conversation")
-	ErrMessageMutationScope        = errors.New("message mutation scope mismatch")
-	ErrAttachmentScope             = errors.New("attachment is unavailable or not owned by sender")
+	ErrStaleSenderKeyGeneration         = errors.New("stale sender key generation")
+	ErrSenderKeyGenerationConflict      = errors.New("sender key generation already has a different commitment")
+	ErrSenderKeyConversationType        = errors.New("sender keys require a group or channel conversation")
+	ErrSenderKeyReceiptMismatch         = errors.New("sender key receipt does not match an exact pending device distribution")
+	ErrSenderKeyRetentionFull           = errors.New("sender key retention limit reached for target device")
+	ErrSenderKeyRetentionExpired        = errors.New("sender key receipt deadline expired for target device")
+	ErrSenderKeyTargetBacklogFull       = errors.New("sender key target backlog limit reached")
+	ErrSenderKeyRestoreBacklogExceeded  = errors.New("sender key restore backlog exceeds the safe login bound")
+	ErrSenderKeyConversationUnavailable = errors.New("sender key conversation is not ready for restore")
+	ErrSenderKeyLegacyState             = errors.New("legacy account-routed sender key state is unsupported")
+	ErrSenderKeyRosterChanged           = errors.New("sender key device roster changed before durable admission")
+	ErrReplyTargetMismatch              = errors.New("reply target does not belong to conversation")
+	ErrMessageMutationScope             = errors.New("message mutation scope mismatch")
+	ErrAttachmentScope                  = errors.New("attachment is unavailable or not owned by sender")
+	ErrMessageSecurityContext           = errors.New("message security context does not match the conversation")
+	ErrMessageRosterChanged             = errors.New("message roster changed before durable admission")
+	ErrConversationAccessDenied         = errors.New("conversation access denied")
 )
 
 const maxUnusedOneTimePreKeysPerDevice = 100
+
+const (
+	MaxPendingSenderKeyGenerationsPerStream = 128
+	SenderKeyReceiptTTL                     = 90 * 24 * time.Hour
+	MaxPendingSenderKeyRowsPerTarget        = 2048
+	MaxPendingSenderKeyBytesPerTarget       = 4 * 1024 * 1024
+)
+
+const (
+	MessageCryptoProfileSenderKeyV5 = "sender_key_v5"
+	MessageCryptoEraSenderKeyV5     = uint64(1)
+)
 
 // --- Users ---
 
@@ -247,6 +271,20 @@ type Message struct {
 	IsDeleted         bool
 	CreatedAt         time.Time
 	Attachments       []MessageAttachment
+	SecurityContext   *MessageSecurityContext
+}
+
+// MessageSecurityContext is the immutable, persisted authorization snapshot
+// for a Sender-Key group/channel ciphertext. SenderDeviceDatabaseID is used
+// only while admitting a new row and is never returned on the wire.
+type MessageSecurityContext struct {
+	CryptoProfile          string
+	CryptoEra              uint64
+	RosterVersion          uint64
+	RosterCommitment       []byte
+	SenderDeviceID         []byte
+	SenderBindingVersion   uint64
+	SenderDeviceDatabaseID string
 }
 
 type MessageAttachment struct {
@@ -261,15 +299,88 @@ type MessageAttachment struct {
 
 // StoreMessage persists an encrypted message.
 func (db *DB) StoreMessage(ctx context.Context, m *Message) error {
-	tx, err := db.Pool.Begin(ctx)
+	if m == nil || m.ConversationID == "" || m.SenderID == "" || len(m.Ciphertext) == 0 {
+		return errors.New("invalid message")
+	}
+	attempts := 1
+	if m.SecurityContext != nil {
+		attempts = 3
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		err := db.storeMessageOnce(ctx, m)
+		if !isSenderKeySerializationFailure(err) {
+			return err
+		}
+	}
+	return ErrMessageRosterChanged
+}
+
+func (db *DB) storeMessageOnce(ctx context.Context, m *Message) error {
+	txOptions := pgx.TxOptions{}
+	if m.SecurityContext != nil {
+		txOptions.IsoLevel = pgx.Serializable
+	}
+	tx, err := db.Pool.BeginTx(ctx, txOptions)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
+	var conversationType int16
+	if err := tx.QueryRow(ctx,
+		`SELECT conv_type FROM conversations WHERE id = $1::uuid FOR UPDATE`,
+		m.ConversationID,
+	).Scan(&conversationType); err != nil {
+		return err
+	}
+	if conversationType == 1 || conversationType == 2 {
+		if err := validateMessageSecurityContext(m.SecurityContext); err != nil {
+			return err
+		}
+		var lockedDeviceID string
+		if err := tx.QueryRow(ctx,
+			`SELECT id::text FROM devices
+			 WHERE id = $1::uuid AND user_id = $2::uuid FOR UPDATE`,
+			m.SecurityContext.SenderDeviceDatabaseID, m.SenderID,
+		).Scan(&lockedDeviceID); err != nil {
+			return ErrMessageSecurityContext
+		}
+		roster, err := resolveConversationDeviceRosterSnapshot(
+			ctx, tx, m.ConversationID, RequiredChannelCapabilities,
+		)
+		if err != nil {
+			if errors.Is(err, ErrSenderKeyRosterChanged) {
+				return ErrMessageRosterChanged
+			}
+			return err
+		}
+		if err := validateMessageRosterSnapshot(
+			ctx, tx, roster, m.ConversationID, m.SenderID, m.SecurityContext,
+		); err != nil {
+			return err
+		}
+	} else if m.SecurityContext != nil {
+		return ErrMessageSecurityContext
+	}
+
+	var securityProfile, rosterCommitment, senderDeviceID any
+	var securityEra, rosterVersion, senderBindingVersion any
+	if m.SecurityContext != nil {
+		securityProfile = m.SecurityContext.CryptoProfile
+		securityEra = int64(m.SecurityContext.CryptoEra)
+		rosterVersion = int64(m.SecurityContext.RosterVersion)
+		rosterCommitment = m.SecurityContext.RosterCommitment
+		senderDeviceID = m.SecurityContext.SenderDeviceID
+		senderBindingVersion = int64(m.SecurityContext.SenderBindingVersion)
+	}
 
 	err = tx.QueryRow(ctx,
-		`INSERT INTO messages (conversation_id, sender_id, ciphertext, header, msg_type, reply_to_id, expires_at)
-		 SELECT $1::uuid, $2::uuid, $3, $4, $5, $6::uuid, $7
+		`INSERT INTO messages (
+		   conversation_id, sender_id, ciphertext, header, msg_type, reply_to_id, expires_at,
+		   crypto_profile, crypto_era, roster_version, roster_commitment,
+		   sender_device_id, sender_binding_version
+		 )
+		 SELECT $1::uuid, $2::uuid, $3, $4, $5, $6::uuid, $7,
+		        $8, $9, $10, $11, $12, $13
 		 WHERE $6::uuid IS NULL OR EXISTS (
 		   SELECT 1 FROM messages reply
 		   WHERE reply.id = $6::uuid
@@ -278,6 +389,7 @@ func (db *DB) StoreMessage(ctx context.Context, m *Message) error {
 		 )
 		 RETURNING id, created_at`,
 		m.ConversationID, m.SenderID, m.Ciphertext, m.Header, m.MsgType, m.ReplyToID, m.ExpiresAt,
+		securityProfile, securityEra, rosterVersion, rosterCommitment, senderDeviceID, senderBindingVersion,
 	).Scan(&m.ID, &m.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) && m.ReplyToID != nil {
 		return ErrReplyTargetMismatch
@@ -312,13 +424,135 @@ func (db *DB) StoreMessage(ctx context.Context, m *Message) error {
 	return tx.Commit(ctx)
 }
 
-// GetPendingMessages returns the authoritative current rows from one
-// conversation for a member since a creation-time keyset boundary. It
-// intentionally includes caller-owned, edited, deleted and expired rows so a
-// full replay can reconcile local state after being offline. The REST handler
-// redacts ciphertext for deleted/expired tombstones. Both IDs are part of the
-// query so rows from another conversation can never cross the BOLA boundary.
+func validateMessageSecurityContext(security *MessageSecurityContext) error {
+	if security == nil || security.CryptoProfile != MessageCryptoProfileSenderKeyV5 ||
+		security.CryptoEra != MessageCryptoEraSenderKeyV5 ||
+		security.RosterVersion == 0 || security.RosterVersion > math.MaxInt64 ||
+		len(security.RosterCommitment) != 32 || len(security.SenderDeviceID) != 16 ||
+		security.SenderBindingVersion == 0 || security.SenderBindingVersion > math.MaxInt64 ||
+		security.SenderDeviceDatabaseID == "" {
+		return ErrMessageSecurityContext
+	}
+	return nil
+}
+
+func validateMessageRosterSnapshot(ctx context.Context, tx pgx.Tx, roster *ConversationDeviceRoster, conversationID, senderUserID string, security *MessageSecurityContext) error {
+	if roster == nil || !roster.Ready || security == nil ||
+		roster.Version != security.RosterVersion ||
+		!bytes.Equal(roster.Commitment[:], security.RosterCommitment) {
+		return ErrMessageRosterChanged
+	}
+	senderFound := false
+	for memberIndex := range roster.Members {
+		member := &roster.Members[memberIndex]
+		if member.UserID != senderUserID {
+			continue
+		}
+		for deviceIndex := range member.Devices {
+			device := &member.Devices[deviceIndex]
+			if device.DeviceID != security.SenderDeviceDatabaseID {
+				continue
+			}
+			if !device.Eligible || device.Binding == nil ||
+				device.Binding.Status != DeviceBindingActive ||
+				device.Binding.Capabilities&RequiredChannelCapabilities != RequiredChannelCapabilities ||
+				device.Binding.Version != security.SenderBindingVersion ||
+				!bytes.Equal(device.DeviceKey, security.SenderDeviceID) {
+				return ErrMessageRosterChanged
+			}
+			senderFound = true
+		}
+	}
+	if !senderFound {
+		return ErrMessageRosterChanged
+	}
+	canSend, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, senderUserID,
+		ChannelReadPermissions|PermSendMessages,
+	)
+	if err != nil {
+		return err
+	}
+	if !canSend {
+		return ErrMessageRosterChanged
+	}
+	return nil
+}
+
+type ConversationHistoryPage struct {
+	Messages    []Message
+	Reactions   []Reaction
+	Attachments []MessageAttachment
+}
+
+// GetPendingMessages is the narrow sync API used by non-HTTP callers. It uses
+// the same all-or-nothing authorized snapshot as the REST history page.
 func (db *DB) GetPendingMessages(ctx context.Context, conversationID, userID string, after time.Time, afterID string, limit int) ([]Message, error) {
+	page, err := db.GetConversationHistoryPage(
+		ctx, conversationID, userID, after, afterID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return page.Messages, nil
+}
+
+// GetConversationHistoryPage authorizes and reads ciphertext, reactions and
+// encrypted attachment descriptors from one repeatable-read snapshot. A
+// committed revoke cannot land between a handler precheck and any related
+// read, and an error returns no partial page.
+func (db *DB) GetConversationHistoryPage(ctx context.Context, conversationID, userID string, after time.Time, afterID string, limit int) (*ConversationHistoryPage, error) {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	// Authorization and ciphertext are read from one MVCC snapshot. A role or
+	// history revocation that committed before this transaction's first read is
+	// therefore authoritative; a request that won the snapshot first is
+	// explicitly linearized before that revocation.
+	allowed, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, userID, ChannelReadPermissions,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, ErrConversationAccessDenied
+	}
+	messages, err := getPendingMessagesWithQuery(
+		ctx, tx, conversationID, userID, after, afterID, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	messageIDs := make([]string, 0, len(messages))
+	for _, message := range messages {
+		messageIDs = append(messageIDs, message.ID)
+	}
+	reactions, err := getReactionsForMessagesWithQuery(ctx, tx, messageIDs)
+	if err != nil {
+		return nil, err
+	}
+	attachments, err := getAttachmentsForMessagesWithQuery(ctx, tx, messageIDs)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &ConversationHistoryPage{
+		Messages: messages, Reactions: reactions, Attachments: attachments,
+	}, nil
+}
+
+// getPendingMessagesWithQuery returns authoritative current rows since a
+// creation-time keyset boundary through the caller's authorized snapshot.
+// Deleted/expired rows are included so clients can reconcile tombstones.
+func getPendingMessagesWithQuery(ctx context.Context, query rosterQuerier, conversationID, userID string, after time.Time, afterID string, limit int) ([]Message, error) {
 	predicate := `m.created_at > $3`
 	args := []any{userID, conversationID, after, limit}
 	limitPlaceholder := "$4"
@@ -330,11 +564,13 @@ func (db *DB) GetPendingMessages(ctx context.Context, conversationID, userID str
 		limitPlaceholder = "$5"
 	}
 
-	rows, err := db.Pool.Query(ctx,
+	rows, err := query.Query(ctx,
 		`SELECT m.id, m.conversation_id, m.sender_id,
 		        u.identity_key, u.signing_key,
 		        m.ciphertext, m.header, m.msg_type, m.reply_to_id, m.expires_at,
-		        m.edited_at, m.is_deleted, m.created_at
+		        m.edited_at, m.is_deleted, m.created_at,
+		        m.crypto_profile, m.crypto_era, m.roster_version,
+		        m.roster_commitment, m.sender_device_id, m.sender_binding_version
 		 FROM messages m
 		 JOIN conversation_members cm ON cm.conversation_id = m.conversation_id
 		 JOIN users u ON u.id = m.sender_id
@@ -346,29 +582,55 @@ func (db *DB) GetPendingMessages(ctx context.Context, conversationID, userID str
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var msgs []Message
 	for rows.Next() {
 		var m Message
+		var profile *string
+		var era, rosterVersion, senderBindingVersion *int64
+		var rosterCommitment, senderDeviceID []byte
 		if err := rows.Scan(&m.ID, &m.ConversationID, &m.SenderID,
 			&m.SenderIdentityKey, &m.SenderSigningKey, &m.Ciphertext, &m.Header,
-			&m.MsgType, &m.ReplyToID, &m.ExpiresAt, &m.EditedAt, &m.IsDeleted, &m.CreatedAt); err != nil {
+			&m.MsgType, &m.ReplyToID, &m.ExpiresAt, &m.EditedAt, &m.IsDeleted, &m.CreatedAt,
+			&profile, &era, &rosterVersion, &rosterCommitment, &senderDeviceID, &senderBindingVersion,
+		); err != nil {
+			rows.Close()
 			return nil, err
+		}
+		if profile != nil || era != nil || rosterVersion != nil || rosterCommitment != nil ||
+			senderDeviceID != nil || senderBindingVersion != nil {
+			if profile == nil || era == nil || rosterVersion == nil || len(rosterCommitment) != 32 ||
+				len(senderDeviceID) != 16 || senderBindingVersion == nil || *era <= 0 ||
+				*rosterVersion <= 0 || *senderBindingVersion <= 0 {
+				return nil, ErrMessageSecurityContext
+			}
+			m.SecurityContext = &MessageSecurityContext{
+				CryptoProfile:        *profile,
+				CryptoEra:            uint64(*era),
+				RosterVersion:        uint64(*rosterVersion),
+				RosterCommitment:     append([]byte(nil), rosterCommitment...),
+				SenderDeviceID:       append([]byte(nil), senderDeviceID...),
+				SenderBindingVersion: uint64(*senderBindingVersion),
+			}
 		}
 		msgs = append(msgs, m)
 	}
-	return msgs, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	return msgs, nil
 }
 
-// GetAttachmentsForMessages returns encrypted attachment descriptors in their
-// sender-declared order. The referenced tus row must still exist; retention
-// deletion cascades the stale descriptor.
-func (db *DB) GetAttachmentsForMessages(ctx context.Context, messageIDs []string) ([]MessageAttachment, error) {
+// getAttachmentsForMessagesWithQuery is intentionally transaction-scoped;
+// callers cannot fetch wrapped attachment keys without an authorized history
+// snapshot. The referenced tus row must still exist.
+func getAttachmentsForMessagesWithQuery(ctx context.Context, query rosterQuerier, messageIDs []string) ([]MessageAttachment, error) {
 	if len(messageIDs) == 0 {
 		return []MessageAttachment{}, nil
 	}
-	rows, err := db.Pool.Query(ctx,
+	rows, err := query.Query(ctx,
 		`SELECT attachment.message_id, attachment.file_id, attachment.position,
 		        attachment.encrypted_key, attachment.nonce, attachment.size_bytes,
 		        attachment.content_type
@@ -403,9 +665,16 @@ func (db *DB) UpdateMessageCiphertext(ctx context.Context, messageID, senderID, 
 	var convID string
 	var editedAt time.Time
 	err := db.Pool.QueryRow(ctx,
-		`UPDATE messages SET ciphertext = $1, header = $2, edited_at = now()
-		 WHERE id = $3::uuid AND sender_id = $4::uuid AND conversation_id = $5::uuid AND is_deleted = false
-		 RETURNING conversation_id, edited_at`,
+		`UPDATE messages message
+		 SET ciphertext = $1, header = $2, edited_at = now()
+		 FROM conversations conversation
+		 WHERE message.id = $3::uuid
+		   AND message.sender_id = $4::uuid
+		   AND message.conversation_id = $5::uuid
+		   AND message.is_deleted = false
+		   AND conversation.id = message.conversation_id
+		   AND conversation.conv_type = 0
+		 RETURNING message.conversation_id, message.edited_at`,
 		newCiphertext, newHeader, messageID, senderID, conversationID,
 	).Scan(&convID, &editedAt)
 	if err != nil {
@@ -524,16 +793,12 @@ func (db *DB) ListUserConversations(ctx context.Context, userID string, after ti
 
 		for _, candidate := range candidates {
 			scanAfter, scanAfterID = candidate.CreatedAt, candidate.ID
-			allowed, err := db.CanAccessConversation(ctx, candidate.ID, userID, ChannelReadPermissions)
-			if err != nil {
-				return nil, err
-			}
-			if !allowed {
+			candidate.Members, err = db.GetConversationMemberBindingsForRequester(
+				ctx, candidate.ID, userID, ChannelReadPermissions,
+			)
+			if errors.Is(err, ErrConversationAccessDenied) {
 				continue
 			}
-			candidate.Members, err = db.GetAuthorizedConversationMemberBindings(
-				ctx, candidate.ID, ChannelReadPermissions,
-			)
 			if err != nil {
 				return nil, err
 			}
@@ -820,12 +1085,6 @@ func (db *DB) GetMemberRole(ctx context.Context, convID, userID string) (int16, 
 	return role, err
 }
 
-// StoreSenderKey persists an encrypted sender key distribution for one target
-// device. See StoreSenderKeys for atomic multi-device fan-out.
-func (db *DB) StoreSenderKey(ctx context.Context, convID, ownerDeviceID, targetDeviceID string, encryptedKey []byte, generation uint32) error {
-	return db.StoreSenderKeys(ctx, convID, ownerDeviceID, []string{targetDeviceID}, encryptedKey, generation)
-}
-
 type senderKeyWrite struct {
 	targetDeviceID       string
 	encryptedKey         []byte
@@ -873,31 +1132,60 @@ func (db *DB) StoreDeviceSenderKey(ctx context.Context, convID, ownerDeviceID, t
 	}})
 }
 
-// StoreSenderKeys atomically appends an authenticated distribution for every
-// target device. All unacknowledged generations remain retained for offline
-// delivery. A stream's high-water mark prevents rollback, and the first
-// envelope accepted for a generation is immutable: an equal-generation retry
-// succeeds only when both its commitment and bytes are exactly identical.
-func (db *DB) StoreSenderKeys(ctx context.Context, convID, ownerDeviceID string, targetDeviceIDs []string, encryptedKey []byte, generation uint32) error {
-	if len(targetDeviceIDs) == 0 {
-		return errors.New("at least one target device required")
-	}
-	writes := make([]senderKeyWrite, 0, len(targetDeviceIDs))
-	for _, targetDeviceID := range targetDeviceIDs {
-		writes = append(writes, senderKeyWrite{
-			targetDeviceID: targetDeviceID,
-			encryptedKey:   append([]byte(nil), encryptedKey...),
-		})
-	}
-	return db.storeSenderKeyWrites(ctx, convID, ownerDeviceID, generation, writes)
-}
-
 func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID string, generation uint32, writes []senderKeyWrite) error {
 	if convID == "" || ownerDeviceID == "" || len(writes) == 0 || generation == 0 {
 		return errors.New("invalid sender key distribution")
 	}
+	deviceRouted := writes[0].deviceRouted
+	for _, write := range writes[1:] {
+		if write.deviceRouted != deviceRouted {
+			return errors.New("mixed sender key routing modes")
+		}
+	}
+	if deviceRouted {
+		targets := make(map[string]struct{}, len(writes))
+		for _, write := range writes {
+			if write.targetDeviceID == "" {
+				return errors.New("target device id required")
+			}
+			targets[write.targetDeviceID] = struct{}{}
+		}
+		orderedTargets := make([]string, 0, len(targets))
+		for targetDeviceID := range targets {
+			orderedTargets = append(orderedTargets, targetDeviceID)
+		}
+		sort.Strings(orderedTargets)
+		for _, targetDeviceID := range orderedTargets {
+			if err := db.pruneUnauthorizedSenderKeyTarget(ctx, targetDeviceID); err != nil {
+				return err
+			}
+		}
+	}
+	attempts := 1
+	if deviceRouted {
+		attempts = 3
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		lastErr = db.storeSenderKeyWritesOnce(
+			ctx, convID, ownerDeviceID, generation, writes, deviceRouted,
+		)
+		if !isSenderKeySerializationFailure(lastErr) {
+			return lastErr
+		}
+	}
+	return ErrSenderKeyRosterChanged
+}
 
-	tx, err := db.Pool.Begin(ctx)
+func (db *DB) storeSenderKeyWritesOnce(ctx context.Context, convID, ownerDeviceID string, generation uint32, writes []senderKeyWrite, deviceRouted bool) error {
+	txOptions := pgx.TxOptions{}
+	if deviceRouted {
+		// Predicate reads over membership, devices, bindings, roles, and
+		// overwrites must conflict with concurrent roster mutations. Row locks
+		// alone cannot protect against a newly inserted device or overwrite.
+		txOptions.IsoLevel = pgx.Serializable
+	}
+	tx, err := db.Pool.BeginTx(ctx, txOptions)
 	if err != nil {
 		return fmt.Errorf("begin sender key transaction: %w", err)
 	}
@@ -910,6 +1198,51 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 	}
 	if conversationType != 1 && conversationType != 2 {
 		return ErrSenderKeyConversationType
+	}
+	var secureRoster *ConversationDeviceRoster
+	if deviceRouted {
+		deviceIDs := make([]string, 0, len(writes)+1)
+		deviceIDs = append(deviceIDs, ownerDeviceID)
+		for _, write := range writes {
+			deviceIDs = append(deviceIDs, write.targetDeviceID)
+		}
+		rows, err := tx.Query(ctx,
+			`SELECT id::text FROM devices
+			 WHERE id = ANY($1::uuid[])
+			 ORDER BY id
+			 FOR UPDATE`,
+			deviceIDs,
+		)
+		if err != nil {
+			return err
+		}
+		locked := 0
+		for rows.Next() {
+			var ignored string
+			if err := rows.Scan(&ignored); err != nil {
+				rows.Close()
+				return err
+			}
+			locked++
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+		uniqueDevices := make(map[string]struct{}, len(deviceIDs))
+		for _, deviceID := range deviceIDs {
+			uniqueDevices[deviceID] = struct{}{}
+		}
+		if locked != len(uniqueDevices) {
+			return ErrSenderKeyRosterChanged
+		}
+		secureRoster, err = resolveConversationDeviceRosterSnapshot(
+			ctx, tx, convID, RequiredChannelCapabilities,
+		)
+		if err != nil {
+			return err
+		}
 	}
 	seen := make(map[string]struct{}, len(writes))
 	for _, write := range writes {
@@ -927,6 +1260,13 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 		} else if write.rosterVersion != 0 || len(write.rosterCommitment) != 0 ||
 			write.ownerBindingVersion != 0 || write.targetBindingVersion != 0 {
 			return errors.New("partial sender key device route")
+		}
+		if write.deviceRouted {
+			if err := validateSenderKeyRouteSnapshot(
+				ctx, tx, secureRoster, convID, ownerDeviceID, targetDeviceID, write,
+			); err != nil {
+				return err
+			}
 		}
 		if _, duplicate := seen[targetDeviceID]; duplicate {
 			continue
@@ -951,6 +1291,11 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 		).Scan(&currentGeneration, &currentCommitment)
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
+			if write.deviceRouted {
+				if err := enforceSenderKeyRetentionAdmission(ctx, tx, convID, ownerDeviceID, targetDeviceID, len(write.encryptedKey)); err != nil {
+					return err
+				}
+			}
 			if _, err := tx.Exec(ctx,
 				`INSERT INTO sender_key_heads (
 				   conversation_id, owner_device_id, target_device_id,
@@ -958,10 +1303,10 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 				 ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5)`,
 				convID, ownerDeviceID, targetDeviceID, int64(generation), headCommitment[:],
 			); err != nil {
-				return fmt.Errorf("create sender key head for device %s: %w", targetDeviceID, err)
+				return fmt.Errorf("create sender key target head: %w", err)
 			}
 		case err != nil:
-			return fmt.Errorf("lookup sender key head for device %s: %w", targetDeviceID, err)
+			return fmt.Errorf("lookup sender key target head: %w", err)
 		case int64(generation) < currentGeneration:
 			return ErrStaleSenderKeyGeneration
 		case int64(generation) == currentGeneration:
@@ -985,11 +1330,12 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 			if errors.Is(err, pgx.ErrNoRows) {
 				// The row was explicitly collected after its stream head was
 				// committed. An exact retry remains idempotent but must not
-				// resurrect control state already acknowledged or expired.
+				// resurrect control state already acknowledged or pruned by an
+				// explicit target-device eligibility transition.
 				continue
 			}
 			if err != nil {
-				return fmt.Errorf("verify sender key for device %s: %w", targetDeviceID, err)
+				return fmt.Errorf("verify retained sender key target: %w", err)
 			}
 			if !senderKeyWriteMatches(write, retainedKey, retainedCommitment,
 				retainedRosterVersion, retainedRosterCommitment,
@@ -998,6 +1344,11 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 			}
 			continue
 		default:
+			if write.deviceRouted {
+				if err := enforceSenderKeyRetentionAdmission(ctx, tx, convID, ownerDeviceID, targetDeviceID, len(write.encryptedKey)); err != nil {
+					return err
+				}
+			}
 			if _, err := tx.Exec(ctx,
 				`UPDATE sender_key_heads
 				 SET max_generation = $4, max_commitment = $5, updated_at = now()
@@ -1006,7 +1357,7 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 				   AND target_device_id = $3::uuid`,
 				convID, ownerDeviceID, targetDeviceID, int64(generation), headCommitment[:],
 			); err != nil {
-				return fmt.Errorf("advance sender key head for device %s: %w", targetDeviceID, err)
+				return fmt.Errorf("advance sender key target head: %w", err)
 			}
 		}
 
@@ -1014,8 +1365,12 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 			`INSERT INTO sender_keys (
 			   conversation_id, owner_device_id, target_device_id,
 			   encrypted_key, generation, envelope_commitment, roster_version,
-			   roster_commitment, owner_binding_version, target_binding_version
-			 ) VALUES ($1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10)
+			   roster_commitment, owner_binding_version, target_binding_version,
+			   expires_at
+			 ) VALUES (
+			   $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, $10,
+			   now() + ($11 * INTERVAL '1 second')
+			 )
 			 ON CONFLICT (conversation_id, owner_device_id, target_device_id, generation)
 			 DO NOTHING`,
 			convID, ownerDeviceID, targetDeviceID, write.encryptedKey, int64(generation),
@@ -1023,8 +1378,9 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 			nullableSenderKeyBytes(write.rosterCommitment, write.deviceRouted),
 			nullableSenderKeyRoute(write.ownerBindingVersion, write.deviceRouted),
 			nullableSenderKeyRoute(write.targetBindingVersion, write.deviceRouted),
+			int64(SenderKeyReceiptTTL/time.Second),
 		); err != nil {
-			return fmt.Errorf("store sender key for device %s: %w", targetDeviceID, err)
+			return fmt.Errorf("store sender key target: %w", err)
 		}
 
 		// ON CONFLICT is intentionally non-mutating. Verify the retained row so
@@ -1044,7 +1400,7 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 			convID, ownerDeviceID, targetDeviceID, int64(generation),
 		).Scan(&retainedKey, &retainedCommitment, &retainedRosterVersion,
 			&retainedRosterCommitment, &retainedOwnerBindingVersion, &retainedTargetBindingVersion); err != nil {
-			return fmt.Errorf("verify sender key for device %s: %w", targetDeviceID, err)
+			return fmt.Errorf("verify retained sender key target: %w", err)
 		}
 		if !senderKeyWriteMatches(write, retainedKey, retainedCommitment,
 			retainedRosterVersion, retainedRosterCommitment,
@@ -1052,7 +1408,320 @@ func (db *DB) storeSenderKeyWrites(ctx context.Context, convID, ownerDeviceID st
 			return ErrSenderKeyGenerationConflict
 		}
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSenderKeyRouteSnapshot(ctx context.Context, tx pgx.Tx, roster *ConversationDeviceRoster, conversationID, ownerDeviceID, targetDeviceID string, write senderKeyWrite) error {
+	if roster == nil || !roster.Ready || roster.Version != write.rosterVersion ||
+		!bytes.Equal(roster.Commitment[:], write.rosterCommitment) ||
+		ownerDeviceID == "" || targetDeviceID == "" || ownerDeviceID == targetDeviceID {
+		return ErrSenderKeyRosterChanged
+	}
+	var ownerMemberID string
+	ownerFound, targetFound := false, false
+	for memberIndex := range roster.Members {
+		member := &roster.Members[memberIndex]
+		for deviceIndex := range member.Devices {
+			device := &member.Devices[deviceIndex]
+			if device.DeviceID != ownerDeviceID && device.DeviceID != targetDeviceID {
+				continue
+			}
+			if !device.Eligible || device.Binding == nil ||
+				device.Binding.Status != DeviceBindingActive ||
+				device.Binding.Capabilities&RequiredChannelCapabilities != RequiredChannelCapabilities {
+				return ErrSenderKeyRosterChanged
+			}
+			switch device.DeviceID {
+			case ownerDeviceID:
+				if device.Binding.Version != write.ownerBindingVersion {
+					return ErrSenderKeyRosterChanged
+				}
+				ownerMemberID = member.UserID
+				ownerFound = true
+			case targetDeviceID:
+				if device.Binding.Version != write.targetBindingVersion {
+					return ErrSenderKeyRosterChanged
+				}
+				targetFound = true
+			}
+		}
+	}
+	if !ownerFound || !targetFound {
+		return ErrSenderKeyRosterChanged
+	}
+	canSend, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, ownerMemberID,
+		ChannelReadPermissions|PermSendMessages,
+	)
+	if err != nil {
+		return err
+	}
+	if !canSend {
+		return ErrSenderKeyRosterChanged
+	}
+	return nil
+}
+
+// WithCurrentSenderKeyRoute holds the conversation's common roster revision
+// lock while revalidating and publishing one already-durable distribution.
+// Roster mutations therefore linearize either before the callback (which is
+// skipped) or after it (and may then prune the retained row).
+func (db *DB) WithCurrentSenderKeyRoute(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, rosterVersion uint64, rosterCommitment []byte, ownerBindingVersion, targetBindingVersion uint64, publish func() error) error {
+	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
+		rosterVersion == 0 || rosterVersion > math.MaxInt64 || len(rosterCommitment) != 32 ||
+		ownerBindingVersion == 0 || ownerBindingVersion > math.MaxInt64 ||
+		targetBindingVersion == 0 || targetBindingVersion > math.MaxInt64 || publish == nil {
+		return ErrSenderKeyRosterChanged
+	}
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT id FROM conversations WHERE id = $1::uuid FOR UPDATE`, conversationID,
+	); err != nil {
+		return err
+	}
+	roster, err := resolveConversationDeviceRosterSnapshot(
+		ctx, tx, conversationID, RequiredChannelCapabilities,
+	)
+	if err != nil {
+		return err
+	}
+	if err := validateSenderKeyRouteSnapshot(
+		ctx, tx, roster, conversationID, ownerDeviceID, targetDeviceID,
+		senderKeyWrite{
+			targetDeviceID:       targetDeviceID,
+			rosterVersion:        rosterVersion,
+			rosterCommitment:     rosterCommitment,
+			ownerBindingVersion:  ownerBindingVersion,
+			targetBindingVersion: targetBindingVersion,
+			deviceRouted:         true,
+		},
+	); err != nil {
+		return err
+	}
+	if err := publish(); err != nil {
+		return err
+	}
 	return tx.Commit(ctx)
+}
+
+// DiscardDeviceSenderKey removes only the stale pending envelope created by a
+// route that changed between durable admission and publication. The stream
+// head remains the rollback barrier, so the sender must correct with a newer
+// generation for the new roster.
+func (db *DB) DiscardDeviceSenderKey(ctx context.Context, conversationID, ownerDeviceID, targetDeviceID string, generation uint32, rosterVersion uint64, envelopeCommitment []byte) error {
+	if conversationID == "" || ownerDeviceID == "" || targetDeviceID == "" ||
+		generation == 0 || rosterVersion == 0 || rosterVersion > math.MaxInt64 ||
+		len(envelopeCommitment) != 32 {
+		return ErrSenderKeyReceiptMismatch
+	}
+	_, err := db.Pool.Exec(ctx,
+		`DELETE FROM sender_keys
+		 WHERE conversation_id = $1::uuid
+		   AND owner_device_id = $2::uuid
+		   AND target_device_id = $3::uuid
+		   AND generation = $4
+		   AND roster_version = $5
+		   AND envelope_commitment = $6`,
+		conversationID, ownerDeviceID, targetDeviceID, int64(generation),
+		int64(rosterVersion), envelopeCommitment,
+	)
+	return err
+}
+
+func isSenderKeySerializationFailure(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && (pgErr.Code == "40001" || pgErr.Code == "40P01")
+}
+
+// pruneUnauthorizedSenderKeyTarget removes retained envelopes only after the
+// exact target account has lost current channel-read authorization. It locks
+// every affected conversation and its common roster revision in canonical
+// order, so an ACL mutation linearizes wholly before or after the decision.
+// Stream heads are deliberately untouched: re-admission is future-only and
+// therefore requires a newer generation for the newer roster commitment.
+func (db *DB) pruneUnauthorizedSenderKeyTarget(ctx context.Context, targetDeviceID string) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		lastErr = db.pruneUnauthorizedSenderKeyTargetOnce(ctx, targetDeviceID)
+		if !isSenderKeySerializationFailure(lastErr) {
+			return lastErr
+		}
+	}
+	return fmt.Errorf("prune unauthorized sender-key target after serialization retries: %w", lastErr)
+}
+
+func (db *DB) pruneUnauthorizedSenderKeyTargetOnce(ctx context.Context, targetDeviceID string) error {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	rows, err := tx.Query(ctx,
+		`SELECT DISTINCT conversation_id::text
+		 FROM sender_keys
+		 WHERE target_device_id = $1::uuid
+		 ORDER BY conversation_id::text
+		 LIMIT $2`,
+		targetDeviceID, MaxPendingSenderKeyRowsPerTarget+1,
+	)
+	if err != nil {
+		return err
+	}
+	conversationIDs := make([]string, 0)
+	for rows.Next() {
+		var conversationID string
+		if err := rows.Scan(&conversationID); err != nil {
+			rows.Close()
+			return err
+		}
+		conversationIDs = append(conversationIDs, conversationID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(conversationIDs) > MaxPendingSenderKeyRowsPerTarget {
+		return ErrSenderKeyRestoreBacklogExceeded
+	}
+	if len(conversationIDs) == 0 {
+		return tx.Commit(ctx)
+	}
+
+	rows, err = tx.Query(ctx,
+		`SELECT id::text
+		 FROM conversations
+		 WHERE id = ANY($1::uuid[])
+		 ORDER BY id
+		 FOR UPDATE`,
+		conversationIDs,
+	)
+	if err != nil {
+		return err
+	}
+	lockedConversations := make([]string, 0, len(conversationIDs))
+	for rows.Next() {
+		var conversationID string
+		if err := rows.Scan(&conversationID); err != nil {
+			rows.Close()
+			return err
+		}
+		lockedConversations = append(lockedConversations, conversationID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if len(lockedConversations) == 0 {
+		return tx.Commit(ctx)
+	}
+
+	var targetUserID string
+	if err := tx.QueryRow(ctx,
+		`SELECT user_id::text FROM devices
+		 WHERE id = $1::uuid FOR SHARE`,
+		targetDeviceID,
+	).Scan(&targetUserID); err != nil {
+		return err
+	}
+
+	rows, err = tx.Query(ctx,
+		`SELECT conversation_id::text
+		 FROM conversation_roster_revisions
+		 WHERE conversation_id = ANY($1::uuid[])
+		 ORDER BY conversation_id
+		 FOR UPDATE`,
+		lockedConversations,
+	)
+	if err != nil {
+		return err
+	}
+	lockedRevisions := 0
+	for rows.Next() {
+		var ignored string
+		if err := rows.Scan(&ignored); err != nil {
+			rows.Close()
+			return err
+		}
+		lockedRevisions++
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+	if lockedRevisions != len(lockedConversations) {
+		return ErrSenderKeyRosterChanged
+	}
+
+	for _, conversationID := range lockedConversations {
+		allowed, err := canAccessConversationWithQuery(
+			ctx, tx, conversationID, targetUserID, ChannelReadPermissions,
+		)
+		if err != nil {
+			return err
+		}
+		if allowed {
+			continue
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM sender_keys
+			 WHERE conversation_id = $1::uuid
+			   AND target_device_id = $2::uuid`,
+			conversationID, targetDeviceID,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
+}
+
+func enforceSenderKeyRetentionAdmission(ctx context.Context, tx pgx.Tx, conversationID, ownerDeviceID, targetDeviceID string, prospectiveBytes int) error {
+	var targetRows, targetBytes int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(octet_length(encrypted_key)), 0)
+		 FROM sender_keys
+		 WHERE target_device_id = $1::uuid`,
+		targetDeviceID,
+	).Scan(&targetRows, &targetBytes); err != nil {
+		return fmt.Errorf("check target sender key backlog: %w", err)
+	}
+	if prospectiveBytes <= 0 || targetRows >= MaxPendingSenderKeyRowsPerTarget ||
+		targetBytes+int64(prospectiveBytes) > MaxPendingSenderKeyBytesPerTarget {
+		return ErrSenderKeyTargetBacklogFull
+	}
+	var pending int64
+	var expired bool
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*), COALESCE(bool_or(expires_at <= now()), false)
+		 FROM sender_keys
+		 WHERE conversation_id = $1::uuid
+		   AND owner_device_id = $2::uuid
+		   AND target_device_id = $3::uuid
+		   AND roster_version IS NOT NULL`,
+		conversationID, ownerDeviceID, targetDeviceID,
+	).Scan(&pending, &expired); err != nil {
+		return fmt.Errorf("check sender key retention: %w", err)
+	}
+	// Never discard an unacknowledged generation to make room. Expiry and the
+	// hard cap both keep the sender's durable ACK gate closed until an exact
+	// device receipt arrives or the device is explicitly excluded/revoked.
+	if expired {
+		return ErrSenderKeyRetentionExpired
+	}
+	if pending >= MaxPendingSenderKeyGenerationsPerStream {
+		return ErrSenderKeyRetentionFull
+	}
+	return nil
 }
 
 func nullableSenderKeyRoute(value uint64, present bool) any {
@@ -1085,14 +1754,332 @@ func senderKeyWriteMatches(write senderKeyWrite, retainedKey, retainedCommitment
 		targetBindingVersion == int64(write.targetBindingVersion)
 }
 
+// SenderKeyConversationBacklog is bounded metadata used by pre-auth restore
+// to decide which conversations are safe to materialize. Ciphertext is loaded
+// only after the gateway confirms that this conversation's current roster is
+// ready, so one expired/not-ready/oversized group cannot consume the global
+// restore budget or prevent DMs and healthy groups from starting.
+type SenderKeyConversationBacklog struct {
+	ConversationID  string
+	TargetUserID    string
+	Rows            int64
+	Bytes           int64
+	Expired         bool
+	LegacyOrPartial bool
+}
+
+// ListPendingSenderKeyConversations returns aggregate metadata only. It never
+// acknowledges or removes retained rows; committed target authorization loss
+// remains the sole pruning step performed before this snapshot.
+func (db *DB) ListPendingSenderKeyConversations(ctx context.Context, targetDeviceID string) ([]SenderKeyConversationBacklog, error) {
+	if targetDeviceID == "" {
+		return nil, ErrSenderKeyRestoreBacklogExceeded
+	}
+	if err := db.pruneUnauthorizedSenderKeyTarget(ctx, targetDeviceID); err != nil {
+		return nil, err
+	}
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var lockedDevice string
+	if err := tx.QueryRow(ctx,
+		`SELECT id::text FROM devices WHERE id = $1::uuid FOR SHARE`, targetDeviceID,
+	).Scan(&lockedDevice); err != nil {
+		return nil, err
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT sender_key.conversation_id::text, target_device.user_id::text,
+		        COUNT(*), COALESCE(SUM(octet_length(sender_key.encrypted_key)), 0),
+		        COALESCE(bool_or(sender_key.expires_at <= now()), FALSE),
+		        COALESCE(bool_or(
+		          sender_key.roster_version IS NULL
+		          OR sender_key.roster_commitment IS NULL
+		          OR sender_key.owner_binding_version IS NULL
+		          OR sender_key.target_binding_version IS NULL
+		        ), FALSE)
+		 FROM sender_keys AS sender_key
+		 JOIN conversations AS conversation
+		   ON conversation.id = sender_key.conversation_id
+		  AND conversation.conv_type IN (1, 2)
+		 JOIN devices AS target_device ON target_device.id = sender_key.target_device_id
+		 WHERE sender_key.target_device_id = $1::uuid
+		 GROUP BY sender_key.conversation_id, target_device.user_id
+		 ORDER BY sender_key.conversation_id
+		 LIMIT $2`,
+		targetDeviceID, MaxPendingSenderKeyRowsPerTarget+1,
+	)
+	if err != nil {
+		return nil, err
+	}
+	backlogs := make([]SenderKeyConversationBacklog, 0)
+	for rows.Next() {
+		var backlog SenderKeyConversationBacklog
+		if err := rows.Scan(
+			&backlog.ConversationID, &backlog.TargetUserID,
+			&backlog.Rows, &backlog.Bytes,
+			&backlog.Expired, &backlog.LegacyOrPartial,
+		); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		backlogs = append(backlogs, backlog)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if len(backlogs) > MaxPendingSenderKeyRowsPerTarget {
+		return nil, ErrSenderKeyRestoreBacklogExceeded
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return backlogs, nil
+}
+
+type SenderKeyConversationRestore struct {
+	Roster *ConversationDeviceRoster
+	Rows   []SenderKeyRow
+}
+
+// LoadPendingSenderKeyConversation atomically resolves current readiness,
+// verifies the exact authenticated target device/head, and only then
+// materializes one all-or-nothing retained suffix. Roster or binding mutation
+// cannot land between those decisions and the ciphertext read.
+func (db *DB) LoadPendingSenderKeyConversation(ctx context.Context, targetDeviceID string, targetDeviceKey []byte, targetBindingVersion uint64, conversationID string, maxRows, maxBytes int64) (*SenderKeyConversationRestore, error) {
+	if targetDeviceID == "" || len(targetDeviceKey) != 16 || targetBindingVersion == 0 ||
+		targetBindingVersion > math.MaxInt64 || conversationID == "" ||
+		maxRows <= 0 || maxBytes <= 0 || maxRows > MaxPendingSenderKeyRowsPerTarget ||
+		maxBytes > MaxPendingSenderKeyBytesPerTarget {
+		return nil, ErrSenderKeyRestoreBacklogExceeded
+	}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		restore, err := db.loadPendingSenderKeyConversationOnce(
+			ctx, targetDeviceID, targetDeviceKey, targetBindingVersion,
+			conversationID, maxRows, maxBytes,
+		)
+		if !isSenderKeySerializationFailure(err) {
+			return restore, err
+		}
+		lastErr = err
+	}
+	return nil, fmt.Errorf("load sender-key conversation after serialization retries: %w", lastErr)
+}
+
+func (db *DB) loadPendingSenderKeyConversationOnce(ctx context.Context, targetDeviceID string, targetDeviceKey []byte, targetBindingVersion uint64, conversationID string, maxRows, maxBytes int64) (*SenderKeyConversationRestore, error) {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var conversationType int16
+	if err := tx.QueryRow(ctx,
+		`SELECT conv_type FROM conversations
+		 WHERE id = $1::uuid FOR UPDATE`, conversationID,
+	).Scan(&conversationType); err != nil {
+		return nil, err
+	}
+	if conversationType != 1 && conversationType != 2 {
+		return nil, ErrSenderKeyConversationType
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO conversation_roster_revisions (conversation_id)
+		 VALUES ($1::uuid) ON CONFLICT (conversation_id) DO NOTHING`, conversationID,
+	); err != nil {
+		return nil, err
+	}
+	var mutationRevision int64
+	if err := tx.QueryRow(ctx,
+		`SELECT mutation_revision FROM conversation_roster_revisions
+		 WHERE conversation_id = $1::uuid FOR UPDATE`, conversationID,
+	).Scan(&mutationRevision); err != nil {
+		return nil, err
+	}
+	roster, err := buildConversationDeviceRoster(
+		ctx, tx, conversationID, RequiredChannelCapabilities,
+	)
+	if err != nil {
+		return nil, err
+	}
+	roster.Version, err = recordConversationRosterCommitmentTx(
+		ctx, tx, conversationID, roster.Commitment, mutationRevision,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !roster.Ready || !rosterHasExactRestoreTarget(
+		roster, targetDeviceID, targetDeviceKey, targetBindingVersion,
+	) {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return nil, ErrSenderKeyConversationUnavailable
+	}
+
+	var totalRows, totalBytes int64
+	var expired, legacyOrPartial bool
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(octet_length(encrypted_key)), 0),
+		        COALESCE(bool_or(expires_at <= now()), FALSE),
+		        COALESCE(bool_or(
+		          roster_version IS NULL OR roster_commitment IS NULL
+		          OR owner_binding_version IS NULL OR target_binding_version IS NULL
+		        ), FALSE)
+		 FROM sender_keys
+		 WHERE target_device_id = $1::uuid
+		   AND conversation_id = $2::uuid`,
+		targetDeviceID, conversationID,
+	).Scan(&totalRows, &totalBytes, &expired, &legacyOrPartial); err != nil {
+		return nil, err
+	}
+	if legacyOrPartial {
+		return nil, ErrSenderKeyLegacyState
+	}
+	if expired {
+		return nil, ErrSenderKeyRetentionExpired
+	}
+	if totalRows == 0 {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return &SenderKeyConversationRestore{Roster: roster, Rows: []SenderKeyRow{}}, nil
+	}
+	if totalRows > maxRows || totalBytes > maxBytes {
+		return nil, ErrSenderKeyRestoreBacklogExceeded
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT sender_key.conversation_id, sender_key.owner_device_id,
+		        sender_key.target_device_id, target_device.user_id,
+		        sender_key.encrypted_key, sender_key.generation,
+		        sender_key.roster_version, sender_key.roster_commitment,
+		        sender_key.owner_binding_version, sender_key.target_binding_version,
+		        sender_key.envelope_commitment,
+		        sender_key.created_at, sender_key.expires_at
+		 FROM sender_keys AS sender_key
+		 JOIN devices AS target_device ON target_device.id = sender_key.target_device_id
+		 JOIN devices AS owner_device ON owner_device.id = sender_key.owner_device_id
+		 WHERE sender_key.target_device_id = $1::uuid
+		   AND sender_key.conversation_id = $2::uuid
+		 ORDER BY sender_key.owner_device_id, sender_key.generation
+		 LIMIT $3`,
+		targetDeviceID, conversationID, maxRows+1,
+	)
+	if err != nil {
+		return nil, err
+	}
+	keys := make([]SenderKeyRow, 0, int(totalRows))
+	for rows.Next() {
+		var key SenderKeyRow
+		var rosterVersion, ownerBindingVersion, targetBindingVersion int64
+		if err := rows.Scan(
+			&key.ConversationID, &key.OwnerDeviceID, &key.TargetDeviceID,
+			&key.TargetUserID, &key.EncryptedKey, &key.Generation,
+			&rosterVersion, &key.RosterCommitment,
+			&ownerBindingVersion, &targetBindingVersion,
+			&key.EnvelopeCommitment, &key.CreatedAt, &key.ExpiresAt,
+		); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if rosterVersion <= 0 || ownerBindingVersion <= 0 || targetBindingVersion <= 0 {
+			rows.Close()
+			return nil, ErrSenderKeyLegacyState
+		}
+		key.RosterVersion = uint64(rosterVersion)
+		key.OwnerBindingVersion = uint64(ownerBindingVersion)
+		key.TargetBindingVersion = uint64(targetBindingVersion)
+		keys = append(keys, key)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	if int64(len(keys)) != totalRows || int64(len(keys)) > maxRows {
+		return nil, ErrSenderKeyRestoreBacklogExceeded
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return &SenderKeyConversationRestore{Roster: roster, Rows: keys}, nil
+}
+
+func rosterHasExactRestoreTarget(roster *ConversationDeviceRoster, targetDeviceID string, targetDeviceKey []byte, targetBindingVersion uint64) bool {
+	if roster == nil || !roster.Ready {
+		return false
+	}
+	for memberIndex := range roster.Members {
+		member := &roster.Members[memberIndex]
+		for deviceIndex := range member.Devices {
+			device := &member.Devices[deviceIndex]
+			if device.DeviceID == targetDeviceID {
+				return device.Eligible && device.Binding != nil &&
+					device.Binding.Status == DeviceBindingActive &&
+					device.Binding.Capabilities&RequiredChannelCapabilities == RequiredChannelCapabilities &&
+					device.Binding.Version == targetBindingVersion &&
+					bytes.Equal(device.DeviceKey, targetDeviceKey) &&
+					bytes.Equal(device.Binding.DeviceKey, targetDeviceKey)
+			}
+		}
+	}
+	return false
+}
+
 // GetPendingSenderKeys returns sender keys addressed to a specific device.
 func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) ([]SenderKeyRow, error) {
-	rows, err := db.Pool.Query(ctx,
+	if targetDeviceID == "" {
+		return nil, ErrSenderKeyRestoreBacklogExceeded
+	}
+	if err := db.pruneUnauthorizedSenderKeyTarget(ctx, targetDeviceID); err != nil {
+		return nil, err
+	}
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	var lockedDevice string
+	if err := tx.QueryRow(ctx,
+		`SELECT id::text FROM devices WHERE id = $1::uuid FOR SHARE`, targetDeviceID,
+	).Scan(&lockedDevice); err != nil {
+		return nil, err
+	}
+	var totalRows, totalBytes int64
+	var expired, legacyOrPartial bool
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*), COALESCE(SUM(octet_length(encrypted_key)), 0),
+		        COALESCE(bool_or(expires_at <= now()), FALSE),
+		        COALESCE(bool_or(
+		          roster_version IS NULL OR roster_commitment IS NULL
+		          OR owner_binding_version IS NULL OR target_binding_version IS NULL
+		        ), FALSE)
+		 FROM sender_keys WHERE target_device_id = $1::uuid`,
+		targetDeviceID,
+	).Scan(&totalRows, &totalBytes, &expired, &legacyOrPartial); err != nil {
+		return nil, err
+	}
+	if legacyOrPartial {
+		return nil, ErrSenderKeyLegacyState
+	}
+	if expired {
+		// Expiry is an explicit history-unavailable boundary. Never deliver a
+		// partial suffix or silently collect the evidence needed to explain why
+		// older ciphertext can no longer be decrypted.
+		return nil, ErrSenderKeyRetentionExpired
+	}
+	if totalRows > MaxPendingSenderKeyRowsPerTarget || totalBytes > MaxPendingSenderKeyBytesPerTarget {
+		return nil, ErrSenderKeyRestoreBacklogExceeded
+	}
+	rows, err := tx.Query(ctx,
 		`SELECT sk.conversation_id, sk.owner_device_id, sk.target_device_id,
 		        target_device.user_id, sk.encrypted_key, sk.generation,
 		        COALESCE(sk.roster_version, 0), COALESCE(sk.roster_commitment, ''::bytea),
 		        COALESCE(sk.owner_binding_version, 0), COALESCE(sk.target_binding_version, 0),
-		        sk.envelope_commitment
+		        sk.envelope_commitment, sk.created_at, sk.expires_at
 		 FROM sender_keys sk
 		 JOIN conversations conversation ON conversation.id = sk.conversation_id AND conversation.conv_type IN (1, 2)
 		 JOIN devices target_device ON target_device.id = sk.target_device_id
@@ -1100,12 +2087,10 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		 JOIN conversation_members target_member
 		   ON target_member.conversation_id = sk.conversation_id
 		  AND target_member.user_id = target_device.user_id
-		 JOIN conversation_members owner_member
-		   ON owner_member.conversation_id = sk.conversation_id
-		  AND owner_member.user_id = owner_device.user_id
 		 WHERE sk.target_device_id = $1::uuid
-		 ORDER BY sk.conversation_id, sk.owner_device_id, sk.generation`,
-		targetDeviceID,
+		 ORDER BY sk.conversation_id, sk.owner_device_id, sk.generation
+		 LIMIT $2`,
+		targetDeviceID, MaxPendingSenderKeyRowsPerTarget+1,
 	)
 	if err != nil {
 		return nil, err
@@ -1118,7 +2103,7 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		if err := rows.Scan(&k.ConversationID, &k.OwnerDeviceID, &k.TargetDeviceID,
 			&k.TargetUserID, &k.EncryptedKey, &k.Generation, &rosterVersion,
 			&k.RosterCommitment, &ownerBindingVersion, &targetBindingVersion,
-			&k.EnvelopeCommitment); err != nil {
+			&k.EnvelopeCommitment, &k.CreatedAt, &k.ExpiresAt); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -1132,12 +2117,24 @@ func (db *DB) GetPendingSenderKeys(ctx context.Context, targetDeviceID string) (
 		return nil, err
 	}
 	rows.Close()
+	if len(keys) > MaxPendingSenderKeyRowsPerTarget {
+		return nil, ErrSenderKeyRestoreBacklogExceeded
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
 
 	authorized := keys[:0]
+	authorizationByConversation := make(map[string]bool)
 	for _, key := range keys {
-		allowed, err := db.CanAccessConversation(ctx, key.ConversationID, key.TargetUserID, ChannelReadPermissions)
-		if err != nil {
-			return nil, err
+		allowed, checked := authorizationByConversation[key.ConversationID]
+		if !checked {
+			var err error
+			allowed, err = db.CanAccessConversation(ctx, key.ConversationID, key.TargetUserID, ChannelReadPermissions)
+			if err != nil {
+				return nil, err
+			}
+			authorizationByConversation[key.ConversationID] = allowed
 		}
 		if allowed {
 			authorized = append(authorized, key)
@@ -1158,6 +2155,8 @@ type SenderKeyRow struct {
 	OwnerBindingVersion  uint64
 	TargetBindingVersion uint64
 	EnvelopeCommitment   []byte
+	CreatedAt            time.Time
+	ExpiresAt            time.Time
 }
 
 // AcknowledgeSenderKey removes only the exact pending row installed by the
@@ -1237,9 +2236,13 @@ type Reaction struct {
 	Emoji          string
 }
 
-// GetReactionsForMessages returns all reactions for the given message IDs.
-func (db *DB) GetReactionsForMessages(ctx context.Context, messageIDs []string) ([]Reaction, error) {
-	rows, err := db.Pool.Query(ctx,
+// getReactionsForMessagesWithQuery remains inside the authorized history
+// transaction so related metadata cannot cross a committed revoke boundary.
+func getReactionsForMessagesWithQuery(ctx context.Context, query rosterQuerier, messageIDs []string) ([]Reaction, error) {
+	if len(messageIDs) == 0 {
+		return []Reaction{}, nil
+	}
+	rows, err := query.Query(ctx,
 		`SELECT reaction.message_id, reaction.conversation_id, reaction.user_id,
 		        user_account.username, reaction.emoji
 		 FROM reactions reaction

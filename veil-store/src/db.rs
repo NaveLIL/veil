@@ -40,12 +40,194 @@ pub type PendingInitialHeaderRow = ([u8; 32], Vec<u8>);
 pub type MessageBinding = (String, Vec<u8>, bool, Option<i64>);
 pub type TrustedSigningKeyBinding = ([u8; 32], [u8; 32]);
 pub type StoredSenderKey = (Vec<u8>, Vec<u8>, bool);
+type StoredSenderKeyMaterial = ([u8; 32], Zeroizing<Vec<u8>>);
+const MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER: usize = 128;
+
+pub struct StoredIncomingSenderKeyGeneration {
+    pub sender_identity_key: [u8; 32],
+    pub generation: u32,
+    pub iteration: u32,
+    pub state_revision: u64,
+    /// All-zero is reserved for a migrated legacy state whose original
+    /// distribution commitment cannot be reconstructed after ratcheting.
+    pub distribution_commitment: [u8; 32],
+    pub key_data: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceBindingPinV1 {
+    pub device_id: [u8; 16],
+    pub account_identity_key: [u8; 32],
+    pub account_signing_key: [u8; 32],
+    pub device_identity_key: [u8; 32],
+    pub device_signing_key: [u8; 32],
+    pub binding_version: u64,
+    pub capabilities: u64,
+    pub status: u8,
+    pub account_signature: [u8; 64],
+}
+
+pub struct DeviceRosterSnapshotV1<'a> {
+    pub conversation_id: &'a str,
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub required_capabilities: u64,
+    pub canonical_snapshot: &'a [u8],
+    pub bindings: &'a [DeviceBindingPinV1],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalDeviceBindingProofV1 {
+    pub sender_account_signing_key: [u8; 32],
+    pub sender_device_capabilities: u64,
+    pub sender_device_binding_status: u8,
+    pub sender_account_signature: [u8; 64],
+    pub target_device_identity_key: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingSenderKeyRouteV1 {
+    pub sender_account_identity_key: [u8; 32],
+    pub sender_device_id: [u8; 16],
+    pub sender_device_identity_key: [u8; 32],
+    pub sender_device_signing_key: [u8; 32],
+    pub sender_binding_version: u64,
+    pub target_device_id: [u8; 16],
+    pub target_binding_version: u64,
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub envelope_commitment: [u8; 32],
+    /// `None` exists only for routes installed by an interim development
+    /// schema. Any newly received SKDM must atomically upgrade it to `Some`.
+    pub historical_sender_binding: Option<HistoricalDeviceBindingProofV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSenderKeyDeviceEnvelopeV1 {
+    pub conversation_id: String,
+    pub generation: u32,
+    pub target_account_identity_key: [u8; 32],
+    pub target_device_id: [u8; 16],
+    pub target_device_identity_key: [u8; 32],
+    pub target_binding_version: u64,
+    pub sender_device_id: [u8; 16],
+    pub sender_device_identity_key: [u8; 32],
+    pub sender_binding_version: u64,
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub envelope_commitment: [u8; 32],
+    pub sealed_envelope: Vec<u8>,
+}
 
 fn fixed_bytes<const N: usize>(label: &str, value: Vec<u8>) -> Result<[u8; N], String> {
     let actual = value.len();
     value
         .try_into()
         .map_err(|_| format!("invalid persisted {label} length: expected {N}, got {actual}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_incoming_sender_key_generation(
+    conn: &Connection,
+    group_id: &str,
+    sender_identity_key: &[u8; 32],
+    generation: u32,
+    iteration: u32,
+    state_revision: u64,
+    distribution_commitment: &[u8; 32],
+    key_data: &[u8],
+) -> Result<(), String> {
+    if group_id.is_empty() || generation == 0 || iteration > 2000 {
+        return Err("invalid incoming sender-key generation scope".to_string());
+    }
+    if key_data.is_empty() || key_data.len() > 65_536 {
+        return Err("invalid incoming sender-key state size".to_string());
+    }
+
+    let existing = conn
+        .query_row(
+            "SELECT iteration, state_revision, distribution_commitment, key_data
+             FROM sender_key_incoming_generations
+             WHERE group_id = ?1 AND sender_identity_key = ?2 AND generation = ?3",
+            rusqlite::params![
+                group_id,
+                sender_identity_key.as_slice(),
+                i64::from(generation),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(3)?),
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| format!("load incoming sender-key generation before save: {e}"))?;
+
+    let is_new_generation = existing.is_none();
+    if let Some((old_iteration, old_revision, old_commitment, old_data)) = existing {
+        let old_revision = u64::from_be_bytes(fixed_bytes::<8>(
+            "incoming sender-key revision",
+            old_revision,
+        )?);
+        let old_commitment = fixed_bytes::<32>(
+            "incoming sender-key distribution commitment",
+            old_commitment,
+        )?;
+        if old_commitment != *distribution_commitment {
+            return Err("incoming sender-key generation commitment changed".to_string());
+        }
+        if state_revision < old_revision || iteration < old_iteration {
+            return Err("incoming sender-key state rollback rejected".to_string());
+        }
+        if state_revision == old_revision {
+            if iteration != old_iteration || old_data.as_slice() != key_data {
+                return Err(
+                    "incoming sender-key state changed without a revision advance".to_string(),
+                );
+            }
+            return Ok(());
+        }
+    }
+    if is_new_generation {
+        let retained: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sender_key_incoming_generations
+                 WHERE group_id = ?1 AND sender_identity_key = ?2",
+                rusqlite::params![group_id, sender_identity_key.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("count retained incoming sender-key generations: {e}"))?;
+        if retained >= MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER as i64 {
+            return Err("incoming sender-key generation retention limit reached".to_string());
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO sender_key_incoming_generations
+            (group_id, sender_identity_key, generation, iteration,
+             state_revision, distribution_commitment, key_data, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+         ON CONFLICT(group_id, sender_identity_key, generation) DO UPDATE SET
+            iteration = excluded.iteration,
+            state_revision = excluded.state_revision,
+            distribution_commitment = excluded.distribution_commitment,
+            key_data = excluded.key_data,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            group_id,
+            sender_identity_key.as_slice(),
+            i64::from(generation),
+            iteration,
+            state_revision.to_be_bytes().as_slice(),
+            distribution_commitment.as_slice(),
+            key_data,
+        ],
+    )
+    .map_err(|e| format!("save incoming sender-key generation: {e}"))?;
+    Ok(())
 }
 
 impl VeilDb {
@@ -203,6 +385,28 @@ impl VeilDb {
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
+            CREATE TABLE IF NOT EXISTS device_binding_pins_v1 (
+                device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
+                account_identity_key BLOB NOT NULL CHECK(length(account_identity_key) = 32),
+                account_signing_key BLOB NOT NULL CHECK(length(account_signing_key) = 32),
+                device_identity_key BLOB NOT NULL CHECK(length(device_identity_key) = 32),
+                device_signing_key BLOB NOT NULL CHECK(length(device_signing_key) = 32),
+                binding_version BLOB NOT NULL CHECK(length(binding_version) = 8),
+                capabilities BLOB NOT NULL CHECK(length(capabilities) = 8),
+                status INTEGER NOT NULL CHECK(status BETWEEN 1 AND 3),
+                account_signature BLOB NOT NULL CHECK(length(account_signature) = 64),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_device_roster_snapshots_v1 (
+                conversation_id TEXT PRIMARY KEY,
+                roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                required_capabilities BLOB NOT NULL CHECK(length(required_capabilities) = 8),
+                canonical_snapshot BLOB NOT NULL CHECK(length(canonical_snapshot) BETWEEN 1 AND 1048576),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS local_prekeys (
                 key_type INTEGER NOT NULL CHECK(key_type IN (0, 1)),
                 protocol_key_id INTEGER NOT NULL CHECK(protocol_key_id > 0),
@@ -256,6 +460,46 @@ impl VeilDb {
                 PRIMARY KEY (group_id, sender_identity_key)
             );
 
+            -- Incoming Sender-Key receive state is retained by exact
+            -- generation. `sender_keys_local` remains authoritative only for
+            -- outgoing state and as a read-once legacy source for old clients.
+            CREATE TABLE IF NOT EXISTS sender_key_incoming_generations (
+                group_id TEXT NOT NULL,
+                sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                iteration INTEGER NOT NULL CHECK(iteration BETWEEN 0 AND 2000),
+                state_revision BLOB NOT NULL CHECK(length(state_revision) = 8),
+                distribution_commitment BLOB NOT NULL CHECK(length(distribution_commitment) = 32),
+                key_data BLOB NOT NULL CHECK(length(key_data) BETWEEN 1 AND 65536),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, sender_identity_key, generation)
+            );
+
+            -- Immutable authenticated route proof for each installed incoming
+            -- device-owned Sender-Key generation. It remains available after
+            -- the live roster advances so REST history can be checked against
+            -- the exact historical device/binding/roster context.
+            CREATE TABLE IF NOT EXISTS sender_key_incoming_routes_v1 (
+                group_id TEXT NOT NULL,
+                sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                sender_account_identity_key BLOB NOT NULL CHECK(length(sender_account_identity_key) = 32),
+                sender_device_id BLOB NOT NULL CHECK(length(sender_device_id) = 16),
+                sender_device_signing_key BLOB NOT NULL CHECK(length(sender_device_signing_key) = 32),
+                sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
+                target_device_id BLOB NOT NULL CHECK(length(target_device_id) = 16),
+                target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
+                roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
+                installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, sender_identity_key, generation),
+                FOREIGN KEY (group_id, sender_identity_key, generation)
+                    REFERENCES sender_key_incoming_generations
+                        (group_id, sender_identity_key, generation)
+                    ON DELETE CASCADE
+            );
+
             -- Exact authenticated SKDM bytes awaiting the gateway's durable
             -- storage ACK. The first envelope for a generation/recipient is
             -- immutable because a randomized re-seal of the same generation
@@ -268,6 +512,27 @@ impl VeilDb {
                 sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 4096),
                 created_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (conversation_id, generation, target_identity_key)
+            );
+
+            -- Upgraded exact-device retry cache. Every routing and roster
+            -- coordinate is part of the immutable row; randomized re-sealing
+            -- for the same target/generation is rejected.
+            CREATE TABLE IF NOT EXISTS pending_sender_key_device_envelopes_v1 (
+                conversation_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                target_account_identity_key BLOB NOT NULL CHECK(length(target_account_identity_key) = 32),
+                target_device_id BLOB NOT NULL CHECK(length(target_device_id) = 16),
+                target_device_identity_key BLOB NOT NULL CHECK(length(target_device_identity_key) = 32),
+                target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
+                sender_device_id BLOB NOT NULL CHECK(length(sender_device_id) = 16),
+                sender_device_identity_key BLOB NOT NULL CHECK(length(sender_device_identity_key) = 32),
+                sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
+                roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
+                sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 4096),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (conversation_id, generation, target_device_id)
             );
 
             CREATE TABLE IF NOT EXISTS reactions (
@@ -368,6 +633,9 @@ impl VeilDb {
             )
             .map_err(|e| format!("migrations: {e}"))?;
 
+        self.rebuild_interim_sender_key_tables()?;
+        self.ensure_sender_key_historical_proof_schema()?;
+
         // Add `crypto_mode` to conversations if missing. Older DBs created
         // before Phase 6 don't have this column. SQLite has no
         // `ADD COLUMN IF NOT EXISTS`, so we attempt and ignore the error.
@@ -385,6 +653,236 @@ impl VeilDb {
             )
             .map_err(|e| format!("normalize incoming message status: {e}"))?;
 
+        Ok(())
+    }
+
+    fn normalized_table_sql(&self, table: &str) -> Result<String, String> {
+        let sql: String = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                rusqlite::params![table],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect {table} schema: {e}"))?;
+        Ok(sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase())
+    }
+
+    /// Historical account-authorized binding material is kept separately so
+    /// databases created by the interim route schema remain readable. A
+    /// replay can atomically add the missing proof without fabricating fields
+    /// for already-installed generations.
+    fn ensure_sender_key_historical_proof_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin historical Sender-Key proof schema: {e}"))?;
+        tx
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS sender_key_historical_device_proofs_v1 (
+                    group_id TEXT NOT NULL,
+                    sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                    generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                    sender_account_signing_key BLOB NOT NULL CHECK(length(sender_account_signing_key) = 32),
+                    sender_device_capabilities BLOB NOT NULL CHECK(length(sender_device_capabilities) = 8),
+                    sender_device_binding_status INTEGER NOT NULL CHECK(sender_device_binding_status BETWEEN 1 AND 3),
+                    sender_account_signature BLOB NOT NULL CHECK(length(sender_account_signature) = 64),
+                    target_device_identity_key BLOB CHECK(target_device_identity_key IS NULL OR length(target_device_identity_key) = 32),
+                    installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (group_id, sender_identity_key, generation),
+                    FOREIGN KEY (group_id, sender_identity_key, generation)
+                        REFERENCES sender_key_incoming_routes_v1
+                            (group_id, sender_identity_key, generation)
+                        ON DELETE CASCADE
+                );",
+            )
+            .map_err(|e| format!("create historical Sender-Key proof schema: {e}"))?;
+        let has_target_identity: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('sender_key_historical_device_proofs_v1')
+                    WHERE name = 'target_device_identity_key'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect historical Sender-Key proof schema: {e}"))?;
+        if !has_target_identity {
+            tx.execute_batch(
+                "ALTER TABLE sender_key_historical_device_proofs_v1
+                 ADD COLUMN target_device_identity_key BLOB
+                 CHECK(target_device_identity_key IS NULL OR length(target_device_identity_key) = 32);",
+            )
+            .map_err(|e| format!("upgrade historical Sender-Key proof schema: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit historical Sender-Key proof schema: {e}"))
+    }
+
+    /// Repair the short-lived development schema that used a route-scoped PK
+    /// (allowing two randomized seals for one target/generation), a 64 KiB
+    /// envelope limit, and an orphanable incoming-route table. Rebuilds are
+    /// transactional and fail closed on ambiguous duplicate rows.
+    fn rebuild_interim_sender_key_tables(&self) -> Result<(), String> {
+        let pending_sql = self.normalized_table_sql("pending_sender_key_device_envelopes_v1")?;
+        let pending_current = pending_sql
+            .contains("primary key (conversation_id, generation, target_device_id)")
+            && pending_sql.contains("length(sealed_envelope) between 1 and 4096");
+        if !pending_current {
+            let ambiguous: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pending_sender_key_device_envelopes_v1
+                        GROUP BY conversation_id, generation, target_device_id
+                        HAVING count(*) > 1
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("preflight interim sender-key cache duplicates: {e}"))?;
+            let oversized: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pending_sender_key_device_envelopes_v1
+                        WHERE length(sealed_envelope) NOT BETWEEN 1 AND 4096
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("preflight interim sender-key cache sizes: {e}"))?;
+            if ambiguous || oversized {
+                return Err(
+                    "interim exact-device Sender-Key cache is ambiguous or exceeds protocol bounds"
+                        .to_string(),
+                );
+            }
+            let backup_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_sender_key_device_envelopes_v1_interim')",
+                [],
+                |row| row.get(0),
+            ).map_err(|e| format!("inspect interim sender-key cache backup: {e}"))?;
+            if backup_exists {
+                return Err("interim sender-key cache backup already exists".to_string());
+            }
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| format!("begin interim sender-key cache rebuild: {e}"))?;
+            tx.execute_batch(
+                "ALTER TABLE pending_sender_key_device_envelopes_v1
+                    RENAME TO pending_sender_key_device_envelopes_v1_interim;
+                 CREATE TABLE pending_sender_key_device_envelopes_v1 (
+                    conversation_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                    target_account_identity_key BLOB NOT NULL CHECK(length(target_account_identity_key) = 32),
+                    target_device_id BLOB NOT NULL CHECK(length(target_device_id) = 16),
+                    target_device_identity_key BLOB NOT NULL CHECK(length(target_device_identity_key) = 32),
+                    target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
+                    sender_device_id BLOB NOT NULL CHECK(length(sender_device_id) = 16),
+                    sender_device_identity_key BLOB NOT NULL CHECK(length(sender_device_identity_key) = 32),
+                    sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
+                    roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                    roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                    envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
+                    sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 4096),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (conversation_id, generation, target_device_id)
+                 );
+                 INSERT INTO pending_sender_key_device_envelopes_v1
+                    SELECT * FROM pending_sender_key_device_envelopes_v1_interim;
+                 DROP TABLE pending_sender_key_device_envelopes_v1_interim;",
+            ).map_err(|e| format!("rebuild interim sender-key cache: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("commit interim sender-key cache rebuild: {e}"))?;
+        }
+
+        let route_sql = self.normalized_table_sql("sender_key_incoming_routes_v1")?;
+        let route_current = route_sql
+            .contains("foreign key (group_id, sender_identity_key, generation)")
+            && route_sql.contains("on delete cascade");
+        if !route_current {
+            let proof_table_exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                                   WHERE type='table' AND name='sender_key_historical_device_proofs_v1')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("inspect historical proof table before route rebuild: {e}"))?;
+            if proof_table_exists {
+                let proof_rows: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM sender_key_historical_device_proofs_v1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| format!("count historical proofs before route rebuild: {e}"))?;
+                if proof_rows != 0 {
+                    return Err(
+                        "cannot rebuild interim incoming routes with historical proofs present"
+                            .to_string(),
+                    );
+                }
+            }
+            let backup_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sender_key_incoming_routes_v1_interim')",
+                [],
+                |row| row.get(0),
+            ).map_err(|e| format!("inspect interim incoming-route backup: {e}"))?;
+            if backup_exists {
+                return Err("interim incoming Sender-Key route backup already exists".to_string());
+            }
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| format!("begin interim incoming-route rebuild: {e}"))?;
+            if proof_table_exists {
+                tx.execute_batch("DROP TABLE sender_key_historical_device_proofs_v1;")
+                    .map_err(|e| {
+                        format!("drop empty historical proof table for route rebuild: {e}")
+                    })?;
+            }
+            tx.execute_batch(
+                "ALTER TABLE sender_key_incoming_routes_v1
+                    RENAME TO sender_key_incoming_routes_v1_interim;
+                 CREATE TABLE sender_key_incoming_routes_v1 (
+                    group_id TEXT NOT NULL,
+                    sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                    generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                    sender_account_identity_key BLOB NOT NULL CHECK(length(sender_account_identity_key) = 32),
+                    sender_device_id BLOB NOT NULL CHECK(length(sender_device_id) = 16),
+                    sender_device_signing_key BLOB NOT NULL CHECK(length(sender_device_signing_key) = 32),
+                    sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
+                    target_device_id BLOB NOT NULL CHECK(length(target_device_id) = 16),
+                    target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
+                    roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                    roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                    envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
+                    installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (group_id, sender_identity_key, generation),
+                    FOREIGN KEY (group_id, sender_identity_key, generation)
+                        REFERENCES sender_key_incoming_generations
+                            (group_id, sender_identity_key, generation)
+                        ON DELETE CASCADE
+                 );
+                 INSERT INTO sender_key_incoming_routes_v1
+                    SELECT * FROM sender_key_incoming_routes_v1_interim;
+                 DROP TABLE sender_key_incoming_routes_v1_interim;",
+            ).map_err(|e| format!("rebuild interim incoming Sender-Key routes: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("commit interim incoming-route rebuild: {e}"))?;
+            if proof_table_exists {
+                self.ensure_sender_key_historical_proof_schema()?;
+            }
+        }
         Ok(())
     }
 
@@ -1606,6 +2104,227 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Commit an independently validated roster proof and every observed
+    /// account-authorized device binding as one rollback-resistant snapshot.
+    pub fn commit_device_roster_snapshot_v1(
+        &self,
+        snapshot: &DeviceRosterSnapshotV1<'_>,
+    ) -> Result<(), String> {
+        if snapshot.conversation_id.is_empty()
+            || snapshot.roster_version == 0
+            || snapshot.roster_version > i64::MAX as u64
+            || snapshot.required_capabilities == 0
+            || snapshot.required_capabilities > i64::MAX as u64
+            || snapshot.canonical_snapshot.is_empty()
+            || snapshot.canonical_snapshot.len() > 1_048_576
+        {
+            return Err("invalid device roster snapshot scope".to_string());
+        }
+        let mut unique_devices = std::collections::HashSet::new();
+        for binding in snapshot.bindings {
+            if binding.device_id == [0u8; 16]
+                || !unique_devices.insert(binding.device_id)
+                || binding.binding_version == 0
+                || binding.binding_version > i64::MAX as u64
+                || binding.capabilities > i64::MAX as u64
+                || !(1..=3).contains(&binding.status)
+                || std::collections::HashSet::from([
+                    binding.account_identity_key,
+                    binding.account_signing_key,
+                    binding.device_identity_key,
+                    binding.device_signing_key,
+                ])
+                .len()
+                    != 4
+            {
+                return Err("invalid device binding pin in roster snapshot".to_string());
+            }
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin device roster snapshot transaction: {e}"))?;
+        let existing_roster = tx
+            .query_row(
+                "SELECT roster_version, roster_commitment, required_capabilities,
+                        canonical_snapshot
+                 FROM conversation_device_roster_snapshots_v1
+                 WHERE conversation_id = ?1",
+                rusqlite::params![snapshot.conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load pinned device roster head: {e}"))?;
+        if let Some((version, commitment, capabilities, canonical)) = existing_roster {
+            let version = u64::from_be_bytes(fixed_bytes("roster version", version)?);
+            if snapshot.roster_version < version {
+                return Err("device roster version rollback rejected".to_string());
+            }
+            if snapshot.roster_version == version
+                && (commitment.as_slice() != snapshot.roster_commitment
+                    || u64::from_be_bytes(fixed_bytes::<8>(
+                        "roster required capabilities",
+                        capabilities,
+                    )?) != snapshot.required_capabilities
+                    || canonical.as_slice() != snapshot.canonical_snapshot)
+            {
+                return Err("same device roster version changed committed state".to_string());
+            }
+        }
+
+        for binding in snapshot.bindings {
+            type PinRow = (
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                i64,
+                Vec<u8>,
+            );
+            let existing: Option<PinRow> = tx
+                .query_row(
+                    "SELECT account_identity_key, account_signing_key,
+                            device_identity_key, device_signing_key,
+                            binding_version, capabilities, status,
+                            account_signature
+                     FROM device_binding_pins_v1 WHERE device_id = ?1",
+                    rusqlite::params![binding.device_id.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| format!("load device binding pin: {e}"))?;
+            if let Some(existing) = existing {
+                let old_version =
+                    u64::from_be_bytes(fixed_bytes("pinned binding version", existing.4)?);
+                let old_capabilities =
+                    u64::from_be_bytes(fixed_bytes("pinned binding capabilities", existing.5)?);
+                let old_status = u8::try_from(existing.6)
+                    .map_err(|_| "pinned device binding status is invalid".to_string())?;
+                if existing.0.as_slice() != binding.account_identity_key
+                    || existing.1.as_slice() != binding.account_signing_key
+                    || existing.2.as_slice() != binding.device_identity_key
+                    || existing.3.as_slice() != binding.device_signing_key
+                {
+                    return Err("pinned device/account key replacement rejected".to_string());
+                }
+                if binding.binding_version < old_version {
+                    return Err("device binding version rollback rejected".to_string());
+                }
+                if old_status == 3 && binding.status != 3 {
+                    return Err("revoked device binding cannot become active again".to_string());
+                }
+                if binding.binding_version == old_version
+                    && (binding.capabilities != old_capabilities
+                        || binding.status != old_status
+                        || existing.7.as_slice() != binding.account_signature)
+                {
+                    return Err("same device binding version changed signed state".to_string());
+                }
+            }
+
+            tx.execute(
+                "INSERT INTO device_binding_pins_v1
+                    (device_id, account_identity_key, account_signing_key,
+                     device_identity_key, device_signing_key, binding_version,
+                     capabilities, status, account_signature, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    binding_version = excluded.binding_version,
+                    capabilities = excluded.capabilities,
+                    status = excluded.status,
+                    account_signature = excluded.account_signature,
+                    updated_at = datetime('now')",
+                rusqlite::params![
+                    binding.device_id.as_slice(),
+                    binding.account_identity_key.as_slice(),
+                    binding.account_signing_key.as_slice(),
+                    binding.device_identity_key.as_slice(),
+                    binding.device_signing_key.as_slice(),
+                    binding.binding_version.to_be_bytes().as_slice(),
+                    binding.capabilities.to_be_bytes().as_slice(),
+                    binding.status,
+                    binding.account_signature.as_slice(),
+                ],
+            )
+            .map_err(|e| format!("pin device binding: {e}"))?;
+        }
+
+        tx.execute(
+            "INSERT INTO conversation_device_roster_snapshots_v1
+                (conversation_id, roster_version, roster_commitment,
+                 required_capabilities, canonical_snapshot, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                roster_version = excluded.roster_version,
+                roster_commitment = excluded.roster_commitment,
+                required_capabilities = excluded.required_capabilities,
+                canonical_snapshot = excluded.canonical_snapshot,
+                updated_at = datetime('now')",
+            rusqlite::params![
+                snapshot.conversation_id,
+                snapshot.roster_version.to_be_bytes().as_slice(),
+                snapshot.roster_commitment.as_slice(),
+                snapshot.required_capabilities.to_be_bytes().as_slice(),
+                snapshot.canonical_snapshot,
+            ],
+        )
+        .map_err(|e| format!("persist device roster snapshot: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit device roster snapshot: {e}"))
+    }
+
+    pub fn load_device_roster_head_v1(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(u64, [u8; 32], u64)>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT roster_version, roster_commitment, required_capabilities
+                 FROM conversation_device_roster_snapshots_v1
+                 WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load device roster head: {e}"))?;
+        row.map(|(version, commitment, capabilities)| {
+            Ok((
+                u64::from_be_bytes(fixed_bytes("roster version", version)?),
+                fixed_bytes("roster commitment", commitment)?,
+                u64::from_be_bytes(fixed_bytes("roster capabilities", capabilities)?),
+            ))
+        })
+        .transpose()
+    }
+
     /// Trust-on-authenticated-directory: insert the first observed Ed25519 key
     /// for an X25519 identity and reject any later substitution.
     pub fn pin_trusted_signing_key(
@@ -1901,6 +2620,622 @@ impl VeilDb {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_incoming_sender_key_generation(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        generation: u32,
+        iteration: u32,
+        state_revision: u64,
+        distribution_commitment: &[u8; 32],
+        key_data: &[u8],
+    ) -> Result<(), String> {
+        self.conn
+            .execute_batch("SAVEPOINT veil_incoming_sender_key")
+            .map_err(|e| format!("begin incoming sender-key savepoint: {e}"))?;
+        let operation = upsert_incoming_sender_key_generation(
+            &self.conn,
+            group_id,
+            sender_identity_key,
+            generation,
+            iteration,
+            state_revision,
+            distribution_commitment,
+            key_data,
+        );
+        if let Err(error) = operation {
+            let rollback = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_incoming_sender_key;
+                 RELEASE SAVEPOINT veil_incoming_sender_key;",
+            );
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; incoming sender-key rollback failed: {rollback_error}")
+                }
+            });
+        }
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_incoming_sender_key")
+            .map_err(|e| format!("commit incoming sender-key savepoint: {e}"))
+    }
+
+    /// Atomically install an incoming generation and its immutable historical
+    /// route proof. The same generation can be replayed only with byte-for-byte
+    /// identical device/binding/roster metadata.
+    pub fn begin_retained_sender_key_conversation_v1(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch("SAVEPOINT veil_retained_sender_key_conversation")
+            .map_err(|e| format!("begin retained Sender-Key conversation savepoint: {e}"))
+    }
+
+    pub fn commit_retained_sender_key_conversation_v1(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_retained_sender_key_conversation")
+            .map_err(|e| format!("commit retained Sender-Key conversation savepoint: {e}"))
+    }
+
+    pub fn rollback_retained_sender_key_conversation_v1(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_retained_sender_key_conversation;
+                 RELEASE SAVEPOINT veil_retained_sender_key_conversation;",
+            )
+            .map_err(|e| format!("rollback retained Sender-Key conversation savepoint: {e}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_incoming_sender_key_generation_with_route_v1(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        generation: u32,
+        iteration: u32,
+        state_revision: u64,
+        distribution_commitment: &[u8; 32],
+        key_data: &[u8],
+        route: &IncomingSenderKeyRouteV1,
+    ) -> Result<(), String> {
+        let historical = route
+            .historical_sender_binding
+            .as_ref()
+            .ok_or("incoming sender-key route has no historical device proof")?;
+        if route.sender_device_identity_key != *sender_identity_key
+            || route.sender_device_id == [0u8; 16]
+            || route.target_device_id == [0u8; 16]
+            || route.sender_binding_version == 0
+            || route.sender_binding_version > i64::MAX as u64
+            || route.target_binding_version == 0
+            || route.target_binding_version > i64::MAX as u64
+            || route.roster_version == 0
+            || route.roster_version > i64::MAX as u64
+            || historical.sender_account_signing_key == [0u8; 32]
+            || historical.sender_device_capabilities > i64::MAX as u64
+            || !(1..=3).contains(&historical.sender_device_binding_status)
+            || historical.target_device_identity_key == Some([0u8; 32])
+            || historical.target_device_identity_key.is_none()
+            || std::collections::HashSet::from([
+                route.sender_account_identity_key,
+                historical.sender_account_signing_key,
+                route.sender_device_identity_key,
+                route.sender_device_signing_key,
+            ])
+            .len()
+                != 4
+        {
+            return Err("invalid incoming sender-key route proof".to_string());
+        }
+        self.conn
+            .execute_batch("SAVEPOINT veil_incoming_sender_key_route")
+            .map_err(|e| format!("begin incoming sender-key route savepoint: {e}"))?;
+        let operation = (|| {
+            let trusted_signing: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT signing_key FROM trusted_identity_keys WHERE identity_key = ?1",
+                    rusqlite::params![route.sender_account_identity_key.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("load historical trusted signing pin: {e}"))?;
+            if trusted_signing
+                .as_ref()
+                .is_some_and(|stored| stored.as_slice() != historical.sender_account_signing_key)
+            {
+                return Err("trusted signing key changed for pinned identity".to_string());
+            }
+            if trusted_signing.is_none() {
+                self.conn
+                    .execute(
+                        "INSERT INTO trusted_identity_keys (identity_key, signing_key)
+                         VALUES (?1, ?2)",
+                        rusqlite::params![
+                            route.sender_account_identity_key.as_slice(),
+                            historical.sender_account_signing_key.as_slice(),
+                        ],
+                    )
+                    .map_err(|e| format!("pin historical trusted signing key: {e}"))?;
+            }
+
+            type ExistingDevicePin = (
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                i64,
+                Vec<u8>,
+            );
+            let existing_pin: Option<ExistingDevicePin> = self
+                .conn
+                .query_row(
+                    "SELECT account_identity_key, account_signing_key,
+                            device_identity_key, device_signing_key,
+                            binding_version, capabilities, status,
+                            account_signature
+                     FROM device_binding_pins_v1 WHERE device_id = ?1",
+                    rusqlite::params![route.sender_device_id.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| format!("load historical device binding pin: {e}"))?;
+            let mut advance_pin = true;
+            if let Some(existing) = existing_pin {
+                let old_version =
+                    u64::from_be_bytes(fixed_bytes("pinned binding version", existing.4)?);
+                let old_capabilities =
+                    u64::from_be_bytes(fixed_bytes("pinned binding capabilities", existing.5)?);
+                let old_status = u8::try_from(existing.6)
+                    .map_err(|_| "pinned device binding status is invalid".to_string())?;
+                if existing.0.as_slice() != route.sender_account_identity_key
+                    || existing.1.as_slice() != historical.sender_account_signing_key
+                    || existing.2.as_slice() != route.sender_device_identity_key
+                    || existing.3.as_slice() != route.sender_device_signing_key
+                {
+                    return Err("pinned device/account key replacement rejected".to_string());
+                }
+                if route.sender_binding_version < old_version {
+                    // Historical decrypt proof is accepted, but must never
+                    // lower or reactivate the current binding head.
+                    advance_pin = false;
+                } else if route.sender_binding_version == old_version {
+                    if old_capabilities != historical.sender_device_capabilities
+                        || old_status != historical.sender_device_binding_status
+                        || existing.7.as_slice() != historical.sender_account_signature
+                    {
+                        return Err("same device binding version changed signed state".to_string());
+                    }
+                    advance_pin = false;
+                } else if old_status == 3 && historical.sender_device_binding_status != 3 {
+                    return Err("revoked device binding cannot become active again".to_string());
+                }
+            }
+            if advance_pin {
+                self.conn
+                    .execute(
+                        "INSERT INTO device_binding_pins_v1
+                            (device_id, account_identity_key, account_signing_key,
+                             device_identity_key, device_signing_key, binding_version,
+                             capabilities, status, account_signature, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                         ON CONFLICT(device_id) DO UPDATE SET
+                            binding_version = excluded.binding_version,
+                            capabilities = excluded.capabilities,
+                            status = excluded.status,
+                            account_signature = excluded.account_signature,
+                            updated_at = datetime('now')",
+                        rusqlite::params![
+                            route.sender_device_id.as_slice(),
+                            route.sender_account_identity_key.as_slice(),
+                            historical.sender_account_signing_key.as_slice(),
+                            route.sender_device_identity_key.as_slice(),
+                            route.sender_device_signing_key.as_slice(),
+                            route.sender_binding_version.to_be_bytes().as_slice(),
+                            historical
+                                .sender_device_capabilities
+                                .to_be_bytes()
+                                .as_slice(),
+                            historical.sender_device_binding_status,
+                            historical.sender_account_signature.as_slice(),
+                        ],
+                    )
+                    .map_err(|e| format!("pin historical device binding: {e}"))?;
+            }
+
+            upsert_incoming_sender_key_generation(
+                &self.conn,
+                group_id,
+                sender_identity_key,
+                generation,
+                iteration,
+                state_revision,
+                distribution_commitment,
+                key_data,
+            )?;
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO sender_key_incoming_routes_v1
+                        (group_id, sender_identity_key, generation,
+                         sender_account_identity_key, sender_device_id,
+                         sender_device_signing_key, sender_binding_version,
+                         target_device_id, target_binding_version, roster_version,
+                         roster_commitment, envelope_commitment)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        group_id,
+                        sender_identity_key.as_slice(),
+                        i64::from(generation),
+                        route.sender_account_identity_key.as_slice(),
+                        route.sender_device_id.as_slice(),
+                        route.sender_device_signing_key.as_slice(),
+                        route.sender_binding_version.to_be_bytes().as_slice(),
+                        route.target_device_id.as_slice(),
+                        route.target_binding_version.to_be_bytes().as_slice(),
+                        route.roster_version.to_be_bytes().as_slice(),
+                        route.roster_commitment.as_slice(),
+                        route.envelope_commitment.as_slice(),
+                    ],
+                )
+                .map_err(|e| format!("save incoming sender-key route proof: {e}"))?;
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO sender_key_historical_device_proofs_v1
+                        (group_id, sender_identity_key, generation,
+                         sender_account_signing_key, sender_device_capabilities,
+                         sender_device_binding_status, sender_account_signature,
+                         target_device_identity_key)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(group_id, sender_identity_key, generation) DO UPDATE SET
+                        target_device_identity_key = excluded.target_device_identity_key
+                     WHERE sender_key_historical_device_proofs_v1.target_device_identity_key IS NULL",
+                    rusqlite::params![
+                        group_id,
+                        sender_identity_key.as_slice(),
+                        i64::from(generation),
+                        historical.sender_account_signing_key.as_slice(),
+                        historical
+                            .sender_device_capabilities
+                            .to_be_bytes()
+                            .as_slice(),
+                        historical.sender_device_binding_status,
+                        historical.sender_account_signature.as_slice(),
+                        historical
+                            .target_device_identity_key
+                            .as_ref()
+                            .map(|key| key.as_slice()),
+                    ],
+                )
+                .map_err(|e| format!("save historical sender device proof: {e}"))?;
+            let stored = self
+                .load_incoming_sender_key_route_v1(group_id, sender_identity_key, generation)?
+                .ok_or("incoming sender-key route proof disappeared after save")?;
+            if stored != *route {
+                return Err("incoming sender-key route proof changed for generation".to_string());
+            }
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            let rollback = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_incoming_sender_key_route;
+                 RELEASE SAVEPOINT veil_incoming_sender_key_route;",
+            );
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; incoming sender-key route rollback failed: {rollback_error}")
+                }
+            });
+        }
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_incoming_sender_key_route")
+            .map_err(|e| format!("commit incoming sender-key route savepoint: {e}"))
+    }
+
+    pub fn load_incoming_sender_key_route_v1(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        generation: u32,
+    ) -> Result<Option<IncomingSenderKeyRouteV1>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT r.sender_account_identity_key, r.sender_device_id,
+                    r.sender_device_signing_key, r.sender_binding_version,
+                    r.target_device_id, r.target_binding_version, r.roster_version,
+                    r.roster_commitment, r.envelope_commitment,
+                    p.sender_account_signing_key, p.sender_device_capabilities,
+                    p.sender_device_binding_status, p.sender_account_signature,
+                    p.target_device_identity_key
+             FROM sender_key_incoming_routes_v1 r
+             LEFT JOIN sender_key_historical_device_proofs_v1 p
+               ON p.group_id = r.group_id
+              AND p.sender_identity_key = r.sender_identity_key
+              AND p.generation = r.generation
+             WHERE r.group_id = ?1 AND r.sender_identity_key = ?2 AND r.generation = ?3",
+                rusqlite::params![
+                    group_id,
+                    sender_identity_key.as_slice(),
+                    i64::from(generation)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, Option<Vec<u8>>>(9)?,
+                        row.get::<_, Option<Vec<u8>>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<Vec<u8>>>(12)?,
+                        row.get::<_, Option<Vec<u8>>>(13)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load incoming sender-key route proof: {e}"))?;
+        row.map(|row| {
+            Ok(IncomingSenderKeyRouteV1 {
+                sender_account_identity_key: fixed_bytes("route sender account identity", row.0)?,
+                sender_device_id: fixed_bytes("route sender device id", row.1)?,
+                sender_device_identity_key: *sender_identity_key,
+                sender_device_signing_key: fixed_bytes("route sender device signing key", row.2)?,
+                sender_binding_version: u64::from_be_bytes(fixed_bytes(
+                    "route sender binding version",
+                    row.3,
+                )?),
+                target_device_id: fixed_bytes("route target device id", row.4)?,
+                target_binding_version: u64::from_be_bytes(fixed_bytes(
+                    "route target binding version",
+                    row.5,
+                )?),
+                roster_version: u64::from_be_bytes(fixed_bytes("route roster version", row.6)?),
+                roster_commitment: fixed_bytes("route roster commitment", row.7)?,
+                envelope_commitment: fixed_bytes("route envelope commitment", row.8)?,
+                historical_sender_binding: match (row.9, row.10, row.11, row.12, row.13) {
+                    (None, None, None, None, None) => None,
+                    (Some(signing), Some(capabilities), Some(status), Some(signature), target) => {
+                        Some(HistoricalDeviceBindingProofV1 {
+                            sender_account_signing_key: fixed_bytes(
+                                "route sender account signing key",
+                                signing,
+                            )?,
+                            sender_device_capabilities: u64::from_be_bytes(fixed_bytes(
+                                "route sender device capabilities",
+                                capabilities,
+                            )?),
+                            sender_device_binding_status: u8::try_from(status).map_err(|_| {
+                                "route sender device binding status is invalid".to_string()
+                            })?,
+                            sender_account_signature: fixed_bytes(
+                                "route sender account signature",
+                                signature,
+                            )?,
+                            target_device_identity_key: target
+                                .map(|key| fixed_bytes("route target device identity key", key))
+                                .transpose()?,
+                        })
+                    }
+                    _ => {
+                        return Err(
+                            "persisted historical sender device proof is partial".to_string()
+                        )
+                    }
+                },
+            })
+        })
+        .transpose()
+    }
+
+    /// Promote one legacy single-row incoming state into the generation-keyed
+    /// table. Insert/verification and legacy deletion are atomic, so a crash
+    /// leaves either the old readable row or the complete new row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_legacy_incoming_sender_key_generation(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        generation: u32,
+        iteration: u32,
+        state_revision: u64,
+        distribution_commitment: &[u8; 32],
+        key_data: &[u8],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin legacy sender-key migration: {e}"))?;
+        upsert_incoming_sender_key_generation(
+            &tx,
+            group_id,
+            sender_identity_key,
+            generation,
+            iteration,
+            state_revision,
+            distribution_commitment,
+            key_data,
+        )?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM sender_keys_local
+                 WHERE group_id = ?1 AND sender_identity_key = ?2 AND is_outgoing = 0",
+                rusqlite::params![group_id, sender_identity_key.as_slice()],
+            )
+            .map_err(|e| format!("delete migrated legacy sender key: {e}"))?;
+        if deleted > 1 {
+            return Err("legacy sender-key migration deleted multiple rows".to_string());
+        }
+        tx.commit()
+            .map_err(|e| format!("commit legacy sender-key migration: {e}"))
+    }
+
+    pub fn load_incoming_sender_key_generations_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<StoredIncomingSenderKeyGeneration>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_identity_key, generation, iteration,
+                        state_revision, distribution_commitment, key_data
+                 FROM sender_key_incoming_generations
+                 WHERE group_id = ?1
+                 ORDER BY sender_identity_key ASC, generation ASC",
+            )
+            .map_err(|e| format!("prepare load incoming sender-key generations: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(5)?),
+                ))
+            })
+            .map_err(|e| format!("query incoming sender-key generations: {e}"))?;
+
+        let mut result = Vec::new();
+        let mut current_sender = None;
+        let mut current_sender_generations = 0usize;
+        for row in rows {
+            let (sender, generation, iteration, revision, commitment, key_data) =
+                row.map_err(|e| format!("read incoming sender-key generation: {e}"))?;
+            let sender_identity_key = fixed_bytes("incoming sender identity", sender)?;
+            if current_sender == Some(sender_identity_key) {
+                current_sender_generations += 1;
+            } else {
+                current_sender = Some(sender_identity_key);
+                current_sender_generations = 1;
+            }
+            if current_sender_generations > MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER {
+                return Err(
+                    "persisted incoming sender-key generation retention limit exceeded".to_string(),
+                );
+            }
+            result.push(StoredIncomingSenderKeyGeneration {
+                sender_identity_key,
+                generation: u32::try_from(generation)
+                    .map_err(|_| "incoming sender-key generation exceeds u32".to_string())?,
+                iteration: u32::try_from(iteration)
+                    .map_err(|_| "incoming sender-key iteration exceeds u32".to_string())?,
+                state_revision: u64::from_be_bytes(fixed_bytes(
+                    "incoming sender-key revision",
+                    revision,
+                )?),
+                distribution_commitment: fixed_bytes(
+                    "incoming sender-key distribution commitment",
+                    commitment,
+                )?,
+                key_data,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn load_legacy_incoming_sender_keys_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<StoredSenderKeyMaterial>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_identity_key, key_data
+                 FROM sender_keys_local
+                 WHERE group_id = ?1 AND is_outgoing = 0
+                 ORDER BY sender_identity_key ASC",
+            )
+            .map_err(|e| format!("prepare load legacy incoming sender keys: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(1)?),
+                ))
+            })
+            .map_err(|e| format!("query legacy incoming sender keys: {e}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (sender, key_data) =
+                row.map_err(|e| format!("read legacy incoming sender key: {e}"))?;
+            result.push((
+                fixed_bytes("legacy incoming sender identity", sender)?,
+                key_data,
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Commit a fresh outgoing generation and invalidate every cached sealed
+    /// envelope from the previous generation as one durable transition.
+    ///
+    /// Splitting these writes can leave a crash-recovered client with the old
+    /// generation but without its immutable retry envelopes (or vice versa).
+    /// The runtime prepares the new state off to the side and only publishes it
+    /// in memory after this transaction succeeds.
+    pub fn commit_sender_key_rotation(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        key_data: &[u8],
+    ) -> Result<(), String> {
+        if group_id.is_empty() {
+            return Err("sender-key rotation group id must not be empty".to_string());
+        }
+        if key_data.is_empty() || key_data.len() > 4096 {
+            return Err("invalid rotated sender-key state size".to_string());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin sender-key rotation transaction: {e}"))?;
+        tx.execute(
+            "DELETE FROM sender_keys_local
+             WHERE group_id = ?1 AND is_outgoing = 1 AND sender_identity_key <> ?2",
+            rusqlite::params![group_id, sender_identity_key.as_slice()],
+        )
+        .map_err(|e| format!("remove superseded sender-key owner state: {e}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sender_keys_local
+                (group_id, sender_identity_key, key_data, is_outgoing, updated_at)
+             VALUES (?1, ?2, ?3, 1, datetime('now'))",
+            rusqlite::params![group_id, sender_identity_key.as_slice(), key_data],
+        )
+        .map_err(|e| format!("persist rotated sender key: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_sender_key_envelopes WHERE conversation_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("invalidate rotated sender-key envelopes: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_sender_key_device_envelopes_v1 WHERE conversation_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("invalidate rotated exact-device sender-key envelopes: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit sender-key rotation: {e}"))
+    }
+
     pub fn load_sender_key(
         &self,
         group_id: &str,
@@ -1919,13 +3254,56 @@ impl VeilDb {
     }
 
     pub fn delete_sender_keys_for_group(&self, group_id: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "DELETE FROM sender_keys_local WHERE group_id = ?1",
-                rusqlite::params![group_id],
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin delete sender keys: {e}"))?;
+        tx.execute(
+            "DELETE FROM sender_keys_local WHERE group_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("delete legacy/outgoing sender keys: {e}"))?;
+        tx.execute(
+            "DELETE FROM sender_key_incoming_generations WHERE group_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("delete incoming sender-key generations: {e}"))?;
+        tx.execute(
+            "DELETE FROM sender_key_incoming_routes_v1 WHERE group_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("delete incoming sender-key route proofs: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit delete sender keys: {e}"))
+    }
+
+    pub fn load_outgoing_sender_keys_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<StoredSenderKeyMaterial>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_identity_key, key_data
+                 FROM sender_keys_local
+                 WHERE group_id = ?1 AND is_outgoing = 1
+                 ORDER BY sender_identity_key ASC",
             )
-            .map_err(|e| format!("delete sender keys: {e}"))?;
-        Ok(())
+            .map_err(|e| format!("prepare load outgoing sender keys: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(1)?),
+                ))
+            })
+            .map_err(|e| format!("query outgoing sender keys: {e}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (sender, key_data) = row.map_err(|e| format!("read outgoing sender key: {e}"))?;
+            result.push((fixed_bytes("outgoing sender identity", sender)?, key_data));
+        }
+        Ok(result)
     }
 
     /// Load every saved sender key entry for a group (incoming + outgoing).
@@ -2047,6 +3425,173 @@ impl VeilDb {
         Ok(Some(sealed_envelope))
     }
 
+    pub fn save_pending_sender_key_device_envelope_v1(
+        &self,
+        envelope: &PendingSenderKeyDeviceEnvelopeV1,
+    ) -> Result<Vec<u8>, String> {
+        if envelope.conversation_id.is_empty()
+            || envelope.generation == 0
+            || envelope.target_device_id == [0u8; 16]
+            || envelope.sender_device_id == [0u8; 16]
+            || envelope.target_binding_version == 0
+            || envelope.target_binding_version > i64::MAX as u64
+            || envelope.sender_binding_version == 0
+            || envelope.sender_binding_version > i64::MAX as u64
+            || envelope.roster_version == 0
+            || envelope.roster_version > i64::MAX as u64
+            || envelope.sealed_envelope.is_empty()
+            || envelope.sealed_envelope.len() > 4_096
+        {
+            return Err("invalid exact-device sender-key envelope".to_string());
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO pending_sender_key_device_envelopes_v1
+                (conversation_id, generation, target_account_identity_key,
+                 target_device_id, target_device_identity_key,
+                 target_binding_version, sender_device_id,
+                 sender_device_identity_key, sender_binding_version,
+                 roster_version, roster_commitment, envelope_commitment,
+                 sealed_envelope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    envelope.conversation_id,
+                    i64::from(envelope.generation),
+                    envelope.target_account_identity_key.as_slice(),
+                    envelope.target_device_id.as_slice(),
+                    envelope.target_device_identity_key.as_slice(),
+                    envelope.target_binding_version.to_be_bytes().as_slice(),
+                    envelope.sender_device_id.as_slice(),
+                    envelope.sender_device_identity_key.as_slice(),
+                    envelope.sender_binding_version.to_be_bytes().as_slice(),
+                    envelope.roster_version.to_be_bytes().as_slice(),
+                    envelope.roster_commitment.as_slice(),
+                    envelope.envelope_commitment.as_slice(),
+                    envelope.sealed_envelope,
+                ],
+            )
+            .map_err(|e| format!("save exact-device sender-key envelope: {e}"))?;
+        let stored = self
+            .load_pending_sender_key_device_envelope_v1(
+                &envelope.conversation_id,
+                envelope.generation,
+                &envelope.target_device_id,
+                envelope.target_binding_version,
+                envelope.roster_version,
+            )?
+            .ok_or("exact-device sender-key envelope disappeared after save")?;
+        if stored != *envelope {
+            return Err("exact-device sender-key envelope tuple changed".to_string());
+        }
+        Ok(stored.sealed_envelope)
+    }
+
+    pub fn load_pending_sender_key_device_envelope_v1(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+        target_device_id: &[u8; 16],
+        target_binding_version: u64,
+        roster_version: u64,
+    ) -> Result<Option<PendingSenderKeyDeviceEnvelopeV1>, String> {
+        type Row = (
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+        );
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT target_account_identity_key, target_device_identity_key,
+                    sender_device_id, sender_device_identity_key,
+                    sender_binding_version, roster_commitment,
+                    envelope_commitment, sealed_envelope, target_binding_version,
+                    roster_version
+             FROM pending_sender_key_device_envelopes_v1
+             WHERE conversation_id = ?1 AND generation = ?2
+               AND target_device_id = ?3",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    target_device_id.as_slice(),
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load exact-device sender-key envelope: {e}"))?;
+        row.map(|row| {
+            let stored_target_version =
+                u64::from_be_bytes(fixed_bytes("cached target binding version", row.8)?);
+            if stored_target_version != target_binding_version {
+                return Err("cached target binding version mismatch".to_string());
+            }
+            let stored_roster_version =
+                u64::from_be_bytes(fixed_bytes("cached roster version", row.9)?);
+            if stored_roster_version != roster_version {
+                return Err("cached roster version mismatch".to_string());
+            }
+            Ok(PendingSenderKeyDeviceEnvelopeV1 {
+                conversation_id: conversation_id.to_string(),
+                generation,
+                target_account_identity_key: fixed_bytes("cached target account identity", row.0)?,
+                target_device_id: *target_device_id,
+                target_device_identity_key: fixed_bytes("cached target device identity", row.1)?,
+                target_binding_version,
+                sender_device_id: fixed_bytes("cached sender device id", row.2)?,
+                sender_device_identity_key: fixed_bytes("cached sender device identity", row.3)?,
+                sender_binding_version: u64::from_be_bytes(fixed_bytes(
+                    "cached sender binding version",
+                    row.4,
+                )?),
+                roster_version,
+                roster_commitment: fixed_bytes("cached roster commitment", row.5)?,
+                envelope_commitment: fixed_bytes("cached envelope commitment", row.6)?,
+                sealed_envelope: row.7,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn delete_pending_sender_key_device_generation_v1(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+        roster_version: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_sender_key_device_envelopes_v1
+             WHERE conversation_id = ?1 AND generation = ?2 AND roster_version = ?3",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    roster_version.to_be_bytes().as_slice()
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("delete exact-device sender-key envelopes: {e}"))
+    }
+
     /// Remove a completed generation only after all corresponding gateway
     /// durable-storage ACKs have been observed by the client.
     pub fn delete_pending_sender_key_envelope_generation(
@@ -2070,13 +3615,22 @@ impl VeilDb {
         &self,
         conversation_id: &str,
     ) -> Result<(), String> {
-        self.conn
-            .execute(
-                "DELETE FROM pending_sender_key_envelopes WHERE conversation_id = ?1",
-                rusqlite::params![conversation_id],
-            )
-            .map(|_| ())
-            .map_err(|e| format!("invalidate pending sender-key envelopes: {e}"))
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin sender-key cache invalidation: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_sender_key_envelopes WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| format!("invalidate pending sender-key envelopes: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_sender_key_device_envelopes_v1 WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| format!("invalidate pending exact-device sender-key envelopes: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit sender-key cache invalidation: {e}"))
     }
 
     // ─── CRUD: Reactions ──────────────────────────────────
@@ -2580,6 +4134,46 @@ mod tests {
             account_signature: [0x77; 64],
         }
     }
+
+    fn sample_binding_pin(seed: u8, version: u64, status: u8) -> DeviceBindingPinV1 {
+        DeviceBindingPinV1 {
+            device_id: [seed; 16],
+            account_identity_key: [seed.wrapping_add(1); 32],
+            account_signing_key: [seed.wrapping_add(2); 32],
+            device_identity_key: [seed.wrapping_add(3); 32],
+            device_signing_key: [seed.wrapping_add(4); 32],
+            binding_version: version,
+            capabilities: 3,
+            status,
+            account_signature: [seed.wrapping_add(5); 64],
+        }
+    }
+
+    fn sample_incoming_route(
+        binding: &DeviceBindingPinV1,
+        target_device_id: [u8; 16],
+        target_device_identity_key: [u8; 32],
+    ) -> IncomingSenderKeyRouteV1 {
+        IncomingSenderKeyRouteV1 {
+            sender_account_identity_key: binding.account_identity_key,
+            sender_device_id: binding.device_id,
+            sender_device_identity_key: binding.device_identity_key,
+            sender_device_signing_key: binding.device_signing_key,
+            sender_binding_version: binding.binding_version,
+            target_device_id,
+            target_binding_version: 1,
+            roster_version: 1,
+            roster_commitment: [0x91; 32],
+            envelope_commitment: [0x92; 32],
+            historical_sender_binding: Some(HistoricalDeviceBindingProofV1 {
+                sender_account_signing_key: binding.account_signing_key,
+                sender_device_capabilities: binding.capabilities,
+                sender_device_binding_status: binding.status,
+                sender_account_signature: binding.account_signature,
+                target_device_identity_key: Some(target_device_identity_key),
+            }),
+        }
+    }
     use rusqlite::params;
 
     #[test]
@@ -2854,6 +4448,50 @@ mod tests {
     }
 
     #[test]
+    fn sender_key_rotation_rolls_back_state_when_cache_invalidation_fails() {
+        let db = VeilDb::open_memory(&[0x95u8; 32]).unwrap();
+        let sender = [0x11u8; 32];
+        let target = [0x22u8; 32];
+        let old_state = b"old-outgoing-state";
+        db.save_sender_key("group-atomic-rotation", &sender, old_state, true)
+            .unwrap();
+        db.save_pending_sender_key_envelope(
+            "group-atomic-rotation",
+            7,
+            &target,
+            &sender,
+            b"immutable-old-envelope",
+        )
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER abort_sender_key_cache_delete
+                 BEFORE DELETE ON pending_sender_key_envelopes
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected cache delete failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = db
+            .commit_sender_key_rotation("group-atomic-rotation", &sender, b"new-outgoing-state")
+            .unwrap_err();
+        assert!(error.contains("injected cache delete failure"));
+        assert_eq!(
+            db.load_sender_key("group-atomic-rotation", &sender)
+                .unwrap()
+                .unwrap(),
+            old_state
+        );
+        assert_eq!(
+            db.load_pending_sender_key_envelope("group-atomic-rotation", 7, &target, &sender,)
+                .unwrap()
+                .unwrap(),
+            b"immutable-old-envelope"
+        );
+    }
+
+    #[test]
     fn pending_sender_key_envelope_survives_sqlcipher_restart() {
         let path =
             std::env::temp_dir().join(format!("veil-pending-skdm-{}.db", uuid::Uuid::new_v4()));
@@ -2879,6 +4517,729 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn incoming_sender_key_generations_persist_ordered_and_reject_state_rollback() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-incoming-generations-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let key = [0xA1; 32];
+        let sender = [0x31; 32];
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            db.save_incoming_sender_key_generation(
+                "group-generations",
+                &sender,
+                2,
+                0,
+                1,
+                &[0x22; 32],
+                b"generation-two-revision-one",
+            )
+            .unwrap();
+            db.save_incoming_sender_key_generation(
+                "group-generations",
+                &sender,
+                1,
+                0,
+                1,
+                &[0x11; 32],
+                b"generation-one-revision-one",
+            )
+            .unwrap();
+            db.save_incoming_sender_key_generation(
+                "group-generations",
+                &sender,
+                1,
+                1,
+                2,
+                &[0x11; 32],
+                b"generation-one-revision-two",
+            )
+            .unwrap();
+            assert!(db
+                .save_incoming_sender_key_generation(
+                    "group-generations",
+                    &sender,
+                    1,
+                    0,
+                    1,
+                    &[0x11; 32],
+                    b"generation-one-revision-one",
+                )
+                .unwrap_err()
+                .contains("rollback"));
+            assert!(db
+                .save_incoming_sender_key_generation(
+                    "group-generations",
+                    &sender,
+                    1,
+                    1,
+                    2,
+                    &[0x11; 32],
+                    b"changed-without-revision",
+                )
+                .unwrap_err()
+                .contains("without a revision"));
+        }
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            let rows = db
+                .load_incoming_sender_key_generations_for_group("group-generations")
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                (
+                    rows[0].generation,
+                    rows[0].iteration,
+                    rows[0].state_revision
+                ),
+                (1, 1, 2)
+            );
+            assert_eq!(rows[0].key_data.as_slice(), b"generation-one-revision-two");
+            assert_eq!(rows[1].generation, 2);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn incoming_sender_key_generation_retention_cap_is_fail_closed_and_scoped() {
+        let db = VeilDb::open_memory(&[0xA7; 32]).unwrap();
+        let sender = [0xA8; 32];
+        for generation in 1..=MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER as u32 {
+            db.save_incoming_sender_key_generation(
+                "bounded-conversation",
+                &sender,
+                generation,
+                0,
+                1,
+                &[generation as u8; 32],
+                &[generation as u8],
+            )
+            .unwrap();
+        }
+        let error = db
+            .save_incoming_sender_key_generation(
+                "bounded-conversation",
+                &sender,
+                MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER as u32 + 1,
+                0,
+                1,
+                &[0xFF; 32],
+                b"must-not-persist",
+            )
+            .unwrap_err();
+        assert!(error.contains("retention limit"));
+        assert_eq!(
+            db.load_incoming_sender_key_generations_for_group("bounded-conversation")
+                .unwrap()
+                .len(),
+            MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER,
+        );
+        db.save_incoming_sender_key_generation(
+            "independent-conversation",
+            &sender,
+            1,
+            0,
+            1,
+            &[0xF1; 32],
+            b"independent",
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_incoming_sender_key_generations_for_group("independent-conversation")
+                .unwrap()
+                .len(),
+            1,
+        );
+    }
+
+    #[test]
+    fn injected_legacy_sender_key_migration_failure_rolls_back_new_generation() {
+        let db = VeilDb::open_memory(&[0xA2; 32]).unwrap();
+        let sender = [0x41; 32];
+        db.save_sender_key("group-legacy-rollback", &sender, b"legacy-state", false)
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER abort_legacy_sender_key_delete
+                 BEFORE DELETE ON sender_keys_local
+                 BEGIN SELECT RAISE(ABORT, 'injected legacy migration failure'); END;",
+            )
+            .unwrap();
+        let error = db
+            .migrate_legacy_incoming_sender_key_generation(
+                "group-legacy-rollback",
+                &sender,
+                7,
+                0,
+                0,
+                &[0u8; 32],
+                b"legacy-state",
+            )
+            .unwrap_err();
+        assert!(error.contains("injected legacy migration failure"));
+        assert_eq!(
+            db.load_sender_key("group-legacy-rollback", &sender)
+                .unwrap()
+                .unwrap(),
+            b"legacy-state"
+        );
+        assert!(db
+            .load_incoming_sender_key_generations_for_group("group-legacy-rollback")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn device_roster_pins_survive_restart_and_reject_rollback_or_equivocation() {
+        let path =
+            std::env::temp_dir().join(format!("veil-roster-pins-{}.db", uuid::Uuid::new_v4()));
+        let key = [0xA3; 32];
+        let binding = sample_binding_pin(0x20, 1, 1);
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000101",
+                roster_version: 5,
+                roster_commitment: [0x51; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"canonical-roster-five",
+                bindings: std::slice::from_ref(&binding),
+            })
+            .unwrap();
+        }
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            assert_eq!(
+                db.load_device_roster_head_v1("00000000-0000-0000-0000-000000000101")
+                    .unwrap(),
+                Some((5, [0x51; 32], 3))
+            );
+            assert!(db
+                .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                    conversation_id: "00000000-0000-0000-0000-000000000101",
+                    roster_version: 4,
+                    roster_commitment: [0x41; 32],
+                    required_capabilities: 3,
+                    canonical_snapshot: b"rollback",
+                    bindings: std::slice::from_ref(&binding),
+                })
+                .unwrap_err()
+                .contains("rollback"));
+            assert!(db
+                .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                    conversation_id: "00000000-0000-0000-0000-000000000101",
+                    roster_version: 5,
+                    roster_commitment: [0x52; 32],
+                    required_capabilities: 3,
+                    canonical_snapshot: b"same-version-equivocation",
+                    bindings: std::slice::from_ref(&binding),
+                })
+                .unwrap_err()
+                .contains("same device roster version"));
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn device_binding_pin_rejects_key_replacement_rollback_and_revoked_resurrection_atomically() {
+        let db = VeilDb::open_memory(&[0xA4; 32]).unwrap();
+        let original = sample_binding_pin(0x30, 2, 1);
+        db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000201",
+            roster_version: 1,
+            roster_commitment: [0x61; 32],
+            required_capabilities: 3,
+            canonical_snapshot: b"initial",
+            bindings: std::slice::from_ref(&original),
+        })
+        .unwrap();
+
+        let mut replacement = original.clone();
+        replacement.binding_version = 3;
+        replacement.device_identity_key[0] ^= 1;
+        assert!(db
+            .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000202",
+                roster_version: 1,
+                roster_commitment: [0x62; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"replacement",
+                bindings: std::slice::from_ref(&replacement),
+            })
+            .unwrap_err()
+            .contains("replacement"));
+
+        let mut rollback = original.clone();
+        rollback.binding_version = 1;
+        assert!(db
+            .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000203",
+                roster_version: 1,
+                roster_commitment: [0x63; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"binding-rollback",
+                bindings: std::slice::from_ref(&rollback),
+            })
+            .unwrap_err()
+            .contains("binding version rollback"));
+
+        let mut revoked = original.clone();
+        revoked.binding_version = 3;
+        revoked.status = 3;
+        revoked.account_signature[0] ^= 1;
+        db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000204",
+            roster_version: 1,
+            roster_commitment: [0x64; 32],
+            required_capabilities: 3,
+            canonical_snapshot: b"revoked",
+            bindings: std::slice::from_ref(&revoked),
+        })
+        .unwrap();
+        let mut resurrected = revoked.clone();
+        resurrected.binding_version = 4;
+        resurrected.status = 1;
+        assert!(db
+            .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000205",
+                roster_version: 1,
+                roster_commitment: [0x65; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"resurrected",
+                bindings: std::slice::from_ref(&resurrected),
+            })
+            .unwrap_err()
+            .contains("cannot become active"));
+
+        let fresh = sample_binding_pin(0x40, 1, 1);
+        let mut conflict = revoked.clone();
+        conflict.binding_version = 4;
+        conflict.device_signing_key[0] ^= 1;
+        assert!(db
+            .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000206",
+                roster_version: 1,
+                roster_commitment: [0x66; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"atomic-failure",
+                bindings: &[fresh.clone(), conflict],
+            })
+            .is_err());
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM device_binding_pins_v1 WHERE device_id = ?1",
+                rusqlite::params![fresh.device_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "failed roster transaction leaked its first pin");
+        assert!(db
+            .load_device_roster_head_v1("00000000-0000-0000-0000-000000000206")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn historical_sender_proof_first_seen_tofu_pins_atomically_and_conflicts_roll_back() {
+        let db = VeilDb::open_memory(&[0xB1; 32]).unwrap();
+        let binding = sample_binding_pin(0x51, 1, 1);
+        let route = sample_incoming_route(&binding, [0x61; 16], [0x62; 32]);
+        db.save_incoming_sender_key_generation_with_route_v1(
+            "historical-tofu",
+            &binding.device_identity_key,
+            1,
+            0,
+            1,
+            &[0x63; 32],
+            b"incoming-state",
+            &route,
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_incoming_sender_key_route_v1(
+                "historical-tofu",
+                &binding.device_identity_key,
+                1,
+            )
+            .unwrap(),
+            Some(route)
+        );
+        assert!(db
+            .load_trusted_signing_keys()
+            .unwrap()
+            .contains(&(binding.account_identity_key, binding.account_signing_key,)));
+
+        let conflict_db = VeilDb::open_memory(&[0xB2; 32]).unwrap();
+        conflict_db
+            .pin_trusted_signing_key(&binding.account_identity_key, &[0xEE; 32])
+            .unwrap();
+        let error = conflict_db
+            .save_incoming_sender_key_generation_with_route_v1(
+                "historical-conflict",
+                &binding.device_identity_key,
+                1,
+                0,
+                1,
+                &[0x64; 32],
+                b"must-rollback",
+                &sample_incoming_route(&binding, [0x65; 16], [0x66; 32]),
+            )
+            .unwrap_err();
+        assert!(error.contains("trusted signing key changed"));
+        assert!(conflict_db
+            .load_incoming_sender_key_generations_for_group("historical-conflict")
+            .unwrap()
+            .is_empty());
+        let leaked_device_pin: i64 = conflict_db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM device_binding_pins_v1 WHERE device_id = ?1",
+                rusqlite::params![binding.device_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_device_pin, 0);
+    }
+
+    #[test]
+    fn historical_binding_below_current_head_never_downgrades_or_reactivates_it() {
+        let db = VeilDb::open_memory(&[0xB3; 32]).unwrap();
+        let historical = sample_binding_pin(0x71, 1, 1);
+        let mut current = historical.clone();
+        current.binding_version = 2;
+        current.account_signature = [0x81; 64];
+        db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000701",
+            roster_version: 1,
+            roster_commitment: [0x82; 32],
+            required_capabilities: 3,
+            canonical_snapshot: b"current-active",
+            bindings: std::slice::from_ref(&current),
+        })
+        .unwrap();
+        let route = sample_incoming_route(&historical, [0x83; 16], [0x84; 32]);
+        db.save_incoming_sender_key_generation_with_route_v1(
+            "historical-below-active",
+            &historical.device_identity_key,
+            1,
+            0,
+            1,
+            &[0x85; 32],
+            b"historical-active",
+            &route,
+        )
+        .unwrap();
+
+        let mut revoked = current.clone();
+        revoked.binding_version = 3;
+        revoked.status = 3;
+        revoked.account_signature = [0x86; 64];
+        db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000702",
+            roster_version: 1,
+            roster_commitment: [0x87; 32],
+            required_capabilities: 3,
+            canonical_snapshot: b"current-revoked",
+            bindings: std::slice::from_ref(&revoked),
+        })
+        .unwrap();
+        let mut second_route = route.clone();
+        second_route.roster_version = 2;
+        second_route.roster_commitment = [0x88; 32];
+        second_route.envelope_commitment = [0x89; 32];
+        db.save_incoming_sender_key_generation_with_route_v1(
+            "historical-below-revoked",
+            &historical.device_identity_key,
+            2,
+            0,
+            1,
+            &[0x8A; 32],
+            b"historical-revoked",
+            &second_route,
+        )
+        .unwrap();
+        let (version, status): (Vec<u8>, i64) = db
+            .conn
+            .query_row(
+                "SELECT binding_version, status FROM device_binding_pins_v1 WHERE device_id = ?1",
+                rusqlite::params![historical.device_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            u64::from_be_bytes(fixed_bytes("test version", version).unwrap()),
+            3
+        );
+        assert_eq!(status, 3);
+
+        let mut equivocation = second_route;
+        equivocation.sender_device_identity_key = [0xFE; 32];
+        let error = db
+            .save_incoming_sender_key_generation_with_route_v1(
+                "historical-equivocation",
+                &[0xFE; 32],
+                3,
+                0,
+                1,
+                &[0x8B; 32],
+                b"must-not-persist",
+                &equivocation,
+            )
+            .unwrap_err();
+        assert!(error.contains("replacement"));
+        assert!(db
+            .load_incoming_sender_key_generations_for_group("historical-equivocation")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn interim_exact_device_tables_rebuild_idempotently_and_fail_closed_on_ambiguity() {
+        let db = VeilDb::open_memory(&[0xA5; 32]).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE sender_key_incoming_routes_v1;
+                 DROP TABLE pending_sender_key_device_envelopes_v1;
+                 CREATE TABLE pending_sender_key_device_envelopes_v1 (
+                    conversation_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    target_account_identity_key BLOB NOT NULL,
+                    target_device_id BLOB NOT NULL,
+                    target_device_identity_key BLOB NOT NULL,
+                    target_binding_version BLOB NOT NULL,
+                    sender_device_id BLOB NOT NULL,
+                    sender_device_identity_key BLOB NOT NULL,
+                    sender_binding_version BLOB NOT NULL,
+                    roster_version BLOB NOT NULL,
+                    roster_commitment BLOB NOT NULL,
+                    envelope_commitment BLOB NOT NULL,
+                    sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 65536),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (conversation_id, generation, target_device_id,
+                                 target_binding_version, roster_version)
+                 );
+                 CREATE TABLE sender_key_incoming_routes_v1 (
+                    group_id TEXT NOT NULL,
+                    sender_identity_key BLOB NOT NULL,
+                    generation INTEGER NOT NULL,
+                    sender_account_identity_key BLOB NOT NULL,
+                    sender_device_id BLOB NOT NULL,
+                    sender_device_signing_key BLOB NOT NULL,
+                    sender_binding_version BLOB NOT NULL,
+                    target_device_id BLOB NOT NULL,
+                    target_binding_version BLOB NOT NULL,
+                    roster_version BLOB NOT NULL,
+                    roster_commitment BLOB NOT NULL,
+                    envelope_commitment BLOB NOT NULL,
+                    installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (group_id, sender_identity_key, generation)
+                 );",
+            )
+            .unwrap();
+        db.save_incoming_sender_key_generation(
+            "group-interim",
+            &[0x11; 32],
+            1,
+            0,
+            1,
+            &[0x12; 32],
+            b"state",
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO sender_key_incoming_routes_v1 VALUES
+                (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))",
+                rusqlite::params![
+                    "group-interim",
+                    [0x11u8; 32].as_slice(),
+                    [0x13u8; 32].as_slice(),
+                    [0x14u8; 16].as_slice(),
+                    [0x15u8; 32].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x16u8; 16].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x17u8; 32].as_slice(),
+                    [0x18u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO pending_sender_key_device_envelopes_v1 VALUES
+                (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))",
+                rusqlite::params![
+                    "group-interim",
+                    [0x21u8; 32].as_slice(),
+                    [0x22u8; 16].as_slice(),
+                    [0x23u8; 32].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x24u8; 16].as_slice(),
+                    [0x25u8; 32].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x26u8; 32].as_slice(),
+                    [0x27u8; 32].as_slice(),
+                    b"sealed",
+                ],
+            )
+            .unwrap();
+        db.rebuild_interim_sender_key_tables().unwrap();
+        db.rebuild_interim_sender_key_tables().unwrap();
+        assert!(db
+            .normalized_table_sql("pending_sender_key_device_envelopes_v1")
+            .unwrap()
+            .contains("primary key (conversation_id, generation, target_device_id)"));
+        assert!(db
+            .normalized_table_sql("sender_key_incoming_routes_v1")
+            .unwrap()
+            .contains("on delete cascade"));
+        db.conn
+            .execute_batch(
+                "DROP TABLE sender_key_historical_device_proofs_v1;
+                 CREATE TABLE sender_key_historical_device_proofs_v1 (
+                    group_id TEXT NOT NULL, sender_identity_key BLOB NOT NULL,
+                    generation INTEGER NOT NULL, sender_account_signing_key BLOB NOT NULL,
+                    sender_device_capabilities BLOB NOT NULL,
+                    sender_device_binding_status INTEGER NOT NULL,
+                    sender_account_signature BLOB NOT NULL,
+                    PRIMARY KEY (group_id, sender_identity_key, generation),
+                    FOREIGN KEY (group_id, sender_identity_key, generation)
+                      REFERENCES sender_key_incoming_routes_v1
+                        (group_id, sender_identity_key, generation) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+        db.ensure_sender_key_historical_proof_schema().unwrap();
+        db.ensure_sender_key_historical_proof_schema().unwrap();
+        let target_column_present: bool = db
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('sender_key_historical_device_proofs_v1')
+                    WHERE name = 'target_device_identity_key'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(target_column_present);
+
+        db.conn
+            .execute_batch(
+                "DROP TABLE pending_sender_key_device_envelopes_v1;
+                 CREATE TABLE pending_sender_key_device_envelopes_v1 (
+                    conversation_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                    target_account_identity_key BLOB NOT NULL, target_device_id BLOB NOT NULL,
+                    target_device_identity_key BLOB NOT NULL, target_binding_version BLOB NOT NULL,
+                    sender_device_id BLOB NOT NULL, sender_device_identity_key BLOB NOT NULL,
+                    sender_binding_version BLOB NOT NULL, roster_version BLOB NOT NULL,
+                    roster_commitment BLOB NOT NULL, envelope_commitment BLOB NOT NULL,
+                    sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 65536),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (conversation_id, generation, target_device_id,
+                                 target_binding_version, roster_version)
+                 );",
+            )
+            .unwrap();
+        for version in [1u64, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO pending_sender_key_device_envelopes_v1 VALUES
+                    (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))",
+                    rusqlite::params![
+                        "group-ambiguous",
+                        [0x31u8; 32].as_slice(),
+                        [0x32u8; 16].as_slice(),
+                        [0x33u8; 32].as_slice(),
+                        version.to_be_bytes().as_slice(),
+                        [0x34u8; 16].as_slice(),
+                        [0x35u8; 32].as_slice(),
+                        1u64.to_be_bytes().as_slice(),
+                        version.to_be_bytes().as_slice(),
+                        [0x36u8; 32].as_slice(),
+                        [0x37u8; 32].as_slice(),
+                        b"sealed",
+                    ],
+                )
+                .unwrap();
+        }
+        assert!(db
+            .rebuild_interim_sender_key_tables()
+            .unwrap_err()
+            .contains("ambiguous"));
+        let rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pending_sender_key_device_envelopes_v1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert!(db
+            .normalized_table_sql("pending_sender_key_device_envelopes_v1")
+            .unwrap()
+            .contains("target_binding_version, roster_version"));
+    }
+
+    #[test]
+    fn interim_route_rebuild_rolls_back_when_an_orphan_cannot_gain_its_foreign_key() {
+        let db = VeilDb::open_memory(&[0xA6; 32]).unwrap();
+        db.conn.execute_batch(
+            "DROP TABLE sender_key_incoming_routes_v1;
+             CREATE TABLE sender_key_incoming_routes_v1 (
+                group_id TEXT NOT NULL, sender_identity_key BLOB NOT NULL, generation INTEGER NOT NULL,
+                sender_account_identity_key BLOB NOT NULL, sender_device_id BLOB NOT NULL,
+                sender_device_signing_key BLOB NOT NULL, sender_binding_version BLOB NOT NULL,
+                target_device_id BLOB NOT NULL, target_binding_version BLOB NOT NULL,
+                roster_version BLOB NOT NULL, roster_commitment BLOB NOT NULL,
+                envelope_commitment BLOB NOT NULL, installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, sender_identity_key, generation)
+             );"
+        ).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO sender_key_incoming_routes_v1 VALUES
+                ('orphan', ?1, 9, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+                rusqlite::params![
+                    [0x41u8; 32].as_slice(),
+                    [0x42u8; 32].as_slice(),
+                    [0x43u8; 16].as_slice(),
+                    [0x44u8; 32].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x45u8; 16].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x46u8; 32].as_slice(),
+                    [0x47u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        assert!(db.rebuild_interim_sender_key_tables().is_err());
+        assert!(!db
+            .normalized_table_sql("sender_key_incoming_routes_v1")
+            .unwrap()
+            .contains("foreign key"));
+        let rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sender_key_incoming_routes_v1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
     }
 
     #[test]

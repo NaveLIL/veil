@@ -1,6 +1,7 @@
 package servers
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -128,5 +129,29 @@ func TestAdministratorStillCannotPersistUnknownPermissionBits(t *testing.T) {
 	}
 	if administrator.canGrant(db.AllRolePermissions | uint64(1)<<63) {
 		t.Fatal("administrator was allowed to persist unknown permission bits")
+	}
+}
+
+func TestChannelOverwriteGrantRequiresAuthorityAndKnownSubset(t *testing.T) {
+	managerPermissions := db.PermManageChannels | db.PermViewChannel
+	if err := validateChannelOverwriteGrant(managerPermissions, db.PermViewChannel); err != nil {
+		t.Fatalf("manager could not grant possessed channel permission: %v", err)
+	}
+	if err := validateChannelOverwriteGrant(db.PermAdministrator, db.AllChannelPermissions); err != nil {
+		t.Fatalf("administrator could not grant known channel permissions: %v", err)
+	}
+
+	if err := validateChannelOverwriteGrant(db.PermViewChannel, db.PermViewChannel); err == nil {
+		t.Fatal("non-manager was allowed to grant a channel permission")
+	}
+	if err := validateChannelOverwriteGrant(managerPermissions, db.PermSendMessages); err == nil {
+		t.Fatal("manager was allowed to grant a channel permission it does not possess")
+	}
+
+	unknown := uint64(1) << 20
+	for _, permissions := range []uint64{managerPermissions, db.PermAdministrator} {
+		if err := validateChannelOverwriteGrant(permissions, unknown); !errors.Is(err, db.ErrInvalidChannelOverwrite) {
+			t.Fatalf("unknown overwrite permission error = %v", err)
+		}
 	}
 }

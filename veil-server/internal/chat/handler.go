@@ -18,6 +18,7 @@ import (
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
 	"github.com/AegisSec/veil-server/internal/logsafe"
+	"github.com/AegisSec/veil-server/internal/publicerr"
 	"github.com/google/uuid"
 )
 
@@ -96,19 +97,12 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check membership
-	isMember, err := h.svc.db.CanAccessConversation(
-		r.Context(), conversationID, userID, db.ChannelReadPermissions,
-	)
-	if err != nil || !isMember {
-		writeJSON(w, http.StatusForbidden, errorResp("not a conversation member"))
-		return
-	}
-
 	maxLimit := configuredPageLimit(h.svc.cfg.MessageBatchLimit)
 	limit, err := parsePageLimit(r.URL.Query().Get("limit"), maxLimit, maxLimit)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_page_limit", "invalid pagination limit", err,
+		))
 		return
 	}
 
@@ -140,12 +134,19 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		afterID = cursor.ID
 	}
 
-	msgs, err := h.svc.db.GetPendingMessages(r.Context(), conversationID, userID, after, afterID, limit+1)
+	history, err := h.svc.db.GetConversationHistoryPage(
+		r.Context(), conversationID, userID, after, afterID, limit+1,
+	)
 	if err != nil {
-		log.Printf("get messages error: %v", err)
+		if errors.Is(err, db.ErrConversationAccessDenied) {
+			writeJSON(w, http.StatusForbidden, errorResp("not a conversation member"))
+			return
+		}
+		log.Printf("get messages error: class=%s", logsafe.ErrorClass(err))
 		writeJSON(w, http.StatusInternalServerError, errorResp("failed to fetch messages"))
 		return
 	}
+	msgs := history.Messages
 
 	type reactionJSON struct {
 		Emoji    string `json:"emoji"`
@@ -160,24 +161,30 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		ContentType  string `json:"content_type"`
 	}
 	type msgJSON struct {
-		ID                string           `json:"id"`
-		ConversationID    string           `json:"conversation_id"`
-		SenderID          string           `json:"sender_id"`
-		SenderIdentityKey string           `json:"sender_identity_key"`
-		SenderSigningKey  string           `json:"sender_signing_key"`
-		Ciphertext        string           `json:"ciphertext"` // lowercase hex (legacy wire contract)
-		Header            string           `json:"header"`     // lowercase hex (legacy wire contract)
-		MsgType           int16            `json:"msg_type"`
-		ReplyToID         *string          `json:"reply_to_id,omitempty"`
-		ExpiresAt         *string          `json:"expires_at,omitempty"`
-		EditedAt          *string          `json:"edited_at"`
-		IsDeleted         bool             `json:"is_deleted"`
-		IsExpired         bool             `json:"is_expired"`
-		Reactions         []reactionJSON   `json:"reactions"`
-		Attachments       []attachmentJSON `json:"attachments"`
-		CreatedAt         string           `json:"created_at"`
-		ServerTimestamp   int64            `json:"server_timestamp"`
-		RevisionTimestamp int64            `json:"revision_timestamp"`
+		ID                   string           `json:"id"`
+		ConversationID       string           `json:"conversation_id"`
+		SenderID             string           `json:"sender_id"`
+		SenderIdentityKey    string           `json:"sender_identity_key"`
+		SenderSigningKey     string           `json:"sender_signing_key"`
+		Ciphertext           string           `json:"ciphertext"` // lowercase hex (legacy wire contract)
+		Header               string           `json:"header"`     // lowercase hex (legacy wire contract)
+		MsgType              int16            `json:"msg_type"`
+		ReplyToID            *string          `json:"reply_to_id,omitempty"`
+		ExpiresAt            *string          `json:"expires_at,omitempty"`
+		EditedAt             *string          `json:"edited_at"`
+		IsDeleted            bool             `json:"is_deleted"`
+		IsExpired            bool             `json:"is_expired"`
+		Reactions            []reactionJSON   `json:"reactions"`
+		Attachments          []attachmentJSON `json:"attachments"`
+		CreatedAt            string           `json:"created_at"`
+		ServerTimestamp      int64            `json:"server_timestamp"`
+		RevisionTimestamp    int64            `json:"revision_timestamp"`
+		CryptoProfile        string           `json:"crypto_profile"`
+		CryptoEra            string           `json:"crypto_era,omitempty"`
+		RosterVersion        string           `json:"roster_version,omitempty"`
+		RosterCommitment     string           `json:"roster_commitment,omitempty"`
+		SenderDeviceID       string           `json:"sender_device_id,omitempty"`
+		SenderBindingVersion string           `json:"sender_binding_version,omitempty"`
 	}
 
 	hasMore := len(msgs) > limit
@@ -187,19 +194,13 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	reactionsByMessage := make(map[string][]reactionJSON, len(msgs))
 	attachmentsByMessage := make(map[string][]attachmentJSON, len(msgs))
 	if len(msgs) != 0 {
-		messageIDs := make([]string, 0, len(msgs))
-		for _, message := range msgs {
-			messageIDs = append(messageIDs, message.ID)
-		}
-		storedReactions, reactionErr := h.svc.db.GetReactionsForMessages(r.Context(), messageIDs)
-		if reactionErr != nil {
-			log.Printf("get message reactions error: %v", reactionErr)
-			writeJSON(w, http.StatusInternalServerError, errorResp("failed to fetch message reactions"))
-			return
-		}
-		for _, reaction := range storedReactions {
+		for _, reaction := range history.Reactions {
 			if reaction.ConversationID != conversationID {
-				log.Printf("reaction %s has unexpected conversation %s", reaction.MessageID, reaction.ConversationID)
+				log.Printf(
+					"reaction message_ref=%s has unexpected conversation_ref=%s",
+					logsafe.Ref("message", reaction.MessageID),
+					logsafe.Ref("conversation", reaction.ConversationID),
+				)
 				writeJSON(w, http.StatusInternalServerError, errorResp("invalid reaction state"))
 				return
 			}
@@ -207,13 +208,7 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 				Emoji: reaction.Emoji, UserID: reaction.UserID, Username: reaction.Username,
 			})
 		}
-		storedAttachments, attachmentErr := h.svc.db.GetAttachmentsForMessages(r.Context(), messageIDs)
-		if attachmentErr != nil {
-			log.Printf("get message attachments error: %v", attachmentErr)
-			writeJSON(w, http.StatusInternalServerError, errorResp("failed to fetch message attachments"))
-			return
-		}
-		for _, attachment := range storedAttachments {
+		for _, attachment := range history.Attachments {
 			attachmentsByMessage[attachment.MessageID] = append(
 				attachmentsByMessage[attachment.MessageID],
 				attachmentJSON{
@@ -271,16 +266,34 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 			IsExpired:         isExpired,
 			Reactions:         reactions,
 			Attachments:       attachments,
-			CreatedAt:         m.CreatedAt.Format(time.RFC3339Nano),
+			CreatedAt:         m.CreatedAt.UTC().Format(time.RFC3339Nano),
 			ServerTimestamp:   m.CreatedAt.UnixMilli(),
 			RevisionTimestamp: revisionTimestamp,
+			CryptoProfile:     "legacy_unknown",
+		}
+		if m.SecurityContext != nil {
+			security := m.SecurityContext
+			if security.CryptoProfile != db.MessageCryptoProfileSenderKeyV5 ||
+				security.CryptoEra != db.MessageCryptoEraSenderKeyV5 ||
+				security.RosterVersion == 0 || len(security.RosterCommitment) != 32 ||
+				len(security.SenderDeviceID) != 16 || security.SenderBindingVersion == 0 {
+				log.Printf("message_ref=%s has invalid persisted security context", logsafe.Ref("message", m.ID))
+				writeJSON(w, http.StatusInternalServerError, errorResp("message security context is invalid"))
+				return
+			}
+			mj.CryptoProfile = security.CryptoProfile
+			mj.CryptoEra = strconv.FormatUint(security.CryptoEra, 10)
+			mj.RosterVersion = strconv.FormatUint(security.RosterVersion, 10)
+			mj.RosterCommitment = hex.EncodeToString(security.RosterCommitment)
+			mj.SenderDeviceID = hex.EncodeToString(security.SenderDeviceID)
+			mj.SenderBindingVersion = strconv.FormatUint(security.SenderBindingVersion, 10)
 		}
 		if m.ExpiresAt != nil {
-			t := m.ExpiresAt.Format(time.RFC3339)
+			t := m.ExpiresAt.UTC().Format(time.RFC3339)
 			mj.ExpiresAt = &t
 		}
 		if m.EditedAt != nil {
-			t := m.EditedAt.Format(time.RFC3339Nano)
+			t := m.EditedAt.UTC().Format(time.RFC3339Nano)
 			mj.EditedAt = &t
 		}
 		result = append(result, mj)
@@ -294,7 +307,7 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		last := msgs[len(msgs)-1]
 		nextCursor, encodeErr := encodePageCursor("messages", conversationID, last.CreatedAt, last.ID)
 		if encodeErr != nil {
-			log.Printf("encode message cursor: %v", encodeErr)
+			log.Printf("encode message cursor: class=%s", logsafe.ErrorClass(encodeErr))
 			writeJSON(w, http.StatusInternalServerError, errorResp("failed to paginate messages"))
 			return
 		}
@@ -316,7 +329,9 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 
 	limit, err := parsePageLimit(r.URL.Query().Get("limit"), defaultConversationPageLimit, defaultConversationPageLimit)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errorResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_page_limit", "invalid pagination limit", err,
+		))
 		return
 	}
 
@@ -334,7 +349,7 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 
 	conversations, err := h.svc.db.ListUserConversations(r.Context(), userID, after, afterID, limit+1)
 	if err != nil {
-		log.Printf("list conversations error: %v", err)
+		log.Printf("list conversations error: class=%s", logsafe.ErrorClass(err))
 		writeJSON(w, http.StatusInternalServerError, errorResp("failed to fetch conversations"))
 		return
 	}
@@ -365,7 +380,11 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 		members := make([]memberJSON, 0, len(conversation.Members))
 		for _, member := range conversation.Members {
 			if len(member.IdentityKey) != 32 || len(member.SigningKey) != ed25519.PublicKeySize {
-				log.Printf("conversation %s member %s has invalid public key material", conversation.ID, member.UserID)
+				log.Printf(
+					"conversation_ref=%s member_ref=%s has invalid public key material",
+					logsafe.Ref("conversation", conversation.ID),
+					logsafe.Ref("user", member.UserID),
+				)
 				writeJSON(w, http.StatusInternalServerError, errorResp("member cryptographic identity is invalid"))
 				return
 			}
@@ -375,7 +394,7 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 				IdentityKey: hex.EncodeToString(member.IdentityKey),
 				SigningKey:  hex.EncodeToString(member.SigningKey),
 				Role:        member.Role,
-				JoinedAt:    member.JoinedAt.Format(time.RFC3339Nano),
+				JoinedAt:    member.JoinedAt.UTC().Format(time.RFC3339Nano),
 			})
 		}
 		result = append(result, conversationJSON{
@@ -383,7 +402,7 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 			ConvType:  conversation.ConvType,
 			Name:      conversation.Name,
 			ServerID:  conversation.ServerID,
-			CreatedAt: conversation.CreatedAt.Format(time.RFC3339Nano),
+			CreatedAt: conversation.CreatedAt.UTC().Format(time.RFC3339Nano),
 			Members:   members,
 		})
 	}
@@ -396,7 +415,7 @@ func (h *Handler) ListConversations(w http.ResponseWriter, r *http.Request) {
 		last := conversations[len(conversations)-1]
 		nextCursor, encodeErr := encodePageCursor("conversations", userID, last.CreatedAt, last.ID)
 		if encodeErr != nil {
-			log.Printf("encode conversation cursor: %v", encodeErr)
+			log.Printf("encode conversation cursor: class=%s", logsafe.ErrorClass(encodeErr))
 			writeJSON(w, http.StatusInternalServerError, errorResp("failed to paginate conversations"))
 			return
 		}
@@ -437,7 +456,11 @@ func (h *Handler) CreateDM(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, errDMPrincipalMismatch) {
 			status = http.StatusForbidden
 		}
-		writeJSON(w, status, errorResp(err.Error()))
+		mapped := publicerr.New(status, "invalid_dm_request", "invalid DM request", err)
+		if errors.Is(err, errDMPrincipalMismatch) {
+			mapped = publicerr.New(status, "dm_principal_mismatch", "DM participants must include authenticated user", err)
+		}
+		publicerr.Write(w, status, mapped)
 		return
 	}
 
@@ -447,14 +470,14 @@ func (h *Handler) CreateDM(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(peer.IdentityKey) != 32 || len(peer.SigningKey) != ed25519.PublicKeySize {
-		log.Printf("create DM peer %s has invalid public key material", peerID)
+		log.Printf("create DM peer_ref=%s has invalid public key material", logsafe.Ref("user", peerID))
 		writeJSON(w, http.StatusConflict, errorResp("peer cryptographic identity is invalid"))
 		return
 	}
 
 	convID, created, err := h.svc.db.FindOrCreateDM(r.Context(), requesterID, peerID)
 	if err != nil {
-		log.Printf("create DM error: %v", err)
+		log.Printf("create DM error: class=%s", logsafe.ErrorClass(err))
 		writeJSON(w, http.StatusInternalServerError, errorResp("failed to create DM"))
 		return
 	}
@@ -481,18 +504,14 @@ func (h *Handler) GetMembers(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, errorResp("conversation_id required"))
 		return
 	}
-	isMember, err := h.svc.db.CanAccessConversation(
+	members, err := h.svc.db.GetConversationMemberBindingsForRequester(
 		r.Context(), conversationID, requesterID, db.ChannelReadPermissions,
 	)
-	if err != nil || !isMember {
-		writeJSON(w, http.StatusForbidden, errorResp("not a conversation member"))
-		return
-	}
-
-	members, err := h.svc.db.GetAuthorizedConversationMemberBindings(
-		r.Context(), conversationID, db.ChannelReadPermissions,
-	)
 	if err != nil {
+		if errors.Is(err, db.ErrConversationAccessDenied) {
+			writeJSON(w, http.StatusForbidden, errorResp("not a conversation member"))
+			return
+		}
 		writeJSON(w, http.StatusNotFound, errorResp("conversation not found"))
 		return
 	}
@@ -508,7 +527,11 @@ func (h *Handler) GetMembers(w http.ResponseWriter, r *http.Request) {
 	result := make([]memberJSON, 0, len(members))
 	for _, member := range members {
 		if len(member.IdentityKey) != 32 || len(member.SigningKey) != ed25519.PublicKeySize {
-			log.Printf("conversation %s member %s has invalid public key material", conversationID, member.UserID)
+			log.Printf(
+				"conversation_ref=%s member_ref=%s has invalid public key material",
+				logsafe.Ref("conversation", conversationID),
+				logsafe.Ref("user", member.UserID),
+			)
 			writeJSON(w, http.StatusInternalServerError, errorResp("member cryptographic identity is invalid"))
 			return
 		}
@@ -518,7 +541,7 @@ func (h *Handler) GetMembers(w http.ResponseWriter, r *http.Request) {
 			IdentityKey: hex.EncodeToString(member.IdentityKey),
 			SigningKey:  hex.EncodeToString(member.SigningKey),
 			Role:        member.Role,
-			JoinedAt:    member.JoinedAt.Format(time.RFC3339),
+			JoinedAt:    member.JoinedAt.UTC().Format(time.RFC3339),
 		})
 	}
 
@@ -669,8 +692,10 @@ func (h *Handler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 
 	convID, err := h.svc.CreateGroup(r.Context(), req.Name, userID)
 	if err != nil {
-		log.Printf("create group error: %v", err)
-		writeJSON(w, http.StatusBadRequest, errorResp(err.Error()))
+		log.Printf("create group error: class=%s", logsafe.ErrorClass(err))
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_group", "invalid group request", err,
+		))
 		return
 	}
 
@@ -710,10 +735,10 @@ func (h *Handler) AddGroupMember(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.svc.AddGroupMember(r.Context(), groupID, requesterID, req.UserID); err != nil {
 		status := http.StatusBadRequest
-		if errors.Is(err, ErrNotMember) || err.Error() == "insufficient permissions" {
+		if errors.Is(err, ErrNotMember) || errors.Is(err, ErrInsufficientPermissions) {
 			status = http.StatusForbidden
 		}
-		writeJSON(w, status, errorResp(err.Error()))
+		publicerr.Write(w, status, err)
 		return
 	}
 
@@ -737,10 +762,10 @@ func (h *Handler) RemoveGroupMember(w http.ResponseWriter, r *http.Request) {
 
 	if err := h.svc.RemoveGroupMember(r.Context(), groupID, requesterID, targetUserID); err != nil {
 		status := http.StatusBadRequest
-		if errors.Is(err, ErrNotMember) || err.Error() == "insufficient permissions" {
+		if errors.Is(err, ErrNotMember) || errors.Is(err, ErrInsufficientPermissions) {
 			status = http.StatusForbidden
 		}
-		writeJSON(w, status, errorResp(err.Error()))
+		publicerr.Write(w, status, err)
 		return
 	}
 
@@ -762,7 +787,7 @@ func (h *Handler) GetGroupMembers(w http.ResponseWriter, r *http.Request) {
 
 	members, err := h.svc.GetGroupMembers(r.Context(), groupID, requesterID)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errorResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 
@@ -783,7 +808,7 @@ func (h *Handler) GetGroupMembers(w http.ResponseWriter, r *http.Request) {
 			SigningKey:  hex.EncodeToString(m.SigningKey),
 			Username:    m.Username,
 			Role:        m.Role,
-			JoinedAt:    m.JoinedAt.Format(time.RFC3339),
+			JoinedAt:    m.JoinedAt.UTC().Format(time.RFC3339),
 		})
 	}
 

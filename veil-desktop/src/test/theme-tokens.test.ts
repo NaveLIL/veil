@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-const activeUiSources = import.meta.glob(["../App.tsx", "../components/**/*.tsx"], {
+const activeUiSources = import.meta.glob(["../App.tsx", "../app.css", "../components/**/*.tsx"], {
   eager: true,
   query: "?raw",
   import: "default",
@@ -17,6 +17,10 @@ describe("active UI theme contract", () => {
   it("uses semantic tokens for neutral and status colors", () => {
     const violations = Object.entries(activeUiSources).flatMap(([path, source]) =>
       source.split(/\r?\n/).flatMap((line, index) =>
+        // Palette/status literals belong only in the semantic-token
+        // declarations. Active CSS rules and component styles must consume
+        // those tokens so every theme, including OLED, stays coherent.
+        !line.trimStart().startsWith("--") &&
         forbiddenThemeLiterals.some((pattern) => pattern.test(line))
           ? [`${path}:${index + 1}: ${line.trim()}`]
           : [],

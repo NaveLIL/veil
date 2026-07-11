@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -122,6 +123,24 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create device: %v", err)
 	}
+	aliceDeviceKeys := newIntegrationDeviceKeys(t)
+	_, aliceBindingPayload := signedDeviceBinding(
+		t, alice, aliceDeviceKey, aliceDeviceKeys, 1,
+		db.RequiredChannelCapabilities, db.DeviceBindingActive,
+	)
+	putDeviceBinding(t, h, alice, aliceDeviceKey, aliceBindingPayload, http.StatusOK)
+
+	bobDeviceKey := randomBytes(t, 16)
+	bobDevice, err := h.DB.CreateDevice(context.Background(), bob.ID, bobDeviceKey, "bob-device")
+	if err != nil {
+		t.Fatalf("create bob device: %v", err)
+	}
+	bobDeviceKeys := newIntegrationDeviceKeys(t)
+	_, bobBindingPayload := signedDeviceBinding(
+		t, bob, bobDeviceKey, bobDeviceKeys, 1,
+		db.RequiredChannelCapabilities, db.DeviceBindingActive,
+	)
+	putDeviceBinding(t, h, bob, bobDeviceKey, bobBindingPayload, http.StatusOK)
 
 	spk := randomBytes(t, 32)
 	spkSigningMessage, err := auth.SignedPreKeySigningMessage(spk)
@@ -520,8 +539,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			NewCiphertext:  []byte("malicious edit"),
 			NewHeader:      []byte("malicious header"),
 		})
-		if !errors.Is(err, chat.ErrMessageConversationMismatch) {
-			t.Fatalf("cross-conversation edit error = %v, want mismatch", err)
+		if !errors.Is(err, chat.ErrNotMember) {
+			t.Fatalf("cross-conversation edit error = %v, want membership denial without a message-existence oracle", err)
 		}
 		_, _, _, err = h.Chat.HandleDeleteMessage(context.Background(), alice.ID, &pb.DeleteMessage{
 			MessageId:      message.ID,
@@ -730,14 +749,11 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("unauthorized channel users leaked in directory: %v", ownerMembers)
 		}
 
-		_, _, recipients, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
+		_, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
 			ConversationId: conversationID, Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
 		})
-		if err != nil {
-			t.Fatalf("VIEW+SEND member could not send: %v", err)
-		}
-		if len(recipients) != 1 || recipients[0] != alice.ID {
-			t.Fatalf("no-history member entered message fanout: %v", recipients)
+		if !errors.Is(err, db.ErrMessageSecurityContext) {
+			t.Fatalf("legacy channel send error=%v, want ErrMessageSecurityContext", err)
 		}
 
 		capture := &captureBroadcaster{}
@@ -776,6 +792,16 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 		if !seen[alice.ID] || !seen[bob.ID] || seen[mallory.ID] {
 			t.Fatalf("authorized directory binding mismatch: %v", members)
+		}
+		security := secureMessageContextForDevice(t, h, conversationID, bob.ID, bobDevice)
+		_, _, recipients, err := h.Chat.HandleSecureSendMessage(ctx, bob.ID, &pb.SendMessage{
+			ConversationId: conversationID, Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
+		}, security)
+		if err != nil {
+			t.Fatalf("VIEW+READ+SEND member could not send securely: %v", err)
+		}
+		if len(recipients) != 1 || recipients[0] != alice.ID {
+			t.Fatalf("unauthorized member entered secure message fanout: %v", recipients)
 		}
 
 		capture.reset()
@@ -898,25 +924,51 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		if status != http.StatusOK {
 			t.Fatalf("member send allow status=%d body=%v", status, body)
 		}
-		_, _, recipients, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
+		security := secureMessageContextForDevice(t, h, conversationID, bob.ID, bobDevice)
+		_, _, recipients, err := h.Chat.HandleSecureSendMessage(ctx, bob.ID, &pb.SendMessage{
 			ConversationId: conversationID, Ciphertext: []byte("allowed by member overwrite"),
-		})
+		}, security)
 		if err != nil || len(recipients) != 1 || recipients[0] != alice.ID {
 			t.Fatalf("member send allow err=%v recipients=%v", err, recipients)
 		}
 
-		bobDevice, err := h.DB.CreateDevice(ctx, bob.ID, randomBytes(t, 16), "overwrite-bob-device")
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := h.DB.StoreSenderKey(
+		roster := requireReadySecurityRoster(t, h, conversationID)
+		if err := h.DB.StoreDeviceSenderKey(
 			ctx, conversationID, aliceDevice.ID, bobDevice.ID, []byte("sealed-skdm"), 1,
+			roster.Version, roster.Commitment[:], 1, 1,
 		); err != nil {
 			t.Fatal(err)
 		}
 		pending, err := h.DB.GetPendingSenderKeys(ctx, bobDevice.ID)
 		if err != nil || len(pending) != 1 {
 			t.Fatalf("authorized retained sender keys=%v err=%v", pending, err)
+		}
+
+		// Removing one role must not collect the target's history when another
+		// independently applicable role preserves the exact read authorization.
+		alternateReader, err := h.DB.CreateRole(
+			ctx, serverID, "continuous-reader", 0, nil, nil,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.DB.AssignRole(ctx, serverID, bob.ID, alternateReader.ID); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.DB.UpsertChannelOverwrite(ctx, db.ChannelOverwrite{
+			ChannelID: channelID, TargetID: alternateReader.ID,
+			TargetType: db.ChannelOverwriteRole,
+			Allow:      db.ChannelReadPermissions,
+			Deny:       db.PermSendMessages,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err := h.DB.UnassignRole(ctx, serverID, bob.ID, readerRole); err != nil {
+			t.Fatal(err)
+		}
+		pending, err = h.DB.GetPendingSenderKeys(ctx, bobDevice.ID)
+		if err != nil || len(pending) != 1 {
+			t.Fatalf("continuously authorized target lost retained key=%v err=%v", pending, err)
 		}
 
 		status, _, body = h.Do(alice, http.MethodPut,
@@ -926,6 +978,54 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			})
 		if status != http.StatusOK {
 			t.Fatalf("member history deny status=%d body=%v", status, body)
+		}
+		if _, err := h.DB.Pool.Exec(ctx,
+			`UPDATE sender_keys
+			 SET created_at = now() - INTERVAL '2 hours',
+			     expires_at = now() - INTERVAL '1 hour'
+			 WHERE conversation_id = $1::uuid
+			   AND owner_device_id = $2::uuid
+			   AND target_device_id = $3::uuid`,
+			conversationID, aliceDevice.ID, bobDevice.ID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		otherConversationID, err := h.DB.CreateGroup(ctx, "overwrite-prune-other", alice.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := h.DB.AddGroupMember(ctx, otherConversationID, bob.ID, 0); err != nil {
+			t.Fatal(err)
+		}
+		otherRoster := requireReadySecurityRoster(t, h, otherConversationID)
+		otherBlob := []byte("other-conversation-skdm")
+		if err := h.DB.StoreDeviceSenderKey(
+			ctx, otherConversationID, aliceDevice.ID, bobDevice.ID, otherBlob, 1,
+			otherRoster.Version, otherRoster.Commitment[:], 1, 1,
+		); err != nil {
+			t.Fatalf("expired unauthorized row blocked another conversation admission: %v", err)
+		}
+		otherCommitment := sha256.Sum256(otherBlob)
+		if err := h.DB.AcknowledgeSenderKey(
+			ctx, otherConversationID, aliceDevice.ID, bobDevice.ID, 1,
+			otherRoster.Version, otherCommitment[:],
+		); err != nil {
+			t.Fatal(err)
+		}
+		var unauthorizedRows, preservedHeads int
+		if err := h.DB.Pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM sender_keys
+			 WHERE conversation_id = $1::uuid AND target_device_id = $2::uuid`,
+			conversationID, bobDevice.ID,
+		).Scan(&unauthorizedRows); err != nil || unauthorizedRows != 0 {
+			t.Fatalf("ACL-removed target rows=%d err=%v, want 0", unauthorizedRows, err)
+		}
+		if err := h.DB.Pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM sender_key_heads
+			 WHERE conversation_id = $1::uuid AND target_device_id = $2::uuid`,
+			conversationID, bobDevice.ID,
+		).Scan(&preservedHeads); err != nil || preservedHeads != 1 {
+			t.Fatalf("ACL removal sender-key heads=%d err=%v, want preserved head", preservedHeads, err)
 		}
 		status, _, _ = h.Do(bob, http.MethodGet, "/v1/conversations/"+conversationID+"/members", nil)
 		if status != http.StatusForbidden {
@@ -946,12 +1046,12 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 		pending, err = h.DB.GetPendingSenderKeys(ctx, bobDevice.ID)
 		if err != nil || len(pending) != 0 {
-			t.Fatalf("history-denied retained sender keys=%v err=%v", pending, err)
+			t.Fatalf("history-denied sender keys were not pruned=%v err=%v", pending, err)
 		}
 		if _, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
 			ConversationId: conversationID, Ciphertext: []byte("send without history"),
-		}); err != nil {
-			t.Fatalf("independent send permission was lost: %v", err)
+		}); !errors.Is(err, db.ErrMessageSecurityContext) {
+			t.Fatalf("send-only legacy channel write error=%v, want fail-closed Sender-Key context rejection", err)
 		}
 
 		status, _, _ = h.Do(alice, http.MethodDelete,
@@ -960,8 +1060,47 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("delete member overwrite status=%d", status)
 		}
 		pending, err = h.DB.GetPendingSenderKeys(ctx, bobDevice.ID)
-		if err != nil || len(pending) != 1 {
-			t.Fatalf("restored retained sender keys=%v err=%v", pending, err)
+		if err != nil || len(pending) != 0 {
+			t.Fatalf("future-only re-admission resurrected old sender keys=%v err=%v", pending, err)
+		}
+
+		// A committed loss transition must collect the old target row even when
+		// access is restored before any roster resolve, login or pending-key
+		// query. Otherwise a fast remove->re-add would resurrect old history.
+		reAdmittedRoster := requireReadySecurityRoster(t, h, conversationID)
+		transientBlob := []byte("must-not-survive-fast-re-admission")
+		if err := h.DB.StoreDeviceSenderKey(
+			ctx, conversationID, aliceDevice.ID, bobDevice.ID, transientBlob, 2,
+			reAdmittedRoster.Version, reAdmittedRoster.Commitment[:], 1, 1,
+		); err != nil {
+			t.Fatal(err)
+		}
+		status, _, body = h.Do(alice, http.MethodPut,
+			"/v1/channels/"+channelID+"/overwrites", map[string]any{
+				"target_id": bob.ID, "target_type": db.ChannelOverwriteUser,
+				"allow": uint64(0), "deny": db.PermReadMessageHistory,
+			})
+		if status != http.StatusOK {
+			t.Fatalf("fast re-admission deny status=%d body=%v", status, body)
+		}
+		status, _, _ = h.Do(alice, http.MethodDelete,
+			fmt.Sprintf("/v1/channels/%s/overwrites/%d/%s", channelID, db.ChannelOverwriteUser, bob.ID), nil)
+		if status != http.StatusOK {
+			t.Fatalf("fast re-admission restore status=%d", status)
+		}
+		pending, err = h.DB.GetPendingSenderKeys(ctx, bobDevice.ID)
+		if err != nil || len(pending) != 0 {
+			t.Fatalf("fast re-admission resurrected old sender keys=%v err=%v", pending, err)
+		}
+		var transientHead int64
+		if err := h.DB.Pool.QueryRow(ctx,
+			`SELECT max_generation FROM sender_key_heads
+			 WHERE conversation_id = $1::uuid
+			   AND owner_device_id = $2::uuid
+			   AND target_device_id = $3::uuid`,
+			conversationID, aliceDevice.ID, bobDevice.ID,
+		).Scan(&transientHead); err != nil || transientHead != 2 {
+			t.Fatalf("fast re-admission head=%d err=%v, want preserved generation 2", transientHead, err)
 		}
 
 		status, _, _ = h.Do(alice, http.MethodPut,
@@ -979,6 +1118,100 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			})
 		if status != http.StatusBadRequest {
 			t.Fatalf("foreign-server overwrite target status=%d, want 400", status)
+		}
+
+		// The database is a second authorization boundary: direct writers must
+		// not be able to persist masks/targets the REST service rejects.
+		if _, err := h.DB.Pool.Exec(ctx,
+			`DELETE FROM roles WHERE id = $1::uuid`, defaultRole,
+		); err == nil {
+			t.Fatal("database allowed deletion of the only default role")
+		}
+		var defaultCount int
+		if err := h.DB.Pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM roles WHERE server_id = $1::uuid AND is_default = TRUE`, serverID,
+		).Scan(&defaultCount); err != nil || defaultCount != 1 {
+			t.Fatalf("default role invariant count=%d err=%v", defaultCount, err)
+		}
+
+		for _, invalidPermissions := range []int64{-1, int64(uint64(1) << 20)} {
+			if _, err := h.DB.Pool.Exec(ctx,
+				`INSERT INTO roles (server_id, name, permissions, position, is_default)
+				 VALUES ($1::uuid, 'invalid-mask', $2, 1, FALSE)`,
+				serverID, invalidPermissions,
+			); err == nil {
+				t.Fatalf("database accepted invalid role permission mask %d", invalidPermissions)
+			}
+		}
+
+		var cleanupRole string
+		if err := h.DB.Pool.QueryRow(ctx,
+			`INSERT INTO roles (server_id, name, permissions, position, is_default)
+			 VALUES ($1::uuid, 'overwrite-cleanup', 0, 1, FALSE)
+			 RETURNING id::text`, serverID,
+		).Scan(&cleanupRole); err != nil {
+			t.Fatalf("create cleanup role: %v", err)
+		}
+		for _, masks := range [][2]int64{
+			{int64(uint64(1) << 20), 0},
+			{int64(db.PermViewChannel), int64(db.PermViewChannel)},
+		} {
+			if _, err := h.DB.Pool.Exec(ctx,
+				`INSERT INTO channel_overwrites (channel_id, target_id, target_type, allow, deny)
+				 VALUES ($1::uuid, $2::uuid, 0, $3, $4)`,
+				channelID, cleanupRole, masks[0], masks[1],
+			); err == nil {
+				t.Fatalf("database accepted invalid overwrite allow=%d deny=%d", masks[0], masks[1])
+			}
+		}
+		if _, err := h.DB.Pool.Exec(ctx,
+			`INSERT INTO channel_overwrites (channel_id, target_id, target_type, allow, deny)
+			 VALUES ($1::uuid, $2::uuid, 1, $3, 0)`,
+			channelID, outsider.ID, int64(db.PermViewChannel),
+		); err == nil {
+			t.Fatal("database accepted an overwrite for a user outside the server")
+		}
+
+		if _, err := h.DB.Pool.Exec(ctx,
+			`INSERT INTO channel_overwrites (channel_id, target_id, target_type, allow, deny)
+			 VALUES ($1::uuid, $2::uuid, 0, $3, 0)`,
+			channelID, cleanupRole, int64(db.PermViewChannel),
+		); err != nil {
+			t.Fatalf("insert role cleanup overwrite: %v", err)
+		}
+		if _, err := h.DB.Pool.Exec(ctx, `DELETE FROM roles WHERE id = $1::uuid`, cleanupRole); err != nil {
+			t.Fatalf("delete non-default role: %v", err)
+		}
+		var overwriteCount int
+		if err := h.DB.Pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM channel_overwrites
+			 WHERE target_type = 0 AND target_id = $1::uuid`, cleanupRole,
+		).Scan(&overwriteCount); err != nil || overwriteCount != 0 {
+			t.Fatalf("deleted role retained %d overwrites err=%v", overwriteCount, err)
+		}
+
+		if _, err := h.DB.Pool.Exec(ctx,
+			`INSERT INTO channel_overwrites (channel_id, target_id, target_type, allow, deny)
+			 VALUES ($1::uuid, $2::uuid, 1, $3, 0)`,
+			channelID, mallory.ID, int64(db.PermViewChannel),
+		); err != nil {
+			t.Fatalf("insert member cleanup overwrite: %v", err)
+		}
+		if _, err := h.DB.Pool.Exec(ctx,
+			`DELETE FROM server_members WHERE server_id = $1::uuid AND user_id = $2::uuid`,
+			serverID, mallory.ID,
+		); err != nil {
+			t.Fatalf("delete server member: %v", err)
+		}
+		if err := h.DB.Pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM channel_overwrites overwrite
+			 JOIN channels channel ON channel.id = overwrite.channel_id
+			 WHERE channel.server_id = $1::uuid
+			   AND overwrite.target_type = 1
+			   AND overwrite.target_id = $2::uuid`,
+			serverID, mallory.ID,
+		).Scan(&overwriteCount); err != nil || overwriteCount != 0 {
+			t.Fatalf("removed member retained %d overwrites err=%v", overwriteCount, err)
 		}
 	})
 
@@ -1206,6 +1439,41 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("owner kick status=%d, want 200", status)
 		}
 	})
+}
+
+func requireReadySecurityRoster(t *testing.T, h *Harness, conversationID string) *db.ConversationDeviceRoster {
+	t.Helper()
+	roster, err := h.DB.ResolveConversationDeviceRoster(
+		context.Background(), conversationID, db.RequiredChannelCapabilities,
+	)
+	if err != nil {
+		t.Fatalf("resolve secure roster: %v", err)
+	}
+	if roster == nil || !roster.Ready || roster.Version == 0 {
+		t.Fatalf("secure roster is not ready: %+v", roster)
+	}
+	return roster
+}
+
+func secureMessageContextForDevice(t *testing.T, h *Harness, conversationID, userID string, device *db.Device) *db.MessageSecurityContext {
+	t.Helper()
+	if device == nil {
+		t.Fatal("secure message device is nil")
+	}
+	roster := requireReadySecurityRoster(t, h, conversationID)
+	binding, err := h.DB.GetLatestDeviceBinding(context.Background(), device.ID)
+	if err != nil {
+		t.Fatalf("load secure message device binding: %v", err)
+	}
+	return &db.MessageSecurityContext{
+		CryptoProfile:          db.MessageCryptoProfileSenderKeyV5,
+		CryptoEra:              db.MessageCryptoEraSenderKeyV5,
+		RosterVersion:          roster.Version,
+		RosterCommitment:       append([]byte(nil), roster.Commitment[:]...),
+		SenderDeviceID:         append([]byte(nil), device.DeviceKey...),
+		SenderBindingVersion:   binding.Version,
+		SenderDeviceDatabaseID: device.ID,
+	}
 }
 
 type broadcastCall struct {

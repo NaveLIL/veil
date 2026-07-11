@@ -291,7 +291,7 @@ export const OnboardingScreen: Component = () => {
     backBtn: {
       display: "flex", "align-items": "center", "justify-content": "center",
       gap: "6px", height: "36px", background: "transparent", border: "none",
-      color: "var(--veil-contrast-30)", "font-size": "12px", cursor: "pointer",
+      color: "var(--veil-text-faint)", "font-size": "12px", cursor: "pointer",
       transition: "color 0.15s", "margin-top": "4px", width: "100%",
     },
     sectionTitle: {
@@ -299,7 +299,7 @@ export const OnboardingScreen: Component = () => {
       "margin-bottom": "4px",
     },
     sectionSub: {
-      "font-size": "13px", color: "var(--veil-contrast-35)", "margin-bottom": "20px",
+      "font-size": "13px", color: "var(--veil-text-faint)", "margin-bottom": "20px",
     },
   };
 
@@ -339,7 +339,7 @@ export const OnboardingScreen: Component = () => {
             </div>
             <div>
               <div style={{ "font-size": "16px", "font-weight": "600", color: "var(--veil-contrast-85)", "letter-spacing": "0.2em", "text-align": "center" }}>VEIL</div>
-              <div style={{ "font-size": "10px", color: "var(--veil-contrast-25)", "text-align": "center", "margin-top": "2px" }}>Encrypted messenger</div>
+              <div style={{ "font-size": "10px", color: "var(--veil-text-faint)", "text-align": "center", "margin-top": "2px" }}>Encrypted messenger</div>
             </div>
           </div>
 
@@ -350,7 +350,7 @@ export const OnboardingScreen: Component = () => {
               <div style={{ "font-size": "16px", "font-weight": "500", color: "var(--veil-contrast-85)", "margin-bottom": "4px" }}>
                 {tagline().text}
               </div>
-              <div style={{ "font-size": "12px", color: "var(--veil-contrast-35)" }}>
+              <div style={{ "font-size": "12px", color: "var(--veil-text-faint)" }}>
                 {tagline().sub}
               </div>
             </div>
@@ -427,7 +427,7 @@ export const OnboardingScreen: Component = () => {
                 position: "absolute", top: "8px", right: "8px",
                 width: "32px", height: "32px", "border-radius": "8px",
                 background: "var(--veil-contrast-04)", border: "none",
-                color: "var(--veil-contrast-30)", cursor: "pointer",
+                color: "var(--veil-text-faint)", cursor: "pointer",
                 display: "flex", "align-items": "center", "justify-content": "center",
                 "font-size": "14px", transition: "background 0.15s",
               }}
@@ -468,7 +468,7 @@ export const OnboardingScreen: Component = () => {
             style={S.backBtn}
             onClick={() => transitionTo("welcome")}
             onMouseEnter={(e) => { e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-contrast-30)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-text-faint)"; }}
           >
             {"\u2190 Back"}
           </button>
@@ -523,7 +523,7 @@ export const OnboardingScreen: Component = () => {
             style={S.backBtn}
             onClick={() => transitionTo("welcome")}
             onMouseEnter={(e) => { e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-contrast-30)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-text-faint)"; }}
           >
             {"\u2190 Back"}
           </button>

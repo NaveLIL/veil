@@ -121,6 +121,11 @@ func (db *DB) StoreDeviceBinding(ctx context.Context, binding *DeviceBinding) (*
 		); err != nil {
 			return nil, fmt.Errorf("create device binding head: %w", err)
 		}
+		if !deviceBindingCanReceiveSecureChannels(binding) {
+			if err := pruneDeviceSenderKeyTargets(ctx, tx, binding.DeviceID); err != nil {
+				return nil, err
+			}
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return nil, fmt.Errorf("commit initial device binding: %w", err)
 		}
@@ -165,10 +170,31 @@ func (db *DB) StoreDeviceBinding(ctx context.Context, binding *DeviceBinding) (*
 	); err != nil {
 		return nil, fmt.Errorf("advance device binding head: %w", err)
 	}
+	if !deviceBindingCanReceiveSecureChannels(binding) {
+		if err := pruneDeviceSenderKeyTargets(ctx, tx, binding.DeviceID); err != nil {
+			return nil, err
+		}
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit device binding: %w", err)
 	}
 	return cloneDeviceBinding(binding), nil
+}
+
+func deviceBindingCanReceiveSecureChannels(binding *DeviceBinding) bool {
+	return binding != nil && binding.Status == DeviceBindingActive &&
+		binding.Capabilities&RequiredChannelCapabilities == RequiredChannelCapabilities
+}
+
+func pruneDeviceSenderKeyTargets(ctx context.Context, tx pgx.Tx, deviceID string) error {
+	// Preserve sender_key_heads as the permanent rollback barrier. Only queued
+	// envelopes addressed TO the now-ineligible device are collected.
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM sender_keys WHERE target_device_id = $1::uuid`, deviceID,
+	); err != nil {
+		return fmt.Errorf("prune ineligible device sender keys: %w", err)
+	}
+	return nil
 }
 
 type bindingQuerier interface {
@@ -231,6 +257,44 @@ func scanLatestDeviceBinding(ctx context.Context, query bindingQuerier, deviceID
 
 func (db *DB) GetLatestDeviceBinding(ctx context.Context, deviceID string) (*DeviceBinding, error) {
 	return scanLatestDeviceBinding(ctx, db.Pool, deviceID, false)
+}
+
+// GetDeviceBindingVersion loads one immutable historical version. It is used
+// to verify a retained SKDM from a sender device whose current status may have
+// changed after the distribution was durably accepted.
+func (db *DB) GetDeviceBindingVersion(ctx context.Context, deviceID string, version uint64) (*DeviceBinding, error) {
+	if deviceID == "" || version == 0 || version > math.MaxInt64 {
+		return nil, ErrDeviceBindingUnavailable
+	}
+	var binding DeviceBinding
+	var storedVersion, capabilities int64
+	var status int16
+	err := db.Pool.QueryRow(ctx,
+		`SELECT device.id::text, device.user_id::text, device.device_key,
+		        keys.device_identity_key, keys.device_signing_key,
+		        binding.binding_version, binding.capabilities, binding.binding_status,
+		        binding.account_signature, binding.binding_commitment, binding.created_at
+		 FROM device_binding_versions binding
+		 JOIN devices device ON device.id = binding.device_id
+		 JOIN device_crypto_keys keys ON keys.device_id = binding.device_id
+		 WHERE binding.device_id = $1::uuid AND binding.binding_version = $2`,
+		deviceID, int64(version),
+	).Scan(
+		&binding.DeviceID, &binding.UserID, &binding.DeviceKey,
+		&binding.DeviceIdentityKey, &binding.DeviceSigningKey,
+		&storedVersion, &capabilities, &status, &binding.AccountSignature,
+		&binding.Commitment, &binding.CreatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrDeviceBindingUnavailable
+	}
+	if err != nil {
+		return nil, fmt.Errorf("load device binding version: %w", err)
+	}
+	binding.Version = uint64(storedVersion)
+	binding.Capabilities = uint64(capabilities)
+	binding.Status = DeviceBindingStatus(status)
+	return &binding, nil
 }
 
 func (db *DB) GetLatestDeviceBindingByKey(ctx context.Context, deviceKey []byte) (*DeviceBinding, error) {

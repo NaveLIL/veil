@@ -183,7 +183,7 @@ export const LockScreen: Component = () => {
   // ─── Styles ─────────────────────────────────────────
   const S = {
     root: {
-      position: "relative" as const, width: "100%", height: "100%", overflow: "hidden",
+      position: "relative" as const, width: "100%", flex: "1 1 auto", "min-height": "0", overflow: "hidden",
       background: "var(--veil-background)", display: "flex", "flex-direction": "column" as const,
       "justify-content": "center", "align-items": "center",
     },
@@ -219,16 +219,22 @@ export const LockScreen: Component = () => {
       "align-items": "center",
       background: "color-mix(in srgb, var(--veil-window) 85%, transparent)", "backdrop-filter": "blur(20px)",
       border: "1px solid var(--veil-contrast-06)",
-      "border-radius": "24px", padding: "40px 48px",
+      "border-radius": "var(--veil-lock-island-radius)",
+      padding: "var(--veil-lock-island-padding-y) var(--veil-lock-island-padding-x)",
+      "max-height": "calc(100% - 16px)", "max-width": "calc(100% - 16px)",
+      "overflow-y": "auto" as const, "overscroll-behavior": "contain",
+      "scrollbar-width": "thin" as const,
       "box-shadow": "0 8px 40px var(--veil-shadow), 0 0 80px rgba(var(--veil-accent-rgb),0.04)",
       transition: "opacity 0.35s ease, transform 0.35s ease",
     },
     logoIcon: {
-      width: "56px", height: "56px", "border-radius": "18px",
+      width: "var(--veil-lock-logo-size)", height: "var(--veil-lock-logo-size)",
+      "border-radius": "var(--veil-lock-logo-radius)",
       background: "linear-gradient(135deg, rgba(var(--veil-accent-rgb),0.25) 0%, rgba(var(--veil-accent-rgb),0.08) 100%)",
       border: "1px solid rgba(var(--veil-accent-rgb),0.15)",
       display: "flex", "align-items": "center", "justify-content": "center",
-      position: "relative" as const, "margin-bottom": "14px",
+      position: "relative" as const, "margin-bottom": "var(--veil-lock-logo-margin-bottom)",
+      "flex-shrink": "0",
     },
     logoGlow: {
       position: "absolute" as const, inset: "-8px", "border-radius": "22px",
@@ -236,12 +242,14 @@ export const LockScreen: Component = () => {
       animation: "glowPulse 4s ease-in-out infinite",
     },
     title: {
-      "font-size": "18px", "font-weight": "600", color: "var(--veil-contrast-85)",
-      "letter-spacing": "0.2em", "margin-bottom": "6px",
+      "font-size": "var(--veil-lock-title-size)", "font-weight": "600", color: "var(--veil-contrast-85)",
+      "letter-spacing": "0.2em", "margin-bottom": "var(--veil-lock-title-margin-bottom)",
+      "line-height": "1.15",
     },
     subtitle: {
       display: "flex", "align-items": "center", gap: "6px",
-      "font-size": "12px", color: "var(--veil-contrast-25)", "margin-bottom": "28px",
+      "font-size": "var(--veil-lock-subtitle-size)", color: "var(--veil-text-faint)",
+      "margin-bottom": "var(--veil-lock-subtitle-margin-bottom)", "line-height": "1.2",
     },
     hiddenInput: {
       position: "absolute" as const,
@@ -251,8 +259,10 @@ export const LockScreen: Component = () => {
       border: "0", opacity: "0",
     },
     progressWrap: (focused: boolean) => ({
-      width: "228px", padding: "10px 12px 8px", "margin-bottom": "20px",
-      "border-radius": "14px",
+      width: "var(--veil-lock-progress-width)",
+      padding: "var(--veil-lock-progress-padding-top) var(--veil-lock-progress-padding-x) var(--veil-lock-progress-padding-bottom)",
+      "margin-bottom": "var(--veil-lock-progress-margin-bottom)",
+      "border-radius": "var(--veil-lock-progress-radius)",
       border: focused
         ? "1px solid rgba(var(--veil-accent-rgb),0.24)"
         : "1px solid var(--veil-contrast-04)",
@@ -263,12 +273,12 @@ export const LockScreen: Component = () => {
       transition: "border-color 0.2s ease, background 0.2s ease, box-shadow 0.2s ease",
     }),
     dotsRow: {
-      display: "flex", gap: "7px", height: "12px",
+      display: "flex", gap: "var(--veil-lock-dot-gap)", height: "var(--veil-lock-dot-row-height)",
       "align-items": "center", "justify-content": "center",
     },
     dot: (filled: boolean, isError: boolean, isSuccess: boolean) => ({
-      width: filled ? "10px" : "8px",
-      height: filled ? "10px" : "8px",
+      width: filled ? "var(--veil-lock-dot-filled-size)" : "var(--veil-lock-dot-empty-size)",
+      height: filled ? "var(--veil-lock-dot-filled-size)" : "var(--veil-lock-dot-empty-size)",
       "border-radius": "50%",
       background: isSuccess
         ? "var(--veil-success)"
@@ -290,35 +300,39 @@ export const LockScreen: Component = () => {
             : "none",
     }),
     progressHint: {
-      "font-size": "10px", color: "var(--veil-contrast-28)",
-      "text-align": "center" as const, "margin-top": "8px", height: "14px",
+      "font-size": "var(--veil-lock-progress-hint-size)", color: "var(--veil-contrast-28)",
+      "text-align": "center" as const, "margin-top": "var(--veil-lock-progress-hint-margin-top)",
+      height: "var(--veil-lock-progress-hint-height)", "line-height": "var(--veil-lock-progress-hint-height)",
       "white-space": "nowrap" as const,
     },
     numGrid: {
       display: "grid", "grid-template-columns": "repeat(3, 1fr)",
-      gap: "10px",
+      gap: "var(--veil-lock-key-gap)",
     },
     numBtn: {
-      width: "64px", height: "64px", "border-radius": "18px",
+      width: "var(--veil-lock-key-size)", height: "var(--veil-lock-key-size)",
+      "border-radius": "var(--veil-lock-key-radius)",
       background: "var(--veil-contrast-03)",
       border: "1px solid var(--veil-contrast-05)",
-      color: "var(--veil-contrast-75)", "font-size": "20px", "font-weight": "500",
+      color: "var(--veil-contrast-75)", "font-size": "var(--veil-lock-key-font-size)", "font-weight": "500",
       cursor: "pointer", display: "flex", "align-items": "center",
       "justify-content": "center",
       transition: "all 0.15s ease",
       "user-select": "none" as const,
     },
     deleteBtn: {
-      width: "64px", height: "64px", "border-radius": "18px",
+      width: "var(--veil-lock-key-size)", height: "var(--veil-lock-key-size)",
+      "border-radius": "var(--veil-lock-key-radius)",
       background: "transparent", border: "none",
-      color: "var(--veil-contrast-25)", "font-size": "18px",
+      color: "var(--veil-text-faint)", "font-size": "18px",
       cursor: "pointer", display: "flex", "align-items": "center",
       "justify-content": "center", transition: "color 0.15s",
     },
-    emptyCell: { width: "64px", height: "64px" },
+    emptyCell: { width: "var(--veil-lock-key-size)", height: "var(--veil-lock-key-size)" },
     errorMsg: {
-      "font-size": "12px", color: "color-mix(in srgb, var(--veil-danger) 70%, transparent)",
-      "margin-top": "16px", height: "18px",
+      "font-size": "var(--veil-lock-error-size)", color: "color-mix(in srgb, var(--veil-danger) 70%, transparent)",
+      "margin-top": "var(--veil-lock-error-margin-top)", height: "var(--veil-lock-error-height)",
+      "line-height": "var(--veil-lock-error-height)",
       transition: "opacity 0.2s",
     },
   };
@@ -330,17 +344,26 @@ export const LockScreen: Component = () => {
   });
 
   return (
-    <div style={{ ...S.root, background: appearanceStore.wallpaperUrl() ? "transparent" : "var(--veil-background)" }}>
+    <div
+      class="veil-lock-screen"
+      data-testid="lock-screen"
+      style={{ ...S.root, background: appearanceStore.wallpaperUrl() ? "transparent" : "var(--veil-background)" }}
+    >
       <div style={S.glow1} />
       <div style={S.glow2} />
 
-      <div style={S.rainContainer}>
+      <div class="veil-lock-rain" style={S.rainContainer}>
         <For each={rainDrops()}>
           {(d) => <span style={S.rainDrop(d)}>{d.word}</span>}
         </For>
       </div>
 
-      <div style={{ ...S.island, ...animStyle() }} onClick={() => focusPinInput()}>
+      <div
+        class="veil-lock-island"
+        data-testid="lock-island"
+        style={{ ...S.island, ...animStyle() }}
+        onClick={() => focusPinInput()}
+      >
         <input
           ref={pinInput}
           type="password"
@@ -351,6 +374,7 @@ export const LockScreen: Component = () => {
           value={pin()}
           disabled={inputDisabled()}
           style={S.hiddenInput}
+          data-testid="lock-pin-input"
           aria-label="Unlock PIN, 4 to 12 digits. New PINs use 6 to 12 digits."
           aria-describedby="pin-progress-status pin-error-status"
           aria-errormessage={error() ? "pin-error-status" : undefined}
@@ -378,7 +402,7 @@ export const LockScreen: Component = () => {
         </div>
 
         {/* PIN progress: all 12 supported positions remain visible. */}
-        <div style={S.progressWrap(inputFocused())}>
+        <div data-testid="lock-pin-progress" style={S.progressWrap(inputFocused())}>
           <div
             style={S.dotsRow}
             role="progressbar"
@@ -398,7 +422,7 @@ export const LockScreen: Component = () => {
         </div>
 
         {/* Numpad */}
-        <div style={S.numGrid}>
+        <div data-testid="lock-numpad" style={S.numGrid}>
           <For each={["1", "2", "3", "4", "5", "6", "7", "8", "9"]}>
             {(d) => (
               <button
@@ -461,7 +485,7 @@ export const LockScreen: Component = () => {
             disabled={pin().length === 0 || inputDisabled()}
             aria-label="Delete last PIN digit"
             onMouseEnter={(e) => { e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-contrast-25)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-text-faint)"; }}
           >
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <path d="M21 4H8l-7 8 7 8h13a2 2 0 0 0 2-2V6a2 2 0 0 0-2-2z"/>
@@ -476,14 +500,14 @@ export const LockScreen: Component = () => {
           <button
             type="button"
             style={{
-              "margin-top": "16px",
-              height: "40px",
-              padding: "0 28px",
-              "border-radius": "12px",
+              "margin-top": "var(--veil-lock-unlock-margin-top)",
+              height: "var(--veil-lock-unlock-height)",
+              padding: "0 var(--veil-lock-unlock-padding-x)",
+              "border-radius": "var(--veil-lock-unlock-radius)",
               background: "linear-gradient(135deg, var(--veil-accent) 0%, var(--veil-accent-deep) 100%)",
               color: "var(--veil-on-accent)",
               border: "none",
-              "font-size": "13px",
+              "font-size": "var(--veil-lock-unlock-size)",
               "font-weight": "600",
               cursor: "pointer",
               transition: "transform 0.15s, box-shadow 0.15s",

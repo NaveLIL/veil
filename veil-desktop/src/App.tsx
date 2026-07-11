@@ -20,6 +20,7 @@ import { CreateInviteDialog } from "@/components/server/CreateInviteDialog";
 import { MembersIsland } from "@/components/layout/MembersIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
+import { conversationCryptoUiState } from "@/security/conversationCrypto";
 
 /** Detect emoji-only messages (1-3 emoji, no other text). */
 const EMOJI_ONLY_RE = /^(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}(?:\u{FE0F})?(?:\u{200D}\p{Extended_Pictographic}(?:\u{FE0F})?)*){1,3}$/u;
@@ -35,6 +36,8 @@ import { FriendsPanel } from "@/components/chat/FriendsPanel";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { toast, ToastViewport } from "@/components/ui/toast";
 import { CommandPalette, useCommandPaletteHotkey } from "@/components/ui/CommandPalette";
+import { DecisionDialogHost } from "@/components/ui/DecisionDialogHost";
+import { confirmDecision, promptDecision } from "@/lib/decisionDialog";
 import {
   MessageCircle, Users, UserPlus, UserMinus, Settings, Lock,
   ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
@@ -142,7 +145,7 @@ const DisclaimerScreen: Component = () => {
         }}>
           "{tip.text}"
         </div>
-        <div style={{ "font-size": "13px", color: "var(--veil-contrast-25)", "letter-spacing": "0.05em" }}>
+        <div style={{ "font-size": "13px", color: "var(--veil-text-faint)", "letter-spacing": "0.05em" }}>
           {tip.sub}
         </div>
         <div style={{
@@ -196,8 +199,14 @@ const App: Component = () => {
   let activeSendToken: number | null = null;
 
   const conv = () => appStore.activeConversation();
+  const cryptoGate = () => conversationCryptoUiState(
+    appStore.conversationCryptoDiagnostics(),
+    conv()?.id,
+  );
+  const cryptoDiagnostic = () => cryptoGate().diagnostic;
   const encryptionLabel = () => {
     const conversation = conv();
+    if (cryptoGate().headerLabel) return cryptoGate().headerLabel!;
     if (!conversation || conversation.type === "dm") return "End-to-end encryption enforced on send";
     const status = appStore.senderKeyStatus()[conversation.id] ?? "checking";
     const kind = conversation.type === "channel" ? "channel" : "group";
@@ -208,6 +217,7 @@ const App: Component = () => {
   };
   const encryptionTone = () => {
     const conversation = conv();
+    if (cryptoDiagnostic()) return "var(--veil-danger)";
     if (!conversation || conversation.type === "dm") return "var(--veil-text-faint)";
     const status = appStore.senderKeyStatus()[conversation.id] ?? "checking";
     if (status === "error") return "var(--veil-danger)";
@@ -264,6 +274,20 @@ const App: Component = () => {
   createEffect(() => {
     const id = appStore.activeConversationId();
     if (id !== previousConversationId) {
+      if (
+        previousConversationId
+        && appStore.conversationCryptoDiagnostics()[previousConversationId]
+        && inputText().trim()
+      ) {
+        setDeferredSendDrafts((previous) => ({
+          ...previous,
+          [previousConversationId!]: {
+            text: inputText(),
+            reply: replyingTo(),
+            token: 0,
+          },
+        }));
+      }
       const deferred = id ? untrack(() => deferredSendDrafts()[id]) : undefined;
       setInputText(deferred?.text ?? "");
       setReplyingTo(deferred?.reply ?? null);
@@ -330,6 +354,15 @@ const App: Component = () => {
     const text = inputText().trim();
     const conversation = conv();
     if (!text || !conversation || text.length > MAX_MSG_LEN || sendBusy()) return;
+    const quarantine = cryptoDiagnostic();
+    if (quarantine) {
+      setSendNotice("security");
+      toast.warning(
+        "Secure conversation unavailable",
+        `${quarantine.detail} Your draft remains in this conversation.`,
+      );
+      return;
+    }
     const reply = replyingTo();
     const conversationId = conversation.id;
     const sendSessionEpoch = captureUiSessionEpoch();
@@ -387,6 +420,17 @@ const App: Component = () => {
         activeSendToken = null;
         setSendBusy(false);
       }
+    }
+  };
+
+  const recheckConversationCrypto = async () => {
+    try {
+      await appStore.connectToServer();
+    } catch (reason) {
+      toast.error(
+        "Secure recheck failed",
+        `This conversation remains blocked and your draft was kept. ${String(reason)}`,
+      );
     }
   };
 
@@ -483,7 +527,12 @@ const App: Component = () => {
     const warning = msg.deliveryUnknown
       ? "Delete the only local copy? The message may already have reached the recipient. This cannot be undone."
       : "Delete the only local copy of this unsent message? This cannot be undone.";
-    if (!window.confirm(warning)) return;
+    if (!await confirmDecision({
+      title: "Delete local message copy?",
+      message: warning,
+      confirmLabel: "Delete local copy",
+      danger: true,
+    })) return;
     try {
       await appStore.discardFailedMessage(msg.id);
     } catch (error) {
@@ -553,13 +602,30 @@ const App: Component = () => {
     }
   };
 
+  const handleSidebarTabKeyDown = (
+    event: KeyboardEvent,
+    current: "all" | "dm" | "group",
+  ) => {
+    const tabs = ["all", "dm", "group"] as const;
+    let nextIndex = tabs.indexOf(current);
+    if (event.key === "ArrowRight") nextIndex = (nextIndex + 1) % tabs.length;
+    else if (event.key === "ArrowLeft") nextIndex = (nextIndex + tabs.length - 1) % tabs.length;
+    else if (event.key === "Home") nextIndex = 0;
+    else if (event.key === "End") nextIndex = tabs.length - 1;
+    else return;
+    event.preventDefault();
+    const next = tabs[nextIndex];
+    changeSidebarTab(next);
+    requestAnimationFrame(() => document.getElementById(`messages-tab-${next}`)?.focus());
+  };
+
   const openConversation = (id: string) => {
     closeHomeTransientUi();
     setShowFriendsPanel(false);
     setActiveServer("home");
     appStore.selectConversation(id);
     const selected = appStore.conversations().find((conversation) => conversation.id === id);
-    if (selected?.type === "group") {
+    if (selected?.type === "group" && !appStore.conversationCryptoDiagnostics()[id]) {
       void appStore.distributeSenderKey(id).catch((error) => {
         console.warn("group encryption check failed:", error);
       });
@@ -816,7 +882,11 @@ const App: Component = () => {
               onJoinServer={() => setShowJoinServer(true)}
             />
             {/* ISLAND 2 — Sidebar */}
-            <div class="veil-sidebar-island" style={{ ...S.island("256px"), ...S.islandAnim(island2Vis(), 0) }}>
+            <aside
+              class="veil-sidebar-island"
+              aria-label={appStore.activeServerId() ? "Server channels" : "Conversations"}
+              style={{ ...S.island("256px"), ...S.islandAnim(island2Vis(), 0) }}
+            >
               {/* ── Server context: channels list ───────────────── */}
               <Show when={appStore.activeServerId()}>
                 {(sid) => {
@@ -865,8 +935,10 @@ const App: Component = () => {
                           </div>
                         </div>
                         <button
+                          type="button"
                           style={headerBtn(memberPanelOpen())}
                           title="Members"
+                          aria-label="Show server members"
                           onClick={async () => {
                             if (!memberPanelOpen()) {
                               const sessionEpoch = captureUiSessionEpoch();
@@ -885,16 +957,20 @@ const App: Component = () => {
                           <Users size={14} strokeWidth={1.8} />
                         </button>
                         <button
+                          type="button"
                           style={headerBtn(false)}
                           title="Invite people"
+                          aria-label="Invite people"
                           onClick={() => setShowCreateInvite(true)}
                         >
                           <UserPlus size={14} strokeWidth={1.8} />
                         </button>
                         <Show when={isOwner()}>
                           <button
+                            type="button"
                             style={headerBtn(false)}
                             title="Server settings"
+                            aria-label="Open server settings"
                             onClick={() => appStore.openServerSettings(sid())}
                           >
                             <Settings size={14} strokeWidth={1.8} />
@@ -1089,21 +1165,35 @@ const App: Component = () => {
                                       <Show when={isOwner()}>
                                         <ContextMenuSeparator />
                                         <ContextMenuItem onSelect={() => {
-                                          const next = window.prompt("Rename channel", ch.name);
-                                          if (next && next.trim() && next.trim() !== ch.name) {
-                                            const sid = appStore.activeServerId();
-                                            if (sid) appStore.updateChannel(sid, ch.id, { name: next.trim() });
-                                          }
+                                          void (async () => {
+                                            const next = await promptDecision({
+                                              title: "Rename channel",
+                                              message: `Choose a new name for #${ch.name}.`,
+                                              confirmLabel: "Rename",
+                                              initialValue: ch.name,
+                                            });
+                                            if (next && next.trim() && next.trim() !== ch.name) {
+                                              const sid = appStore.activeServerId();
+                                              if (sid) await appStore.updateChannel(sid, ch.id, { name: next.trim() });
+                                            }
+                                          })().catch((error) => toast.error("Channel not renamed", String(error)));
                                         }}>
                                           <ContextMenuIcon><Pencil size={14} strokeWidth={2} /></ContextMenuIcon>
                                           Rename
                                         </ContextMenuItem>
                                         <ContextMenuItem
                                           onSelect={() => {
-                                            if (window.confirm(`Delete channel #${ch.name}? This cannot be undone.`)) {
+                                            void (async () => {
+                                              const confirmed = await confirmDecision({
+                                                title: "Delete channel?",
+                                                message: `Delete #${ch.name}? This cannot be undone.`,
+                                                confirmLabel: "Delete channel",
+                                                danger: true,
+                                              });
+                                              if (!confirmed) return;
                                               const sid = appStore.activeServerId();
-                                              if (sid) appStore.deleteChannel(sid, ch.id);
-                                            }
+                                              if (sid) await appStore.deleteChannel(sid, ch.id);
+                                            })().catch((error) => toast.error("Channel not deleted", String(error)));
                                           }}
                                         >
                                           <ContextMenuIcon><Trash2 size={14} strokeWidth={2} /></ContextMenuIcon>
@@ -1146,46 +1236,53 @@ const App: Component = () => {
                                     const collapsed = () => collapsedCats().has(g.cat.id);
                                     return (
                                       <div style={{ "margin-top": "8px" }} {...catDropProps(g.cat.id)}>
-                                        <button
-                                          onClick={() => toggleCategory(g.cat.id)}
-                                          style={{
-                                            display: "flex", "align-items": "center", gap: "4px",
-                                            width: "100%", padding: "6px 6px 4px",
-                                            background: "transparent", border: "none",
-                                            color: "var(--veil-text-faint)", cursor: "pointer",
-                                            "text-align": "left",
-                                            "font-family": "inherit",
-                                            "font-size": "10px", "font-weight": "700",
-                                            "letter-spacing": "0.08em", "text-transform": "uppercase",
-                                            transition: "color 0.15s",
-                                          }}
-                                          onMouseEnter={(e) => (e.currentTarget.style.color = "var(--veil-text-muted)")}
-                                          onMouseLeave={(e) => (e.currentTarget.style.color = "var(--veil-text-faint)")}
-                                        >
-                                          <ChevronDown
-                                            size={10}
-                                            strokeWidth={3}
-                                            style={{ transform: collapsed() ? "rotate(-90deg)" : "none", transition: "transform 0.15s", "flex-shrink": "0" }}
-                                          />
-                                          <span style={{ flex: "1", overflow: "hidden", "white-space": "nowrap", "text-overflow": "ellipsis" }}>{g.cat.name}</span>
+                                        <div style={{ display: "flex", "align-items": "center" }}>
+                                          <button
+                                            type="button"
+                                            aria-expanded={!collapsed()}
+                                            aria-label={`${collapsed() ? "Expand" : "Collapse"} ${g.cat.name} category`}
+                                            onClick={() => toggleCategory(g.cat.id)}
+                                            style={{
+                                              display: "flex", "align-items": "center", gap: "4px",
+                                              flex: "1", "min-width": "0", padding: "6px 6px 4px",
+                                              background: "transparent", border: "none",
+                                              color: "var(--veil-text-faint)", cursor: "pointer",
+                                              "text-align": "left",
+                                              "font-family": "inherit",
+                                              "font-size": "10px", "font-weight": "700",
+                                              "letter-spacing": "0.08em", "text-transform": "uppercase",
+                                              transition: "color 0.15s",
+                                            }}
+                                            onMouseEnter={(e) => (e.currentTarget.style.color = "var(--veil-text-muted)")}
+                                            onMouseLeave={(e) => (e.currentTarget.style.color = "var(--veil-text-faint)")}
+                                          >
+                                            <ChevronDown
+                                              size={10}
+                                              strokeWidth={3}
+                                              aria-hidden="true"
+                                              style={{ transform: collapsed() ? "rotate(-90deg)" : "none", transition: "transform 0.15s", "flex-shrink": "0" }}
+                                            />
+                                            <span style={{ flex: "1", overflow: "hidden", "white-space": "nowrap", "text-overflow": "ellipsis" }}>{g.cat.name}</span>
+                                          </button>
                                           <Show when={isOwner()}>
-                                            <span
-                                              role="button"
-                                              tabindex="-1"
+                                            <button
+                                              type="button"
+                                              aria-label={`Create channel in ${g.cat.name}`}
                                               title="Create channel in category"
-                                              onClick={(e) => {
-                                                e.stopPropagation();
+                                              onClick={() => {
                                                 // TODO: prefill category in CreateChannelDialog when category prop is supported.
                                                 setShowCreateChannel(true);
                                               }}
                                               style={{
+                                                width: "28px", height: "28px", "flex-shrink": "0",
+                                                display: "inline-flex", "align-items": "center", "justify-content": "center",
+                                                background: "transparent", border: "none", cursor: "pointer",
                                                 "font-size": "14px", color: "var(--veil-text-faint)",
-                                                padding: "0 4px",
                                                 "line-height": "1",
                                               }}
-                                            >+</span>
+                                            >+</button>
                                           </Show>
-                                        </button>
+                                        </div>
                                         <Show when={!collapsed()}>
                                           <For each={g.kids}>{channelBtn}</For>
                                         </Show>
@@ -1272,10 +1369,16 @@ const App: Component = () => {
                 </div>
 
                 {/* Tabs: All / DM / Groups */}
-                <div style={{ display: "flex", gap: "2px", "margin-bottom": "10px", background: "var(--veil-window)", "border-radius": "8px", padding: "3px" }}>
+                <div role="tablist" aria-label="Conversation filters" style={{ display: "flex", gap: "2px", "margin-bottom": "10px", background: "var(--veil-window)", "border-radius": "8px", padding: "3px" }}>
                   <For each={[{ key: "all" as const, label: "All" }, { key: "dm" as const, label: "DMs" }, { key: "group" as const, label: "Groups" }]}>
                     {(t) => (
                       <button
+                        type="button"
+                        role="tab"
+                        id={`messages-tab-${t.key}`}
+                        aria-controls="messages-tab-panel"
+                        aria-selected={sidebarTab() === t.key}
+                        tabIndex={sidebarTab() === t.key ? 0 : -1}
                         style={{
                           flex: "1", padding: "5px 0", "border-radius": "6px", border: "none",
                           background: sidebarTab() === t.key ? "rgba(var(--veil-accent-rgb),0.15)" : "transparent",
@@ -1284,6 +1387,7 @@ const App: Component = () => {
                           transition: "background 0.15s, color 0.15s",
                         }}
                         onClick={() => changeSidebarTab(t.key)}
+                        onKeyDown={(event) => handleSidebarTabKeyDown(event, t.key)}
                       >{t.label}</button>
                     )}
                   </For>
@@ -1358,7 +1462,12 @@ const App: Component = () => {
                 />
               </div>
 
-              <div style={S.contactList}>
+              <div
+                id="messages-tab-panel"
+                role="tabpanel"
+                aria-labelledby={`messages-tab-${sidebarTab()}`}
+                style={S.contactList}
+              >
                 <Show
                   when={filtered().length > 0}
                   fallback={
@@ -1366,10 +1475,12 @@ const App: Component = () => {
                       <p style={{ "font-size": "13px" }}>No conversations</p>
                       <div style={{ display: "flex", gap: "8px", "justify-content": "center", "margin-top": "8px" }}>
                         <button
+                          type="button"
                           style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
                           onClick={toggleNewDm}
                         >New DM {"\u2192"}</button>
                         <button
+                          type="button"
                           style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
                           onClick={toggleNewGroup}
                         >New Group {"\u2192"}</button>
@@ -1453,22 +1564,31 @@ const App: Component = () => {
                   </div>
                 </div>
                 <button
+                  type="button"
                   style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", "font-size": "14px" }}
                   onClick={() => appStore.setScreen("settings")}
                   title="Settings"
+                  aria-label="Open settings"
                 ><Settings size={15} strokeWidth={1.9} /></button>
                 <button
+                  type="button"
                   style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", "font-size": "13px" }}
                   onClick={() => appStore.lock()}
                   title="Lock"
+                  aria-label="Lock Veil"
                 ><Lock size={14} strokeWidth={1.9} /></button>
               </div>
               </>
               </Show>
-            </div>
+            </aside>
 
             {/* ISLAND 3 — Chat or Friends */}
-            <div class="veil-chat-island" style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}>
+            <main
+              id="main-content"
+              class="veil-chat-island"
+              aria-label={showFriendsPanel() ? "Friends" : conv()?.name ? `Conversation: ${conv()?.name}` : "Conversation"}
+              style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}
+            >
               <Show when={!showFriendsPanel()} fallback={<FriendsPanel onNavigate={() => setShowFriendsPanel(false)} />}>
               <Show when={conv()} fallback={
                 <div style={{ flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" }}>
@@ -1507,9 +1627,14 @@ const App: Component = () => {
                       </div>
                       <div style={{ flex: "1" }}>
                         <div style={{ "font-size": "14px", "font-weight": "600", color: "var(--veil-text-strong)" }}>{c().name}</div>
-                        <div style={{ "font-size": "11px", color: sendNotice() === "security" ? "var(--veil-warning)" : encryptionTone(), display: "flex", "align-items": "center", gap: "5px" }}>
+                        <div
+                          title={cryptoDiagnostic()?.detail}
+                          style={{ "font-size": "11px", color: cryptoDiagnostic() ? "var(--veil-danger)" : sendNotice() === "security" ? "var(--veil-warning)" : encryptionTone(), display: "flex", "align-items": "center", gap: "5px" }}
+                        >
                           <Lock size={10} strokeWidth={2} />
-                          {sendNotice() === "security"
+                          {cryptoDiagnostic()
+                            ? encryptionLabel()
+                            : sendNotice() === "security"
                             ? "Encryption update pending"
                             : encryptionLabel()}
                         </div>
@@ -1599,9 +1724,12 @@ const App: Component = () => {
                                         {(() => {
                                           const ref = () => msgs().find((m) => m.id === msg.replyToId);
                                           return (
-                                            <div
+                                            <button
+                                              type="button"
+                                              aria-label={`Go to replied message from ${ref()?.senderName ?? "unknown sender"}`}
                                               style={{
                                                 display: "flex", "align-items": "center", gap: "8px",
+                                                width: "100%", border: "none", color: "inherit", "text-align": "left",
                                                 padding: "4px 10px", "margin-bottom": "4px",
                                                 "border-left": "2px solid var(--veil-accent)",
                                                 background: "rgba(var(--veil-accent-rgb),0.06)", "border-radius": "0 6px 6px 0",
@@ -1634,7 +1762,7 @@ const App: Component = () => {
                                               <span style={{ "font-size": "11px", color: "var(--veil-text-muted)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
                                                 {ref()?.text ?? "Message not found"}
                                               </span>
-                                            </div>
+                                            </button>
                                           );
                                         })()}
                                       </Show>
@@ -1698,7 +1826,7 @@ const App: Component = () => {
                                         >
                                           <span>Not sent · kept locally</span>
                                           <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-accent)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => restoreFailedDraft(msg)}>Restore draft</button>
-                                          <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-contrast-45)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => void deleteLocalMessageCopy(msg)}>Delete local copy</button>
+                                          <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-text-muted)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => void deleteLocalMessageCopy(msg)}>Delete local copy</button>
                                         </div>
                                       </Show>
                                       <Show when={msg.deliveryUnknown}>
@@ -1711,7 +1839,7 @@ const App: Component = () => {
                                         >
                                           <span>Delivery unknown · it may already have arrived</span>
                                           <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-accent)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => restoreFailedDraft(msg)}>Copy to composer</button>
-                                          <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-contrast-45)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => void deleteLocalMessageCopy(msg)}>Delete local copy</button>
+                                          <button type="button" style={{ background: "transparent", border: "none", color: "var(--veil-text-muted)", padding: "0", cursor: "pointer", "font-size": "10px" }} onClick={() => void deleteLocalMessageCopy(msg)}>Delete local copy</button>
                                         </div>
                                       </Show>
                                       {/* Reaction pills */}
@@ -1879,6 +2007,41 @@ const App: Component = () => {
                           </div>
                         )}
                       </Show>
+                      <Show when={cryptoDiagnostic()}>
+                        {(diagnostic) => (
+                          <div
+                            id="conversation-crypto-status"
+                            role="alert"
+                            style={{
+                              display: "flex",
+                              "align-items": "center",
+                              gap: "10px",
+                              padding: "9px 12px",
+                              "margin-bottom": "8px",
+                              background: "var(--veil-danger-surface)",
+                              border: "1px solid var(--veil-danger-border)",
+                              "border-radius": "10px",
+                              color: "var(--veil-danger-text)",
+                              "font-size": "11px",
+                            }}
+                          >
+                            <Shield size={13} strokeWidth={2} style={{ "flex-shrink": "0" }} />
+                            <div style={{ flex: "1", "min-width": "0" }}>
+                              <div style={{ "font-weight": "650", "margin-bottom": "2px" }}>
+                                Secure conversation unavailable on this device
+                              </div>
+                              <div>{diagnostic().detail}</div>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => void recheckConversationCrypto()}
+                              style={{ padding: "5px 8px", "border-radius": "6px", border: "1px solid var(--veil-danger-border)", background: "transparent", color: "inherit", cursor: "pointer", "font-size": "10px" }}
+                            >
+                              Recheck
+                            </button>
+                          </div>
+                        )}
+                      </Show>
                       <Show when={replyingTo()}>
                         {(reply) => (
                           <div style={{
@@ -1893,6 +2056,8 @@ const App: Component = () => {
                               <div style={{ "font-size": "12px", color: "var(--veil-text-muted)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{reply().text}</div>
                             </div>
                             <button
+                              type="button"
+                              aria-label="Cancel reply"
                               style={{ width: "20px", height: "20px", "border-radius": "4px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center", "flex-shrink": "0" }}
                               onClick={() => setReplyingTo(null)}
                             >
@@ -1906,10 +2071,14 @@ const App: Component = () => {
                           class="veil-message-composer-input"
                           ref={inputRef}
                           style={S.inputField}
-                          placeholder={`Message ${c().name}...`}
+                          placeholder={cryptoGate().composerPlaceholder ?? `Message ${c().name}...`}
                           value={inputText()}
-                          disabled={sendBusy()}
-                          aria-describedby={sendNotice() ? "message-send-status" : undefined}
+                          disabled={sendBusy() || cryptoGate().blocked}
+                          aria-describedby={cryptoDiagnostic()
+                            ? "conversation-crypto-status"
+                            : sendNotice()
+                              ? "message-send-status"
+                              : undefined}
                           maxLength={MAX_MSG_LEN}
                           rows={1}
                           onInput={(e) => {
@@ -1939,7 +2108,7 @@ const App: Component = () => {
                             {inputText().length}/{MAX_MSG_LEN}
                           </span>
                         </Show>
-                        <div style={{ "pointer-events": sendBusy() ? "none" : "auto", opacity: sendBusy() ? "0.55" : "1" }}>
+                        <div style={{ "pointer-events": sendBusy() || cryptoGate().blocked ? "none" : "auto", opacity: sendBusy() || cryptoGate().blocked ? "0.55" : "1" }}>
                           <EmojiPicker onSelect={(emoji) => {
                             const el = inputRef;
                             if (el) {
@@ -1963,9 +2132,9 @@ const App: Component = () => {
                         </div>
                         <button
                           type="button"
-                          style={S.sendBtn(!!inputText().trim() && inputText().length <= MAX_MSG_LEN && !sendBusy())}
-                          disabled={sendBusy() || !inputText().trim() || inputText().length > MAX_MSG_LEN}
-                          aria-label={sendBusy() ? "Sending message" : "Send message"}
+                          style={S.sendBtn(!!inputText().trim() && inputText().length <= MAX_MSG_LEN && !sendBusy() && !cryptoGate().blocked)}
+                          disabled={sendBusy() || cryptoGate().blocked || !inputText().trim() || inputText().length > MAX_MSG_LEN}
+                          aria-label={cryptoGate().blocked ? "Sending blocked: secure conversation unavailable" : sendBusy() ? "Sending message" : "Send message"}
                           onClick={() => void handleSend()}
                         ><Send size={14} strokeWidth={2.2} /></button>
                       </div>
@@ -1976,7 +2145,7 @@ const App: Component = () => {
                 )}
               </Show>
               </Show>
-            </div>
+            </main>
 
             {/* ISLAND 4 — Members Panel */}
             <MembersIsland
@@ -2004,9 +2173,15 @@ const App: Component = () => {
                 void appStore.unassignRole(serverId, userId, roleId);
               }}
               onKickMember={(serverId, userId, username) => {
-                if (confirm(`Kick ${username} from the server?`)) {
-                  void appStore.kickMember(serverId, userId);
-                }
+                void (async () => {
+                  const confirmed = await confirmDecision({
+                    title: "Remove server member?",
+                    message: `Kick ${username} from the server?`,
+                    confirmLabel: "Kick member",
+                    danger: true,
+                  });
+                  if (confirmed) await appStore.kickMember(serverId, userId);
+                })().catch((error) => toast.error("Member not removed", String(error)));
               }}
               onInviteMember={() => setShowCreateInvite(true)}
             />
@@ -2029,6 +2204,7 @@ const App: Component = () => {
 
       {/* Phase 1: global toast viewport (Kobalte-backed). */}
       <ToastViewport />
+      <DecisionDialogHost />
       {/* Phase 2: Cmd/Ctrl+K command palette (Tantivy local search). */}
       <CommandPalette open={cmdkOpen()} onClose={() => setCmdkOpen(false)} onNavigate={openSearchResult} />
     </div>

@@ -14,10 +14,10 @@
   --veil-accent-rgb: 124, 107, 245;
   --veil-text-strong: #eeeeef;
   --veil-text: #dddddf;
-  --veil-text-muted: #9999a3;
-  --veil-text-faint: #666673;
-  --veil-text-subtle: #777783;
-  --veil-on-accent: #ffffff;
+  --veil-text-muted: #c0c0c8;
+  --veil-text-faint: #a8a8b4;
+  --veil-text-subtle: #a8a8b4;
+  --veil-on-accent: #080a12;
   /* Neutral contrast steps are centralized because a theme may eventually
      use a non-neutral foreground. Components must not bake white overlays
      into their own styles. */
@@ -145,7 +145,7 @@
   --color-popover: var(--veil-island);
   --color-popover-foreground: var(--veil-text-strong);
   --color-primary: var(--veil-accent);
-  --color-primary-foreground: #ffffff;
+  --color-primary-foreground: var(--veil-on-accent);
   --color-secondary: var(--veil-surface-raised);
   --color-secondary-foreground: var(--veil-text);
   --color-muted: var(--veil-control);
@@ -153,7 +153,7 @@
   --color-accent: var(--veil-surface-raised);
   --color-accent-foreground: var(--veil-text-strong);
   --color-destructive: var(--veil-danger);
-  --color-destructive-foreground: #ffffff;
+  --color-destructive-foreground: var(--veil-on-accent);
   --color-border: var(--veil-border);
   --color-input: var(--veil-control);
   --color-ring: var(--veil-accent);
@@ -174,6 +174,127 @@
 /* ─── Gradient used by OnboardingScreen & LockScreen ─ */
 .bg-gradient-chat {
   background: linear-gradient(145deg, var(--veil-window) 0%, var(--veil-background) 100%);
+}
+
+/* LockScreen keeps its full 4–12 digit progress and keypad at the native
+   800×600 minimum. The second tier models a 125% WebView zoom, where that
+   physical window exposes roughly a 640×480 CSS viewport. */
+.veil-lock-screen {
+  --veil-lock-island-padding-y: 40px;
+  --veil-lock-island-padding-x: 48px;
+  --veil-lock-island-radius: 24px;
+  --veil-lock-logo-size: 56px;
+  --veil-lock-logo-radius: 18px;
+  --veil-lock-logo-margin-bottom: 14px;
+  --veil-lock-title-size: 18px;
+  --veil-lock-title-margin-bottom: 6px;
+  --veil-lock-subtitle-size: 12px;
+  --veil-lock-subtitle-margin-bottom: 28px;
+  --veil-lock-progress-width: 228px;
+  --veil-lock-progress-padding-top: 10px;
+  --veil-lock-progress-padding-x: 12px;
+  --veil-lock-progress-padding-bottom: 8px;
+  --veil-lock-progress-margin-bottom: 20px;
+  --veil-lock-progress-radius: 14px;
+  --veil-lock-dot-gap: 7px;
+  --veil-lock-dot-row-height: 12px;
+  --veil-lock-dot-filled-size: 10px;
+  --veil-lock-dot-empty-size: 8px;
+  --veil-lock-progress-hint-size: 10px;
+  --veil-lock-progress-hint-margin-top: 8px;
+  --veil-lock-progress-hint-height: 14px;
+  --veil-lock-key-size: 64px;
+  --veil-lock-key-gap: 10px;
+  --veil-lock-key-radius: 18px;
+  --veil-lock-key-font-size: 20px;
+  --veil-lock-unlock-margin-top: 16px;
+  --veil-lock-unlock-height: 40px;
+  --veil-lock-unlock-padding-x: 28px;
+  --veil-lock-unlock-radius: 12px;
+  --veil-lock-unlock-size: 13px;
+  --veil-lock-error-size: 12px;
+  --veil-lock-error-margin-top: 16px;
+  --veil-lock-error-height: 18px;
+}
+
+@media (max-height: 760px) {
+  .veil-lock-screen {
+    --veil-lock-island-padding-y: 16px;
+    --veil-lock-island-padding-x: 32px;
+    --veil-lock-island-radius: 20px;
+    --veil-lock-logo-size: 44px;
+    --veil-lock-logo-radius: 14px;
+    --veil-lock-logo-margin-bottom: 8px;
+    --veil-lock-title-size: 17px;
+    --veil-lock-title-margin-bottom: 3px;
+    --veil-lock-subtitle-size: 11px;
+    --veil-lock-subtitle-margin-bottom: 12px;
+    --veil-lock-progress-width: 212px;
+    --veil-lock-progress-padding-top: 7px;
+    --veil-lock-progress-padding-x: 10px;
+    --veil-lock-progress-padding-bottom: 6px;
+    --veil-lock-progress-margin-bottom: 10px;
+    --veil-lock-progress-radius: 12px;
+    --veil-lock-dot-gap: 6px;
+    --veil-lock-dot-row-height: 12px;
+    --veil-lock-dot-filled-size: 9px;
+    --veil-lock-dot-empty-size: 7px;
+    --veil-lock-progress-hint-size: 9px;
+    --veil-lock-progress-hint-margin-top: 5px;
+    --veil-lock-progress-hint-height: 12px;
+    --veil-lock-key-size: 48px;
+    --veil-lock-key-gap: 6px;
+    --veil-lock-key-radius: 14px;
+    --veil-lock-key-font-size: 18px;
+    --veil-lock-unlock-margin-top: 8px;
+    --veil-lock-unlock-height: 32px;
+    --veil-lock-unlock-padding-x: 22px;
+    --veil-lock-unlock-radius: 10px;
+    --veil-lock-unlock-size: 12px;
+    --veil-lock-error-size: 10px;
+    --veil-lock-error-margin-top: 6px;
+    --veil-lock-error-height: 14px;
+  }
+}
+
+@media (max-height: 560px) {
+  .veil-lock-screen {
+    --veil-lock-island-padding-y: 8px;
+    --veil-lock-island-padding-x: 24px;
+    --veil-lock-island-radius: 16px;
+    --veil-lock-logo-size: 36px;
+    --veil-lock-logo-radius: 12px;
+    --veil-lock-logo-margin-bottom: 4px;
+    --veil-lock-title-size: 15px;
+    --veil-lock-title-margin-bottom: 1px;
+    --veil-lock-subtitle-size: 10px;
+    --veil-lock-subtitle-margin-bottom: 5px;
+    --veil-lock-progress-width: 196px;
+    --veil-lock-progress-padding-top: 5px;
+    --veil-lock-progress-padding-x: 8px;
+    --veil-lock-progress-padding-bottom: 4px;
+    --veil-lock-progress-margin-bottom: 5px;
+    --veil-lock-progress-radius: 10px;
+    --veil-lock-dot-gap: 5px;
+    --veil-lock-dot-row-height: 10px;
+    --veil-lock-dot-filled-size: 8px;
+    --veil-lock-dot-empty-size: 6px;
+    --veil-lock-progress-hint-size: 8px;
+    --veil-lock-progress-hint-margin-top: 3px;
+    --veil-lock-progress-hint-height: 10px;
+    --veil-lock-key-size: 38px;
+    --veil-lock-key-gap: 4px;
+    --veil-lock-key-radius: 11px;
+    --veil-lock-key-font-size: 16px;
+    --veil-lock-unlock-margin-top: 6px;
+    --veil-lock-unlock-height: 28px;
+    --veil-lock-unlock-padding-x: 18px;
+    --veil-lock-unlock-radius: 9px;
+    --veil-lock-unlock-size: 11px;
+    --veil-lock-error-size: 9px;
+    --veil-lock-error-margin-top: 4px;
+    --veil-lock-error-height: 12px;
+  }
 }
 
 /* ─── Base Styles ──────────────────────────────────── */
@@ -283,7 +404,7 @@ select:focus-visible,
     bottom: 0;
     z-index: var(--veil-z-content-overlay);
     margin-left: 0 !important;
-    filter: drop-shadow(-14px 0 24px rgba(0, 0, 0, 0.38));
+    filter: drop-shadow(-14px 0 24px var(--veil-shadow-soft));
   }
 
   .veil-members-island-wrapper:not(.is-open) {
@@ -324,13 +445,13 @@ select:focus-visible,
   justify-content: center;
   border: 0;
   border-radius: 8px;
-  color: #111;
+  color: var(--veil-background);
   background: transparent;
   cursor: pointer;
 }
 
 .veil-caption-button:hover {
-  background: rgba(255, 255, 255, 0.055);
+  background: var(--veil-contrast-05);
 }
 
 .veil-caption-dot {
@@ -340,7 +461,7 @@ select:focus-visible,
   align-items: center;
   justify-content: center;
   border-radius: 999px;
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.08);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--veil-background) 8%, transparent);
   transition: transform 140ms ease, filter 140ms ease;
 }
 
@@ -386,13 +507,13 @@ select:focus-visible,
 }
 
 ::-webkit-scrollbar-thumb {
-  background: rgba(120, 120, 160, 0.08);
+  background: var(--veil-contrast-08);
   border-radius: 10px;
   transition: background 0.2s;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(120, 120, 160, 0.25);
+  background: var(--veil-contrast-25);
 }
 
 /* Show scrollbar on hover for island scroll containers */
@@ -401,11 +522,11 @@ select:focus-visible,
 }
 
 .overflow-y-auto:hover::-webkit-scrollbar-thumb {
-  background: rgba(120, 120, 160, 0.12);
+  background: var(--veil-contrast-10);
 }
 
 .overflow-y-auto:hover::-webkit-scrollbar-thumb:hover {
-  background: rgba(120, 120, 160, 0.3);
+  background: var(--veil-contrast-30);
 }
 
 /* Fully hide scrollbar (used on ServerRail) */
@@ -431,8 +552,8 @@ select:focus-visible,
 .md-code {
   font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
   font-size: 0.85em;
-  background: rgba(0, 0, 0, 0.3);
-  color: #e8b4f8;
+  background: var(--veil-control);
+  color: var(--veil-accent-hi);
   padding: 1.5px 5px;
   border-radius: 4px;
   -webkit-user-select: text;
@@ -444,9 +565,9 @@ select:focus-visible,
   font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
   font-size: 12.5px;
   line-height: 1.5;
-  background: #1a1a24;
-  color: #c8d0e0;
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  background: var(--veil-window);
+  color: var(--veil-text);
+  border: 1px solid var(--veil-border);
   border-radius: 8px;
   padding: 12px 14px;
   margin: 6px 0;
@@ -470,23 +591,23 @@ select:focus-visible,
   right: 10px;
   font-size: 10px;
   font-weight: 600;
-  color: #555;
+  color: var(--veil-text-faint);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   pointer-events: none;
 }
 
 .md-link {
-  color: #7c9bf5;
+  color: var(--veil-accent);
   text-decoration: none;
-  border-bottom: 1px solid rgba(124, 155, 245, 0.3);
+  border-bottom: 1px solid color-mix(in srgb, var(--veil-accent) 30%, transparent);
   transition: color 0.15s, border-color 0.15s;
   cursor: pointer;
 }
 
 .md-link:hover {
-  color: #9db5ff;
-  border-bottom-color: rgba(157, 181, 255, 0.5);
+  color: var(--veil-accent-hi);
+  border-bottom-color: color-mix(in srgb, var(--veil-accent-hi) 50%, transparent);
 }
 
 .md-quote {
@@ -495,11 +616,11 @@ select:focus-visible,
   margin: 4px 0;
   background: rgba(var(--veil-accent-rgb), 0.05);
   border-radius: 0 6px 6px 0;
-  color: #aaa;
+  color: var(--veil-text-muted);
 }
 
 .md-spoiler {
-  background: #3a3a4a;
+  background: var(--veil-surface-raised);
   color: transparent;
   border-radius: 4px;
   padding: 0 4px;
@@ -508,7 +629,7 @@ select:focus-visible,
 }
 
 .md-spoiler:hover {
-  background: #444460;
+  background: var(--veil-composer);
 }
 
 .md-spoiler-revealed {
@@ -649,13 +770,13 @@ select:focus-visible,
 
 /* ─── Glass Effect ─────────────────────────────────── */
 .glass {
-  background: rgba(18, 18, 30, 0.75);
+  background: color-mix(in srgb, var(--veil-window) 75%, transparent);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
 }
 
 .glass-light {
-  background: rgba(28, 28, 44, 0.6);
+  background: color-mix(in srgb, var(--veil-island) 60%, transparent);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
 }
@@ -681,12 +802,12 @@ select:focus-visible,
   min-width: 180px;
   padding: 5px;
   background: var(--color-island);
-  border: 1px solid rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--veil-border);
   border-radius: 10px;
   box-shadow:
-    0 16px 48px rgba(0, 0, 0, 0.45),
-    0 4px 12px rgba(0, 0, 0, 0.25),
-    inset 0 0.5px 0 rgba(255, 255, 255, 0.04);
+    0 16px 48px var(--veil-shadow-strong),
+    0 4px 12px var(--veil-shadow-soft),
+    inset 0 0.5px 0 var(--veil-contrast-04);
   z-index: var(--veil-z-dropdown);
   outline: none;
   overflow: hidden;
@@ -714,7 +835,7 @@ select:focus-visible,
   border-radius: 6px;
   font-size: 13px;
   font-weight: 500;
-  color: #ccc;
+  color: var(--veil-text);
   cursor: default;
   outline: none;
   user-select: none;
@@ -722,22 +843,22 @@ select:focus-visible,
 }
 
 .veil-ctx-item[data-highlighted] {
-  background: rgba(255, 255, 255, 0.06);
-  color: #fff;
+  background: var(--veil-contrast-06);
+  color: var(--veil-text-strong);
 }
 
 .veil-ctx-item[data-disabled] {
-  color: #555;
+  color: var(--veil-text-faint);
   pointer-events: none;
 }
 
 /* Danger variant */
 .veil-ctx-item--danger {
-  color: #f87171;
+  color: var(--veil-danger-text);
 }
 .veil-ctx-item--danger[data-highlighted] {
-  background: rgba(248, 113, 113, 0.1);
-  color: #ef4444;
+  background: var(--veil-danger-surface);
+  color: var(--veil-danger);
 }
 
 /* ─── Icon slot (left) ─────────────────────────────── */
@@ -748,16 +869,16 @@ select:focus-visible,
   width: 16px;
   height: 16px;
   flex-shrink: 0;
-  color: #888;
+  color: var(--veil-text-subtle);
 }
 .veil-ctx-item[data-highlighted] .veil-ctx-icon {
-  color: #bbb;
+  color: var(--veil-text);
 }
 .veil-ctx-item--danger .veil-ctx-icon {
-  color: #f87171;
+  color: var(--veil-danger-text);
 }
 .veil-ctx-item--danger[data-highlighted] .veil-ctx-icon {
-  color: #ef4444;
+  color: var(--veil-danger);
 }
 
 /* ─── Shortcut slot (right) ────────────────────────── */
@@ -766,18 +887,18 @@ select:focus-visible,
   padding-left: 20px;
   font-size: 11px;
   font-weight: 400;
-  color: #555;
+  color: var(--veil-text-faint);
   letter-spacing: 0.02em;
   font-family: system-ui, sans-serif;
 }
 .veil-ctx-item[data-highlighted] .veil-ctx-shortcut {
-  color: #777;
+  color: var(--veil-text-subtle);
 }
 
 /* ─── Item description ─────────────────────────────── */
 .veil-ctx-item-desc {
   font-size: 11px;
-  color: #666;
+  color: var(--veil-text-faint);
   margin-top: 1px;
 }
 
@@ -785,7 +906,7 @@ select:focus-visible,
 .veil-ctx-separator {
   height: 1px;
   margin: 4px 6px;
-  background: rgba(255, 255, 255, 0.06);
+  background: var(--veil-border);
   border: none;
 }
 
@@ -794,7 +915,7 @@ select:focus-visible,
   padding: 6px 10px 4px;
   font-size: 10px;
   font-weight: 700;
-  color: #666;
+  color: var(--veil-text-faint);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   user-select: none;
@@ -808,12 +929,12 @@ select:focus-visible,
   margin-left: auto;
   display: flex;
   align-items: center;
-  color: #555;
+  color: var(--veil-text-faint);
   transition: transform 0.15s ease;
 }
 .veil-ctx-sub-trigger[data-expanded] .veil-ctx-chevron {
   transform: translateX(1px);
-  color: #888;
+  color: var(--veil-text-subtle);
 }
 
 /* ─── Checkbox / Radio indicator ───────────────────── */

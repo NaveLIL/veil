@@ -1,9 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, watch, Mutex};
 use tokio_tungstenite::{
@@ -17,13 +18,15 @@ use veil_crypto::signature;
 use veil_crypto::IdentityKeyPair;
 
 use crate::device_identity::{
-    DeviceBindingPublicV1, DeviceIdentityV1, DEVICE_BINDING_STATUS_ACTIVE,
+    device_binding_signing_bytes, DeviceBindingPublicV1, DeviceIdentityV1,
+    DEVICE_BINDING_STATUS_ACTIVE, REQUIRED_DEVICE_CAPABILITIES,
 };
 use crate::protocol::proto;
 
-const MAX_RETAINED_SKDM_EVENTS: usize = 4_096;
-const MAX_RETAINED_SKDM_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RETAINED_SKDM_WIRE_BYTES: usize = 64 * 1024;
+const MAX_RETAINED_SKDM_EVENTS: usize = 2_048;
+const MAX_RETAINED_SKDM_WIRE_TOTAL_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RETAINED_SKDM_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_RETAINED_SKDM_WIRE_BYTES: usize = 4_096;
 const AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const OUTBOUND_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const LIVE_EVENT_QUEUE_CAPACITY: usize = 4_096;
@@ -130,6 +133,15 @@ pub struct FriendRequestInfo {
     pub outgoing: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderKeyAckMetadataV1 {
+    pub target_device_id: [u8; 16],
+    pub conversation_id: String,
+    pub generation: u32,
+    pub roster_version: u64,
+    pub envelope_commitment: [u8; 32],
+}
+
 /// Local mutation that becomes durable only after the server ACKs its
 /// sequence number. The desktop uses this to update UI after authorization
 /// and ownership checks have succeeded server-side.
@@ -169,6 +181,7 @@ pub enum ConnectionEvent {
         header: Vec<u8>,
         server_timestamp: u64,
         reply_to_id: Option<String>,
+        security_context: Option<crate::api::MessageSecurityContextV1>,
     },
     /// A message was edited by its sender.
     MessageEdited {
@@ -248,14 +261,13 @@ pub enum ConnectionEvent {
         local_message_id: Option<String>,
         /// Filled by VeilClient after committing an ACK-gated local mutation.
         mutation: Option<ConfirmedMutation>,
+        sender_key: Option<SenderKeyAckMetadataV1>,
     },
     /// A Sender Key Distribution Message arrived from a peer.
     /// `sender_key_message` is a sealed envelope (see veil_crypto::sender_key::open_skdm).
     SenderKeyDist {
-        conversation_id: String,
         sender_key_message: Vec<u8>,
-        generation: u32,
-        target_identity_key: Vec<u8>,
+        route: crate::api::SenderKeyRouteV1,
     },
     /// Connection closed.
     Disconnected { reason: String },
@@ -265,6 +277,8 @@ pub enum ConnectionEvent {
         message: String,
         ref_seq: Option<u64>,
         local_message_id: Option<String>,
+        conversation_id: Option<String>,
+        stale_roster_context: bool,
     },
 }
 
@@ -442,7 +456,8 @@ impl Connection {
         // this socket to live fan-out only afterwards. AuthResult is therefore
         // an explicit FIFO barrier: once observed, the buffered set is complete.
         let mut retained_before_auth = Vec::new();
-        let mut retained_bytes = 0usize;
+        let mut retained_wire_bytes = 0usize;
+        let mut retained_metadata_bytes = 0usize;
         let user_id = tokio::time::timeout(AUTH_HANDSHAKE_TIMEOUT, async {
             loop {
                 match ws_read.next().await {
@@ -454,29 +469,34 @@ impl Connection {
                                 return validate_per_device_auth_result(r, binding);
                             }
                             Some(proto::envelope::Payload::SenderKeyDist(skd)) => {
-                                if skd.conversation_id.is_empty()
-                                    || skd.conversation_id.len() > 256
-                                    || skd.target_identity_key.len() != 32
-                                    || skd.sender_key_message.is_empty()
-                                    || skd.sender_key_message.len() > MAX_RETAINED_SKDM_WIRE_BYTES
+                                if sender_key_route_from_proto(skd).is_none()
                                     || retained_before_auth.len() >= MAX_RETAINED_SKDM_EVENTS
                                 {
                                     return Err("invalid or excessive retained sender-key state"
                                         .to_string());
                                 }
-                                let event_bytes = skd
-                                    .conversation_id
-                                    .len()
-                                    .checked_add(skd.target_identity_key.len())
-                                    .and_then(|size| size.checked_add(skd.sender_key_message.len()))
+                                // Count the complete protobuf except the bounded ciphertext
+                                // bytes themselves. This automatically includes every routing
+                                // and historical binding-proof field plus tag/length overhead.
+                                let metadata_bytes = skd
+                                    .encoded_len()
+                                    .checked_sub(skd.sender_key_message.len())
                                     .ok_or_else(|| {
-                                        "retained sender-key byte count overflow".to_string()
+                                        "retained sender-key metadata count overflow".to_string()
                                     })?;
-                                retained_bytes =
-                                    retained_bytes.checked_add(event_bytes).ok_or_else(|| {
-                                        "retained sender-key byte count overflow".to_string()
+                                retained_metadata_bytes = retained_metadata_bytes
+                                    .checked_add(metadata_bytes)
+                                    .ok_or_else(|| {
+                                        "retained sender-key metadata count overflow".to_string()
                                     })?;
-                                if retained_bytes > MAX_RETAINED_SKDM_BYTES {
+                                retained_wire_bytes = retained_wire_bytes
+                                    .checked_add(skd.sender_key_message.len())
+                                    .ok_or_else(|| {
+                                        "retained sender-key wire count overflow".to_string()
+                                    })?;
+                                if retained_wire_bytes > MAX_RETAINED_SKDM_WIRE_TOTAL_BYTES
+                                    || retained_metadata_bytes > MAX_RETAINED_SKDM_METADATA_BYTES
+                                {
                                     return Err("retained sender-key state exceeds client limit"
                                         .to_string());
                                 }
@@ -796,6 +816,175 @@ mod url_policy_tests {
 }
 
 /// Dispatch a received Envelope into a typed ConnectionEvent.
+fn exact_bytes<const N: usize>(value: &[u8]) -> Option<[u8; N]> {
+    value.try_into().ok()
+}
+
+fn sender_key_route_from_proto(
+    skd: &proto::SenderKeyDistribution,
+) -> Option<crate::api::SenderKeyRouteV1> {
+    if skd.conversation_id.is_empty()
+        || skd.conversation_id.len() > MAX_EVENT_ID_BYTES
+        || skd.generation == 0
+        || skd.sender_key_message.is_empty()
+        || skd.sender_key_message.len() > MAX_RETAINED_SKDM_WIRE_BYTES
+        || skd.roster_version == 0
+        || skd.roster_version > i64::MAX as u64
+        || skd.sender_binding_version == 0
+        || skd.sender_binding_version > i64::MAX as u64
+        || skd.target_binding_version == 0
+        || skd.target_binding_version > i64::MAX as u64
+        || skd.sender_device_capabilities > i64::MAX as u64
+        || skd.sender_device_capabilities & REQUIRED_DEVICE_CAPABILITIES
+            != REQUIRED_DEVICE_CAPABILITIES
+        || skd.sender_device_binding_status != u32::from(DEVICE_BINDING_STATUS_ACTIVE)
+    {
+        return None;
+    }
+    let target_account_identity_key = exact_bytes(&skd.target_identity_key)?;
+    let target_device_id = exact_bytes(&skd.target_device_id)?;
+    let target_device_identity_key = exact_bytes(&skd.target_device_identity_key)?;
+    let sender_device_id = exact_bytes(&skd.sender_device_id)?;
+    let sender_account_identity_key = exact_bytes(&skd.sender_account_identity_key)?;
+    let sender_account_signing_key = exact_bytes(&skd.sender_account_signing_key)?;
+    let sender_device_identity_key = exact_bytes(&skd.sender_device_identity_key)?;
+    let sender_device_signing_key = exact_bytes(&skd.sender_device_signing_key)?;
+    let sender_account_signature = exact_bytes(&skd.sender_account_signature)?;
+    let roster_commitment = exact_bytes(&skd.roster_commitment)?;
+    if target_account_identity_key == [0u8; 32]
+        || target_device_id == [0u8; 16]
+        || target_device_identity_key == [0u8; 32]
+        || sender_device_id == [0u8; 16]
+        || sender_account_identity_key == [0u8; 32]
+        || sender_account_signing_key == [0u8; 32]
+        || sender_device_identity_key == [0u8; 32]
+        || sender_device_signing_key == [0u8; 32]
+        || HashSet::from([
+            sender_account_identity_key,
+            sender_account_signing_key,
+            sender_device_identity_key,
+            sender_device_signing_key,
+        ])
+        .len()
+            != 4
+    {
+        return None;
+    }
+    let metadata = veil_crypto::sender_key::inspect_skdm_metadata(&skd.sender_key_message).ok()?;
+    if metadata.group_id != skd.conversation_id
+        || metadata.generation != skd.generation
+        || metadata.sender_identity_key != sender_device_identity_key
+        || metadata.sender_signing_key != sender_device_signing_key
+    {
+        return None;
+    }
+    let proof_bytes = device_binding_signing_bytes(
+        &sender_account_identity_key,
+        &sender_account_signing_key,
+        &sender_device_id,
+        skd.sender_binding_version,
+        &sender_device_identity_key,
+        &sender_device_signing_key,
+        skd.sender_device_capabilities,
+        DEVICE_BINDING_STATUS_ACTIVE,
+    );
+    if !signature::verify(
+        &sender_account_signing_key,
+        &proof_bytes,
+        &sender_account_signature,
+    ) {
+        return None;
+    }
+    Some(crate::api::SenderKeyRouteV1 {
+        conversation_id: skd.conversation_id.clone(),
+        generation: skd.generation,
+        target_account_identity_key,
+        target_device_id,
+        target_device_identity_key,
+        sender_device_id,
+        sender_account_identity_key,
+        sender_account_signing_key,
+        sender_device_identity_key,
+        sender_device_signing_key,
+        sender_device_capabilities: skd.sender_device_capabilities,
+        sender_device_binding_status: DEVICE_BINDING_STATUS_ACTIVE,
+        sender_account_signature,
+        roster_version: skd.roster_version,
+        roster_commitment,
+        sender_binding_version: skd.sender_binding_version,
+        target_binding_version: skd.target_binding_version,
+        envelope_commitment: Sha256::digest(&skd.sender_key_message).into(),
+    })
+}
+
+fn message_security_context_from_proto(
+    message: &proto::MessageEvent,
+) -> Option<Option<crate::api::MessageSecurityContextV1>> {
+    let absent = message.crypto_profile.is_empty()
+        && message.crypto_era == 0
+        && message.roster_version == 0
+        && message.roster_commitment.is_empty()
+        && message.sender_device_id.is_empty()
+        && message.target_device_id.is_empty()
+        && message.sender_binding_version == 0;
+    if absent {
+        return Some(None);
+    }
+    if message.crypto_profile != "sender_key_v5"
+        || message.crypto_era != 1
+        || message.roster_version == 0
+        || message.roster_version > i64::MAX as u64
+        || message.sender_binding_version == 0
+        || message.sender_binding_version > i64::MAX as u64
+    {
+        return None;
+    }
+    let sender_device_id = exact_bytes(&message.sender_device_id)?;
+    let target_device_id = exact_bytes(&message.target_device_id)?;
+    if sender_device_id == [0u8; 16] || target_device_id == [0u8; 16] {
+        return None;
+    }
+    Some(Some(crate::api::MessageSecurityContextV1::SenderKeyV5(
+        crate::api::SenderKeyMessageSecurityContextV1 {
+            roster_version: message.roster_version,
+            roster_commitment: exact_bytes(&message.roster_commitment)?,
+            sender_device_id,
+            target_device_id,
+            sender_binding_version: message.sender_binding_version,
+        },
+    )))
+}
+
+fn sender_key_ack_from_proto(ack: &proto::MessageAck) -> Option<Option<SenderKeyAckMetadataV1>> {
+    let absent = ack.target_device_id.is_empty()
+        && ack.conversation_id.is_none()
+        && ack.sender_key_generation.is_none()
+        && ack.roster_version.is_none()
+        && ack.envelope_commitment.is_none();
+    if absent {
+        return Some(None);
+    }
+    let conversation_id = ack.conversation_id.clone()?;
+    let generation = ack.sender_key_generation?;
+    let roster_version = ack.roster_version?;
+    let envelope = ack.envelope_commitment.as_deref()?;
+    if conversation_id.is_empty()
+        || conversation_id.len() > MAX_EVENT_ID_BYTES
+        || generation == 0
+        || roster_version == 0
+        || roster_version > i64::MAX as u64
+    {
+        return None;
+    }
+    Some(Some(SenderKeyAckMetadataV1 {
+        target_device_id: exact_bytes(&ack.target_device_id)?,
+        conversation_id,
+        generation,
+        roster_version,
+        envelope_commitment: exact_bytes(envelope)?,
+    }))
+}
+
 fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEvent> {
     let event = match env.payload {
         Some(proto::envelope::Payload::MessageEvent(me)) => {
@@ -816,7 +1005,9 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
             {
                 return None;
             }
-            match me.event_type() {
+            let security_context = message_security_context_from_proto(&me)?;
+            let event_type = proto::message_event::EventType::try_from(me.event_type).ok()?;
+            match event_type {
                 proto::message_event::EventType::Edited => ConnectionEvent::MessageEdited {
                     message_id: me.message_id,
                     conversation_id: me.conversation_id,
@@ -831,7 +1022,7 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
                     sender_identity_key: me.sender_identity_key,
                     delete_timestamp: me.edit_timestamp.unwrap_or(me.server_timestamp),
                 },
-                _ => ConnectionEvent::MessageReceived {
+                proto::message_event::EventType::New => ConnectionEvent::MessageReceived {
                     message_id: me.message_id,
                     conversation_id: me.conversation_id,
                     sender_identity_key: me.sender_identity_key,
@@ -840,21 +1031,28 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
                     header: me.header.unwrap_or_default(),
                     server_timestamp: me.server_timestamp,
                     reply_to_id: me.reply_to_id,
+                    security_context,
                 },
             }
         }
-        Some(proto::envelope::Payload::MessageAck(ack)) => ConnectionEvent::MessageAcked {
-            message_id: ack.message_id,
-            server_timestamp: ack.server_timestamp,
-            ref_seq: ack.ref_seq,
-            local_message_id: None,
-            mutation: None,
-        },
+        Some(proto::envelope::Payload::MessageAck(ack)) => {
+            let sender_key = sender_key_ack_from_proto(&ack)?;
+            ConnectionEvent::MessageAcked {
+                message_id: ack.message_id,
+                server_timestamp: ack.server_timestamp,
+                ref_seq: ack.ref_seq,
+                local_message_id: None,
+                mutation: None,
+                sender_key,
+            }
+        }
         Some(proto::envelope::Payload::Error(e)) => ConnectionEvent::Error {
             code: e.code,
             message: e.message,
             ref_seq: e.ref_seq,
             local_message_id: None,
+            conversation_id: None,
+            stale_roster_context: false,
         },
         Some(proto::envelope::Payload::TypingEvent(te)) => ConnectionEvent::TypingEvent {
             conversation_id: te.conversation_id,
@@ -959,19 +1157,10 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
             }
         }
         Some(proto::envelope::Payload::SenderKeyDist(skd)) => {
-            if skd.conversation_id.is_empty()
-                || skd.conversation_id.len() > MAX_EVENT_ID_BYTES
-                || skd.sender_key_message.is_empty()
-                || skd.sender_key_message.len() > MAX_RETAINED_SKDM_WIRE_BYTES
-                || skd.target_identity_key.len() != 32
-            {
-                return None;
-            }
+            let route = sender_key_route_from_proto(&skd)?;
             ConnectionEvent::SenderKeyDist {
-                conversation_id: skd.conversation_id,
                 sender_key_message: skd.sender_key_message,
-                generation: skd.generation,
-                target_identity_key: skd.target_identity_key,
+                route,
             }
         }
         _ => return None, // Ignore unhandled types for now
@@ -982,5 +1171,136 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
 async fn dispatch_event(tx: &mpsc::Sender<ConnectionEvent>, env: proto::Envelope) {
     if let Some(event) = connection_event_from_envelope(env) {
         let _ = tx.send(event).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_message_event() -> proto::MessageEvent {
+        proto::MessageEvent {
+            event_type: proto::message_event::EventType::New as i32,
+            message_id: "message-1".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            sender_identity_key: vec![0x11; 32],
+            sender_username: "Alice".to_string(),
+            server_timestamp: 1,
+            ciphertext: Some(vec![0x22]),
+            header: Some(vec![0x03]),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn unknown_message_event_enum_and_partial_security_context_are_rejected() {
+        let mut unknown = base_message_event();
+        unknown.event_type = 99;
+        assert!(connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(unknown)),
+            ..Default::default()
+        })
+        .is_none());
+
+        let mut partial = base_message_event();
+        partial.crypto_profile = "sender_key_v5".to_string();
+        assert!(connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(partial)),
+            ..Default::default()
+        })
+        .is_none());
+
+        let mut exact = base_message_event();
+        exact.crypto_profile = "sender_key_v5".to_string();
+        exact.crypto_era = 1;
+        exact.roster_version = 7;
+        exact.roster_commitment = vec![0x33; 32];
+        exact.sender_device_id = vec![0x44; 16];
+        exact.target_device_id = vec![0x55; 16];
+        exact.sender_binding_version = 2;
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageEvent(exact)),
+                ..Default::default()
+            }),
+            Some(ConnectionEvent::MessageReceived {
+                security_context: Some(crate::api::MessageSecurityContextV1::SenderKeyV5(_)),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn sender_key_route_and_ack_require_exact_metadata_and_aligned_bounds() {
+        assert_eq!(MAX_RETAINED_SKDM_EVENTS, 2_048);
+        assert_eq!(MAX_RETAINED_SKDM_WIRE_TOTAL_BYTES, 4 * 1024 * 1024);
+        assert_eq!(MAX_RETAINED_SKDM_WIRE_BYTES, 4_096);
+
+        let sender_account = IdentityKeyPair::generate();
+        let recipient_account = IdentityKeyPair::generate();
+        let sender = DeviceIdentityV1::from_stored(
+            &sender_account,
+            DeviceIdentityV1::generate_stored(&sender_account, [0x33; 16]).unwrap(),
+        )
+        .unwrap();
+        let recipient = DeviceIdentityV1::from_stored(
+            &recipient_account,
+            DeviceIdentityV1::generate_stored(&recipient_account, [0x22; 16]).unwrap(),
+        )
+        .unwrap();
+        let sealed = veil_crypto::sender_key::seal_skdm_authenticated_with_device(
+            &sender.binding().device_identity_key,
+            sender.ed25519_signing_key(),
+            &recipient.binding().device_identity_key,
+            "conversation-1",
+            1,
+            b"payload",
+        )
+        .unwrap();
+        let skdm = proto::SenderKeyDistribution {
+            conversation_id: "conversation-1".to_string(),
+            sender_key_message: sealed,
+            generation: 1,
+            target_identity_key: recipient_account.x25519_public_bytes().to_vec(),
+            target_device_id: vec![0x22; 16],
+            target_device_identity_key: recipient.binding().device_identity_key.to_vec(),
+            sender_device_id: vec![0x33; 16],
+            roster_version: 4,
+            roster_commitment: vec![0x44; 32],
+            sender_binding_version: sender.binding().version,
+            target_binding_version: 3,
+            sender_account_identity_key: sender_account.x25519_public_bytes().to_vec(),
+            sender_account_signing_key: sender_account.ed25519_public_bytes().to_vec(),
+            sender_device_identity_key: sender.binding().device_identity_key.to_vec(),
+            sender_device_signing_key: sender.binding().device_signing_key.to_vec(),
+            sender_device_capabilities: sender.binding().capabilities,
+            sender_device_binding_status: u32::from(sender.binding().status),
+            sender_account_signature: sender.binding().account_signature.to_vec(),
+        };
+        assert!(sender_key_route_from_proto(&skdm).is_some());
+        let mut oversized = skdm.clone();
+        oversized.sender_key_message = vec![0x55; MAX_RETAINED_SKDM_WIRE_BYTES + 1];
+        assert!(sender_key_route_from_proto(&oversized).is_none());
+        let mut zero_device = skdm;
+        zero_device.sender_device_id = vec![0; 16];
+        assert!(sender_key_route_from_proto(&zero_device).is_none());
+
+        let partial_ack = proto::MessageAck {
+            target_device_id: vec![0x22; 16],
+            ..Default::default()
+        };
+        assert!(sender_key_ack_from_proto(&partial_ack).is_none());
+        let exact_ack = proto::MessageAck {
+            target_device_id: vec![0x22; 16],
+            conversation_id: Some("conversation-1".to_string()),
+            sender_key_generation: Some(1),
+            roster_version: Some(4),
+            envelope_commitment: Some(vec![0x66; 32]),
+            ..Default::default()
+        };
+        assert!(matches!(
+            sender_key_ack_from_proto(&exact_ack),
+            Some(Some(_))
+        ));
     }
 }

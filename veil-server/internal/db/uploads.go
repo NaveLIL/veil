@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 var ErrTusQuotaExceeded = errors.New("upload quota exceeded")
@@ -145,7 +147,23 @@ func (db *DB) GetTusUpload(ctx context.Context, fileID string) (*TusUpload, erro
 // conversation message that references the blob. Channel recipients must
 // still hold both VIEW_CHANNEL and READ_MESSAGE_HISTORY at download time.
 func (db *DB) CanDownloadTusUpload(ctx context.Context, fileID, userID string) (bool, error) {
-	upload, err := db.GetTusUpload(ctx, fileID)
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var upload TusUpload
+	err = tx.QueryRow(ctx,
+		`SELECT file_id, user_id, size_bytes, received_bytes, backend,
+		        created_at, finished_at, expires_at
+		 FROM tus_uploads WHERE file_id = $1`, fileID,
+	).Scan(
+		&upload.ID, &upload.UserID, &upload.SizeBytes, &upload.ReceivedBytes,
+		&upload.Backend, &upload.CreatedAt, &upload.FinishedAt, &upload.ExpiresAt,
+	)
 	if err != nil {
 		return false, err
 	}
@@ -153,9 +171,12 @@ func (db *DB) CanDownloadTusUpload(ctx context.Context, fileID, userID string) (
 		return false, nil
 	}
 	if upload.UserID == userID {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
-	rows, err := db.Pool.Query(ctx,
+	rows, err := tx.Query(ctx,
 		`SELECT DISTINCT message.conversation_id::text
 		 FROM message_attachments attachment
 		 JOIN messages message ON message.id = attachment.message_id
@@ -167,26 +188,36 @@ func (db *DB) CanDownloadTusUpload(ctx context.Context, fileID, userID string) (
 	if err != nil {
 		return false, err
 	}
-	defer rows.Close()
 	conversationIDs := make([]string, 0)
 	for rows.Next() {
 		var conversationID string
 		if err := rows.Scan(&conversationID); err != nil {
+			rows.Close()
 			return false, err
 		}
 		conversationIDs = append(conversationIDs, conversationID)
 	}
 	if err := rows.Err(); err != nil {
+		rows.Close()
 		return false, err
 	}
+	rows.Close()
 	for _, conversationID := range conversationIDs {
-		allowed, err := db.CanAccessConversation(ctx, conversationID, userID, ChannelReadPermissions)
+		allowed, err := canAccessConversationWithQuery(
+			ctx, tx, conversationID, userID, ChannelReadPermissions,
+		)
 		if err != nil {
 			return false, err
 		}
 		if allowed {
+			if err := tx.Commit(ctx); err != nil {
+				return false, err
+			}
 			return true, nil
 		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
 	}
 	return false, nil
 }

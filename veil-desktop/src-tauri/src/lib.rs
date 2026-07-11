@@ -7,7 +7,11 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
 use tauri_plugin_notification::NotificationExt;
-use veil_client::api::{OfflineSenderKeyRefresh, VeilClient};
+use veil_client::api::{
+    DeviceBindingCandidateV1, DeviceRosterCandidateV1, DeviceRosterEntryV1,
+    MessageSecurityContextV1, OfflineSenderKeyRefresh, SenderKeyMessageSecurityContextV1,
+    VeilClient,
+};
 use veil_client::connection::ConnectionEvent;
 use veil_search::{Indexer, SearchHit};
 use veil_store::keychain;
@@ -16,6 +20,39 @@ use zeroize::{Zeroize, Zeroizing};
 mod appearance;
 mod pin_throttle;
 use pin_throttle::PinThrottle;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConversationCryptoDiagnostic {
+    conversation_id: String,
+    code: String,
+    detail: String,
+}
+
+#[derive(Default)]
+struct ConversationSyncIsolation {
+    blocked: std::collections::BTreeMap<String, ConversationCryptoDiagnostic>,
+}
+
+impl ConversationSyncIsolation {
+    fn block(&mut self, conversation_id: &str, code: &str, detail: &str) {
+        self.blocked
+            .entry(conversation_id.to_string())
+            .or_insert_with(|| ConversationCryptoDiagnostic {
+                conversation_id: conversation_id.to_string(),
+                code: code.to_string(),
+                detail: bounded_diagnostic_detail(detail),
+            });
+    }
+
+    fn is_blocked(&self, conversation_id: &str) -> bool {
+        self.blocked.contains_key(conversation_id)
+    }
+
+    fn into_diagnostics(self) -> Vec<ConversationCryptoDiagnostic> {
+        self.blocked.into_values().collect()
+    }
+}
 
 struct AppState {
     client: Mutex<VeilClient>,
@@ -48,6 +85,12 @@ struct AppState {
     /// both Double Ratchet and Sender Keys require strict message ordering.
     /// A failed sync leaves the dispatcher paused until a clean reconnect.
     offline_sync_ready: AtomicBool,
+    /// Conversation-scoped crypto quarantine. A missing historical generation
+    /// or an unready device roster must not turn one bad group into a global DM
+    /// outage, but every native send/live-mutation path still fails closed for
+    /// the affected conversation until a complete authenticated reconnect.
+    unavailable_conversations:
+        Mutex<std::collections::HashMap<String, ConversationCryptoDiagnostic>>,
     /// Expiry discovered on an IPC path still has to clear renderer plaintext;
     /// the watchdog consumes this flag and emits the native lock event.
     lock_event_pending: AtomicBool,
@@ -304,6 +347,117 @@ fn require_live_transport_still_ready(state: &AppState) -> Result<(), String> {
     }
 }
 
+fn bounded_diagnostic_detail(detail: &str) -> String {
+    let sanitized: String = detail
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(512)
+        .collect();
+    let sanitized = sanitized.trim();
+    if sanitized.is_empty() {
+        "cryptographic state is unavailable".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn conversation_crypto_diagnostic(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<Option<ConversationCryptoDiagnostic>, String> {
+    Ok(state
+        .unavailable_conversations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .get(conversation_id)
+        .cloned())
+}
+
+fn require_conversation_crypto_available(
+    state: &AppState,
+    conversation_id: &str,
+) -> Result<(), String> {
+    if let Some(diagnostic) = conversation_crypto_diagnostic(state, conversation_id)? {
+        return Err(format!(
+            "conversation cryptography is unavailable ({}): {}",
+            diagnostic.code, diagnostic.detail
+        ));
+    }
+    Ok(())
+}
+
+fn conversation_is_quarantined_fail_closed(state: &AppState, conversation_id: &str) -> bool {
+    !matches!(
+        conversation_crypto_diagnostic(state, conversation_id),
+        Ok(None)
+    )
+}
+
+fn quarantine_conversation_state(
+    state: &AppState,
+    conversation_id: &str,
+    code: &str,
+    detail: &str,
+) -> Result<ConversationCryptoDiagnostic, String> {
+    let mut unavailable = state
+        .unavailable_conversations
+        .lock()
+        .map_err(|error| error.to_string())?;
+    Ok(unavailable
+        .entry(conversation_id.to_string())
+        .or_insert_with(|| ConversationCryptoDiagnostic {
+            conversation_id: conversation_id.to_string(),
+            code: code.to_string(),
+            detail: bounded_diagnostic_detail(detail),
+        })
+        .clone())
+}
+
+fn emit_conversation_crypto_unavailable(
+    app: &AppHandle,
+    diagnostic: &ConversationCryptoDiagnostic,
+) {
+    let _ = app.emit("veil://conversation-crypto-unavailable", diagnostic);
+}
+
+fn quarantine_runtime_conversation(
+    state: &AppState,
+    conversation_id: &str,
+    sender_key_mode: bool,
+) -> Result<(), String> {
+    if !sender_key_mode {
+        return Ok(());
+    }
+    let mut client = state.client.lock().map_err(|error| error.to_string())?;
+    client.invalidate_device_roster_v1(conversation_id);
+    client.mark_channel_conversation(conversation_id);
+    Ok(())
+}
+
+fn quarantine_live_conversation(
+    state: &AppState,
+    app: &AppHandle,
+    client: &mut VeilClient,
+    conversation_id: &str,
+    sender_key_mode: bool,
+    code: &str,
+    detail: &str,
+) -> Result<(), String> {
+    if sender_key_mode {
+        client.invalidate_device_roster_v1(conversation_id);
+        client.mark_channel_conversation(conversation_id);
+    }
+    let diagnostic = quarantine_conversation_state(state, conversation_id, code, detail)?;
+    emit_conversation_crypto_unavailable(app, &diagnostic);
+    Ok(())
+}
+
 fn consume_pending_lock_event(pending: &AtomicBool, unlocked: &AtomicBool) -> bool {
     pending.swap(false, Ordering::AcqRel) && !unlocked.load(Ordering::Acquire)
 }
@@ -327,6 +481,11 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
         .authenticated_rest_origin
         .lock()
         .map_err(|e| e.to_string())? = None;
+    state
+        .unavailable_conversations
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clear();
     // The client mutex is the linearization point: operations already holding
     // it finish first; every later operation observes an empty client.
     *state.client.lock().map_err(|e| e.to_string())? = VeilClient::new();
@@ -340,6 +499,11 @@ fn initialize_client(state: &AppState, mnemonic: &str) -> Result<String, String>
     fresh.set_indexer(state.indexer.clone());
     let key = hex::encode(fresh.identity_key()?);
     *state.client.lock().map_err(|e| e.to_string())? = fresh;
+    state
+        .unavailable_conversations
+        .lock()
+        .map_err(|e| e.to_string())?
+        .clear();
     Ok(key)
 }
 
@@ -842,6 +1006,26 @@ fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value
     Ok(result)
 }
 
+/// Return conversation-scoped crypto quarantine without hiding locally stored
+/// plaintext. The renderer can render a blocked island and a reconnect action
+/// while unrelated DMs/groups remain fully usable.
+#[tauri::command]
+fn get_conversation_crypto_diagnostics(
+    state: State<'_, AppState>,
+) -> Result<Vec<ConversationCryptoDiagnostic>, String> {
+    require_unlocked(&state)?;
+    let mut diagnostics: Vec<_> = state
+        .unavailable_conversations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .values()
+        .cloned()
+        .collect();
+    diagnostics.sort_by(|left, right| left.conversation_id.cmp(&right.conversation_id));
+    require_session_still_unlocked(&state)?;
+    Ok(diagnostics)
+}
+
 /// Get persisted messages for a conversation.
 #[tauri::command]
 fn get_messages(
@@ -1068,6 +1252,14 @@ const OFFLINE_SYNC_MAX_PAGES: usize = 10_000;
 const MAX_SYNC_CIPHERTEXT_BYTES: usize = 64 * 1024;
 const MAX_SYNC_HEADER_BYTES: usize = 512;
 const MAX_SYNC_SENDER_KEY_RECIPIENTS: usize = 3_500;
+const MAX_SYNC_ATTACHMENTS: usize = 64;
+const MAX_SYNC_ATTACHMENT_KEY_BYTES: usize = 4_096;
+const MAX_SYNC_ATTACHMENT_NONCE_BYTES: usize = 64;
+const MAX_DEVICE_DIRECTORY_MEMBERS: usize = 1_024;
+const MAX_DEVICE_DIRECTORY_DEVICES: usize = 3_500;
+const MAX_DIRECTORY_USERNAME_BYTES: usize = 128;
+const MAX_DIRECTORY_DEVICE_NAME_BYTES: usize = 256;
+const MAX_DIRECTORY_REASON_BYTES: usize = 128;
 
 #[derive(serde::Deserialize)]
 struct SyncConversationPage {
@@ -1095,6 +1287,122 @@ struct SyncDirectoryMember {
     signing_key: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceDirectoryWire {
+    conversation_id: String,
+    roster_version: String,
+    roster_commitment: String,
+    ready: bool,
+    #[serde(default)]
+    reason: Option<String>,
+    required_capabilities: String,
+    member_user_ids: Vec<String>,
+    devices: Vec<DeviceDirectoryEntryWire>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceDirectoryEntryWire {
+    user_id: String,
+    username: String,
+    account_identity_key: String,
+    account_signing_key: String,
+    device_id: String,
+    device_name: String,
+    #[serde(default)]
+    binding: Option<DeviceBindingWire>,
+    status: u8,
+    eligible: bool,
+    #[serde(default)]
+    exclusion_reason: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeviceBindingWire {
+    device_id: String,
+    device_identity_key: String,
+    device_signing_key: String,
+    version: String,
+    capabilities: String,
+    status: u8,
+    account_signature: String,
+    created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDeviceBinding {
+    device_id: [u8; 16],
+    device_identity_key: [u8; 32],
+    device_signing_key: [u8; 32],
+    version: u64,
+    capabilities: u64,
+    status: u8,
+    account_signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDeviceRosterEntry {
+    user_id: [u8; 16],
+    account_identity_key: [u8; 32],
+    account_signing_key: [u8; 32],
+    device_id: [u8; 16],
+    binding: Option<ParsedDeviceBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedDeviceRoster {
+    conversation_id: String,
+    roster_version: u64,
+    roster_commitment: [u8; 32],
+    required_capabilities: u64,
+    ready: bool,
+    unavailable_reason: Option<String>,
+    member_user_ids: Vec<[u8; 16]>,
+    devices: Vec<ParsedDeviceRosterEntry>,
+}
+
+impl From<ParsedDeviceBinding> for DeviceBindingCandidateV1 {
+    fn from(binding: ParsedDeviceBinding) -> Self {
+        Self {
+            device_id: binding.device_id,
+            device_identity_key: binding.device_identity_key,
+            device_signing_key: binding.device_signing_key,
+            version: binding.version,
+            capabilities: binding.capabilities,
+            status: binding.status,
+            account_signature: binding.account_signature,
+        }
+    }
+}
+
+impl From<ParsedDeviceRosterEntry> for DeviceRosterEntryV1 {
+    fn from(entry: ParsedDeviceRosterEntry) -> Self {
+        Self {
+            user_id: entry.user_id,
+            account_identity_key: entry.account_identity_key,
+            account_signing_key: entry.account_signing_key,
+            device_id: entry.device_id,
+            binding: entry.binding.map(Into::into),
+        }
+    }
+}
+
+impl From<ParsedDeviceRoster> for DeviceRosterCandidateV1 {
+    fn from(roster: ParsedDeviceRoster) -> Self {
+        Self {
+            conversation_id: roster.conversation_id,
+            roster_version: roster.roster_version,
+            roster_commitment: roster.roster_commitment,
+            required_capabilities: roster.required_capabilities,
+            ready: roster.ready,
+            member_user_ids: roster.member_user_ids,
+            devices: roster.devices.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct PinnedDirectoryMember {
     username: String,
@@ -1103,6 +1411,7 @@ struct PinnedDirectoryMember {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SyncMessagePage {
     messages: Vec<SyncMessage>,
     count: usize,
@@ -1111,6 +1420,7 @@ struct SyncMessagePage {
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SyncMessage {
     id: String,
     conversation_id: String,
@@ -1119,23 +1429,62 @@ struct SyncMessage {
     sender_signing_key: String,
     ciphertext: String,
     header: String,
+    msg_type: i16,
     #[serde(default)]
     reply_to_id: Option<String>,
+    #[serde(default)]
+    expires_at: Option<String>,
+    #[serde(default)]
+    edited_at: Option<String>,
     server_timestamp: i64,
-    #[serde(default, rename = "edited_at")]
-    _edited_at: Option<String>,
+    created_at: String,
     is_deleted: bool,
     is_expired: bool,
     revision_timestamp: i64,
     #[serde(default)]
     reactions: Vec<SyncReaction>,
+    #[serde(default)]
+    attachments: Vec<SyncAttachment>,
+    crypto_profile: String,
+    #[serde(default)]
+    crypto_era: Option<String>,
+    #[serde(default)]
+    roster_version: Option<String>,
+    #[serde(default)]
+    roster_commitment: Option<String>,
+    #[serde(default)]
+    sender_device_id: Option<String>,
+    #[serde(default)]
+    sender_binding_version: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SyncReaction {
     emoji: String,
     user_id: String,
     username: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SyncAttachment {
+    media_id: String,
+    encrypted_key: String,
+    nonce: String,
+    size: i64,
+    content_type: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParsedMessageCryptoContext {
+    LegacyUnknown,
+    SenderKeyV5 {
+        roster_version: u64,
+        roster_commitment: [u8; 32],
+        sender_device_id: [u8; 16],
+        sender_binding_version: u64,
+    },
 }
 
 #[derive(Default)]
@@ -1144,23 +1493,565 @@ struct OfflineSyncStats {
     messages: usize,
     duplicates: usize,
     unavailable_history: usize,
+    unavailable_conversations: Vec<ConversationCryptoDiagnostic>,
     retained_sender_keys: usize,
     edits: usize,
     tombstones: usize,
 }
 
 fn decode_lower_hex_32(field: &str, value: &str) -> Result<[u8; 32], String> {
-    if value.len() != 64
+    decode_lower_hex_fixed(field, value)
+}
+
+fn decode_lower_hex_fixed<const N: usize>(field: &str, value: &str) -> Result<[u8; N], String> {
+    if value.len() != N * 2
         || !value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
-        return Err(format!("{field} must be exactly 32-byte lowercase hex"));
+        return Err(format!("{field} must be exactly {N}-byte lowercase hex"));
     }
     hex::decode(value)
         .map_err(|e| format!("decode {field}: {e}"))?
         .try_into()
-        .map_err(|_| format!("{field} must be exactly 32 bytes"))
+        .map_err(|_| format!("{field} must be exactly {N} bytes"))
+}
+
+fn decode_canonical_base64<const N: usize>(field: &str, value: &str) -> Result<[u8; N], String> {
+    use base64::Engine;
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| format!("{field} must be canonical standard base64"))?;
+    if decoded.len() != N || base64::engine::general_purpose::STANDARD.encode(&decoded) != value {
+        return Err(format!(
+            "{field} must be canonical standard base64 for exactly {N} bytes"
+        ));
+    }
+    decoded
+        .try_into()
+        .map_err(|_| format!("{field} must decode to exactly {N} bytes"))
+}
+
+fn validate_canonical_base64_bytes(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), String> {
+    use base64::Engine;
+
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| format!("{field} must be canonical standard base64"))?;
+    if decoded.is_empty()
+        || decoded.len() > max_bytes
+        || base64::engine::general_purpose::STANDARD.encode(&decoded) != value
+    {
+        return Err(format!(
+            "{field} must be bounded non-empty canonical standard base64"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_decimal_u63(field: &str, value: &str, allow_zero: bool) -> Result<u64, String> {
+    if value.is_empty()
+        || value.len() > 19
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(format!("{field} must be canonical unsigned decimal"));
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| format!("{field} is outside the unsigned 63-bit range"))?;
+    if parsed > i64::MAX as u64 || (!allow_zero && parsed == 0) {
+        return Err(format!("{field} is outside the unsigned 63-bit range"));
+    }
+    Ok(parsed)
+}
+
+fn parse_message_crypto_context(
+    profile: &str,
+    era: Option<&str>,
+    roster_version: Option<&str>,
+    roster_commitment: Option<&str>,
+    sender_device_id: Option<&str>,
+    sender_binding_version: Option<&str>,
+) -> Result<ParsedMessageCryptoContext, String> {
+    let all_absent = era.is_none()
+        && roster_version.is_none()
+        && roster_commitment.is_none()
+        && sender_device_id.is_none()
+        && sender_binding_version.is_none();
+    match profile {
+        "legacy_unknown" if all_absent => Ok(ParsedMessageCryptoContext::LegacyUnknown),
+        "legacy_unknown" => {
+            Err("legacy message crypto profile carries a partial modern context".to_string())
+        }
+        "sender_key_v5" => {
+            let era = parse_decimal_u63(
+                "message crypto_era",
+                era.ok_or("sender-key message is missing crypto_era")?,
+                false,
+            )?;
+            if era != 1 {
+                return Err("sender-key message has an unsupported crypto era".to_string());
+            }
+            let sender_device_id = decode_lower_hex_fixed::<16>(
+                "message sender_device_id",
+                sender_device_id.ok_or("sender-key message is missing sender_device_id")?,
+            )?;
+            if sender_device_id == [0u8; 16] {
+                return Err("sender-key message has an invalid zero sender device id".to_string());
+            }
+            Ok(ParsedMessageCryptoContext::SenderKeyV5 {
+                roster_version: parse_decimal_u63(
+                    "message roster_version",
+                    roster_version.ok_or("sender-key message is missing roster_version")?,
+                    false,
+                )?,
+                roster_commitment: decode_lower_hex_fixed::<32>(
+                    "message roster_commitment",
+                    roster_commitment.ok_or("sender-key message is missing roster_commitment")?,
+                )?,
+                sender_device_id,
+                sender_binding_version: parse_decimal_u63(
+                    "message sender_binding_version",
+                    sender_binding_version
+                        .ok_or("sender-key message is missing sender_binding_version")?,
+                    false,
+                )?,
+            })
+        }
+        _ => Err("message has an unknown crypto profile".to_string()),
+    }
+}
+
+fn client_message_security_context(
+    parsed: ParsedMessageCryptoContext,
+    target_device_id: [u8; 16],
+) -> Option<MessageSecurityContextV1> {
+    match parsed {
+        ParsedMessageCryptoContext::LegacyUnknown => None,
+        ParsedMessageCryptoContext::SenderKeyV5 {
+            roster_version,
+            roster_commitment,
+            sender_device_id,
+            sender_binding_version,
+        } => Some(MessageSecurityContextV1::SenderKeyV5(
+            SenderKeyMessageSecurityContextV1 {
+                roster_version,
+                roster_commitment,
+                sender_device_id,
+                target_device_id,
+                sender_binding_version,
+            },
+        )),
+    }
+}
+
+fn validate_live_message_security_context(
+    sender_key_mode: bool,
+    context: Option<&MessageSecurityContextV1>,
+) -> Result<(), String> {
+    match (sender_key_mode, context) {
+        (false, None) | (true, Some(MessageSecurityContextV1::SenderKeyV5(_))) => Ok(()),
+        (false, Some(_)) => Err("DM message carries a Sender-Key security context".to_string()),
+        (true, None) => {
+            Err("group/channel message is missing its Sender-Key v5 context".to_string())
+        }
+    }
+}
+
+fn decode_canonical_uuid(field: &str, value: &str) -> Result<[u8; 16], String> {
+    if value.len() != 36
+        || value.as_bytes().get(8) != Some(&b'-')
+        || value.as_bytes().get(13) != Some(&b'-')
+        || value.as_bytes().get(18) != Some(&b'-')
+        || value.as_bytes().get(23) != Some(&b'-')
+    {
+        return Err(format!("{field} must be a canonical lowercase UUID"));
+    }
+    let compact: String = value
+        .chars()
+        .filter(|character| *character != '-')
+        .collect();
+    let decoded = decode_lower_hex_fixed(field, &compact)
+        .map_err(|_| format!("{field} must be a canonical lowercase UUID"))?;
+    if decoded == [0u8; 16] {
+        return Err(format!("{field} must not be the nil UUID"));
+    }
+    Ok(decoded)
+}
+
+fn validate_directory_text(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), String> {
+    if value.len() > max_bytes
+        || (!allow_empty && value.is_empty())
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!("{field} is empty, oversized, or contains controls"));
+    }
+    Ok(())
+}
+
+fn validate_directory_reason(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > MAX_DIRECTORY_REASON_BYTES
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+    {
+        return Err(format!("{field} must be a bounded canonical reason token"));
+    }
+    Ok(())
+}
+
+fn validate_utc_rfc3339_nano(field: &str, value: &str) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    let fixed_layout = bytes.len() >= 20
+        && bytes.len() <= 30
+        && bytes.get(4) == Some(&b'-')
+        && bytes.get(7) == Some(&b'-')
+        && bytes.get(10) == Some(&b'T')
+        && bytes.get(13) == Some(&b':')
+        && bytes.get(16) == Some(&b':')
+        && bytes.last() == Some(&b'Z');
+    if !fixed_layout {
+        return Err(format!("{field} must be canonical UTC RFC3339Nano"));
+    }
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        if matches!(index, 4 | 7 | 10 | 13 | 16) || index == bytes.len() - 1 {
+            continue;
+        }
+        if index == 19 && bytes.len() > 20 {
+            if byte != b'.' {
+                return Err(format!("{field} must be canonical UTC RFC3339Nano"));
+            }
+            continue;
+        }
+        if !byte.is_ascii_digit() {
+            return Err(format!("{field} must be canonical UTC RFC3339Nano"));
+        }
+    }
+    let parse_u8_component = |range: std::ops::Range<usize>| -> Result<u8, String> {
+        std::str::from_utf8(&bytes[range])
+            .ok()
+            .and_then(|part| part.parse::<u8>().ok())
+            .ok_or_else(|| format!("{field} must be canonical UTC RFC3339Nano"))
+    };
+    let year = std::str::from_utf8(&bytes[0..4])
+        .ok()
+        .and_then(|part| part.parse::<u16>().ok())
+        .ok_or_else(|| format!("{field} must be canonical UTC RFC3339Nano"))?;
+    let month = parse_u8_component(5..7)?;
+    let day = parse_u8_component(8..10)?;
+    let hour = parse_u8_component(11..13)?;
+    let minute = parse_u8_component(14..16)?;
+    let second = parse_u8_component(17..19)?;
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => 0,
+    };
+    let fractional_is_canonical = bytes.len() == 20
+        || (bytes.len() >= 22
+            && bytes.len() <= 30
+            && bytes[19] == b'.'
+            // Go's RFC3339Nano formatter removes trailing fractional zeros.
+            // Accepting them would give the signed directory more than one
+            // wire representation for the same timestamp.
+            && bytes[bytes.len() - 2] != b'0');
+    if !(1..=12).contains(&month)
+        || day == 0
+        || day > days_in_month
+        || hour > 23
+        || minute > 59
+        || second > 59
+        || !fractional_is_canonical
+    {
+        return Err(format!("{field} must be canonical UTC RFC3339Nano"));
+    }
+    Ok(())
+}
+
+fn parse_device_directory(
+    value: serde_json::Value,
+    expected_conversation_id: &str,
+) -> Result<ParsedDeviceRoster, String> {
+    let wire: DeviceDirectoryWire = serde_json::from_value(value)
+        .map_err(|error| format!("invalid device directory response: {error}"))?;
+    let expected_conversation_uuid = decode_canonical_uuid(
+        "expected device directory conversation_id",
+        expected_conversation_id,
+    )?;
+    let conversation_uuid =
+        decode_canonical_uuid("device directory conversation_id", &wire.conversation_id)?;
+    if conversation_uuid != expected_conversation_uuid
+        || wire.conversation_id != expected_conversation_id
+    {
+        return Err("device directory response changed its conversation id".to_string());
+    }
+    let roster_version = parse_decimal_u63(
+        "device directory roster_version",
+        &wire.roster_version,
+        false,
+    )?;
+    let roster_commitment = decode_lower_hex_fixed::<32>(
+        "device directory roster_commitment",
+        &wire.roster_commitment,
+    )?;
+    let required_capabilities = parse_decimal_u63(
+        "device directory required_capabilities",
+        &wire.required_capabilities,
+        false,
+    )?;
+    if let Some(reason) = wire.reason.as_deref() {
+        validate_directory_reason("device directory reason", reason)?;
+    }
+    if wire.ready == wire.reason.is_some() {
+        return Err("device directory ready/reason fields contradict each other".to_string());
+    }
+    if wire.member_user_ids.is_empty()
+        || wire.member_user_ids.len() > MAX_DEVICE_DIRECTORY_MEMBERS
+        || wire.devices.len() > MAX_DEVICE_DIRECTORY_DEVICES
+    {
+        return Err("device directory member or device count is outside client limits".to_string());
+    }
+
+    let mut member_user_ids = Vec::with_capacity(wire.member_user_ids.len());
+    let mut member_set = std::collections::HashSet::new();
+    for user_id in &wire.member_user_ids {
+        let decoded = decode_canonical_uuid("device directory member user_id", user_id)?;
+        if member_user_ids
+            .last()
+            .is_some_and(|previous| previous >= &decoded)
+            || !member_set.insert(decoded)
+        {
+            return Err("device directory members are duplicated or non-canonical".to_string());
+        }
+        member_user_ids.push(decoded);
+    }
+
+    let mut devices = Vec::with_capacity(wire.devices.len());
+    let mut device_ids = std::collections::HashSet::new();
+    let mut account_keys = std::collections::HashMap::new();
+    let mut account_names = std::collections::HashMap::new();
+    let mut account_identity_owners = std::collections::HashMap::new();
+    let mut account_signing_owners = std::collections::HashMap::new();
+    let mut eligible_by_member = std::collections::HashMap::<[u8; 16], usize>::new();
+    let mut previous_device_order: Option<([u8; 16], [u8; 16])> = None;
+    let mut has_legacy = false;
+    let mut has_missing_capabilities = false;
+
+    for entry in wire.devices {
+        validate_directory_text(
+            "device directory username",
+            &entry.username,
+            MAX_DIRECTORY_USERNAME_BYTES,
+            false,
+        )?;
+        validate_directory_text(
+            "device directory device_name",
+            &entry.device_name,
+            MAX_DIRECTORY_DEVICE_NAME_BYTES,
+            true,
+        )?;
+        let user_id = decode_canonical_uuid("device directory device user_id", &entry.user_id)?;
+        if !member_set.contains(&user_id) {
+            return Err("device directory contains a device for a non-member".to_string());
+        }
+        match account_names.insert(user_id, entry.username.clone()) {
+            Some(previous) if previous != entry.username => {
+                return Err("device directory changed username within one member".to_string());
+            }
+            _ => {}
+        }
+        let account_identity_key = decode_canonical_base64::<32>(
+            "device directory account_identity_key",
+            &entry.account_identity_key,
+        )?;
+        let account_signing_key = decode_canonical_base64::<32>(
+            "device directory account_signing_key",
+            &entry.account_signing_key,
+        )?;
+        match account_keys.insert(user_id, (account_identity_key, account_signing_key)) {
+            Some(previous) if previous != (account_identity_key, account_signing_key) => {
+                return Err("device directory changed account keys within one member".to_string());
+            }
+            _ => {}
+        }
+        if let Some(previous_owner) = account_identity_owners.insert(account_identity_key, user_id)
+        {
+            if previous_owner != user_id {
+                return Err(
+                    "device directory maps one account identity to multiple users".to_string(),
+                );
+            }
+        }
+        if let Some(previous_owner) = account_signing_owners.insert(account_signing_key, user_id) {
+            if previous_owner != user_id {
+                return Err(
+                    "device directory maps one account signing key to multiple users".to_string(),
+                );
+            }
+        }
+        let device_id =
+            decode_lower_hex_fixed::<16>("device directory device_id", &entry.device_id)?;
+        if device_id == [0u8; 16] || !device_ids.insert(device_id) {
+            return Err("device directory repeats a protocol device id".to_string());
+        }
+        let order = (user_id, device_id);
+        if previous_device_order
+            .as_ref()
+            .is_some_and(|previous| previous >= &order)
+        {
+            return Err("device directory devices are not in canonical order".to_string());
+        }
+        previous_device_order = Some(order);
+
+        let (binding, expected_status, expected_eligible, expected_exclusion_reason) =
+            if let Some(binding) = entry.binding {
+                let binding_device_id =
+                    decode_lower_hex_fixed::<16>("device binding device_id", &binding.device_id)?;
+                if binding_device_id != device_id {
+                    return Err("device binding id differs from its directory device".to_string());
+                }
+                let version = parse_decimal_u63("device binding version", &binding.version, false)?;
+                let capabilities =
+                    parse_decimal_u63("device binding capabilities", &binding.capabilities, true)?;
+                if !matches!(binding.status, 1..=3) {
+                    return Err("device binding has an invalid signed status".to_string());
+                }
+                validate_utc_rfc3339_nano("device binding created_at", &binding.created_at)?;
+                let eligible = binding.status == 1
+                    && capabilities & required_capabilities == required_capabilities;
+                let exclusion_reason = match (binding.status, eligible) {
+                    (_, true) => None,
+                    (1, false) => Some("missing_required_capabilities"),
+                    (2, false) => Some("explicitly_excluded"),
+                    (3, false) => Some("revoked"),
+                    _ => unreachable!(),
+                };
+                let parsed = ParsedDeviceBinding {
+                    device_id: binding_device_id,
+                    device_identity_key: decode_canonical_base64::<32>(
+                        "device binding device_identity_key",
+                        &binding.device_identity_key,
+                    )?,
+                    device_signing_key: decode_canonical_base64::<32>(
+                        "device binding device_signing_key",
+                        &binding.device_signing_key,
+                    )?,
+                    version,
+                    capabilities,
+                    status: binding.status,
+                    account_signature: decode_canonical_base64::<64>(
+                        "device binding account_signature",
+                        &binding.account_signature,
+                    )?,
+                };
+                (Some(parsed), binding.status, eligible, exclusion_reason)
+            } else {
+                (None, 4, false, Some("legacy_unbound"))
+            };
+        if entry.status != expected_status
+            || entry.eligible != expected_eligible
+            || entry.exclusion_reason.as_deref() != expected_exclusion_reason
+        {
+            return Err(
+                "device directory status, eligibility, or exclusion reason is inconsistent"
+                    .to_string(),
+            );
+        }
+        if let Some(reason) = entry.exclusion_reason.as_deref() {
+            validate_directory_reason("device directory exclusion_reason", reason)?;
+        }
+        if expected_eligible {
+            *eligible_by_member.entry(user_id).or_default() += 1;
+        }
+        has_legacy |= expected_status == 4;
+        has_missing_capabilities |= expected_status == 1 && !expected_eligible;
+        devices.push(ParsedDeviceRosterEntry {
+            user_id,
+            account_identity_key,
+            account_signing_key,
+            device_id,
+            binding,
+        });
+    }
+
+    let member_without_eligible_device = member_user_ids
+        .iter()
+        .any(|member| eligible_by_member.get(member).copied().unwrap_or_default() == 0);
+    let derived_reason = if has_legacy {
+        Some("legacy_unbound_device")
+    } else if has_missing_capabilities {
+        Some("active_device_missing_required_capabilities")
+    } else if member_without_eligible_device {
+        Some("member_has_no_eligible_active_device")
+    } else {
+        None
+    };
+    if wire.ready != derived_reason.is_none() || wire.reason.as_deref() != derived_reason {
+        return Err(
+            "device directory readiness does not match its canonical device set".to_string(),
+        );
+    }
+
+    Ok(ParsedDeviceRoster {
+        conversation_id: wire.conversation_id,
+        roster_version,
+        roster_commitment,
+        required_capabilities,
+        ready: wire.ready,
+        unavailable_reason: wire.reason,
+        member_user_ids,
+        devices,
+    })
+}
+
+fn verify_device_directory_account_keys(
+    roster: &ParsedDeviceRoster,
+    account_directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
+) -> Result<(), String> {
+    if roster.member_user_ids.len() != account_directory.len() {
+        return Err("device and account directories disagree on the member set".to_string());
+    }
+    let mut pinned_by_user = std::collections::HashMap::with_capacity(account_directory.len());
+    for (user_id, member) in account_directory {
+        let user_id = decode_canonical_uuid("account directory member user_id", user_id)?;
+        if pinned_by_user.insert(user_id, member).is_some() {
+            return Err("account directory repeats a canonical member id".to_string());
+        }
+    }
+    if roster
+        .member_user_ids
+        .iter()
+        .any(|user_id| !pinned_by_user.contains_key(user_id))
+    {
+        return Err("device and account directories disagree on a member id".to_string());
+    }
+    for device in &roster.devices {
+        let member = pinned_by_user
+            .get(&device.user_id)
+            .ok_or("device directory contains an account outside the pinned member set")?;
+        if member.identity_key != device.account_identity_key
+            || member.signing_key != device.account_signing_key
+        {
+            return Err("device directory substituted pinned account keys".to_string());
+        }
+    }
+    Ok(())
 }
 
 fn decode_lower_hex_bytes(field: &str, value: &str) -> Result<Vec<u8>, String> {
@@ -1267,9 +2158,11 @@ fn pin_and_persist_sync_conversation(
     ),
     String,
 > {
-    if conversation.id.is_empty() || conversation.created_at.is_empty() {
-        return Err("server returned an incomplete conversation directory entry".to_string());
-    }
+    decode_canonical_uuid("conversation directory id", &conversation.id)?;
+    validate_utc_rfc3339_nano(
+        "conversation directory created_at",
+        &conversation.created_at,
+    )?;
     if conversation.conv_type > 2 {
         return Err(format!(
             "conversation {} has unsupported type {}",
@@ -1282,6 +2175,18 @@ fn pin_and_persist_sync_conversation(
             conversation.id
         ));
     }
+    if let Some(server_id) = conversation.server_id.as_deref() {
+        decode_canonical_uuid("conversation directory server_id", server_id)?;
+    }
+    if (conversation.conv_type == 2) != conversation.server_id.is_some() {
+        return Err(format!(
+            "conversation {} has a server scope inconsistent with its type",
+            conversation.id
+        ));
+    }
+    if let Some(name) = conversation.name.as_deref() {
+        validate_directory_text("conversation directory name", name, 256, false)?;
+    }
     if conversation.members.is_empty() || conversation.members.len() > 1_024 {
         return Err(format!(
             "conversation {} has an invalid authenticated member count",
@@ -1292,12 +2197,13 @@ fn pin_and_persist_sync_conversation(
     let mut directory = std::collections::HashMap::new();
     let mut identity_owners = std::collections::HashMap::new();
     for member in &conversation.members {
-        if member.user_id.is_empty() || member.username.is_empty() {
-            return Err(format!(
-                "conversation {} contains an incomplete member",
-                conversation.id
-            ));
-        }
+        decode_canonical_uuid("conversation directory member user_id", &member.user_id)?;
+        validate_directory_text(
+            "conversation directory member username",
+            &member.username,
+            MAX_DIRECTORY_USERNAME_BYTES,
+            false,
+        )?;
         let identity_key = decode_lower_hex_32("member identity_key", &member.identity_key)?;
         let signing_key = decode_lower_hex_32("member signing_key", &member.signing_key)?;
         if directory.contains_key(&member.user_id) {
@@ -1439,10 +2345,62 @@ fn sync_conversation_messages(
 
         let mut page_message_ids = std::collections::HashSet::new();
         for message in &page.messages {
-            if message.id.is_empty() || !page_message_ids.insert(message.id.as_str()) {
+            decode_canonical_uuid("message sync id", &message.id)?;
+            decode_canonical_uuid("message sync conversation_id", &message.conversation_id)?;
+            decode_canonical_uuid("message sync sender_id", &message.sender_id)?;
+            if let Some(reply_to_id) = message.reply_to_id.as_deref() {
+                decode_canonical_uuid("message sync reply_to_id", reply_to_id)?;
+            }
+            validate_utc_rfc3339_nano("message sync created_at", &message.created_at)?;
+            if let Some(edited_at) = message.edited_at.as_deref() {
+                validate_utc_rfc3339_nano("message sync edited_at", edited_at)?;
+            }
+            if let Some(expires_at) = message.expires_at.as_deref() {
+                validate_utc_rfc3339_nano("message sync expires_at", expires_at)?;
+            }
+            if !(0..=5).contains(&message.msg_type) || !page_message_ids.insert(message.id.as_str())
+            {
                 return Err(format!(
-                    "message sync returned an empty or repeated UUID for conversation {conversation_id}"
+                    "message sync returned an invalid type or repeated UUID for conversation {conversation_id}"
                 ));
+            }
+            if message.attachments.len() > MAX_SYNC_ATTACHMENTS
+                || ((message.is_deleted || message.is_expired) && !message.attachments.is_empty())
+            {
+                return Err(format!(
+                    "message {} has an invalid attachment count for its state",
+                    message.id
+                ));
+            }
+            for attachment in &message.attachments {
+                validate_directory_text(
+                    "message attachment media_id",
+                    &attachment.media_id,
+                    256,
+                    false,
+                )?;
+                validate_canonical_base64_bytes(
+                    "message attachment encrypted_key",
+                    &attachment.encrypted_key,
+                    MAX_SYNC_ATTACHMENT_KEY_BYTES,
+                )?;
+                validate_canonical_base64_bytes(
+                    "message attachment nonce",
+                    &attachment.nonce,
+                    MAX_SYNC_ATTACHMENT_NONCE_BYTES,
+                )?;
+                if attachment.size < 0 {
+                    return Err(format!(
+                        "message {} has a negative attachment size",
+                        message.id
+                    ));
+                }
+                validate_directory_text(
+                    "message attachment content_type",
+                    &attachment.content_type,
+                    256,
+                    false,
+                )?;
             }
             if message.conversation_id != conversation_id {
                 return Err(format!(
@@ -1450,6 +2408,14 @@ fn sync_conversation_messages(
                     message.id
                 ));
             }
+            let crypto_context = parse_message_crypto_context(
+                &message.crypto_profile,
+                message.crypto_era.as_deref(),
+                message.roster_version.as_deref(),
+                message.roster_commitment.as_deref(),
+                message.sender_device_id.as_deref(),
+                message.sender_binding_version.as_deref(),
+            )?;
 
             let response_identity =
                 decode_lower_hex_32("message sender_identity_key", &message.sender_identity_key)?;
@@ -1482,8 +2448,47 @@ fn sync_conversation_messages(
             } else {
                 veil_store::models::RemoteMessageStateKind::Active
             };
+            let encrypted_wire =
+                if remote_state == veil_store::models::RemoteMessageStateKind::Active {
+                    if message.header.len() > MAX_SYNC_HEADER_BYTES * 2
+                        || message.ciphertext.len() > MAX_SYNC_CIPHERTEXT_BYTES * 2
+                    {
+                        return Err(format!(
+                            "message {} exceeds the E2E wire size limit",
+                            message.id
+                        ));
+                    }
+                    Some((
+                        decode_lower_hex_bytes("message header", &message.header)?,
+                        decode_lower_hex_bytes("message ciphertext", &message.ciphertext)?,
+                    ))
+                } else {
+                    if !message.header.is_empty() || !message.ciphertext.is_empty() {
+                        return Err(format!(
+                            "message {} exposes ciphertext for a terminal tombstone",
+                            message.id
+                        ));
+                    }
+                    None
+                };
 
             let mut client = state.client.lock().map_err(|e| e.to_string())?;
+            let sender_key_mode = client.is_channel_conversation(conversation_id);
+            let message_security_context =
+                client_message_security_context(crypto_context, client.device_id());
+            if let Some((header, _)) = encrypted_wire.as_ref() {
+                let valid_header = if sender_key_mode {
+                    header.as_slice() == [0x05]
+                } else {
+                    matches!(header.first(), Some(0x01 | 0x02))
+                };
+                if !valid_header {
+                    return Err(format!(
+                        "message {} E2E header conflicts with its pinned conversation mode",
+                        message.id
+                    ));
+                }
+            }
             let mut sender_is_usable = true;
             if let Some(pinned_sender) = directory.get(&message.sender_id) {
                 if response_identity != pinned_sender.identity_key
@@ -1497,11 +2502,11 @@ fn sync_conversation_messages(
                 }
             } else {
                 // Removed members are absent from the current member list. We
-                // may decrypt their history only if this exact X->Ed binding
-                // was already durably pinned while they were a member. A new
-                // device is not entitled to unavailable pre-join Sender-Key
-                // history, so first-seen former senders are skipped explicitly
-                // instead of blocking later backlog pages.
+                // may decrypt their history only after the ciphertext resolves
+                // through an exact retained account-signed device proof below.
+                // An existing IK->Ed conflict stays fatal. A first observation
+                // is deliberately service-mediated TOFU: it establishes device
+                // continuity, never a user-visible "Verified" attribution.
                 if !client.peer_signing_key_is_pinned(&response_identity, &response_signing) {
                     sender_is_usable = false;
                 }
@@ -1513,6 +2518,102 @@ fn sync_conversation_messages(
                         "message {} former sender conflicts with a known user identity",
                         message.id
                     ));
+                }
+            }
+
+            match (sender_key_mode, crypto_context) {
+                (false, ParsedMessageCryptoContext::LegacyUnknown) => {}
+                (false, ParsedMessageCryptoContext::SenderKeyV5 { .. }) => {
+                    return Err(format!(
+                        "DM message {} carries a sender-key security context",
+                        message.id
+                    ));
+                }
+                (true, ParsedMessageCryptoContext::LegacyUnknown)
+                    if remote_state == veil_store::models::RemoteMessageStateKind::Active =>
+                {
+                    let has_local_plaintext = client
+                        .db()
+                        .ok_or("database not initialized")?
+                        .message_exists(&message.id)?;
+                    if has_local_plaintext {
+                        // Migration 018 labels pre-context rows explicitly as
+                        // legacy_unknown. An already-decrypted local row is
+                        // still trustworthy at the same authenticated
+                        // revision: preserve its plaintext/index and reconcile
+                        // reactions as Active. A newer encrypted edit cannot
+                        // be applied, so retain the old local body while
+                        // recording only the newer remote revision as
+                        // unavailable.
+                        match client.reconcile_remote_message_metadata(
+                            &message.id,
+                            conversation_id,
+                            &response_identity,
+                            &metadata,
+                            veil_store::models::RemoteMessageStateKind::Active,
+                        )? {
+                            veil_client::api::RemoteReconcileAction::Unchanged
+                            | veil_client::api::RemoteReconcileAction::SelfStateOnly => {
+                                stats.duplicates += 1;
+                                continue;
+                            }
+                            veil_client::api::RemoteReconcileAction::NeedsEncryptedEdit => {}
+                            unexpected => {
+                                return Err(format!(
+                                    "legacy message {} produced unexpected local reconciliation {unexpected:?}",
+                                    message.id
+                                ));
+                            }
+                        }
+                    }
+                    client.reconcile_remote_message_metadata(
+                        &message.id,
+                        conversation_id,
+                        &response_identity,
+                        &metadata,
+                        veil_store::models::RemoteMessageStateKind::Unavailable,
+                    )?;
+                    stats.unavailable_history += 1;
+                    continue;
+                }
+                (true, ParsedMessageCryptoContext::LegacyUnknown) => {}
+                (true, ParsedMessageCryptoContext::SenderKeyV5 { .. }) => {
+                    if remote_state == veil_store::models::RemoteMessageStateKind::Active {
+                        let existing_local_self = message.sender_id == authenticated_user_id
+                            && client
+                                .db()
+                                .ok_or("database not initialized")?
+                                .message_exists(&message.id)?;
+                        if !existing_local_self {
+                            let (_, ciphertext) = encrypted_wire
+                                .as_ref()
+                                .ok_or("active Sender-Key message has no ciphertext")?;
+                            client.validate_sender_key_message_context_v1(
+                                conversation_id,
+                                &response_identity,
+                                ciphertext,
+                                message_security_context
+                                    .as_ref()
+                                    .ok_or("Sender-Key message context conversion failed")?,
+                            )?;
+                            if !client
+                                .peer_signing_key_is_pinned(&response_identity, &response_signing)
+                            {
+                                return Err(format!(
+                                    "message {} sender signing key is absent from its current or retained continuity pin",
+                                    message.id
+                                ));
+                            }
+                        }
+                        // For a row that needs wire authentication, require an
+                        // exact current or retained account-signed device proof
+                        // and its durable IK->Ed continuity pin. A first-seen
+                        // retained proof remains unverified service-mediated
+                        // TOFU. The only bypass is our already-persisted local
+                        // outgoing plaintext, which is never re-decrypted or
+                        // replaced by the server ciphertext here.
+                        sender_is_usable = true;
+                    }
                 }
             }
 
@@ -1552,7 +2653,7 @@ fn sync_conversation_messages(
                     continue;
                 }
                 veil_client::api::RemoteReconcileAction::NeedsInitialCiphertext
-                    if message.sender_id == authenticated_user_id =>
+                    if message.sender_id == authenticated_user_id && !sender_key_mode =>
                 {
                     client.reconcile_remote_message_metadata(
                         &message.id,
@@ -1575,17 +2676,9 @@ fn sync_conversation_messages(
                 _ => {}
             }
 
-            if message.header.len() > MAX_SYNC_HEADER_BYTES * 2
-                || message.ciphertext.len() > MAX_SYNC_CIPHERTEXT_BYTES * 2
-            {
-                return Err(format!(
-                    "message {} exceeds the E2E wire size limit",
-                    message.id
-                ));
-            }
-            let header = decode_lower_hex_bytes("message header", &message.header)?;
-            let ciphertext = decode_lower_hex_bytes("message ciphertext", &message.ciphertext)?;
-            let sender_key_mode = client.is_channel_conversation(conversation_id);
+            let (header, ciphertext) = encrypted_wire
+                .as_ref()
+                .ok_or("active reconciliation action has no encrypted wire")?;
             match action {
                 veil_client::api::RemoteReconcileAction::NeedsInitialCiphertext => {
                     match client.receive_and_persist_message(
@@ -1593,9 +2686,10 @@ fn sync_conversation_messages(
                         conversation_id,
                         &response_identity,
                         sender_key_mode,
+                        message_security_context.as_ref(),
                         None,
-                        &header,
-                        &ciphertext,
+                        header,
+                        ciphertext,
                         Some(message.server_timestamp),
                         message.reply_to_id.as_deref(),
                         Some(&metadata),
@@ -1614,8 +2708,8 @@ fn sync_conversation_messages(
                         conversation_id,
                         &response_identity,
                         sender_key_mode,
-                        &header,
-                        &ciphertext,
+                        header,
+                        ciphertext,
                         Some(&metadata),
                     )?;
                     stats.edits += 1;
@@ -1651,6 +2745,7 @@ fn sync_offline_state(
     let mut cursor: Option<String> = None;
     let mut seen_conversations = std::collections::HashSet::new();
     let mut directories = Vec::new();
+    let mut isolation = ConversationSyncIsolation::default();
     let mut finished = false;
 
     for _ in 0..OFFLINE_SYNC_MAX_PAGES {
@@ -1677,16 +2772,58 @@ fn sync_offline_state(
         )?;
 
         for conversation in &page.conversations {
+            // A malformed identifier cannot be isolated because it has no
+            // canonical native key. Every later per-conversation failure can.
+            decode_canonical_uuid("conversation directory id", &conversation.id)?;
             if !seen_conversations.insert(conversation.id.clone()) {
                 return Err(format!(
                     "conversation directory repeated {} across pages",
                     conversation.id
                 ));
             }
-            let (directory, sender_key_refresh) =
-                pin_and_persist_sync_conversation(state, authenticated_user_id, conversation)?;
-            directories.push((conversation.id.clone(), directory, sender_key_refresh));
             stats.conversations += 1;
+            let (directory, sender_key_refresh) =
+                match pin_and_persist_sync_conversation(state, authenticated_user_id, conversation)
+                {
+                    Ok(pinned) => pinned,
+                    Err(error) => {
+                        require_session_still_unlocked(state)?;
+                        quarantine_runtime_conversation(
+                            state,
+                            &conversation.id,
+                            matches!(conversation.conv_type, 1 | 2),
+                        )?;
+                        isolation.block(&conversation.id, "account_directory_rejected", &error);
+                        continue;
+                    }
+                };
+            if sender_key_refresh.is_some() {
+                // The retained SKDM FIFO barrier and every Sender-Key
+                // ciphertext are device-owned. Install the complete current
+                // signed roster (including rollback/signature pins) before
+                // either can consume cryptographic state.
+                match fetch_and_install_authenticated_device_directory(
+                    state,
+                    server_http_url,
+                    authenticated_user_id,
+                    &conversation.id,
+                    &directory,
+                ) {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        quarantine_runtime_conversation(state, &conversation.id, true)?;
+                        isolation.block(&conversation.id, "device_roster_not_ready", &reason);
+                        continue;
+                    }
+                    Err(error) => {
+                        require_session_still_unlocked(state)?;
+                        quarantine_runtime_conversation(state, &conversation.id, true)?;
+                        isolation.block(&conversation.id, "device_roster_rejected", &error);
+                        continue;
+                    }
+                }
+            }
+            directories.push((conversation.id.clone(), directory, sender_key_refresh));
         }
 
         match page.next_cursor {
@@ -1707,24 +2844,60 @@ fn sync_offline_state(
     // AuthResult is a FIFO barrier: all retained SKDM envelopes were buffered
     // before it. Install them only now, after every signed member directory is
     // pinned, and before any group ciphertext consumes Sender-Key state.
-    stats.retained_sender_keys = state
-        .client
-        .lock()
-        .map_err(|e| e.to_string())?
-        .process_retained_sender_keys_before_sync()?;
+    {
+        let mut client = state.client.lock().map_err(|e| e.to_string())?;
+        let report = client.process_retained_sender_keys_before_sync()?;
+        stats.retained_sender_keys = report.processed;
+        for diagnostic in report.diagnostics {
+            decode_canonical_uuid(
+                "retained Sender-Key diagnostic conversation_id",
+                &diagnostic.conversation_id,
+            )?;
+            if client.is_channel_conversation(&diagnostic.conversation_id) {
+                client.invalidate_device_roster_v1(&diagnostic.conversation_id);
+                client.mark_channel_conversation(&diagnostic.conversation_id);
+            }
+            isolation.block(
+                &diagnostic.conversation_id,
+                "retained_sender_key_rejected",
+                &diagnostic.reason,
+            );
+        }
+        // process_sender_key_distribution_v1 queues a receipt only after the
+        // exact generation and route proof commit to SQLCipher. Flush that
+        // durable queue before any REST ciphertext consumes the generation. A
+        // receipt attests only that exact SKDM install, not that every later
+        // history row exists; delaying it would permit retention/availability
+        // DoS through an unrelated missing generation.
+        state
+            .runtime
+            .block_on(client.flush_sender_key_receipts_v1())?;
+    }
+    directories.retain(|(conversation_id, _, _)| !isolation.is_blocked(conversation_id));
 
     // All identities are pinned and all FK parents/groups are installed before
     // consuming any ratchet state from the ciphertext backlog.
-    for (conversation_id, directory, _) in &directories {
-        sync_conversation_messages(
+    for (conversation_id, directory, sender_key_refresh) in &directories {
+        if let Err(error) = sync_conversation_messages(
             state,
             server_http_url,
             authenticated_user_id,
             conversation_id,
             directory,
             &mut stats,
-        )?;
+        ) {
+            require_session_still_unlocked(state)?;
+            // Rows accepted earlier are independently authenticated and each
+            // plaintext/ratchet mutation committed transactionally. There is no
+            // remote message-cursor ACK: reconnect replays the page and those
+            // exact rows become validated duplicates. Quarantine prevents any
+            // outgoing fanout here; the local N+1 remains pending and the
+            // client's immutable retry invariant reuses it on reconnect.
+            quarantine_runtime_conversation(state, conversation_id, sender_key_refresh.is_some())?;
+            isolation.block(conversation_id, "message_history_unavailable", &error);
+        }
     }
+    directories.retain(|(conversation_id, _, _)| !isolation.is_blocked(conversation_id));
 
     // The current roster may have changed while this client was offline and
     // membership events are not durable. After all historical ciphertext has
@@ -1732,48 +2905,21 @@ fn sync_offline_state(
     // outgoing generation and distribute only to the freshly authenticated
     // directory. Sending stays blocked until every server ACK is processed by
     // the live dispatcher.
-    let our_identity = state
-        .client
-        .lock()
-        .map_err(|e| e.to_string())?
-        .identity_key()?;
-    let mut total_recipients = 0usize;
-    for (conversation_id, directory, _) in &directories {
-        let sender_key_mode = state
-            .client
-            .lock()
-            .map_err(|e| e.to_string())?
-            .is_channel_conversation(conversation_id);
-        if sender_key_mode {
-            total_recipients = total_recipients
-                .checked_add(
-                    directory
-                        .values()
-                        .filter(|member| member.identity_key != our_identity)
-                        .count(),
-                )
-                .ok_or_else(|| "sender-key recipient count overflow".to_string())?;
-        }
-    }
-    if total_recipients > MAX_SYNC_SENDER_KEY_RECIPIENTS {
-        return Err(format!(
-            "offline sender-key refresh exceeds {MAX_SYNC_SENDER_KEY_RECIPIENTS} recipients"
-        ));
-    }
-    for (conversation_id, directory, sender_key_refresh) in directories {
+    for (conversation_id, _, sender_key_refresh) in directories {
         let Some(sender_key_refresh) = sender_key_refresh else {
             continue;
         };
-        let recipients = directory
-            .values()
-            .map(|member| (hex::encode(member.identity_key), member.identity_key));
-        distribute_pinned_sender_key(
+        if let Err(error) = distribute_pinned_sender_key(
             state,
             &conversation_id,
-            recipients,
             SenderKeyDistributionPreparation::OfflineRefresh(sender_key_refresh),
-        )?;
+        ) {
+            require_session_still_unlocked(state)?;
+            quarantine_runtime_conversation(state, &conversation_id, true)?;
+            isolation.block(&conversation_id, "sender_key_distribution_failed", &error);
+        }
     }
+    stats.unavailable_conversations = isolation.into_diagnostics();
     Ok(stats)
 }
 
@@ -1805,12 +2951,18 @@ fn connect_to_server(
     // first connection. It is enabled only after the complete keyset backlog
     // has been authenticated, decrypted and persisted.
     state.offline_sync_ready.store(false, Ordering::SeqCst);
+    state
+        .unavailable_conversations
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clear();
     *state
         .authenticated_rest_origin
         .lock()
         .map_err(|e| e.to_string())? = None;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     client.clear_all_authorized_conversation_senders();
+    client.clear_device_rosters_v1();
     let result = state.runtime.block_on(client.connect(&server_url))?;
     drop(client);
 
@@ -1863,6 +3015,15 @@ fn connect_to_server(
         if !binding_matches {
             return Err("authenticated REST binding changed during offline sync".to_string());
         }
+        *state
+            .unavailable_conversations
+            .lock()
+            .map_err(|error| error.to_string())? = sync_stats
+            .unavailable_conversations
+            .iter()
+            .cloned()
+            .map(|diagnostic| (diagnostic.conversation_id.clone(), diagnostic))
+            .collect();
         state.offline_sync_ready.store(true, Ordering::SeqCst);
         let _ = app.emit(
             "veil://sync-complete",
@@ -1874,8 +3035,12 @@ fn connect_to_server(
                 "retainedSenderKeys": sync_stats.retained_sender_keys,
                 "edits": sync_stats.edits,
                 "tombstones": sync_stats.tombstones,
+                "unavailableConversations": &sync_stats.unavailable_conversations,
             }),
         );
+        for diagnostic in &sync_stats.unavailable_conversations {
+            let _ = app.emit("veil://conversation-crypto-unavailable", diagnostic);
+        }
     }
 
     // Start exactly one background event polling loop for the app lifetime.
@@ -1931,7 +3096,15 @@ fn connect_to_server(
                             header,
                             server_timestamp,
                             reply_to_id,
+                            security_context,
                         } => {
+                            if conversation_is_quarantined_fail_closed(
+                                &state_inner,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             // Decrypt strictly; invalid or legacy plaintext network
                             // frames are rejected below.
                             let sender_key: [u8; 32] = match sender_identity_key
@@ -1951,19 +3124,28 @@ fn connect_to_server(
                                     continue;
                                 }
                             };
+                            let sender_key_mode = client.is_channel_conversation(&conversation_id);
 
                             if let Err(error) = client
                                 .require_currently_authorized_sender(&conversation_id, &sender_key)
                             {
-                                state_inner
-                                    .offline_sync_ready
-                                    .store(false, Ordering::Release);
+                                let detail =
+                                    format!("live message authorization rejected: {error}");
+                                let _ = quarantine_live_conversation(
+                                    &state_inner,
+                                    &app_handle,
+                                    &mut client,
+                                    &conversation_id,
+                                    sender_key_mode,
+                                    "live_sender_authorization_rejected",
+                                    &detail,
+                                );
                                 drop(client);
                                 let _ = app_handle.emit(
                                     "veil://error",
                                     serde_json::json!({
                                         "code": 4003,
-                                        "message": format!("live message authorization rejected: {error}"),
+                                        "message": detail,
                                     }),
                                 );
                                 let _ = app_handle.emit(
@@ -1973,13 +3155,42 @@ fn connect_to_server(
                                 continue;
                             }
 
-                            let sender_key_mode = client.is_channel_conversation(&conversation_id);
+                            if let Err(error) = validate_live_message_security_context(
+                                sender_key_mode,
+                                security_context.as_ref(),
+                            ) {
+                                let detail =
+                                    format!("live message security context rejected: {error}");
+                                let _ = quarantine_live_conversation(
+                                    &state_inner,
+                                    &app_handle,
+                                    &mut client,
+                                    &conversation_id,
+                                    sender_key_mode,
+                                    "live_message_context_rejected",
+                                    &detail,
+                                );
+                                drop(client);
+                                let _ = app_handle.emit(
+                                    "veil://error",
+                                    serde_json::json!({
+                                        "code": 4004,
+                                        "message": detail,
+                                    }),
+                                );
+                                let _ = app_handle.emit(
+                                    "veil://membership-refresh-required",
+                                    serde_json::json!({ "conversationId": conversation_id }),
+                                );
+                                continue;
+                            }
                             let ts_ms = (server_timestamp / 1_000_000) as i64;
                             let text = match client.receive_and_persist_live_message(
                                 &message_id,
                                 &conversation_id,
                                 &sender_key,
                                 sender_key_mode,
+                                security_context.as_ref(),
                                 Some(&sender_username),
                                 &header,
                                 &ciphertext,
@@ -1997,12 +3208,28 @@ fn connect_to_server(
                                 Err(error) => {
                                     // Crypto state, FK parent and plaintext row
                                     // were rolled back together by the client.
+                                    let detail = format!("message transaction rejected: {error}");
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        sender_key_mode,
+                                        "live_message_transaction_rejected",
+                                        &detail,
+                                    );
                                     drop(client);
                                     let _ = app_handle.emit(
                                         "veil://error",
                                         serde_json::json!({
                                             "code": 4001,
-                                            "message": format!("message transaction rejected: {error}"),
+                                            "message": detail,
+                                        }),
+                                    );
+                                    let _ = app_handle.emit(
+                                        "veil://membership-refresh-required",
+                                        serde_json::json!({
+                                            "conversationId": conversation_id,
                                         }),
                                     );
                                     continue;
@@ -2037,6 +3264,7 @@ fn connect_to_server(
                             ref_seq,
                             local_message_id,
                             mutation,
+                            ..
                         } => {
                             drop(client);
                             let _ = app_handle.emit(
@@ -2109,6 +3337,13 @@ fn connect_to_server(
                             header,
                             edit_timestamp,
                         } => {
+                            if conversation_is_quarantined_fail_closed(
+                                &state_inner,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             let sender_key: [u8; 32] = match sender_identity_key
                                 .as_slice()
                                 .try_into()
@@ -2126,19 +3361,45 @@ fn connect_to_server(
                                     continue;
                                 }
                             };
+                            let sender_key_mode = client.is_channel_conversation(&conversation_id);
+                            if sender_key_mode {
+                                let detail = "encrypted group/channel edits are unavailable without an exact-device edit context";
+                                let _ = quarantine_live_conversation(
+                                    &state_inner,
+                                    &app_handle,
+                                    &mut client,
+                                    &conversation_id,
+                                    true,
+                                    "unsupported_encrypted_edit",
+                                    detail,
+                                );
+                                drop(client);
+                                let _ = app_handle.emit(
+                                    "veil://error",
+                                    serde_json::json!({ "code": 4004, "message": detail }),
+                                );
+                                continue;
+                            }
 
                             if let Err(error) = client
                                 .require_currently_authorized_sender(&conversation_id, &sender_key)
                             {
-                                state_inner
-                                    .offline_sync_ready
-                                    .store(false, Ordering::Release);
+                                let detail = format!("live edit authorization rejected: {error}");
+                                let _ = quarantine_live_conversation(
+                                    &state_inner,
+                                    &app_handle,
+                                    &mut client,
+                                    &conversation_id,
+                                    false,
+                                    "live_edit_authorization_rejected",
+                                    &detail,
+                                );
                                 drop(client);
                                 let _ = app_handle.emit(
                                     "veil://error",
                                     serde_json::json!({
                                         "code": 4003,
-                                        "message": format!("live edit authorization rejected: {error}"),
+                                        "message": detail,
                                     }),
                                 );
                                 let _ = app_handle.emit(
@@ -2148,7 +3409,6 @@ fn connect_to_server(
                                 continue;
                             }
 
-                            let sender_key_mode = client.is_channel_conversation(&conversation_id);
                             let revision_ms = match i64::try_from(edit_timestamp / 1_000_000) {
                                 Ok(timestamp) => timestamp,
                                 Err(_) => {
@@ -2179,12 +3439,23 @@ fn connect_to_server(
                                     continue;
                                 }
                                 Err(error) => {
+                                    let detail =
+                                        format!("message edit reconciliation rejected: {error}");
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        false,
+                                        "live_edit_reconciliation_rejected",
+                                        &detail,
+                                    );
                                     drop(client);
                                     let _ = app_handle.emit(
                                         "veil://error",
                                         serde_json::json!({
                                             "code": 4001,
-                                            "message": format!("message edit reconciliation rejected: {error}"),
+                                            "message": detail,
                                         }),
                                     );
                                     continue;
@@ -2201,12 +3472,22 @@ fn connect_to_server(
                             ) {
                                 Ok(plaintext) => plaintext,
                                 Err(error) => {
+                                    let detail = format!("message edit rejected: {error}");
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        false,
+                                        "live_edit_decryption_rejected",
+                                        &detail,
+                                    );
                                     drop(client);
                                     let _ = app_handle.emit(
                                         "veil://error",
                                         serde_json::json!({
                                             "code": 4001,
-                                            "message": format!("message edit rejected: {error}"),
+                                            "message": detail,
                                         }),
                                     );
                                     continue;
@@ -2231,6 +3512,13 @@ fn connect_to_server(
                             sender_identity_key,
                             delete_timestamp,
                         } => {
+                            if conversation_is_quarantined_fail_closed(
+                                &state_inner,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             let sender_key: [u8; 32] = match sender_identity_key.try_into() {
                                 Ok(sender) => sender,
                                 Err(_) => {
@@ -2238,6 +3526,7 @@ fn connect_to_server(
                                     continue;
                                 }
                             };
+                            let sender_key_mode = client.is_channel_conversation(&conversation_id);
 
                             // A durable identity pin proves who signed the event,
                             // but it does not prove that the sender is still a
@@ -2247,15 +3536,22 @@ fn connect_to_server(
                             if let Err(error) = client
                                 .require_currently_authorized_sender(&conversation_id, &sender_key)
                             {
-                                state_inner
-                                    .offline_sync_ready
-                                    .store(false, Ordering::Release);
+                                let detail = format!("live delete authorization rejected: {error}");
+                                let _ = quarantine_live_conversation(
+                                    &state_inner,
+                                    &app_handle,
+                                    &mut client,
+                                    &conversation_id,
+                                    sender_key_mode,
+                                    "live_delete_authorization_rejected",
+                                    &detail,
+                                );
                                 drop(client);
                                 let _ = app_handle.emit(
                                     "veil://error",
                                     serde_json::json!({
                                         "code": 4003,
-                                        "message": format!("live delete authorization rejected: {error}"),
+                                        "message": detail,
                                     }),
                                 );
                                 let _ = app_handle.emit(
@@ -2283,12 +3579,22 @@ fn connect_to_server(
                                 &metadata,
                                 veil_store::models::RemoteMessageStateKind::Deleted,
                             ) {
+                                let detail = format!("message delete persistence failed: {error}");
+                                let _ = quarantine_live_conversation(
+                                    &state_inner,
+                                    &app_handle,
+                                    &mut client,
+                                    &conversation_id,
+                                    sender_key_mode,
+                                    "live_delete_persistence_failed",
+                                    &detail,
+                                );
                                 drop(client);
                                 let _ = app_handle.emit(
                                     "veil://error",
                                     serde_json::json!({
                                         "code": 5001,
-                                        "message": format!("message delete persistence failed: {error}"),
+                                        "message": detail,
                                     }),
                                 );
                                 continue;
@@ -2315,8 +3621,35 @@ fn connect_to_server(
                             code,
                             message,
                             local_message_id,
+                            conversation_id,
+                            stale_roster_context,
                             ..
                         } => {
+                            if stale_roster_context {
+                                // VeilClient has already invalidated the exact
+                                // proof associated with the rejected sequence.
+                                // Quarantine that conversation only. A malformed
+                                // error without the pending sequence's scope is
+                                // the sole case that still requires a global
+                                // barrier because it cannot be isolated safely.
+                                if let Some(conversation_id) = conversation_id.as_deref() {
+                                    let sender_key_mode =
+                                        client.is_channel_conversation(conversation_id);
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        conversation_id,
+                                        sender_key_mode,
+                                        "stale_roster_context",
+                                        &message,
+                                    );
+                                } else {
+                                    state_inner
+                                        .offline_sync_ready
+                                        .store(false, Ordering::Release);
+                                }
+                            }
                             drop(client);
                             let _ = app_handle.emit(
                                 "veil://error",
@@ -2326,12 +3659,27 @@ fn connect_to_server(
                                     "localMessageId": local_message_id,
                                 }),
                             );
+                            if stale_roster_context {
+                                let _ = app_handle.emit(
+                                    "veil://membership-refresh-required",
+                                    serde_json::json!({
+                                        "conversationId": conversation_id,
+                                    }),
+                                );
+                            }
                         }
                         ConnectionEvent::TypingEvent {
                             conversation_id,
                             identity_key,
                             started,
                         } => {
+                            if conversation_is_quarantined_fail_closed(
+                                &state_inner,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             drop(client);
                             let _ = app_handle.emit(
                                 "veil://typing",
@@ -2350,6 +3698,13 @@ fn connect_to_server(
                             username,
                             add,
                         } => {
+                            if conversation_is_quarantined_fail_closed(
+                                &state_inner,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             // Persist to local DB
                             let persistence = if add {
                                 client.add_local_reaction(&message_id, &user_id, &emoji, &username)
@@ -2476,12 +3831,11 @@ fn connect_to_server(
                             // role changes (3..=9). Metadata-only create/update
                             // events (0/1) do not require key rotation.
                             let roster_changed = matches!(event_type, 2..=9);
+                            let mut diagnostics = Vec::new();
                             if roster_changed {
                                 // Membership and role changes invalidate every
-                                // channel roster. Clear live authorization and
-                                // rotate/block before pausing the dispatcher;
-                                // old incoming keys remain only for historical
-                                // backlog decryption during the forced reconnect.
+                                // affected channel roster without pausing DMs or
+                                // unrelated groups.
                                 let conversation_ids: Vec<String> = client
                                     .db()
                                     .and_then(|db| db.list_channels(&server_id).ok())
@@ -2490,17 +3844,22 @@ fn connect_to_server(
                                     .filter_map(|channel| channel.conversation_id)
                                     .collect();
                                 for conversation_id in conversation_ids {
-                                    client.clear_authorized_conversation_senders(&conversation_id);
+                                    client.invalidate_device_roster_v1(&conversation_id);
                                     client.mark_channel_conversation(&conversation_id);
-                                    // Even if persistence fails, clear_authorized
-                                    // and mark_channel keep live receive/send blocked.
-                                    let _ = client.rotate_sender_key(&conversation_id);
+                                    if let Ok(diagnostic) = quarantine_conversation_state(
+                                        &state_inner,
+                                        &conversation_id,
+                                        "membership_refresh_required",
+                                        "server membership or role authorization changed",
+                                    ) {
+                                        diagnostics.push(diagnostic);
+                                    }
                                 }
-                                state_inner
-                                    .offline_sync_ready
-                                    .store(false, Ordering::Release);
                             }
                             drop(client);
+                            for diagnostic in &diagnostics {
+                                emit_conversation_crypto_unavailable(&app_handle, diagnostic);
+                            }
                             let _ = app_handle.emit(
                                 "veil://server-event",
                                 serde_json::json!({
@@ -2546,15 +3905,23 @@ fn connect_to_server(
                                 .into_iter()
                                 .filter_map(|cached| cached.conversation_id)
                                 .collect();
+                            let mut diagnostics = Vec::new();
                             for conversation_id in conversation_ids {
-                                client.clear_authorized_conversation_senders(&conversation_id);
+                                client.invalidate_device_roster_v1(&conversation_id);
                                 client.mark_channel_conversation(&conversation_id);
-                                let _ = client.rotate_sender_key(&conversation_id);
+                                if let Ok(diagnostic) = quarantine_conversation_state(
+                                    &state_inner,
+                                    &conversation_id,
+                                    "membership_refresh_required",
+                                    "server channel authorization changed",
+                                ) {
+                                    diagnostics.push(diagnostic);
+                                }
                             }
-                            state_inner
-                                .offline_sync_ready
-                                .store(false, Ordering::Release);
                             drop(client);
+                            for diagnostic in &diagnostics {
+                                emit_conversation_crypto_unavailable(&app_handle, diagnostic);
+                            }
                             let _ = app_handle.emit(
                                 "veil://channel-event",
                                 serde_json::json!({
@@ -2577,42 +3944,61 @@ fn connect_to_server(
                             );
                         }
                         ConnectionEvent::SenderKeyDist {
-                            conversation_id,
                             sender_key_message,
-                            generation,
-                            ..
-                        } => match client.process_sealed_skdm(
-                            &sender_key_message,
-                            &conversation_id,
-                            generation,
-                        ) {
-                            Ok(()) => {
+                            route,
+                        } => {
+                            let conversation_id = route.conversation_id.clone();
+                            if conversation_is_quarantined_fail_closed(
+                                &state_inner,
+                                &conversation_id,
+                            ) {
                                 drop(client);
-                                let _ = app_handle.emit(
-                                    "veil://sender-key-received",
-                                    serde_json::json!({
-                                        "conversationId": conversation_id,
-                                    }),
-                                );
+                                continue;
                             }
-                            Err(e) => {
-                                state_inner
-                                    .offline_sync_ready
-                                    .store(false, Ordering::Release);
-                                drop(client);
-                                let _ = app_handle.emit(
-                                    "veil://error",
-                                    serde_json::json!({
-                                        "code": 4002,
-                                        "message": format!("sender-key distribution rejected: {e}"),
-                                    }),
-                                );
-                                let _ = app_handle.emit(
-                                    "veil://membership-refresh-required",
-                                    serde_json::json!({ "conversationId": conversation_id }),
-                                );
+                            let result = client
+                                .process_sender_key_distribution_v1(&sender_key_message, &route)
+                                .and_then(|_| {
+                                    state_inner
+                                        .runtime
+                                        .block_on(client.flush_sender_key_receipts_v1())
+                                        .map(|_| ())
+                                });
+                            match result {
+                                Ok(()) => {
+                                    drop(client);
+                                    let _ = app_handle.emit(
+                                        "veil://sender-key-received",
+                                        serde_json::json!({
+                                            "conversationId": conversation_id,
+                                        }),
+                                    );
+                                }
+                                Err(e) => {
+                                    let detail = format!("sender-key distribution rejected: {e}");
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        true,
+                                        "live_sender_key_distribution_rejected",
+                                        &detail,
+                                    );
+                                    drop(client);
+                                    let _ = app_handle.emit(
+                                        "veil://error",
+                                        serde_json::json!({
+                                            "code": 4002,
+                                            "message": detail,
+                                        }),
+                                    );
+                                    let _ = app_handle.emit(
+                                        "veil://membership-refresh-required",
+                                        serde_json::json!({ "conversationId": conversation_id }),
+                                    );
+                                }
                             }
-                        },
+                        }
                         _ => {}
                     }
                 }
@@ -2633,6 +4019,7 @@ fn send_message(
     reply_to_id: Option<String>,
 ) -> Result<u64, String> {
     require_live_transport_ready(&state)?;
+    require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
     state
@@ -2658,8 +4045,15 @@ fn edit_message(
     new_text: String,
 ) -> Result<u64, String> {
     require_live_transport_ready(&state)?;
+    require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
+    if client.is_channel_conversation(&conversation_id) {
+        return Err(
+            "editing encrypted group/channel messages is unavailable until the exact-device edit protocol is implemented"
+                .to_string(),
+        );
+    }
     state
         .runtime
         .block_on(client.edit_message(&message_id, &conversation_id, &new_text))
@@ -2672,6 +4066,7 @@ fn delete_message(
     conversation_id: String,
 ) -> Result<u64, String> {
     require_live_transport_ready(&state)?;
+    require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
     state
@@ -2686,6 +4081,7 @@ fn send_typing(
     started: bool,
 ) -> Result<(), String> {
     require_live_transport_ready(&state)?;
+    require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
     state
@@ -2703,6 +4099,7 @@ fn toggle_reaction(
     add: bool,
 ) -> Result<(), String> {
     require_live_transport_ready(&state)?;
+    require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
     if user_id != client.authenticated_user_id()? {
@@ -2832,19 +4229,48 @@ fn is_connected(state: State<'_, AppState>) -> Result<bool, String> {
 
 // ─── Groups ───────────────────────────────────────────
 
-/// Create a new group on the server. Returns the conversation_id.
+/// Preserve a server-created ID even when its post-create crypto setup must be
+/// quarantined. Returning an IPC error would invite duplicate groups when a
+/// user retries a POST that already committed on the server.
+fn preserve_created_group_outcome(
+    conversation_id: String,
+    crypto_setup: Result<(), String>,
+) -> (String, Option<ConversationCryptoDiagnostic>) {
+    let diagnostic = crypto_setup
+        .err()
+        .map(|error| ConversationCryptoDiagnostic {
+            conversation_id: conversation_id.clone(),
+            code: "group_crypto_setup_pending".to_string(),
+            detail: bounded_diagnostic_detail(&error),
+        });
+    (conversation_id, diagnostic)
+}
+
+/// Create a new group on the server. Returns the conversation_id once the
+/// canonical POST succeeded; subsequent crypto setup failures are quarantined.
 #[tauri::command]
 fn create_group(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     user_id: String,
     name: String,
 ) -> Result<String, String> {
+    require_live_transport_ready(&state)?;
+    validate_directory_text("group name", &name, 256, false)?;
+    let authenticated_user_id = state
+        .client
+        .lock()
+        .map_err(|error| error.to_string())?
+        .authenticated_user_id()?;
+    if user_id != authenticated_user_id {
+        return Err("group creator does not match the authenticated session".to_string());
+    }
     let resp = state.runtime.block_on(rest_send_json(
         &state,
         reqwest::Method::POST,
         rest_api_url(&server_http_url, &["v1", "groups"])?,
-        &user_id,
+        &authenticated_user_id,
         Some(serde_json::json!({ "name": name })),
     ))?;
 
@@ -2852,11 +4278,62 @@ fn create_group(
         .as_str()
         .ok_or("no conversation_id")?
         .to_string();
+    decode_canonical_uuid("created group conversation_id", &conv_id)?;
 
-    // Persist locally
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    if let Some(db) = client.db() {
-        let _ = db.insert_conversation(&conv_id, 1, Some(&name), None, None);
+    let crypto_setup = (|| -> Result<(), String> {
+        {
+            let mut client = state.client.lock().map_err(|e| e.to_string())?;
+            require_live_transport_still_ready(&state)?;
+            client
+                .db()
+                .ok_or("database not initialized")?
+                .insert_conversation(&conv_id, 1, Some(&name), None, None)?;
+            client.mark_channel_conversation(&conv_id);
+        }
+
+        // A newly-created group is unusable until the signed exact-device roster
+        // is pinned and its device-owned Sender-Key generation has reached every
+        // other eligible device (including our own other installations).
+        let members = fetch_authorized_conversation_directory(
+            &state,
+            &server_http_url,
+            &authenticated_user_id,
+            &conv_id,
+        )?;
+        let account_directory = pinned_account_directory_from_json(&members)?;
+        if let Some(reason) = fetch_and_install_authenticated_device_directory(
+            &state,
+            &server_http_url,
+            &authenticated_user_id,
+            &conv_id,
+            &account_directory,
+        )? {
+            return Err(format!(
+                "created group is waiting for a ready exact-device roster: {reason}"
+            ));
+        }
+        distribute_pinned_sender_key(
+            &state,
+            &conv_id,
+            SenderKeyDistributionPreparation::ReusePendingGeneration,
+        )?;
+        Ok(())
+    })();
+
+    let (conv_id, diagnostic) = preserve_created_group_outcome(conv_id, crypto_setup);
+    if let Some(diagnostic) = diagnostic {
+        if let Ok(mut client) = state.client.lock() {
+            client.invalidate_device_roster_v1(&conv_id);
+            client.mark_channel_conversation(&conv_id);
+        }
+        // The server has already committed the group at this point. A poisoned
+        // local diagnostic mutex must not turn that successful POST into an IPC
+        // error, because a UI retry could create a duplicate group.
+        if let Ok(published) =
+            quarantine_conversation_state(&state, &conv_id, &diagnostic.code, &diagnostic.detail)
+        {
+            emit_conversation_crypto_unavailable(&app, &published);
+        }
     }
 
     Ok(conv_id)
@@ -2866,45 +4343,75 @@ fn create_group(
 #[tauri::command]
 fn add_group_member(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     user_id: String,
     group_id: String,
     target_user_id: String,
 ) -> Result<(), String> {
-    state
-        .runtime
-        .block_on(rest_send_json(
-            &state,
-            reqwest::Method::POST,
-            rest_api_url(&server_http_url, &["v1", "groups", &group_id, "members"])?,
-            &user_id,
-            Some(serde_json::json!({ "user_id": target_user_id })),
-        ))
-        .map(|_| ())
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::POST,
+        rest_api_url(&server_http_url, &["v1", "groups", &group_id, "members"])?,
+        &user_id,
+        Some(serde_json::json!({ "user_id": target_user_id })),
+    ))?;
+    {
+        let mut client = state.client.lock().map_err(|error| error.to_string())?;
+        client.invalidate_device_roster_v1(&group_id);
+        client.mark_channel_conversation(&group_id);
+    }
+    let diagnostic = quarantine_conversation_state(
+        &state,
+        &group_id,
+        "membership_refresh_required",
+        "group membership changed; refresh its exact-device roster",
+    )?;
+    emit_conversation_crypto_unavailable(&app, &diagnostic);
+    let _ = app.emit(
+        "veil://membership-refresh-required",
+        serde_json::json!({ "conversationId": group_id }),
+    );
+    Ok(())
 }
 
 /// Remove a member from a group (or leave).
 #[tauri::command]
 fn remove_group_member(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     user_id: String,
     group_id: String,
     target_user_id: String,
 ) -> Result<(), String> {
-    state
-        .runtime
-        .block_on(rest_send_json(
-            &state,
-            reqwest::Method::DELETE,
-            rest_api_url(
-                &server_http_url,
-                &["v1", "groups", &group_id, "members", &target_user_id],
-            )?,
-            &user_id,
-            None,
-        ))
-        .map(|_| ())
+    state.runtime.block_on(rest_send_json(
+        &state,
+        reqwest::Method::DELETE,
+        rest_api_url(
+            &server_http_url,
+            &["v1", "groups", &group_id, "members", &target_user_id],
+        )?,
+        &user_id,
+        None,
+    ))?;
+    {
+        let mut client = state.client.lock().map_err(|error| error.to_string())?;
+        client.invalidate_device_roster_v1(&group_id);
+        client.mark_channel_conversation(&group_id);
+    }
+    let diagnostic = quarantine_conversation_state(
+        &state,
+        &group_id,
+        "membership_refresh_required",
+        "group membership changed; refresh its exact-device roster",
+    )?;
+    emit_conversation_crypto_unavailable(&app, &diagnostic);
+    let _ = app.emit(
+        "veil://membership-refresh-required",
+        serde_json::json!({ "conversationId": group_id }),
+    );
+    Ok(())
 }
 
 /// Get group members from the server.
@@ -2940,6 +4447,7 @@ fn fetch_authorized_conversation_directory(
     user_id: &str,
     conversation_id: &str,
 ) -> Result<Vec<serde_json::Value>, String> {
+    decode_canonical_uuid("conversation directory request id", conversation_id)?;
     let response = state.runtime.block_on(rest_send_json(
         state,
         reqwest::Method::GET,
@@ -2978,10 +4486,14 @@ fn fetch_authorized_conversation_directory(
             .get("username")
             .and_then(serde_json::Value::as_str)
             .ok_or("conversation directory member is missing username")?;
-        if member_user_id.is_empty()
-            || username.is_empty()
-            || !user_ids.insert(member_user_id.to_string())
-        {
+        decode_canonical_uuid("conversation directory member user_id", member_user_id)?;
+        validate_directory_text(
+            "conversation directory member username",
+            username,
+            MAX_DIRECTORY_USERNAME_BYTES,
+            false,
+        )?;
+        if !user_ids.insert(member_user_id.to_string()) {
             return Err("conversation directory contains an invalid duplicate member".to_string());
         }
         let identity = decode_lower_hex_32(
@@ -3026,6 +4538,147 @@ fn fetch_authorized_conversation_directory(
     )?;
     require_session_still_unlocked(state)?;
     Ok(members)
+}
+
+fn pinned_account_directory_from_json(
+    members: &[serde_json::Value],
+) -> Result<std::collections::HashMap<String, PinnedDirectoryMember>, String> {
+    let mut directory = std::collections::HashMap::with_capacity(members.len());
+    for member in members {
+        let user_id = member
+            .get("user_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("conversation directory member is missing user_id")?;
+        decode_canonical_uuid("conversation directory member user_id", user_id)?;
+        let username = member
+            .get("username")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("conversation directory member is missing username")?;
+        validate_directory_text(
+            "conversation directory member username",
+            username,
+            MAX_DIRECTORY_USERNAME_BYTES,
+            false,
+        )?;
+        let identity_key = decode_lower_hex_32(
+            "conversation directory member identity_key",
+            member
+                .get("identity_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("conversation directory member is missing identity_key")?,
+        )?;
+        let signing_key = decode_lower_hex_32(
+            "conversation directory member signing_key",
+            member
+                .get("signing_key")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("conversation directory member is missing signing_key")?,
+        )?;
+        if directory
+            .insert(
+                user_id.to_string(),
+                PinnedDirectoryMember {
+                    username: username.to_string(),
+                    identity_key,
+                    signing_key,
+                },
+            )
+            .is_some()
+        {
+            return Err("conversation directory repeats a member".to_string());
+        }
+    }
+    Ok(directory)
+}
+
+fn fetch_authenticated_device_directory(
+    state: &AppState,
+    server_http_url: &str,
+    user_id: &str,
+    conversation_id: &str,
+) -> Result<ParsedDeviceRoster, String> {
+    require_unlocked(state)?;
+    let response = state.runtime.block_on(rest_send_json(
+        state,
+        reqwest::Method::GET,
+        rest_api_url(
+            server_http_url,
+            &["v1", "conversations", conversation_id, "device-directory"],
+        )?,
+        user_id,
+        None,
+    ))?;
+    let parsed = parse_device_directory(response, conversation_id)?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("device directory user differs from authenticated session".to_string());
+    }
+    let our_identity = client.identity_key()?;
+    let our_signing = client.signing_key()?;
+    let our_user_id = decode_canonical_uuid("authenticated user id", user_id)?;
+    let self_entry = parsed
+        .devices
+        .iter()
+        .find(|device| device.user_id == our_user_id)
+        .ok_or("authenticated account has no device in the device directory")?;
+    if self_entry.account_identity_key != our_identity
+        || self_entry.account_signing_key != our_signing
+    {
+        return Err("device directory substituted authenticated account keys".to_string());
+    }
+    require_session_still_unlocked(state)?;
+    Ok(parsed)
+}
+
+fn fetch_and_install_authenticated_device_directory(
+    state: &AppState,
+    server_http_url: &str,
+    user_id: &str,
+    conversation_id: &str,
+    account_directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
+) -> Result<Option<String>, String> {
+    let parsed = match fetch_authenticated_device_directory(
+        state,
+        server_http_url,
+        user_id,
+        conversation_id,
+    ) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            if let Ok(mut client) = state.client.lock() {
+                client.invalidate_device_roster_v1(conversation_id);
+            }
+            return Err(error);
+        }
+    };
+    if !parsed.ready {
+        let reason = parsed
+            .unavailable_reason
+            .clone()
+            .unwrap_or_else(|| "device_roster_not_ready".to_string());
+        state
+            .client
+            .lock()
+            .map_err(|lock_error| lock_error.to_string())?
+            .invalidate_device_roster_v1(conversation_id);
+        return Ok(Some(reason));
+    }
+    if let Err(error) = verify_device_directory_account_keys(&parsed, account_directory) {
+        state
+            .client
+            .lock()
+            .map_err(|lock_error| lock_error.to_string())?
+            .invalidate_device_roster_v1(conversation_id);
+        return Err(error);
+    }
+    let mut client = state.client.lock().map_err(|error| error.to_string())?;
+    if client.authenticated_user_id()? != user_id {
+        client.invalidate_device_roster_v1(conversation_id);
+        return Err("device directory belongs to a stale authenticated session".to_string());
+    }
+    client.install_device_roster_v1(parsed.into())?;
+    require_session_still_unlocked(state)?;
+    Ok(None)
 }
 
 #[tauri::command]
@@ -3419,8 +5072,11 @@ async fn rest_send_json(
     Ok(json)
 }
 
-fn pause_server_sender_keys(state: &AppState, server_id: &str) -> Result<(), String> {
-    state.offline_sync_ready.store(false, Ordering::Release);
+fn pause_server_sender_keys(
+    state: &AppState,
+    app: &AppHandle,
+    server_id: &str,
+) -> Result<(), String> {
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     let conversation_ids: Vec<String> = client
         .db()
@@ -3430,13 +5086,24 @@ fn pause_server_sender_keys(state: &AppState, server_id: &str) -> Result<(), Str
         .into_iter()
         .filter_map(|channel| channel.conversation_id)
         .collect();
+    let mut diagnostics = Vec::with_capacity(conversation_ids.len());
     for conversation_id in conversation_ids {
-        client.clear_authorized_conversation_senders(&conversation_id);
+        client.invalidate_device_roster_v1(&conversation_id);
         client.mark_channel_conversation(&conversation_id);
-        // The pending flag above is the security boundary; rotation errors are
-        // returned so callers cannot report the role/member mutation as fully
-        // reconciled while continuing on the old generation.
-        client.rotate_sender_key(&conversation_id)?;
+        diagnostics.push(quarantine_conversation_state(
+            state,
+            &conversation_id,
+            "membership_refresh_required",
+            "server roles or channel authorization changed; refresh the exact-device roster",
+        )?);
+        // Rotation is deliberately deferred until a fresh signed exact-device
+        // directory is installed. Generating against the now-stale roster
+        // would create another undistributable key and invites accidental
+        // account-level fallback.
+    }
+    drop(client);
+    for diagnostic in &diagnostics {
+        emit_conversation_crypto_unavailable(app, diagnostic);
     }
     Ok(())
 }
@@ -3791,7 +5458,7 @@ fn update_role(
     if let Some(v) = color {
         body.insert("color".into(), v.into());
     }
-    if let Err(error) = pause_server_sender_keys(&state, &server_id) {
+    if let Err(error) = pause_server_sender_keys(&state, &app, &server_id) {
         emit_membership_refresh_required(&app, &server_id);
         return Err(error);
     }
@@ -3818,7 +5485,7 @@ fn delete_role(
     server_id: String,
     role_id: String,
 ) -> Result<(), String> {
-    if let Err(error) = pause_server_sender_keys(&state, &server_id) {
+    if let Err(error) = pause_server_sender_keys(&state, &app, &server_id) {
         emit_membership_refresh_required(&app, &server_id);
         return Err(error);
     }
@@ -3846,7 +5513,7 @@ fn assign_role(
     target_user_id: String,
     role_id: String,
 ) -> Result<(), String> {
-    if let Err(error) = pause_server_sender_keys(&state, &server_id) {
+    if let Err(error) = pause_server_sender_keys(&state, &app, &server_id) {
         emit_membership_refresh_required(&app, &server_id);
         return Err(error);
     }
@@ -3882,7 +5549,7 @@ fn unassign_role(
     target_user_id: String,
     role_id: String,
 ) -> Result<(), String> {
-    if let Err(error) = pause_server_sender_keys(&state, &server_id) {
+    if let Err(error) = pause_server_sender_keys(&state, &app, &server_id) {
         emit_membership_refresh_required(&app, &server_id);
         return Err(error);
     }
@@ -4396,12 +6063,24 @@ enum SenderKeyDistributionPreparation {
 fn distribute_pinned_sender_key(
     state: &AppState,
     conversation_id: &str,
-    recipients: impl IntoIterator<Item = (String, [u8; 32])>,
     preparation: SenderKeyDistributionPreparation,
 ) -> Result<u32, String> {
     require_unlocked(state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     client.mark_channel_conversation(conversation_id);
+    let targets = client.sender_key_device_targets(conversation_id)?;
+    if targets.len() > MAX_SYNC_SENDER_KEY_RECIPIENTS {
+        client.mark_sender_key_distribution_failed(conversation_id);
+        return Err(format!(
+            "sender-key fanout exceeds {MAX_SYNC_SENDER_KEY_RECIPIENTS} exact devices"
+        ));
+    }
+    if targets.is_empty() {
+        // A one-device conversation needs no transport round trip, but still
+        // requires a validated roster and a device-owned outgoing generation.
+        client.mark_sender_key_distributed(conversation_id)?;
+        return Ok(0);
+    }
     let should_distribute = match preparation {
         SenderKeyDistributionPreparation::ReusePendingGeneration => {
             client.begin_sender_key_distribution(conversation_id)?
@@ -4414,16 +6093,16 @@ fn distribute_pinned_sender_key(
         return Ok(0);
     }
 
-    let our_ik = client.identity_key()?;
     let mut seen = std::collections::HashSet::new();
     let mut sent = 0u32;
     let started = Instant::now();
     client.buffer_connection_events_during_sync();
-    for (label, peer_ik) in recipients {
-        if peer_ik == our_ik || !seen.insert(peer_ik) {
-            continue;
+    for target in targets {
+        if !seen.insert(target.device_id) {
+            client.mark_sender_key_distribution_failed(conversation_id);
+            return Err("validated device roster repeated an exact fanout target".to_string());
         }
-        if !client.is_currently_authorized_sender(conversation_id, &peer_ik) {
+        if !client.is_currently_authorized_sender(conversation_id, &target.account_identity_key) {
             client.mark_sender_key_distribution_failed(conversation_id);
             return Err("refusing to distribute a sender key outside the current roster".into());
         }
@@ -4435,10 +6114,13 @@ fn distribute_pinned_sender_key(
         }
         if let Err(error) = state
             .runtime
-            .block_on(client.send_sender_key_to(conversation_id, &peer_ik))
+            .block_on(client.send_sender_key_to_device(&target))
         {
             client.mark_sender_key_distribution_failed(conversation_id);
-            return Err(format!("sender-key delivery to {label} failed: {error}"));
+            return Err(format!(
+                "sender-key delivery to device {} failed: {error}",
+                hex::encode(target.device_id)
+            ));
         }
         sent += 1;
         if sent.is_multiple_of(128) {
@@ -4466,20 +6148,33 @@ fn distribute_sender_key(
         &server_http_url,
         &user_id,
         &conversation_id,
-    )?;
-    let mut recipients = Vec::new();
-    for member in &members {
-        let hex_key = member
-            .get("identity_key")
-            .and_then(serde_json::Value::as_str)
-            .ok_or("authorized directory member is missing identity_key")?;
-        let peer_ik = decode_lower_hex_32("authorized member identity_key", hex_key)?;
-        recipients.push((hex_key.to_string(), peer_ik));
+    );
+    let members = match members {
+        Ok(members) => members,
+        Err(error) => {
+            state
+                .client
+                .lock()
+                .map_err(|lock_error| lock_error.to_string())?
+                .invalidate_device_roster_v1(&conversation_id);
+            return Err(error);
+        }
+    };
+    let account_directory = pinned_account_directory_from_json(&members)?;
+    if let Some(reason) = fetch_and_install_authenticated_device_directory(
+        &state,
+        &server_http_url,
+        &user_id,
+        &conversation_id,
+        &account_directory,
+    )? {
+        return Err(format!(
+            "conversation exact-device roster is not ready: {reason}"
+        ));
     }
     distribute_pinned_sender_key(
         &state,
         &conversation_id,
-        recipients,
         SenderKeyDistributionPreparation::ReusePendingGeneration,
     )
 }
@@ -4757,6 +6452,7 @@ pub fn run() {
                 pin_configured: AtomicBool::new(pin_configured),
                 event_poller_started: AtomicBool::new(false),
                 offline_sync_ready: AtomicBool::new(false),
+                unavailable_conversations: Mutex::new(std::collections::HashMap::new()),
                 lock_event_pending: AtomicBool::new(false),
                 pin_throttle: Mutex::new(PinThrottle::default()),
                 runtime: tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
@@ -4905,6 +6601,7 @@ pub fn run() {
             set_auto_lock_seconds,
             init_from_seed,
             get_conversations,
+            get_conversation_crypto_diagnostics,
             get_messages,
             upload_prekeys,
             establish_session,
@@ -4986,11 +6683,14 @@ pub fn run() {
 #[cfg(test)]
 mod e2ee_rest_tests {
     use super::{
-        consume_pending_lock_event, offline_sync_url, parse_prekey_bundle,
+        consume_pending_lock_event, offline_sync_url, parse_device_directory,
+        parse_message_crypto_context, parse_prekey_bundle, preserve_created_group_outcome,
         publish_unlocked_session, resolve_auto_lock_seconds, rest_api_url, rest_authority,
         rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
-        valid_unlock_pin, validate_next_cursor, validate_rest_url, validate_server_endpoint_pair,
-        DEFAULT_AUTO_LOCK_SECONDS,
+        valid_unlock_pin, validate_live_message_security_context, validate_next_cursor,
+        validate_rest_url, validate_server_endpoint_pair, validate_utc_rfc3339_nano,
+        verify_device_directory_account_keys, ConversationSyncIsolation,
+        ParsedMessageCryptoContext, PinnedDirectoryMember, DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
 
@@ -5219,5 +6919,301 @@ mod e2ee_rest_tests {
         assert!(validate_next_cursor(None, Some("next"), 0).is_err());
         assert!(validate_next_cursor(Some("old"), Some("next"), 1).is_ok());
         assert!(validate_next_cursor(Some("last"), None, 0).is_ok());
+    }
+
+    #[test]
+    fn conversation_failure_isolated_without_blocking_unrelated_dm_or_group() {
+        let blocked = "00000000-0000-0000-0000-000000000101";
+        let ready_group = "00000000-0000-0000-0000-000000000102";
+        let ready_dm = "00000000-0000-0000-0000-000000000103";
+        let mut isolation = ConversationSyncIsolation::default();
+        isolation.block(
+            blocked,
+            "retained_sender_key_rejected",
+            "generation 7 is unavailable\nretry safely",
+        );
+        // A later stage never hides the first actionable root cause.
+        isolation.block(blocked, "message_history_unavailable", "secondary failure");
+
+        let syncable: Vec<_> = [blocked, ready_group, ready_dm]
+            .into_iter()
+            .filter(|conversation_id| !isolation.is_blocked(conversation_id))
+            .collect();
+        assert_eq!(syncable, vec![ready_group, ready_dm]);
+
+        let diagnostics = isolation.into_diagnostics();
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].conversation_id, blocked);
+        assert_eq!(diagnostics[0].code, "retained_sender_key_rejected");
+        assert_eq!(
+            diagnostics[0].detail,
+            "generation 7 is unavailable retry safely"
+        );
+    }
+
+    #[test]
+    fn post_create_crypto_failure_preserves_group_id_and_becomes_diagnostic() {
+        let conversation_id = "00000000-0000-0000-0000-000000000104".to_string();
+        let (returned_id, diagnostic) = preserve_created_group_outcome(
+            conversation_id.clone(),
+            Err("exact-device roster is not ready".to_string()),
+        );
+        assert_eq!(returned_id, conversation_id);
+        let diagnostic = diagnostic.expect("post-create failure must be visible");
+        assert_eq!(diagnostic.conversation_id, returned_id);
+        assert_eq!(diagnostic.code, "group_crypto_setup_pending");
+
+        let (returned_id, diagnostic) = preserve_created_group_outcome(returned_id.clone(), Ok(()));
+        assert_eq!(returned_id, conversation_id);
+        assert!(diagnostic.is_none());
+    }
+
+    fn ready_device_directory_fixture() -> serde_json::Value {
+        let b64 = base64::engine::general_purpose::STANDARD;
+        serde_json::json!({
+            "conversation_id": "00000000-0000-0000-0000-000000000010",
+            "roster_version": "7",
+            "roster_commitment": "abababababababababababababababababababababababababababababababab",
+            "ready": true,
+            "required_capabilities": "3",
+            "member_user_ids": [
+                "00000000-0000-0000-0000-000000000001",
+                "00000000-0000-0000-0000-000000000002"
+            ],
+            "devices": [
+                {
+                    "user_id": "00000000-0000-0000-0000-000000000001",
+                    "username": "alice",
+                    "account_identity_key": b64.encode([0x11; 32]),
+                    "account_signing_key": b64.encode([0x12; 32]),
+                    "device_id": "10101010101010101010101010101010",
+                    "device_name": "alice desktop",
+                    "binding": {
+                        "device_id": "10101010101010101010101010101010",
+                        "device_identity_key": b64.encode([0x13; 32]),
+                        "device_signing_key": b64.encode([0x14; 32]),
+                        "version": "1",
+                        "capabilities": "3",
+                        "status": 1,
+                        "account_signature": b64.encode([0x15; 64]),
+                        "created_at": "2026-07-11T18:00:00.123456789Z"
+                    },
+                    "status": 1,
+                    "eligible": true
+                },
+                {
+                    "user_id": "00000000-0000-0000-0000-000000000002",
+                    "username": "bob",
+                    "account_identity_key": b64.encode([0x21; 32]),
+                    "account_signing_key": b64.encode([0x22; 32]),
+                    "device_id": "20202020202020202020202020202020",
+                    "device_name": "bob phone",
+                    "binding": {
+                        "device_id": "20202020202020202020202020202020",
+                        "device_identity_key": b64.encode([0x23; 32]),
+                        "device_signing_key": b64.encode([0x24; 32]),
+                        "version": "9223372036854775807",
+                        "capabilities": "3",
+                        "status": 1,
+                        "account_signature": b64.encode([0x25; 64]),
+                        "created_at": "2026-07-11T18:00:00Z"
+                    },
+                    "status": 1,
+                    "eligible": true
+                }
+            ]
+        })
+    }
+
+    #[test]
+    fn device_directory_parser_produces_bounded_canonical_crypto_input() {
+        let parsed = parse_device_directory(
+            ready_device_directory_fixture(),
+            "00000000-0000-0000-0000-000000000010",
+        )
+        .unwrap();
+        assert!(parsed.ready);
+        assert_eq!(parsed.roster_version, 7);
+        assert_eq!(parsed.required_capabilities, 3);
+        assert_eq!(parsed.roster_commitment, [0xab; 32]);
+        assert_eq!(parsed.member_user_ids.len(), 2);
+        assert_eq!(parsed.devices.len(), 2);
+        assert_eq!(parsed.devices[0].device_id, [0x10; 16]);
+        assert_eq!(
+            parsed.devices[1].binding.as_ref().unwrap().version,
+            i64::MAX as u64
+        );
+        let candidate: veil_client::api::DeviceRosterCandidateV1 = parsed.into();
+        assert_eq!(candidate.devices[0].binding.as_ref().unwrap().status, 1);
+        assert_eq!(candidate.devices[1].user_id[15], 2);
+    }
+
+    #[test]
+    fn device_directory_cannot_substitute_the_pinned_account_directory() {
+        let roster = parse_device_directory(
+            ready_device_directory_fixture(),
+            "00000000-0000-0000-0000-000000000010",
+        )
+        .unwrap();
+        let mut accounts = std::collections::HashMap::new();
+        accounts.insert(
+            "00000000-0000-0000-0000-000000000001".to_string(),
+            PinnedDirectoryMember {
+                username: "alice".to_string(),
+                identity_key: [0x11; 32],
+                signing_key: [0x12; 32],
+            },
+        );
+        accounts.insert(
+            "00000000-0000-0000-0000-000000000002".to_string(),
+            PinnedDirectoryMember {
+                username: "bob".to_string(),
+                identity_key: [0x21; 32],
+                signing_key: [0x22; 32],
+            },
+        );
+        verify_device_directory_account_keys(&roster, &accounts).unwrap();
+        accounts
+            .get_mut("00000000-0000-0000-0000-000000000002")
+            .unwrap()
+            .signing_key = [0x42; 32];
+        assert!(verify_device_directory_account_keys(&roster, &accounts).is_err());
+    }
+
+    #[test]
+    fn device_directory_parser_rejects_noncanonical_numbers_and_encodings() {
+        let conversation_id = "00000000-0000-0000-0000-000000000010";
+        for invalid_version in ["0", "01", "9223372036854775808", "+7"] {
+            let mut fixture = ready_device_directory_fixture();
+            fixture["roster_version"] = serde_json::json!(invalid_version);
+            assert!(parse_device_directory(fixture, conversation_id).is_err());
+        }
+
+        let mut numeric_version = ready_device_directory_fixture();
+        numeric_version["roster_version"] = serde_json::json!(7);
+        assert!(parse_device_directory(numeric_version, conversation_id).is_err());
+
+        let mut uppercase_hex = ready_device_directory_fixture();
+        uppercase_hex["roster_commitment"] =
+            serde_json::json!("ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB");
+        assert!(parse_device_directory(uppercase_hex, conversation_id).is_err());
+
+        let mut unpadded_base64 = ready_device_directory_fixture();
+        let encoded = unpadded_base64["devices"][0]["account_identity_key"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches('=')
+            .to_string();
+        unpadded_base64["devices"][0]["account_identity_key"] = serde_json::json!(encoded);
+        assert!(parse_device_directory(unpadded_base64, conversation_id).is_err());
+    }
+
+    #[test]
+    fn device_directory_parser_rejects_ambiguous_or_inconsistent_rosters() {
+        let conversation_id = "00000000-0000-0000-0000-000000000010";
+
+        let mut unknown_field = ready_device_directory_fixture();
+        unknown_field["downgrade_allowed"] = serde_json::json!(true);
+        assert!(parse_device_directory(unknown_field, conversation_id).is_err());
+
+        let mut wrong_conversation = ready_device_directory_fixture();
+        wrong_conversation["conversation_id"] =
+            serde_json::json!("00000000-0000-0000-0000-000000000011");
+        assert!(parse_device_directory(wrong_conversation, conversation_id).is_err());
+
+        let mut inconsistent_ready = ready_device_directory_fixture();
+        inconsistent_ready["ready"] = serde_json::json!(false);
+        inconsistent_ready["reason"] = serde_json::json!("legacy_unbound_device");
+        assert!(parse_device_directory(inconsistent_ready, conversation_id).is_err());
+
+        let mut false_eligibility = ready_device_directory_fixture();
+        false_eligibility["devices"][0]["eligible"] = serde_json::json!(false);
+        false_eligibility["devices"][0]["exclusion_reason"] =
+            serde_json::json!("missing_required_capabilities");
+        assert!(parse_device_directory(false_eligibility, conversation_id).is_err());
+
+        let mut binding_substitution = ready_device_directory_fixture();
+        binding_substitution["devices"][0]["binding"]["device_id"] =
+            serde_json::json!("30303030303030303030303030303030");
+        assert!(parse_device_directory(binding_substitution, conversation_id).is_err());
+
+        let mut repeated_device = ready_device_directory_fixture();
+        repeated_device["devices"][1]["device_id"] =
+            serde_json::json!("10101010101010101010101010101010");
+        repeated_device["devices"][1]["binding"]["device_id"] =
+            serde_json::json!("10101010101010101010101010101010");
+        assert!(parse_device_directory(repeated_device, conversation_id).is_err());
+    }
+
+    #[test]
+    fn persisted_message_crypto_context_is_strictly_all_or_none() {
+        assert_eq!(
+            parse_message_crypto_context("legacy_unknown", None, None, None, None, None).unwrap(),
+            ParsedMessageCryptoContext::LegacyUnknown
+        );
+        assert!(
+            parse_message_crypto_context("legacy_unknown", Some("1"), None, None, None, None,)
+                .is_err()
+        );
+        assert!(
+            parse_message_crypto_context("sender_key_v5", None, None, None, None, None).is_err()
+        );
+        assert!(parse_message_crypto_context("unknown", None, None, None, None, None).is_err());
+
+        let parsed = parse_message_crypto_context(
+            "sender_key_v5",
+            Some("1"),
+            Some("7"),
+            Some("abababababababababababababababababababababababababababababababab"),
+            Some("10101010101010101010101010101010"),
+            Some("9"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed,
+            ParsedMessageCryptoContext::SenderKeyV5 {
+                roster_version: 7,
+                roster_commitment: [0xab; 32],
+                sender_device_id: [0x10; 16],
+                sender_binding_version: 9,
+            }
+        );
+    }
+
+    #[test]
+    fn live_message_mode_never_accepts_a_missing_or_cross_protocol_context() {
+        use veil_client::api::{MessageSecurityContextV1, SenderKeyMessageSecurityContextV1};
+
+        let sender_key = MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+            roster_version: 7,
+            roster_commitment: [0xab; 32],
+            sender_device_id: [0x10; 16],
+            target_device_id: [0x20; 16],
+            sender_binding_version: 9,
+        });
+        validate_live_message_security_context(false, None).unwrap();
+        validate_live_message_security_context(true, Some(&sender_key)).unwrap();
+        assert!(validate_live_message_security_context(true, None).is_err());
+        assert!(validate_live_message_security_context(false, Some(&sender_key)).is_err());
+    }
+
+    #[test]
+    fn signed_directory_timestamp_accepts_only_canonical_go_rfc3339_nano() {
+        for valid in [
+            "2026-07-11T18:00:00Z",
+            "2024-02-29T23:59:59.1Z",
+            "2026-07-11T18:00:00.123456789Z",
+        ] {
+            validate_utc_rfc3339_nano("created_at", valid).unwrap();
+        }
+        for invalid in [
+            "2026-02-29T18:00:00Z",
+            "2026-04-31T18:00:00Z",
+            "2026-07-11T18:00:00.10Z",
+            "2026-07-11T18:00:00+00:00",
+            "2026-07-11t18:00:00Z",
+        ] {
+            assert!(validate_utc_rfc3339_nano("created_at", invalid).is_err());
+        }
     }
 }

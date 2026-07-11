@@ -11,6 +11,7 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/publicerr"
 	"github.com/google/uuid"
 )
 
@@ -123,7 +124,7 @@ func (h *Handler) CreateServer(w http.ResponseWriter, r *http.Request) {
 	}
 	srv, err := h.svc.CreateServer(r.Context(), req.Name, uid)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, serverDTO(srv))
@@ -136,7 +137,7 @@ func (h *Handler) ListServers(w http.ResponseWriter, r *http.Request) {
 	}
 	srvs, err := h.svc.ListUserServers(r.Context(), uid)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, errResp(err.Error()))
+		publicerr.Write(w, http.StatusInternalServerError, err)
 		return
 	}
 	out := make([]serverJSON, len(srvs))
@@ -153,7 +154,7 @@ func (h *Handler) GetServer(w http.ResponseWriter, r *http.Request) {
 	}
 	srv, err := h.svc.GetServer(r.Context(), r.PathValue("serverID"), uid)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, serverDTO(srv))
@@ -177,7 +178,7 @@ func (h *Handler) UpdateServer(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := h.svc.UpdateServer(r.Context(), r.PathValue("serverID"), uid, req.Name, req.Description, req.IconURL); err != nil {
 		status := http.StatusForbidden
-		writeJSON(w, status, errResp(err.Error()))
+		publicerr.Write(w, status, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -189,7 +190,7 @@ func (h *Handler) DeleteServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.DeleteServer(r.Context(), r.PathValue("serverID"), uid); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -201,7 +202,7 @@ func (h *Handler) LeaveServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.LeaveServer(r.Context(), r.PathValue("serverID"), uid); err != nil {
-		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "left"})
@@ -226,7 +227,7 @@ func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
 	}
 	members, err := h.svc.ListMembers(r.Context(), r.PathValue("serverID"), uid)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	out := make([]memberJSON, len(members))
@@ -260,15 +261,19 @@ func (h *Handler) KickMember(w http.ResponseWriter, r *http.Request) {
 	}
 	reason, err := normalizeKickReason(req.Reason)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_kick_reason", "invalid kick reason", err,
+		))
 		return
 	}
 	if err := h.svc.KickMember(r.Context(), r.PathValue("serverID"), uid, r.PathValue("userID"), reason); err != nil {
 		if errors.Is(err, ErrInvalidKickReason) {
-			writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_kick_reason", "invalid kick reason", err,
+			))
 			return
 		}
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "kicked"})
@@ -297,7 +302,7 @@ func (h *Handler) ListChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	chans, err := h.svc.ListChannels(r.Context(), r.PathValue("serverID"), uid)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	out := make([]channelJSON, len(chans))
@@ -331,7 +336,7 @@ func (h *Handler) CreateChannel(w http.ResponseWriter, r *http.Request) {
 	}
 	ch, err := h.svc.CreateChannel(r.Context(), r.PathValue("serverID"), uid, req.Name, req.ChannelType, req.CategoryID, req.Topic)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, channelJSON{
@@ -360,7 +365,7 @@ func (h *Handler) UpdateChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.UpdateChannel(r.Context(), r.PathValue("channelID"), uid, req.Name, req.Topic, req.NSFW, req.SlowmodeSecs); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -372,7 +377,7 @@ func (h *Handler) DeleteChannel(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.DeleteChannel(r.Context(), r.PathValue("channelID"), uid); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -392,7 +397,7 @@ func (h *Handler) ListChannelOverwrites(w http.ResponseWriter, r *http.Request) 
 	}
 	overwrites, err := h.svc.ListChannelOverwrites(r.Context(), r.PathValue("channelID"), uid)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	result := make([]channelOverwriteJSON, 0, len(overwrites))
@@ -426,12 +431,14 @@ func (h *Handler) UpsertChannelOverwrite(w http.ResponseWriter, r *http.Request)
 	})
 	if err != nil {
 		status := http.StatusForbidden
-		message := err.Error()
+		mapped := err
 		if errors.Is(err, db.ErrInvalidChannelOverwrite) {
 			status = http.StatusBadRequest
-			message = "invalid channel permission overwrite"
+			mapped = publicerr.New(
+				status, "invalid_channel_overwrite", "invalid channel permission overwrite", err,
+			)
 		}
-		writeJSON(w, status, errResp(message))
+		publicerr.Write(w, status, mapped)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -456,10 +463,14 @@ func (h *Handler) DeleteChannelOverwrite(w http.ResponseWriter, r *http.Request)
 		r.Context(), r.PathValue("channelID"), uid, targetID.String(), int16(targetType),
 	); err != nil {
 		status := http.StatusForbidden
+		mapped := err
 		if errors.Is(err, db.ErrInvalidChannelOverwrite) {
 			status = http.StatusBadRequest
+			mapped = publicerr.New(
+				status, "invalid_channel_overwrite", "invalid channel permission overwrite", err,
+			)
 		}
-		writeJSON(w, status, errResp(err.Error()))
+		publicerr.Write(w, status, mapped)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -497,7 +508,7 @@ func (h *Handler) ReorderChannels(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 	if err := h.svc.ReorderChannels(r.Context(), r.PathValue("serverID"), uid, items); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reordered"})
@@ -524,7 +535,7 @@ func (h *Handler) ListRoles(w http.ResponseWriter, r *http.Request) {
 	}
 	roles, err := h.svc.ListRoles(r.Context(), r.PathValue("serverID"), uid)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	out := make([]roleJSON, len(roles))
@@ -556,7 +567,7 @@ func (h *Handler) CreateRole(w http.ResponseWriter, r *http.Request) {
 	}
 	role, err := h.svc.CreateRole(r.Context(), r.PathValue("serverID"), uid, req.Name, req.Permissions, req.Color)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusCreated, roleJSON{
@@ -583,7 +594,7 @@ func (h *Handler) UpdateRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.UpdateRole(r.Context(), r.PathValue("serverID"), r.PathValue("roleID"), uid, req.Name, req.Permissions, req.Color); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "updated"})
@@ -595,7 +606,7 @@ func (h *Handler) DeleteRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.DeleteRole(r.Context(), r.PathValue("serverID"), r.PathValue("roleID"), uid); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
@@ -607,7 +618,7 @@ func (h *Handler) AssignRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.AssignRole(r.Context(), r.PathValue("serverID"), uid, r.PathValue("userID"), r.PathValue("roleID")); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "assigned"})
@@ -619,7 +630,7 @@ func (h *Handler) UnassignRole(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.UnassignRole(r.Context(), r.PathValue("serverID"), uid, r.PathValue("userID"), r.PathValue("roleID")); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "unassigned"})
@@ -653,16 +664,20 @@ func (h *Handler) CreateInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := validateInviteInput(req.MaxUses, req.ExpiresInSecs); err != nil {
-		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_invite_limits", "invalid invite limits", err,
+		))
 		return
 	}
 	inv, err := h.svc.CreateInvite(r.Context(), r.PathValue("serverID"), uid, req.MaxUses, req.ExpiresInSecs)
 	if err != nil {
 		if errors.Is(err, ErrInvalidInviteInput) {
-			writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_invite_limits", "invalid invite limits", err,
+			))
 			return
 		}
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	out := inviteJSON{
@@ -701,7 +716,7 @@ func (h *Handler) ListInvites(w http.ResponseWriter, r *http.Request) {
 	}
 	invs, err := h.svc.ListInvites(r.Context(), r.PathValue("serverID"), uid)
 	if err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	out := make([]inviteJSON, len(invs))
@@ -725,7 +740,7 @@ func (h *Handler) RevokeInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.svc.RevokeInvite(r.Context(), r.PathValue("code"), uid); err != nil {
-		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
+		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
@@ -734,7 +749,7 @@ func (h *Handler) RevokeInvite(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) PreviewInvite(w http.ResponseWriter, r *http.Request) {
 	srv, inv, err := h.svc.PreviewInvite(r.Context(), r.PathValue("code"))
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, errResp(err.Error()))
+		publicerr.Write(w, http.StatusNotFound, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -754,7 +769,7 @@ func (h *Handler) UseInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	srv, err := h.svc.UseInvite(r.Context(), r.PathValue("code"), uid)
 	if err != nil {
-		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+		publicerr.Write(w, http.StatusBadRequest, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, serverDTO(srv))

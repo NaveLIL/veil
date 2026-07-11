@@ -1,7 +1,9 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
+use subtle::ConstantTimeEq;
 use veil_crypto::fingerprint;
 use veil_crypto::kdf;
 use veil_crypto::keys::{generate_mnemonic, validate_mnemonic, IdentityKeyPair};
@@ -9,13 +11,19 @@ use veil_crypto::ratchet::{MessageHeader, RatchetSession};
 use veil_crypto::sender_key::{SenderKeyDistribution, SenderKeyStore};
 use veil_crypto::x3dh;
 use veil_search::Indexer;
-use veil_store::db::{LocalPreKey, VeilDb};
+use veil_store::db::{
+    DeviceBindingPinV1, DeviceRosterSnapshotV1, HistoricalDeviceBindingProofV1,
+    IncomingSenderKeyRouteV1, LocalPreKey, PendingSenderKeyDeviceEnvelopeV1, VeilDb,
+};
 use veil_store::models::{RemoteMessageStateKind, RemoteReaction};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::connection::{ConfirmedMutation, Connection, ConnectionConfig, ConnectionEvent};
-use crate::device_identity::DeviceIdentityV1;
+use crate::device_identity::{
+    device_binding_signing_bytes, DeviceIdentityV1, DEVICE_BINDING_STATUS_ACTIVE,
+    REQUIRED_DEVICE_CAPABILITIES,
+};
 use crate::protocol::proto;
 
 // Wire header type tags
@@ -28,6 +36,7 @@ const INNER_TEXT: u8 = 0x00; // UTF-8 text message
 const INNER_SKDM: u8 = 0x01; // Sender Key Distribution Message (JSON)
 const RATCHET_AD_DOMAIN: &[u8] = b"veil-ratchet-message-v1";
 const MAX_PLAINTEXT_BYTES: usize = 32 * 1024;
+const DEVICE_ROSTER_COMMITMENT_DOMAIN: &[u8] = b"veil-conversation-device-roster-v1\0";
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct PendingInitialHeader {
@@ -50,14 +59,15 @@ impl Drop for PendingOutgoingMessage {
     }
 }
 
-/// Exact routing scope of one sealed Sender-Key distribution. The current
-/// protocol seals to a user's identity key; once independent device identities
-/// land, the target device binding must become part of this key as well.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PendingSenderKeyEnvelopeKey {
     conversation_id: String,
     generation: u32,
-    target_identity_key: [u8; 32],
+    target_device_id: [u8; 16],
+    target_binding_version: u64,
+    roster_version: u64,
+    roster_commitment: [u8; 32],
+    envelope_commitment: [u8; 32],
 }
 
 struct ReceiveCryptoSnapshot {
@@ -119,23 +129,6 @@ fn random_device_id() -> [u8; 16] {
     }
 }
 
-fn split_retained_sender_key_prefix(
-    queued: Vec<ConnectionEvent>,
-) -> (Vec<ConnectionEvent>, VecDeque<ConnectionEvent>) {
-    let mut retained = Vec::new();
-    let mut deferred = VecDeque::new();
-    let mut reached_live_fifo = false;
-    for event in queued {
-        if !reached_live_fifo && matches!(event, ConnectionEvent::SenderKeyDist { .. }) {
-            retained.push(event);
-        } else {
-            reached_live_fifo = true;
-            deferred.push_back(event);
-        }
-    }
-    (retained, deferred)
-}
-
 /// Result of decrypting an incoming message.
 #[derive(Debug)]
 pub enum DecryptedPayload {
@@ -174,12 +167,145 @@ pub enum RemoteReconcileAction {
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OfflineSenderKeyRefresh {
-    /// No cold-restored outgoing generation was rotated. Offline sync must
-    /// create one fresh generation before distributing it to the live roster.
+    /// No fresh outgoing generation is prepared in this native session.
+    /// Offline sync must create one before distributing to the live roster.
     Required,
-    /// A persisted outgoing generation was restored and immediately rotated.
-    /// Distribution must reuse that fresh, still-pending generation.
+    /// A persisted outgoing generation was restored and immediately rotated,
+    /// or another native caller already prepared the same still-pending
+    /// refresh. Distribution must reuse that exact generation.
     AlreadyRotated,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceBindingCandidateV1 {
+    pub device_id: [u8; 16],
+    pub device_identity_key: [u8; 32],
+    pub device_signing_key: [u8; 32],
+    pub version: u64,
+    pub capabilities: u64,
+    pub status: u8,
+    pub account_signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRosterEntryV1 {
+    pub user_id: [u8; 16],
+    pub account_identity_key: [u8; 32],
+    pub account_signing_key: [u8; 32],
+    pub device_id: [u8; 16],
+    pub binding: Option<DeviceBindingCandidateV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceRosterCandidateV1 {
+    pub conversation_id: String,
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub required_capabilities: u64,
+    pub ready: bool,
+    pub member_user_ids: Vec<[u8; 16]>,
+    pub devices: Vec<DeviceRosterEntryV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceTargetV1 {
+    pub conversation_id: String,
+    pub user_id: [u8; 16],
+    pub account_identity_key: [u8; 32],
+    pub account_signing_key: [u8; 32],
+    pub device_id: [u8; 16],
+    pub device_identity_key: [u8; 32],
+    pub device_signing_key: [u8; 32],
+    pub binding_version: u64,
+    pub capabilities: u64,
+    pub account_signature: [u8; 64],
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderKeyMessageSecurityContextV1 {
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub sender_device_id: [u8; 16],
+    pub target_device_id: [u8; 16],
+    pub sender_binding_version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageSecurityContextV1 {
+    SenderKeyV5(SenderKeyMessageSecurityContextV1),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SenderKeyRouteV1 {
+    pub conversation_id: String,
+    pub generation: u32,
+    pub target_account_identity_key: [u8; 32],
+    pub target_device_id: [u8; 16],
+    pub target_device_identity_key: [u8; 32],
+    pub sender_device_id: [u8; 16],
+    pub sender_account_identity_key: [u8; 32],
+    pub sender_account_signing_key: [u8; 32],
+    pub sender_device_identity_key: [u8; 32],
+    pub sender_device_signing_key: [u8; 32],
+    pub sender_device_capabilities: u64,
+    pub sender_device_binding_status: u8,
+    pub sender_account_signature: [u8; 64],
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub sender_binding_version: u64,
+    pub target_binding_version: u64,
+    pub envelope_commitment: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PendingSenderKeyReceiptV1 {
+    pub conversation_id: String,
+    pub owner_device_id: [u8; 16],
+    pub target_device_id: [u8; 16],
+    pub generation: u32,
+    pub roster_version: u64,
+    pub envelope_commitment: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedSenderKeyDiagnosticV1 {
+    pub conversation_id: String,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RetainedSenderKeyProcessReportV1 {
+    pub processed: usize,
+    pub diagnostics: Vec<RetainedSenderKeyDiagnosticV1>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderKeyDistributionModeV1 {
+    Live,
+    /// Pre-auth replay may carry a former sender absent from the current
+    /// roster. A first observation is deliberately service-mediated TOFU,
+    /// never a "Verified identity" claim: the account/device chain is pinned
+    /// atomically so later substitution fails closed, while Phase 4D
+    /// out-of-band verification remains the user-authentication boundary.
+    Retained,
+}
+
+#[derive(Clone)]
+struct ValidatedDeviceRosterV1 {
+    version: u64,
+    commitment: [u8; 32],
+    required_capabilities: u64,
+    authorized_account_identities: HashSet<[u8; 32]>,
+    targets: Vec<DeviceTargetV1>,
+    eligible_devices: HashMap<[u8; 16], DeviceTargetV1>,
+}
+
+struct PreparedDeviceRosterV1 {
+    validated: ValidatedDeviceRosterV1,
+    bindings: Vec<DeviceBindingPinV1>,
+    canonical_snapshot: Vec<u8>,
 }
 
 /// Prekey set generated for uploading to the server.
@@ -239,14 +365,33 @@ pub struct VeilClient {
     /// permission-filtered conversation directory. Historical sync has a
     /// separate path so former members can never inject fresh live ciphertext.
     authorized_conversation_senders: HashMap<String, HashSet<[u8; 32]>>,
+    /// Authenticated, locally pinned per-device directory for each encrypted
+    /// conversation. This is deliberately process-local: every connection
+    /// epoch must obtain a fresh HTTPS directory while SQLCipher retains only
+    /// the monotonic rollback/key-replacement pins.
+    device_rosters: HashMap<String, ValidatedDeviceRosterV1>,
+    last_invalidated_device_rosters: HashMap<String, (u64, [u8; 32])>,
+    /// A roster was durably accepted but rotating the previous outgoing
+    /// generation has not yet succeeded. Keeping this distinct from ordinary
+    /// fan-out state makes an install retry rotate exactly once.
+    device_roster_rotation_pending: HashSet<String>,
     /// Channels whose fresh outgoing key has not yet been delivered to the
     /// complete current member set. Sending remains blocked while present.
     sender_key_distribution_pending: HashSet<String>,
+    /// Conversations for which the current in-memory outgoing generation was
+    /// freshly created for the still-pending distribution gate. This separates
+    /// an immutable retry from a security invalidation that still needs a
+    /// rotation, and keeps cold-restore orchestration idempotent even when an
+    /// earlier hydration result was discarded by another native caller.
+    prepared_sender_key_generations: HashSet<String>,
     pending_sender_key_sequences: HashMap<u64, PendingSenderKeyEnvelopeKey>,
     /// Process-local mirror of the SQLCipher exact-retry cache. Rows are
     /// written durably before the first network send and survive transport
     /// loss; this map also gives no-database test/embedded clients safe retry.
     pending_sender_key_envelopes: HashMap<PendingSenderKeyEnvelopeKey, Vec<u8>>,
+    pending_sender_key_receipts: VecDeque<PendingSenderKeyReceiptV1>,
+    pending_sender_key_receipt_set: HashSet<PendingSenderKeyReceiptV1>,
+    pending_sender_key_receipt_sequences: HashMap<u64, PendingSenderKeyReceiptV1>,
     failed_sender_key_distributions: HashSet<String>,
     /// Optional local-only full-text index. Index calls are best-effort and never fatal.
     indexer: Option<Arc<Indexer>>,
@@ -309,9 +454,16 @@ impl VeilClient {
             sender_keys: SenderKeyStore::new(),
             channel_conversations: HashSet::new(),
             authorized_conversation_senders: HashMap::new(),
+            device_rosters: HashMap::new(),
+            last_invalidated_device_rosters: HashMap::new(),
+            device_roster_rotation_pending: HashSet::new(),
             sender_key_distribution_pending: HashSet::new(),
+            prepared_sender_key_generations: HashSet::new(),
             pending_sender_key_sequences: HashMap::new(),
             pending_sender_key_envelopes: HashMap::new(),
+            pending_sender_key_receipts: VecDeque::new(),
+            pending_sender_key_receipt_set: HashSet::new(),
+            pending_sender_key_receipt_sequences: HashMap::new(),
             failed_sender_key_distributions: HashSet::new(),
             indexer: None,
         }
@@ -343,9 +495,16 @@ impl VeilClient {
             sender_keys: SenderKeyStore::new(),
             channel_conversations: HashSet::new(),
             authorized_conversation_senders: HashMap::new(),
+            device_rosters: HashMap::new(),
+            last_invalidated_device_rosters: HashMap::new(),
+            device_roster_rotation_pending: HashSet::new(),
             sender_key_distribution_pending: HashSet::new(),
+            prepared_sender_key_generations: HashSet::new(),
             pending_sender_key_sequences: HashMap::new(),
             pending_sender_key_envelopes: HashMap::new(),
+            pending_sender_key_receipts: VecDeque::new(),
+            pending_sender_key_receipt_set: HashSet::new(),
+            pending_sender_key_receipt_sequences: HashMap::new(),
             failed_sender_key_distributions: HashSet::new(),
             indexer: None,
         }
@@ -515,6 +674,372 @@ impl VeilClient {
         self.device_id
     }
 
+    fn prepare_device_roster_v1(
+        &self,
+        candidate: &DeviceRosterCandidateV1,
+    ) -> Result<PreparedDeviceRosterV1, String> {
+        const LEGACY_UNBOUND_STATUS: u8 = 4;
+        if !candidate.ready {
+            return Err("device roster is not ready for encrypted traffic".to_string());
+        }
+        if candidate.roster_version == 0 || candidate.roster_version > i64::MAX as u64 {
+            return Err("invalid device roster version".to_string());
+        }
+        if candidate.required_capabilities != REQUIRED_DEVICE_CAPABILITIES {
+            return Err("device roster uses an unsupported capability suite".to_string());
+        }
+        let conversation_uuid = uuid::Uuid::parse_str(&candidate.conversation_id)
+            .map_err(|_| "device roster conversation id is not a UUID".to_string())?;
+        if conversation_uuid.hyphenated().to_string() != candidate.conversation_id {
+            return Err("device roster conversation id is not canonical".to_string());
+        }
+        if candidate.member_user_ids.is_empty() || candidate.member_user_ids.len() > 100_000 {
+            return Err("invalid device roster member count".to_string());
+        }
+        if candidate.devices.len() > 200_000 {
+            return Err("device roster contains too many devices".to_string());
+        }
+
+        let member_set: HashSet<[u8; 16]> = candidate.member_user_ids.iter().copied().collect();
+        if member_set.len() != candidate.member_user_ids.len() || member_set.contains(&[0u8; 16]) {
+            return Err("device roster contains an invalid or duplicate member".to_string());
+        }
+        let mut grouped: BTreeMap<[u8; 16], Vec<&DeviceRosterEntryV1>> = member_set
+            .iter()
+            .copied()
+            .map(|member| (member, Vec::new()))
+            .collect();
+        let mut unique_devices = HashSet::new();
+        let mut account_keys = BTreeMap::new();
+        let mut account_identity_owners = HashMap::new();
+        let mut account_signing_owners = HashMap::new();
+        for entry in &candidate.devices {
+            let devices = grouped
+                .get_mut(&entry.user_id)
+                .ok_or("device roster contains a device for a non-member")?;
+            if entry.device_id == [0u8; 16] || !unique_devices.insert(entry.device_id) {
+                return Err("device roster contains an invalid or duplicate device id".to_string());
+            }
+            if entry.account_identity_key == [0u8; 32] || entry.account_signing_key == [0u8; 32] {
+                return Err("device roster contains an invalid account key".to_string());
+            }
+            if account_identity_owners
+                .insert(entry.account_identity_key, entry.user_id)
+                .is_some_and(|owner| owner != entry.user_id)
+                || account_signing_owners
+                    .insert(entry.account_signing_key, entry.user_id)
+                    .is_some_and(|owner| owner != entry.user_id)
+            {
+                return Err("device roster reuses an account key across members".to_string());
+            }
+            match account_keys.entry(entry.user_id) {
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((entry.account_identity_key, entry.account_signing_key));
+                }
+                std::collections::btree_map::Entry::Occupied(slot)
+                    if slot.get() != &(entry.account_identity_key, entry.account_signing_key) =>
+                {
+                    return Err("device roster changed account keys within one member".to_string());
+                }
+                _ => {}
+            }
+            devices.push(entry);
+        }
+        let mut unique_public_keys = HashSet::new();
+        for (account_identity_key, account_signing_key) in account_keys.values() {
+            if account_identity_key == account_signing_key
+                || !unique_public_keys.insert(*account_identity_key)
+                || !unique_public_keys.insert(*account_signing_key)
+            {
+                return Err("device roster reuses a key across cryptographic domains".to_string());
+            }
+        }
+
+        let mut canonical = Vec::with_capacity(
+            DEVICE_ROSTER_COMMITMENT_DOMAIN.len() + 16 + 8 + 4 + candidate.devices.len() * 193,
+        );
+        canonical.extend_from_slice(DEVICE_ROSTER_COMMITMENT_DOMAIN);
+        canonical.extend_from_slice(conversation_uuid.as_bytes());
+        canonical.extend_from_slice(&candidate.required_capabilities.to_be_bytes());
+        canonical.extend_from_slice(&(grouped.len() as u32).to_be_bytes());
+
+        let mut targets = Vec::new();
+        let mut eligible_devices = HashMap::new();
+        let mut bindings = Vec::new();
+        let mut current_device = None;
+        let local = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is not initialized")?;
+        let local_binding = local.binding();
+        let local_account_identity = self.identity_key()?;
+        let local_account_signing = self.signing_key()?;
+        let local_user_id_text = self.authenticated_user_id.as_deref().ok_or_else(|| {
+            "device roster cannot be installed before authenticated user binding".to_string()
+        })?;
+        let local_user_uuid = uuid::Uuid::parse_str(local_user_id_text)
+            .map_err(|_| "authenticated user id is not a UUID".to_string())?;
+        if local_user_uuid.hyphenated().to_string() != local_user_id_text {
+            return Err("authenticated user id is not canonical".to_string());
+        }
+        let local_user_id = *local_user_uuid.as_bytes();
+
+        for (member_id, devices) in &mut grouped {
+            canonical.extend_from_slice(member_id);
+            devices.sort_by_key(|entry| entry.device_id);
+            canonical.extend_from_slice(&(devices.len() as u32).to_be_bytes());
+            let mut eligible_count = 0usize;
+            for entry in devices.iter() {
+                canonical.extend_from_slice(&entry.device_id);
+                let Some(binding) = entry.binding.as_ref() else {
+                    canonical.push(LEGACY_UNBOUND_STATUS);
+                    canonical.extend_from_slice(&0u64.to_be_bytes());
+                    canonical.extend_from_slice(&0u64.to_be_bytes());
+                    canonical.extend_from_slice(&[0u8; 32]);
+                    canonical.extend_from_slice(&[0u8; 32]);
+                    canonical.extend_from_slice(&[0u8; 64]);
+                    return Err("ready device roster contains a legacy unbound device".to_string());
+                };
+                if binding.device_id != entry.device_id
+                    || binding.version == 0
+                    || binding.version > i64::MAX as u64
+                    || binding.capabilities > i64::MAX as u64
+                    || !(1..=3).contains(&binding.status)
+                    || binding.device_identity_key == [0u8; 32]
+                    || binding.device_signing_key == [0u8; 32]
+                    || binding.device_identity_key == entry.account_identity_key
+                    || binding.device_signing_key == entry.account_signing_key
+                    || !unique_public_keys.insert(binding.device_identity_key)
+                    || !unique_public_keys.insert(binding.device_signing_key)
+                {
+                    return Err("device roster contains an invalid device binding".to_string());
+                }
+                let signing_bytes = device_binding_signing_bytes(
+                    &entry.account_identity_key,
+                    &entry.account_signing_key,
+                    &entry.device_id,
+                    binding.version,
+                    &binding.device_identity_key,
+                    &binding.device_signing_key,
+                    binding.capabilities,
+                    binding.status,
+                );
+                if !veil_crypto::signature::verify(
+                    &entry.account_signing_key,
+                    &signing_bytes,
+                    &binding.account_signature,
+                ) {
+                    return Err("device binding account signature is invalid".to_string());
+                }
+
+                canonical.push(binding.status);
+                canonical.extend_from_slice(&binding.version.to_be_bytes());
+                canonical.extend_from_slice(&binding.capabilities.to_be_bytes());
+                canonical.extend_from_slice(&binding.device_identity_key);
+                canonical.extend_from_slice(&binding.device_signing_key);
+                canonical.extend_from_slice(&binding.account_signature);
+                bindings.push(DeviceBindingPinV1 {
+                    device_id: entry.device_id,
+                    account_identity_key: entry.account_identity_key,
+                    account_signing_key: entry.account_signing_key,
+                    device_identity_key: binding.device_identity_key,
+                    device_signing_key: binding.device_signing_key,
+                    binding_version: binding.version,
+                    capabilities: binding.capabilities,
+                    status: binding.status,
+                    account_signature: binding.account_signature,
+                });
+
+                if binding.status == DEVICE_BINDING_STATUS_ACTIVE {
+                    if binding.capabilities & candidate.required_capabilities
+                        != candidate.required_capabilities
+                    {
+                        return Err(
+                            "ready device roster contains an active device without required capabilities"
+                                .to_string(),
+                        );
+                    }
+                    eligible_count += 1;
+                    let target = DeviceTargetV1 {
+                        conversation_id: candidate.conversation_id.clone(),
+                        user_id: *member_id,
+                        account_identity_key: entry.account_identity_key,
+                        account_signing_key: entry.account_signing_key,
+                        device_id: entry.device_id,
+                        device_identity_key: binding.device_identity_key,
+                        device_signing_key: binding.device_signing_key,
+                        binding_version: binding.version,
+                        capabilities: binding.capabilities,
+                        account_signature: binding.account_signature,
+                        roster_version: candidate.roster_version,
+                        roster_commitment: candidate.roster_commitment,
+                    };
+                    if target.device_id == self.device_id {
+                        if target.device_identity_key != local_binding.device_identity_key
+                            || target.device_signing_key != local_binding.device_signing_key
+                            || target.binding_version != local_binding.version
+                            || target.capabilities != local_binding.capabilities
+                            || target.account_signature != local_binding.account_signature
+                            || target.account_identity_key != local_account_identity
+                            || entry.account_signing_key != local_account_signing
+                            || target.user_id != local_user_id
+                        {
+                            return Err(
+                                "current device roster binding does not match local private identity"
+                                    .to_string(),
+                            );
+                        }
+                        current_device = Some(target.clone());
+                    } else {
+                        targets.push(target.clone());
+                    }
+                    eligible_devices.insert(target.device_id, target);
+                }
+            }
+            if eligible_count == 0 {
+                return Err("ready device roster member has no eligible active device".to_string());
+            }
+        }
+        if account_keys.len() != grouped.len() {
+            return Err("ready device roster member has no device/account binding".to_string());
+        }
+        let _current_device = current_device
+            .ok_or("ready device roster does not contain the current authenticated device")?;
+        let computed: [u8; 32] = Sha256::digest(&canonical).into();
+        if !bool::from(computed.ct_eq(&candidate.roster_commitment)) {
+            return Err("device roster commitment does not match canonical contents".to_string());
+        }
+        targets.sort_by_key(|target| target.device_id);
+        bindings.sort_by_key(|binding| binding.device_id);
+        Ok(PreparedDeviceRosterV1 {
+            validated: ValidatedDeviceRosterV1 {
+                version: candidate.roster_version,
+                commitment: candidate.roster_commitment,
+                required_capabilities: candidate.required_capabilities,
+                authorized_account_identities: candidate
+                    .devices
+                    .iter()
+                    .map(|entry| entry.account_identity_key)
+                    .collect(),
+                targets,
+                eligible_devices,
+            },
+            bindings,
+            canonical_snapshot: canonical,
+        })
+    }
+
+    /// Validate a signed-directory device roster, pin its monotonic history,
+    /// and rotate to a device-owned Sender-Key generation when the snapshot
+    /// changes. Any invalid/not-ready candidate invalidates the old runtime
+    /// proof before returning an error.
+    pub fn install_device_roster_v1(
+        &mut self,
+        candidate: DeviceRosterCandidateV1,
+    ) -> Result<bool, String> {
+        let conversation_id = candidate.conversation_id.clone();
+        let previous = self
+            .device_rosters
+            .get(&conversation_id)
+            .map(|roster| (roster.version, roster.commitment))
+            .or_else(|| {
+                self.last_invalidated_device_rosters
+                    .get(&conversation_id)
+                    .copied()
+            });
+        let fresh_generation_already_prepared = self
+            .prepared_sender_key_generations
+            .contains(&conversation_id);
+        self.invalidate_device_roster_v1(&conversation_id);
+        let prepared = self.prepare_device_roster_v1(&candidate)?;
+        if let Some(db) = self.db.as_ref() {
+            db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: &conversation_id,
+                roster_version: prepared.validated.version,
+                roster_commitment: prepared.validated.commitment,
+                required_capabilities: prepared.validated.required_capabilities,
+                canonical_snapshot: &prepared.canonical_snapshot,
+                bindings: &prepared.bindings,
+            })?;
+        }
+        let changed = previous.is_none_or(|old| {
+            old.0 != prepared.validated.version || old.1 != prepared.validated.commitment
+        });
+        let no_targets = prepared.validated.targets.is_empty();
+        let local_owner = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is not initialized")?
+            .binding()
+            .device_identity_key;
+        let single_device_generation_stale = no_targets
+            && (self.sender_keys.needs_rotation(&conversation_id)
+                || self
+                    .sender_keys
+                    .outgoing_owner_identity_key(&conversation_id)
+                    != Some(local_owner));
+        // A fresh cold-restored generation has never been distributed in this
+        // process and can be bound to the first authenticated roster. Once an
+        // earlier runtime roster is known, however, any changed commitment
+        // must rotate even if an unrelated generation is already pending.
+        let reusable_cold_generation = previous.is_none() && fresh_generation_already_prepared;
+        if (changed
+            || !self.sender_keys.has_outgoing(&conversation_id)
+            || single_device_generation_stale)
+            && (!reusable_cold_generation || single_device_generation_stale)
+        {
+            self.rotate_sender_key(&conversation_id)?;
+        } else {
+            self.device_roster_rotation_pending.remove(&conversation_id);
+        }
+        self.authorized_conversation_senders.insert(
+            conversation_id.clone(),
+            prepared.validated.authorized_account_identities.clone(),
+        );
+        self.device_rosters
+            .insert(conversation_id.clone(), prepared.validated);
+        self.last_invalidated_device_rosters
+            .remove(&conversation_id);
+        if no_targets {
+            self.sender_key_distribution_pending
+                .remove(&conversation_id);
+            self.prepared_sender_key_generations
+                .remove(&conversation_id);
+        }
+        Ok(changed)
+    }
+
+    pub fn invalidate_device_roster_v1(&mut self, conversation_id: &str) {
+        if let Some(roster) = self.device_rosters.remove(conversation_id) {
+            self.last_invalidated_device_rosters.insert(
+                conversation_id.to_string(),
+                (roster.version, roster.commitment),
+            );
+        }
+        self.authorized_conversation_senders.remove(conversation_id);
+        self.device_roster_rotation_pending
+            .insert(conversation_id.to_string());
+        self.sender_key_distribution_pending
+            .insert(conversation_id.to_string());
+    }
+
+    pub fn clear_device_rosters_v1(&mut self) {
+        let conversations: Vec<String> = self.device_rosters.keys().cloned().collect();
+        for conversation_id in conversations {
+            self.invalidate_device_roster_v1(&conversation_id);
+        }
+    }
+
+    pub fn sender_key_device_targets(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Vec<DeviceTargetV1>, String> {
+        self.device_rosters
+            .get(conversation_id)
+            .map(|roster| roster.targets.clone())
+            .ok_or("validated current device roster is unavailable".to_string())
+    }
+
     /// Remember a server user ID to identity-key binding obtained from a signed
     /// directory response. This is deliberately not populated from UI input.
     pub fn remember_user_identity(&mut self, user_id: &str, identity_key: [u8; 32]) {
@@ -621,41 +1146,138 @@ impl VeilClient {
     /// Install retained SKDMs that were authenticated before the WS AuthResult
     /// barrier. Call only after the signed conversation/member directory has
     /// been pinned and before decrypting REST history.
-    pub fn process_retained_sender_keys_before_sync(&mut self) -> Result<usize, String> {
-        let mut queued = Vec::new();
+    pub fn process_retained_sender_keys_before_sync(
+        &mut self,
+    ) -> Result<RetainedSenderKeyProcessReportV1, String> {
+        let mut retained = Vec::new();
+        let mut live = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
-            queued.extend(connection.retained_events.drain(..));
+            retained.extend(connection.retained_events.drain(..));
+            // AuthResult is the protocol barrier. Everything in the live
+            // channel arrived after it and must later pass the exact-current
+            // live route checks, even when SenderKeyDist is the first event.
             while let Ok(event) = connection.events.try_recv() {
-                queued.push(event);
+                live.push(event);
             }
         }
+        self.process_retained_and_defer_live_events_v1(retained, live)
+    }
 
-        let (retained, deferred) = split_retained_sender_key_prefix(queued);
-        self.deferred_connection_events.extend(deferred);
-        let our_identity = self.identity_key()?;
-        let mut processed = 0usize;
+    fn process_retained_and_defer_live_events_v1(
+        &mut self,
+        retained: Vec<ConnectionEvent>,
+        live: Vec<ConnectionEvent>,
+    ) -> Result<RetainedSenderKeyProcessReportV1, String> {
+        self.deferred_connection_events.extend(live);
+        self.process_retained_sender_key_events_v1(retained)
+    }
+
+    fn process_retained_sender_key_events_v1(
+        &mut self,
+        retained: Vec<ConnectionEvent>,
+    ) -> Result<RetainedSenderKeyProcessReportV1, String> {
+        let mut conversation_order = Vec::new();
+        let mut batches: HashMap<String, Vec<(Vec<u8>, SenderKeyRouteV1)>> = HashMap::new();
         for event in retained {
             match event {
                 ConnectionEvent::SenderKeyDist {
-                    conversation_id,
                     sender_key_message,
-                    generation,
-                    target_identity_key,
+                    route,
                 } => {
-                    let target: [u8; 32] =
-                        target_identity_key.try_into().map_err(|target: Vec<u8>| {
-                            format!("retained SKDM target length is {}", target.len())
-                        })?;
-                    if target != our_identity {
-                        return Err("retained SKDM target identity mismatch".to_string());
+                    if !batches.contains_key(&route.conversation_id) {
+                        conversation_order.push(route.conversation_id.clone());
                     }
-                    self.process_sealed_skdm(&sender_key_message, &conversation_id, generation)?;
-                    processed += 1;
+                    batches
+                        .entry(route.conversation_id.clone())
+                        .or_default()
+                        .push((sender_key_message, route));
                 }
                 _ => unreachable!("retained prefix contains only sender-key envelopes"),
             }
         }
-        Ok(processed)
+
+        let mut report = RetainedSenderKeyProcessReportV1::default();
+        for conversation_id in conversation_order {
+            let batch = batches
+                .remove(&conversation_id)
+                .ok_or("retained Sender-Key batch disappeared")?;
+            let sender_keys_before = self.sender_keys.clone();
+            let channel_conversations_before = self.channel_conversations.clone();
+            let trusted_signing_keys_before = self.trusted_signing_keys.clone();
+            let receipts_before = self.pending_sender_key_receipts.clone();
+            let receipt_set_before = self.pending_sender_key_receipt_set.clone();
+            let savepoint_started = if let Some(db) = self.db.as_ref() {
+                match db.begin_retained_sender_key_conversation_v1() {
+                    Ok(()) => true,
+                    Err(reason) => {
+                        report.diagnostics.push(RetainedSenderKeyDiagnosticV1 {
+                            conversation_id,
+                            reason,
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                false
+            };
+
+            let mut processed = 0usize;
+            let mut failure = None;
+            for (sender_key_message, route) in batch {
+                match self.process_sender_key_distribution_inner_v1(
+                    &sender_key_message,
+                    &route,
+                    SenderKeyDistributionModeV1::Retained,
+                ) {
+                    Ok(_) => processed += 1,
+                    Err(reason) => {
+                        failure = Some(reason);
+                        break;
+                    }
+                }
+            }
+            if failure.is_none() && savepoint_started {
+                if let Err(reason) = self
+                    .db
+                    .as_ref()
+                    .ok_or("database disappeared during retained Sender-Key batch")?
+                    .commit_retained_sender_key_conversation_v1()
+                {
+                    failure = Some(reason);
+                }
+            }
+            if let Some(reason) = failure {
+                let rollback_error = if savepoint_started {
+                    self.db
+                        .as_ref()
+                        .ok_or("database disappeared during retained Sender-Key rollback")?
+                        .rollback_retained_sender_key_conversation_v1()
+                        .err()
+                } else {
+                    None
+                };
+                // Runtime state must fail closed even if SQLite reports that
+                // its rollback could not be completed and durable state is
+                // therefore uncertain.
+                self.sender_keys = sender_keys_before;
+                self.channel_conversations = channel_conversations_before;
+                self.trusted_signing_keys = trusted_signing_keys_before;
+                self.pending_sender_key_receipts = receipts_before;
+                self.pending_sender_key_receipt_set = receipt_set_before;
+                if let Some(rollback) = rollback_error {
+                    return Err(format!(
+                        "{reason}; retained Sender-Key conversation rollback failed: {rollback}"
+                    ));
+                }
+                report.diagnostics.push(RetainedSenderKeyDiagnosticV1 {
+                    conversation_id,
+                    reason,
+                });
+            } else {
+                report.processed += processed;
+            }
+        }
+        Ok(report)
     }
 
     /// Move already-authenticated live events out of the bounded socket queue
@@ -690,18 +1312,42 @@ impl VeilClient {
                 ref_seq,
                 local_message_id,
                 mutation,
+                sender_key,
             }) => {
                 *local_message_id =
                     self.finalize_outgoing_message(*ref_seq, message_id, *server_timestamp)?;
                 *mutation = self.confirm_pending_mutation(*ref_seq, *server_timestamp)?;
                 self.confirm_initial_message(*ref_seq)?;
-                self.confirm_sender_key_distribution(*ref_seq)?;
+                self.confirm_sender_key_distribution(*ref_seq, sender_key.as_ref())?;
             }
             Some(ConnectionEvent::Error {
+                code,
                 ref_seq: Some(ref_seq),
                 local_message_id,
+                conversation_id,
+                stale_roster_context,
                 ..
-            }) => *local_message_id = self.reject_pending_sequence(*ref_seq)?,
+            }) => {
+                let pending_conversation = self
+                    .pending_sender_key_sequences
+                    .get(ref_seq)
+                    .map(|pending| pending.conversation_id.clone())
+                    .or_else(|| {
+                        self.pending_outgoing_messages
+                            .get(ref_seq)
+                            .map(|pending| pending.conversation_id.clone())
+                    });
+                if *code == 409 {
+                    if let Some(pending_conversation) = pending_conversation.as_ref() {
+                        if self.channel_conversations.contains(pending_conversation) {
+                            self.invalidate_device_roster_v1(pending_conversation);
+                            *conversation_id = Some(pending_conversation.clone());
+                            *stale_roster_context = true;
+                        }
+                    }
+                }
+                *local_message_id = self.reject_pending_sequence(*ref_seq)?;
+            }
             Some(ConnectionEvent::Disconnected { reason }) => {
                 // There can be no trustworthy delivery conclusion once the
                 // socket epoch ends: a frame may have reached the gateway and
@@ -725,6 +1371,10 @@ impl VeilClient {
     }
 
     fn mark_all_pending_sequences_unknown(&mut self) -> Result<(), String> {
+        for receipt in self.pending_sender_key_receipt_sequences.values() {
+            self.pending_sender_key_receipt_set.remove(receipt);
+        }
+        self.pending_sender_key_receipt_sequences.clear();
         let stale_sequences: HashSet<u64> = self
             .pending_outgoing_messages
             .keys()
@@ -832,10 +1482,53 @@ impl VeilClient {
         Ok(())
     }
 
-    fn confirm_sender_key_distribution(&mut self, sequence: u64) -> Result<(), String> {
+    fn confirm_sender_key_distribution(
+        &mut self,
+        sequence: u64,
+        ack: Option<&crate::connection::SenderKeyAckMetadataV1>,
+    ) -> Result<(), String> {
+        if let Some(receipt) = self
+            .pending_sender_key_receipt_sequences
+            .get(&sequence)
+            .cloned()
+        {
+            let ack = ack.ok_or("Sender-Key receipt acknowledgement omitted exact metadata")?;
+            if ack.conversation_id != receipt.conversation_id
+                || ack.generation != receipt.generation
+                || ack.target_device_id != receipt.target_device_id
+                || ack.roster_version != receipt.roster_version
+                || ack.envelope_commitment != receipt.envelope_commitment
+            {
+                return Err("Sender-Key receipt acknowledgement metadata mismatch".to_string());
+            }
+            self.pending_sender_key_receipt_sequences.remove(&sequence);
+            self.pending_sender_key_receipt_set.remove(&receipt);
+            return Ok(());
+        }
         let Some(pending) = self.pending_sender_key_sequences.get(&sequence).cloned() else {
+            if ack.is_some() {
+                return Err("unexpected Sender-Key acknowledgement sequence".to_string());
+            }
             return Ok(());
         };
+        let ack = ack.ok_or("Sender-Key acknowledgement omitted exact route metadata")?;
+        if ack.conversation_id != pending.conversation_id
+            || ack.generation != pending.generation
+            || ack.target_device_id != pending.target_device_id
+            || ack.roster_version != pending.roster_version
+            || ack.envelope_commitment != pending.envelope_commitment
+        {
+            return Err("Sender-Key acknowledgement route metadata mismatch".to_string());
+        }
+        let roster = self
+            .device_rosters
+            .get(&pending.conversation_id)
+            .ok_or("Sender-Key acknowledgement arrived without a current roster proof")?;
+        if roster.version != pending.roster_version
+            || roster.commitment != pending.roster_commitment
+        {
+            return Err("Sender-Key acknowledgement belongs to a stale roster".to_string());
+        }
         let still_waiting =
             self.pending_sender_key_sequences
                 .iter()
@@ -843,6 +1536,7 @@ impl VeilClient {
                     *pending_sequence != sequence
                         && other.conversation_id == pending.conversation_id
                         && other.generation == pending.generation
+                        && other.roster_version == pending.roster_version
                 });
         let completed = !still_waiting
             && !self
@@ -855,11 +1549,14 @@ impl VeilClient {
             self.clear_sender_key_envelope_generation(
                 &pending.conversation_id,
                 pending.generation,
+                pending.roster_version,
             )?;
         }
         self.pending_sender_key_sequences.remove(&sequence);
         if completed {
             self.sender_key_distribution_pending
+                .remove(&pending.conversation_id);
+            self.prepared_sender_key_generations
                 .remove(&pending.conversation_id);
         }
         Ok(())
@@ -933,6 +1630,9 @@ impl VeilClient {
     }
 
     fn reject_pending_sequence(&mut self, sequence: u64) -> Result<Option<String>, String> {
+        if let Some(receipt) = self.pending_sender_key_receipt_sequences.remove(&sequence) {
+            self.pending_sender_key_receipt_set.remove(&receipt);
+        }
         self.pending_initial_sequences.remove(&sequence);
         if let Some(ConfirmedMutation::Edit { new_text, .. }) =
             self.pending_mutations.remove(&sequence).as_mut()
@@ -1057,6 +1757,15 @@ impl VeilClient {
             }
         }
 
+        let roster_proof = if self.channel_conversations.contains(conversation_id) {
+            let roster = self
+                .device_rosters
+                .get(conversation_id)
+                .ok_or("validated current device roster is unavailable")?;
+            Some((roster.version, roster.commitment))
+        } else {
+            None
+        };
         let send_msg = proto::SendMessage {
             conversation_id: conversation_id.to_string(),
             ciphertext,
@@ -1066,6 +1775,11 @@ impl VeilClient {
             ttl_seconds: None,
             attachments: vec![],
             sealed: false,
+            // Populated by the per-device roster integration. Zero/empty is
+            // valid only for DMs; the gateway rejects Sender-Key traffic that
+            // does not carry an exact authenticated roster proof.
+            roster_version: roster_proof.map_or(0, |proof| proof.0),
+            roster_commitment: roster_proof.map_or_else(Vec::new, |proof| proof.1.to_vec()),
         };
 
         let env = proto::Envelope {
@@ -1325,10 +2039,16 @@ impl VeilClient {
                 );
             }
 
-            let identity = self.identity.as_ref().ok_or("not initialized")?;
-            let ct =
-                self.sender_keys
-                    .encrypt_signed(conversation_id, identity, plaintext.as_bytes())?;
+            let device = self
+                .device_identity
+                .as_ref()
+                .ok_or("per-device identity is required for Sender-Key v5")?;
+            let ct = self.sender_keys.encrypt_signed_with_device(
+                conversation_id,
+                &device.binding().device_identity_key,
+                device.ed25519_signing_key(),
+                plaintext.as_bytes(),
+            )?;
             self.persist_outgoing_sender_key(conversation_id)?;
             return Ok((ct, vec![HEADER_SENDER_KEY]));
         }
@@ -1425,6 +2145,180 @@ impl VeilClient {
         conversation_id: &str,
         header: &[u8],
         ciphertext: &[u8],
+    ) -> Result<DecryptedPayload, String> {
+        self.decrypt_from_with_security_context(
+            sender_identity_key,
+            conversation_id,
+            header,
+            ciphertext,
+            None,
+        )
+    }
+
+    fn validated_sender_key_route_for_message(
+        &self,
+        conversation_id: &str,
+        sender_account_identity_key: &[u8; 32],
+        ciphertext: &[u8],
+        security_context: &MessageSecurityContextV1,
+    ) -> Result<(u32, IncomingSenderKeyRouteV1), String> {
+        let MessageSecurityContextV1::SenderKeyV5(context) = security_context;
+        let local = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is not initialized")?;
+        if context.target_device_id != self.device_id {
+            return Err("Sender-Key message targets another device".to_string());
+        }
+        let unverified = veil_crypto::sender_key::inspect_signed_sender_key_metadata(ciphertext)?;
+        let local_account_identity = self.identity_key()?;
+        let local_account_signing = self.signing_key()?;
+        if *sender_account_identity_key == local_account_identity
+            && context.sender_device_id == self.device_id
+        {
+            let roster = self
+                .device_rosters
+                .get(conversation_id)
+                .filter(|roster| {
+                    roster.version == context.roster_version
+                        && roster.commitment == context.roster_commitment
+                })
+                .ok_or("self-authored Sender-Key message has no exact current roster proof")?;
+            let current = roster
+                .eligible_devices
+                .get(&self.device_id)
+                .ok_or("current device is absent from its installed roster")?;
+            if current.device_identity_key != local.binding().device_identity_key
+                || current.device_signing_key != local.binding().device_signing_key
+                || current.account_signing_key != local_account_signing
+                || current.binding_version != context.sender_binding_version
+                || unverified.sender_identity_key != local.binding().device_identity_key
+                || self
+                    .sender_keys
+                    .outgoing_owner_identity_key(conversation_id)
+                    != Some(local.binding().device_identity_key)
+            {
+                return Err("self-authored Sender-Key device context mismatch".to_string());
+            }
+            let generation = veil_crypto::sender_key::verify_signed_sender_key_envelope(
+                conversation_id,
+                &local.binding().device_identity_key,
+                &local.binding().device_signing_key,
+                ciphertext,
+            )?;
+            return Ok((
+                generation,
+                IncomingSenderKeyRouteV1 {
+                    sender_account_identity_key: local_account_identity,
+                    sender_device_id: self.device_id,
+                    sender_device_identity_key: local.binding().device_identity_key,
+                    sender_device_signing_key: local.binding().device_signing_key,
+                    sender_binding_version: local.binding().version,
+                    target_device_id: self.device_id,
+                    target_binding_version: local.binding().version,
+                    roster_version: context.roster_version,
+                    roster_commitment: context.roster_commitment,
+                    envelope_commitment: Sha256::digest(ciphertext).into(),
+                    historical_sender_binding: Some(HistoricalDeviceBindingProofV1 {
+                        sender_account_signing_key: current.account_signing_key,
+                        sender_device_capabilities: local.binding().capabilities,
+                        sender_device_binding_status: local.binding().status,
+                        sender_account_signature: local.binding().account_signature,
+                        target_device_identity_key: Some(local.binding().device_identity_key),
+                    }),
+                },
+            ));
+        }
+        let route = self
+            .db
+            .as_ref()
+            .ok_or("database is required for Sender-Key route verification")?
+            .load_incoming_sender_key_route_v1(
+                conversation_id,
+                &unverified.sender_identity_key,
+                unverified.generation,
+            )?
+            .ok_or("trusted historical Sender-Key route is unavailable")?;
+        let current_target = self
+            .device_rosters
+            .get(conversation_id)
+            .and_then(|roster| roster.eligible_devices.get(&self.device_id))
+            .ok_or("current device is not eligible in the installed roster")?;
+        if current_target.account_identity_key != local_account_identity
+            || current_target.account_signing_key != local_account_signing
+            || current_target.device_identity_key != local.binding().device_identity_key
+            || current_target.device_signing_key != local.binding().device_signing_key
+            || current_target.binding_version != local.binding().version
+            || current_target.capabilities != local.binding().capabilities
+            || current_target.account_signature != local.binding().account_signature
+        {
+            return Err(
+                "installed target roster no longer matches local device identity".to_string(),
+            );
+        }
+        if let Some(proof) = route.historical_sender_binding.as_ref() {
+            if proof.target_device_identity_key != Some(local.binding().device_identity_key)
+                || self
+                    .trusted_signing_keys
+                    .get(&route.sender_account_identity_key)
+                    != Some(&proof.sender_account_signing_key)
+            {
+                return Err("historical Sender-Key binding proof is no longer trusted".to_string());
+            }
+        } else if route.target_binding_version != local.binding().version {
+            return Err(
+                "legacy Sender-Key route cannot cross a target binding version".to_string(),
+            );
+        }
+        if route.sender_account_identity_key != *sender_account_identity_key
+            || route.sender_device_id != context.sender_device_id
+            || route.sender_binding_version != context.sender_binding_version
+            || route.target_device_id != context.target_device_id
+            || route.target_device_id != self.device_id
+            || route.target_binding_version == 0
+            || route.target_binding_version > local.binding().version
+            || route.roster_version != context.roster_version
+            || route.roster_commitment != context.roster_commitment
+        {
+            return Err(
+                "Sender-Key message security context does not match installed route".to_string(),
+            );
+        }
+        let generation = veil_crypto::sender_key::verify_signed_sender_key_envelope(
+            conversation_id,
+            &route.sender_device_identity_key,
+            &route.sender_device_signing_key,
+            ciphertext,
+        )?;
+        if generation != unverified.generation {
+            return Err("Sender-Key signed generation changed during verification".to_string());
+        }
+        Ok((generation, route))
+    }
+
+    pub fn validate_sender_key_message_context_v1(
+        &self,
+        conversation_id: &str,
+        sender_account_identity_key: &[u8; 32],
+        ciphertext: &[u8],
+        security_context: &MessageSecurityContextV1,
+    ) -> Result<(), String> {
+        self.validated_sender_key_route_for_message(
+            conversation_id,
+            sender_account_identity_key,
+            ciphertext,
+            security_context,
+        )
+        .map(|_| ())
+    }
+
+    pub fn decrypt_from_with_security_context(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        conversation_id: &str,
+        header: &[u8],
+        ciphertext: &[u8],
+        security_context: Option<&MessageSecurityContextV1>,
     ) -> Result<DecryptedPayload, String> {
         if header.is_empty() {
             // Network messages without an authenticated E2E header are a
@@ -1537,20 +2431,36 @@ impl VeilClient {
                 self.process_ratchet_plaintext(sender_identity_key, plaintext)
             }
             HEADER_SENDER_KEY => {
-                let pinned_signing_key = self
-                    .trusted_signing_keys
-                    .get(sender_identity_key)
-                    .copied()
-                    .ok_or("sender-key signer is not pinned")?;
-                self.ensure_incoming_sender_key_loaded(conversation_id, sender_identity_key);
-                let pt = self.sender_keys.decrypt_signed(
+                let context = security_context
+                    .ok_or("Sender-Key v5 message is missing persisted device security context")?;
+                let (generation, route) = self.validated_sender_key_route_for_message(
                     conversation_id,
                     sender_identity_key,
-                    &pinned_signing_key,
+                    ciphertext,
+                    context,
+                )?;
+                self.ensure_incoming_sender_key_loaded(
+                    conversation_id,
+                    &route.sender_device_identity_key,
+                    generation,
+                )?;
+                let mut decrypted = self.sender_keys.decrypt_signed_with_metadata(
+                    conversation_id,
+                    &route.sender_device_identity_key,
+                    &route.sender_device_signing_key,
                     ciphertext,
                 )?;
-                self.persist_incoming_sender_key(conversation_id, sender_identity_key)?;
-                Ok(DecryptedPayload::Text(pt))
+                if decrypted.generation != generation {
+                    return Err("sender-key generation changed during authenticated decrypt".into());
+                }
+                self.persist_incoming_sender_key(
+                    conversation_id,
+                    &route.sender_device_identity_key,
+                    generation,
+                )?;
+                Ok(DecryptedPayload::Text(std::mem::take(
+                    &mut *decrypted.plaintext,
+                )))
             }
             _ => {
                 // Unknown wire versions are never interpreted as plaintext.
@@ -1593,7 +2503,7 @@ impl VeilClient {
                 self.channel_conversations.insert(group_id.clone());
                 self.sender_key_distribution_pending
                     .insert(group_id.clone());
-                self.persist_incoming_sender_key(&group_id, sender_identity_key)?;
+                self.persist_incoming_sender_key(&group_id, sender_identity_key, dist.key_id)?;
                 Ok(DecryptedPayload::Control)
             }
             _ => {
@@ -1640,7 +2550,15 @@ impl VeilClient {
             // members). Rotation also discards outstanding ACK mappings for
             // the old roster and keeps sends blocked until the new SKDM fanout
             // is fully acknowledged.
-            self.rotate_sender_key(conversation_id)?;
+            if self.device_identity.is_some() {
+                // The account directory is only a membership/display input in
+                // per-device mode. Block the stale proof immediately; the
+                // exact canonical device roster install performs the single
+                // required rotation after all bindings have been verified.
+                self.invalidate_device_roster_v1(conversation_id);
+            } else {
+                self.rotate_sender_key(conversation_id)?;
+            }
         }
         // Commit the new authorization view only after cache invalidation and
         // rotation succeed. A SQLCipher failure must leave both the old roster
@@ -1694,13 +2612,7 @@ impl VeilClient {
         buf
     }
 
-    fn invalidate_sender_key_envelopes_for_conversation(
-        &mut self,
-        conversation_id: &str,
-    ) -> Result<(), String> {
-        if let Some(db) = self.db.as_ref() {
-            db.delete_pending_sender_key_envelopes_for_conversation(conversation_id)?;
-        }
+    fn invalidate_sender_key_envelopes_in_memory(&mut self, conversation_id: &str) {
         self.pending_sender_key_envelopes.retain(|key, wire| {
             let keep = key.conversation_id != conversation_id;
             if !keep {
@@ -1708,16 +2620,21 @@ impl VeilClient {
             }
             keep
         });
-        Ok(())
     }
 
     fn clear_sender_key_envelope_generation(
         &mut self,
         conversation_id: &str,
         generation: u32,
+        roster_version: u64,
     ) -> Result<(), String> {
         if let Some(db) = self.db.as_ref() {
             db.delete_pending_sender_key_envelope_generation(conversation_id, generation)?;
+            db.delete_pending_sender_key_device_generation_v1(
+                conversation_id,
+                generation,
+                roster_version,
+            )?;
         }
         self.pending_sender_key_envelopes.retain(|key, wire| {
             let keep = key.conversation_id != conversation_id || key.generation != generation;
@@ -1731,11 +2648,28 @@ impl VeilClient {
 
     /// Force-rotate our outgoing sender key for a channel (e.g. after a member leaves).
     pub fn rotate_sender_key(&mut self, conversation_id: &str) -> Result<(), String> {
-        let our_key = self.identity_key()?;
-        // Invalidate before mutating the generation. A DB failure must leave
-        // the old state intact rather than permit cross-roster cache reuse.
-        self.invalidate_sender_key_envelopes_for_conversation(conversation_id)?;
-        let _ = self.sender_keys.create_outgoing(conversation_id, &our_key);
+        let owner_key = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is required for Sender-Key v5")?
+            .binding()
+            .device_identity_key;
+        // Prepare the new secret state on a clone. Generation exhaustion or a
+        // durable-store failure therefore leaves both the live generation and
+        // the immutable retry cache untouched.
+        let mut next_sender_keys = self.sender_keys.clone();
+        let mut distribution = next_sender_keys.try_create_outgoing(conversation_id, &owner_key)?;
+        let next_state = next_sender_keys
+            .serialize_outgoing(conversation_id)
+            .ok_or("cannot serialize rotated outgoing sender key")?;
+        distribution.zeroize();
+
+        if let Some(db) = self.db.as_ref() {
+            db.commit_sender_key_rotation(conversation_id, &owner_key, &next_state)?;
+        }
+
+        self.sender_keys = next_sender_keys;
+        self.invalidate_sender_key_envelopes_in_memory(conversation_id);
         self.pending_sender_key_sequences
             .retain(|_, pending| pending.conversation_id != conversation_id);
         self.failed_sender_key_distributions.remove(conversation_id);
@@ -1743,7 +2677,8 @@ impl VeilClient {
             .insert(conversation_id.to_string());
         self.sender_key_distribution_pending
             .insert(conversation_id.to_string());
-        self.persist_outgoing_sender_key(conversation_id)?;
+        self.prepared_sender_key_generations
+            .insert(conversation_id.to_string());
         Ok(())
     }
 
@@ -1773,7 +2708,10 @@ impl VeilClient {
         if !missing && !expired && !pending {
             return Ok(false);
         }
-        if missing || expired {
+        let fresh_generation_prepared = self
+            .prepared_sender_key_generations
+            .contains(conversation_id);
+        if missing || expired || (pending && !fresh_generation_prepared) {
             self.rotate_sender_key(conversation_id)?;
         } else {
             self.failed_sender_key_distributions.remove(conversation_id);
@@ -1792,8 +2730,20 @@ impl VeilClient {
         conversation_id: &str,
         refresh: OfflineSenderKeyRefresh,
     ) -> Result<bool, String> {
-        if refresh == OfflineSenderKeyRefresh::Required {
-            self.rotate_sender_key(conversation_id)?;
+        let already_prepared = self
+            .prepared_sender_key_generations
+            .contains(conversation_id);
+        match refresh {
+            OfflineSenderKeyRefresh::Required if !already_prepared => {
+                self.rotate_sender_key(conversation_id)?;
+            }
+            OfflineSenderKeyRefresh::AlreadyRotated if !already_prepared => {
+                return Err(
+                    "offline sender-key refresh marker is stale or belongs to another session"
+                        .to_string(),
+                );
+            }
+            _ => {}
         }
         self.begin_sender_key_distribution(conversation_id)
     }
@@ -1813,6 +2763,7 @@ impl VeilClient {
         }
         self.failed_sender_key_distributions.remove(conversation_id);
         self.sender_key_distribution_pending.remove(conversation_id);
+        self.prepared_sender_key_generations.remove(conversation_id);
         Ok(())
     }
 
@@ -1847,122 +2798,194 @@ impl VeilClient {
         }
     }
 
-    fn validate_cached_sender_key_envelope(
+    fn validate_cached_sender_key_device_envelope(
         &self,
         key: &PendingSenderKeyEnvelopeKey,
+        target: &DeviceTargetV1,
         wire: &[u8],
     ) -> Result<(), String> {
         let metadata = veil_crypto::sender_key::inspect_skdm_metadata(wire)?;
         if metadata.group_id != key.conversation_id || metadata.generation != key.generation {
             return Err("cached SKDM scope does not match its conversation/generation".to_string());
         }
-        if metadata.sender_identity_key != self.identity_key()?
-            || metadata.sender_signing_key != self.signing_key()?
+        let local = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is not initialized")?;
+        if metadata.sender_identity_key != local.binding().device_identity_key
+            || metadata.sender_signing_key != local.binding().device_signing_key
         {
-            return Err("cached SKDM sender binding does not match this identity".to_string());
+            return Err("cached SKDM sender binding does not match this device".to_string());
+        }
+        if key.target_device_id != target.device_id
+            || key.target_binding_version != target.binding_version
+            || key.roster_version != target.roster_version
+            || key.roster_commitment != target.roster_commitment
+        {
+            return Err("cached SKDM target/roster tuple changed".to_string());
+        }
+        let commitment: [u8; 32] = Sha256::digest(wire).into();
+        if !bool::from(commitment.ct_eq(&key.envelope_commitment)) {
+            return Err("cached SKDM envelope commitment mismatch".to_string());
         }
         Ok(())
     }
 
-    /// Return the immutable sealed bytes for one generation/recipient,
-    /// creating and committing them to SQLCipher before the first transport
-    /// attempt. The recipient is currently a user identity because the gateway
-    /// does not yet expose independent cryptographic device identities.
-    fn prepare_sender_key_envelope(
+    fn prepare_sender_key_device_envelope(
         &mut self,
-        conversation_id: &str,
-        peer_identity_key: &[u8; 32],
+        target: &DeviceTargetV1,
     ) -> Result<(PendingSenderKeyEnvelopeKey, Vec<u8>), String> {
+        let conversation_id = target.conversation_id.as_str();
+        let roster = self
+            .device_rosters
+            .get(conversation_id)
+            .ok_or("validated current device roster is unavailable")?;
+        let pinned_target = roster
+            .eligible_devices
+            .get(&target.device_id)
+            .ok_or("target device is not eligible in the current roster")?;
+        if pinned_target != target || target.device_id == self.device_id {
+            return Err("target device tuple is stale or resolves to this device".to_string());
+        }
         if !self.sender_keys.has_outgoing(conversation_id) {
             self.rotate_sender_key(conversation_id)?;
         }
         let mut distribution = self.sender_keys.build_distribution(conversation_id)?;
-        let key = PendingSenderKeyEnvelopeKey {
-            conversation_id: conversation_id.to_string(),
-            generation: distribution.key_id,
-            target_identity_key: *peer_identity_key,
-        };
-        let our_identity_key = self.identity_key()?;
+        let local = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is not initialized")?;
+        if distribution.sender_identity_key != local.binding().device_identity_key {
+            distribution.zeroize();
+            return Err(
+                "outgoing Sender-Key generation is not device-owned; rotation required".to_string(),
+            );
+        }
 
         if let Some(db) = self.db.as_ref() {
-            if let Some(cached) = db.load_pending_sender_key_envelope(
+            if let Some(cached) = db.load_pending_sender_key_device_envelope_v1(
                 conversation_id,
-                key.generation,
-                peer_identity_key,
-                &our_identity_key,
+                distribution.key_id,
+                &target.device_id,
+                target.binding_version,
+                target.roster_version,
             )? {
-                self.validate_cached_sender_key_envelope(&key, &cached)?;
+                let key = PendingSenderKeyEnvelopeKey {
+                    conversation_id: conversation_id.to_string(),
+                    generation: distribution.key_id,
+                    target_device_id: target.device_id,
+                    target_binding_version: target.binding_version,
+                    roster_version: target.roster_version,
+                    roster_commitment: target.roster_commitment,
+                    envelope_commitment: cached.envelope_commitment,
+                };
+                if cached.target_account_identity_key != target.account_identity_key
+                    || cached.target_device_identity_key != target.device_identity_key
+                    || cached.sender_device_id != self.device_id
+                    || cached.sender_device_identity_key != local.binding().device_identity_key
+                    || cached.sender_binding_version != local.binding().version
+                    || cached.roster_commitment != target.roster_commitment
+                {
+                    distribution.zeroize();
+                    return Err("persisted exact-device SKDM route tuple changed".to_string());
+                }
+                self.validate_cached_sender_key_device_envelope(
+                    &key,
+                    target,
+                    &cached.sealed_envelope,
+                )?;
                 if self
                     .pending_sender_key_envelopes
                     .get(&key)
-                    .is_some_and(|in_memory| in_memory != &cached)
+                    .is_some_and(|in_memory| in_memory != &cached.sealed_envelope)
                 {
                     return Err("SQLCipher and in-memory SKDM caches disagree".to_string());
                 }
                 self.pending_sender_key_envelopes
-                    .insert(key.clone(), cached.clone());
+                    .insert(key.clone(), cached.sealed_envelope.clone());
                 distribution.zeroize();
-                return Ok((key, cached));
+                return Ok((key, cached.sealed_envelope));
             }
         }
 
-        if let Some(cached) = self.pending_sender_key_envelopes.get(&key).cloned() {
-            self.validate_cached_sender_key_envelope(&key, &cached)?;
-            let canonical = if let Some(db) = self.db.as_ref() {
-                db.save_pending_sender_key_envelope(
-                    conversation_id,
-                    key.generation,
-                    peer_identity_key,
-                    &our_identity_key,
-                    &cached,
-                )?
-            } else {
-                cached
-            };
-            distribution.zeroize();
-            return Ok((key, canonical));
-        }
-
-        // Build the distribution directly so chain-key material never passes
-        // through a non-zeroizing serde_json::Value tree.
         let json = Zeroizing::new(
             serde_json::to_vec(&distribution).map_err(|e| format!("encode SKDM: {e}"))?,
         );
+        let generation = distribution.key_id;
         distribution.zeroize();
-        let identity = self.identity.as_ref().ok_or("not initialized")?;
-        let sealed = veil_crypto::sender_key::seal_skdm_authenticated(
-            identity,
-            peer_identity_key,
+        let sealed = veil_crypto::sender_key::seal_skdm_authenticated_with_device(
+            &local.binding().device_identity_key,
+            local.ed25519_signing_key(),
+            &target.device_identity_key,
             conversation_id,
-            key.generation,
+            generation,
             &json,
         )?;
-        let canonical = if let Some(db) = self.db.as_ref() {
-            db.save_pending_sender_key_envelope(
-                conversation_id,
-                key.generation,
-                peer_identity_key,
-                &our_identity_key,
-                &sealed,
-            )?
-        } else {
-            sealed
+        let envelope_commitment: [u8; 32] = Sha256::digest(&sealed).into();
+        let key = PendingSenderKeyEnvelopeKey {
+            conversation_id: conversation_id.to_string(),
+            generation,
+            target_device_id: target.device_id,
+            target_binding_version: target.binding_version,
+            roster_version: target.roster_version,
+            roster_commitment: target.roster_commitment,
+            envelope_commitment,
         };
-        self.validate_cached_sender_key_envelope(&key, &canonical)?;
+        let persisted = PendingSenderKeyDeviceEnvelopeV1 {
+            conversation_id: conversation_id.to_string(),
+            generation,
+            target_account_identity_key: target.account_identity_key,
+            target_device_id: target.device_id,
+            target_device_identity_key: target.device_identity_key,
+            target_binding_version: target.binding_version,
+            sender_device_id: self.device_id,
+            sender_device_identity_key: local.binding().device_identity_key,
+            sender_binding_version: local.binding().version,
+            roster_version: target.roster_version,
+            roster_commitment: target.roster_commitment,
+            envelope_commitment,
+            sealed_envelope: sealed,
+        };
+        let canonical = if let Some(db) = self.db.as_ref() {
+            db.save_pending_sender_key_device_envelope_v1(&persisted)?
+        } else {
+            persisted.sealed_envelope
+        };
+        self.validate_cached_sender_key_device_envelope(&key, target, &canonical)?;
         self.pending_sender_key_envelopes
             .insert(key.clone(), canonical.clone());
         Ok((key, canonical))
     }
 
-    /// Distribute our current outgoing sender key for `conversation_id` to a single peer.
-    /// Sends a sealed SKDM via the server's SenderKeyDistribution envelope.
+    #[cfg(test)]
+    fn prepare_sender_key_envelope(
+        &mut self,
+        _conversation_id: &str,
+        _peer_identity_key: &[u8; 32],
+    ) -> Result<(PendingSenderKeyEnvelopeKey, Vec<u8>), String> {
+        Err("legacy account-level Sender-Key test helper is disabled".to_string())
+    }
+
+    #[deprecated(note = "account-level Sender-Key distribution is disabled; use exact devices")]
     pub async fn send_sender_key_to(
         &mut self,
-        conversation_id: &str,
-        peer_identity_key: &[u8; 32],
+        _conversation_id: &str,
+        _peer_identity_key: &[u8; 32],
     ) -> Result<u64, String> {
-        let (pending, sealed) =
-            self.prepare_sender_key_envelope(conversation_id, peer_identity_key)?;
+        Err("account-level Sender-Key distribution is disabled".to_string())
+    }
+
+    pub async fn send_sender_key_to_device(
+        &mut self,
+        target: &DeviceTargetV1,
+    ) -> Result<u64, String> {
+        let (pending, sealed) = self.prepare_sender_key_device_envelope(target)?;
+        let local = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is not initialized")?;
+        let local_account_identity = self.identity_key()?;
+        let local_account_signing = self.signing_key()?;
 
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let seq = conn.next_seq().await;
@@ -1971,10 +2994,24 @@ impl VeilClient {
             timestamp: 0,
             payload: Some(proto::envelope::Payload::SenderKeyDist(
                 proto::SenderKeyDistribution {
-                    conversation_id: conversation_id.to_string(),
+                    conversation_id: target.conversation_id.clone(),
                     sender_key_message: sealed,
                     generation: pending.generation,
-                    target_identity_key: peer_identity_key.to_vec(),
+                    target_identity_key: target.account_identity_key.to_vec(),
+                    target_device_id: target.device_id.to_vec(),
+                    target_device_identity_key: target.device_identity_key.to_vec(),
+                    sender_device_id: self.device_id.to_vec(),
+                    roster_version: target.roster_version,
+                    roster_commitment: target.roster_commitment.to_vec(),
+                    sender_binding_version: local.binding().version,
+                    target_binding_version: target.binding_version,
+                    sender_account_identity_key: local_account_identity.to_vec(),
+                    sender_account_signing_key: local_account_signing.to_vec(),
+                    sender_device_identity_key: local.binding().device_identity_key.to_vec(),
+                    sender_device_signing_key: local.binding().device_signing_key.to_vec(),
+                    sender_device_capabilities: local.binding().capabilities,
+                    sender_device_binding_status: u32::from(local.binding().status),
+                    sender_account_signature: local.binding().account_signature.to_vec(),
                 },
             )),
         };
@@ -1983,87 +3020,286 @@ impl VeilClient {
         Ok(seq)
     }
 
-    /// Process a sender-key envelope only when the caller supplies a sender
-    /// signing key obtained from an authenticated identity directory.
+    #[deprecated(note = "account-domain SKDM processing is disabled; use exact device routes")]
     pub fn process_authenticated_sealed_skdm(
         &mut self,
-        sealed_wire: &[u8],
-        expected_sender_identity_key: &[u8; 32],
-        expected_sender_signing_key: &[u8; 32],
-        expected_group_id: &str,
-        expected_generation: u32,
+        _sealed_wire: &[u8],
+        _expected_sender_identity_key: &[u8; 32],
+        _expected_sender_signing_key: &[u8; 32],
+        _expected_group_id: &str,
+        _expected_generation: u32,
     ) -> Result<(), String> {
-        let identity = self.identity.as_ref().ok_or("not initialized")?;
-        let authenticated = identity.open_authenticated_sealed_skdm(
-            expected_sender_identity_key,
-            expected_sender_signing_key,
-            expected_group_id,
-            expected_generation,
-            sealed_wire,
-        )?;
-        self.install_authenticated_skdm(authenticated)
+        Err("account-domain SKDM processing is disabled".to_string())
     }
 
-    fn install_authenticated_skdm(
+    fn install_authenticated_device_skdm(
         &mut self,
         authenticated: veil_crypto::sender_key::AuthenticatedSkdm,
-    ) -> Result<(), String> {
-        self.require_currently_authorized_sender(
-            &authenticated.group_id,
-            &authenticated.sender_identity_key,
-        )?;
+        sender_account_identity_key: [u8; 32],
+        route: &SenderKeyRouteV1,
+    ) -> Result<PendingSenderKeyReceiptV1, String> {
         let group_id = authenticated.group_id.clone();
-        self.sender_keys
-            .process_authenticated_skdm(&authenticated)?;
+        let mut candidate = self.sender_keys.clone();
+        candidate.process_authenticated_skdm(&authenticated)?;
+        let state = candidate
+            .serialize_incoming_generation(
+                &group_id,
+                &authenticated.sender_identity_key,
+                authenticated.generation,
+            )
+            .ok_or("cannot serialize installed incoming Sender-Key generation")?;
+        let metadata = candidate
+            .incoming_generation_metadata(
+                &group_id,
+                &authenticated.sender_identity_key,
+                authenticated.generation,
+            )
+            .ok_or("cannot inspect installed incoming Sender-Key generation")?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or("durable database is required before acknowledging an SKDM")?;
+        db.save_incoming_sender_key_generation_with_route_v1(
+            &group_id,
+            &authenticated.sender_identity_key,
+            authenticated.generation,
+            metadata.iteration,
+            metadata.revision,
+            &metadata
+                .distribution_commitment
+                .ok_or("incoming Sender-Key distribution has no commitment")?,
+            &state,
+            &IncomingSenderKeyRouteV1 {
+                sender_account_identity_key,
+                sender_device_id: route.sender_device_id,
+                sender_device_identity_key: authenticated.sender_identity_key,
+                sender_device_signing_key: authenticated.sender_signing_key,
+                sender_binding_version: route.sender_binding_version,
+                target_device_id: route.target_device_id,
+                target_binding_version: route.target_binding_version,
+                roster_version: route.roster_version,
+                roster_commitment: route.roster_commitment,
+                envelope_commitment: route.envelope_commitment,
+                historical_sender_binding: Some(HistoricalDeviceBindingProofV1 {
+                    sender_account_signing_key: route.sender_account_signing_key,
+                    sender_device_capabilities: route.sender_device_capabilities,
+                    sender_device_binding_status: route.sender_device_binding_status,
+                    sender_account_signature: route.sender_account_signature,
+                    target_device_identity_key: Some(route.target_device_identity_key),
+                }),
+            },
+        )?;
+        self.trusted_signing_keys.insert(
+            route.sender_account_identity_key,
+            route.sender_account_signing_key,
+        );
+        self.sender_keys = candidate;
         self.channel_conversations.insert(group_id.clone());
-        // A membership-triggered peer generation is a conservative signal to
-        // rotate and redistribute our own key before sending again.
-        self.sender_key_distribution_pending
-            .insert(group_id.clone());
-        self.persist_incoming_sender_key(&group_id, &authenticated.sender_identity_key)?;
-        Ok(())
+        Ok(PendingSenderKeyReceiptV1 {
+            conversation_id: group_id,
+            owner_device_id: route.sender_device_id,
+            target_device_id: route.target_device_id,
+            generation: authenticated.generation,
+            roster_version: route.roster_version,
+            envelope_commitment: route.envelope_commitment,
+        })
     }
 
-    /// Inspect public v3 metadata only to locate an independently pinned key,
-    /// then verify the signature/AEAD against the outer gateway context.
-    pub fn process_sealed_skdm(
+    pub fn process_sender_key_distribution_v1(
         &mut self,
         sealed_wire: &[u8],
-        outer_group_id: &str,
-        outer_generation: u32,
-    ) -> Result<(), String> {
-        if self.dm_conversations.contains_key(outer_group_id) {
+        route: &SenderKeyRouteV1,
+    ) -> Result<PendingSenderKeyReceiptV1, String> {
+        self.process_sender_key_distribution_inner_v1(
+            sealed_wire,
+            route,
+            SenderKeyDistributionModeV1::Live,
+        )
+    }
+
+    fn process_sender_key_distribution_inner_v1(
+        &mut self,
+        sealed_wire: &[u8],
+        route: &SenderKeyRouteV1,
+        mode: SenderKeyDistributionModeV1,
+    ) -> Result<PendingSenderKeyReceiptV1, String> {
+        if self.dm_conversations.contains_key(&route.conversation_id) {
             return Err("sender keys are forbidden for DM conversations".to_string());
         }
-        if !self.channel_conversations.contains(outer_group_id) {
+        if !self.channel_conversations.contains(&route.conversation_id) {
             return Err(
                 "sender-key conversation is not an authenticated group/channel".to_string(),
             );
         }
         let metadata = veil_crypto::sender_key::inspect_skdm_metadata(sealed_wire)?;
-        if metadata.group_id != outer_group_id || metadata.generation != outer_generation {
+        let computed_envelope_commitment: [u8; 32] = Sha256::digest(sealed_wire).into();
+        if metadata.group_id != route.conversation_id
+            || metadata.generation != route.generation
+            || computed_envelope_commitment != route.envelope_commitment
+        {
             return Err("SKDM outer routing context mismatch".to_string());
         }
-        let trusted_signing_key = self
-            .trusted_signing_keys
-            .get(&metadata.sender_identity_key)
-            .copied();
-        if let Some(trusted_signing_key) = trusted_signing_key {
-            if metadata.sender_signing_key != trusted_signing_key {
-                return Err(
-                    "SKDM embedded signing key does not match pinned directory key".to_string(),
-                );
-            }
-            return self.process_authenticated_sealed_skdm(
-                sealed_wire,
-                &metadata.sender_identity_key,
-                &trusted_signing_key,
-                outer_group_id,
-                outer_generation,
-            );
+        let local = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is not initialized")?;
+        let local_account_identity = self.identity_key()?;
+        let local_account_signing = self.signing_key()?;
+        if route.sender_device_id == [0u8; 16]
+            || route.sender_device_id == route.target_device_id
+            || route.sender_account_identity_key == [0u8; 32]
+            || route.sender_account_signing_key == [0u8; 32]
+            || route.sender_device_identity_key == [0u8; 32]
+            || route.sender_device_signing_key == [0u8; 32]
+            || HashSet::from([
+                route.sender_account_identity_key,
+                route.sender_account_signing_key,
+                route.sender_device_identity_key,
+                route.sender_device_signing_key,
+            ])
+            .len()
+                != 4
+            || route.sender_binding_version == 0
+            || route.sender_binding_version > i64::MAX as u64
+            || route.sender_device_capabilities > i64::MAX as u64
+            || route.sender_device_capabilities & REQUIRED_DEVICE_CAPABILITIES
+                != REQUIRED_DEVICE_CAPABILITIES
+            || route.sender_device_binding_status != DEVICE_BINDING_STATUS_ACTIVE
+            || route.sender_device_identity_key != metadata.sender_identity_key
+            || route.sender_device_signing_key != metadata.sender_signing_key
+        {
+            return Err("invalid historical sender device binding proof".to_string());
+        }
+        let proof_bytes = device_binding_signing_bytes(
+            &route.sender_account_identity_key,
+            &route.sender_account_signing_key,
+            &route.sender_device_id,
+            route.sender_binding_version,
+            &route.sender_device_identity_key,
+            &route.sender_device_signing_key,
+            route.sender_device_capabilities,
+            route.sender_device_binding_status,
+        );
+        if !veil_crypto::signature::verify(
+            &route.sender_account_signing_key,
+            &proof_bytes,
+            &route.sender_account_signature,
+        ) {
+            return Err("historical sender device account signature is invalid".to_string());
         }
 
-        Err("SKDM sender has no signing key in the authenticated directory".to_string())
+        if route.target_account_identity_key != local_account_identity
+            || route.target_device_id != self.device_id
+            || route.target_device_identity_key != local.binding().device_identity_key
+            || route.target_binding_version == 0
+            || route.target_binding_version > local.binding().version
+        {
+            return Err("SKDM is not routed to the current authenticated device".to_string());
+        }
+        let current_roster = self
+            .device_rosters
+            .get(&route.conversation_id)
+            .ok_or("current device roster is unavailable for SKDM target authorization")?;
+        let current_target = current_roster
+            .eligible_devices
+            .get(&self.device_id)
+            .ok_or("current device is not eligible in the installed roster")?;
+        if current_target.account_identity_key != local_account_identity
+            || current_target.account_signing_key != local_account_signing
+            || current_target.device_identity_key != local.binding().device_identity_key
+            || current_target.device_signing_key != local.binding().device_signing_key
+            || current_target.binding_version != local.binding().version
+            || current_target.capabilities != local.binding().capabilities
+            || current_target.account_signature != local.binding().account_signature
+        {
+            return Err(
+                "installed target roster no longer matches local device identity".to_string(),
+            );
+        }
+        if mode == SenderKeyDistributionModeV1::Live {
+            if route.target_binding_version != local.binding().version
+                || route.roster_version != current_roster.version
+                || route.roster_commitment != current_roster.commitment
+            {
+                return Err("live SKDM does not match the exact current roster head".to_string());
+            }
+            let current_sender = current_roster
+                .eligible_devices
+                .get(&route.sender_device_id)
+                .ok_or("live SKDM sender is not eligible in the current roster")?;
+            if current_sender.account_identity_key != route.sender_account_identity_key
+                || current_sender.account_signing_key != route.sender_account_signing_key
+                || current_sender.device_identity_key != route.sender_device_identity_key
+                || current_sender.device_signing_key != route.sender_device_signing_key
+                || current_sender.binding_version != route.sender_binding_version
+                || current_sender.capabilities != route.sender_device_capabilities
+                || current_sender.account_signature != route.sender_account_signature
+            {
+                return Err(
+                    "live SKDM sender binding does not match the current roster".to_string()
+                );
+            }
+        }
+
+        let authenticated = veil_crypto::sender_key::open_skdm_authenticated_with_device(
+            local.x25519_secret(),
+            &local.binding().device_identity_key,
+            &metadata.sender_identity_key,
+            &metadata.sender_signing_key,
+            &route.conversation_id,
+            route.generation,
+            sealed_wire,
+        )?;
+        let receipt = self.install_authenticated_device_skdm(
+            authenticated,
+            route.sender_account_identity_key,
+            route,
+        )?;
+        if self.pending_sender_key_receipt_set.insert(receipt.clone()) {
+            self.pending_sender_key_receipts.push_back(receipt.clone());
+        }
+        Ok(receipt)
+    }
+
+    #[deprecated(note = "use process_sender_key_distribution_v1 with exact route metadata")]
+    pub fn process_sealed_skdm(
+        &mut self,
+        _sealed_wire: &[u8],
+        _outer_group_id: &str,
+        _outer_generation: u32,
+    ) -> Result<(), String> {
+        Err("Sender-Key route metadata is required".to_string())
+    }
+
+    /// Send receipts only for generations already committed to SQLCipher.
+    /// A transport failure leaves the FIFO intact; retained replay is also
+    /// idempotent because the receipt set is keyed by the immutable route.
+    pub async fn flush_sender_key_receipts_v1(&mut self) -> Result<usize, String> {
+        let mut sent = 0usize;
+        while let Some(receipt) = self.pending_sender_key_receipts.front().cloned() {
+            let conn = self.connection.as_ref().ok_or("not connected")?;
+            let seq = conn.next_seq().await;
+            conn.send_envelope(&proto::Envelope {
+                seq,
+                timestamp: 0,
+                payload: Some(proto::envelope::Payload::SenderKeyReceipt(
+                    proto::SenderKeyReceipt {
+                        conversation_id: receipt.conversation_id.clone(),
+                        owner_device_id: receipt.owner_device_id.to_vec(),
+                        target_device_id: receipt.target_device_id.to_vec(),
+                        generation: receipt.generation,
+                        roster_version: receipt.roster_version,
+                        envelope_commitment: receipt.envelope_commitment.to_vec(),
+                    },
+                )),
+            })
+            .await?;
+            self.pending_sender_key_receipts.pop_front();
+            self.pending_sender_key_receipt_sequences
+                .insert(seq, receipt);
+            sent += 1;
+        }
+        Ok(sent)
     }
 
     /// Drop a peer's incoming sender key (e.g. after a kick/leave WS event).
@@ -2077,44 +3313,159 @@ impl VeilClient {
         let Some(db) = self.db.as_ref() else {
             return Ok(());
         };
-        let our_key = self.identity_key()?;
+        let owner_key = self
+            .sender_keys
+            .outgoing_owner_identity_key(conversation_id)
+            .ok_or("cannot persist sender-key state without an authenticated owner")?;
+        let expected_owner = self
+            .device_identity
+            .as_ref()
+            .ok_or("per-device identity is required for Sender-Key v5")?
+            .binding()
+            .device_identity_key;
+        if owner_key != expected_owner {
+            return Err("refusing to persist account-owned Sender-Key v5 state".to_string());
+        }
         let data = self
             .sender_keys
             .serialize_outgoing(conversation_id)
             .ok_or_else(|| "cannot persist missing outgoing sender key".to_string())?;
-        db.save_sender_key(conversation_id, &our_key, &data, true)
+        db.save_sender_key(conversation_id, &owner_key, &data, true)
     }
 
     fn persist_incoming_sender_key(
         &self,
         conversation_id: &str,
         sender_ik: &[u8; 32],
+        generation: u32,
     ) -> Result<(), String> {
         let Some(db) = self.db.as_ref() else {
             return Ok(());
         };
         let data = self
             .sender_keys
-            .serialize_incoming(conversation_id, sender_ik)
-            .ok_or_else(|| "cannot persist missing incoming sender key".to_string())?;
-        db.save_sender_key(conversation_id, sender_ik, &data, false)
+            .serialize_incoming_generation(conversation_id, sender_ik, generation)
+            .ok_or_else(|| "cannot persist missing incoming sender-key generation".to_string())?;
+        let metadata = self
+            .sender_keys
+            .incoming_generation_metadata(conversation_id, sender_ik, generation)
+            .ok_or("cannot inspect incoming sender-key generation")?;
+        db.save_incoming_sender_key_generation(
+            conversation_id,
+            sender_ik,
+            metadata.generation,
+            metadata.iteration,
+            metadata.revision,
+            &metadata.distribution_commitment.unwrap_or([0u8; 32]),
+            &data,
+        )
     }
 
-    fn ensure_incoming_sender_key_loaded(&mut self, conversation_id: &str, sender_ik: &[u8; 32]) {
-        // Already in memory? Nothing to do.
-        // (We can't peek into the private map; just attempt a lazy load —
-        //  load_incoming is idempotent and overwriting with on-disk state is fine
-        //  ONLY if we haven't ratcheted past it. Avoid clobbering newer in-memory state.)
-        if self.sender_keys.has_incoming(conversation_id, sender_ik) {
-            return;
+    fn hydrate_incoming_sender_key_generations(
+        &mut self,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        let sender_keys_before = self.sender_keys.clone();
+        if let Err(error) = self.hydrate_incoming_sender_key_generations_inner(conversation_id) {
+            self.sender_keys = sender_keys_before;
+            return Err(error);
         }
-        if let Some(db) = self.db.as_ref() {
-            if let Ok(Some(data)) = db.load_sender_key(conversation_id, sender_ik) {
-                let data = Zeroizing::new(data);
-                let _ = self
-                    .sender_keys
-                    .load_incoming(conversation_id, sender_ik, &data);
+        Ok(())
+    }
+
+    fn hydrate_incoming_sender_key_generations_inner(
+        &mut self,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        let (generations, legacy) = match self.db.as_ref() {
+            Some(db) => (
+                db.load_incoming_sender_key_generations_for_group(conversation_id)?,
+                db.load_legacy_incoming_sender_keys_for_group(conversation_id)?,
+            ),
+            None => return Ok(()),
+        };
+
+        for row in generations {
+            if self.sender_keys.has_incoming_generation(
+                conversation_id,
+                &row.sender_identity_key,
+                row.generation,
+            ) {
+                continue;
             }
+            let metadata = self.sender_keys.load_incoming_generation(
+                conversation_id,
+                &row.sender_identity_key,
+                Some(row.generation),
+                Some(row.distribution_commitment),
+                &row.key_data,
+            )?;
+            if metadata.iteration != row.iteration || metadata.revision != row.state_revision {
+                return Err("incoming sender-key database metadata does not match state".into());
+            }
+        }
+
+        for (sender_ik, data) in legacy {
+            let mut probe = SenderKeyStore::new();
+            probe.load_incoming(conversation_id, &sender_ik, &data)?;
+            let generation = probe
+                .incoming_generations(conversation_id, &sender_ik)
+                .into_iter()
+                .next()
+                .ok_or("legacy incoming sender-key row decoded without a generation")?;
+            let metadata = probe
+                .incoming_generation_metadata(conversation_id, &sender_ik, generation)
+                .ok_or("cannot inspect legacy incoming sender-key state")?;
+            let commitment = metadata.distribution_commitment.unwrap_or([0u8; 32]);
+            if !self
+                .sender_keys
+                .has_incoming_generation(conversation_id, &sender_ik, generation)
+            {
+                self.sender_keys.load_incoming_generation(
+                    conversation_id,
+                    &sender_ik,
+                    Some(generation),
+                    Some(commitment),
+                    &data,
+                )?;
+            }
+            self.db
+                .as_ref()
+                .ok_or("database disappeared during sender-key migration")?
+                .migrate_legacy_incoming_sender_key_generation(
+                    conversation_id,
+                    &sender_ik,
+                    generation,
+                    metadata.iteration,
+                    metadata.revision,
+                    &commitment,
+                    &data,
+                )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_incoming_sender_key_loaded(
+        &mut self,
+        conversation_id: &str,
+        sender_ik: &[u8; 32],
+        generation: u32,
+    ) -> Result<(), String> {
+        if !self
+            .sender_keys
+            .has_incoming_generation(conversation_id, sender_ik, generation)
+        {
+            self.hydrate_incoming_sender_key_generations(conversation_id)?;
+        }
+        if self
+            .sender_keys
+            .has_incoming_generation(conversation_id, sender_ik, generation)
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "incoming sender-key generation {generation} is unavailable after hydration"
+            ))
         }
     }
 
@@ -2125,32 +3476,50 @@ impl VeilClient {
     ) -> Result<OfflineSenderKeyRefresh, String> {
         self.channel_conversations
             .insert(conversation_id.to_string());
-        let our_key = self.identity_key()?;
+        let account_key = self.identity_key()?;
+        let expected_owner = self
+            .device_identity
+            .as_ref()
+            .map(|device| device.binding().device_identity_key)
+            .unwrap_or(account_key);
         let had_outgoing = self.sender_keys.has_outgoing(conversation_id);
         let mut restored_outgoing = false;
+        let mut legacy_account_owner = self
+            .sender_keys
+            .outgoing_owner_identity_key(conversation_id)
+            .is_some_and(|owner| owner != expected_owner);
         if let Some(db) = self.db.as_ref() {
-            let rows = db.load_sender_keys_for_group(conversation_id)?;
-            for (sender_ik, data, is_outgoing) in rows {
-                let data = Zeroizing::new(data);
-                let ik: [u8; 32] = sender_ik
-                    .try_into()
-                    .map_err(|_| "persisted sender-key identity has an invalid length")?;
-                if is_outgoing {
-                    if ik != our_key {
+            let rows = db.load_outgoing_sender_keys_for_group(conversation_id)?;
+            for (ik, data) in rows {
+                if ik != expected_owner {
+                    if self.device_identity.is_some() && ik == account_key {
+                        legacy_account_owner = true;
+                        continue;
+                    }
+                    return Err(
+                        "persisted outgoing sender key does not belong to this identity"
+                            .to_string(),
+                    );
+                }
+                if self.sender_keys.has_outgoing(conversation_id) {
+                    let current = self
+                        .sender_keys
+                        .serialize_outgoing(conversation_id)
+                        .ok_or("cannot inspect hydrated outgoing sender key")?;
+                    if current.as_slice() != data.as_slice() {
                         return Err(
-                            "persisted outgoing sender key does not belong to this identity"
+                            "in-memory and persisted outgoing sender-key states disagree"
                                 .to_string(),
                         );
                     }
+                } else {
                     self.sender_keys.load_outgoing(conversation_id, &data)?;
                     restored_outgoing = true;
-                } else {
-                    self.sender_keys
-                        .load_incoming(conversation_id, &ik, &data)?;
                 }
             }
         }
-        if !had_outgoing && restored_outgoing {
+        self.hydrate_incoming_sender_key_generations(conversation_id)?;
+        if legacy_account_owner || (!had_outgoing && restored_outgoing) {
             // The authoritative roster is not yet persisted across a native
             // session. Continuing a restored generation after an offline
             // membership/permission change could let a former member retain
@@ -2158,6 +3527,12 @@ impl VeilClient {
             // restore and keep sending blocked until the current roster has
             // durably received the new generation.
             self.rotate_sender_key(conversation_id)?;
+            return Ok(OfflineSenderKeyRefresh::AlreadyRotated);
+        }
+        if self
+            .prepared_sender_key_generations
+            .contains(conversation_id)
+        {
             return Ok(OfflineSenderKeyRefresh::AlreadyRotated);
         }
         Ok(OfflineSenderKeyRefresh::Required)
@@ -2179,6 +3554,7 @@ impl VeilClient {
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
         sender_key_mode: bool,
+        security_context: Option<&MessageSecurityContextV1>,
         fallback_conversation_name: Option<&str>,
         header: &[u8],
         ciphertext: &[u8],
@@ -2192,6 +3568,7 @@ impl VeilClient {
             conversation_id,
             sender_identity_key,
             sender_key_mode,
+            security_context,
             fallback_conversation_name,
             header,
             ciphertext,
@@ -2211,6 +3588,7 @@ impl VeilClient {
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
         sender_key_mode: bool,
+        security_context: Option<&MessageSecurityContextV1>,
         fallback_conversation_name: Option<&str>,
         header: &[u8],
         ciphertext: &[u8],
@@ -2224,7 +3602,7 @@ impl VeilClient {
         if header.is_empty() || ciphertext.is_empty() {
             return Err("inbound E2E header and ciphertext must not be empty".to_string());
         }
-        if !self.trusted_signing_keys.contains_key(sender_identity_key) {
+        if !sender_key_mode && !self.trusted_signing_keys.contains_key(sender_identity_key) {
             return Err("inbound sender identity is not pinned to a signing key".to_string());
         }
         let wire_uses_sender_key = header.first() == Some(&HEADER_SENDER_KEY);
@@ -2232,6 +3610,19 @@ impl VeilClient {
             return Err(
                 "inbound E2E header conflicts with the pinned conversation type".to_string(),
             );
+        }
+        if sender_key_mode != security_context.is_some() {
+            return Err(
+                "inbound message security context conflicts with the conversation type".to_string(),
+            );
+        }
+        if let Some(security_context) = security_context {
+            self.validate_sender_key_message_context_v1(
+                conversation_id,
+                sender_identity_key,
+                ciphertext,
+                security_context,
+            )?;
         }
 
         let crypto_snapshot = self.receive_crypto_snapshot();
@@ -2260,11 +3651,12 @@ impl VeilClient {
                     fallback_conversation_name,
                 )?;
 
-            let plaintext = match self.decrypt_from(
+            let plaintext = match self.decrypt_from_with_security_context(
                 sender_identity_key,
                 conversation_id,
                 header,
                 ciphertext,
+                security_context,
             )? {
                 DecryptedPayload::Text(plaintext) => String::from_utf8(plaintext)
                     .map_err(|_| "inbound plaintext is not valid UTF-8".to_string())?,
@@ -2569,6 +3961,12 @@ impl VeilClient {
         ciphertext: &[u8],
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
     ) -> Result<String, String> {
+        if sender_key_mode || self.channel_conversations.contains(conversation_id) {
+            return Err(
+                "encrypted group/channel edits are disabled until an exact device edit protocol exists"
+                    .to_string(),
+            );
+        }
         if !self.trusted_signing_keys.contains_key(sender_identity_key) {
             return Err("edit sender identity is not pinned to a signing key".to_string());
         }
@@ -2726,6 +4124,12 @@ impl VeilClient {
         conversation_id: &str,
         new_text: &str,
     ) -> Result<u64, String> {
+        if self.channel_conversations.contains(conversation_id) {
+            return Err(
+                "group/channel edits are disabled until an exact device edit protocol exists"
+                    .to_string(),
+            );
+        }
         if new_text.is_empty() {
             return Err("edited plaintext must not be empty".to_string());
         }
@@ -3083,6 +4487,172 @@ impl Drop for VeilClient {
 mod tests {
     use super::*;
 
+    fn test_roster_commitment(candidate: &DeviceRosterCandidateV1) -> [u8; 32] {
+        let conversation = uuid::Uuid::parse_str(&candidate.conversation_id).unwrap();
+        let mut grouped: BTreeMap<[u8; 16], Vec<&DeviceRosterEntryV1>> = candidate
+            .member_user_ids
+            .iter()
+            .copied()
+            .map(|member| (member, Vec::new()))
+            .collect();
+        for device in &candidate.devices {
+            grouped.get_mut(&device.user_id).unwrap().push(device);
+        }
+        let mut canonical = Vec::new();
+        canonical.extend_from_slice(DEVICE_ROSTER_COMMITMENT_DOMAIN);
+        canonical.extend_from_slice(conversation.as_bytes());
+        canonical.extend_from_slice(&candidate.required_capabilities.to_be_bytes());
+        canonical.extend_from_slice(&(grouped.len() as u32).to_be_bytes());
+        for (member, devices) in &mut grouped {
+            canonical.extend_from_slice(member);
+            devices.sort_by_key(|device| device.device_id);
+            canonical.extend_from_slice(&(devices.len() as u32).to_be_bytes());
+            for device in devices {
+                canonical.extend_from_slice(&device.device_id);
+                match device.binding.as_ref() {
+                    Some(binding) => {
+                        canonical.push(binding.status);
+                        canonical.extend_from_slice(&binding.version.to_be_bytes());
+                        canonical.extend_from_slice(&binding.capabilities.to_be_bytes());
+                        canonical.extend_from_slice(&binding.device_identity_key);
+                        canonical.extend_from_slice(&binding.device_signing_key);
+                        canonical.extend_from_slice(&binding.account_signature);
+                    }
+                    None => {
+                        canonical.push(4);
+                        canonical.extend_from_slice(&[0u8; 8 + 8 + 32 + 32 + 64]);
+                    }
+                }
+            }
+        }
+        Sha256::digest(canonical).into()
+    }
+
+    fn roster_entry(
+        user_id: [u8; 16],
+        account: &IdentityKeyPair,
+        binding: &crate::device_identity::DeviceBindingPublicV1,
+    ) -> DeviceRosterEntryV1 {
+        DeviceRosterEntryV1 {
+            user_id,
+            account_identity_key: account.x25519_public_bytes(),
+            account_signing_key: account.ed25519_public_bytes(),
+            device_id: binding.device_id,
+            binding: Some(DeviceBindingCandidateV1 {
+                device_id: binding.device_id,
+                device_identity_key: binding.device_identity_key,
+                device_signing_key: binding.device_signing_key,
+                version: binding.version,
+                capabilities: binding.capabilities,
+                status: binding.status,
+                account_signature: binding.account_signature,
+            }),
+        }
+    }
+
+    fn candidate_with_commitment(
+        conversation_id: &str,
+        version: u64,
+        entries: Vec<DeviceRosterEntryV1>,
+    ) -> DeviceRosterCandidateV1 {
+        let mut members: Vec<[u8; 16]> = entries.iter().map(|entry| entry.user_id).collect();
+        members.sort();
+        members.dedup();
+        let mut candidate = DeviceRosterCandidateV1 {
+            conversation_id: conversation_id.to_string(),
+            roster_version: version,
+            roster_commitment: [0u8; 32],
+            required_capabilities: REQUIRED_DEVICE_CAPABILITIES,
+            ready: true,
+            member_user_ids: members,
+            devices: entries,
+        };
+        candidate.roster_commitment = test_roster_commitment(&candidate);
+        candidate
+    }
+
+    fn memory_client_with_device(
+        account: IdentityKeyPair,
+        user_id: uuid::Uuid,
+        device_id: [u8; 16],
+        db_key: [u8; 32],
+    ) -> VeilClient {
+        let stored = DeviceIdentityV1::generate_stored(&account, device_id).unwrap();
+        let device = DeviceIdentityV1::from_stored(&account, stored).unwrap();
+        let mut client = VeilClient::from_identity(account);
+        client.device_id = device_id;
+        client.device_identity = Some(device);
+        client.db = Some(VeilDb::open_memory(&db_key).unwrap());
+        client.authenticated_user_id = Some(user_id.hyphenated().to_string());
+        client
+    }
+
+    fn clone_local_device_at_version(client: &VeilClient, version: u64) -> DeviceIdentityV1 {
+        let account = client.identity.as_ref().unwrap();
+        let current = client.device_identity.as_ref().unwrap();
+        let binding = current.binding();
+        let account_identity_key = account.x25519_public_bytes();
+        let account_signing_key = account.ed25519_public_bytes();
+        let signature = veil_crypto::signature::sign(
+            account,
+            &device_binding_signing_bytes(
+                &account_identity_key,
+                &account_signing_key,
+                &binding.device_id,
+                version,
+                &binding.device_identity_key,
+                &binding.device_signing_key,
+                binding.capabilities,
+                binding.status,
+            ),
+        );
+        DeviceIdentityV1::from_stored(
+            account,
+            veil_store::db::LocalDeviceIdentityV1 {
+                device_id: binding.device_id,
+                version,
+                x25519_secret: current.x25519_secret().to_bytes(),
+                ed25519_secret: current.ed25519_signing_key().to_bytes(),
+                device_identity_key: binding.device_identity_key,
+                device_signing_key: binding.device_signing_key,
+                capabilities: binding.capabilities,
+                status: binding.status,
+                account_identity_key,
+                account_signing_key,
+                account_signature: signature,
+            },
+        )
+        .unwrap()
+    }
+
+    fn route_for_test(
+        sender: &VeilClient,
+        target: &DeviceTargetV1,
+        key: &PendingSenderKeyEnvelopeKey,
+    ) -> SenderKeyRouteV1 {
+        let local = sender.device_identity.as_ref().unwrap().binding();
+        SenderKeyRouteV1 {
+            conversation_id: target.conversation_id.clone(),
+            generation: key.generation,
+            target_account_identity_key: target.account_identity_key,
+            target_device_id: target.device_id,
+            target_device_identity_key: target.device_identity_key,
+            sender_device_id: sender.device_id,
+            sender_account_identity_key: sender.identity_key().unwrap(),
+            sender_account_signing_key: sender.signing_key().unwrap(),
+            sender_device_identity_key: local.device_identity_key,
+            sender_device_signing_key: local.device_signing_key,
+            sender_device_capabilities: local.capabilities,
+            sender_device_binding_status: local.status,
+            sender_account_signature: local.account_signature,
+            roster_version: target.roster_version,
+            roster_commitment: target.roster_commitment,
+            sender_binding_version: local.version,
+            target_binding_version: target.binding_version,
+            envelope_commitment: key.envelope_commitment,
+        }
+    }
+
     fn pending_sender_key(
         client: &VeilClient,
         conversation_id: &str,
@@ -3095,13 +4665,66 @@ mod tests {
         PendingSenderKeyEnvelopeKey {
             conversation_id: conversation_id.to_string(),
             generation: distribution.key_id,
-            target_identity_key,
+            target_device_id: target_identity_key[..16].try_into().unwrap(),
+            target_binding_version: 1,
+            roster_version: 1,
+            roster_commitment: [0xA1; 32],
+            envelope_commitment: [0xB2; 32],
         }
     }
 
     #[test]
     fn generated_device_id_is_never_the_legacy_zero_value() {
         assert_ne!(VeilClient::new().device_id, [0u8; 16]);
+    }
+
+    #[test]
+    fn roster_commitment_matches_the_go_cross_language_vector() {
+        let binding = |device: u8, status: u8, version: u64, key: u8| DeviceRosterEntryV1 {
+            user_id: [0u8; 16],
+            account_identity_key: [0x90; 32],
+            account_signing_key: [0x91; 32],
+            device_id: [device; 16],
+            binding: Some(DeviceBindingCandidateV1 {
+                device_id: [device; 16],
+                device_identity_key: [key; 32],
+                device_signing_key: [key + 1; 32],
+                version,
+                capabilities: 3,
+                status,
+                account_signature: [key + 2; 64],
+            }),
+        };
+        let user_one = *uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+            .unwrap()
+            .as_bytes();
+        let user_two = *uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002")
+            .unwrap()
+            .as_bytes();
+        let mut excluded = binding(0x30, 2, 7, 0x31);
+        excluded.user_id = user_one;
+        let mut active = binding(0x20, 1, 2, 0x21);
+        active.user_id = user_two;
+        let legacy = DeviceRosterEntryV1 {
+            user_id: user_two,
+            account_identity_key: [0x92; 32],
+            account_signing_key: [0x93; 32],
+            device_id: [0x10; 16],
+            binding: None,
+        };
+        let candidate = DeviceRosterCandidateV1 {
+            conversation_id: "00112233-4455-6677-8899-aabbccddeeff".to_string(),
+            roster_version: 1,
+            roster_commitment: [0u8; 32],
+            required_capabilities: 3,
+            ready: false,
+            member_user_ids: vec![user_two, user_one],
+            devices: vec![active, legacy, excluded],
+        };
+        assert_eq!(
+            hex::encode(test_roster_commitment(&candidate)),
+            "d2a757a44fb7f4fc28a17d92d6d874b4301bc0a17b71ae929ca1b65684923902"
+        );
     }
 
     #[test]
@@ -3128,6 +4751,941 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn validated_roster_targets_own_other_devices_and_invalidates_stale_runtime_proof() {
+        let local_user = uuid::Uuid::from_bytes([0x11; 16]);
+        let remote_user = uuid::Uuid::from_bytes([0x22; 16]);
+        let mut client = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            local_user,
+            [0x31; 16],
+            [0x71; 32],
+        );
+        let conversation = "00000000-0000-0000-0000-000000000301";
+        client.mark_channel_conversation(conversation);
+
+        let local_account = client.identity.as_ref().unwrap();
+        let local_entry = roster_entry(
+            *local_user.as_bytes(),
+            local_account,
+            client.device_identity.as_ref().unwrap().binding(),
+        );
+        let second_stored = DeviceIdentityV1::generate_stored(local_account, [0x32; 16]).unwrap();
+        let second_device = DeviceIdentityV1::from_stored(local_account, second_stored).unwrap();
+        let second_entry = roster_entry(
+            *local_user.as_bytes(),
+            local_account,
+            second_device.binding(),
+        );
+        let remote_account = IdentityKeyPair::generate();
+        let remote_stored = DeviceIdentityV1::generate_stored(&remote_account, [0x41; 16]).unwrap();
+        let remote_device = DeviceIdentityV1::from_stored(&remote_account, remote_stored).unwrap();
+        let remote_entry = roster_entry(
+            *remote_user.as_bytes(),
+            &remote_account,
+            remote_device.binding(),
+        );
+        let candidate = candidate_with_commitment(
+            conversation,
+            1,
+            vec![remote_entry, second_entry, local_entry],
+        );
+        client.install_device_roster_v1(candidate.clone()).unwrap();
+        let targets = client.sender_key_device_targets(conversation).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert!(targets.iter().any(|target| target.device_id == [0x32; 16]));
+        assert!(targets.iter().any(|target| target.device_id == [0x41; 16]));
+        assert!(!targets.iter().any(|target| target.device_id == [0x31; 16]));
+        assert_eq!(
+            client.sender_keys.outgoing_owner_identity_key(conversation),
+            Some(
+                client
+                    .device_identity
+                    .as_ref()
+                    .unwrap()
+                    .binding()
+                    .device_identity_key
+            )
+        );
+        let mut pending = Vec::new();
+        for (offset, target) in targets.iter().enumerate() {
+            let (key, first) = client.prepare_sender_key_device_envelope(target).unwrap();
+            let (_, retry) = client.prepare_sender_key_device_envelope(target).unwrap();
+            assert_eq!(retry, first);
+            let stored = client
+                .db()
+                .unwrap()
+                .load_pending_sender_key_device_envelope_v1(
+                    conversation,
+                    key.generation,
+                    &target.device_id,
+                    target.binding_version,
+                    target.roster_version,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.sealed_envelope, first);
+            let sequence = 800 + offset as u64;
+            client
+                .pending_sender_key_sequences
+                .insert(sequence, key.clone());
+            pending.push((sequence, key));
+        }
+        let (first_sequence, first_key) = &pending[0];
+        let mut wrong_ack = crate::connection::SenderKeyAckMetadataV1 {
+            target_device_id: first_key.target_device_id,
+            conversation_id: conversation.to_string(),
+            generation: first_key.generation,
+            roster_version: first_key.roster_version,
+            envelope_commitment: first_key.envelope_commitment,
+        };
+        wrong_ack.envelope_commitment[0] ^= 1;
+        assert!(client
+            .confirm_sender_key_distribution(*first_sequence, Some(&wrong_ack))
+            .is_err());
+        let exact_ack = crate::connection::SenderKeyAckMetadataV1 {
+            envelope_commitment: first_key.envelope_commitment,
+            ..wrong_ack
+        };
+        client
+            .confirm_sender_key_distribution(*first_sequence, Some(&exact_ack))
+            .unwrap();
+        assert_eq!(
+            client.sender_key_distribution_status(conversation),
+            "pending"
+        );
+        let (last_sequence, last_key) = &pending[1];
+        client
+            .confirm_sender_key_distribution(
+                *last_sequence,
+                Some(&crate::connection::SenderKeyAckMetadataV1 {
+                    target_device_id: last_key.target_device_id,
+                    conversation_id: conversation.to_string(),
+                    generation: last_key.generation,
+                    roster_version: last_key.roster_version,
+                    envelope_commitment: last_key.envelope_commitment,
+                }),
+            )
+            .unwrap();
+        assert_eq!(client.sender_key_distribution_status(conversation), "ready");
+        let account = client.identity.as_ref().unwrap();
+        assert!(client
+            .sender_keys
+            .encrypt_signed(conversation, account, b"account substitution")
+            .unwrap_err()
+            .contains("does not own"));
+
+        let mut not_ready = candidate;
+        not_ready.ready = false;
+        assert!(client.install_device_roster_v1(not_ready).is_err());
+        assert!(client.sender_key_device_targets(conversation).is_err());
+        assert!(client.encrypt_outgoing(conversation, "blocked").is_err());
+    }
+
+    #[test]
+    fn changed_roster_rotates_even_when_old_generation_is_still_prepared_and_zero_targets_complete()
+    {
+        let local_user = uuid::Uuid::from_bytes([0x51; 16]);
+        let removed_user = uuid::Uuid::from_bytes([0x52; 16]);
+        let mut client = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            local_user,
+            [0x61; 16],
+            [0x72; 32],
+        );
+        let conversation = "00000000-0000-0000-0000-000000000302";
+        client.mark_channel_conversation(conversation);
+        let local_entry = roster_entry(
+            *local_user.as_bytes(),
+            client.identity.as_ref().unwrap(),
+            client.device_identity.as_ref().unwrap().binding(),
+        );
+        let removed_account = IdentityKeyPair::generate();
+        let removed_stored =
+            DeviceIdentityV1::generate_stored(&removed_account, [0x62; 16]).unwrap();
+        let removed_device =
+            DeviceIdentityV1::from_stored(&removed_account, removed_stored).unwrap();
+        let removed_entry = roster_entry(
+            *removed_user.as_bytes(),
+            &removed_account,
+            removed_device.binding(),
+        );
+        client
+            .install_device_roster_v1(candidate_with_commitment(
+                conversation,
+                1,
+                vec![local_entry.clone(), removed_entry],
+            ))
+            .unwrap();
+        let first_generation = client
+            .sender_keys
+            .build_distribution(conversation)
+            .unwrap()
+            .key_id;
+        assert!(client
+            .prepared_sender_key_generations
+            .contains(conversation));
+
+        let single_device_roster = candidate_with_commitment(conversation, 2, vec![local_entry]);
+        client
+            .install_device_roster_v1(single_device_roster.clone())
+            .unwrap();
+        let second_generation = client
+            .sender_keys
+            .build_distribution(conversation)
+            .unwrap()
+            .key_id;
+        assert_eq!(second_generation, first_generation + 1);
+        assert!(client
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .is_empty());
+        assert_eq!(client.sender_key_distribution_status(conversation), "ready");
+        assert!(client
+            .encrypt_outgoing(conversation, "single device")
+            .is_ok());
+
+        let device_identity_key = client
+            .device_identity
+            .as_ref()
+            .unwrap()
+            .binding()
+            .device_identity_key;
+        let signing = ed25519_dalek::SigningKey::from_bytes(
+            &client
+                .device_identity
+                .as_ref()
+                .unwrap()
+                .ed25519_signing_key()
+                .to_bytes(),
+        );
+        while !client.sender_keys.needs_rotation(conversation) {
+            client
+                .sender_keys
+                .encrypt_signed_with_device(conversation, &device_identity_key, &signing, b"expire")
+                .unwrap();
+        }
+        let expired_generation = client
+            .sender_keys
+            .build_distribution(conversation)
+            .unwrap()
+            .key_id;
+        assert!(!client
+            .install_device_roster_v1(single_device_roster)
+            .unwrap());
+        assert_eq!(
+            client
+                .sender_keys
+                .build_distribution(conversation)
+                .unwrap()
+                .key_id,
+            expired_generation + 1,
+        );
+        assert_eq!(client.sender_key_distribution_status(conversation), "ready");
+        assert!(client
+            .encrypt_outgoing(conversation, "fresh single device")
+            .is_ok());
+    }
+
+    #[test]
+    fn retained_first_seen_tofu_conflict_rolls_back_key_route_and_receipt() {
+        let sender_user = uuid::Uuid::from_bytes([0x91; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0x92; 16]);
+        let mut sender = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_user,
+            [0x93; 16],
+            [0x94; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            recipient_user,
+            [0x95; 16],
+            [0x96; 32],
+        );
+        let conversation = "00000000-0000-0000-0000-000000000304";
+        let roster = candidate_with_commitment(
+            conversation,
+            1,
+            vec![
+                roster_entry(
+                    *sender_user.as_bytes(),
+                    sender.identity.as_ref().unwrap(),
+                    sender.device_identity.as_ref().unwrap().binding(),
+                ),
+                roster_entry(
+                    *recipient_user.as_bytes(),
+                    recipient.identity.as_ref().unwrap(),
+                    recipient.device_identity.as_ref().unwrap().binding(),
+                ),
+            ],
+        );
+        sender.mark_channel_conversation(conversation);
+        recipient.mark_channel_conversation(conversation);
+        sender.install_device_roster_v1(roster.clone()).unwrap();
+        recipient.install_device_roster_v1(roster).unwrap();
+        let target = sender
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (pending, sealed) = sender.prepare_sender_key_device_envelope(&target).unwrap();
+        let route = route_for_test(&sender, &target, &pending);
+        let sender_account_identity = sender.identity_key().unwrap();
+        recipient
+            .pin_peer_signing_key(sender_account_identity, [0xFF; 32])
+            .unwrap();
+
+        let error = recipient
+            .process_sender_key_distribution_inner_v1(
+                &sealed,
+                &route,
+                SenderKeyDistributionModeV1::Retained,
+            )
+            .unwrap_err();
+        assert!(error.contains("trusted signing key changed"));
+        assert!(!recipient.sender_keys.has_incoming_generation(
+            conversation,
+            &route.sender_device_identity_key,
+            route.generation,
+        ));
+        assert!(recipient
+            .db()
+            .unwrap()
+            .load_incoming_sender_key_generations_for_group(conversation)
+            .unwrap()
+            .is_empty());
+        assert!(recipient.pending_sender_key_receipts.is_empty());
+    }
+
+    #[test]
+    fn retained_failure_is_isolated_to_its_conversation() {
+        let sender_user = uuid::Uuid::from_bytes([0xA1; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0xA2; 16]);
+        let mut sender = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_user,
+            [0xA3; 16],
+            [0xA4; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            recipient_user,
+            [0xA5; 16],
+            [0xA6; 32],
+        );
+        let valid_conversation = "00000000-0000-0000-0000-000000000305";
+        let blocked_conversation = "00000000-0000-0000-0000-000000000306";
+        let roster = candidate_with_commitment(
+            valid_conversation,
+            1,
+            vec![
+                roster_entry(
+                    *sender_user.as_bytes(),
+                    sender.identity.as_ref().unwrap(),
+                    sender.device_identity.as_ref().unwrap().binding(),
+                ),
+                roster_entry(
+                    *recipient_user.as_bytes(),
+                    recipient.identity.as_ref().unwrap(),
+                    recipient.device_identity.as_ref().unwrap().binding(),
+                ),
+            ],
+        );
+        sender.mark_channel_conversation(valid_conversation);
+        recipient.mark_channel_conversation(valid_conversation);
+        recipient.mark_channel_conversation(blocked_conversation);
+        sender.install_device_roster_v1(roster.clone()).unwrap();
+        recipient.install_device_roster_v1(roster).unwrap();
+        let target = sender
+            .sender_key_device_targets(valid_conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (pending, sealed) = sender.prepare_sender_key_device_envelope(&target).unwrap();
+        let valid_route = route_for_test(&sender, &target, &pending);
+        let mut bad_route = valid_route.clone();
+        bad_route.conversation_id = blocked_conversation.to_string();
+        let outgoing_generation_before = recipient
+            .sender_keys
+            .build_distribution(valid_conversation)
+            .unwrap()
+            .key_id;
+
+        let report = recipient
+            .process_retained_sender_key_events_v1(vec![
+                ConnectionEvent::SenderKeyDist {
+                    sender_key_message: sealed.clone(),
+                    route: bad_route.clone(),
+                },
+                ConnectionEvent::SenderKeyDist {
+                    sender_key_message: sealed.clone(),
+                    route: bad_route,
+                },
+                ConnectionEvent::SenderKeyDist {
+                    sender_key_message: sealed,
+                    route: valid_route.clone(),
+                },
+            ])
+            .unwrap();
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].conversation_id, blocked_conversation);
+        assert!(report.diagnostics[0]
+            .reason
+            .contains("outer routing context"));
+        assert!(recipient.sender_keys.has_incoming_generation(
+            valid_conversation,
+            &valid_route.sender_device_identity_key,
+            valid_route.generation,
+        ));
+        assert!(!recipient.sender_keys.has_incoming_generation(
+            blocked_conversation,
+            &valid_route.sender_device_identity_key,
+            valid_route.generation,
+        ));
+        assert_eq!(recipient.pending_sender_key_receipts.len(), 1);
+        assert_eq!(
+            recipient
+                .sender_keys
+                .build_distribution(valid_conversation)
+                .unwrap()
+                .key_id,
+            outgoing_generation_before,
+        );
+    }
+
+    #[test]
+    fn retained_conversation_batch_rolls_back_an_earlier_success_before_diagnosing() {
+        let sender_a_user = uuid::Uuid::from_bytes([0xB1; 16]);
+        let sender_b_user = uuid::Uuid::from_bytes([0xB2; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0xB3; 16]);
+        let mut sender_a = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_a_user,
+            [0xB4; 16],
+            [0xB5; 32],
+        );
+        let mut sender_b = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_b_user,
+            [0xB6; 16],
+            [0xB7; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            recipient_user,
+            [0xB8; 16],
+            [0xB9; 32],
+        );
+        let conversation_a = "00000000-0000-0000-0000-000000000307";
+        let conversation_b = "00000000-0000-0000-0000-000000000308";
+
+        let recipient_entry = || {
+            roster_entry(
+                *recipient_user.as_bytes(),
+                recipient.identity.as_ref().unwrap(),
+                recipient.device_identity.as_ref().unwrap().binding(),
+            )
+        };
+        let roster_a = candidate_with_commitment(
+            conversation_a,
+            1,
+            vec![
+                roster_entry(
+                    *sender_a_user.as_bytes(),
+                    sender_a.identity.as_ref().unwrap(),
+                    sender_a.device_identity.as_ref().unwrap().binding(),
+                ),
+                recipient_entry(),
+            ],
+        );
+        let roster_b = candidate_with_commitment(
+            conversation_b,
+            1,
+            vec![
+                roster_entry(
+                    *sender_b_user.as_bytes(),
+                    sender_b.identity.as_ref().unwrap(),
+                    sender_b.device_identity.as_ref().unwrap().binding(),
+                ),
+                recipient_entry(),
+            ],
+        );
+        for conversation in [conversation_a, conversation_b] {
+            recipient.mark_channel_conversation(conversation);
+        }
+        sender_a.mark_channel_conversation(conversation_a);
+        sender_b.mark_channel_conversation(conversation_b);
+        sender_a.install_device_roster_v1(roster_a.clone()).unwrap();
+        recipient.install_device_roster_v1(roster_a).unwrap();
+        sender_b.install_device_roster_v1(roster_b.clone()).unwrap();
+        recipient.install_device_roster_v1(roster_b).unwrap();
+
+        let target_a = sender_a
+            .sender_key_device_targets(conversation_a)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let target_b = sender_b
+            .sender_key_device_targets(conversation_b)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (pending_a, sealed_a) = sender_a
+            .prepare_sender_key_device_envelope(&target_a)
+            .unwrap();
+        let (pending_b, sealed_b) = sender_b
+            .prepare_sender_key_device_envelope(&target_b)
+            .unwrap();
+        let route_a = route_for_test(&sender_a, &target_a, &pending_a);
+        let route_b = route_for_test(&sender_b, &target_b, &pending_b);
+        let mut conflicting_a = route_a.clone();
+        conflicting_a.sender_account_signature[0] ^= 1;
+
+        let report = recipient
+            .process_retained_sender_key_events_v1(vec![
+                ConnectionEvent::SenderKeyDist {
+                    sender_key_message: sealed_a.clone(),
+                    route: route_a.clone(),
+                },
+                ConnectionEvent::SenderKeyDist {
+                    sender_key_message: sealed_b,
+                    route: route_b.clone(),
+                },
+                ConnectionEvent::SenderKeyDist {
+                    sender_key_message: sealed_a,
+                    route: conflicting_a,
+                },
+            ])
+            .unwrap();
+        assert_eq!(report.processed, 1);
+        assert_eq!(report.diagnostics.len(), 1);
+        assert_eq!(report.diagnostics[0].conversation_id, conversation_a);
+        assert!(!recipient.sender_keys.has_incoming_generation(
+            conversation_a,
+            &route_a.sender_device_identity_key,
+            route_a.generation,
+        ));
+        assert!(recipient.sender_keys.has_incoming_generation(
+            conversation_b,
+            &route_b.sender_device_identity_key,
+            route_b.generation,
+        ));
+        assert!(recipient
+            .db()
+            .unwrap()
+            .load_incoming_sender_key_generations_for_group(conversation_a)
+            .unwrap()
+            .is_empty());
+        assert!(recipient
+            .db()
+            .unwrap()
+            .load_incoming_sender_key_route_v1(
+                conversation_a,
+                &route_a.sender_device_identity_key,
+                route_a.generation,
+            )
+            .unwrap()
+            .is_none());
+        assert!(!recipient.peer_signing_key_is_pinned(
+            &route_a.sender_account_identity_key,
+            &route_a.sender_account_signing_key,
+        ));
+        assert!(recipient.peer_signing_key_is_pinned(
+            &route_b.sender_account_identity_key,
+            &route_b.sender_account_signing_key,
+        ));
+        assert_eq!(recipient.pending_sender_key_receipts.len(), 1);
+        assert_eq!(
+            recipient.pending_sender_key_receipts[0].conversation_id,
+            conversation_b
+        );
+    }
+
+    #[test]
+    fn live_sender_key_generation_cap_blocks_only_the_affected_conversation() {
+        let sender_user = uuid::Uuid::from_bytes([0xC1; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0xC2; 16]);
+        let mut sender = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_user,
+            [0xC3; 16],
+            [0xC4; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            recipient_user,
+            [0xC5; 16],
+            [0xC6; 32],
+        );
+        let bounded = "00000000-0000-0000-0000-000000000309";
+        let independent = "00000000-0000-0000-0000-000000000310";
+        for conversation in [bounded, independent] {
+            let entries = vec![
+                roster_entry(
+                    *sender_user.as_bytes(),
+                    sender.identity.as_ref().unwrap(),
+                    sender.device_identity.as_ref().unwrap().binding(),
+                ),
+                roster_entry(
+                    *recipient_user.as_bytes(),
+                    recipient.identity.as_ref().unwrap(),
+                    recipient.device_identity.as_ref().unwrap().binding(),
+                ),
+            ];
+            let roster = candidate_with_commitment(conversation, 1, entries);
+            sender.mark_channel_conversation(conversation);
+            recipient.mark_channel_conversation(conversation);
+            sender.install_device_roster_v1(roster.clone()).unwrap();
+            recipient.install_device_roster_v1(roster).unwrap();
+        }
+        let bounded_target = sender
+            .sender_key_device_targets(bounded)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        for accepted in 0..veil_crypto::sender_key::MAX_RETAINED_GENERATIONS_PER_SENDER {
+            let (pending, sealed) = sender
+                .prepare_sender_key_device_envelope(&bounded_target)
+                .unwrap();
+            let route = route_for_test(&sender, &bounded_target, &pending);
+            recipient
+                .process_sender_key_distribution_v1(&sealed, &route)
+                .unwrap();
+            assert_eq!(pending.generation as usize, accepted + 1);
+            sender.rotate_sender_key(bounded).unwrap();
+        }
+        let (overflow_pending, overflow_sealed) = sender
+            .prepare_sender_key_device_envelope(&bounded_target)
+            .unwrap();
+        let overflow_route = route_for_test(&sender, &bounded_target, &overflow_pending);
+        assert!(recipient
+            .process_sender_key_distribution_v1(&overflow_sealed, &overflow_route)
+            .unwrap_err()
+            .contains("retention limit"));
+        assert_eq!(
+            recipient
+                .db()
+                .unwrap()
+                .load_incoming_sender_key_generations_for_group(bounded)
+                .unwrap()
+                .len(),
+            veil_crypto::sender_key::MAX_RETAINED_GENERATIONS_PER_SENDER,
+        );
+        assert_eq!(
+            recipient.pending_sender_key_receipts.len(),
+            veil_crypto::sender_key::MAX_RETAINED_GENERATIONS_PER_SENDER,
+        );
+
+        let independent_target = sender
+            .sender_key_device_targets(independent)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (pending, sealed) = sender
+            .prepare_sender_key_device_envelope(&independent_target)
+            .unwrap();
+        let route = route_for_test(&sender, &independent_target, &pending);
+        recipient
+            .process_sender_key_distribution_v1(&sealed, &route)
+            .unwrap();
+        assert!(recipient.sender_keys.has_incoming_generation(
+            independent,
+            &route.sender_device_identity_key,
+            route.generation,
+        ));
+        assert_eq!(
+            recipient.pending_sender_key_receipts.len(),
+            veil_crypto::sender_key::MAX_RETAINED_GENERATIONS_PER_SENDER + 1,
+        );
+    }
+
+    #[test]
+    fn hydration_rejects_oversized_generation_history_without_partial_heap_state() {
+        let user = uuid::Uuid::from_bytes([0xD1; 16]);
+        let mut client =
+            memory_client_with_device(IdentityKeyPair::generate(), user, [0xD2; 16], [0xD3; 32]);
+        let bounded = "00000000-0000-0000-0000-000000000311";
+        let independent = "00000000-0000-0000-0000-000000000312";
+        let sender = [0xD4; 32];
+        let mut source = SenderKeyStore::new();
+        for generation in
+            1..=veil_crypto::sender_key::MAX_RETAINED_GENERATIONS_PER_SENDER as u32 + 1
+        {
+            source
+                .create_outgoing_at_generation(bounded, &sender, generation)
+                .unwrap();
+            let data = source.serialize_outgoing(bounded).unwrap();
+            client
+                .db()
+                .unwrap()
+                .conn()
+                .execute(
+                    "INSERT INTO sender_key_incoming_generations
+                        (group_id, sender_identity_key, generation, iteration,
+                         state_revision, distribution_commitment, key_data)
+                     VALUES (?1, ?2, ?3, 0, ?4, ?5, ?6)",
+                    rusqlite::params![
+                        bounded,
+                        sender.as_slice(),
+                        i64::from(generation),
+                        0u64.to_be_bytes().as_slice(),
+                        [0u8; 32].as_slice(),
+                        data.as_slice(),
+                    ],
+                )
+                .unwrap();
+        }
+        assert!(client
+            .hydrate_channel_sender_keys(bounded)
+            .unwrap_err()
+            .contains("retention limit"));
+        assert!(client
+            .sender_keys
+            .incoming_generations(bounded, &sender)
+            .is_empty());
+
+        source
+            .create_outgoing_at_generation(independent, &sender, 1)
+            .unwrap();
+        let independent_data = source.serialize_outgoing(independent).unwrap();
+        client
+            .db()
+            .unwrap()
+            .save_incoming_sender_key_generation(
+                independent,
+                &sender,
+                1,
+                0,
+                0,
+                &[0u8; 32],
+                &independent_data,
+            )
+            .unwrap();
+        assert_eq!(
+            client.hydrate_channel_sender_keys(independent).unwrap(),
+            OfflineSenderKeyRefresh::Required,
+        );
+        assert!(client
+            .sender_keys
+            .has_incoming_generation(independent, &sender, 1));
+    }
+
+    #[test]
+    fn exact_device_skdm_restores_and_decrypts_two_generations_after_restart() {
+        let sender_mnemonic = generate_mnemonic().to_string();
+        let recipient_mnemonic = generate_mnemonic().to_string();
+        let sender_path =
+            std::env::temp_dir().join(format!("veil-device-sender-{}.db", uuid::Uuid::new_v4()));
+        let recipient_path =
+            std::env::temp_dir().join(format!("veil-device-recipient-{}.db", uuid::Uuid::new_v4()));
+        let sender_user = uuid::Uuid::from_bytes([0x71; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0x72; 16]);
+        let conversation = "00000000-0000-0000-0000-000000000303";
+
+        let mut sender = VeilClient::new();
+        sender
+            .init_with_mnemonic(&sender_mnemonic, &sender_path)
+            .unwrap();
+        sender.authenticated_user_id = Some(sender_user.hyphenated().to_string());
+        let mut recipient = VeilClient::new();
+        recipient
+            .init_with_mnemonic(&recipient_mnemonic, &recipient_path)
+            .unwrap();
+        recipient.authenticated_user_id = Some(recipient_user.hyphenated().to_string());
+        recipient.device_identity = Some(clone_local_device_at_version(&recipient, 2));
+        let sender_account_key = sender.identity_key().unwrap();
+        let sender_account_signing_key = sender.signing_key().unwrap();
+        let sender_entry = roster_entry(
+            *sender_user.as_bytes(),
+            sender.identity.as_ref().unwrap(),
+            sender.device_identity.as_ref().unwrap().binding(),
+        );
+        let recipient_entry = roster_entry(
+            *recipient_user.as_bytes(),
+            recipient.identity.as_ref().unwrap(),
+            recipient.device_identity.as_ref().unwrap().binding(),
+        );
+        let candidate =
+            candidate_with_commitment(conversation, 1, vec![recipient_entry, sender_entry]);
+        sender.mark_channel_conversation(conversation);
+        recipient.mark_channel_conversation(conversation);
+        sender.install_device_roster_v1(candidate.clone()).unwrap();
+        recipient
+            .install_device_roster_v1(candidate.clone())
+            .unwrap();
+
+        let recipient_target = sender
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.user_id == *recipient_user.as_bytes())
+            .unwrap();
+        let (key_one, sealed_one) = sender
+            .prepare_sender_key_device_envelope(&recipient_target)
+            .unwrap();
+        let mut route_one = route_for_test(&sender, &recipient_target, &key_one);
+        // A retained generation may have been published under an older roster
+        // while the immutable sender device binding is still present now.
+        route_one.roster_version = 77;
+        route_one.roster_commitment = [0x77; 32];
+        route_one.target_binding_version = 1;
+        assert!(recipient
+            .process_sender_key_distribution_v1(&sealed_one, &route_one)
+            .unwrap_err()
+            .contains("exact current roster"));
+        let mut future_target = route_one.clone();
+        future_target.target_binding_version = 3;
+        assert!(recipient
+            .process_sender_key_distribution_inner_v1(
+                &sealed_one,
+                &future_target,
+                SenderKeyDistributionModeV1::Retained,
+            )
+            .is_err());
+        let mut substituted_target_key = route_one.clone();
+        substituted_target_key.target_device_identity_key[0] ^= 1;
+        assert!(recipient
+            .process_sender_key_distribution_inner_v1(
+                &sealed_one,
+                &substituted_target_key,
+                SenderKeyDistributionModeV1::Retained,
+            )
+            .is_err());
+        let mut bad_sender_proof = route_one.clone();
+        bad_sender_proof.sender_account_signature[0] ^= 1;
+        assert!(recipient
+            .process_sender_key_distribution_inner_v1(
+                &sealed_one,
+                &bad_sender_proof,
+                SenderKeyDistributionModeV1::Retained,
+            )
+            .is_err());
+        let receipt_one = recipient
+            .process_sender_key_distribution_inner_v1(
+                &sealed_one,
+                &route_one,
+                SenderKeyDistributionModeV1::Retained,
+            )
+            .unwrap();
+        assert_eq!(receipt_one.envelope_commitment, key_one.envelope_commitment);
+        assert!(
+            recipient.peer_signing_key_is_pinned(&sender_account_key, &sender_account_signing_key,)
+        );
+        sender.mark_sender_key_distributed(conversation).unwrap();
+        let (ciphertext_one, header_one) = sender
+            .encrypt_outgoing(conversation, "generation one")
+            .unwrap();
+
+        sender.rotate_sender_key(conversation).unwrap();
+        let (key_two, sealed_two) = sender
+            .prepare_sender_key_device_envelope(&recipient_target)
+            .unwrap();
+        assert_eq!(key_two.generation, key_one.generation + 1);
+        let route_two = route_for_test(&sender, &recipient_target, &key_two);
+        recipient
+            .process_sender_key_distribution_v1(&sealed_two, &route_two)
+            .unwrap();
+        assert_eq!(recipient.pending_sender_key_receipts.len(), 2);
+        let acked_receipt = recipient.pending_sender_key_receipts.pop_front().unwrap();
+        recipient
+            .pending_sender_key_receipt_sequences
+            .insert(901, acked_receipt.clone());
+        recipient
+            .confirm_sender_key_distribution(
+                901,
+                Some(&crate::connection::SenderKeyAckMetadataV1 {
+                    target_device_id: acked_receipt.target_device_id,
+                    conversation_id: acked_receipt.conversation_id.clone(),
+                    generation: acked_receipt.generation,
+                    roster_version: acked_receipt.roster_version,
+                    envelope_commitment: acked_receipt.envelope_commitment,
+                }),
+            )
+            .unwrap();
+        assert!(!recipient
+            .pending_sender_key_receipt_sequences
+            .contains_key(&901));
+        let lost_ack_receipt = recipient.pending_sender_key_receipts.pop_front().unwrap();
+        recipient
+            .pending_sender_key_receipt_sequences
+            .insert(902, lost_ack_receipt.clone());
+        recipient.mark_all_pending_sequences_unknown().unwrap();
+        assert!(recipient.pending_sender_key_receipt_sequences.is_empty());
+        assert!(!recipient
+            .pending_sender_key_receipt_set
+            .contains(&lost_ack_receipt));
+        sender.mark_sender_key_distributed(conversation).unwrap();
+        let (ciphertext_two, header_two) = sender
+            .encrypt_outgoing(conversation, "generation two")
+            .unwrap();
+        drop(recipient);
+
+        let mut restored = VeilClient::new();
+        restored
+            .init_with_mnemonic(&recipient_mnemonic, &recipient_path)
+            .unwrap();
+        restored.authenticated_user_id = Some(recipient_user.hyphenated().to_string());
+        restored.device_identity = Some(clone_local_device_at_version(&restored, 2));
+        restored.mark_channel_conversation(conversation);
+        assert_eq!(
+            restored.hydrate_channel_sender_keys(conversation).unwrap(),
+            OfflineSenderKeyRefresh::AlreadyRotated
+        );
+        restored.install_device_roster_v1(candidate).unwrap();
+        let context = |route: &SenderKeyRouteV1| {
+            MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+                roster_version: route.roster_version,
+                roster_commitment: route.roster_commitment,
+                sender_device_id: route.sender_device_id,
+                target_device_id: route.target_device_id,
+                sender_binding_version: route.sender_binding_version,
+            })
+        };
+        let context_two = context(&route_two);
+        let context_one = context(&route_one);
+        match restored
+            .decrypt_from_with_security_context(
+                &sender_account_key,
+                conversation,
+                &header_two,
+                &ciphertext_two,
+                Some(&context_two),
+            )
+            .unwrap()
+        {
+            DecryptedPayload::Text(text) => assert_eq!(text, b"generation two"),
+            DecryptedPayload::Control => panic!("generation two decoded as control"),
+        }
+        match restored
+            .decrypt_from_with_security_context(
+                &sender_account_key,
+                conversation,
+                &header_one,
+                &ciphertext_one,
+                Some(&context_one),
+            )
+            .unwrap()
+        {
+            DecryptedPayload::Text(text) => assert_eq!(text, b"generation one"),
+            DecryptedPayload::Control => panic!("generation one decoded as control"),
+        }
+
+        drop(restored);
+        for path in [&sender_path, &recipient_path] {
+            let _ = std::fs::remove_file(path);
+            let _ = std::fs::remove_file(path.with_extension("db-wal"));
+            let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        }
     }
 
     #[test]
@@ -3177,30 +5735,93 @@ mod tests {
     }
 
     #[test]
-    fn retained_sender_keys_stop_at_first_live_fifo_event() {
-        let skdm = || ConnectionEvent::SenderKeyDist {
-            conversation_id: "group".to_string(),
-            sender_key_message: vec![1],
-            generation: 1,
-            target_identity_key: vec![2; 32],
-        };
-        let live = ConnectionEvent::MessageReceived {
-            message_id: "message".to_string(),
-            conversation_id: "group".to_string(),
-            sender_identity_key: vec![3; 32],
-            sender_username: "Alice".to_string(),
+    fn first_post_barrier_skdm_stays_live_fifo_and_requires_exact_current_roster() {
+        let sender_user = uuid::Uuid::from_bytes([0xE1; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0xE2; 16]);
+        let mut sender = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_user,
+            [0xE3; 16],
+            [0xE4; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            recipient_user,
+            [0xE5; 16],
+            [0xE6; 32],
+        );
+        let conversation = "00000000-0000-0000-0000-000000000313";
+        let roster = candidate_with_commitment(
+            conversation,
+            1,
+            vec![
+                roster_entry(
+                    *sender_user.as_bytes(),
+                    sender.identity.as_ref().unwrap(),
+                    sender.device_identity.as_ref().unwrap().binding(),
+                ),
+                roster_entry(
+                    *recipient_user.as_bytes(),
+                    recipient.identity.as_ref().unwrap(),
+                    recipient.device_identity.as_ref().unwrap().binding(),
+                ),
+            ],
+        );
+        sender.mark_channel_conversation(conversation);
+        recipient.mark_channel_conversation(conversation);
+        sender.install_device_roster_v1(roster.clone()).unwrap();
+        recipient.install_device_roster_v1(roster).unwrap();
+        let target = sender
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (pending, sealed) = sender.prepare_sender_key_device_envelope(&target).unwrap();
+        let mut stale_route = route_for_test(&sender, &target, &pending);
+        stale_route.roster_version += 1;
+        stale_route.roster_commitment[0] ^= 1;
+        let next_live = ConnectionEvent::MessageReceived {
+            message_id: "next-live-message".to_string(),
+            conversation_id: conversation.to_string(),
+            sender_identity_key: sender.identity_key().unwrap().to_vec(),
+            sender_username: "Sender".to_string(),
             ciphertext: vec![4],
             header: vec![HEADER_SENDER_KEY],
             server_timestamp: 1,
             reply_to_id: None,
+            security_context: None,
         };
-        let (retained, deferred) = split_retained_sender_key_prefix(vec![skdm(), live, skdm()]);
-        assert_eq!(retained.len(), 1);
-        assert_eq!(deferred.len(), 2);
+        let report = recipient
+            .process_retained_and_defer_live_events_v1(
+                Vec::new(),
+                vec![
+                    ConnectionEvent::SenderKeyDist {
+                        sender_key_message: sealed.clone(),
+                        route: stale_route.clone(),
+                    },
+                    next_live,
+                ],
+            )
+            .unwrap();
+        assert_eq!(report, RetainedSenderKeyProcessReportV1::default());
+        let first = recipient.deferred_connection_events.pop_front().unwrap();
+        match first {
+            ConnectionEvent::SenderKeyDist {
+                sender_key_message,
+                route,
+            } => assert!(recipient
+                .process_sender_key_distribution_v1(&sender_key_message, &route)
+                .unwrap_err()
+                .contains("exact current roster")),
+            _ => panic!("first post-barrier event was reordered"),
+        }
         assert!(matches!(
-            deferred.back(),
-            Some(ConnectionEvent::SenderKeyDist { .. })
+            recipient.deferred_connection_events.pop_front(),
+            Some(ConnectionEvent::MessageReceived { message_id, .. })
+                if message_id == "next-live-message"
         ));
+        assert!(recipient.pending_sender_key_receipts.is_empty());
     }
 
     #[test]
@@ -3372,6 +5993,7 @@ mod tests {
                     "dm-restart",
                     &bob_key,
                     false,
+                    None,
                     Some("Bob"),
                     &reply_header,
                     &reply_ciphertext,
@@ -3447,6 +6069,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 false,
+                None,
                 Some("Alice"),
                 &header,
                 &ciphertext,
@@ -3475,6 +6098,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 false,
+                None,
                 Some("Alice"),
                 &header,
                 &ciphertext,
@@ -3504,6 +6128,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 false,
+                None,
                 Some("Alice"),
                 &header,
                 &ciphertext,
@@ -3568,6 +6193,8 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
+    #[ignore = "superseded by exact-device Sender-Key v5 roster tests"]
     fn authenticated_skdm_requires_current_directory_authorization() {
         let alice_identity = IdentityKeyPair::generate();
         let alice_ik = alice_identity.x25519_public_bytes();
@@ -3627,6 +6254,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded by exact-device Sender-Key v5 roster tests"]
     fn sender_key_send_unblocks_only_after_every_ack() {
         let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
         client.rotate_sender_key("group-1").unwrap();
@@ -3635,9 +6263,9 @@ mod tests {
         client.pending_sender_key_sequences.insert(10, pending_10);
         client.pending_sender_key_sequences.insert(11, pending_11);
 
-        client.confirm_sender_key_distribution(10).unwrap();
+        client.confirm_sender_key_distribution(10, None).unwrap();
         assert!(client.sender_key_distribution_pending.contains("group-1"));
-        client.confirm_sender_key_distribution(11).unwrap();
+        client.confirm_sender_key_distribution(11, None).unwrap();
         assert!(!client.sender_key_distribution_pending.contains("group-1"));
 
         let generation_before_reconnect = client.sender_keys.serialize_outgoing("group-1").unwrap();
@@ -3671,6 +6299,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded by exact-device Sender-Key v5 retry tests"]
     fn sender_key_lost_ack_retries_exact_persisted_envelopes() {
         let identity = IdentityKeyPair::generate();
         let sender_identity = identity.x25519_public_bytes();
@@ -3700,7 +6329,7 @@ mod tests {
         // One ACK arrives, then the connection dies before the second. The
         // full roster will be retried, so even the acknowledged target's bytes
         // must remain cached until the attempt completes as a whole.
-        client.confirm_sender_key_distribution(101).unwrap();
+        client.confirm_sender_key_distribution(101, None).unwrap();
         client.mark_pending_sequence_unknown(102).unwrap();
         assert!(client
             .failed_sender_key_distributions
@@ -3733,7 +6362,7 @@ mod tests {
         assert_eq!(retry_b, first_b);
         client.pending_sender_key_sequences.insert(103, retry_key_a);
         client.pending_sender_key_sequences.insert(104, retry_key_b);
-        client.confirm_sender_key_distribution(103).unwrap();
+        client.confirm_sender_key_distribution(103, None).unwrap();
         assert!(client
             .db()
             .unwrap()
@@ -3745,7 +6374,7 @@ mod tests {
             )
             .unwrap()
             .is_some());
-        client.confirm_sender_key_distribution(104).unwrap();
+        client.confirm_sender_key_distribution(104, None).unwrap();
         assert!(!client
             .sender_key_distribution_pending
             .contains(conversation_id));
@@ -3764,6 +6393,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded by exact-device Sender-Key v5 retry tests"]
     fn sender_key_retry_cache_survives_restart_until_rotation_invalidation() {
         let mnemonic = generate_mnemonic().to_string();
         let path = std::env::temp_dir().join(format!(
@@ -3829,6 +6459,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded by exact-device roster rotation tests"]
     fn sender_key_roster_change_rotates_and_blocks_until_new_ack() {
         let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
         let conversation_id = "group-membership-change";
@@ -3881,13 +6512,14 @@ mod tests {
         assert!(client
             .encrypt_outgoing(conversation_id, "still waiting")
             .is_err());
-        client.confirm_sender_key_distribution(77).unwrap();
+        client.confirm_sender_key_distribution(77, None).unwrap();
         assert!(client
             .encrypt_outgoing(conversation_id, "fresh generation")
             .is_ok());
     }
 
     #[test]
+    #[ignore = "superseded by exact-device roster rotation tests"]
     fn sender_key_iteration_limit_rotates_once_and_blocks_until_distribution_complete() {
         let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
         let conversation_id = "group-iteration-limit";
@@ -3973,6 +6605,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "superseded by exact-device cold-restore tests"]
     fn cold_restore_conservatively_rotates_once_when_roster_continuity_is_unknown() {
         let identity = IdentityKeyPair::generate();
         let our_identity = identity.x25519_public_bytes();
@@ -4005,6 +6638,7 @@ mod tests {
         client.channel_conversations.clear();
         client.authorized_conversation_senders.clear();
         client.sender_key_distribution_pending.clear();
+        client.prepared_sender_key_generations.clear();
         client
             .replace_authorized_conversation_senders(conversation_id, [our_identity])
             .unwrap();
@@ -4033,7 +6667,7 @@ mod tests {
         // freshly persisted generation and cannot rotate forever.
         assert_eq!(
             client.hydrate_channel_sender_keys(conversation_id).unwrap(),
-            OfflineSenderKeyRefresh::Required
+            OfflineSenderKeyRefresh::AlreadyRotated
         );
         assert_eq!(
             &*client
@@ -4063,6 +6697,208 @@ mod tests {
         assert!(client
             .encrypt_outgoing(conversation_id, "new roster only")
             .is_ok());
+    }
+
+    #[test]
+    #[ignore = "superseded by exact-device cold-restore tests"]
+    fn cold_restore_early_hydration_cannot_cause_a_second_rotation() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path = std::env::temp_dir().join(format!(
+            "veil-client-cold-restore-once-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let conversation_id = "channel-cold-restore-once";
+        let peer = [0xB4u8; 32];
+        let persisted_generation = {
+            let mut initial = VeilClient::new();
+            initial.init_with_mnemonic(&mnemonic, &path).unwrap();
+            let our_identity = initial.identity_key().unwrap();
+            initial
+                .replace_authorized_conversation_senders(conversation_id, [our_identity, peer])
+                .unwrap();
+            initial.mark_channel_conversation(conversation_id);
+            initial.rotate_sender_key(conversation_id).unwrap();
+            initial
+                .mark_sender_key_distributed(conversation_id)
+                .unwrap();
+            initial
+                .sender_keys
+                .build_distribution(conversation_id)
+                .unwrap()
+                .key_id
+        };
+
+        let mut restored = VeilClient::new();
+        restored.init_with_mnemonic(&mnemonic, &path).unwrap();
+
+        // Reproduce the real race that used to create N+2: a renderer-driven
+        // hydration happens before offline sync and discards its return value.
+        restored.mark_channel_conversation(conversation_id);
+        assert_eq!(
+            restored
+                .hydrate_channel_sender_keys(conversation_id)
+                .unwrap(),
+            OfflineSenderKeyRefresh::AlreadyRotated
+        );
+        let once_rotated_generation = restored
+            .sender_keys
+            .build_distribution(conversation_id)
+            .unwrap()
+            .key_id;
+        assert_eq!(once_rotated_generation, persisted_generation + 1);
+
+        // Offline directory pinning/hydration runs later. The session marker,
+        // not the discarded first return value, carries the exact transition.
+        let our_identity = restored.identity_key().unwrap();
+        restored
+            .replace_authorized_conversation_senders(conversation_id, [our_identity, peer])
+            .unwrap();
+        let sync_refresh = restored
+            .hydrate_channel_sender_keys(conversation_id)
+            .unwrap();
+        assert_eq!(sync_refresh, OfflineSenderKeyRefresh::AlreadyRotated);
+        assert!(restored
+            .begin_offline_sender_key_distribution(conversation_id, sync_refresh)
+            .unwrap());
+        assert_eq!(
+            restored
+                .sender_keys
+                .build_distribution(conversation_id)
+                .unwrap()
+                .key_id,
+            once_rotated_generation
+        );
+        assert!(restored
+            .encrypt_outgoing(conversation_id, "blocked until durable fanout")
+            .is_err());
+
+        drop(restored);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    #[ignore = "superseded by exact-device retry tests"]
+    fn pending_security_refresh_rotates_once_but_failed_retry_reuses_it() {
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        let conversation_id = "channel-security-refresh";
+        client.mark_channel_conversation(conversation_id);
+        client.rotate_sender_key(conversation_id).unwrap();
+        client.mark_sender_key_distributed(conversation_id).unwrap();
+        let generation_before = client
+            .sender_keys
+            .build_distribution(conversation_id)
+            .unwrap()
+            .key_id;
+
+        // A peer-generation/security invalidation marks distribution pending
+        // without having prepared a new local generation yet.
+        client
+            .sender_key_distribution_pending
+            .insert(conversation_id.to_string());
+        assert!(client
+            .begin_sender_key_distribution(conversation_id)
+            .unwrap());
+        let prepared_generation = client
+            .sender_keys
+            .build_distribution(conversation_id)
+            .unwrap()
+            .key_id;
+        assert_eq!(prepared_generation, generation_before + 1);
+
+        // A retry of that still-pending attempt is immutable and cannot rotate
+        // again merely because the transport failed before producing an ACK.
+        client.mark_sender_key_distribution_failed(conversation_id);
+        assert!(client
+            .begin_sender_key_distribution(conversation_id)
+            .unwrap());
+        assert_eq!(
+            client
+                .sender_keys
+                .build_distribution(conversation_id)
+                .unwrap()
+                .key_id,
+            prepared_generation
+        );
+    }
+
+    #[test]
+    #[ignore = "superseded by exact-device atomic rotation tests"]
+    fn failed_rotation_keeps_live_generation_and_exact_retry_cache() {
+        let identity = IdentityKeyPair::generate();
+        let sender_identity = identity.x25519_public_bytes();
+        let target_identity = IdentityKeyPair::generate().x25519_public_bytes();
+        let conversation_id = "channel-atomic-rotation-failure";
+        let mut client = VeilClient::from_identity(identity);
+        client.db = Some(VeilDb::open_memory(&[0x96u8; 32]).unwrap());
+        client.mark_channel_conversation(conversation_id);
+        client.rotate_sender_key(conversation_id).unwrap();
+        client.mark_sender_key_distributed(conversation_id).unwrap();
+        let (cache_key, cached_wire) = client
+            .prepare_sender_key_envelope(conversation_id, &target_identity)
+            .unwrap();
+        let state_before = client
+            .sender_keys
+            .serialize_outgoing(conversation_id)
+            .unwrap();
+        client
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER abort_client_rotation_cache_delete
+                 BEFORE DELETE ON pending_sender_key_envelopes
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected client rotation failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = client.rotate_sender_key(conversation_id).unwrap_err();
+        assert!(error.contains("injected client rotation failure"));
+        assert_eq!(
+            client
+                .sender_keys
+                .serialize_outgoing(conversation_id)
+                .unwrap()
+                .as_slice(),
+            state_before.as_slice()
+        );
+        assert_eq!(
+            client.pending_sender_key_envelopes.get(&cache_key),
+            Some(&cached_wire)
+        );
+        assert_eq!(
+            client
+                .db()
+                .unwrap()
+                .load_pending_sender_key_envelope(
+                    conversation_id,
+                    cache_key.generation,
+                    &target_identity,
+                    &sender_identity,
+                )
+                .unwrap()
+                .unwrap(),
+            cached_wire
+        );
+    }
+
+    #[test]
+    #[ignore = "superseded by exact-device cold-restore tests"]
+    fn stale_offline_rotation_marker_fails_closed() {
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        let error = client
+            .begin_offline_sender_key_distribution(
+                "channel-stale-offline-marker",
+                OfflineSenderKeyRefresh::AlreadyRotated,
+            )
+            .unwrap_err();
+        assert!(error.contains("marker is stale"));
+        assert!(!client
+            .sender_keys
+            .has_outgoing("channel-stale-offline-marker"));
     }
 
     #[test]

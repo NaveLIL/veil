@@ -1,5 +1,5 @@
 import { Dialog as KDialog } from "@kobalte/core/dialog";
-import { Component, JSX, Show, createMemo } from "solid-js";
+import { Component, JSX, Show, createEffect, createMemo, onCleanup } from "solid-js";
 import { X } from "lucide-solid";
 import { Z } from "@/lib/zIndex";
 
@@ -20,6 +20,46 @@ const portalHost = () =>
 export const IslandDialog: Component<Props> = (props) => {
   const accent = createMemo(() => props.accent ?? "var(--veil-accent)");
   const widthCss = createMemo(() => `${props.width ?? 440}px`);
+  let previouslyFocused: HTMLElement | null = null;
+  let wasOpen = false;
+  let focusEpoch = 0;
+
+  const captureFocus = () => {
+    if (previouslyFocused) return;
+    const active = typeof document !== "undefined" ? document.activeElement : null;
+    if (active instanceof HTMLElement && active !== document.body) previouslyFocused = active;
+  };
+
+  const restoreFocus = () => {
+    const target = previouslyFocused;
+    if (!target) return;
+    previouslyFocused = null;
+    const epoch = ++focusEpoch;
+    queueMicrotask(() => {
+      if (
+        epoch !== focusEpoch
+        || !target?.isConnected
+        || target.hasAttribute("disabled")
+        || target.getAttribute("aria-disabled") === "true"
+      ) return;
+      target.focus({ preventScroll: true });
+    });
+  };
+
+  createEffect(() => {
+    const open = props.open;
+    if (open && !wasOpen) {
+      focusEpoch += 1;
+      captureFocus();
+    } else if (!open && wasOpen) {
+      restoreFocus();
+    }
+    wasOpen = open;
+  });
+
+  onCleanup(() => {
+    if (wasOpen) restoreFocus();
+  });
 
   const handleOpenChange = (open: boolean) => {
     if (!open) {
@@ -48,6 +88,11 @@ export const IslandDialog: Component<Props> = (props) => {
           }}
         >
           <KDialog.Content
+            onOpenAutoFocus={captureFocus}
+            onCloseAutoFocus={(event) => {
+              event.preventDefault();
+              restoreFocus();
+            }}
             style={{
               "pointer-events": "auto",
               width: widthCss(),
@@ -88,6 +133,7 @@ export const IslandDialog: Component<Props> = (props) => {
                 </KDialog.Title>
               </div>
               <KDialog.CloseButton
+                aria-label={`Close ${props.title}`}
                 disabled={props.closeDisabled}
                 style={{
                   width: "26px", height: "26px", "border-radius": "8px",

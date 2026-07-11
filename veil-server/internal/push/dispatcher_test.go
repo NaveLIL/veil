@@ -1,9 +1,13 @@
 package push
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -199,6 +203,31 @@ func TestDispatcher_BoundsConcurrentDeliveryJobs(t *testing.T) {
 		t.Fatalf("concurrent outbound jobs = %d, want 1", got)
 	}
 	close(release)
+}
+
+func TestDispatcher_WarningsNeverLogRawUserID(t *testing.T) {
+	const rawUserID = "0a751249-4dc5-45d7-aa17-d91cdbeb9cec"
+	var output bytes.Buffer
+	d := New(Options{
+		Store:                   &fakeStore{listErr: errors.New("database unavailable")},
+		TransportKey:            make([]byte, MinTransportKeyLen),
+		MaxConcurrentDeliveries: 1,
+		Logger:                  slog.New(slog.NewTextHandler(&output, nil)),
+	})
+
+	// The storage-error warning and the overload warning are separate paths.
+	d.deliver(context.Background(), rawUserID, &pb.Envelope{})
+	d.deliverySlots <- struct{}{}
+	d.NotifyOffline(context.Background(), rawUserID, &pb.Envelope{})
+	<-d.deliverySlots
+
+	logged := output.String()
+	if strings.Contains(logged, rawUserID) {
+		t.Fatalf("push warning leaked raw user id: %s", logged)
+	}
+	if got := strings.Count(logged, "user_ref=v1_"); got != 2 {
+		t.Fatalf("push warnings contain %d pseudonymous user refs, want 2: %s", got, logged)
+	}
 }
 
 func TestRedact_StripsPath(t *testing.T) {

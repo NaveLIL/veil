@@ -37,99 +37,96 @@ func (db *DB) HasAllPermissions(ctx context.Context, serverID, userID string, re
 // standalone groups. Server-backed channel conversations additionally require
 // the requested server role bits.
 func (db *DB) CanAccessConversation(ctx context.Context, conversationID, userID string, required uint64) (bool, error) {
-	var conversationType int16
-	var channelID *string
-	err := db.Pool.QueryRow(ctx,
-		`SELECT conversation.conv_type, channel.id
-		 FROM conversations conversation
-		 LEFT JOIN channels channel ON channel.conversation_id = conversation.id
-		 WHERE conversation.id = $1::uuid`,
-		conversationID,
-	).Scan(&conversationType, &channelID)
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, nil
-		}
 		return false, err
 	}
-	member, err := db.IsConversationMember(ctx, conversationID, userID)
-	if err != nil || !member {
-		return false, err
-	}
-	if conversationType != 2 {
-		return true, nil
-	}
-	if channelID == nil {
+	defer tx.Rollback(ctx)
+	allowed, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, userID, required,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
 		return false, nil
 	}
-	return db.HasAllChannelPermissions(ctx, *channelID, userID, required)
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return allowed, nil
 }
 
 // GetAuthorizedConversationMembers returns all current recipients for a
 // conversation. DMs/groups return their ordinary member set; channels filter
 // dynamically by role permissions so role changes take effect immediately.
 func (db *DB) GetAuthorizedConversationMembers(ctx context.Context, conversationID string, required uint64) ([]string, error) {
-	var conversationType int16
-	err := db.Pool.QueryRow(ctx,
-		`SELECT conv_type FROM conversations WHERE id = $1::uuid`,
-		conversationID,
-	).Scan(&conversationType)
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
 	if err != nil {
 		return nil, err
 	}
-	if conversationType != 2 {
-		return db.GetConversationMembers(ctx, conversationID)
-	}
-
-	rows, err := db.Pool.Query(ctx,
-		`SELECT user_id::text
-		 FROM conversation_members
-		 WHERE conversation_id = $1::uuid
-		 ORDER BY user_id`,
-		conversationID,
+	defer tx.Rollback(ctx)
+	members, err := authorizedConversationMemberIDs(
+		ctx, tx, conversationID, required,
 	)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	candidates := make([]string, 0)
-	for rows.Next() {
-		var userID string
-		if err := rows.Scan(&userID); err != nil {
-			return nil, err
-		}
-		candidates = append(candidates, userID)
-	}
-	if err := rows.Err(); err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
-	}
-
-	members := make([]string, 0, len(candidates))
-	for _, userID := range candidates {
-		allowed, err := db.CanAccessConversation(ctx, conversationID, userID, required)
-		if err != nil {
-			return nil, err
-		}
-		if allowed {
-			members = append(members, userID)
-		}
 	}
 	return members, nil
 }
 
-// GetAuthorizedConversationMemberBindings returns the public cryptographic
-// directory for exactly the users currently authorized to receive traffic in
-// a conversation. It deliberately derives the ID set through the same ACL
-// helper used by message and sender-key fan-out.
-func (db *DB) GetAuthorizedConversationMemberBindings(ctx context.Context, conversationID string, required uint64) ([]ConversationMemberBinding, error) {
-	memberIDs, err := db.GetAuthorizedConversationMembers(ctx, conversationID, required)
+// GetConversationMemberBindingsForRequester authorizes the requester and
+// reads the returned public directory from one repeatable-read snapshot. This
+// prevents a committed role/history revocation from landing between a handler
+// precheck and the member-key query.
+func (db *DB) GetConversationMemberBindingsForRequester(ctx context.Context, conversationID, requesterID string, required uint64) ([]ConversationMemberBinding, error) {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	allowed, err := canAccessConversationWithQuery(
+		ctx, tx, conversationID, requesterID, required,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !allowed {
+		return nil, ErrConversationAccessDenied
+	}
+	members, err := getAuthorizedConversationMemberBindingsWithQuery(
+		ctx, tx, conversationID, required,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return members, nil
+}
+
+func getAuthorizedConversationMemberBindingsWithQuery(ctx context.Context, query rosterQuerier, conversationID string, required uint64) ([]ConversationMemberBinding, error) {
+	memberIDs, err := authorizedConversationMemberIDs(ctx, query, conversationID, required)
 	if err != nil {
 		return nil, err
 	}
 	if len(memberIDs) == 0 {
 		return []ConversationMemberBinding{}, nil
 	}
-	rows, err := db.Pool.Query(ctx,
+	rows, err := query.Query(ctx,
 		`SELECT member.user_id::text, users.username, users.identity_key,
 		        users.signing_key, member.role, member.joined_at
 		 FROM conversation_members member

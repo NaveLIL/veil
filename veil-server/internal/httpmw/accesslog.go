@@ -3,6 +3,7 @@ package httpmw
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -33,7 +34,7 @@ func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 func AccessLogWithPseudonymSecret(logger *slog.Logger, secret []byte) func(http.Handler) http.Handler {
 	pseudonyms, err := logsafe.New(secret)
 	if err != nil {
-		panic("httpmw: " + err.Error())
+		panic(fmt.Errorf("httpmw: initialize pseudonymizer: %w", err))
 	}
 	return accessLog(logger, pseudonyms.Ref)
 }
@@ -51,9 +52,10 @@ func accessLog(logger *slog.Logger, pseudonymize func(domain, raw string) string
 
 			userRef := pseudonymize("user", r.Header.Get("X-User-ID"))
 			ipRef := pseudonymize("ip", clientIP(r))
+			pathLabel := routeTemplate(r)
 			logger.Info("http",
 				slog.String("method", r.Method),
-				slog.String("path", r.URL.Path),
+				slog.String("path", pathLabel),
 				slog.Int("status", rw.status),
 				slog.Int("bytes", rw.bytes),
 				slog.String("dur", dur.String()),
@@ -62,11 +64,9 @@ func accessLog(logger *slog.Logger, pseudonymize func(domain, raw string) string
 				slog.String("ip_ref", ipRef),
 			)
 
-			// Prometheus: use the matched route template (e.g.
-			// "/v1/servers/{serverID}") instead of the raw URL so id-bearing
-			// paths do not blow up label cardinality. Falls back to URL.Path
-			// for routes not registered on the mux (e.g. /metrics, /health).
-			pathLabel := routeTemplate(r)
+			// The same bounded template is used for metrics and logs so neither
+			// surface receives raw path parameters or attacker-controlled label
+			// cardinality.
 			metrics.ObserveHTTP(r.Method, pathLabel, rw.status, dur)
 		})
 	}
@@ -74,12 +74,17 @@ func accessLog(logger *slog.Logger, pseudonymize func(domain, raw string) string
 
 // routeTemplate returns the matched ServeMux pattern stripped of its
 // HTTP-method prefix (e.g. "GET /v1/servers/{id}" → "/v1/servers/{id}").
-// Falls back to r.URL.Path when no pattern is available so /metrics and
-// /health still produce stable labels.
+// Only fixed operational endpoints are allowed as an unmatched fallback.
+// Every other unmatched path is collapsed to one non-sensitive label.
 func routeTemplate(r *http.Request) string {
 	p := r.Pattern
 	if p == "" {
-		return r.URL.Path
+		switch r.URL.Path {
+		case "/health", "/metrics":
+			return r.URL.Path
+		default:
+			return "<unmatched>"
+		}
 	}
 	if i := strings.IndexByte(p, ' '); i >= 0 {
 		p = p[i+1:]

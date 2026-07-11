@@ -14,12 +14,14 @@ import (
 )
 
 var (
-	ErrNotMember                   = errors.New("not a conversation member")
-	ErrMessageTooBig               = errors.New("message ciphertext too large")
-	ErrNoPreKeys                   = errors.New("no signed prekey available for target")
-	ErrPreKeyAccessDenied          = errors.New("prekey access requires a shared conversation")
-	ErrMessageConversationMismatch = errors.New("message does not belong to conversation")
-	ErrAttachmentAccess            = errors.New("attachment is unavailable or not owned by sender")
+	ErrNotMember                    = errors.New("not a conversation member")
+	ErrInsufficientPermissions      = errors.New("insufficient permissions")
+	ErrMessageTooBig                = errors.New("message ciphertext too large")
+	ErrNoPreKeys                    = errors.New("no signed prekey available for target")
+	ErrPreKeyAccessDenied           = errors.New("prekey access requires a shared conversation")
+	ErrMessageConversationMismatch  = errors.New("message does not belong to conversation")
+	ErrAttachmentAccess             = errors.New("attachment is unavailable or not owned by sender")
+	ErrSecureMessageEditUnsupported = errors.New("editing Sender-Key group/channel messages requires an exact device-routed edit protocol")
 )
 
 // Service handles message routing and prekey distribution.
@@ -40,6 +42,17 @@ func (s *Service) DB() *db.DB {
 // HandleSendMessage processes a client's send_message request.
 // Returns: message ID, server timestamp, list of recipient user IDs for fan-out.
 func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage) (string, time.Time, []string, error) {
+	return s.handleSendMessage(ctx, senderUserID, msg, nil)
+}
+
+// HandleSecureSendMessage supplies the authenticated device/roster snapshot
+// required for every new group/channel row. DM callers continue through
+// HandleSendMessage with no Sender-Key context.
+func (s *Service) HandleSecureSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage, security *db.MessageSecurityContext) (string, time.Time, []string, error) {
+	return s.handleSendMessage(ctx, senderUserID, msg, security)
+}
+
+func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage, security *db.MessageSecurityContext) (string, time.Time, []string, error) {
 	// --- Validate ---
 	if msg == nil || msg.ConversationId == "" {
 		return "", time.Time{}, nil, errors.New("conversation_id required")
@@ -74,12 +87,13 @@ func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, ms
 
 	// --- Store message ---
 	dbMsg := &db.Message{
-		ConversationID: msg.ConversationId,
-		SenderID:       senderUserID,
-		Ciphertext:     msg.Ciphertext,
-		Header:         msg.Header,
-		MsgType:        int16(msg.MsgType),
-		ExpiresAt:      expiresAt,
+		ConversationID:  msg.ConversationId,
+		SenderID:        senderUserID,
+		Ciphertext:      msg.Ciphertext,
+		Header:          msg.Header,
+		MsgType:         int16(msg.MsgType),
+		ExpiresAt:       expiresAt,
+		SecurityContext: security,
 	}
 	if len(msg.Attachments) > 32 {
 		return "", time.Time{}, nil, errors.New("too many attachments")
@@ -121,6 +135,9 @@ func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, ms
 		}
 		if errors.Is(err, db.ErrAttachmentScope) {
 			return "", time.Time{}, nil, ErrAttachmentAccess
+		}
+		if errors.Is(err, db.ErrMessageSecurityContext) || errors.Is(err, db.ErrMessageRosterChanged) {
+			return "", time.Time{}, nil, err
 		}
 		return "", time.Time{}, nil, fmt.Errorf("store message: %w", err)
 	}
@@ -167,13 +184,6 @@ func (s *Service) HandleEditMessage(ctx context.Context, senderUserID string, ms
 	if len(msg.NewCiphertext) > s.cfg.MaxMessageSize {
 		return "", time.Time{}, nil, ErrMessageTooBig
 	}
-	matches, err := s.db.MessageBelongsToConversation(ctx, msg.MessageId, msg.ConversationId)
-	if err != nil {
-		return "", time.Time{}, nil, fmt.Errorf("check edit message scope: %w", err)
-	}
-	if !matches {
-		return "", time.Time{}, nil, ErrMessageConversationMismatch
-	}
 	allowed, err := s.db.CanAccessConversation(
 		ctx,
 		msg.ConversationId,
@@ -185,6 +195,20 @@ func (s *Service) HandleEditMessage(ctx context.Context, senderUserID string, ms
 	}
 	if !allowed {
 		return "", time.Time{}, nil, ErrNotMember
+	}
+	matches, err := s.db.MessageBelongsToConversation(ctx, msg.MessageId, msg.ConversationId)
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("check edit message scope: %w", err)
+	}
+	if !matches {
+		return "", time.Time{}, nil, ErrMessageConversationMismatch
+	}
+	conversationType, err := s.db.GetConversationType(ctx, msg.ConversationId)
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("lookup edit conversation type: %w", err)
+	}
+	if conversationType == 1 || conversationType == 2 {
+		return "", time.Time{}, nil, ErrSecureMessageEditUnsupported
 	}
 
 	convID, editedAt, err := s.db.UpdateMessageCiphertext(ctx, msg.MessageId, senderUserID, msg.ConversationId, msg.NewCiphertext, msg.NewHeader)
@@ -406,7 +430,7 @@ func (s *Service) AddGroupMember(ctx context.Context, convID, requesterID, targe
 		return ErrNotMember
 	}
 	if role < 1 { // must be admin(1) or owner(2)
-		return errors.New("insufficient permissions")
+		return ErrInsufficientPermissions
 	}
 
 	// Verify target user exists
@@ -442,7 +466,7 @@ func (s *Service) RemoveGroupMember(ctx context.Context, convID, requesterID, ta
 
 	// Cannot kick someone with equal or higher role
 	if requesterRole <= targetRole {
-		return errors.New("insufficient permissions")
+		return ErrInsufficientPermissions
 	}
 
 	return s.db.RemoveGroupMember(ctx, convID, targetUserID)

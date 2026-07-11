@@ -13,6 +13,8 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/logsafe"
+	"github.com/AegisSec/veil-server/internal/publicerr"
 )
 
 // Handler provides REST endpoints for the auth service.
@@ -129,7 +131,9 @@ func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
 	if req.SignedPreKey != nil {
 		pk, err := decodePreKey(req.SignedPreKey, 0)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResp("invalid signed_prekey: "+err.Error()))
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_signed_prekey", "invalid signed_prekey", err,
+			))
 			return
 		}
 		prekeys = append(prekeys, pk)
@@ -139,7 +143,9 @@ func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
 	for _, otk := range req.OneTimeKeys {
 		pk, err := decodePreKey(&otk, 1)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResp("invalid one_time_prekey: "+err.Error()))
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_one_time_prekey", "invalid one_time_prekey", err,
+			))
 			return
 		}
 		if _, duplicate := seenOPKIDs[pk.protocolKeyID]; duplicate {
@@ -158,12 +164,14 @@ func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
 	if signedPreKey != nil {
 		owner, err := h.svc.db.FindUserByID(r.Context(), requesterID)
 		if err != nil {
-			log.Printf("prekey owner lookup error: %v", err)
+			log.Printf("prekey owner lookup error: class=%s", logsafe.ErrorClass(err))
 			writeJSON(w, http.StatusUnauthorized, errorResp("authenticated user not found"))
 			return
 		}
 		if err := validateSignedPreKey(owner, signedPreKey); err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResp(err.Error()))
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_signed_prekey", "signed prekey validation failed", err,
+			))
 			return
 		}
 	}
@@ -180,7 +188,7 @@ func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := h.svc.StorePreKeys(r.Context(), device.ID, dbKeys); err != nil {
-		log.Printf("store prekeys error: %v", err)
+		log.Printf("store prekeys error: class=%s", logsafe.ErrorClass(err))
 		writeJSON(w, http.StatusInternalServerError, errorResp("failed to store prekeys"))
 		return
 	}
@@ -211,10 +219,12 @@ func (h *Handler) GetPreKeyBundle(w http.ResponseWriter, r *http.Request) {
 	bundle, err := h.svc.GetPreKeyBundle(r.Context(), requesterID, identityKey)
 	if err != nil {
 		if errors.Is(err, ErrPreKeyAccessDenied) {
-			writeJSON(w, http.StatusForbidden, errorResp(err.Error()))
+			publicerr.Write(w, http.StatusForbidden, publicerr.New(
+				http.StatusForbidden, "prekey_access_denied", "prekey access requires a shared conversation", err,
+			))
 			return
 		}
-		writeJSON(w, http.StatusNotFound, errorResp(err.Error()))
+		publicerr.Write(w, http.StatusNotFound, err)
 		return
 	}
 

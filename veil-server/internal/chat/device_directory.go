@@ -3,6 +3,7 @@ package chat
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -52,17 +53,14 @@ func (h *Handler) GetDeviceDirectory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	conversationID := r.PathValue("conversationID")
-	allowed, err := h.svc.db.CanAccessConversation(
-		r.Context(), conversationID, requesterID, db.ChannelReadPermissions,
-	)
-	if err != nil || !allowed {
-		writeJSON(w, http.StatusForbidden, errorResp("not authorized for conversation"))
-		return
-	}
-	roster, err := h.svc.db.ResolveConversationDeviceRoster(
-		r.Context(), conversationID, db.RequiredChannelCapabilities,
+	roster, err := h.svc.db.ResolveConversationDeviceRosterForRequester(
+		r.Context(), conversationID, requesterID, db.RequiredChannelCapabilities,
 	)
 	if err != nil {
+		if errors.Is(err, db.ErrConversationAccessDenied) {
+			writeJSON(w, http.StatusForbidden, errorResp("not authorized for conversation"))
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, errorResp("failed to resolve device directory"))
 		return
 	}
