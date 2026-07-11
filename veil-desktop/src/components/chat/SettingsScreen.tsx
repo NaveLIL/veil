@@ -1,6 +1,6 @@
 import { Component, createSignal, Show, For, Switch, Match, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { appStore } from "@/stores/app";
+import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
 
 /* ═══════════════════════════════════════════════════════
    SETTINGS — Full-screen overlay with sidebar navigation
@@ -26,6 +26,7 @@ export const SettingsScreen: Component = () => {
   const [hasPin, setHasPin] = createSignal(false);
   const [pinInput, setPinInput] = createSignal("");
   const [pinConfirm, setPinConfirm] = createSignal("");
+  const [currentPin, setCurrentPin] = createSignal("");
   const [pinMode, setPinMode] = createSignal<"idle" | "set" | "change">("idle");
   const [pinMsg, setPinMsg] = createSignal("");
 
@@ -33,9 +34,10 @@ export const SettingsScreen: Component = () => {
   const [wsUrl, setWsUrl] = createSignal(appStore.serverUrl());
   const [httpUrl, setHttpUrl] = createSignal(appStore.serverHttpUrl());
   const [networkSaved, setNetworkSaved] = createSignal(false);
+  const [networkError, setNetworkError] = createSignal("");
 
   // Auto-lock
-  const [autoLockMin, setAutoLockMin] = createSignal(15);
+  const autoLockMin = () => appStore.autoLockSeconds() / 60;
   const [autoLockOpen, setAutoLockOpen] = createSignal(false);
 
   // Recovery phrase
@@ -44,6 +46,8 @@ export const SettingsScreen: Component = () => {
   const [recoveryConfirmed, setRecoveryConfirmed] = createSignal(false);
   const [recoveryLoading, setRecoveryLoading] = createSignal(false);
   const [recoveryError, setRecoveryError] = createSignal("");
+  const [recoveryPin, setRecoveryPin] = createSignal("");
+  let recoveryHideTimer: ReturnType<typeof setTimeout> | undefined;
 
   const autoLockOptions = [
     { value: 1, label: "1 minute" },
@@ -54,27 +58,45 @@ export const SettingsScreen: Component = () => {
   ];
 
   const loadRecoveryPhrase = async () => {
+    const sessionEpoch = captureUiSessionEpoch();
     setRecoveryLoading(true);
     setRecoveryError("");
     try {
-      const seed = await invoke<string | null>("get_stored_seed");
+      const seed = await invoke<string>("reveal_recovery_phrase", { pin: recoveryPin() });
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       setRecoveryPhrase(seed);
-      if (!seed) {
-        setRecoveryError("Recovery phrase not found in keychain. You may need to restore from your backup.");
-      }
+      if (recoveryHideTimer) clearTimeout(recoveryHideTimer);
+      recoveryHideTimer = setTimeout(() => hideRecoveryPhrase(), 60_000);
     } catch (e) {
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       console.error("Failed to load recovery phrase:", e);
       setRecoveryError(`Keychain error: ${String(e)}`);
     } finally {
-      setRecoveryLoading(false);
+      if (isUiSessionEpochCurrent(sessionEpoch)) setRecoveryLoading(false);
     }
   };
 
   const hideRecoveryPhrase = () => {
+    if (recoveryHideTimer) clearTimeout(recoveryHideTimer);
+    recoveryHideTimer = undefined;
     setShowRecovery(false);
     setRecoveryPhrase(null);
     setRecoveryConfirmed(false);
     setRecoveryError("");
+    setRecoveryPin("");
+  };
+
+  const confirmRecoveryReveal = () => {
+    if (!hasPin()) {
+      setRecoveryError("Configure a PIN before revealing the recovery phrase.");
+      return;
+    }
+    if (recoveryPin().length < 4) {
+      setRecoveryError("Enter your current PIN.");
+      return;
+    }
+    setRecoveryConfirmed(true);
+    loadRecoveryPhrase();
   };
 
   onMount(async () => {
@@ -100,6 +122,11 @@ export const SettingsScreen: Component = () => {
     document.addEventListener("click", handleClickOutside);
   });
   onCleanup(() => {
+    if (recoveryHideTimer) clearTimeout(recoveryHideTimer);
+    hideRecoveryPhrase();
+    setPinInput("");
+    setPinConfirm("");
+    setCurrentPin("");
     document.removeEventListener("keydown", handleKey);
     document.removeEventListener("click", handleClickOutside);
   });
@@ -116,20 +143,25 @@ export const SettingsScreen: Component = () => {
   };
 
   const handleSetPin = async () => {
-    if (pinInput().length < 4) {
-      setPinMsg("PIN must be at least 4 digits");
+    if (pinInput().length < 6 || pinInput().length > 12) {
+      setPinMsg("New PIN must contain 6–12 digits");
       return;
     }
     if (pinInput() !== pinConfirm()) {
       setPinMsg("PINs don't match");
       return;
     }
+    if (hasPin() && currentPin().length < 4) {
+      setPinMsg("Enter the current PIN first");
+      return;
+    }
     try {
-      await invoke("set_pin", { pin: pinInput() });
+      await appStore.setPin(pinInput(), hasPin() ? currentPin() : undefined);
       setHasPin(true);
       setPinMode("idle");
       setPinInput("");
       setPinConfirm("");
+      setCurrentPin("");
       setPinMsg("PIN set successfully");
       setTimeout(() => setPinMsg(""), 3000);
     } catch (e) {
@@ -138,9 +170,14 @@ export const SettingsScreen: Component = () => {
   };
 
   const handleClearPin = async () => {
+    if (currentPin().length < 4) {
+      setPinMsg("Enter the current PIN before removing it");
+      return;
+    }
     try {
-      await invoke("clear_pin");
+      await appStore.clearPin(currentPin());
       setHasPin(false);
+      setCurrentPin("");
       setPinMsg("PIN removed");
       setTimeout(() => setPinMsg(""), 3000);
     } catch (e) {
@@ -149,10 +186,27 @@ export const SettingsScreen: Component = () => {
   };
 
   const saveNetwork = () => {
-    appStore.setServerUrl(wsUrl());
-    appStore.setServerHttpUrl(httpUrl());
-    setNetworkSaved(true);
-    setTimeout(() => setNetworkSaved(false), 2000);
+    try {
+      const ws = new URL(wsUrl());
+      const http = new URL(httpUrl());
+      const loopback = (host: string) => host === "localhost" || host === "127.0.0.1" || host === "[::1]";
+      if (ws.protocol !== "wss:" && !(ws.protocol === "ws:" && loopback(ws.hostname))) {
+        throw new Error("WebSocket URL must use wss:// (ws:// is allowed only for localhost)");
+      }
+      if (http.protocol !== "https:" && !(http.protocol === "http:" && loopback(http.hostname))) {
+        throw new Error("API URL must use https:// (http:// is allowed only for localhost)");
+      }
+      if (ws.hostname !== http.hostname) {
+        throw new Error("WebSocket and API endpoints must use the same host");
+      }
+      appStore.setServerEndpoints(ws.toString(), http.toString());
+      setNetworkError("");
+      setNetworkSaved(true);
+      setTimeout(() => setNetworkSaved(false), 2000);
+    } catch (e) {
+      setNetworkSaved(false);
+      setNetworkError(String(e));
+    }
   };
 
   const identityKey = () => appStore.identity() || "—";
@@ -467,6 +521,19 @@ export const SettingsScreen: Component = () => {
           </span>
         </div>
 
+        <Show when={hasPin()}>
+          <input
+            type="password"
+            inputMode="numeric"
+            style={{ ...S.input, "margin-top": "14px" }}
+            placeholder="Current PIN"
+            value={currentPin()}
+            onInput={(e) => setCurrentPin(e.currentTarget.value.replace(/\D/g, ""))}
+            maxLength={12}
+            autocomplete="current-password"
+          />
+        </Show>
+
         <Show when={pinMode() === "idle"}>
           <div style={{ display: "flex", gap: "10px", "margin-top": "14px" }}>
             <Show when={!hasPin()}>
@@ -484,10 +551,10 @@ export const SettingsScreen: Component = () => {
             <input
               type="password"
               style={S.input}
-              placeholder="Enter new PIN (4–6 digits)"
+              placeholder="Enter new PIN (6–12 digits)"
               value={pinInput()}
               onInput={(e) => setPinInput(e.currentTarget.value.replace(/\D/g, ""))}
-              maxLength={6}
+              maxLength={12}
             />
             <input
               type="password"
@@ -495,7 +562,7 @@ export const SettingsScreen: Component = () => {
               placeholder="Confirm PIN"
               value={pinConfirm()}
               onInput={(e) => setPinConfirm(e.currentTarget.value.replace(/\D/g, ""))}
-              maxLength={6}
+              maxLength={12}
             />
             <div style={{ display: "flex", gap: "10px" }}>
               <button style={S.btnPrimary} onClick={handleSetPin}>Save PIN</button>
@@ -574,7 +641,12 @@ export const SettingsScreen: Component = () => {
                         "text-align": "left",
                         transition: "background 0.15s, color 0.15s",
                       }}
-                      onClick={() => { setAutoLockMin(opt.value); setAutoLockOpen(false); }}
+                      onClick={() => {
+                        appStore.setAutoLockMinutes(opt.value).catch((e) =>
+                          console.error("auto-lock update failed:", e),
+                        );
+                        setAutoLockOpen(false);
+                      }}
                       onMouseEnter={(e) => {
                         if (autoLockMin() !== opt.value) {
                           e.currentTarget.style.background = "rgba(255,255,255,0.04)";
@@ -631,8 +703,25 @@ export const SettingsScreen: Component = () => {
               Make sure no one can see your screen right now.
             </div>
           </div>
+          <Show when={hasPin()} fallback={
+            <div style={S.errorMsg}>Set a PIN before revealing the recovery phrase.</div>
+          }>
+            <input
+              type="password"
+              inputMode="numeric"
+              style={{ ...S.input, "margin-bottom": "12px" }}
+              placeholder="Enter current PIN to continue"
+              value={recoveryPin()}
+              onInput={(e) => setRecoveryPin(e.currentTarget.value.replace(/\D/g, ""))}
+              maxLength={12}
+              autocomplete="current-password"
+            />
+          </Show>
+          <Show when={recoveryError()}>
+            <div style={S.errorMsg}>{recoveryError()}</div>
+          </Show>
           <div style={{ display: "flex", gap: "10px" }}>
-            <button style={S.btnDanger} onClick={() => { setRecoveryConfirmed(true); loadRecoveryPhrase(); }}>
+            <button style={S.btnDanger} onClick={confirmRecoveryReveal}>
               I understand, show phrase
             </button>
             <button style={S.btnSecondary} onClick={hideRecoveryPhrase}>
@@ -688,15 +777,12 @@ export const SettingsScreen: Component = () => {
               </div>
             </div>
             <div style={{ display: "flex", gap: "10px" }}>
-              <button
-                style={S.btnPrimary}
-                onClick={() => copyText(recoveryPhrase()!, "phrase")}
-              >
-                {copied() === "phrase" ? "\u2713 Copied" : "Copy Phrase"}
-              </button>
               <button style={S.btnSecondary} onClick={hideRecoveryPhrase}>
                 Hide
               </button>
+            </div>
+            <div style={{ ...S.paragraph, "margin-top": "10px", color: "rgba(251,191,36,0.65)" }}>
+              Clipboard copy is disabled because Windows Clipboard History and cloud sync can retain a recovery phrase after the clipboard is cleared.
             </div>
           </Show>
           <Show when={!recoveryLoading() && !recoveryPhrase()}>
@@ -735,7 +821,7 @@ export const SettingsScreen: Component = () => {
             style={S.input}
             value={wsUrl()}
             onInput={(e) => setWsUrl(e.currentTarget.value)}
-            placeholder="ws://5.144.181.72:9080/ws"
+            placeholder="wss://secret.erez.pro/ws"
           />
         </div>
 
@@ -745,7 +831,7 @@ export const SettingsScreen: Component = () => {
             style={S.input}
             value={httpUrl()}
             onInput={(e) => setHttpUrl(e.currentTarget.value)}
-            placeholder="http://5.144.181.72:9080"
+            placeholder="https://secret.erez.pro"
           />
         </div>
 
@@ -758,6 +844,9 @@ export const SettingsScreen: Component = () => {
             <span style={S.successMsg}>{"\u2713"} Saved</span>
           </Show>
         </div>
+        <Show when={networkError()}>
+          <div style={S.errorMsg}>{networkError()}</div>
+        </Show>
       </div>
 
       <div style={S.card}>
@@ -793,10 +882,10 @@ export const SettingsScreen: Component = () => {
           <div>
             <div style={S.fieldLabel}>Message notifications</div>
             <div style={{ "font-size": "11px", color: "rgba(255,255,255,0.2)", "margin-top": "2px" }}>
-              Show a system notification when a new message arrives
+              Show a generic alert; sender and message text are never stored in Windows Action Center
             </div>
           </div>
-          <span style={S.badge("#34d399")}>Enabled</span>
+          <span style={S.badge("#34d399")}>Private preview</span>
         </div>
       </div>
 
@@ -844,7 +933,7 @@ export const SettingsScreen: Component = () => {
 
         <div style={S.field}>
           <span style={S.fieldLabel}>Encryption</span>
-          <span style={{ ...S.fieldValue, "font-family": "inherit" }}>X3DH + Double Ratchet + XChaCha20-Poly1305</span>
+          <span style={{ ...S.fieldValue, "font-family": "inherit" }}>DM: X3DH + Double Ratchet; groups: Sender Keys</span>
         </div>
         <div style={S.field}>
           <span style={S.fieldLabel}>Identity</span>
@@ -856,7 +945,7 @@ export const SettingsScreen: Component = () => {
         </div>
         <div style={S.field}>
           <span style={S.fieldLabel}>Transport</span>
-          <span style={{ ...S.fieldValue, "font-family": "inherit" }}>WebSocket + Protobuf</span>
+          <span style={{ ...S.fieldValue, "font-family": "inherit" }}>WSS (TLS) + Protobuf</span>
         </div>
         <div style={{ ...S.field, "border-bottom": "none" }}>
           <span style={S.fieldLabel}>Framework</span>
@@ -883,11 +972,11 @@ export const SettingsScreen: Component = () => {
       <div style={S.card}>
         <div style={S.cardTitle}>Privacy Principles</div>
         <For each={[
-          { title: "Zero Knowledge", desc: "The server cannot read your messages. All encryption and decryption happens exclusively on your device." },
+          { title: "Content Confidentiality", desc: "Supported message paths fail closed: content is not sent until an end-to-end encryption session exists." },
           { title: "No Phone Number", desc: "Your identity is a cryptographic key pair derived from a BIP39 mnemonic. No personal information required." },
-          { title: "No Metadata Collection", desc: "We minimize metadata storage. Message content is end-to-end encrypted and unreadable by the server." },
-          { title: "Forward Secrecy", desc: "Each message is encrypted with a unique key via the Double Ratchet protocol. Compromising one key does not compromise past or future messages." },
-          { title: "Local Encryption", desc: "Your messages, contacts, and session data are stored in an encrypted SQLCipher database on your device. The key is derived from your mnemonic." },
+          { title: "Metadata Minimization", desc: "The service still processes routing, membership, timing and delivery metadata, but does not require phone numbers or email addresses." },
+          { title: "Forward Secrecy", desc: "Direct messages use Double Ratchet. Group sender keys are rotated on membership changes; MLS is not advertised until its network workflow is complete." },
+          { title: "Local Encryption", desc: "Messages, contacts and sessions live in SQLCipher. Full-text search is rebuilt in memory after unlock and erased on lock." },
           { title: "Open Source", desc: "The entire protocol and client implementation is open source and auditable." },
         ]}>
           {(item) => (

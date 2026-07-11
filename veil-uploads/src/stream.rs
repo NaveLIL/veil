@@ -11,14 +11,20 @@
 
 use std::path::Path;
 
+use rand::RngCore;
 use thiserror::Error;
-use tokio::fs::File;
+use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use zeroize::Zeroizing;
 
 use veil_crypto::chunked_aead::{
     open_chunk, random_nonce_prefix, seal_chunk, ChunkedAeadError, CHUNK_PLAINTEXT_SIZE,
     NONCE_PREFIX_LEN,
 };
+
+/// The current public API returns all ciphertext chunks in a Vec and downloads
+/// blobs in one shot. Bound it until a true streaming consumer is exposed.
+const MAX_ONE_SHOT_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Per-chunk envelope for upload. The ciphertext is ready to be
 /// `PATCH`ed to a tus offset; the index is exposed so callers can
@@ -49,6 +55,12 @@ pub enum StreamError {
     Aead(#[from] ChunkedAeadError),
     #[error("chunk count mismatch: expected {expected}, got {actual}")]
     ChunkCount { expected: u64, actual: u64 },
+    #[error("invalid encrypted file metadata: {0}")]
+    InvalidMetadata(String),
+    #[error("file exceeds the current {0}-byte one-shot limit")]
+    FileTooLarge(u64),
+    #[error("destination already exists")]
+    DestinationExists,
 }
 
 /// Encrypt `src` into a Vec of chunks plus the metadata the receiver
@@ -63,10 +75,13 @@ pub async fn encrypt_file_to_chunks(
     let nonce_prefix = random_nonce_prefix();
     let file = File::open(src).await?;
     let plaintext_size = file.metadata().await?.len();
+    if plaintext_size > MAX_ONE_SHOT_FILE_BYTES {
+        return Err(StreamError::FileTooLarge(MAX_ONE_SHOT_FILE_BYTES));
+    }
     let mut reader = BufReader::with_capacity(CHUNK_PLAINTEXT_SIZE, file);
 
     let mut chunks = Vec::new();
-    let mut buf = vec![0u8; CHUNK_PLAINTEXT_SIZE];
+    let mut buf = Zeroizing::new(vec![0u8; CHUNK_PLAINTEXT_SIZE]);
     let mut idx: u64 = 0;
     let mut bytes_consumed: u64 = 0;
     let mut ciphertext_size: u64 = 0;
@@ -135,39 +150,141 @@ pub async fn decrypt_stream_to_file(
 ) -> Result<(), StreamError> {
     use veil_crypto::chunked_aead::{FULL_CHUNK_CIPHERTEXT_SIZE, TAG_LEN};
 
-    let file = File::create(dst).await?;
+    validate_encrypted_file(meta, ciphertext.len(), TAG_LEN)?;
+    if tokio::fs::try_exists(dst).await? {
+        return Err(StreamError::DestinationExists);
+    }
+
+    let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+    let mut random = rand::rngs::OsRng;
+    let (temporary_path, file) = {
+        let mut created = None;
+        for _ in 0..8 {
+            let suffix = random.next_u64();
+            let candidate = parent.join(format!(".veil-decrypt-{suffix:016x}.tmp"));
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&candidate)
+                .await
+            {
+                Ok(file) => {
+                    created = Some((candidate, file));
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(StreamError::Io(error)),
+            }
+        }
+        created.ok_or_else(|| {
+            StreamError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "could not allocate a unique temporary decrypt file",
+            ))
+        })?
+    };
     let mut writer = BufWriter::new(file);
 
-    let mut cursor = 0usize;
-    let mut decoded_chunks: u64 = 0;
-    let total = meta.chunk_count;
+    let operation: Result<(), StreamError> = async {
+        let mut cursor = 0usize;
+        let mut decoded_chunks: u64 = 0;
+        let total = meta.chunk_count;
 
-    while decoded_chunks < total {
-        let is_final = decoded_chunks + 1 == total;
-        let take = if is_final {
-            ciphertext.len() - cursor
-        } else {
-            FULL_CHUNK_CIPHERTEXT_SIZE
-        };
-        if take == 0 || cursor + take > ciphertext.len() || take < TAG_LEN {
+        while decoded_chunks < total {
+            let is_final = decoded_chunks + 1 == total;
+            let take = if is_final {
+                ciphertext.len().checked_sub(cursor).ok_or_else(|| {
+                    StreamError::InvalidMetadata("ciphertext cursor overflow".to_string())
+                })?
+            } else {
+                FULL_CHUNK_CIPHERTEXT_SIZE
+            };
+            let end = cursor.checked_add(take).ok_or_else(|| {
+                StreamError::InvalidMetadata("ciphertext length overflow".to_string())
+            })?;
+            if take < TAG_LEN || end > ciphertext.len() {
+                return Err(StreamError::ChunkCount {
+                    expected: total,
+                    actual: decoded_chunks,
+                });
+            }
+            let slice = &ciphertext[cursor..end];
+            let mut plaintext = Zeroizing::new(open_chunk(
+                key,
+                &meta.nonce_prefix,
+                decoded_chunks,
+                is_final,
+                slice,
+            )?);
+            writer.write_all(&plaintext).await?;
+            plaintext.fill(0);
+            cursor = end;
+            decoded_chunks += 1;
+        }
+        if cursor != ciphertext.len() {
             return Err(StreamError::ChunkCount {
                 expected: total,
                 actual: decoded_chunks,
             });
         }
-        let slice = &ciphertext[cursor..cursor + take];
-        let pt = open_chunk(key, &meta.nonce_prefix, decoded_chunks, is_final, slice)?;
-        writer.write_all(&pt).await?;
-        cursor += take;
-        decoded_chunks += 1;
+        writer.flush().await?;
+        writer.get_ref().sync_all().await?;
+        Ok(())
     }
-    if cursor != ciphertext.len() {
+    .await;
+
+    drop(writer);
+    if let Err(error) = operation {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(error);
+    }
+    if tokio::fs::try_exists(dst).await? {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(StreamError::DestinationExists);
+    }
+    if let Err(error) = tokio::fs::rename(&temporary_path, dst).await {
+        let _ = tokio::fs::remove_file(&temporary_path).await;
+        return Err(StreamError::Io(error));
+    }
+    Ok(())
+}
+
+fn validate_encrypted_file(
+    meta: &EncryptedFileMeta,
+    actual_ciphertext_len: usize,
+    tag_len: usize,
+) -> Result<(), StreamError> {
+    if meta.plaintext_size > MAX_ONE_SHOT_FILE_BYTES {
+        return Err(StreamError::FileTooLarge(MAX_ONE_SHOT_FILE_BYTES));
+    }
+    let chunk_size = u64::try_from(CHUNK_PLAINTEXT_SIZE)
+        .map_err(|_| StreamError::InvalidMetadata("chunk size overflow".to_string()))?;
+    let expected_chunks = if meta.plaintext_size == 0 {
+        1
+    } else {
+        meta.plaintext_size.div_ceil(chunk_size)
+    };
+    if meta.chunk_count != expected_chunks {
         return Err(StreamError::ChunkCount {
-            expected: total,
-            actual: decoded_chunks,
+            expected: expected_chunks,
+            actual: meta.chunk_count,
         });
     }
-    writer.flush().await?;
+    let authentication_overhead = meta
+        .chunk_count
+        .checked_mul(u64::try_from(tag_len).unwrap_or(u64::MAX))
+        .ok_or_else(|| StreamError::InvalidMetadata("tag overhead overflow".to_string()))?;
+    let expected_ciphertext_size = meta
+        .plaintext_size
+        .checked_add(authentication_overhead)
+        .ok_or_else(|| StreamError::InvalidMetadata("ciphertext size overflow".to_string()))?;
+    if meta.ciphertext_size != expected_ciphertext_size
+        || u64::try_from(actual_ciphertext_len).unwrap_or(u64::MAX) != expected_ciphertext_size
+    {
+        return Err(StreamError::InvalidMetadata(
+            "ciphertext size does not match authenticated chunk geometry".to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -198,7 +315,9 @@ mod tests {
         assert!(chunks[0].is_final);
         let blob: Vec<u8> = chunks.iter().flat_map(|c| c.ciphertext.clone()).collect();
         let dst = src.with_extension("dec");
-        decrypt_stream_to_file(&key(), &meta, &blob, &dst).await.unwrap();
+        decrypt_stream_to_file(&key(), &meta, &blob, &dst)
+            .await
+            .unwrap();
         let got = tokio::fs::read(&dst).await.unwrap();
         assert_eq!(got, b"hello veil uploads");
     }
@@ -216,7 +335,9 @@ mod tests {
         assert!(!chunks[0].is_final);
         let blob: Vec<u8> = chunks.iter().flat_map(|c| c.ciphertext.clone()).collect();
         let dst = src.with_extension("dec");
-        decrypt_stream_to_file(&key(), &meta, &blob, &dst).await.unwrap();
+        decrypt_stream_to_file(&key(), &meta, &blob, &dst)
+            .await
+            .unwrap();
         let got = tokio::fs::read(&dst).await.unwrap();
         assert_eq!(got, plaintext);
     }
@@ -228,7 +349,55 @@ mod tests {
         assert_eq!(meta.chunk_count, 1);
         let blob: Vec<u8> = chunks.iter().flat_map(|c| c.ciphertext.clone()).collect();
         let dst = src.with_extension("dec");
-        decrypt_stream_to_file(&key(), &meta, &blob, &dst).await.unwrap();
+        decrypt_stream_to_file(&key(), &meta, &blob, &dst)
+            .await
+            .unwrap();
         assert_eq!(tokio::fs::read(&dst).await.unwrap(), Vec::<u8>::new());
+    }
+
+    #[tokio::test]
+    async fn tampered_tail_never_publishes_partial_plaintext() {
+        let plaintext = vec![7u8; CHUNK_PLAINTEXT_SIZE + 123];
+        let (_d, src) = write_tmp(&plaintext).await;
+        let (chunks, meta) = encrypt_file_to_chunks(&key(), &src).await.unwrap();
+        let mut blob: Vec<u8> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.ciphertext.clone())
+            .collect();
+        *blob.last_mut().unwrap() ^= 1;
+        let dst = src.with_extension("tampered-dec");
+
+        assert!(decrypt_stream_to_file(&key(), &meta, &blob, &dst)
+            .await
+            .is_err());
+        assert!(!tokio::fs::try_exists(&dst).await.unwrap());
+        let leftovers: Vec<_> = std::fs::read_dir(dst.parent().unwrap())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".veil-decrypt-")
+            })
+            .collect();
+        assert!(leftovers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_metadata_is_rejected_before_touching_destination() {
+        let (_d, src) = write_tmp(b"small").await;
+        let (chunks, mut meta) = encrypt_file_to_chunks(&key(), &src).await.unwrap();
+        let blob: Vec<u8> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.ciphertext.clone())
+            .collect();
+        meta.chunk_count = u64::MAX;
+        let dst = src.with_extension("invalid-dec");
+
+        assert!(decrypt_stream_to_file(&key(), &meta, &blob, &dst)
+            .await
+            .is_err());
+        assert!(!tokio::fs::try_exists(&dst).await.unwrap());
     }
 }

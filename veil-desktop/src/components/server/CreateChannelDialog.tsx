@@ -1,6 +1,6 @@
-import { Component, createSignal, Show, For } from "solid-js";
+import { Component, createEffect, createSignal, Show, For } from "solid-js";
 import { Hash, Volume2, Folder, ArrowRight, Loader2 } from "lucide-solid";
-import { appStore } from "@/stores/app";
+import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
 import { IslandDialog, dlgStyles as ds } from "@/components/ui/IslandDialog";
 
 interface Props {
@@ -33,17 +33,29 @@ export const CreateChannelDialog: Component<Props> = (props) => {
   const close = () => { if (loading()) return; reset(); props.onClose(); };
   const finalName = () => normalizeName(name(), type());
 
+  createEffect(() => {
+    if (!props.open) {
+      reset();
+      setLoading(false);
+    }
+  });
+
   const handleCreate = async () => {
     const n = finalName();
     if (!n) return;
+    const sessionEpoch = captureUiSessionEpoch();
     setLoading(true); setError("");
     try {
       const ch = await appStore.createChannel(props.serverId, n, type());
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       if (ch && ch.channelType === 0) appStore.selectChannel(ch.id);
       reset();
       props.onClose();
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
+    } catch (e) {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setError(String(e));
+    } finally {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setLoading(false);
+    }
   };
 
   const onKey = (e: KeyboardEvent) => {

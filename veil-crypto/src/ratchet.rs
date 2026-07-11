@@ -14,9 +14,14 @@ type SkippedKeysMap = HashMap<([u8; 32], u32), [u8; 32]>;
 const MAX_SKIP: u32 = 1000;
 /// Absolute maximum number of total stored skipped keys (prevents unbounded growth).
 const MAX_TOTAL_SKIPPED: usize = 5000;
+/// Current authenticated Double Ratchet wire format.
+const RATCHET_HEADER_VERSION: u8 = 0x02;
+/// Domain-separated protocol associated data. The caller-provided AD and the
+/// canonical serialized header are appended to this value.
+const RATCHET_PROTOCOL_AD: &[u8] = b"veil-double-ratchet-v2";
 
 /// Header attached to each ratchet message (sent alongside ciphertext).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MessageHeader {
     /// Sender's current ratchet public key
     pub ratchet_key: [u8; 32],
@@ -28,7 +33,8 @@ pub struct MessageHeader {
 
 impl MessageHeader {
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(32 + 4 + 4);
+        let mut bytes = Vec::with_capacity(1 + 32 + 4 + 4);
+        bytes.push(RATCHET_HEADER_VERSION);
         bytes.extend_from_slice(&self.ratchet_key);
         bytes.extend_from_slice(&self.n.to_be_bytes());
         bytes.extend_from_slice(&self.pn.to_be_bytes());
@@ -36,22 +42,46 @@ impl MessageHeader {
     }
 
     pub fn from_bytes(data: &[u8]) -> Result<Self, String> {
-        if data.len() < 40 {
-            return Err("header too short".to_string());
+        if data.len() != 41 {
+            return Err(format!(
+                "invalid ratchet header length: expected 41 bytes for v2, got {}",
+                data.len()
+            ));
+        }
+        if data[0] != RATCHET_HEADER_VERSION {
+            return Err(format!(
+                "unsupported ratchet header version: {:#x}",
+                data[0]
+            ));
         }
         let mut ratchet_key = [0u8; 32];
-        ratchet_key.copy_from_slice(&data[..32]);
-        let n = u32::from_be_bytes([data[32], data[33], data[34], data[35]]);
-        let pn = u32::from_be_bytes([data[36], data[37], data[38], data[39]]);
+        ratchet_key.copy_from_slice(&data[1..33]);
+        let n = u32::from_be_bytes([data[33], data[34], data[35], data[36]]);
+        let pn = u32::from_be_bytes([data[37], data[38], data[39], data[40]]);
         Ok(Self { ratchet_key, n, pn })
     }
+}
+
+/// Construct Signal-style `CONCAT(AD, header)` with a protocol domain and an
+/// unambiguous caller-AD length. The serialized header itself is therefore
+/// authenticated by the message AEAD tag.
+fn message_aad(associated_data: &[u8], header: &MessageHeader) -> Result<Vec<u8>, String> {
+    let ad_len = u32::try_from(associated_data.len())
+        .map_err(|_| "ratchet associated data too large".to_string())?;
+    let header_bytes = header.to_bytes();
+    let mut aad = Vec::with_capacity(RATCHET_PROTOCOL_AD.len() + 4 + associated_data.len() + 41);
+    aad.extend_from_slice(RATCHET_PROTOCOL_AD);
+    aad.extend_from_slice(&ad_len.to_be_bytes());
+    aad.extend_from_slice(associated_data);
+    aad.extend_from_slice(&header_bytes);
+    Ok(aad)
 }
 
 /// A Double Ratchet session between two parties.
 ///
 /// Provides forward secrecy: each message is encrypted with a unique key.
 /// Even if a session state is compromised, past messages cannot be decrypted.
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct RatchetSession {
     /// DH ratchet sending keypair (our current ratchet key)
     #[serde(with = "secret_key_serde")]
@@ -162,34 +192,46 @@ impl RatchetSession {
     ///
     /// Returns `(header, ciphertext)` — both must be sent to the peer.
     pub fn encrypt(&mut self, plaintext: &[u8]) -> Result<(MessageHeader, Vec<u8>), String> {
+        self.encrypt_with_ad(plaintext, &[])
+    }
+
+    /// Encrypt while binding caller-provided associated data (for example the
+    /// two identity keys or a conversation identifier) to this message.
+    pub fn encrypt_with_ad(
+        &mut self,
+        plaintext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<(MessageHeader, Vec<u8>), String> {
         let ck = self
             .sending_chain_key
             .as_ref()
             .ok_or("sending chain not initialized (responder must receive first)")?;
 
-        // KDF_CK: derive message key and next chain key
         let mut message_key = kdf::hmac_sha256(ck, b"\x01");
         let next_chain_key = kdf::hmac_sha256(ck, b"\x02");
 
-        self.sending_chain_key = Some(next_chain_key);
-
         let header = MessageHeader {
-            ratchet_key: self.dh_sending_public.unwrap_or([0u8; 32]),
+            ratchet_key: self
+                .dh_sending_public
+                .ok_or("sending ratchet key not initialized")?,
             n: self.send_count,
             pn: self.prev_send_count,
         };
-
-        self.send_count = self
+        let next_send_count = self
             .send_count
             .checked_add(1)
             .ok_or("message counter overflow".to_string())?;
 
-        // Encrypt with message key
-        let result = aead::encrypt(&message_key, plaintext);
+        // Signal-style CONCAT(AD, header): authenticate the canonical header
+        // and commit the sending chain only after encryption succeeds.
+        let aad = message_aad(associated_data, &header)?;
+        let result = aead::encrypt_with_aad(&message_key, plaintext, &aad);
         message_key.zeroize();
         let (ciphertext, nonce) = result?;
 
-        // Prepend nonce to ciphertext for transport
+        self.sending_chain_key = Some(next_chain_key);
+        self.send_count = next_send_count;
+
         let mut output = Vec::with_capacity(aead::NONCE_SIZE + ciphertext.len());
         output.extend_from_slice(&nonce);
         output.extend_from_slice(&ciphertext);
@@ -205,12 +247,40 @@ impl RatchetSession {
         header: &MessageHeader,
         ciphertext: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.decrypt_with_ad(header, ciphertext, &[])
+    }
+
+    /// Decrypt with caller-provided associated data.
+    ///
+    /// All ratchet mutations are made on a clone and committed only after AEAD
+    /// authentication succeeds. Invalid packets cannot consume skipped keys or
+    /// advance the receiving/DH chains.
+    pub fn decrypt_with_ad(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, String> {
         if ciphertext.len() < aead::NONCE_SIZE {
             return Err("ciphertext too short".to_string());
         }
 
+        let mut candidate = self.clone();
+        let plaintext = candidate.decrypt_in_place(header, ciphertext, associated_data)?;
+        *self = candidate;
+        Ok(plaintext)
+    }
+
+    fn decrypt_in_place(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext: &[u8],
+        associated_data: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let aad = message_aad(associated_data, header)?;
+
         // Try skipped keys first (out-of-order message)
-        if let Some(plaintext) = self.try_skipped_keys(header, ciphertext)? {
+        if let Some(plaintext) = self.try_skipped_keys(header, ciphertext, &aad)? {
             return Ok(plaintext);
         }
 
@@ -248,7 +318,7 @@ impl RatchetSession {
             .map_err(|_| "invalid nonce")?;
         let ct = &ciphertext[aead::NONCE_SIZE..];
 
-        let result = aead::decrypt(&message_key, ct, &nonce);
+        let result = aead::decrypt_with_aad(&message_key, ct, &nonce, &aad);
         message_key.zeroize();
         result
     }
@@ -341,15 +411,17 @@ impl RatchetSession {
         &mut self,
         header: &MessageHeader,
         ciphertext: &[u8],
+        aad: &[u8],
     ) -> Result<Option<Vec<u8>>, String> {
         let key = (header.ratchet_key, header.n);
-        if let Some(message_key) = self.skipped_keys.remove(&key) {
+        if let Some(mut message_key) = self.skipped_keys.remove(&key) {
             let nonce: [u8; aead::NONCE_SIZE] = ciphertext[..aead::NONCE_SIZE]
                 .try_into()
                 .map_err(|_| "invalid nonce")?;
             let ct = &ciphertext[aead::NONCE_SIZE..];
-            let plaintext = aead::decrypt(&message_key, ct, &nonce)?;
-            Ok(Some(plaintext))
+            let result = aead::decrypt_with_aad(&message_key, ct, &nonce, aad);
+            message_key.zeroize();
+            Ok(Some(result?))
         } else {
             Ok(None)
         }
@@ -515,6 +587,12 @@ mod tests {
         (alice_session, bob_session)
     }
 
+    fn assert_serialized_session_eq(actual: Vec<u8>, expected: Vec<u8>) {
+        let actual: serde_json::Value = serde_json::from_slice(&actual).unwrap();
+        let expected: serde_json::Value = serde_json::from_slice(&expected).unwrap();
+        assert_eq!(actual, expected);
+    }
+
     #[test]
     fn test_basic_messaging() {
         let (mut alice, mut bob) = setup_sessions();
@@ -636,5 +714,79 @@ mod tests {
         let (h, ct) = alice.encrypt(&large).unwrap();
         let pt = bob.decrypt(&h, &ct).unwrap();
         assert_eq!(pt, large);
+    }
+
+    #[test]
+    fn test_header_roundtrip_is_explicitly_versioned() {
+        let header = MessageHeader {
+            ratchet_key: [7u8; 32],
+            n: 42,
+            pn: 9,
+        };
+        let bytes = header.to_bytes();
+        assert_eq!(bytes.len(), 41);
+        assert_eq!(bytes[0], RATCHET_HEADER_VERSION);
+        assert_eq!(MessageHeader::from_bytes(&bytes).unwrap(), header);
+
+        // Legacy v1 headers had no version byte and must not be interpreted as
+        // v2, because their ciphertext did not authenticate the header.
+        assert!(MessageHeader::from_bytes(&bytes[1..]).is_err());
+        let mut unknown = bytes;
+        unknown[0] = 0x7f;
+        assert!(MessageHeader::from_bytes(&unknown).is_err());
+    }
+
+    #[test]
+    fn test_tampered_header_does_not_desync_session() {
+        let (mut alice, mut bob) = setup_sessions();
+        let (header, ciphertext) = alice.encrypt(b"authenticated header").unwrap();
+        let before = bob.serialize().unwrap();
+
+        let mut tampered = header.clone();
+        tampered.n ^= 1;
+        assert!(bob.decrypt(&tampered, &ciphertext).is_err());
+        assert_serialized_session_eq(bob.serialize().unwrap(), before);
+
+        // The authentic packet must still decrypt after the failed attempt.
+        assert_eq!(
+            bob.decrypt(&header, &ciphertext).unwrap(),
+            b"authenticated header"
+        );
+    }
+
+    #[test]
+    fn test_failed_skipped_key_authentication_does_not_consume_key() {
+        let (mut alice, mut bob) = setup_sessions();
+        let (h1, ct1) = alice.encrypt(b"one").unwrap();
+        let (_h2, _ct2) = alice.encrypt(b"two").unwrap();
+        let (h3, ct3) = alice.encrypt(b"three").unwrap();
+
+        assert_eq!(bob.decrypt(&h3, &ct3).unwrap(), b"three");
+        let before = bob.serialize().unwrap();
+
+        let mut tampered = h1.clone();
+        tampered.pn ^= 1;
+        assert!(bob.decrypt(&tampered, &ct1).is_err());
+        assert_serialized_session_eq(bob.serialize().unwrap(), before);
+        assert_eq!(bob.decrypt(&h1, &ct1).unwrap(), b"one");
+    }
+
+    #[test]
+    fn test_caller_associated_data_is_authenticated() {
+        let (mut alice, mut bob) = setup_sessions();
+        let (header, ciphertext) = alice
+            .encrypt_with_ad(b"bound", b"alice|bob|conversation-a")
+            .unwrap();
+        let before = bob.serialize().unwrap();
+
+        assert!(bob
+            .decrypt_with_ad(&header, &ciphertext, b"alice|bob|conversation-b")
+            .is_err());
+        assert_serialized_session_eq(bob.serialize().unwrap(), before);
+        assert_eq!(
+            bob.decrypt_with_ad(&header, &ciphertext, b"alice|bob|conversation-a")
+                .unwrap(),
+            b"bound"
+        );
     }
 }

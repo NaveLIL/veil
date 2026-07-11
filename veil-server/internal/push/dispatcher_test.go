@@ -73,11 +73,16 @@ func TestDispatcher_DispatchesToAllSubscriptions(t *testing.T) {
 			{ID: 2, UserID: "u1", EndpointURL: srv.URL + "/topic-b", PushKind: "unifiedpush"},
 		},
 	}
+	policy, err := NewEndpointPolicy(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	d := New(Options{
-		Store:        store,
-		TransportKey: make([]byte, MinTransportKeyLen),
-		Salt:         []byte("salt"),
-		HTTPClient:   srv.Client(),
+		Store:          store,
+		TransportKey:   make([]byte, MinTransportKeyLen),
+		Salt:           []byte("salt"),
+		HTTPClient:     srv.Client(),
+		EndpointPolicy: policy,
 	})
 	if !d.Enabled() {
 		t.Fatal("expected enabled dispatcher")
@@ -93,7 +98,10 @@ func TestDispatcher_DispatchesToAllSubscriptions(t *testing.T) {
 
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
-		if hits.Load() == 2 {
+		store.mu.Lock()
+		touched := len(store.touched)
+		store.mu.Unlock()
+		if hits.Load() == 2 && touched == 2 {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -107,9 +115,10 @@ func TestDispatcher_DispatchesToAllSubscriptions(t *testing.T) {
 
 	// Touch was called for each successful dispatch.
 	store.mu.Lock()
-	defer store.mu.Unlock()
-	if len(store.touched) != 2 {
-		t.Fatalf("expected 2 touch calls, got %d", len(store.touched))
+	touched := len(store.touched)
+	store.mu.Unlock()
+	if touched != 2 {
+		t.Fatalf("expected 2 touch calls, got %d", touched)
 	}
 }
 
@@ -124,10 +133,15 @@ func TestDispatcher_PrunesGoneEndpoints(t *testing.T) {
 			{ID: 1, UserID: "u1", EndpointURL: srv.URL + "/dead", PushKind: "unifiedpush"},
 		},
 	}
+	policy, err := NewEndpointPolicy(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
 	d := New(Options{
-		Store:        store,
-		TransportKey: make([]byte, MinTransportKeyLen),
-		HTTPClient:   srv.Client(),
+		Store:          store,
+		TransportKey:   make([]byte, MinTransportKeyLen),
+		HTTPClient:     srv.Client(),
+		EndpointPolicy: policy,
 	})
 	d.NotifyOffline(context.Background(), "u1", &pb.Envelope{
 		Payload: &pb.Envelope_MessageEvent{MessageEvent: &pb.MessageEvent{
@@ -146,6 +160,45 @@ func TestDispatcher_PrunesGoneEndpoints(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("expected dead endpoint to be pruned, deleted=%v", store.deleted)
+}
+
+func TestDispatcher_BoundsConcurrentDeliveryJobs(t *testing.T) {
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		started <- struct{}{}
+		<-release
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+	policy, err := NewEndpointPolicy(srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := New(Options{
+		Store: &fakeStore{subs: []Subscription{{
+			ID: 1, UserID: "u1", EndpointURL: srv.URL + "/topic", PushKind: "unifiedpush",
+		}}},
+		TransportKey:            make([]byte, MinTransportKeyLen),
+		HTTPClient:              srv.Client(),
+		EndpointPolicy:          policy,
+		MaxConcurrentDeliveries: 1,
+	})
+	d.NotifyOffline(context.Background(), "u1", &pb.Envelope{})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first delivery did not start")
+	}
+	// The only slot is occupied, so this event must be dropped synchronously.
+	d.NotifyOffline(context.Background(), "u1", &pb.Envelope{})
+	time.Sleep(25 * time.Millisecond)
+	if got := hits.Load(); got != 1 {
+		t.Fatalf("concurrent outbound jobs = %d, want 1", got)
+	}
+	close(release)
 }
 
 func TestRedact_StripsPath(t *testing.T) {

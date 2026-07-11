@@ -27,6 +27,12 @@ func TestMembers_OwnerSeesAllMembers(t *testing.T) {
 	if len(members) != 2 {
 		t.Fatalf("members: want 2 got %d (%v)", len(members), body)
 	}
+	for _, raw := range members {
+		member, _ := raw.(map[string]any)
+		if signingKey, _ := member["signing_key"].(string); len(signingKey) != 64 {
+			t.Fatalf("server member missing 32-byte hex signing_key: %v", member)
+		}
+	}
 }
 
 func TestMembers_NonMemberCannotList(t *testing.T) {

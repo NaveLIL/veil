@@ -1,0 +1,92 @@
+name: Signed Desktop Release
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows (Authenticode)
+    runs-on: windows-latest
+    env:
+      WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: veil-desktop/pnpm-lock.yaml
+
+      - name: Require signing credentials
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX) -or
+              [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "WINDOWS_CERTIFICATE_PFX and WINDOWS_CERTIFICATE_PASSWORD secrets are required"
+          }
+
+      - name: Import Authenticode certificate
+        id: certificate
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "veil-signing.pfx"
+          [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
+          $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $cert = Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password
+          if (-not $cert.HasPrivateKey) { throw "Imported certificate has no private key" }
+          "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
+          Remove-Item -LiteralPath $pfxPath -Force
+
+      - name: Generate release-only Tauri config
+        shell: pwsh
+        working-directory: veil-desktop
+        env:
+          CERT_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
+        run: |
+          $config = Get-Content src-tauri\tauri.conf.json -Raw | ConvertFrom-Json
+          $windows = [ordered]@{
+            certificateThumbprint = $env:CERT_THUMBPRINT
+            digestAlgorithm = "sha256"
+            timestampUrl = "http://timestamp.digicert.com"
+          }
+          $config.bundle | Add-Member -NotePropertyName windows -NotePropertyValue $windows -Force
+          $config | ConvertTo-Json -Depth 100 | Set-Content src-tauri\tauri.release.conf.json -Encoding utf8
+
+      - name: Install frontend dependencies
+        working-directory: veil-desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build signed Windows installers
+        working-directory: veil-desktop
+        run: pnpm tauri build --config src-tauri/tauri.release.conf.json
+
+      - name: Verify Authenticode signatures
+        shell: pwsh
+        run: |
+          $artifacts = Get-ChildItem veil-desktop\src-tauri\target\release\bundle -Recurse -File |
+            Where-Object { $_.Extension -in @(".exe", ".msi") }
+          if ($artifacts.Count -eq 0) { throw "No Windows installers were produced" }
+          foreach ($artifact in $artifacts) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $artifact.FullName
+            if ($signature.Status -ne "Valid") {
+              throw "Invalid Authenticode signature on $($artifact.FullName): $($signature.Status)"
+            }
+          }
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veil-windows-signed
+          path: |
+            veil-desktop/src-tauri/target/release/bundle/nsis/*.exe
+            veil-desktop/src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error

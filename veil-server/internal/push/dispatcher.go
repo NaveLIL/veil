@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,6 +18,8 @@ import (
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 	"google.golang.org/protobuf/proto"
 )
+
+const defaultMaxConcurrentDeliveries = 32
 
 // Subscription is the projection of a row used by the dispatcher. Kept
 // independent from db.PushSubscription so the push package does not
@@ -39,25 +42,31 @@ type Store interface {
 // Dispatcher is goroutine-safe. Construct with New and pass to the
 // gateway via SetPushNotifier.
 type Dispatcher struct {
-	store        Store
-	httpClient   *http.Client
-	transportKey []byte
-	salt         []byte
-	maxJitter    time.Duration
-	counter      atomic.Uint64
-	enabled      bool
-	log          *slog.Logger
+	store          Store
+	httpClient     *http.Client
+	endpointPolicy *EndpointPolicy
+	transportKey   []byte
+	salt           []byte
+	maxJitter      time.Duration
+	deliverySlots  chan struct{}
+	counter        atomic.Uint64
+	enabled        bool
+	log            *slog.Logger
 }
 
 // Options is the construction record. All fields are optional except
 // Store; defaults are filled in by New when zero.
 type Options struct {
-	Store        Store
-	TransportKey []byte
-	Salt         []byte
-	HTTPClient   *http.Client
-	MaxJitter    time.Duration
-	Logger       *slog.Logger
+	Store          Store
+	TransportKey   []byte
+	Salt           []byte
+	HTTPClient     *http.Client
+	EndpointPolicy *EndpointPolicy
+	MaxJitter      time.Duration
+	// MaxConcurrentDeliveries bounds event-level outbound fan-out. Values <=0
+	// use the production default.
+	MaxConcurrentDeliveries int
+	Logger                  *slog.Logger
 }
 
 // New builds a Dispatcher. When TransportKey is nil, the dispatcher
@@ -67,16 +76,34 @@ func New(opts Options) *Dispatcher {
 	if opts.Store == nil {
 		panic("push.New: Store is required")
 	}
+	maxConcurrent := opts.MaxConcurrentDeliveries
+	if maxConcurrent <= 0 {
+		maxConcurrent = defaultMaxConcurrentDeliveries
+	}
 	d := &Dispatcher{
-		store:        opts.Store,
-		httpClient:   opts.HTTPClient,
-		transportKey: opts.TransportKey,
-		salt:         opts.Salt,
-		maxJitter:    opts.MaxJitter,
-		log:          opts.Logger,
+		store:          opts.Store,
+		httpClient:     opts.HTTPClient,
+		endpointPolicy: opts.EndpointPolicy,
+		transportKey:   opts.TransportKey,
+		salt:           opts.Salt,
+		maxJitter:      opts.MaxJitter,
+		deliverySlots:  make(chan struct{}, maxConcurrent),
+		log:            opts.Logger,
+	}
+	if d.endpointPolicy == nil {
+		d.endpointPolicy = defaultEndpointPolicy()
 	}
 	if d.httpClient == nil {
-		d.httpClient = &http.Client{Timeout: 10 * time.Second}
+		d.httpClient = d.endpointPolicy.newHTTPClient()
+	} else {
+		// Injected transports remain useful in tests, but redirect and timeout
+		// behavior still obey the production destination policy.
+		clientCopy := *d.httpClient
+		clientCopy.CheckRedirect = d.endpointPolicy.checkRedirect
+		if clientCopy.Timeout <= 0 || clientCopy.Timeout > defaultPushHTTPTimeout {
+			clientCopy.Timeout = defaultPushHTTPTimeout
+		}
+		d.httpClient = &clientCopy
 	}
 	if d.log == nil {
 		d.log = slog.Default()
@@ -96,13 +123,22 @@ func New(opts Options) *Dispatcher {
 func (d *Dispatcher) Enabled() bool { return d.enabled }
 
 // NotifyOffline POSTs an encrypted envelope to every subscription the
-// user has registered. Safe to call from a hot path: it spawns its own
-// goroutine and never blocks the caller.
+// user has registered. It never blocks the caller and admits only a bounded
+// number of concurrent delivery jobs; overload is dropped as a best-effort
+// wakeup rather than creating an unbounded goroutine backlog.
 func (d *Dispatcher) NotifyOffline(ctx context.Context, userID string, env *pb.Envelope) {
 	if !d.enabled || env == nil {
 		return
 	}
-	go d.deliver(context.Background(), userID, env)
+	select {
+	case d.deliverySlots <- struct{}{}:
+		go func() {
+			defer func() { <-d.deliverySlots }()
+			d.deliver(context.Background(), userID, env)
+		}()
+	default:
+		d.log.Warn("push: delivery queue saturated", "user", userID)
+	}
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, userID string, env *pb.Envelope) {
@@ -146,7 +182,11 @@ func (d *Dispatcher) deliver(ctx context.Context, userID string, env *pb.Envelop
 }
 
 func (d *Dispatcher) post(ctx context.Context, sub Subscription, sealed []byte) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sub.EndpointURL, strings.NewReader(base64.StdEncoding.EncodeToString(sealed)))
+	endpoint, err := d.endpointPolicy.ValidateEndpoint(ctx, sub.EndpointURL)
+	if err != nil {
+		return fmt.Errorf("unsafe endpoint: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint.String(), strings.NewReader(base64.StdEncoding.EncodeToString(sealed)))
 	if err != nil {
 		return fmt.Errorf("build request: %w", err)
 	}
@@ -163,6 +203,14 @@ func (d *Dispatcher) post(ctx context.Context, sub Subscription, sealed []byte) 
 		return err
 	}
 	defer resp.Body.Close()
+	const maxResponseBytes = 4 << 10
+	read, err := io.Copy(io.Discard, io.LimitReader(resp.Body, maxResponseBytes+1))
+	if err != nil {
+		return fmt.Errorf("read push response: %w", err)
+	}
+	if read > maxResponseBytes {
+		return errors.New("push response body too large")
+	}
 
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:

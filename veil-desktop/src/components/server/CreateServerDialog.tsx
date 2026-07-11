@@ -1,6 +1,6 @@
-import { Component, createSignal, Show } from "solid-js";
+import { Component, createEffect, createSignal, Show } from "solid-js";
 import { Plus, ArrowRight, Loader2 } from "lucide-solid";
-import { appStore } from "@/stores/app";
+import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
 import { IslandDialog, dlgStyles as ds } from "@/components/ui/IslandDialog";
 
 interface Props {
@@ -16,19 +16,31 @@ export const CreateServerDialog: Component<Props> = (props) => {
   const reset = () => { setName(""); setError(""); };
   const close = () => { if (loading()) return; reset(); props.onClose(); };
 
+  createEffect(() => {
+    if (!props.open) {
+      reset();
+      setLoading(false);
+    }
+  });
+
   const handleCreate = async () => {
     const n = name().trim();
     if (!n) return;
+    const sessionEpoch = captureUiSessionEpoch();
     setLoading(true); setError("");
     try {
       const created = await appStore.createServer(n);
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       if (created) {
         appStore.selectServer(created.id);
         reset();
         props.onClose();
       } else setError("Failed to create server");
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
+    } catch (e) {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setError(String(e));
+    } finally {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setLoading(false);
+    }
   };
 
   const onKey = (e: KeyboardEvent) => {

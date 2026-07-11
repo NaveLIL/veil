@@ -37,8 +37,7 @@ pub use store::{InMemoryStore, MlsKeyStore, SignerBlob};
 
 /// The single cipher suite Veil supports. Locked at the protocol layer
 /// — changing this number is a hard fork.
-pub const CIPHERSUITE: Ciphersuite =
-    Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+pub const CIPHERSUITE: Ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
 
 /// Domain label used to derive auxiliary secrets (e.g. for LiveKit in
 /// Phase 7) from the MLS exporter.
@@ -298,8 +297,8 @@ impl<S: MlsKeyStore> MlsClient<S> {
     /// Decrypt an application message.
     pub fn decrypt(&self, group_id: &MlsGroupId, ciphertext: &MlsCiphertext) -> Result<Vec<u8>> {
         let mut group = self.load_group(group_id)?;
-        let msg = MlsMessageIn::tls_deserialize_exact_bytes(ciphertext.0.as_slice())
-            .map_err(tls_err)?;
+        let msg =
+            MlsMessageIn::tls_deserialize_exact_bytes(ciphertext.0.as_slice()).map_err(tls_err)?;
         let protocol_msg: ProtocolMessage = match msg.extract() {
             MlsMessageBodyIn::PrivateMessage(m) => m.into(),
             MlsMessageBodyIn::PublicMessage(m) => m.into(),
@@ -365,11 +364,7 @@ impl<S: MlsKeyStore> MlsClient<S> {
     /// blob and storage snapshot. The signer must already live in
     /// `store`; this is the symmetric counterpart to [`Self::create`]
     /// + [`Self::snapshot`].
-    pub fn restore_with_snapshot(
-        leaf: LeafIdentity,
-        store: S,
-        snapshot: &[u8],
-    ) -> Result<Self> {
+    pub fn restore_with_snapshot(leaf: LeafIdentity, store: S, snapshot: &[u8]) -> Result<Self> {
         let provider = OpenMlsRustCrypto::default();
         // Parse the snapshot bytes (same format as `snapshot()`) and
         // load them into the new provider's storage HashMap via interior
@@ -507,7 +502,9 @@ mod tests {
             b"team meeting"
         );
         assert_eq!(
-            charlie.decrypt(&group_id, &from_alice).expect("charlie dec"),
+            charlie
+                .decrypt(&group_id, &from_alice)
+                .expect("charlie dec"),
             b"team meeting"
         );
 

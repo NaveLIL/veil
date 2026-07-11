@@ -25,7 +25,13 @@
   "devDependencies": {
     "@tauri-apps/cli": "^2",
     "typescript": "^5.7",
-    "vite": "^6",
+    "vite": "^6.4.3",
     "vite-plugin-solid": "^2"
+  },
+  "pnpm": {
+    "overrides": {
+      "@babel/core": "7.29.6",
+      "postcss": "8.5.10"
+    }
   }
 }

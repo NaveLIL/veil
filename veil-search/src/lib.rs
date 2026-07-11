@@ -1,7 +1,8 @@
 //! Local-only full-text search index for decrypted Veil messages.
 //!
-//! Backed by [Tantivy]. The index lives entirely on-device under
-//! `<app_data>/search/v1/` and is never transmitted to the server.
+//! Backed by [Tantivy]. For sensitive message content, callers should use the
+//! process-memory-only index and rebuild it from their encrypted database after
+//! unlock. The index is never transmitted to the server.
 //!
 //! # Schema
 //! - `id`           — STRING, STORED (primary key, used for delete/update)
@@ -15,6 +16,7 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 use tantivy::collector::TopDocs;
+use tantivy::directory::RamDirectory;
 use tantivy::query::{BooleanQuery, FuzzyTermQuery, Occur, Query, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, SchemaBuilder, FAST, INDEXED, STORED, STRING, TEXT,
@@ -89,14 +91,30 @@ fn build_schema() -> (Schema, Fields) {
 }
 
 impl Indexer {
+    /// Create a process-memory-only index.
+    ///
+    /// Decrypted message bodies must not be duplicated into an unencrypted
+    /// on-disk Tantivy index. The desktop rebuilds this index from SQLCipher
+    /// after unlock and clears it again when locking.
+    pub fn in_memory() -> Result<Self> {
+        let (schema, fields) = build_schema();
+        let index = Index::open_or_create(RamDirectory::create(), schema)?;
+        let writer = index.writer(WRITER_HEAP)?;
+        Ok(Self {
+            index,
+            writer: Mutex::new(writer),
+            fields,
+        })
+    }
+
     /// Open or create an index at `path`. Directory is created if missing.
+    ///
+    /// This constructor remains available for non-sensitive consumers. Veil
+    /// Desktop intentionally uses [`Indexer::in_memory`] instead.
     pub fn open(path: &Path) -> Result<Self> {
         std::fs::create_dir_all(path)?;
         let (schema, fields) = build_schema();
-        let index = Index::open_or_create(
-            tantivy::directory::MmapDirectory::open(path)?,
-            schema,
-        )?;
+        let index = Index::open_or_create(tantivy::directory::MmapDirectory::open(path)?, schema)?;
         let writer = index.writer(WRITER_HEAP)?;
         Ok(Self {
             index,
@@ -179,7 +197,7 @@ impl Indexer {
         }
         let final_query = BooleanQuery::new(clauses);
 
-        let top = searcher.search(&final_query, &TopDocs::with_limit(limit))?;
+        let top = searcher.search(&final_query, &TopDocs::with_limit(limit).order_by_score())?;
         let mut hits = Vec::with_capacity(top.len());
         for (score, addr) in top {
             let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
@@ -214,7 +232,9 @@ fn read_str(doc: &tantivy::TantivyDocument, f: Field) -> String {
 
 fn read_i64(doc: &tantivy::TantivyDocument, f: Field) -> i64 {
     use tantivy::schema::Value;
-    doc.get_first(f).and_then(|v| v.as_i64()).unwrap_or_default()
+    doc.get_first(f)
+        .and_then(|v| v.as_i64())
+        .unwrap_or_default()
 }
 
 /// Run `query` through the index's tokenizer for `field` and return the
@@ -243,11 +263,13 @@ mod tests {
 
     #[test]
     fn index_search_delete_roundtrip() {
-        let dir = tempfile::tempdir().unwrap();
-        let idx = Indexer::open(dir.path()).unwrap();
-        idx.index_message("m1", "c1", "alice", "hello world", 1).unwrap();
-        idx.index_message("m2", "c1", "bob", "another message", 2).unwrap();
-        idx.index_message("m3", "c2", "alice", "world peace", 3).unwrap();
+        let idx = Indexer::in_memory().unwrap();
+        idx.index_message("m1", "c1", "alice", "hello world", 1)
+            .unwrap();
+        idx.index_message("m2", "c1", "bob", "another message", 2)
+            .unwrap();
+        idx.index_message("m3", "c2", "alice", "world peace", 3)
+            .unwrap();
 
         let hits = idx.search("world", None, 10).unwrap();
         assert_eq!(hits.len(), 2);
@@ -264,11 +286,13 @@ mod tests {
 
     #[test]
     fn prefix_and_cyrillic_match() {
-        let dir = tempfile::tempdir().unwrap();
-        let idx = Indexer::open(dir.path()).unwrap();
-        idx.index_message("m1", "c1", "alice", "слякоть на улице", 1).unwrap();
-        idx.index_message("m2", "c1", "bob", "привет мир", 2).unwrap();
-        idx.index_message("m3", "c1", "alice", "Hello World wonderful", 3).unwrap();
+        let idx = Indexer::in_memory().unwrap();
+        idx.index_message("m1", "c1", "alice", "слякоть на улице", 1)
+            .unwrap();
+        idx.index_message("m2", "c1", "bob", "привет мир", 2)
+            .unwrap();
+        idx.index_message("m3", "c1", "alice", "Hello World wonderful", 3)
+            .unwrap();
 
         // Cyrillic prefix
         let h1 = idx.search("сля", None, 10).unwrap();

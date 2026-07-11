@@ -1,6 +1,6 @@
 import { Component, createSignal, Show, createEffect } from "solid-js";
 import { UserPlus, Copy, Check, Loader2, RefreshCw } from "lucide-solid";
-import { appStore } from "@/stores/app";
+import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
 import { IslandDialog, dlgStyles as ds } from "@/components/ui/IslandDialog";
 import { IslandSelect } from "@/components/ui/IslandSelect";
 
@@ -38,18 +38,30 @@ export const CreateInviteDialog: Component<Props> = (props) => {
   const inviteUrl = () => (code() ? `veil://invite/${code()}` : "");
 
   const generate = async () => {
+    const sessionEpoch = captureUiSessionEpoch();
     setLoading(true); setError(""); setCopied(false);
     try {
       const inv = await appStore.createInvite(props.serverId, maxUses(), expirySecs());
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       if (inv) setCode(inv.code);
       else setError("Failed to create invite");
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
+    } catch (e) {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setError(String(e));
+    } finally {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setLoading(false);
+    }
   };
 
   // Auto-generate when dialog opens
   createEffect(() => {
-    if (props.open && !code() && !loading()) generate();
+    if (!props.open) {
+      setCode("");
+      setError("");
+      setCopied(false);
+      setLoading(false);
+      return;
+    }
+    if (!code() && !loading()) generate();
   });
 
   const close = () => {
@@ -61,11 +73,17 @@ export const CreateInviteDialog: Component<Props> = (props) => {
   const copy = async () => {
     const v = inviteUrl();
     if (!v) return;
+    const sessionEpoch = captureUiSessionEpoch();
     try {
       await navigator.clipboard.writeText(v);
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    } catch { setError("Clipboard unavailable"); }
+      setTimeout(() => {
+        if (isUiSessionEpochCurrent(sessionEpoch)) setCopied(false);
+      }, 2000);
+    } catch {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setError("Clipboard unavailable");
+    }
   };
 
   const copyBtn = () => {

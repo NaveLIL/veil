@@ -3,7 +3,12 @@ import { Component, For, Show, createEffect, createMemo, createSignal, onCleanup
 import { Search, MessageCircle, Users, RefreshCw } from "lucide-solid";
 import { invoke } from "@tauri-apps/api/core";
 import { Z } from "@/lib/zIndex";
-import { appStore, type Conversation } from "@/stores/app";
+import {
+  appStore,
+  captureUiSessionEpoch,
+  isUiSessionEpochCurrent,
+  type Conversation,
+} from "@/stores/app";
 
 interface Props {
   open: boolean;
@@ -63,18 +68,21 @@ export const CommandPalette: Component<Props> = (props) => {
       setLoading(false);
       return;
     }
+    const sessionEpoch = captureUiSessionEpoch();
     setLoading(true);
     try {
       const res = await invoke<SearchHit[]>("search_messages", {
         query: q, conversationId: null, limit: 30,
       });
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       setHits(res);
       setActive(0);
     } catch (err) {
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       console.error("search_messages failed", err);
       setHits([]);
     } finally {
-      setLoading(false);
+      if (isUiSessionEpochCurrent(sessionEpoch)) setLoading(false);
     }
   };
 
@@ -93,6 +101,18 @@ export const CommandPalette: Component<Props> = (props) => {
     }
   });
 
+  createEffect(() => {
+    if (appStore.screen() !== "locked") return;
+    if (timer) window.clearTimeout(timer);
+    setQuery("");
+    setHits([]);
+    setActive(0);
+    setLoading(false);
+    setRebuilding(false);
+    setRebuildMsg(null);
+    props.onClose();
+  });
+
   const conversationsById = createMemo(() => {
     const map = new Map<string, Conversation>();
     for (const c of appStore.conversations()) map.set(c.id, c);
@@ -106,17 +126,20 @@ export const CommandPalette: Component<Props> = (props) => {
 
   const rebuild = async () => {
     if (rebuilding()) return;
+    const sessionEpoch = captureUiSessionEpoch();
     setRebuilding(true);
     setRebuildMsg(null);
     try {
       const n = await invoke<number>("rebuild_search_index");
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       setRebuildMsg(`Indexed ${n} message${n === 1 ? "" : "s"}.`);
       if (query().trim()) await runSearch(query());
     } catch (err) {
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       console.error("rebuild_search_index failed", err);
       setRebuildMsg("Rebuild failed — see console.");
     } finally {
-      setRebuilding(false);
+      if (isUiSessionEpochCurrent(sessionEpoch)) setRebuilding(false);
     }
   };
 
@@ -356,6 +379,7 @@ export function useCommandPaletteHotkey() {
       // Use physical-key code so the hotkey works on non-Latin keyboard
       // layouts (e.g. Russian: same physical "K" key emits `e.key === "л"`).
       if ((e.metaKey || e.ctrlKey) && e.code === "KeyK") {
+        if (appStore.screen() === "locked") return;
         e.preventDefault();
         setOpen((o) => !o);
       }

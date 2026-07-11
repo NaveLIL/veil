@@ -5,9 +5,9 @@
 //! to glue together themselves:
 //!
 //!   1. **Streaming encryption** — wraps a plaintext file as a chunked
-//!      AEAD stream (see [`veil_crypto::chunked_aead`]). Memory use is
-//!      O(chunk size) regardless of file size, which matters on
-//!      mobile.
+//!      AEAD stream (see [`veil_crypto::chunked_aead`]). The current one-shot
+//!      adapter is explicitly capped at 64 MiB until the public API exposes a
+//!      true O(chunk-size) upload/download stream.
 //!   2. **tus.io client** — talks the
 //!      [tus 1.0.0 protocol](https://tus.io/protocols/resumable-upload.html)
 //!      so partial uploads survive flaky links: the client HEADs the
@@ -19,9 +19,9 @@
 //!
 //! ## Threat model
 //!
-//! * The server only ever sees ciphertext + opaque metadata
-//!   (`{file_id, size, declared_chunks}`). The content key never
-//!   leaves the client.
+//! * The server only ever sees ciphertext plus optional metadata already
+//!   encrypted by the caller. Plaintext filenames and MIME types are never
+//!   placed in tus headers. The content key never leaves the client.
 //! * Chunked AEAD detects truncation, reordering and per-chunk
 //!   tampering (see [`veil_crypto::chunked_aead`]).
 //! * The bearer token is bound to a single user via HMAC-SHA256;
@@ -43,6 +43,5 @@ pub mod stream;
 
 pub use client::{TusClient, TusClientError, TusUploadHandle, TusUploadInit};
 pub use stream::{
-    decrypt_stream_to_file, encrypt_file_to_chunks, EncryptedChunk, EncryptedFileMeta,
-    StreamError,
+    decrypt_stream_to_file, encrypt_file_to_chunks, EncryptedChunk, EncryptedFileMeta, StreamError,
 };

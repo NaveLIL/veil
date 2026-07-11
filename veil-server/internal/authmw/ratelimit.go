@@ -1,17 +1,18 @@
 package authmw
 
 import (
-	"net"
 	"net/http"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/AegisSec/veil-server/internal/httpmw"
 )
 
 // RateLimit is a per-user (or per-IP) token-bucket limiter for REST
-// endpoints. It identifies the caller via the X-User-ID header (set by
-// RequireSigned on success) and falls back to the client IP when no user is
-// associated. Buckets are kept in memory; this is a single-process
+// endpoints. It identifies the caller only via the verified principal
+// context installed by RequireSigned and falls back to the client IP when no
+// authenticated principal is associated. Raw identity headers are never
+// trusted for quota selection. Buckets are kept in memory; this is a single-process
 // best-effort defence and does not coordinate across multiple gateway
 // replicas.
 //
@@ -86,8 +87,11 @@ func (rl *RateLimit) evictIdle(now time.Time) {
 // bucket is empty the request is rejected with 429 Too Many Requests.
 func (rl *RateLimit) Wrap(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-User-ID")
-		if key == "" {
+		userID, verified := VerifiedUserID(r.Context())
+		key := ""
+		if verified {
+			key = "user:" + userID
+		} else {
 			key = "ip:" + clientIP(r)
 		}
 		if !rl.allow(key) {
@@ -125,16 +129,5 @@ func (rl *RateLimit) allow(key string) bool {
 }
 
 func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// Trust only the first IP in the chain (closest to the client).
-		if comma := strings.IndexByte(xff, ','); comma >= 0 {
-			return strings.TrimSpace(xff[:comma])
-		}
-		return strings.TrimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return httpmw.ClientIP(r)
 }

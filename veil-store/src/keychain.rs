@@ -1,4 +1,5 @@
 use keyring::Entry;
+use zeroize::Zeroize;
 
 const SERVICE_NAME: &str = "veil-messenger";
 
@@ -26,10 +27,17 @@ pub fn delete_seed(account: &str) -> Result<(), String> {
         .map_err(|e| format!("keychain delete: {e}"))
 }
 
-/// Check if a seed exists in the keychain.
-pub fn has_seed(account: &str) -> bool {
-    let Ok(entry) = Entry::new(SERVICE_NAME, account) else {
-        return false;
-    };
-    entry.get_password().is_ok()
+/// Check if a credential exists without treating secure-storage failures as
+/// absence. Callers use this for lock decisions, so only `NoEntry` may map to
+/// `false`; a locked or unavailable OS credential store must fail closed.
+pub fn has_seed(account: &str) -> Result<bool, String> {
+    let entry = Entry::new(SERVICE_NAME, account).map_err(|e| format!("keychain entry: {e}"))?;
+    match entry.get_password() {
+        Ok(mut value) => {
+            value.zeroize();
+            Ok(true)
+        }
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(format!("keychain access: {error}")),
+    }
 }

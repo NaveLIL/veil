@@ -6,6 +6,20 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 use crate::kdf;
 use crate::keys::IdentityKeyPair;
 
+/// Domain separator for Ed25519 signatures over X3DH signed prekeys.
+pub const SIGNED_PREKEY_SIGNATURE_DOMAIN: &[u8] = b"veil-x3dh-spk-v1\0";
+
+/// Build the canonical message covered by an X3DH signed-prekey signature.
+///
+/// Raw 32-byte SPK signatures from the legacy format are intentionally not
+/// accepted: callers must sign this domain-separated message exactly.
+pub fn signed_prekey_signature_message(signed_prekey: &[u8; 32]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(SIGNED_PREKEY_SIGNATURE_DOMAIN.len() + 32);
+    message.extend_from_slice(SIGNED_PREKEY_SIGNATURE_DOMAIN);
+    message.extend_from_slice(signed_prekey);
+    message
+}
+
 /// A prekey bundle published to the server for X3DH session establishment.
 #[derive(Clone)]
 pub struct PreKeyBundle {
@@ -15,7 +29,7 @@ pub struct PreKeyBundle {
     pub signing_key: [u8; 32],
     /// Signed prekey (SPK) — X25519 public
     pub signed_prekey: [u8; 32],
-    /// Ed25519 signature over SPK
+    /// Ed25519 signature over `veil-x3dh-spk-v1\0 || SPK`
     pub signed_prekey_signature: [u8; 64],
     /// SPK ID (for server-side tracking)
     pub signed_prekey_id: u32,
@@ -73,7 +87,8 @@ impl SignedPreKey {
         let secret = X25519StaticSecret::random_from_rng(OsRng);
         let public = X25519PublicKey::from(&secret);
 
-        let signature = identity.ed25519_signing_key().sign(public.as_bytes());
+        let signature_message = signed_prekey_signature_message(public.as_bytes());
+        let signature = identity.ed25519_signing_key().sign(&signature_message);
 
         Self {
             secret,
@@ -111,9 +126,10 @@ pub fn initiate(
     peer_bundle: &PreKeyBundle,
 ) -> Result<X3DHResult, String> {
     // Verify SPK signature with peer's Ed25519 signing key
+    let signature_message = signed_prekey_signature_message(&peer_bundle.signed_prekey);
     if !crate::signature::verify(
         &peer_bundle.signing_key,
-        &peer_bundle.signed_prekey,
+        &signature_message,
         &peer_bundle.signed_prekey_signature,
     ) {
         return Err("invalid SPK signature: peer's signed prekey failed verification".to_string());
@@ -333,5 +349,31 @@ mod tests {
             result1.shared_secret, result2.shared_secret,
             "Different OPKs must produce different shared secrets"
         );
+    }
+
+    #[test]
+    fn test_signed_prekey_signature_is_domain_separated() {
+        let identity = IdentityKeyPair::generate();
+        let spk = SignedPreKey::generate(&identity, 1);
+        let public = *spk.public.as_bytes();
+        let message = signed_prekey_signature_message(&public);
+
+        assert!(crate::signature::verify(
+            &identity.ed25519_public_bytes(),
+            &message,
+            &spk.signature
+        ));
+        assert!(
+            !crate::signature::verify(&identity.ed25519_public_bytes(), &public, &spk.signature),
+            "legacy raw-SPK signatures must be rejected"
+        );
+
+        let mut other_public = public;
+        other_public[0] ^= 1;
+        assert!(!crate::signature::verify(
+            &identity.ed25519_public_bytes(),
+            &signed_prekey_signature_message(&other_public),
+            &spk.signature
+        ));
     }
 }

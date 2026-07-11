@@ -1,5 +1,5 @@
 use chacha20poly1305::{
-    aead::{Aead, KeyInit},
+    aead::{Aead, KeyInit, Payload},
     XChaCha20Poly1305, XNonce,
 };
 use rand::RngCore;
@@ -17,6 +17,19 @@ const PAD_BLOCK: usize = 256;
 ///
 /// Returns `(ciphertext, nonce)`. The nonce is 24 bytes, randomly generated.
 pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_SIZE]), String> {
+    encrypt_with_aad(key, plaintext, &[])
+}
+
+/// Encrypt plaintext and authenticate additional, non-encrypted protocol data.
+///
+/// Callers must pass the exact same `aad` to [`decrypt_with_aad`]. This is used
+/// by higher-level protocols to bind their wire headers and conversation
+/// context to the ciphertext.
+pub fn encrypt_with_aad(
+    key: &[u8; 32],
+    plaintext: &[u8],
+    aad: &[u8],
+) -> Result<(Vec<u8>, [u8; NONCE_SIZE]), String> {
     if plaintext.len() > u32::MAX as usize {
         return Err("plaintext too large (max 4GB)".to_string());
     }
@@ -31,12 +44,18 @@ pub fn encrypt(key: &[u8; 32], plaintext: &[u8]) -> Result<(Vec<u8>, [u8; NONCE_
     // Pad plaintext to hide length
     let mut padded = pad(plaintext);
 
-    let ciphertext = cipher
-        .encrypt(nonce, padded.as_ref())
-        .map_err(|e| format!("encrypt: {e}"))?;
+    let result = cipher.encrypt(
+        nonce,
+        Payload {
+            msg: padded.as_ref(),
+            aad,
+        },
+    );
 
     // Zeroize padded plaintext
     padded.zeroize();
+
+    let ciphertext = result.map_err(|e| format!("encrypt: {e}"))?;
 
     Ok((ciphertext, nonce_bytes))
 }
@@ -49,20 +68,36 @@ pub fn decrypt(
     ciphertext: &[u8],
     nonce: &[u8; NONCE_SIZE],
 ) -> Result<Vec<u8>, String> {
+    decrypt_with_aad(key, ciphertext, nonce, &[])
+}
+
+/// Decrypt ciphertext while authenticating additional protocol data.
+pub fn decrypt_with_aad(
+    key: &[u8; 32],
+    ciphertext: &[u8],
+    nonce: &[u8; NONCE_SIZE],
+    aad: &[u8],
+) -> Result<Vec<u8>, String> {
     let cipher = XChaCha20Poly1305::new_from_slice(key).map_err(|e| format!("cipher init: {e}"))?;
 
     let nonce = XNonce::from_slice(nonce);
 
     let mut padded = cipher
-        .decrypt(nonce, ciphertext)
+        .decrypt(
+            nonce,
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| "decryption failed: invalid key or corrupted data".to_string())?;
 
-    let plaintext = unpad(&padded)?;
+    let plaintext = unpad(&padded);
 
-    // Zeroize padded buffer
+    // Zeroize padded buffer even when padding validation fails.
     padded.zeroize();
 
-    Ok(plaintext)
+    plaintext
 }
 
 /// Pad plaintext to a multiple of PAD_BLOCK (256 bytes).
@@ -163,6 +198,19 @@ mod tests {
 
         let result = decrypt(&key, &ciphertext, &nonce);
         assert!(result.is_err(), "Tampered ciphertext must fail");
+    }
+
+    #[test]
+    fn test_aad_is_authenticated() {
+        let key = [42u8; 32];
+        let (ciphertext, nonce) = encrypt_with_aad(&key, b"secret", b"header-v2").unwrap();
+
+        assert_eq!(
+            decrypt_with_aad(&key, &ciphertext, &nonce, b"header-v2").unwrap(),
+            b"secret"
+        );
+        assert!(decrypt_with_aad(&key, &ciphertext, &nonce, b"header-v3").is_err());
+        assert!(decrypt(&key, &ciphertext, &nonce).is_err());
     }
 
     #[test]

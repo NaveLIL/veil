@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/AegisSec/veil-server/internal/db"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 )
 
@@ -58,18 +59,6 @@ func (h *hooks) PreCreate(event tusd.HookEvent) (tusd.HTTPResponse, tusd.FileInf
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	since := time.Now().Add(-h.cfg.QuotaWindow)
-	used, err := h.store.SumTusBytesInWindow(ctx, userID, since)
-	if err != nil {
-		h.logger.Warn("uploads: quota lookup failed", "err", err, "user", userID)
-		return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
-			rejectError("quota check failed", 500)
-	}
-	if used+size > h.cfg.UserDailyQuota {
-		return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
-			rejectError("quota exceeded", 413)
-	}
-
 	fileID, err := generateFileID()
 	if err != nil {
 		return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
@@ -79,7 +68,14 @@ func (h *hooks) PreCreate(event tusd.HookEvent) (tusd.HTTPResponse, tusd.FileInf
 	// Set the abort TTL up-front; PreFinish will overwrite with the
 	// retention TTL once the upload completes.
 	abortAt := time.Now().Add(h.cfg.AbortAfterIdle)
-	if err := h.store.CreateTusUpload(ctx, fileID, userID, size, "local", abortAt); err != nil {
+	since := time.Now().Add(-h.cfg.QuotaWindow)
+	if err := h.store.ReserveTusUpload(
+		ctx, fileID, userID, size, "local", abortAt, since, h.cfg.UserDailyQuota,
+	); err != nil {
+		if errors.Is(err, db.ErrTusQuotaExceeded) {
+			return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
+				rejectError("quota exceeded", 413)
+		}
 		h.logger.Warn("uploads: create row failed", "err", err, "user", userID)
 		return tusd.HTTPResponse{}, tusd.FileInfoChanges{},
 			rejectError("could not create upload", 500)
@@ -96,8 +92,9 @@ func (h *hooks) PreFinish(event tusd.HookEvent) (tusd.HTTPResponse, error) {
 	retainUntil := time.Now().Add(h.cfg.RetentionAfterFinish)
 	if err := h.store.FinishTusUpload(ctx, event.Upload.ID, retainUntil); err != nil {
 		h.logger.Warn("uploads: finish row failed", "err", err, "id", event.Upload.ID)
-		// Don't fail the request — bytes are on disk, the row will be
-		// reconciled by the sweeper if it stays orphaned.
+		// Do not acknowledge a completed tus upload until its authorization
+		// row is complete too. A 5xx lets the client retry the final PATCH.
+		return tusd.HTTPResponse{}, rejectError("could not finalize upload", 500)
 	}
 	return tusd.HTTPResponse{}, nil
 }

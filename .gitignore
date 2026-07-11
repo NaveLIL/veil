@@ -1,6 +1,5 @@
 # Rust
 target/
-Cargo.lock
 
 # Node
 node_modules/
@@ -18,6 +17,11 @@ veil-server/veil-server
 # OS
 .DS_Store
 Thumbs.db
+
+# Local secrets
+.env
+.env.*
+!.env.example
 
 # Build artifacts
 *.wasm

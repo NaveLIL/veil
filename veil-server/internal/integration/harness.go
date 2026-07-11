@@ -19,9 +19,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -46,6 +44,7 @@ import (
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"golang.org/x/crypto/curve25519"
 )
 
 // Harness is a fully wired veil-server REST stack backed by an ephemeral
@@ -55,6 +54,7 @@ import (
 type Harness struct {
 	t      *testing.T
 	DB     *db.DB
+	Chat   *chat.Service
 	Server *httptest.Server
 	mw     *authmw.Middleware
 
@@ -143,6 +143,7 @@ func New(t *testing.T) *Harness {
 	return &Harness{
 		t:           t,
 		DB:          database,
+		Chat:        chatSvc,
 		Server:      srv,
 		mw:          mw,
 		pgContainer: pgC,
@@ -152,9 +153,12 @@ func New(t *testing.T) *Harness {
 // User is a registered test user with the secret material needed to sign
 // requests on its behalf.
 type User struct {
-	ID         string
-	Username   string
-	SigningKey ed25519.PrivateKey
+	ID              string
+	Username        string
+	IdentityPrivate []byte
+	IdentityKey     []byte
+	SigningPublic   ed25519.PublicKey
+	SigningKey      ed25519.PrivateKey
 }
 
 // CreateUser inserts a user with a fresh ed25519 signing key and returns
@@ -165,12 +169,15 @@ func (h *Harness) CreateUser(username string) *User {
 	if err != nil {
 		h.t.Fatalf("generate key: %v", err)
 	}
-	// identity_key column requires a unique 32-byte BYTEA; reuse the public
-	// signing key as identity for test purposes (production clients keep them
-	// separate but the schema only enforces uniqueness).
-	identity := make([]byte, 32)
-	if _, err := rand.Read(identity); err != nil {
+	// Generate a real X25519 identity pair so authentication tests can exercise
+	// proof-of-possession instead of using arbitrary 32-byte database fixtures.
+	identityPrivate := make([]byte, 32)
+	if _, err := rand.Read(identityPrivate); err != nil {
 		h.t.Fatalf("rand identity: %v", err)
+	}
+	identity, err := curve25519.X25519(identityPrivate, curve25519.Basepoint)
+	if err != nil {
+		h.t.Fatalf("derive identity public key: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -178,7 +185,14 @@ func (h *Harness) CreateUser(username string) *User {
 	if err != nil {
 		h.t.Fatalf("CreateUser: %v", err)
 	}
-	return &User{ID: u.ID, Username: username, SigningKey: priv}
+	return &User{
+		ID:              u.ID,
+		Username:        username,
+		IdentityPrivate: append([]byte(nil), identityPrivate...),
+		IdentityKey:     append([]byte(nil), identity...),
+		SigningPublic:   append(ed25519.PublicKey(nil), pub...),
+		SigningKey:      priv,
+	}
 }
 
 // Do issues a signed REST request and returns (status, body bytes,
@@ -200,15 +214,20 @@ func (h *Harness) Do(u *User, method, path string, body any) (int, []byte, map[s
 			raw = b2
 		}
 	}
-	tsMs := time.Now().UnixMilli()
-	hash := sha256.Sum256(raw)
-	canonical := method + "\n" + path + "\n" + strconv.FormatInt(tsMs, 10) + "\n" + hex.EncodeToString(hash[:])
-	sig := ed25519.Sign(u.SigningKey, []byte(canonical))
-
 	req, err := http.NewRequest(method, h.Server.URL+path, bytes.NewReader(raw))
 	if err != nil {
 		h.t.Fatalf("new request: %v", err)
 	}
+	tsMs := time.Now().UnixMilli()
+	target := req.URL.EscapedPath()
+	if req.URL.ForceQuery || req.URL.RawQuery != "" {
+		target += "?" + req.URL.RawQuery
+	}
+	canonical, err := authmw.CanonicalRequest(req.Method, req.Host, target, strconv.FormatInt(tsMs, 10), raw)
+	if err != nil {
+		h.t.Fatalf("canonical request: %v", err)
+	}
+	sig := ed25519.Sign(u.SigningKey, canonical)
 	req.Header.Set("X-Veil-User", u.ID)
 	req.Header.Set("X-Veil-Timestamp", strconv.FormatInt(tsMs, 10))
 	req.Header.Set("X-Veil-Signature", base64.StdEncoding.EncodeToString(sig))

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -26,6 +27,10 @@ const (
 	PermManageServer       uint64 = 1 << 9
 	PermReadMessageHistory uint64 = 1 << 10 // gets epoch key envelopes; can decrypt
 	PermAdministrator      uint64 = 1 << 32
+	AllRolePermissions            = PermViewChannel | PermSendMessages | PermManageMessages |
+		PermMentionEveryone | PermManageChannels | PermManageRoles | PermKickMembers |
+		PermBanMembers | PermCreateInvite | PermManageServer | PermReadMessageHistory |
+		PermAdministrator
 
 	// Default @everyone gets visibility + read + send + invite. No history by default.
 	DefaultEveryonePerms = PermViewChannel | PermReadMessageHistory | PermSendMessages | PermCreateInvite
@@ -46,6 +51,7 @@ type ServerMember struct {
 	ServerID    string
 	UserID      string
 	IdentityKey []byte
+	SigningKey  []byte
 	Username    string
 	Nickname    *string
 	JoinedAt    time.Time
@@ -270,13 +276,13 @@ func (db *DB) RemoveServerMember(ctx context.Context, serverID, userID string) e
 // GetServerMembers returns all members of a server with their assigned role IDs.
 func (db *DB) GetServerMembers(ctx context.Context, serverID string) ([]ServerMember, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT sm.server_id, sm.user_id, u.identity_key, u.username, sm.nickname, sm.joined_at,
+		`SELECT sm.server_id, sm.user_id, u.identity_key, u.signing_key, u.username, sm.nickname, sm.joined_at,
 		        COALESCE(array_agg(mr.role_id) FILTER (WHERE mr.role_id IS NOT NULL), '{}')::uuid[]
 		 FROM server_members sm
 		 JOIN users u ON u.id = sm.user_id
 		 LEFT JOIN member_roles mr ON mr.server_id = sm.server_id AND mr.user_id = sm.user_id
 		 WHERE sm.server_id = $1
-		 GROUP BY sm.server_id, sm.user_id, u.identity_key, u.username, sm.nickname, sm.joined_at
+		 GROUP BY sm.server_id, sm.user_id, u.identity_key, u.signing_key, u.username, sm.nickname, sm.joined_at
 		 ORDER BY sm.joined_at ASC`,
 		serverID)
 	if err != nil {
@@ -287,7 +293,7 @@ func (db *DB) GetServerMembers(ctx context.Context, serverID string) ([]ServerMe
 	for rows.Next() {
 		var m ServerMember
 		var roleIDs []string
-		if err := rows.Scan(&m.ServerID, &m.UserID, &m.IdentityKey, &m.Username, &m.Nickname, &m.JoinedAt, &roleIDs); err != nil {
+		if err := rows.Scan(&m.ServerID, &m.UserID, &m.IdentityKey, &m.SigningKey, &m.Username, &m.Nickname, &m.JoinedAt, &roleIDs); err != nil {
 			return nil, err
 		}
 		m.RoleIDs = roleIDs
@@ -310,8 +316,9 @@ func (db *DB) GetUserPermissions(ctx context.Context, serverID, userID string) (
 	var perms int64
 	err = db.Pool.QueryRow(ctx,
 		`SELECT COALESCE(BIT_OR(r.permissions), 0)
-		 FROM roles r
-		 WHERE r.server_id = $1 AND (
+		 FROM server_members sm
+		 JOIN roles r ON r.server_id = sm.server_id
+		 WHERE sm.server_id = $1 AND sm.user_id = $2::uuid AND (
 		     r.is_default = TRUE
 		     OR r.id IN (
 		         SELECT role_id FROM member_roles
@@ -363,15 +370,56 @@ func (db *DB) GetServerRoles(ctx context.Context, serverID string) ([]Role, erro
 	return out, rows.Err()
 }
 
+// GetRole returns a role only when both its server and role IDs match.
+func (db *DB) GetRole(ctx context.Context, serverID, roleID string) (*Role, error) {
+	var role Role
+	var permissions int64
+	err := db.Pool.QueryRow(ctx,
+		`SELECT id, server_id, name, permissions, position, color, is_default, hoist, mentionable
+		 FROM roles WHERE server_id = $1::uuid AND id = $2::uuid`,
+		serverID, roleID,
+	).Scan(&role.ID, &role.ServerID, &role.Name, &permissions, &role.Position,
+		&role.Color, &role.IsDefault, &role.Hoist, &role.Mentionable)
+	if err != nil {
+		return nil, err
+	}
+	role.Permissions = uint64(permissions)
+	return &role, nil
+}
+
+// GetHighestRolePosition returns the highest assigned/default role for a
+// member. Callers must separately handle the server owner, whose hierarchy is
+// above every database role.
+func (db *DB) GetHighestRolePosition(ctx context.Context, serverID, userID string) (int16, error) {
+	var position int16
+	err := db.Pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(r.position), 0)
+		 FROM server_members sm
+		 JOIN roles r ON r.server_id = sm.server_id
+		 WHERE sm.server_id = $1::uuid AND sm.user_id = $2::uuid
+		   AND (r.is_default = TRUE OR EXISTS (
+		     SELECT 1 FROM member_roles mr
+		     WHERE mr.server_id = sm.server_id AND mr.user_id = sm.user_id AND mr.role_id = r.id
+		   ))`,
+		serverID, userID,
+	).Scan(&position)
+	return position, err
+}
+
 // CreateRole creates a new role. Returns the new role.
-func (db *DB) CreateRole(ctx context.Context, serverID, name string, perms uint64, color *int32) (*Role, error) {
+func (db *DB) CreateRole(ctx context.Context, serverID, name string, perms uint64, color *int32, positionCeiling *int16) (*Role, error) {
 	var r Role
 	var p int64
 	err := db.Pool.QueryRow(ctx,
 		`INSERT INTO roles (server_id, name, permissions, position, color)
-		 VALUES ($1, $2, $3, COALESCE((SELECT MAX(position) + 1 FROM roles WHERE server_id = $1), 1), $4)
+		 VALUES ($1, $2, $3,
+		   CASE WHEN $5::smallint IS NULL
+		     THEN LEAST(COALESCE((SELECT MAX(position)::integer + 1 FROM roles WHERE server_id = $1), 1), 32767)
+		     ELSE LEAST(COALESCE((SELECT MAX(position)::integer + 1 FROM roles WHERE server_id = $1), 1), $5::smallint)
+		   END,
+		   $4)
 		 RETURNING id, server_id, name, permissions, position, color, is_default, hoist, mentionable`,
-		serverID, name, int64(perms), color,
+		serverID, name, int64(perms), color, positionCeiling,
 	).Scan(&r.ID, &r.ServerID, &r.Name, &p, &r.Position, &r.Color, &r.IsDefault, &r.Hoist, &r.Mentionable)
 	if err != nil {
 		return nil, err
@@ -381,25 +429,32 @@ func (db *DB) CreateRole(ctx context.Context, serverID, name string, perms uint6
 }
 
 // UpdateRole updates name/permissions/color of a role.
-func (db *DB) UpdateRole(ctx context.Context, roleID string, name *string, perms *uint64, color *int32) error {
+func (db *DB) UpdateRole(ctx context.Context, serverID, roleID string, name *string, perms *uint64, color *int32) error {
 	var permsArg interface{}
 	if perms != nil {
 		permsArg = int64(*perms)
 	}
-	_, err := db.Pool.Exec(ctx,
+	result, err := db.Pool.Exec(ctx,
 		`UPDATE roles
-		 SET name = COALESCE($2, name),
-		     permissions = COALESCE($3, permissions),
-		     color = COALESCE($4, color)
-		 WHERE id = $1`,
-		roleID, name, permsArg, color)
-	return err
+		 SET name = COALESCE($3, name),
+		     permissions = COALESCE($4, permissions),
+		     color = COALESCE($5, color)
+		 WHERE server_id = $1::uuid AND id = $2::uuid`,
+		serverID, roleID, name, permsArg, color)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("role not found in server")
+	}
+	return nil
 }
 
 // DeleteRole removes a role (default @everyone cannot be deleted).
-func (db *DB) DeleteRole(ctx context.Context, roleID string) error {
+func (db *DB) DeleteRole(ctx context.Context, serverID, roleID string) error {
 	res, err := db.Pool.Exec(ctx,
-		`DELETE FROM roles WHERE id = $1 AND is_default = FALSE`, roleID)
+		`DELETE FROM roles WHERE server_id = $1::uuid AND id = $2::uuid AND is_default = FALSE`,
+		serverID, roleID)
 	if err != nil {
 		return err
 	}
@@ -411,19 +466,40 @@ func (db *DB) DeleteRole(ctx context.Context, roleID string) error {
 
 // AssignRole assigns a role to a member.
 func (db *DB) AssignRole(ctx context.Context, serverID, userID, roleID string) error {
-	_, err := db.Pool.Exec(ctx,
-		`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2::uuid, $3)
-		 ON CONFLICT DO NOTHING`,
+	result, err := db.Pool.Exec(ctx,
+		`INSERT INTO member_roles (server_id, user_id, role_id)
+		 SELECT role.server_id, member.user_id, role.id
+		 FROM roles role
+		 JOIN server_members member ON member.server_id = role.server_id AND member.user_id = $2::uuid
+		 WHERE role.server_id = $1::uuid AND role.id = $3::uuid AND role.is_default = FALSE
+		 ON CONFLICT (server_id, user_id, role_id)
+		 DO UPDATE SET role_id = EXCLUDED.role_id`,
 		serverID, userID, roleID)
-	return err
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("role or target member not found in server")
+	}
+	return nil
 }
 
 // UnassignRole removes a role from a member.
 func (db *DB) UnassignRole(ctx context.Context, serverID, userID, roleID string) error {
-	_, err := db.Pool.Exec(ctx,
-		`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2::uuid AND role_id = $3`,
+	result, err := db.Pool.Exec(ctx,
+		`DELETE FROM member_roles assignment
+		 USING roles role
+		 WHERE assignment.server_id = $1::uuid AND assignment.user_id = $2::uuid
+		   AND assignment.role_id = $3::uuid
+		   AND role.server_id = assignment.server_id AND role.id = assignment.role_id`,
 		serverID, userID, roleID)
-	return err
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("role assignment not found in server")
+	}
+	return nil
 }
 
 // ─── Channels ────────────────────────────────────────
@@ -564,20 +640,30 @@ func (db *DB) GetChannel(ctx context.Context, channelID string) (*Channel, error
 
 // ─── Invites ─────────────────────────────────────────
 
-// generateInviteCode produces an 8-char URL-safe code.
-func generateInviteCode() string {
+// generateInviteCode produces an 8-char URL-safe code and fails closed when
+// the OS CSPRNG is unavailable.
+func generateInviteCode() (string, error) {
+	return generateInviteCodeFrom(rand.Reader)
+}
+
+func generateInviteCodeFrom(reader io.Reader) (string, error) {
 	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
+	if _, err := io.ReadFull(reader, b); err != nil {
+		return "", fmt.Errorf("generate invite code: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 // CreateInvite creates a new invite for a server.
 func (db *DB) CreateInvite(ctx context.Context, serverID, createdBy string, maxUses int32, expiresAt *time.Time) (*Invite, error) {
 	// Try a few times in case of unlikely collision
 	for i := 0; i < 5; i++ {
-		code := generateInviteCode()
+		code, err := generateInviteCode()
+		if err != nil {
+			return nil, err
+		}
 		var inv Invite
-		err := db.Pool.QueryRow(ctx,
+		err = db.Pool.QueryRow(ctx,
 			`INSERT INTO server_invites (code, server_id, created_by, max_uses, expires_at)
 			 VALUES ($1, $2, $3::uuid, $4, $5)
 			 RETURNING code, server_id, created_by, max_uses, uses, expires_at, created_at`,
@@ -605,26 +691,24 @@ func (db *DB) GetInvite(ctx context.Context, code string) (*Invite, error) {
 
 // UseInvite atomically validates and consumes an invite, joining the user to the server.
 // Returns the joined server.
-func (db *DB) UseInvite(ctx context.Context, code, userID string) (*Server, error) {
+func (db *DB) UseInvite(ctx context.Context, code, userID string) (*Server, bool, error) {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer tx.Rollback(ctx)
 
 	var inv Invite
 	err = tx.QueryRow(ctx,
-		`SELECT code, server_id, created_by, max_uses, uses, expires_at, created_at
-		 FROM server_invites WHERE code = $1 FOR UPDATE`, code,
+		`SELECT invite.code, invite.server_id, invite.created_by, invite.max_uses,
+		        invite.uses, invite.expires_at, invite.created_at
+		 FROM server_invites invite
+		 JOIN servers server ON server.id = invite.server_id AND server.deleted_at IS NULL
+		 WHERE invite.code = $1
+		 FOR UPDATE OF invite`, code,
 	).Scan(&inv.Code, &inv.ServerID, &inv.CreatedBy, &inv.MaxUses, &inv.Uses, &inv.ExpiresAt, &inv.CreatedAt)
 	if err != nil {
-		return nil, errors.New("invite not found")
-	}
-	if inv.ExpiresAt != nil && time.Now().After(*inv.ExpiresAt) {
-		return nil, errors.New("invite expired")
-	}
-	if inv.MaxUses > 0 && inv.Uses >= inv.MaxUses {
-		return nil, errors.New("invite usage limit reached")
+		return nil, false, errors.New("invite not found")
 	}
 
 	// Check if user already in server
@@ -633,15 +717,21 @@ func (db *DB) UseInvite(ctx context.Context, code, userID string) (*Server, erro
 		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2::uuid)`,
 		inv.ServerID, userID).Scan(&alreadyMember)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	if !alreadyMember {
+		if inv.ExpiresAt != nil && time.Now().After(*inv.ExpiresAt) {
+			return nil, false, errors.New("invite expired")
+		}
+		if inv.MaxUses > 0 && inv.Uses >= inv.MaxUses {
+			return nil, false, errors.New("invite usage limit reached")
+		}
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2::uuid)
 			 ON CONFLICT DO NOTHING`,
 			inv.ServerID, userID); err != nil {
-			return nil, fmt.Errorf("join server: %w", err)
+			return nil, false, fmt.Errorf("join server: %w", err)
 		}
 		// Add to all text channels in this server
 		if _, err := tx.Exec(ctx,
@@ -650,26 +740,29 @@ func (db *DB) UseInvite(ctx context.Context, code, userID string) (*Server, erro
 			 WHERE server_id = $1 AND channel_type = 0 AND conversation_id IS NOT NULL
 			 ON CONFLICT DO NOTHING`,
 			inv.ServerID, userID); err != nil {
-			return nil, fmt.Errorf("add to channels: %w", err)
+			return nil, false, fmt.Errorf("add to channels: %w", err)
 		}
-	}
-
-	// Increment uses
-	if _, err := tx.Exec(ctx,
-		`UPDATE server_invites SET uses = uses + 1 WHERE code = $1`, code); err != nil {
-		return nil, err
+		// Consume a use only for an actual new membership.
+		if _, err := tx.Exec(ctx,
+			`UPDATE server_invites SET uses = uses + 1 WHERE code = $1`, code); err != nil {
+			return nil, false, err
+		}
 	}
 
 	var s Server
 	err = tx.QueryRow(ctx,
-		`SELECT id, name, description, icon_url, owner_id, created_at FROM servers WHERE id = $1`,
+		`SELECT id, name, description, icon_url, owner_id, created_at
+		 FROM servers WHERE id = $1 AND deleted_at IS NULL`,
 		inv.ServerID,
 	).Scan(&s.ID, &s.Name, &s.Description, &s.IconURL, &s.OwnerID, &s.CreatedAt)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
-	return &s, tx.Commit(ctx)
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	return &s, !alreadyMember, nil
 }
 
 // GetServerInvites lists all invites for a server.

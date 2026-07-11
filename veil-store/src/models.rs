@@ -47,6 +47,31 @@ pub struct Message {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteReaction {
+    pub emoji: String,
+    pub user_id: String,
+    pub username: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum RemoteMessageStateKind {
+    Active = 0,
+    Deleted = 1,
+    Expired = 2,
+    Unavailable = 3,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteMessageState {
+    pub message_id: String,
+    pub conversation_id: String,
+    pub sender_key: Vec<u8>,
+    pub revision_ms: i64,
+    pub state: RemoteMessageStateKind,
+}
+
 /// A contact (known user).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Contact {

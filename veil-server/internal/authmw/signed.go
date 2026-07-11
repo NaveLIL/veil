@@ -4,9 +4,10 @@
 //
 // All authenticated REST endpoints across auth/, chat/ and servers/ wrap
 // their handlers via Middleware.RequireSigned. The middleware verifies a
-// canonical signature
+// domain-separated canonical signature
 //
-//	METHOD "\n" PATH "\n" TIMESTAMP_MS "\n" hex(sha256(body))
+//	"veil-rest-v1\n" METHOD "\n" AUTHORITY "\n" REQUEST_TARGET
+//	"\n" TIMESTAMP_MS "\n" hex(sha256(body))
 //
 // using the caller's signing key (stored at registration), with a small
 // ±SignatureMaxSkew window to mitigate replay attacks. Within that window
@@ -21,9 +22,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"io"
+	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -31,6 +35,19 @@ import (
 // SignatureMaxSkew is the tolerance for client/server clock skew + network
 // delay when validating X-Veil-Timestamp.
 const SignatureMaxSkew = 60 * time.Second
+
+const restSignatureDomain = "veil-rest-v1"
+
+type verifiedPrincipalContextKey struct{}
+
+// VerifiedUserID returns the user identity established by RequireSigned.
+// Callers must not fall back to identity headers for authorization or quota
+// accounting because those headers are attacker-controlled before signature
+// verification.
+func VerifiedUserID(ctx context.Context) (string, bool) {
+	userID, ok := ctx.Value(verifiedPrincipalContextKey{}).(string)
+	return userID, ok && userID != ""
+}
 
 // keyCacheTTL controls how long we cache a user's signing public key in
 // memory. Short enough that a rotated key takes effect quickly, long enough
@@ -147,15 +164,29 @@ func (m *Middleware) RequireSigned(next http.HandlerFunc) http.HandlerFunc {
 		var bodyBytes []byte
 		if r.Body != nil {
 			limited := io.LimitReader(r.Body, maxBodyBytes+1)
-			bodyBytes, _ = io.ReadAll(limited)
+			bodyBytes, err = io.ReadAll(limited)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "could not read request body")
+				return
+			}
 			if len(bodyBytes) > maxBodyBytes {
 				writeError(w, http.StatusRequestEntityTooLarge, "request body too large")
 				return
 			}
 			r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
-		bodyHash := sha256.Sum256(bodyBytes)
-		canonical := r.Method + "\n" + r.URL.Path + "\n" + tsStr + "\n" + hex.EncodeToString(bodyHash[:])
+		requestTarget := r.URL.EscapedPath()
+		if requestTarget == "" {
+			requestTarget = "/"
+		}
+		if r.URL.ForceQuery || r.URL.RawQuery != "" {
+			requestTarget += "?" + r.URL.RawQuery
+		}
+		canonical, err := CanonicalRequest(r.Method, r.Host, requestTarget, tsStr, bodyBytes)
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "invalid signed request metadata")
+			return
+		}
 
 		pub, ok := m.keys.get(userID)
 		if !ok {
@@ -174,7 +205,7 @@ func (m *Middleware) RequireSigned(next http.HandlerFunc) http.HandlerFunc {
 			m.keys.put(userID, pub)
 		}
 
-		if !ed25519.Verify(pub, []byte(canonical), sig) {
+		if !ed25519.Verify(pub, canonical, sig) {
 			writeError(w, http.StatusUnauthorized, "signature verification failed")
 			return
 		}
@@ -189,10 +220,165 @@ func (m *Middleware) RequireSigned(next http.HandlerFunc) http.HandlerFunc {
 			return
 		}
 
-		// Propagate verified identity to downstream handlers.
+		// Propagate verified identity to downstream handlers. The context value
+		// is authoritative; X-User-ID remains only for compatibility with
+		// existing handlers and is set after signature verification.
 		r.Header.Set("X-User-ID", userID)
-		next(w, r)
+		ctx := context.WithValue(r.Context(), verifiedPrincipalContextKey{}, userID)
+		next(w, r.WithContext(ctx))
 	}
+}
+
+// CanonicalRequest returns the exact domain-separated bytes signed by REST
+// clients:
+//
+//	veil-rest-v1\n
+//	UPPERCASE_METHOD\n
+//	normalized_authority\n
+//	escaped_path[?raw_query]\n
+//	decimal_timestamp_ms\n
+//	lowercase_hex_sha256(body)
+//
+// Query ordering and escaping are preserved exactly. Explicit ports remain
+// present (including default ports) and are normalized to canonical decimal;
+// an absent port is never synthesized.
+func CanonicalRequest(method, authority, requestTarget, timestamp string, body []byte) ([]byte, error) {
+	if method == "" || method != strings.ToUpper(method) || !validHTTPToken(method) {
+		return nil, errors.New("invalid HTTP method")
+	}
+	normalizedAuthority, err := normalizeAuthority(authority)
+	if err != nil {
+		return nil, err
+	}
+	if requestTarget == "" || requestTarget[0] != '/' || strings.ContainsRune(requestTarget, '#') ||
+		strings.ContainsAny(requestTarget, "\r\n") {
+		return nil, errors.New("invalid request target")
+	}
+	for i := 0; i < len(requestTarget); i++ {
+		if requestTarget[i] <= 0x20 || requestTarget[i] >= 0x7f {
+			return nil, errors.New("request target must be printable ASCII with percent-encoding")
+		}
+	}
+	if timestamp == "" {
+		return nil, errors.New("timestamp required")
+	}
+	if _, err := strconv.ParseInt(timestamp, 10, 64); err != nil {
+		return nil, errors.New("invalid timestamp")
+	}
+
+	bodyHash := sha256.Sum256(body)
+	canonical := restSignatureDomain + "\n" + method + "\n" + normalizedAuthority + "\n" +
+		requestTarget + "\n" + timestamp + "\n" + hex.EncodeToString(bodyHash[:])
+	return []byte(canonical), nil
+}
+
+func validHTTPToken(value string) bool {
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+			strings.ContainsRune("!#$%&'*+-.^_`|~", rune(c)) {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func normalizeAuthority(authority string) (string, error) {
+	if authority == "" || strings.TrimSpace(authority) != authority || strings.Contains(authority, "@") {
+		return "", errors.New("invalid authority")
+	}
+	for i := 0; i < len(authority); i++ {
+		if authority[i] <= 0x20 || authority[i] >= 0x7f {
+			return "", errors.New("authority must be printable ASCII (use IDNA/punycode)")
+		}
+	}
+
+	var host, port string
+	hasPort := false
+	if strings.HasPrefix(authority, "[") {
+		end := strings.IndexByte(authority, ']')
+		if end < 0 {
+			return "", errors.New("invalid bracketed IPv6 authority")
+		}
+		parsed := net.ParseIP(authority[1:end])
+		if parsed == nil || parsed.To4() != nil {
+			return "", errors.New("invalid IPv6 authority")
+		}
+		host = "[" + strings.ToLower(parsed.String()) + "]"
+		rest := authority[end+1:]
+		if rest != "" {
+			if !strings.HasPrefix(rest, ":") || len(rest) == 1 {
+				return "", errors.New("invalid IPv6 port")
+			}
+			port = rest[1:]
+			hasPort = true
+		}
+	} else {
+		if strings.Count(authority, ":") > 1 {
+			return "", errors.New("IPv6 authority must be bracketed")
+		}
+		host = authority
+		if colon := strings.LastIndexByte(authority, ':'); colon >= 0 {
+			if colon == 0 || colon == len(authority)-1 {
+				return "", errors.New("invalid authority port")
+			}
+			host, port, hasPort = authority[:colon], authority[colon+1:], true
+		}
+
+		if parsed := net.ParseIP(host); parsed != nil {
+			if parsed.To4() == nil {
+				return "", errors.New("IPv6 authority must be bracketed")
+			}
+			host = parsed.To4().String()
+		} else {
+			var err error
+			host, err = normalizeHostname(host)
+			if err != nil {
+				return "", err
+			}
+		}
+	}
+
+	if hasPort {
+		for i := 0; i < len(port); i++ {
+			if port[i] < '0' || port[i] > '9' {
+				return "", errors.New("invalid authority port")
+			}
+		}
+		portNumber, err := strconv.Atoi(port)
+		if err != nil || portNumber < 1 || portNumber > 65535 {
+			return "", errors.New("authority port out of range")
+		}
+		return host + ":" + strconv.Itoa(portNumber), nil
+	}
+	return host, nil
+}
+
+func normalizeHostname(host string) (string, error) {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "" || len(host) > 253 {
+		return "", errors.New("invalid hostname")
+	}
+	allNumericOrDot := true
+	for _, label := range strings.Split(host, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return "", errors.New("invalid hostname label")
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-') {
+				return "", errors.New("invalid hostname character")
+			}
+			if c < '0' || c > '9' {
+				allNumericOrDot = false
+			}
+		}
+	}
+	if allNumericOrDot {
+		return "", errors.New("invalid IPv4 address")
+	}
+	return host, nil
 }
 
 // signingKeyCache caches public signing keys with a TTL.

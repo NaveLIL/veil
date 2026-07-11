@@ -31,17 +31,25 @@ type Node =
   | { type: "quote"; children: Node[] }
   | { type: "br" };
 
+const MAX_MARKDOWN_NESTING = 24;
+
 /* ── URL validation — only safe protocols ──────────── */
 const sanitizeUrl = (raw: string): string | null => {
   try {
     const u = new URL(raw);
-    if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+    // Message content is untrusted. Requiring authenticated transport avoids
+    // click-triggered cleartext requests (including to local HTTP services)
+    // and keeps the implementation aligned with the renderer contract above.
+    if (u.protocol === "https:") return u.href;
   } catch { /* invalid URL */ }
   return null;
 };
 
 /* ── Inline parser ─────────────────────────────────── */
-function parseInline(text: string): Node[] {
+function parseInline(text: string, depth = 0): Node[] {
+  if (depth >= MAX_MARKDOWN_NESTING) {
+    return text ? [{ type: "text", value: text }] : [];
+  }
   const nodes: Node[] = [];
   let i = 0;
   let buf = "";
@@ -74,7 +82,7 @@ function parseInline(text: string): Node[] {
       const end = text.indexOf("**", i + 2);
       if (end !== -1) {
         flush();
-        nodes.push({ type: "bold", children: parseInline(text.slice(i + 2, end)) });
+        nodes.push({ type: "bold", children: parseInline(text.slice(i + 2, end), depth + 1) });
         i = end + 2;
         continue;
       }
@@ -85,7 +93,7 @@ function parseInline(text: string): Node[] {
       const end = findClosing(text, i + 1, "*");
       if (end !== -1) {
         flush();
-        nodes.push({ type: "italic", children: parseInline(text.slice(i + 1, end)) });
+        nodes.push({ type: "italic", children: parseInline(text.slice(i + 1, end), depth + 1) });
         i = end + 1;
         continue;
       }
@@ -96,7 +104,7 @@ function parseInline(text: string): Node[] {
       const end = findClosing(text, i + 1, "_");
       if (end !== -1) {
         flush();
-        nodes.push({ type: "italic", children: parseInline(text.slice(i + 1, end)) });
+        nodes.push({ type: "italic", children: parseInline(text.slice(i + 1, end), depth + 1) });
         i = end + 1;
         continue;
       }
@@ -107,7 +115,7 @@ function parseInline(text: string): Node[] {
       const end = text.indexOf("~~", i + 2);
       if (end !== -1) {
         flush();
-        nodes.push({ type: "strike", children: parseInline(text.slice(i + 2, end)) });
+        nodes.push({ type: "strike", children: parseInline(text.slice(i + 2, end), depth + 1) });
         i = end + 2;
         continue;
       }
@@ -118,7 +126,7 @@ function parseInline(text: string): Node[] {
       const end = text.indexOf("||", i + 2);
       if (end !== -1) {
         flush();
-        nodes.push({ type: "spoiler", children: parseInline(text.slice(i + 2, end)) });
+        nodes.push({ type: "spoiler", children: parseInline(text.slice(i + 2, end), depth + 1) });
         i = end + 2;
         continue;
       }
@@ -163,7 +171,10 @@ function findClosing(text: string, from: number, delim: string): number {
 }
 
 /* ── Block-level parser ────────────────────────────── */
-function parseBlocks(text: string): Node[] {
+function parseBlocks(text: string, depth = 0): Node[] {
+  if (depth >= MAX_MARKDOWN_NESTING) {
+    return parseInline(text, depth);
+  }
   const nodes: Node[] = [];
   const lines = text.split("\n");
   let i = 0;
@@ -192,7 +203,7 @@ function parseBlocks(text: string): Node[] {
         quoteLines.push(lines[i].slice(2));
         i++;
       }
-      nodes.push({ type: "quote", children: parseBlocks(quoteLines.join("\n")) });
+      nodes.push({ type: "quote", children: parseBlocks(quoteLines.join("\n"), depth + 1) });
       continue;
     }
 
@@ -206,7 +217,7 @@ function parseBlocks(text: string): Node[] {
     }
 
     // Inline content
-    const inline = parseInline(line);
+    const inline = parseInline(line, depth);
     nodes.push(...inline);
     // Add linebreak between non-empty lines (except last)
     if (i < lines.length - 1) {

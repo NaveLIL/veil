@@ -2,9 +2,12 @@ package gateway
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/subtle"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -12,11 +15,14 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/AegisSec/veil-server/internal/auth"
 	"github.com/AegisSec/veil-server/internal/chat"
+	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/httpmw"
 	"github.com/AegisSec/veil-server/internal/metrics"
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 )
@@ -283,19 +289,33 @@ func (h *Hub) indexClient(client *Client) {
 	h.mu.Unlock()
 }
 
-// sendToUser sends a serialized Envelope to all connections of a user.
-func (h *Hub) sendToUser(userID string, data []byte) {
+// enqueueToUser sends a serialized Envelope to every currently indexed
+// connection and reports whether at least one live connection existed.
+//
+// The read lock deliberately covers each non-blocking channel send. Hub.Run
+// removes the client and closes that channel while holding the write lock, so
+// releasing the lock before enqueueing would leave a send-on-closed-channel
+// race. It also keeps iteration over userClients synchronized with concurrent
+// connection indexing and removal.
+func (h *Hub) enqueueToUser(userID string, data []byte) bool {
 	h.mu.RLock()
-	clients := h.userClients[userID]
-	h.mu.RUnlock()
+	defer h.mu.RUnlock()
 
+	clients := h.userClients[userID]
+	online := len(clients) > 0
 	for c := range clients {
 		select {
 		case c.send <- data:
 		default:
-			// Client too slow, will be cleaned up by writePump
+			// Client too slow, will be cleaned up by writePump.
 		}
 	}
+	return online
+}
+
+// sendToUser sends a serialized Envelope to all connections of a user.
+func (h *Hub) sendToUser(userID string, data []byte) {
+	h.enqueueToUser(userID, data)
 }
 
 // PushNotifier is the seam between the gateway and the push package
@@ -340,18 +360,7 @@ func (h *Hub) NotifyMLSCommit(conversationID string, epoch uint64, senderUserID 
 // is noisy and out of scope for Phase 4.
 func (h *Hub) fanoutMessageEvent(ctx context.Context, recipients []string, data []byte, env *pb.Envelope) {
 	for _, uid := range recipients {
-		h.mu.RLock()
-		clients := h.userClients[uid]
-		online := len(clients) > 0
-		h.mu.RUnlock()
-
-		if online {
-			for c := range clients {
-				select {
-				case c.send <- data:
-				default:
-				}
-			}
+		if h.enqueueToUser(uid, data) {
 			continue
 		}
 		if h.pushNotifier != nil {
@@ -535,7 +544,7 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 		case *pb.Envelope_PrekeyRequest:
 			c.handlePreKeyRequest(ctx, env.Seq, p.PrekeyRequest)
 		case *pb.Envelope_TypingEvent:
-			c.handleTyping(ctx, p.TypingEvent)
+			c.handleTyping(ctx, env.Seq, p.TypingEvent)
 		case *pb.Envelope_PresenceUpdate:
 			c.handlePresence(ctx, p.PresenceUpdate)
 		case *pb.Envelope_SenderKeyDist:
@@ -572,20 +581,50 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 	if err != nil {
 		log.Printf("auth failed [%s]: %v", c.connID, err)
 		metrics.WSAuthFailuresTotal.Inc()
-		c.sendAuthResult(seq, false, "", err.Error())
+		_ = c.sendAuthResult(seq, false, "", err.Error())
 		return
 	}
 
-	c.authenticated = true
 	c.userID = result.UserID
 	c.deviceID = result.DeviceID
 	c.username = result.Username
 	c.identityKey = resp.IdentityKey
 
-	// Add to user index for message fan-out
+	// Restore durable sender-key state before declaring the session ready. A
+	// database failure forces a reconnect so the client cannot start sending
+	// group messages without the latest retained generation.
+	pendingSenderKeys, err := c.pendingSenderKeyEnvelopes(ctx)
+	if err != nil {
+		log.Printf("auth state restore failed [%s]: %v", c.connID, err)
+		_ = c.sendAuthResult(seq, false, "", "failed to restore encrypted session state")
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+		return
+	}
+	// Queue retained group-key control state before the AuthResult barrier.
+	// The client buffers these envelopes during its handshake, installs them
+	// as soon as AuthResult succeeds, and can then decrypt REST backlog before
+	// the normal WS poller starts. The connection is published only after all
+	// control envelopes and the barrier are durably queued in FIFO order.
+	for _, data := range pendingSenderKeys {
+		if err := c.enqueueData(data); err != nil {
+			log.Printf("pending sender-key delivery failed [%s]: %v", c.connID, err)
+			if c.conn != nil {
+				_ = c.conn.Close()
+			}
+			return
+		}
+	}
+	if err := c.sendAuthResult(seq, true, result.UserID, ""); err != nil {
+		log.Printf("auth result queue failed [%s]: %v", c.connID, err)
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+		return
+	}
+	c.authenticated = true
 	c.hub.indexClient(c)
-
-	c.sendAuthResult(seq, true, result.UserID, "")
 	log.Printf("auth success [%s]: user=%s device=%s", c.connID, c.username, c.deviceID)
 }
 
@@ -649,7 +688,7 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 // --- Edit Message ---
 
 func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.EditMessage) {
-	editedAt, recipients, err := c.hub.chatSvc.HandleEditMessage(ctx, c.userID, msg)
+	conversationID, editedAt, recipients, err := c.hub.chatSvc.HandleEditMessage(ctx, c.userID, msg)
 	if err != nil {
 		c.sendError(seq, 400, err.Error())
 		return
@@ -683,7 +722,7 @@ func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.Edit
 			MessageEvent: &pb.MessageEvent{
 				EventType:         pb.MessageEvent_EDITED,
 				MessageId:         msg.MessageId,
-				ConversationId:    msg.ConversationId,
+				ConversationId:    conversationID,
 				SenderIdentityKey: senderKey,
 				SenderUsername:    senderName,
 				ServerTimestamp:   editTs,
@@ -702,22 +741,22 @@ func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.Edit
 // --- Delete Message ---
 
 func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.DeleteMessage) {
-	recipients, err := c.hub.chatSvc.HandleDeleteMessage(ctx, c.userID, msg)
+	conversationID, deletedAt, recipients, err := c.hub.chatSvc.HandleDeleteMessage(ctx, c.userID, msg)
 	if err != nil {
 		c.sendError(seq, 400, err.Error())
 		return
 	}
 
-	now := uint64(time.Now().UnixNano())
+	deletedTimestamp := uint64(deletedAt.UnixNano())
 
 	// ACK to sender
 	c.sendEnvelope(&pb.Envelope{
 		Seq:       seq,
-		Timestamp: now,
+		Timestamp: deletedTimestamp,
 		Payload: &pb.Envelope_MessageAck{
 			MessageAck: &pb.MessageAck{
 				MessageId:       msg.MessageId,
-				ServerTimestamp: now,
+				ServerTimestamp: deletedTimestamp,
 				RefSeq:          seq,
 			},
 		},
@@ -732,15 +771,15 @@ func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.De
 	}
 
 	event := &pb.Envelope{
-		Timestamp: now,
+		Timestamp: deletedTimestamp,
 		Payload: &pb.Envelope_MessageEvent{
 			MessageEvent: &pb.MessageEvent{
 				EventType:         pb.MessageEvent_DELETED,
 				MessageId:         msg.MessageId,
-				ConversationId:    msg.ConversationId,
+				ConversationId:    conversationID,
 				SenderIdentityKey: senderKey,
 				SenderUsername:    senderName,
-				ServerTimestamp:   now,
+				ServerTimestamp:   deletedTimestamp,
 			},
 		},
 	}
@@ -797,8 +836,12 @@ func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.Reactio
 // --- PreKey Request ---
 
 func (c *Client) handlePreKeyRequest(ctx context.Context, seq uint64, req *pb.PreKeyRequest) {
-	bundle, err := c.hub.chatSvc.HandlePreKeyRequest(ctx, req.TargetIdentityKey)
+	bundle, err := c.hub.chatSvc.HandlePreKeyRequest(ctx, c.userID, req.TargetIdentityKey)
 	if err != nil {
+		if errors.Is(err, chat.ErrPreKeyAccessDenied) {
+			c.sendError(seq, 403, err.Error())
+			return
+		}
 		c.sendError(seq, 404, err.Error())
 		return
 	}
@@ -816,10 +859,47 @@ func (c *Client) handlePreKeyRequest(ctx context.Context, seq uint64, req *pb.Pr
 // --- Sender Key Distribution ---
 
 func (c *Client) handleSenderKeyDist(ctx context.Context, seq uint64, skd *pb.SenderKeyDistribution) {
+	if skd == nil || skd.ConversationId == "" || len(skd.TargetIdentityKey) != 32 {
+		c.sendError(seq, 400, "invalid sender key distribution")
+		return
+	}
+
+	// Bind all clear-text v3 metadata to both the outer authenticated request
+	// and the public keys pinned in the database. The recipient verifies the
+	// signature and AEAD; the gateway's job is to reject spoofed routing
+	// metadata before it can be forwarded.
+	sender, err := c.hub.chatSvc.DB().FindUserByID(ctx, c.userID)
+	if err != nil || sender == nil || len(sender.IdentityKey) != 32 || len(sender.SigningKey) != 32 ||
+		len(c.identityKey) != 32 || subtle.ConstantTimeCompare(sender.IdentityKey, c.identityKey) != 1 {
+		c.sendError(seq, 403, "authenticated sender identity is invalid")
+		return
+	}
+	if err := validateSenderKeyEnvelope(
+		skd.SenderKeyMessage,
+		skd.ConversationId,
+		skd.Generation,
+		c.identityKey,
+		sender.SigningKey,
+		skd.TargetIdentityKey,
+	); err != nil {
+		c.sendError(seq, 403, "invalid authenticated sender key distribution")
+		return
+	}
+
 	// Verify sender is a member of the conversation
-	isMember, err := c.hub.chatSvc.DB().IsConversationMember(ctx, skd.ConversationId, c.userID)
+	isMember, err := c.hub.chatSvc.DB().CanAccessConversation(
+		ctx,
+		skd.ConversationId,
+		c.userID,
+		db.ChannelReadPermissions|db.PermSendMessages,
+	)
 	if err != nil || !isMember {
 		c.sendError(seq, 403, "not a group member")
+		return
+	}
+	conversationType, err := c.hub.chatSvc.DB().GetConversationType(ctx, skd.ConversationId)
+	if err != nil || (conversationType != 1 && conversationType != 2) {
+		c.sendError(seq, 400, "sender key distributions require a group or channel conversation")
 		return
 	}
 
@@ -827,6 +907,43 @@ func (c *Client) handleSenderKeyDist(ctx context.Context, seq uint64, skd *pb.Se
 	target, err := c.hub.chatSvc.DB().FindUserByIdentityKey(ctx, skd.TargetIdentityKey)
 	if err != nil {
 		c.sendError(seq, 404, "target user not found")
+		return
+	}
+	targetIsMember, err := c.hub.chatSvc.DB().CanAccessConversation(
+		ctx, skd.ConversationId, target.ID, db.ChannelReadPermissions,
+	)
+	if err != nil || !targetIsMember {
+		c.sendError(seq, 403, "target is not a conversation member")
+		return
+	}
+	targetDevices, err := c.hub.chatSvc.DB().GetDevicesByUser(ctx, target.ID)
+	if err != nil || len(targetDevices) == 0 {
+		c.sendError(seq, 503, "target has no available devices")
+		return
+	}
+	targetDeviceIDs := make([]string, 0, len(targetDevices))
+	for _, device := range targetDevices {
+		targetDeviceIDs = append(targetDeviceIDs, device.ID)
+	}
+
+	// Durable storage is part of the sender ACK contract. Persist for every
+	// target device atomically before attempting best-effort live fan-out.
+	if err := c.hub.chatSvc.DB().StoreSenderKeys(
+		ctx,
+		skd.ConversationId,
+		c.deviceID,
+		targetDeviceIDs,
+		skd.SenderKeyMessage,
+		skd.Generation,
+	); err != nil {
+		if errors.Is(err, db.ErrSenderKeyConversationType) {
+			c.sendError(seq, 400, err.Error())
+		} else if errors.Is(err, db.ErrStaleSenderKeyGeneration) {
+			c.sendError(seq, 409, "stale sender key generation")
+		} else {
+			log.Printf("sender-key durable store failed: %v", err)
+			c.sendError(seq, 500, "failed to store sender key distribution")
+		}
 		return
 	}
 
@@ -838,11 +955,15 @@ func (c *Client) handleSenderKeyDist(ctx context.Context, seq uint64, skd *pb.Se
 				ConversationId:    skd.ConversationId,
 				SenderKeyMessage:  skd.SenderKeyMessage,
 				Generation:        skd.Generation,
-				TargetIdentityKey: skd.TargetIdentityKey,
+				TargetIdentityKey: target.IdentityKey,
 			},
 		},
 	}
-	data, _ := proto.Marshal(fwd)
+	data, err := proto.Marshal(fwd)
+	if err != nil {
+		c.sendError(seq, 500, "failed to encode sender key distribution")
+		return
+	}
 	c.hub.sendToUser(target.ID, data)
 
 	// ACK to sender
@@ -856,11 +977,170 @@ func (c *Client) handleSenderKeyDist(ctx context.Context, seq uint64, skd *pb.Se
 	})
 }
 
+// pendingSenderKeyEnvelopes builds retained SenderKeyDist events for the
+// authenticated device. Rows remain stored: same-generation replay is
+// idempotent in the v3 client and avoids deleting before confirmed delivery.
+func (c *Client) pendingSenderKeyEnvelopes(ctx context.Context) ([][]byte, error) {
+	if c.deviceID == "" || len(c.identityKey) != 32 {
+		return nil, errors.New("authenticated device identity required")
+	}
+	rows, err := c.hub.chatSvc.DB().GetPendingSenderKeys(ctx, c.deviceID)
+	if err != nil {
+		return nil, err
+	}
+	encoded := make([][]byte, 0, len(rows))
+	for _, row := range rows {
+		if row.ConversationID == "" || row.Generation == 0 || len(row.EncryptedKey) == 0 {
+			return nil, errors.New("invalid retained sender key row")
+		}
+		env := &pb.Envelope{
+			Timestamp: uint64(time.Now().UnixNano()),
+			Payload: &pb.Envelope_SenderKeyDist{
+				SenderKeyDist: &pb.SenderKeyDistribution{
+					ConversationId:    row.ConversationID,
+					SenderKeyMessage:  row.EncryptedKey,
+					Generation:        row.Generation,
+					TargetIdentityKey: append([]byte(nil), c.identityKey...),
+				},
+			},
+		}
+		data, err := proto.Marshal(env)
+		if err != nil {
+			return nil, fmt.Errorf("encode retained sender key: %w", err)
+		}
+		encoded = append(encoded, data)
+	}
+	return encoded, nil
+}
+
+// validateSenderKeyEnvelope parses the public routing/authentication metadata
+// of a v3 sealed SKDM. It intentionally accepts only v3; unauthenticated v1
+// and the transitional v2 format are rejected fail-closed.
+//
+// Wire layout:
+//
+//	[0x03][u16be group_len][group][u32be generation]
+//	[sender_ik 32][sender_signing_key 32][ephemeral_pub 32]
+//	[nonce 24][ciphertext >= 16][Ed25519 signature 64]
+func validateSenderKeyEnvelope(
+	wire []byte,
+	expectedConversationID string,
+	expectedGeneration uint32,
+	authenticatedIdentityKey []byte,
+	pinnedSigningKey []byte,
+	recipientIdentityKey []byte,
+) error {
+	const (
+		version                  = byte(0x03)
+		minimumAuthenticatedTail = 4 + 32 + 32 + 32 + 24 + 16 + 64
+		maxWireBytes             = 4 * 1024
+		maxCiphertextBytes       = 2 * 1024
+	)
+	if len(wire) > maxWireBytes {
+		return fmt.Errorf("sealed SKDM exceeds size limit")
+	}
+	if len(wire) < 3+minimumAuthenticatedTail {
+		return fmt.Errorf("sealed SKDM is too short")
+	}
+	if wire[0] != version {
+		return fmt.Errorf("unsupported sealed SKDM version")
+	}
+	conversationUUID, uuidErr := uuid.Parse(expectedConversationID)
+	if uuidErr != nil || conversationUUID.String() != expectedConversationID || expectedGeneration == 0 ||
+		len(authenticatedIdentityKey) != 32 || len(pinnedSigningKey) != ed25519.PublicKeySize ||
+		len(recipientIdentityKey) != 32 {
+		return fmt.Errorf("invalid expected SKDM metadata")
+	}
+
+	groupLength := int(binary.BigEndian.Uint16(wire[1:3]))
+	groupEnd := 3 + groupLength
+	if groupLength == 0 || groupEnd > len(wire) || len(wire)-groupEnd < minimumAuthenticatedTail {
+		return fmt.Errorf("invalid sealed SKDM group length")
+	}
+	if string(wire[3:groupEnd]) != expectedConversationID {
+		return fmt.Errorf("sealed SKDM conversation binding mismatch")
+	}
+
+	cursor := groupEnd
+	generation := binary.BigEndian.Uint32(wire[cursor : cursor+4])
+	cursor += 4
+	if generation == 0 || generation != expectedGeneration {
+		return fmt.Errorf("sealed SKDM generation binding mismatch")
+	}
+
+	senderIdentity := wire[cursor : cursor+32]
+	cursor += 32
+	if subtle.ConstantTimeCompare(senderIdentity, authenticatedIdentityKey) != 1 {
+		return fmt.Errorf("sealed SKDM sender identity binding mismatch")
+	}
+
+	senderSigningKey := wire[cursor : cursor+32]
+	cursor += 32
+	if subtle.ConstantTimeCompare(senderSigningKey, pinnedSigningKey) != 1 {
+		return fmt.Errorf("sealed SKDM signing key binding mismatch")
+	}
+
+	ephemeralPublic := wire[cursor : cursor+32]
+	cursor += 32
+	allZero := byte(0)
+	for _, value := range ephemeralPublic {
+		allZero |= value
+	}
+	if allZero == 0 {
+		return fmt.Errorf("sealed SKDM ephemeral key is invalid")
+	}
+	nonce := wire[cursor : cursor+24]
+	cursor += 24
+	signatureStart := len(wire) - ed25519.SignatureSize
+	if signatureStart < cursor+16 {
+		return fmt.Errorf("sealed SKDM ciphertext is too short")
+	}
+	ciphertext := wire[cursor:signatureStart]
+	if len(ciphertext) > maxCiphertextBytes {
+		return fmt.Errorf("sealed SKDM ciphertext exceeds size limit")
+	}
+	signature := wire[signatureStart:]
+
+	const domain = "veil-sealed-skdm-v3"
+	aad := make([]byte, 0, len(domain)+1+2+groupLength+4+32+32+32+32)
+	aad = append(aad, domain...)
+	aad = append(aad, version)
+	aad = append(aad, wire[1:3]...)
+	aad = append(aad, wire[3:groupEnd]...)
+	aad = append(aad, wire[groupEnd:groupEnd+4]...)
+	aad = append(aad, senderIdentity...)
+	aad = append(aad, senderSigningKey...)
+	aad = append(aad, recipientIdentityKey...)
+	aad = append(aad, ephemeralPublic...)
+	signed := make([]byte, 0, len(aad)+len(nonce)+len(ciphertext))
+	signed = append(signed, aad...)
+	signed = append(signed, nonce...)
+	signed = append(signed, ciphertext...)
+	if !ed25519.Verify(ed25519.PublicKey(pinnedSigningKey), signed, signature) {
+		return fmt.Errorf("sealed SKDM signature is invalid")
+	}
+	return nil
+}
+
 // --- Presence / Typing (fan-out to conversation members) ---
 
-func (c *Client) handleTyping(ctx context.Context, ev *pb.TypingEvent) {
+func (c *Client) handleTyping(ctx context.Context, seq uint64, ev *pb.TypingEvent) {
+	if ev == nil || ev.ConversationId == "" {
+		c.sendError(seq, 400, "conversation_id required")
+		return
+	}
+	isMember, err := c.hub.chatSvc.DB().CanAccessConversation(
+		ctx,
+		ev.ConversationId,
+		c.userID,
+		db.PermViewChannel|db.PermSendMessages,
+	)
+	if err != nil || !isMember {
+		c.sendError(seq, 403, "not a conversation member")
+		return
+	}
 	ev.IdentityKey = c.identityKey // Server sets sender identity
-	members, err := c.hub.chatSvc.GetConversationMembers(ctx, ev.ConversationId)
+	members, err := authorizedTypingRecipients(ctx, c.hub.chatSvc.DB(), ev.ConversationId)
 	if err != nil {
 		return
 	}
@@ -872,6 +1152,18 @@ func (c *Client) handleTyping(ctx context.Context, ev *pb.TypingEvent) {
 			c.hub.sendToUser(uid, data)
 		}
 	}
+}
+
+type authorizedConversationMemberStore interface {
+	GetAuthorizedConversationMembers(context.Context, string, uint64) ([]string, error)
+}
+
+// authorizedTypingRecipients uses the same permission-aware audience as
+// message-history/live-message delivery. A server member whose channel access
+// was revoked must not continue receiving conversation IDs or activity
+// metadata merely because a stale conversation_members row still exists.
+func authorizedTypingRecipients(ctx context.Context, store authorizedConversationMemberStore, conversationID string) ([]string, error) {
+	return store.GetAuthorizedConversationMembers(ctx, conversationID, db.ChannelReadPermissions)
 }
 
 func (c *Client) handlePresence(ctx context.Context, ev *pb.PresenceUpdate) {
@@ -1170,6 +1462,30 @@ func (c *Client) sendEnvelope(env *pb.Envelope) {
 	}
 }
 
+// enqueueData is used for authentication state restoration where dropping an
+// envelope would be unsafe. The regular event path remains best-effort.
+func (c *Client) enqueueData(data []byte) error {
+	if len(data) == 0 {
+		return errors.New("empty websocket envelope")
+	}
+	timer := time.NewTimer(writeWait)
+	defer timer.Stop()
+	select {
+	case c.send <- data:
+		return nil
+	case <-timer.C:
+		return errors.New("websocket send queue timeout")
+	}
+}
+
+func (c *Client) enqueueEnvelope(env *pb.Envelope) error {
+	data, err := proto.Marshal(env)
+	if err != nil {
+		return fmt.Errorf("marshal envelope: %w", err)
+	}
+	return c.enqueueData(data)
+}
+
 func (c *Client) sendError(refSeq uint64, code uint32, message string) {
 	var refSeqPtr *uint64
 	if refSeq > 0 {
@@ -1186,7 +1502,7 @@ func (c *Client) sendError(refSeq uint64, code uint32, message string) {
 	})
 }
 
-func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string) {
+func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string) error {
 	result := &pb.AuthResult{Success: success}
 	if success {
 		result.UserId = &userID
@@ -1194,7 +1510,7 @@ func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string)
 	if errMsg != "" {
 		result.ErrorMessage = &errMsg
 	}
-	c.sendEnvelope(&pb.Envelope{
+	return c.enqueueEnvelope(&pb.Envelope{
 		Seq: seq,
 		Payload: &pb.Envelope_AuthResult{
 			AuthResult: result,
@@ -1235,15 +1551,5 @@ func (c *Client) writePump() {
 // proxy. Returns "" if RemoteAddr is malformed and no XFF is set, in which
 // case the per-IP cap is bypassed (callers handle this).
 func wsClientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if comma := strings.IndexByte(xff, ','); comma >= 0 {
-			return strings.TrimSpace(xff[:comma])
-		}
-		return strings.TrimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
+	return httpmw.ClientIP(r)
 }

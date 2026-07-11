@@ -9,7 +9,34 @@ import (
 
 	"github.com/AegisSec/veil-server/internal/auth"
 	"github.com/AegisSec/veil-server/internal/config"
+	"golang.org/x/crypto/curve25519"
 )
+
+func x25519KeyPair(t *testing.T) ([]byte, []byte) {
+	t.Helper()
+	private := make([]byte, 32)
+	if _, err := rand.Read(private); err != nil {
+		t.Fatal(err)
+	}
+	public, err := curve25519.X25519(private, curve25519.Basepoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return private, public
+}
+
+func signWSChallenge(t *testing.T, serverPublic, identityPrivate []byte, signingPrivate ed25519.PrivateKey) []byte {
+	t.Helper()
+	shared, err := curve25519.X25519(identityPrivate, serverPublic)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message, err := auth.WSAuthSigningMessage(serverPublic, shared)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ed25519.Sign(signingPrivate, message)
+}
 
 func newTestService() *auth.Service {
 	cfg := &config.Config{
@@ -71,7 +98,7 @@ func TestVerifyResponse_UnknownChallenge(t *testing.T) {
 	svc := newTestService()
 
 	_, err := svc.VerifyResponse(context.Background(), "nonexistent",
-		make([]byte, 32), make([]byte, 32), make([]byte, 64), make([]byte, 16), "")
+		make([]byte, 32), make([]byte, 32), make([]byte, 64), make([]byte, 16), "test")
 	if err != auth.ErrChallengeUnknown {
 		t.Fatalf("expected ErrChallengeUnknown, got %v", err)
 	}
@@ -103,11 +130,10 @@ func TestVerifyResponse_BadDeviceID(t *testing.T) {
 
 func TestVerifyResponse_BadSignature(t *testing.T) {
 	svc := newTestService()
-	nonce, _ := svc.CreateChallenge("conn-1")
+	serverPublic, _ := svc.CreateChallenge("conn-1")
 
 	pub, _, _ := ed25519.GenerateKey(rand.Reader)
-	identityKey := make([]byte, 32)
-	rand.Read(identityKey)
+	_, identityKey := x25519KeyPair(t)
 	deviceID := make([]byte, 16)
 	rand.Read(deviceID)
 
@@ -116,23 +142,34 @@ func TestVerifyResponse_BadSignature(t *testing.T) {
 
 	_, err := svc.VerifyResponse(context.Background(), "conn-1",
 		identityKey, []byte(pub), badSig, deviceID, "test")
-	_ = nonce
+	_ = serverPublic
 	if err != auth.ErrBadSignature {
 		t.Fatalf("expected ErrBadSignature, got %v", err)
 	}
 }
 
+func TestVerifyResponse_RejectsLowOrderIdentityKey(t *testing.T) {
+	svc := newTestService()
+	svc.CreateChallenge("low-order")
+	pub, _, _ := ed25519.GenerateKey(rand.Reader)
+
+	_, err := svc.VerifyResponse(context.Background(), "low-order",
+		make([]byte, 32), pub, make([]byte, ed25519.SignatureSize), make([]byte, 16), "test")
+	if err != auth.ErrBadIdentityProof {
+		t.Fatalf("expected ErrBadIdentityProof, got %v", err)
+	}
+}
+
 func TestVerifyResponse_ChallengeConsumedOnce(t *testing.T) {
 	svc := newTestService()
-	nonce, _ := svc.CreateChallenge("conn-1")
+	serverPublic, _ := svc.CreateChallenge("conn-1")
 
 	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
-	identityKey := make([]byte, 32)
-	rand.Read(identityKey)
+	identityPrivate, identityKey := x25519KeyPair(t)
 	deviceID := make([]byte, 16)
 	rand.Read(deviceID)
 
-	sig := ed25519.Sign(priv, nonce[:])
+	sig := signWSChallenge(t, serverPublic[:], identityPrivate, priv)
 
 	// First call: valid signature passes crypto check, then panics on nil DB.
 	// We recover from the panic — the important thing is that the challenge
@@ -169,7 +206,7 @@ func TestVerifyResponse_ExpiredChallenge(t *testing.T) {
 	rand.Read(deviceID)
 
 	_, err := svc.VerifyResponse(context.Background(), "conn-1",
-		identityKey, []byte(pub), sig, deviceID, "")
+		identityKey, []byte(pub), sig, deviceID, "test")
 	if err != auth.ErrChallengeTooOld {
 		t.Fatalf("expected ErrChallengeTooOld, got %v", err)
 	}

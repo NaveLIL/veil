@@ -2,9 +2,16 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+const MaxPushSubscriptionsPerUser = 16
+
+var ErrPushSubscriptionLimit = errors.New("push subscription limit reached")
 
 // PushSubscription is one (user, distributor endpoint) binding used by
 // the offline delivery worker. EndpointURL is opaque (UnifiedPush spec
@@ -27,8 +34,55 @@ func (db *DB) CreatePushSubscription(ctx context.Context, userID, endpointURL, d
 	if kind == "" {
 		kind = "unifiedpush"
 	}
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("begin push subscription: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	// Serialize subscription changes for this user. An existing endpoint stays
+	// idempotent at the cap, while concurrent new endpoints cannot all observe
+	// the same below-cap count.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 31))`,
+		userID,
+	); err != nil {
+		return 0, fmt.Errorf("lock push subscriptions: %w", err)
+	}
+	var existingID int64
+	err = tx.QueryRow(ctx,
+		`SELECT id FROM push_subscriptions
+		 WHERE user_id = $1::uuid AND endpoint_url = $2`,
+		userID, endpointURL,
+	).Scan(&existingID)
+	if err == nil {
+		if _, err := tx.Exec(ctx,
+			`UPDATE push_subscriptions
+			 SET device_label = NULLIF($3, ''), push_kind = $4
+			 WHERE id = $1 AND user_id = $2::uuid`,
+			existingID, userID, deviceLabel, kind,
+		); err != nil {
+			return 0, fmt.Errorf("update push subscription: %w", err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return 0, fmt.Errorf("commit push subscription: %w", err)
+		}
+		return existingID, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, fmt.Errorf("lookup push subscription: %w", err)
+	}
+	var count int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM push_subscriptions WHERE user_id = $1::uuid`,
+		userID,
+	).Scan(&count); err != nil {
+		return 0, fmt.Errorf("count push subscriptions: %w", err)
+	}
+	if count >= MaxPushSubscriptionsPerUser {
+		return 0, ErrPushSubscriptionLimit
+	}
 	var id int64
-	err := db.Pool.QueryRow(ctx,
+	err = tx.QueryRow(ctx,
 		`INSERT INTO push_subscriptions (user_id, endpoint_url, device_label, push_kind)
 		 VALUES ($1, $2, NULLIF($3, ''), $4)
 		 ON CONFLICT (user_id, endpoint_url) DO UPDATE
@@ -40,6 +94,9 @@ func (db *DB) CreatePushSubscription(ctx context.Context, userID, endpointURL, d
 	if err != nil {
 		return 0, fmt.Errorf("create push subscription: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("commit push subscription: %w", err)
+	}
 	return id, nil
 }
 
@@ -50,7 +107,8 @@ func (db *DB) ListPushSubscriptions(ctx context.Context, userID string) ([]PushS
 		`SELECT id, user_id, endpoint_url, COALESCE(device_label, ''), push_kind, created_at, last_used
 		 FROM push_subscriptions
 		 WHERE user_id = $1
-		 ORDER BY created_at ASC`, userID)
+		 ORDER BY created_at ASC
+		 LIMIT $2`, userID, MaxPushSubscriptionsPerUser)
 	if err != nil {
 		return nil, fmt.Errorf("list push subscriptions: %w", err)
 	}

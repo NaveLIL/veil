@@ -24,7 +24,8 @@
       }
     ],
     "security": {
-      "csp": "default-src 'self' 'unsafe-inline' 'unsafe-eval'; connect-src 'self' ws://127.0.0.1:1420 http://127.0.0.1:* https://*; img-src 'self' data: blob:"
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'",
+      "devCsp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:1420 http://127.0.0.1:1420; img-src 'self' data: blob:; font-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'"
     }
   },
   "plugins": {
@@ -37,7 +38,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["deb", "appimage"],
+    "targets": "all",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -48,6 +49,6 @@
     ],
     "category": "SocialNetworking",
     "shortDescription": "E2EE мессенджер",
-    "longDescription": "Veil — end-to-end encrypted мессенджер. Вся криптография в Rust, ключи не покидают FFI-границу."
+    "longDescription": "Veil — мессенджер со сквозным шифрованием. Криптография и секретный ключевой материал остаются в нативном Rust-слое."
   }
 }

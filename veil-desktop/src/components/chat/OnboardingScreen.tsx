@@ -37,7 +37,6 @@ export const OnboardingScreen: Component = () => {
   const [mnemonic, setMnemonic] = createSignal("");
   const [restoreInput, setRestoreInput] = createSignal("");
   const [showPhrase, setShowPhrase] = createSignal(true);
-  const [copied, setCopied] = createSignal(false);
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal("");
   const [taglineIdx, setTaglineIdx] = createSignal(0);
@@ -101,13 +100,8 @@ export const OnboardingScreen: Component = () => {
     }
   };
 
-  const copyToClipboard = async () => {
-    await navigator.clipboard.writeText(mnemonic());
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
   const initIdentity = async (phrase: string) => {
+    let identityStored = false;
     try {
       setLoading(true);
       setError("");
@@ -127,21 +121,22 @@ export const OnboardingScreen: Component = () => {
 
       const key = await invoke<string>("init_identity", { mnemonic: normalized });
       await invoke("store_seed", { mnemonic: normalized });
+      identityStored = true;
 
       appStore.setIdentity(key);
-      appStore.uploadPrekeys();
+      // Authentication and signed prekey publication are one fail-closed
+      // operation. Do not present onboarding as complete until both succeed.
+      await appStore.connectToServer();
       appStore.setScreen("disclaimer");
-      appStore.connectToServer();
-      // Phase 6 — initialise the local MLS client so subsequent
-      // upgrade-to-MLS actions and persistence have a place to land.
-      appStore.bootstrapMls().catch(() => {});
-
-      // Clear sensitive inputs only after successful identity initialization.
-      setMnemonic("");
-      setRestoreInput("");
     } catch (e) {
       setError(String(e));
     } finally {
+      // Publication can fail while offline after the identity is already
+      // durable. Do not keep another UI copy of the phrase in that case.
+      if (identityStored) {
+        setMnemonic("");
+        setRestoreInput("");
+      }
       setLoading(false);
     }
   };
@@ -290,15 +285,6 @@ export const OnboardingScreen: Component = () => {
       padding: "14px 16px", "border-radius": "12px",
       background: "rgba(251,191,36,0.05)", border: "1px solid rgba(251,191,36,0.12)",
     },
-    copyBtn: (done: boolean) => ({
-      display: "flex", "align-items": "center", "justify-content": "center",
-      gap: "8px", height: "38px", "border-radius": "10px",
-      background: done ? "rgba(52,211,153,0.08)" : "rgba(255,255,255,0.04)",
-      color: done ? "#34d399" : "rgba(255,255,255,0.5)",
-      border: `1px solid ${done ? "rgba(52,211,153,0.2)" : "rgba(255,255,255,0.06)"}`,
-      "font-size": "12px", "font-weight": "500", cursor: "pointer",
-      transition: "all 0.2s", width: "100%",
-    }),
     backBtn: {
       display: "flex", "align-items": "center", "justify-content": "center",
       gap: "6px", height: "36px", background: "transparent", border: "none",
@@ -453,19 +439,10 @@ export const OnboardingScreen: Component = () => {
             </button>
           </div>
 
-          <button
-            style={S.copyBtn(copied())}
-            onClick={copyToClipboard}
-            onMouseEnter={(e) => { if (!copied()) e.currentTarget.style.background = "rgba(255,255,255,0.07)"; }}
-            onMouseLeave={(e) => { if (!copied()) e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
-          >
-            {copied() ? "\u2713 Copied!" : "\uD83D\uDCCB Copy to clipboard"}
-          </button>
-
           <div style={{ ...S.warningBox, "margin-top": "16px" }}>
             <span style={{ "font-size": "14px", "flex-shrink": "0", "margin-top": "1px" }}>{"\u26A0\uFE0F"}</span>
             <span style={{ "font-size": "12px", color: "rgba(251,191,36,0.6)", "line-height": "1.5" }}>
-              Store these 12 words safely. They are the <strong style={{ color: "rgba(251,191,36,0.85)" }}>only way</strong> to recover your identity.
+              Write these 12 words down or save them directly in a trusted password manager. Clipboard copy is disabled because Windows may retain secrets in Clipboard History or cloud sync. They are the <strong style={{ color: "rgba(251,191,36,0.85)" }}>only way</strong> to recover your identity.
             </span>
           </div>
 
@@ -505,6 +482,9 @@ export const OnboardingScreen: Component = () => {
           <textarea
             style={S.textarea}
             placeholder="word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck={false}
             value={restoreInput()}
             onInput={(e) => {
               setRestoreInput(e.currentTarget.value);

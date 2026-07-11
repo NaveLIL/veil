@@ -3,6 +3,8 @@ package servers
 import (
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"time"
 
@@ -26,11 +28,12 @@ func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Hand
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	signed := func(f http.HandlerFunc) http.HandlerFunc {
-		if h.mw != nil {
-			f = h.mw.RequireSigned(f)
-		}
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
+		}
+		if h.mw != nil {
+			// Verify first; the limiter keys from verified principal context.
+			f = h.mw.RequireSigned(f)
 		}
 		return f
 	}
@@ -204,6 +207,7 @@ func (h *Handler) LeaveServer(w http.ResponseWriter, r *http.Request) {
 type memberJSON struct {
 	UserID      string   `json:"user_id"`
 	IdentityKey string   `json:"identity_key"`
+	SigningKey  string   `json:"signing_key"`
 	Username    string   `json:"username"`
 	Nickname    *string  `json:"nickname,omitempty"`
 	JoinedAt    string   `json:"joined_at"`
@@ -225,6 +229,7 @@ func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
 		out[i] = memberJSON{
 			UserID:      m.UserID,
 			IdentityKey: hex.EncodeToString(m.IdentityKey),
+			SigningKey:  hex.EncodeToString(m.SigningKey),
 			Username:    m.Username,
 			Nickname:    m.Nickname,
 			JoinedAt:    m.JoinedAt.Format(time.RFC3339),
@@ -244,8 +249,20 @@ func (h *Handler) KickMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req kickReq
-	_ = json.NewDecoder(r.Body).Decode(&req)
-	if err := h.svc.KickMember(r.Context(), r.PathValue("serverID"), uid, r.PathValue("userID"), req.Reason); err != nil {
+	if err := decodeRequestJSON(r, &req, true); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("invalid JSON"))
+		return
+	}
+	reason, err := normalizeKickReason(req.Reason)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+		return
+	}
+	if err := h.svc.KickMember(r.Context(), r.PathValue("serverID"), uid, r.PathValue("userID"), reason); err != nil {
+		if errors.Is(err, ErrInvalidKickReason) {
+			writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
 		return
 	}
@@ -539,9 +556,20 @@ func (h *Handler) CreateInvite(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req createInviteReq
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	if err := decodeRequestJSON(r, &req, false); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("invalid JSON"))
+		return
+	}
+	if err := validateInviteInput(req.MaxUses, req.ExpiresInSecs); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+		return
+	}
 	inv, err := h.svc.CreateInvite(r.Context(), r.PathValue("serverID"), uid, req.MaxUses, req.ExpiresInSecs)
 	if err != nil {
+		if errors.Is(err, ErrInvalidInviteInput) {
+			writeJSON(w, http.StatusBadRequest, errResp(err.Error()))
+			return
+		}
 		writeJSON(w, http.StatusForbidden, errResp(err.Error()))
 		return
 	}
@@ -554,6 +582,24 @@ func (h *Handler) CreateInvite(w http.ResponseWriter, r *http.Request) {
 		out.ExpiresAt = &s
 	}
 	writeJSON(w, http.StatusCreated, out)
+}
+
+func decodeRequestJSON(r *http.Request, destination any, allowEmpty bool) error {
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(destination); err != nil {
+		if allowEmpty && errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values")
+		}
+		return err
+	}
+	return nil
 }
 
 func (h *Handler) ListInvites(w http.ResponseWriter, r *http.Request) {

@@ -36,11 +36,11 @@ func NewHandler(store *Store, mw *authmw.Middleware, rl *authmw.RateLimit, hub F
 // RegisterRoutes mounts the MLS routes on a mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	signed := func(f http.HandlerFunc) http.HandlerFunc {
-		if h.mw != nil {
-			f = h.mw.RequireSigned(f)
-		}
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
+		}
+		if h.mw != nil {
+			f = h.mw.RequireSigned(f)
 		}
 		return f
 	}

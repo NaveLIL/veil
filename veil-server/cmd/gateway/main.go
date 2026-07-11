@@ -51,7 +51,13 @@ func main() {
 	// Switch to structured JSON logging via slog (consumed by httpmw.AccessLog).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
+	if err := httpmw.ConfigureClientIPFromEnv(); err != nil {
+		log.Fatalf("proxy configuration error: %v", err)
+	}
 
 	// Connect to PostgreSQL
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -90,6 +96,11 @@ func main() {
 	// every REST call must carry the X-Veil-{User,Timestamp,Signature} triplet.
 	signedMw := authmw.New(serversSvc.SigningKeyLookup())
 	rl := authmw.NewRateLimit(240, time.Minute) // 4 req/sec sustained, burst 240
+	defer rl.Close()
+	// Bound unauthenticated key lookup + Ed25519 verification before the
+	// verified-principal limiter inside each REST route.
+	preAuthRL := authmw.NewRateLimit(600, time.Minute)
+	defer preAuthRL.Close()
 
 	// Auth REST endpoints (prekeys, devices, user lookup)
 	authHandler := auth.NewHandler(authSvc, signedMw, rl)
@@ -112,15 +123,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("push: %v", err)
 	}
+	pushEndpointPolicy, err := push.LoadEndpointPolicy()
+	if err != nil {
+		log.Fatalf("push endpoint policy: %v", err)
+	}
 	pushDispatcher := push.New(push.Options{
-		Store:        push.NewDBStore(database),
-		TransportKey: pushKey,
-		Salt:         push.LoadSalt(),
-		MaxJitter:    push.LoadJitter(),
-		Logger:       slog.Default(),
+		Store:          push.NewDBStore(database),
+		TransportKey:   pushKey,
+		Salt:           push.LoadSalt(),
+		EndpointPolicy: pushEndpointPolicy,
+		MaxJitter:      push.LoadJitter(),
+		Logger:         slog.Default(),
 	})
 	hub.SetPushNotifier(pushDispatcher)
-	pushHandler := push.NewHandler(database, signedMw, rl)
+	pushHandler := push.NewHandlerWithEndpointPolicy(database, signedMw, rl, pushEndpointPolicy)
 	pushHandler.RegisterRoutes(mux)
 	if pushDispatcher.Enabled() {
 		log.Printf("push dispatcher enabled (jitter=%s)", push.LoadJitter())
@@ -251,9 +267,10 @@ func main() {
 		mux.Handle("GET /metrics", metrics.Handler())
 	}
 
+	publicHandler := http.HandlerFunc(preAuthRL.Wrap(mux.ServeHTTP))
 	server := &http.Server{
 		Addr:         ":" + cfg.Port,
-		Handler:      httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(parseCORSOrigins()), httpmw.AccessLog(slog.Default()))(mux),
+		Handler:      httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(parseCORSOrigins()), httpmw.AccessLog(slog.Default()))(publicHandler),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,

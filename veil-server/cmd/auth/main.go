@@ -13,10 +13,17 @@ import (
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/httpmw"
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
+	if err := httpmw.ConfigureClientIPFromEnv(); err != nil {
+		log.Fatalf("proxy configuration error: %v", err)
+	}
 
 	port := os.Getenv("AUTH_PORT")
 	if port == "" {
@@ -36,6 +43,9 @@ func main() {
 	authSvc := auth.NewService(database, cfg)
 	signedMw := authmw.New(authSvc.SigningKeyLookup())
 	rl := authmw.NewRateLimit(240, time.Minute)
+	defer rl.Close()
+	preAuthRL := authmw.NewRateLimit(600, time.Minute)
+	defer preAuthRL.Close()
 	handler := auth.NewHandler(authSvc, signedMw, rl)
 
 	mux := http.NewServeMux()
@@ -47,9 +57,10 @@ func main() {
 		w.Write([]byte(`{"service":"veil-auth","status":"ok"}`))
 	})
 
+	publicHandler := http.HandlerFunc(preAuthRL.Wrap(mux.ServeHTTP))
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      mux,
+		Handler:      publicHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,

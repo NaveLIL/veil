@@ -5,9 +5,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -31,11 +30,20 @@ func (f *fakeLookup) GetSigningKey(_ context.Context, _ string) (ed25519.PublicK
 	return f.pub, nil
 }
 
-func sign(t *testing.T, priv ed25519.PrivateKey, method, path string, ts int64, body []byte) string {
+func sign(t *testing.T, priv ed25519.PrivateKey, r *http.Request, ts int64, body []byte) string {
 	t.Helper()
-	h := sha256.Sum256(body)
-	canonical := method + "\n" + path + "\n" + strconv.FormatInt(ts, 10) + "\n" + hex.EncodeToString(h[:])
-	sig := ed25519.Sign(priv, []byte(canonical))
+	target := r.URL.EscapedPath()
+	if target == "" {
+		target = "/"
+	}
+	if r.URL.ForceQuery || r.URL.RawQuery != "" {
+		target += "?" + r.URL.RawQuery
+	}
+	canonical, err := authmw.CanonicalRequest(r.Method, r.Host, target, strconv.FormatInt(ts, 10), body)
+	if err != nil {
+		t.Fatalf("canonical request: %v", err)
+	}
+	sig := ed25519.Sign(priv, canonical)
 	return base64.StdEncoding.EncodeToString(sig)
 }
 
@@ -44,8 +52,61 @@ func newSignedRequest(t *testing.T, priv ed25519.PrivateKey, userID, method, pat
 	r := httptest.NewRequest(method, path, bytes.NewReader(body))
 	r.Header.Set("X-Veil-User", userID)
 	r.Header.Set("X-Veil-Timestamp", strconv.FormatInt(ts, 10))
-	r.Header.Set("X-Veil-Signature", sign(t, priv, method, path, ts, body))
+	r.Header.Set("X-Veil-Signature", sign(t, priv, r, ts, body))
 	return r
+}
+
+func TestRequireSigned_BindsAuthorityAndQuery(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	mw := authmw.New(&fakeLookup{pub: pub})
+	defer mw.Close()
+
+	assertRejected := func(r *http.Request) {
+		t.Helper()
+		w := httptest.NewRecorder()
+		mw.RequireSigned(func(http.ResponseWriter, *http.Request) {
+			t.Fatal("tampered authority/query must not reach handler")
+		})(w, r)
+		if w.Code != http.StatusUnauthorized {
+			t.Fatalf("want 401, got %d", w.Code)
+		}
+	}
+
+	timestamp := time.Now().UnixMilli()
+	queryTampered := newSignedRequest(t, priv, "u1", http.MethodGet,
+		"/v1/users/search?username=alice", timestamp, nil)
+	queryTampered.URL.RawQuery = "username=mallory"
+	assertRejected(queryTampered)
+
+	hostTampered := newSignedRequest(t, priv, "u1", http.MethodGet,
+		"/v1/users/search?username=alice", timestamp, nil)
+	hostTampered.Host = "evil.example"
+	assertRejected(hostTampered)
+}
+
+func TestCanonicalRequest_NormalizesAuthorityAndHasStableVector(t *testing.T) {
+	canonical, err := authmw.CanonicalRequest(
+		http.MethodPost,
+		"Example.COM:0443",
+		"/v1/prekeys?device=7",
+		"1700000000123",
+		[]byte(`{"x":1}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "veil-rest-v1\nPOST\nexample.com:443\n/v1/prekeys?device=7\n1700000000123\n5041bf1f713df204784353e82f6a4a535931cb64f1f4b4a5aeaffcb720918b22"
+	if string(canonical) != want {
+		t.Fatalf("canonical mismatch\n got: %q\nwant: %q", canonical, want)
+	}
+
+	ipv6, err := authmw.CanonicalRequest(http.MethodGet, "[2001:0DB8::1]:00443", "/x", "1", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(ipv6), "\n[2001:db8::1]:443\n") {
+		t.Fatalf("IPv6 authority was not normalized: %q", ipv6)
+	}
 }
 
 func TestRequireSigned_HappyPath(t *testing.T) {
@@ -192,5 +253,31 @@ func TestRequireSigned_RejectsOversizedBody(t *testing.T) {
 
 	if w.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("want 413, got %d", w.Code)
+	}
+}
+
+type failingBodyReader struct{ sent bool }
+
+func (r *failingBodyReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		copy(p, []byte("partial"))
+		return len("partial"), nil
+	}
+	return 0, errors.New("body transport failed")
+}
+
+func TestRequireSigned_RejectsBodyReadError(t *testing.T) {
+	pub, priv, _ := ed25519.GenerateKey(rand.Reader)
+	mw := authmw.New(&fakeLookup{pub: pub})
+	defer mw.Close()
+	r := newSignedRequest(t, priv, "u1", http.MethodPost, "/v1/x", time.Now().UnixMilli(), []byte("partial"))
+	r.Body = io.NopCloser(&failingBodyReader{})
+	w := httptest.NewRecorder()
+	mw.RequireSigned(func(http.ResponseWriter, *http.Request) {
+		t.Fatal("partial body read must not reach handler")
+	})(w, r)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("body read failure status=%d, want 400", w.Code)
 	}
 }

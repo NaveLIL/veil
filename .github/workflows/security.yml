@@ -17,13 +17,13 @@ jobs:
     name: Cargo Audit (CVE scan)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
 
       - name: Run cargo audit
         run: cargo audit
@@ -32,28 +32,68 @@ jobs:
     name: Cargo Deny (licenses + advisories)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@8f84122a46a358a27cb0625d85ad60ab436a1b87 # v2
         with:
           command: check bans licenses sources
           arguments: ""
+
+  go-vulnerability-scan:
+    name: Go Vulnerability Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: veil-server/go.sum
+
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.1.4
+
+      - name: Scan reachable Go code
+        working-directory: veil-server
+        run: govulncheck ./...
+
+  frontend-audit:
+    name: Frontend Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: veil-desktop/pnpm-lock.yaml
+
+      - name: Audit dependencies
+        working-directory: veil-desktop
+        run: pnpm audit
 
   # Check that zeroize is used where it should be (advisory)
   zeroize-check:
     name: Zeroize Compliance
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Check for raw secret patterns without zeroize
         run: |
           echo "=== Checking for potential unzeroized secrets ==="
 
           # Files that handle secrets must import zeroize
-          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs")
+          # signature/chunked_aead only borrow keys owned by zeroizing types;
+          # they do not retain raw private material themselves.
+          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs" ! -name "signature.rs" ! -name "chunked_aead.rs")
           FAIL=0
 
           for f in $CRYPTO_FILES; do
@@ -73,7 +113,8 @@ jobs:
           fi
 
           if [ $FAIL -eq 1 ]; then
-            echo "::warning::Potential zeroize compliance issues found"
+            echo "Potential zeroize compliance issues found"
+            exit 1
           else
             echo "All checks passed"
           fi

@@ -10,6 +10,7 @@ export interface Conversation {
   id: string;
   type: "dm" | "group";
   name: string;
+  peerKey?: string;
   avatarUrl?: string;
   lastMessage?: string;
   lastMessageTime?: number;
@@ -76,12 +77,13 @@ export interface Message {
   text: string;
   timestamp: number;
   isOwn: boolean;
+  pending?: boolean;
   replyToId?: string;
 }
 
 // ─── Global App State ────────────────────────────────
 
-const [screen, setScreen] = createSignal<Screen>("onboarding");
+const [screen, setScreenRaw] = createSignal<Screen>("onboarding");
 const [identity, setIdentity] = createSignal<string | null>(null);
 const [userId, setUserId] = createSignal<string | null>(null);
 const [conversations, setConversations] = createSignal<Conversation[]>([]);
@@ -89,8 +91,75 @@ const [activeConversationId, setActiveConversationId] = createSignal<string | nu
 const [messages, setMessages] = createSignal<Message[]>([]);
 const [isSidebarCollapsed, setSidebarCollapsed] = createSignal(false);
 const [connected, setConnected] = createSignal(false);
-const [serverUrl, setServerUrl] = createSignal("ws://5.144.181.72:9080/ws");
-const [serverHttpUrl, setServerHttpUrl] = createSignal("http://5.144.181.72:9080");
+
+const DEFAULT_SERVER_ENDPOINTS = {
+  ws: "wss://secret.erez.pro/ws",
+  http: "https://secret.erez.pro",
+} as const;
+const SERVER_ENDPOINTS_STORAGE_KEY = "veil.server-endpoints.v1";
+
+type ServerEndpoints = { ws: string; http: string };
+
+function normalizeServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpoints | null {
+  try {
+    const ws = new URL(wsRaw.trim());
+    const http = new URL(httpRaw.trim());
+    const loopback = (hostname: string) =>
+      hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+
+    const securePair = ws.protocol === "wss:" && http.protocol === "https:";
+    const localPair = ws.protocol === "ws:" && http.protocol === "http:" &&
+      loopback(ws.hostname) && loopback(http.hostname);
+    if ((!securePair && !localPair) || ws.host !== http.host) return null;
+    if (ws.username || ws.password || ws.search || ws.hash) return null;
+    if (http.username || http.password || http.search || http.hash) return null;
+
+    return {
+      ws: ws.toString(),
+      http: http.toString().replace(/\/$/, ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function initialServerEndpoints(): ServerEndpoints {
+  const configured = normalizeServerEndpoints(
+    import.meta.env.VITE_VEIL_WS_URL || "",
+    import.meta.env.VITE_VEIL_HTTP_URL || "",
+  );
+  if (configured) return configured;
+
+  try {
+    const stored = JSON.parse(localStorage.getItem(SERVER_ENDPOINTS_STORAGE_KEY) || "null") as
+      | Partial<ServerEndpoints>
+      | null;
+    if (stored && typeof stored.ws === "string" && typeof stored.http === "string") {
+      const normalized = normalizeServerEndpoints(stored.ws, stored.http);
+      if (normalized) return normalized;
+    }
+  } catch {
+    // Treat malformed or unavailable renderer storage as untrusted input.
+  }
+
+  return { ...DEFAULT_SERVER_ENDPOINTS };
+}
+
+const initialEndpoints = initialServerEndpoints();
+const [serverUrl, setServerUrl] = createSignal(initialEndpoints.ws);
+const [serverHttpUrl, setServerHttpUrl] = createSignal(initialEndpoints.http);
+
+function setServerEndpoints(wsRaw: string, httpRaw: string) {
+  const normalized = normalizeServerEndpoints(wsRaw, httpRaw);
+  if (!normalized) throw new Error("Invalid or insecure server endpoint pair");
+  setServerUrl(normalized.ws);
+  setServerHttpUrl(normalized.http);
+  try {
+    localStorage.setItem(SERVER_ENDPOINTS_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // The active session can still use the endpoint when storage is disabled.
+  }
+}
 const [servers, setServers] = createSignal<Server[]>([]);
 const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
 const [channelsByServer, setChannelsByServer] = createSignal<Record<string, Channel[]>>({});
@@ -127,19 +196,103 @@ export interface FriendRequest {
 const [friends, setFriends] = createSignal<Friend[]>([]);
 const [friendRequests, setFriendRequests] = createSignal<FriendRequest[]>([]);
 const [presenceMap, setPresenceMap] = createSignal<Record<string, number>>({});
+const [pinConfigured, setPinConfigured] = createSignal(false);
 // identityKey → status
 
 // Phase 6 — per-conversation crypto mode cache. The chat header reads
 // from this signal to render the "MLS" badge instead of the legacy
 // "Encrypted" label. Populated lazily on conversation activation and
 // after a successful upgrade-to-MLS flow.
-const [cryptoModeByConv, setCryptoModeByConv] = createSignal<Record<string, "sender_key" | "mls">>({});
-// Whether the local MLS client (mls_init) has been initialised this
-// session. Driven by `bootstrapMls()` after identity init.
-const [mlsReady, setMlsReady] = createSignal(false);
-
-const AUTO_LOCK_SECONDS = 300; // 5 minutes
+const [autoLockSeconds, setAutoLockSeconds] = createSignal(300);
 let autoLockTimer: ReturnType<typeof setInterval> | null = null;
+let lastActivityTouch = 0;
+
+// Every native lock invalidates all asynchronous renderer work that was
+// started by the previous unlocked session.  Checking only `screen()` is not
+// enough: a slow IPC response can arrive after the user has already unlocked
+// again and would otherwise repopulate the new session with stale plaintext.
+let uiSessionEpoch = 0;
+let uiSessionActive = true;
+let connectionAttempt: Promise<string> | null = null;
+
+const setScreen: typeof setScreenRaw = ((value: Parameters<typeof setScreenRaw>[0]) => {
+  const next = typeof value === "function" ? value(screen()) : value;
+  if (!uiSessionActive && next !== "locked" && next !== "onboarding") return screen();
+  return setScreenRaw(next);
+}) as typeof setScreenRaw;
+
+export function captureUiSessionEpoch(): number {
+  return uiSessionEpoch;
+}
+
+export function isUiSessionEpochCurrent(epoch: number): boolean {
+  return uiSessionActive && screen() !== "locked" && epoch === uiSessionEpoch;
+}
+
+export class StaleUiSessionError extends Error {
+  constructor() {
+    super("renderer session changed while IPC was in flight");
+    this.name = "StaleUiSessionError";
+  }
+}
+
+function requireCurrentUiSession(epoch: number): void {
+  if (!isUiSessionEpochCurrent(epoch)) throw new StaleUiSessionError();
+}
+
+function rethrowIfStale(error: unknown): void {
+  if (error instanceof StaleUiSessionError) throw error;
+}
+
+function acceptsSensitiveEvent(): boolean {
+  return uiSessionActive && screen() !== "locked";
+}
+
+function activateUiSession(expectedEpoch: number): boolean {
+  if (expectedEpoch !== uiSessionEpoch) return false;
+  uiSessionEpoch += 1;
+  uiSessionActive = true;
+  return true;
+}
+
+async function serializeConnectionAttempt(start: () => Promise<string>): Promise<string> {
+  if (connectionAttempt) return connectionAttempt;
+
+  const attempt = start();
+  connectionAttempt = attempt;
+  try {
+    return await attempt;
+  } finally {
+    if (connectionAttempt === attempt) connectionAttempt = null;
+  }
+}
+
+function clearSensitiveUi(): void {
+  uiSessionEpoch += 1;
+  uiSessionActive = false;
+  setScreen("locked");
+  setIdentity(null);
+  setUserId(null);
+  setConnected(false);
+  setConversations([]);
+  setMessages([]);
+  setActiveConversationId(null);
+  setServers([]);
+  setActiveServerId(null);
+  setChannelsByServer({});
+  setActiveChannelId(null);
+  setServerMembers({});
+  setServerRoles({});
+  setServerSettingsId(null);
+  Object.values(typingTimers).forEach(clearTimeout);
+  typingTimers = {};
+  lastTypingSent = 0;
+  setTypingUsers({});
+  setReactions({});
+  setFriends([]);
+  setFriendRequests([]);
+  setPresenceMap({});
+}
 
 // ─── JSON ↔ store-type adapters (snake_case from Rust ↔ camelCase) ────
 
@@ -222,9 +375,8 @@ export const appStore = {
   setSidebarCollapsed,
   connected,
   serverUrl,
-  setServerUrl,
   serverHttpUrl,
-  setServerHttpUrl,
+  setServerEndpoints,
   servers,
   setServers,
   activeServerId,
@@ -240,9 +392,7 @@ export const appStore = {
   friends,
   friendRequests,
   presenceMap,
-  cryptoModeByConv,
-  mlsReady,
-
+  autoLockSeconds,
   activeConversation: () => {
     const id = activeConversationId();
     if (!id) return null;
@@ -267,15 +417,15 @@ export const appStore = {
   },
 
   selectConversation: (id: string) => {
+    if (!acceptsSensitiveEvent()) return;
     // Selecting a DM clears any active server/channel context
     setActiveServerId(null);
     setActiveChannelId(null);
     setActiveConversationId(id);
-    // Lazily resolve crypto_mode for the chat header badge.
-    appStore.refreshCryptoMode(id);
   },
 
   addMessage: (msg: Message) => {
+    if (!acceptsSensitiveEvent()) return;
     setMessages((prev) => [...prev, msg]);
     // Update conversation's last message
     setConversations((prev) =>
@@ -288,46 +438,91 @@ export const appStore = {
   },
 
   /** Connect to Veil gateway and start listening for events. */
-  connectToServer: async () => {
+  connectToServer: () => serializeConnectionAttempt(async () => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
-      const uid = await invoke<string>("connect_to_server", { serverUrl: serverUrl() });
-      setConnected(true);
+      const uid = await invoke<string>("connect_to_server", {
+        serverUrl: serverUrl(),
+        serverHttpUrl: serverHttpUrl(),
+      });
+      requireCurrentUiSession(sessionEpoch);
       setUserId(uid);
+      // An authenticated transport without published X3DH prekeys cannot
+      // safely receive new DMs. Treat prekey publication as part of connect.
+      await invoke("upload_prekeys", { serverHttpUrl: serverHttpUrl() });
+      requireCurrentUiSession(sessionEpoch);
+      setConnected(true);
+      // Native connect completes authenticated keyset backlog sync before the
+      // live event dispatcher starts. Refresh the Solid store from SQLCipher
+      // once, avoiding per-message replay/duplicate UI events.
+      await appStore.loadConversations();
+      requireCurrentUiSession(sessionEpoch);
+      const selectedConversation = activeConversationId();
+      if (selectedConversation) {
+        await appStore.loadMessages(selectedConversation);
+        requireCurrentUiSession(sessionEpoch);
+      }
       // Request friend list and announce online after connecting
       appStore.requestFriendList();
       appStore.sendPresence(1); // ONLINE
       // Load Discord-like servers (cache-first then refresh)
       appStore.loadServers();
+      // Preload member-only identity directories so inbound group SKDMs can
+      // be verified against pinned Ed25519 keys before any group is opened.
+      await Promise.allSettled(
+        conversations()
+          .filter((conversation) => conversation.type === "group")
+          .map((conversation) => appStore.getGroupMembers(conversation.id)),
+      );
+      requireCurrentUiSession(sessionEpoch);
+      return uid;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("connect failed:", e);
       setConnected(false);
+      setUserId(null);
+      throw e;
     }
-  },
+  }),
 
   /** Send a text message to the active conversation. */
   sendMessage: async (text: string, replyToId?: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const convId = activeConversationId();
     if (!convId) return;
     try {
+      const conversation = appStore.activeConversation();
+      if (conversation?.type === "group" && !activeServerId()) {
+        // Legacy groups have no reliable membership-change push event. Ask the
+        // native layer to fetch and authorize the current directory before send.
+        await appStore.distributeSenderKey(convId);
+        requireCurrentUiSession(sessionEpoch);
+      }
       await invoke("send_message", { conversationId: convId, text, replyToId: replyToId ?? null });
+      requireCurrentUiSession(sessionEpoch);
+      setConversations((prev) =>
+        prev.map((conversation) =>
+          conversation.id === convId
+            ? { ...conversation, lastMessage: text, lastMessageTime: Date.now() }
+            : conversation,
+        ),
+      );
       // Backend already persisted the outgoing message to the local DB
       // (api.rs send_message inserts before returning). The gateway filters
       // the sender from broadcast, so we won't get a veil://message echo.
       // Refresh from DB to display the just-sent message exactly once.
       appStore.loadMessages(convId).catch(() => {});
     } catch (e) {
+      rethrowIfStale(e);
       console.error("send failed:", e);
     }
   },
 
   editMessage: async (messageId: string, newText: string) => {
     const convId = activeConversationId();
-    if (!convId) return;
+    if (!convId || messages().some((message) => message.id === messageId && message.pending)) return;
     try {
       await invoke("edit_message", { messageId, conversationId: convId, newText });
-      setMessages((prev) =>
-        prev.map((m) => (m.id === messageId ? { ...m, text: newText } : m))
-      );
     } catch (e) {
       console.error("edit failed:", e);
     }
@@ -335,10 +530,9 @@ export const appStore = {
 
   deleteMessage: async (messageId: string) => {
     const convId = activeConversationId();
-    if (!convId) return;
+    if (!convId || messages().some((message) => message.id === messageId && message.pending)) return;
     try {
       await invoke("delete_message", { messageId, conversationId: convId });
-      setMessages((prev) => prev.filter((m) => m.id !== messageId));
     } catch (e) {
       console.error("delete failed:", e);
     }
@@ -370,27 +564,13 @@ export const appStore = {
   toggleReaction: async (messageId: string, emoji: string) => {
     const convId = activeConversationId();
     const uid = userId();
-    if (!convId || !uid) return;
+    if (!convId || !uid || messages().some((message) => message.id === messageId && message.pending)) return;
 
     // Check if we already reacted with this emoji
     const msgReactions = reactions()[messageId] ?? {};
     const emojiList = msgReactions[emoji] ?? [];
     const alreadyReacted = emojiList.some((r) => r.userId === uid);
     const add = !alreadyReacted;
-
-    // Optimistic update
-    setReactions((prev) => {
-      const copy = { ...prev };
-      const msgR = { ...(copy[messageId] ?? {}) };
-      if (add) {
-        msgR[emoji] = [...(msgR[emoji] ?? []), { userId: uid, username: "You" }];
-      } else {
-        msgR[emoji] = (msgR[emoji] ?? []).filter((r) => r.userId !== uid);
-        if (msgR[emoji].length === 0) delete msgR[emoji];
-      }
-      copy[messageId] = msgR;
-      return copy;
-    });
 
     try {
       await invoke("toggle_reaction", { messageId, conversationId: convId, emoji, userId: uid, add });
@@ -413,6 +593,7 @@ export const appStore = {
   /** Send a friend request to a user by their user_id. */
   /** Send a friend request. Returns "sent" | "already_pending" | "already_friends" | "error". */
   sendFriendRequest: async (targetUserId: string, message?: string): Promise<string> => {
+    const sessionEpoch = captureUiSessionEpoch();
     // Local duplicate check — if already pending, don't even bother the server
     const existing = friendRequests().find(
       (r) => (r.outgoing && r.fromUserId === targetUserId) || (!r.outgoing && r.fromUserId === targetUserId),
@@ -423,6 +604,7 @@ export const appStore = {
 
     try {
       await invoke("send_friend_request", { targetUserId, message: message ?? null });
+      requireCurrentUiSession(sessionEpoch);
       // Optimistically add outgoing request so it appears in Pending immediately
       setFriendRequests((prev) => [
         ...prev,
@@ -437,8 +619,10 @@ export const appStore = {
       ]);
       // Also request the real list from server (will overwrite optimistic entry)
       await invoke("request_friend_list");
+      requireCurrentUiSession(sessionEpoch);
       return "sent";
     } catch (e) {
+      rethrowIfStale(e);
       console.error("sendFriendRequest failed:", e);
       return "error";
     }
@@ -446,11 +630,14 @@ export const appStore = {
 
   /** Accept or reject a friend request. */
   respondFriendRequest: async (requestId: string, accept: boolean) => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
       await invoke("respond_friend_request", { requestId, accept });
+      requireCurrentUiSession(sessionEpoch);
       // Remove from pending list optimistically
       setFriendRequests((prev) => prev.filter((r) => r.requestId !== requestId));
     } catch (e) {
+      rethrowIfStale(e);
       console.error("respondFriendRequest failed:", e);
       throw e;
     }
@@ -458,10 +645,13 @@ export const appStore = {
 
   /** Remove a friend. */
   removeFriend: async (targetUserId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
       await invoke("remove_friend", { userId: targetUserId });
+      requireCurrentUiSession(sessionEpoch);
       setFriends((prev) => prev.filter((f) => f.userId !== targetUserId));
     } catch (e) {
+      rethrowIfStale(e);
       console.error("removeFriend failed:", e);
       throw e;
     }
@@ -478,13 +668,16 @@ export const appStore = {
 
   /** Search for a user by username. */
   searchUser: async (username: string): Promise<{ userId: string; username: string; identityKey: string } | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
       const result = await invoke<{ user_id: string; username: string; identity_key: string }>(
         "search_user",
         { serverHttpUrl: serverHttpUrl(), username },
       );
+      requireCurrentUiSession(sessionEpoch);
       return { userId: result.user_id, username: result.username, identityKey: result.identity_key };
     } catch (e) {
+      rethrowIfStale(e);
       console.error("searchUser failed:", e);
       return null;
     }
@@ -492,6 +685,7 @@ export const appStore = {
 
   /** Create a DM conversation with a peer (by their user_id). */
   createDm: async (peerUserId: string, peerName?: string): Promise<string | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const ourId = userId();
     if (!ourId) return null;
     try {
@@ -500,6 +694,7 @@ export const appStore = {
         ourUserId: ourId,
         peerUserId,
       });
+      requireCurrentUiSession(sessionEpoch);
       // Add conversation to local list
       const exists = conversations().some((c) => c.id === convId);
       if (!exists) {
@@ -516,6 +711,7 @@ export const appStore = {
       setActiveConversationId(convId);
       return convId;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("create DM failed:", e);
       return null;
     }
@@ -524,33 +720,35 @@ export const appStore = {
   // ─── PIN Lock ───────────────────────────────────────
 
   /** Set a PIN code for app lock. */
-  setPin: async (pin: string) => {
-    await invoke("set_pin", { pin });
+  setPin: async (pin: string, currentPin?: string) => {
+    await invoke("set_pin", { pin, currentPin: currentPin ?? null });
+    setPinConfigured(true);
+  },
+
+  clearPin: async (currentPin: string) => {
+    await invoke("clear_pin", { currentPin });
+    setPinConfigured(false);
   },
 
   /** Verify PIN and unlock. */
   verifyPin: async (pin: string): Promise<boolean> => {
+    const unlockAttemptEpoch = captureUiSessionEpoch();
     const ok = await invoke<boolean>("verify_pin", { pin });
     if (ok) {
-      // Delay heavy init so unlock + stagger animations play smoothly.
-      // LockScreen transitions to chat at +600ms, stagger ends ~+1400ms.
-      // Starting Argon2id-heavy init_from_seed earlier saturates CPU and
-      // prevents the browser from rendering CSS transitions.
+      // Native PIN verification has already initialized the identity and
+      // SQLCipher database atomically; only non-secret UI/network work remains.
+      const key = await invoke<string>("get_identity_key");
+      if (!activateUiSession(unlockAttemptEpoch)) return false;
+      setIdentity(key);
+      const unlockedEpoch = captureUiSessionEpoch();
       setTimeout(async () => {
-        try {
-          const key = await invoke<string>("init_from_seed");
-          setIdentity(key);
-        } catch (e) {
-          console.error("init_from_seed failed:", e);
-        }
+        if (!isUiSessionEpochCurrent(unlockedEpoch)) return;
         await appStore.loadConversations();
+        if (!isUiSessionEpochCurrent(unlockedEpoch)) return;
         appStore.startAutoLock();
         if (!connected()) {
-          appStore.connectToServer();
+          appStore.connectToServer().catch((e) => console.warn("secure connect failed:", e));
         }
-        // Phase 6: bring up the MLS client (restores prior groups
-        // from SQLCipher snapshot if any).
-        appStore.bootstrapMls().catch(() => {});
         // First-launch backfill of the local search index. Idempotent: backend
         // marks itself "done" and no-ops on subsequent launches.
         invoke<number>("ensure_search_backfill")
@@ -563,55 +761,121 @@ export const appStore = {
 
   /** Check if a PIN is configured. */
   hasPin: async (): Promise<boolean> => {
-    return invoke<boolean>("has_pin");
+    const configured = await invoke<boolean>("has_pin");
+    setPinConfigured(configured);
+    return configured;
   },
 
-  /** Lock the app (show PIN screen). */
-  lock: () => {
-    setScreen("locked");
+  /** Lock the native session, not just the WebView. */
+  lock: async () => {
+    if (!pinConfigured()) return;
+    // Clear the DOM and invalidate every in-flight renderer task before the
+    // first asynchronous boundary. The native command is the key/DB boundary.
+    clearSensitiveUi();
+    const lockedEpoch = captureUiSessionEpoch();
+
+    try {
+      await invoke("lock_app");
+    } catch (e) {
+      console.error("native lock failed:", e);
+      // A stale renderer PIN cache is the one recoverable failure: native
+      // lock_app checks PIN existence before destroying any state. Rebuild a
+      // minimal UI from native/SQLCipher instead of resurrecting old arrays.
+      try {
+        const stillConfigured = await invoke<boolean>("has_pin");
+        setPinConfigured(stillConfigured);
+        if (!stillConfigured) {
+          const key = await invoke<string>("get_identity_key");
+          if (!activateUiSession(lockedEpoch)) return;
+          setIdentity(key);
+          setScreen("chat");
+          await appStore.loadConversations();
+          appStore.connectToServer().catch((error) =>
+            console.warn("secure reconnect after cancelled lock failed:", error),
+          );
+        }
+      } catch {
+        // Unknown native failure stays fail-closed on the lock screen.
+      }
+    }
   },
 
-  /** Start auto-lock timer: lock after 5 min inactivity. */
+  /** Start auto-lock timer using the native persisted inactivity period. */
   startAutoLock: () => {
     if (autoLockTimer) clearInterval(autoLockTimer);
     autoLockTimer = setInterval(async () => {
-      const hasPin = await invoke<boolean>("has_pin");
-      if (!hasPin) return;
-      const idle = await invoke<number>("idle_seconds");
-      if (idle >= AUTO_LOCK_SECONDS) {
-        setScreen("locked");
+      const sessionEpoch = captureUiSessionEpoch();
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+      if (!pinConfigured()) return;
+      try {
+        const idle = await invoke<number>("idle_seconds");
+        if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+        if (idle >= autoLockSeconds()) {
+          await appStore.lock();
+        }
+      } catch (error) {
+        if (isUiSessionEpochCurrent(sessionEpoch)) {
+          console.warn("idle timer check failed:", error);
+        }
       }
     }, 10_000); // check every 10s
   },
 
+  loadAutoLockSetting: async (): Promise<number> => {
+    const seconds = await invoke<number>("get_auto_lock_seconds");
+    setAutoLockSeconds(seconds);
+    return seconds;
+  },
+
+  setAutoLockMinutes: async (minutes: number): Promise<void> => {
+    const seconds = minutes * 60;
+    await invoke("set_auto_lock_seconds", { seconds });
+    setAutoLockSeconds(seconds);
+  },
+
   /** Touch activity (called on user interaction). */
   touchActivity: () => {
+    const now = Date.now();
+    if (now - lastActivityTouch < 1000) return;
+    lastActivityTouch = now;
     invoke("touch_activity").catch(() => {});
   },
 
   /** Load persisted conversations from the encrypted DB. */
   loadConversations: async () => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
       const convs = await invoke<Array<{ id: string; type: string; name: string; peerKey?: string; lastMessageAt?: string }>>("get_conversations");
-      setConversations(convs.map(c => ({
-        id: c.id,
-        type: (c.type === "group" ? "group" : "dm") as "dm" | "group",
-        name: c.name || c.id.slice(0, 8),
-        unreadCount: 0,
-        lastMessageTime: c.lastMessageAt ? new Date(c.lastMessageAt).getTime() : undefined,
-      })));
+      requireCurrentUiSession(sessionEpoch);
+      setConversations(
+        convs
+          // Server channels are rendered through channelsByServer. Treating a
+          // channel row as a DM would expose the wrong send/decrypt workflow.
+          .filter((c) => c.type !== "channel")
+          .map(c => ({
+            id: c.id,
+            type: (c.type === "group" ? "group" : "dm") as "dm" | "group",
+            name: c.name || c.id.slice(0, 8),
+            peerKey: c.peerKey,
+            unreadCount: 0,
+            lastMessageTime: c.lastMessageAt ? new Date(c.lastMessageAt).getTime() : undefined,
+          })),
+      );
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("loadConversations failed:", e);
     }
   },
 
   /** Load persisted messages for a conversation. */
   loadMessages: async (conversationId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
-      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; timestamp: number; createdAt: string; replyToId?: string }>>(
+      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; pending: boolean; timestamp: number; createdAt: string; replyToId?: string }>>(
         "get_messages",
         { conversationId },
       );
+      requireCurrentUiSession(sessionEpoch);
       const loaded: Message[] = msgs.map(m => ({
         id: m.id,
         conversationId: m.conversationId,
@@ -620,6 +884,7 @@ export const appStore = {
         text: m.text,
         timestamp: m.timestamp || new Date(m.createdAt).getTime(),
         isOwn: m.isOwn,
+        pending: m.pending,
         replyToId: m.replyToId ?? undefined,
       }));
       setMessages(prev => {
@@ -629,11 +894,12 @@ export const appStore = {
         // don't duplicate, and prepend the DB-loaded list.
         const otherConvs = prev.filter(m => m.conversationId !== conversationId);
         const localOnly = prev.filter(
-          m => m.conversationId === conversationId && !loadedIds.has(m.id),
+          m => m.conversationId === conversationId && m.pending && !loadedIds.has(m.id),
         );
         return [...otherConvs, ...loaded, ...localOnly];
       });
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("loadMessages failed:", e);
     }
   },
@@ -644,6 +910,7 @@ export const appStore = {
       await invoke("upload_prekeys", { serverHttpUrl: serverHttpUrl() });
     } catch (e) {
       console.error("uploadPrekeys failed:", e);
+      throw e;
     }
   },
 
@@ -656,6 +923,7 @@ export const appStore = {
       });
     } catch (e) {
       console.error("establishSession failed:", e);
+      throw e;
     }
   },
 
@@ -663,6 +931,7 @@ export const appStore = {
 
   /** Create a new group. Works offline (local) or online (server). */
   createGroup: async (name: string): Promise<string | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     // If connected and have userId — create on server
     if (uid && connected()) {
@@ -672,6 +941,7 @@ export const appStore = {
           userId: uid,
           name,
         });
+        requireCurrentUiSession(sessionEpoch);
         setConversations((prev) => [
           ...prev,
           { id: convId, type: "group" as const, name, unreadCount: 0 },
@@ -679,10 +949,12 @@ export const appStore = {
         setActiveConversationId(convId);
         return convId;
       } catch (e) {
+        rethrowIfStale(e);
         console.error("createGroup (server) failed:", e);
         // Fall through to local creation
       }
     }
+    requireCurrentUiSession(sessionEpoch);
     // Offline / fallback: create locally with a temp UUID
     const localId = crypto.randomUUID();
     setConversations((prev) => [
@@ -729,6 +1001,7 @@ export const appStore = {
 
   /** Get group members from the server. */
   getGroupMembers: async (groupId: string): Promise<GroupMember[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return [];
     try {
@@ -743,6 +1016,7 @@ export const appStore = {
         userId: uid,
         groupId,
       });
+      requireCurrentUiSession(sessionEpoch);
       return members.map((m) => ({
         userId: m.user_id,
         identityKey: m.identity_key,
@@ -751,14 +1025,16 @@ export const appStore = {
         joinedAt: m.joined_at,
       }));
     } catch (e) {
+      rethrowIfStale(e);
       console.error("getGroupMembers failed:", e);
-      return [];
+      throw e;
     }
   },
 
   // ─── Servers / Channels / Roles / Invites ────────
 
   selectServer: (serverId: string | null) => {
+    if (!acceptsSensitiveEvent()) return;
     setActiveServerId(serverId);
     if (serverId) {
       // Auto-select first text channel of the server, if any
@@ -779,6 +1055,7 @@ export const appStore = {
   },
 
   selectChannel: (channelId: string | null) => {
+    if (!acceptsSensitiveEvent()) return;
     setActiveChannelId(channelId);
     if (!channelId) {
       setActiveConversationId(null);
@@ -796,11 +1073,11 @@ export const appStore = {
       invoke("mark_channel_conversation", { conversationId: convId }).catch(() => {});
       invoke("hydrate_channel_sender_keys", { conversationId: convId }).catch(() => {});
       appStore.loadMessages(convId).catch(() => {});
-      // Distribute (or refresh) our sender key to known members.
-      const members = serverMembers()[sid] ?? [];
-      if (members.length > 0) {
-        appStore.distributeSenderKey(convId, members);
-      }
+      // Native fetches and authorizes the current member directory. Renderer
+      // cache contents are deliberately not accepted as key recipients.
+      appStore.distributeSenderKey(convId).catch((e) =>
+        console.warn("distribute_sender_key failed:", e),
+      );
     } else {
       setActiveConversationId(null);
     }
@@ -808,11 +1085,14 @@ export const appStore = {
 
   /** Hydrate the server rail from local cache (instant), then refresh from REST. */
   loadServers: async () => {
+    const sessionEpoch = captureUiSessionEpoch();
     // 1. Cache first for instant UI
     try {
       const cached = await invoke<Array<any>>("cache_load_servers");
+      requireCurrentUiSession(sessionEpoch);
       setServers(cached.map(serverFromJSON));
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.warn("cache_load_servers failed:", e);
     }
     // 2. REST refresh
@@ -823,19 +1103,32 @@ export const appStore = {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
       });
+      requireCurrentUiSession(sessionEpoch);
       setServers(fresh.map(serverFromJSON));
       await invoke("cache_save_servers", { servers: fresh }).catch(() => {});
+      requireCurrentUiSession(sessionEpoch);
+      // Member-only directories carry the server-pinned identity/signing-key
+      // bindings needed to verify authenticated Sender Key distributions.
+      await Promise.allSettled(
+        fresh.map((server: any) => appStore.loadServerMembers(server.id)),
+      );
+      requireCurrentUiSession(sessionEpoch);
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("list_servers failed:", e);
     }
   },
 
   loadChannels: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     // 1. Cache first
     try {
       const cached = await invoke<Array<any>>("cache_load_channels", { serverId });
+      requireCurrentUiSession(sessionEpoch);
       setChannelsByServer((prev) => ({ ...prev, [serverId]: cached.map(channelFromJSON) }));
-    } catch {}
+    } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
+    }
     // 2. REST refresh
     const uid = userId();
     if (!uid) return;
@@ -845,23 +1138,30 @@ export const appStore = {
         userId: uid,
         serverId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setChannelsByServer((prev) => ({ ...prev, [serverId]: fresh.map(channelFromJSON) }));
       await invoke("cache_save_channels", { serverId, channels: fresh }).catch(() => {});
+      requireCurrentUiSession(sessionEpoch);
       // If active server but no active channel, pick first text channel
       if (activeServerId() === serverId && !activeChannelId()) {
         const firstText = fresh.find((c) => (c.channel_type ?? 0) === 0);
         if (firstText) appStore.selectChannel(firstText.id);
       }
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("list_channels failed:", e);
     }
   },
 
   loadServerMembers: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
       const cached = await invoke<Array<any>>("cache_load_server_members", { serverId });
+      requireCurrentUiSession(sessionEpoch);
       setServerMembers((prev) => ({ ...prev, [serverId]: cached.map(memberFromJSON) }));
-    } catch {}
+    } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
+    }
     const uid = userId();
     if (!uid) return;
     try {
@@ -870,42 +1170,50 @@ export const appStore = {
         userId: uid,
         serverId,
       });
+      requireCurrentUiSession(sessionEpoch);
       const mapped = fresh.map(memberFromJSON);
       setServerMembers((prev) => ({ ...prev, [serverId]: mapped }));
       await invoke("cache_save_server_members", { serverId, members: fresh }).catch(() => {});
+      requireCurrentUiSession(sessionEpoch);
       // If we're viewing a channel of this server, push our sender key to the freshly
       // known members. (Idempotent: noop for already-up-to-date peers, refresh on change.)
       if (activeServerId() === serverId) {
         const convId = activeConversationId();
         if (convId) {
-          appStore.distributeSenderKey(convId, mapped);
+          appStore.distributeSenderKey(convId).catch((e) =>
+            console.warn("distribute_sender_key failed:", e),
+          );
         }
       }
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("list_server_members failed:", e);
     }
   },
 
-  /**
-   * Phase E: Distribute the current outgoing sender key for `conversationId`
-   * to every known member that has an identity_key (skip self, skip unknown).
-   */
-  distributeSenderKey: (conversationId: string, members: ServerMember[]) => {
-    const peers = members
-      .map((m) => m.identityKey)
-      .filter((k): k is string => typeof k === "string" && k.length === 64);
-    if (peers.length === 0) return;
-    invoke<number>("distribute_sender_key", {
+  /** Distribute a sender key using the native authenticated member directory. */
+  distributeSenderKey: async (conversationId: string): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const selfUserId = userId();
+    if (!selfUserId) throw new Error("sender-key distribution requires an authenticated user");
+
+    await invoke<number>("distribute_sender_key", {
       conversationId,
-      peerIdentityKeys: peers,
-    }).catch((e) => console.warn("distribute_sender_key failed:", e));
+      serverHttpUrl: serverHttpUrl(),
+      userId: selfUserId,
+    });
+    requireCurrentUiSession(sessionEpoch);
   },
 
   loadServerRoles: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
       const cached = await invoke<Array<any>>("cache_load_roles", { serverId });
+      requireCurrentUiSession(sessionEpoch);
       setServerRoles((prev) => ({ ...prev, [serverId]: cached.map(roleFromJSON) }));
-    } catch {}
+    } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
+    }
     const uid = userId();
     if (!uid) return;
     try {
@@ -914,14 +1222,18 @@ export const appStore = {
         userId: uid,
         serverId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setServerRoles((prev) => ({ ...prev, [serverId]: fresh.map(roleFromJSON) }));
       await invoke("cache_save_roles", { serverId, roles: fresh }).catch(() => {});
+      requireCurrentUiSession(sessionEpoch);
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("list_roles failed:", e);
     }
   },
 
   createServer: async (name: string): Promise<Server | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid || !name.trim()) return null;
     try {
@@ -930,20 +1242,24 @@ export const appStore = {
         userId: uid,
         name: name.trim(),
       });
+      requireCurrentUiSession(sessionEpoch);
       const created = serverFromJSON(s);
       setServers((prev) => [...prev, created]);
       // Persist the updated list
       await invoke("cache_save_servers", {
         servers: [...servers().map(serverToJSON)],
       }).catch(() => {});
+      requireCurrentUiSession(sessionEpoch);
       return created;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("create_server failed:", e);
       throw e;
     }
   },
 
   deleteServer: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     try {
@@ -952,6 +1268,7 @@ export const appStore = {
         userId: uid,
         serverId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setServers((prev) => prev.filter((s) => s.id !== serverId));
       setChannelsByServer((prev) => {
         const c = { ...prev };
@@ -964,12 +1281,14 @@ export const appStore = {
       }
       await invoke("cache_delete_server", { serverId }).catch(() => {});
     } catch (e) {
+      rethrowIfStale(e);
       console.error("delete_server failed:", e);
       throw e;
     }
   },
 
   leaveServer: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     try {
@@ -978,6 +1297,7 @@ export const appStore = {
         userId: uid,
         serverId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setServers((prev) => prev.filter((s) => s.id !== serverId));
       if (activeServerId() === serverId) {
         setActiveServerId(null);
@@ -985,6 +1305,7 @@ export const appStore = {
       }
       await invoke("cache_delete_server", { serverId }).catch(() => {});
     } catch (e) {
+      rethrowIfStale(e);
       console.error("leave_server failed:", e);
       throw e;
     }
@@ -997,6 +1318,7 @@ export const appStore = {
     categoryId?: string,
     topic?: string,
   ): Promise<Channel | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
     try {
@@ -1009,6 +1331,7 @@ export const appStore = {
         categoryId: categoryId ?? null,
         topic: topic ?? null,
       });
+      requireCurrentUiSession(sessionEpoch);
       const ch = channelFromJSON(c);
       setChannelsByServer((prev) => ({
         ...prev,
@@ -1016,12 +1339,14 @@ export const appStore = {
       }));
       return ch;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("create_channel failed:", e);
       throw e;
     }
   },
 
   deleteChannel: async (serverId: string, channelId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     try {
@@ -1030,6 +1355,7 @@ export const appStore = {
         userId: uid,
         channelId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setChannelsByServer((prev) => ({
         ...prev,
         [serverId]: (prev[serverId] ?? []).filter((c) => c.id !== channelId),
@@ -1037,6 +1363,7 @@ export const appStore = {
       if (activeChannelId() === channelId) setActiveChannelId(null);
       await invoke("cache_delete_channel", { channelId }).catch(() => {});
     } catch (e) {
+      rethrowIfStale(e);
       console.error("delete_channel failed:", e);
       throw e;
     }
@@ -1047,6 +1374,7 @@ export const appStore = {
     maxUses: number,
     expiresInSecs: number,
   ): Promise<{ code: string } | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
     try {
@@ -1057,18 +1385,24 @@ export const appStore = {
         maxUses,
         expiresInSecs,
       });
+      requireCurrentUiSession(sessionEpoch);
       return inv;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("create_invite failed:", e);
       throw e;
     }
   },
 
   previewInvite: async (code: string): Promise<any> => {
-    return invoke("preview_invite", { serverHttpUrl: serverHttpUrl(), code });
+    const sessionEpoch = captureUiSessionEpoch();
+    const preview = await invoke("preview_invite", { serverHttpUrl: serverHttpUrl(), code });
+    requireCurrentUiSession(sessionEpoch);
+    return preview;
   },
 
   useInvite: async (code: string): Promise<Server | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
     try {
@@ -1077,6 +1411,7 @@ export const appStore = {
         userId: uid,
         code,
       });
+      requireCurrentUiSession(sessionEpoch);
       const joined = serverFromJSON(s);
       setServers((prev) => {
         if (prev.some((p) => p.id === joined.id)) return prev;
@@ -1084,6 +1419,7 @@ export const appStore = {
       });
       return joined;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("use_invite failed:", e);
       throw e;
     }
@@ -1092,6 +1428,7 @@ export const appStore = {
   // ─── Server settings overlay ─────────────────────
 
   openServerSettings: (serverId: string) => {
+    if (!acceptsSensitiveEvent()) return;
     setServerSettingsId(serverId);
     setScreen("serverSettings");
     // Make sure members + roles + invites data is warm. Run in parallel so the
@@ -1103,6 +1440,7 @@ export const appStore = {
   },
 
   closeServerSettings: () => {
+    if (!acceptsSensitiveEvent()) return;
     setServerSettingsId(null);
     setScreen("chat");
   },
@@ -1113,6 +1451,7 @@ export const appStore = {
     serverId: string,
     patch: { name?: string; description?: string; iconUrl?: string },
   ) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("update_server", {
@@ -1123,6 +1462,7 @@ export const appStore = {
       description: patch.description ?? null,
       iconUrl: patch.iconUrl ?? null,
     });
+    requireCurrentUiSession(sessionEpoch);
     setServers((prev) =>
       prev.map((s) =>
         s.id === serverId
@@ -1142,6 +1482,7 @@ export const appStore = {
     channelId: string,
     patch: { name?: string; topic?: string; nsfw?: boolean; slowmodeSecs?: number },
   ) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("update_channel", {
@@ -1153,6 +1494,7 @@ export const appStore = {
       nsfw: patch.nsfw ?? null,
       slowmodeSecs: patch.slowmodeSecs ?? null,
     });
+    requireCurrentUiSession(sessionEpoch);
     setChannelsByServer((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((c) =>
@@ -1178,6 +1520,7 @@ export const appStore = {
       clearCategory?: boolean;
     }>,
   ) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     // Optimistic local update
@@ -1214,7 +1557,9 @@ export const appStore = {
         serverId,
         items: payload,
       });
+      requireCurrentUiSession(sessionEpoch);
     } catch (e) {
+      rethrowIfStale(e);
       console.error("reorder_channels failed", e);
       // Refresh from server on failure
       await (appStore as any).loadChannels(serverId);
@@ -1227,6 +1572,7 @@ export const appStore = {
     permissions: number,
     color?: number,
   ): Promise<Role | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
     const r = await invoke<any>("create_role", {
@@ -1237,6 +1583,7 @@ export const appStore = {
       permissions,
       color: color ?? null,
     });
+    requireCurrentUiSession(sessionEpoch);
     const role = roleFromJSON(r);
     setServerRoles((prev) => ({
       ...prev,
@@ -1250,6 +1597,7 @@ export const appStore = {
     roleId: string,
     patch: { name?: string; permissions?: number; color?: number },
   ) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("update_role", {
@@ -1261,6 +1609,7 @@ export const appStore = {
       permissions: patch.permissions ?? null,
       color: patch.color ?? null,
     });
+    requireCurrentUiSession(sessionEpoch);
     setServerRoles((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((r) =>
@@ -1277,6 +1626,7 @@ export const appStore = {
   },
 
   deleteRole: async (serverId: string, roleId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("delete_role", {
@@ -1285,6 +1635,7 @@ export const appStore = {
       serverId,
       roleId,
     });
+    requireCurrentUiSession(sessionEpoch);
     setServerRoles((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).filter((r) => r.id !== roleId),
@@ -1292,6 +1643,7 @@ export const appStore = {
   },
 
   assignRole: async (serverId: string, targetUserId: string, roleId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("assign_role", {
@@ -1301,6 +1653,7 @@ export const appStore = {
       targetUserId,
       roleId,
     });
+    requireCurrentUiSession(sessionEpoch);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((m) =>
@@ -1312,6 +1665,7 @@ export const appStore = {
   },
 
   unassignRole: async (serverId: string, targetUserId: string, roleId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("unassign_role", {
@@ -1321,6 +1675,7 @@ export const appStore = {
       targetUserId,
       roleId,
     });
+    requireCurrentUiSession(sessionEpoch);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((m) =>
@@ -1332,6 +1687,7 @@ export const appStore = {
   },
 
   kickMember: async (serverId: string, targetUserId: string, reason?: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("kick_server_member", {
@@ -1341,6 +1697,7 @@ export const appStore = {
       targetUserId,
       reason: reason ?? null,
     });
+    requireCurrentUiSession(sessionEpoch);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).filter((m) => m.userId !== targetUserId),
@@ -1348,6 +1705,7 @@ export const appStore = {
   },
 
   listInvites: async (serverId: string): Promise<any[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return [];
     const invs = await invoke<any[]>("list_invites", {
@@ -1355,6 +1713,7 @@ export const appStore = {
       userId: uid,
       serverId,
     });
+    requireCurrentUiSession(sessionEpoch);
     return invs;
   },
 
@@ -1370,9 +1729,29 @@ export const appStore = {
 
   /** Set up Tauri event listeners for incoming server events. */
   setupEventListeners: async () => {
+    await listen("veil://locked", () => {
+      // Native expiry already destroyed key/DB state. Clear renderer plaintext
+      // synchronously before any fallible keychain or IPC operation.
+      clearSensitiveUi();
+      invoke("lock_app").catch((error) => console.error("native auto-lock follow-up failed:", error));
+    });
+
+    await listen<{ conversations: number; messages: number; duplicates: number; unavailableHistory: number; retainedSenderKeys: number; edits: number; tombstones: number }>(
+      "veil://sync-complete",
+      (event) => {
+        if (!acceptsSensitiveEvent()) return;
+        if (event.payload.unavailableHistory > 0) {
+          console.warn(
+            `offline sync skipped ${event.payload.unavailableHistory} historical message(s) from former members whose identity was never pinned on this device`,
+          );
+        }
+      },
+    );
+
     await listen<{ messageId: string; conversationId: string; senderKey: string; senderName: string; text: string; timestamp: number; replyToId?: string }>(
       "veil://message",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
         const isOwn = d.senderKey === identity();
         appStore.addMessage({
@@ -1405,12 +1784,57 @@ export const appStore = {
     );
 
     await listen<{ reason: string }>("veil://disconnected", () => {
+      if (!acceptsSensitiveEvent()) return;
       setConnected(false);
     });
+
+    await listen("veil://membership-refresh-required", () => {
+      if (!acceptsSensitiveEvent()) return;
+      void appStore.connectToServer().catch((error) => {
+        if (!(error instanceof StaleUiSessionError)) {
+          console.error("membership refresh reconnect failed:", error);
+        }
+      });
+    });
+
+    await listen<{ messageId: string; localMessageId?: string | null; refSeq: number }>(
+      "veil://message-ack",
+      (event) => {
+        if (!acceptsSensitiveEvent()) return;
+        const { messageId, localMessageId } = event.payload;
+        if (!localMessageId || localMessageId === messageId) return;
+
+        // The native client inserts an optimistic local UUID before the
+        // gateway assigns the durable message UUID. Keep the UI, reply
+        // references and reaction cache on the same identity as the DB.
+        setMessages((prev) => {
+          const hasLocal = prev.some((message) => message.id === localMessageId);
+          if (!hasLocal) return prev;
+          const hasServer = prev.some((message) => message.id === messageId);
+          return prev
+            .filter((message) => !hasServer || message.id !== localMessageId)
+            .map((message) => ({
+              ...message,
+              id: message.id === localMessageId ? messageId : message.id,
+              pending: message.id === localMessageId ? false : message.pending,
+              replyToId: message.replyToId === localMessageId ? messageId : message.replyToId,
+            }));
+        });
+
+        setReactions((prev) => {
+          const local = prev[localMessageId];
+          if (!local) return prev;
+          const copy = { ...prev, [messageId]: local };
+          delete copy[localMessageId];
+          return copy;
+        });
+      },
+    );
 
     await listen<{ messageId: string; conversationId: string; newText: string; editTimestamp: number }>(
       "veil://message-edited",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
         setMessages((prev) =>
           prev.map((m) => (m.id === d.messageId ? { ...m, text: d.newText } : m))
@@ -1421,6 +1845,7 @@ export const appStore = {
     await listen<{ messageId: string; conversationId: string }>(
       "veil://message-deleted",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
         setMessages((prev) => prev.filter((m) => m.id !== d.messageId));
       },
@@ -1429,6 +1854,8 @@ export const appStore = {
     await listen<{ conversationId: string; identityKey: string; started: boolean }>(
       "veil://typing",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
+        const eventEpoch = captureUiSessionEpoch();
         const { conversationId, identityKey, started } = event.payload;
         setTypingUsers((prev) => {
           const copy = { ...prev };
@@ -1446,6 +1873,7 @@ export const appStore = {
         if (typingTimers[timerKey]) clearTimeout(typingTimers[timerKey]);
         if (started) {
           typingTimers[timerKey] = setTimeout(() => {
+            if (!isUiSessionEpochCurrent(eventEpoch)) return;
             setTypingUsers((prev) => {
               const copy = { ...prev };
               const set = new Set(copy[conversationId] ?? []);
@@ -1461,13 +1889,25 @@ export const appStore = {
       },
     );
 
-    await listen<{ code: number; message: string }>("veil://error", (event) => {
+    await listen<{ code: number; message: string; localMessageId?: string | null }>("veil://error", (event) => {
+      if (!acceptsSensitiveEvent()) return;
       console.error("server error:", event.payload);
+      const localMessageId = event.payload.localMessageId;
+      if (localMessageId) {
+        setMessages((prev) => prev.filter((message) => message.id !== localMessageId));
+        setReactions((prev) => {
+          if (!prev[localMessageId]) return prev;
+          const copy = { ...prev };
+          delete copy[localMessageId];
+          return copy;
+        });
+      }
     });
 
     await listen<{ messageId: string; conversationId: string; emoji: string; userId: string; username: string; add: boolean }>(
       "veil://reaction",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const { messageId, emoji, userId: uid, username, add } = event.payload;
         setReactions((prev) => {
           const copy = { ...prev };
@@ -1492,6 +1932,7 @@ export const appStore = {
     await listen<{ identityKey: string; status: number; statusText?: string; lastSeen?: number }>(
       "veil://presence",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const { identityKey, status } = event.payload;
         setPresenceMap((prev) => ({ ...prev, [identityKey]: status }));
         // Also update friend list status
@@ -1507,6 +1948,7 @@ export const appStore = {
     await listen<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number }>(
       "veil://friend-request",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
         setFriendRequests((prev) => [
           ...prev,
@@ -1525,6 +1967,7 @@ export const appStore = {
     await listen<{ userId: string; username: string }>(
       "veil://friend-accepted",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const { userId: uid, username } = event.payload;
         // Add to friends list
         setFriends((prev) => {
@@ -1539,6 +1982,7 @@ export const appStore = {
     await listen<{ userId: string }>(
       "veil://friend-removed",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const { userId: uid } = event.payload;
         setFriends((prev) => prev.filter((f) => f.userId !== uid));
       },
@@ -1550,6 +1994,7 @@ export const appStore = {
     }>(
       "veil://friend-list",
       (event) => {
+        if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
         setFriends(d.friends.map((f) => ({ userId: f.userId, username: f.username, status: f.status, lastSeen: f.lastSeen })));
         setFriendRequests(d.pendingRequests.map((r) => ({
@@ -1583,6 +2028,7 @@ export const appStore = {
       memberInfo?: { identityKey: string; username: string; roleIds: string[]; reason?: string };
       roleInfo?: { id: string; name: string; permissions: number; position: number; color?: number };
     }>("veil://server-event", (event) => {
+      if (!acceptsSensitiveEvent()) return;
       const d = event.payload;
       switch (d.eventType) {
         case SE_CREATED:
@@ -1631,6 +2077,7 @@ export const appStore = {
         topic?: string;
       };
     }>("veil://channel-event", (event) => {
+      if (!acceptsSensitiveEvent()) return;
       const d = event.payload;
       const ch = d.channel;
       switch (d.eventType) {
@@ -1651,16 +2098,24 @@ export const appStore = {
       }
     });
 
-    // Deep links: veil://add/{userId} or veil://share/{id}
+    // Deep links are untrusted OS input. Never create conversations or claim
+    // prekeys without an explicit in-app user decision.
     await listen<string[]>("deep-link://new-url", (event) => {
+      if (!acceptsSensitiveEvent()) return;
       const urls = event.payload;
       for (const raw of urls) {
         try {
           const url = new URL(raw);
           const parts = url.pathname.replace(/^\/+/, "").split("/");
-          if (url.protocol === "veil:" && parts[0] === "add" && parts[1]) {
-            // Auto-create DM with this user
-            appStore.createDm(parts[1]);
+          const addUserId = url.hostname === "add" ? parts[0] : parts[0] === "add" ? parts[1] : "";
+          const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+          if (
+            url.protocol === "veil:" &&
+            addUserId &&
+            canonicalUuid.test(addUserId) &&
+            window.confirm(`Start an encrypted conversation with user ${addUserId}?`)
+          ) {
+            void appStore.createDm(addUserId);
           }
           // veil://share/{id} — future
         } catch {
@@ -1672,72 +2127,4 @@ export const appStore = {
 
   // ─── Phase 6: OpenMLS orchestration ────────────────
 
-  /** Initialise the local MLS client. The leaf identity is derived
-   *  from the user's identity key + a fixed device label so the same
-   *  device gets the same MLS leaf across restarts (signer + group
-   *  state are restored from SQLCipher).
-   *
-   *  Idempotent: safe to call multiple times. Returns the hex-encoded
-   *  Ed25519 public signature key (or null on failure). */
-  bootstrapMls: async (): Promise<string | null> => {
-    try {
-      const ident = identity();
-      if (!ident) return null;
-      // The desktop binds one MLS leaf per device. We don't currently
-      // enumerate physical devices, so use a stable label.
-      const leafSeed = `${ident}::desktop`;
-      // Hash to 32 bytes via SubtleCrypto (SHA-256 is fine — leaf is
-      // an opaque identifier, not a credential).
-      const enc = new TextEncoder().encode(leafSeed);
-      const digest = await crypto.subtle.digest("SHA-256", enc);
-      const leafHex = Array.from(new Uint8Array(digest))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-      console.log("[veil-mls] invoking mls_init, leaf=", leafHex.slice(0, 8) + "…");
-      const pub = await invoke<string>("mls_init", { leafIdentityHex: leafHex });
-      console.log("[veil-mls] mls_init OK, pubkey=", pub.slice(0, 8) + "…");
-      setMlsReady(true);
-      return pub;
-    } catch (e) {
-      console.error("[veil-mls] bootstrap failed:", String(e));
-      setMlsReady(false);
-      return null;
-    }
-  },
-
-  /** Refresh the cached crypto_mode for a single conversation. */
-  refreshCryptoMode: async (conversationId: string): Promise<void> => {
-    try {
-      const mode = await invoke<string>("get_conversation_crypto_mode", { conversationId });
-      const normalized: "sender_key" | "mls" = mode === "mls" ? "mls" : "sender_key";
-      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: normalized }));
-    } catch (e) {
-      // Fall back to the legacy default — not fatal.
-      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: "sender_key" }));
-    }
-  },
-
-  /** Mark a conversation as MLS-encrypted in the local DB. Currently a
-   *  shallow flag — full upgrade-to-MLS over the network (KP fetch,
-   *  Welcome publication, commit broadcast) is implemented in a
-   *  follow-up; this lets the UI badge transition independently for
-   *  validation. */
-  upgradeConversationToMls: async (conversationId: string): Promise<boolean> => {
-    if (!mlsReady()) {
-      console.warn("upgradeConversationToMls: MLS not initialised; calling bootstrapMls first");
-      const pub = await appStore.bootstrapMls();
-      if (!pub) return false;
-    }
-    try {
-      // Group ID == hex(uuid bytes) — matches mls_create_group's contract.
-      const uuidHex = conversationId.replace(/-/g, "");
-      await invoke<number>("mls_create_group", { groupIdHex: uuidHex });
-      await invoke("set_conversation_crypto_mode", { conversationId, mode: "mls" });
-      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: "mls" }));
-      return true;
-    } catch (e) {
-      console.error("upgradeConversationToMls failed:", e);
-      return false;
-    }
-  },
 };

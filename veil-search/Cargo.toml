@@ -6,7 +6,7 @@ license = "MIT"
 description = "Local-only Tantivy full-text index for decrypted Veil messages"
 
 [dependencies]
-tantivy = "0.22"
+tantivy = "0.26.1"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 thiserror = "1"

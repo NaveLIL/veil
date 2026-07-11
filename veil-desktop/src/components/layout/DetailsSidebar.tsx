@@ -1,4 +1,5 @@
-import { Component, Show, For, createEffect, createMemo } from "solid-js";
+import { Component, Show, For, createEffect, createMemo, createSignal } from "solid-js";
+import { invoke } from "@tauri-apps/api/core";
 import { X, Lock, Shield, Image, FileText, Hash, Users, Crown } from "lucide-solid";
 import { Avatar } from "@/components/ui/avatar";
 import { Tooltip } from "@/components/ui/tooltip";
@@ -36,12 +37,27 @@ export interface DetailsSidebarProps {
 
 export const DetailsSidebar: Component<DetailsSidebarProps> = (props) => {
   const conv = () => appStore.activeConversation();
+  const [fingerprint, setFingerprint] = createSignal("");
 
   const shortKey = () => {
     const c = conv();
-    if (!c) return "???";
-    return c.id.slice(0, 16);
+    if (!c?.peerKey) return "Unavailable";
+    return `${c.peerKey.slice(0, 16)}…`;
   };
+
+  const groupedFingerprint = () =>
+    fingerprint().match(/.{1,4}/g)?.join(" ") ?? fingerprint();
+
+  createEffect(() => {
+    const peerKey = conv()?.peerKey;
+    setFingerprint("");
+    if (!peerKey) return;
+    invoke<string>("fingerprint_peer", { peerIdentityKey: peerKey })
+      .then((value) => {
+        if (conv()?.peerKey === peerKey) setFingerprint(value);
+      })
+      .catch((e) => console.warn("fingerprint unavailable:", e));
+  });
 
   // ─── Server-mode helpers ─────────────────────────
   const sid = () => appStore.activeServerId();
@@ -196,7 +212,7 @@ export const DetailsSidebar: Component<DetailsSidebarProps> = (props) => {
                         <span class="text-[12px] text-foreground/70 font-medium">End-to-end encrypted</span>
                       </div>
                       <p class="text-[11px] text-muted-foreground/40 leading-relaxed">
-                        Messages are secured with Signal Protocol. Only you and this contact can read them.
+                        Sending is blocked unless a secure session exists. Compare the safety number below through another trusted channel.
                       </p>
                     </div>
                   </Section>
@@ -204,8 +220,15 @@ export const DetailsSidebar: Component<DetailsSidebarProps> = (props) => {
                   {/* Identity */}
                   <Section title="Identity" icon={Shield}>
                     <InfoRow label="Public Key" value={shortKey()} />
-                    <div class="h-px bg-white/[0.04] mx-4" />
-                    <InfoRow label="Contact ID" value={c().id.slice(0, 12)} />
+                    <Show when={groupedFingerprint()}>
+                      <div class="h-px bg-white/[0.04] mx-4" />
+                      <div class="px-4 py-3">
+                        <div class="text-[10px] text-amber-300/70 mb-2">Not verified automatically</div>
+                        <div class="text-[10px] leading-5 text-foreground/60 font-mono break-all select-all">
+                          {groupedFingerprint()}
+                        </div>
+                      </div>
+                    </Show>
                   </Section>
 
                   {/* Shared media placeholder */}

@@ -1,7 +1,13 @@
 import { Component, Show, Switch, Match, For, createSignal, createEffect, onMount, onCleanup, untrack } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { appStore, type GroupMember, type Message } from "@/stores/app";
+import {
+  appStore,
+  captureUiSessionEpoch,
+  isUiSessionEpochCurrent,
+  type GroupMember,
+  type Message,
+} from "@/stores/app";
 import { OnboardingScreen } from "@/components/chat/OnboardingScreen";
 import { LockScreen } from "@/components/chat/LockScreen";
 import { SettingsScreen } from "@/components/chat/SettingsScreen";
@@ -46,8 +52,8 @@ const TIPS = [
   },
   {
     icon: "shield",
-    text: "Veil uses the X3DH + Double Ratchet protocol\nfor perfect forward secrecy in every conversation.",
-    sub: "Even if keys are compromised, past messages stay safe.",
+    text: "Direct messages use X3DH + Double Ratchet.\nGroups use authenticated Sender Keys.",
+    sub: "Verify contact fingerprints and keep every device updated.",
   },
   {
     icon: "eye",
@@ -57,7 +63,7 @@ const TIPS = [
   {
     icon: "lock",
     text: "Every group message is encrypted with\nSender Keys — efficient and secure at scale.",
-    sub: "Group privacy without compromise.",
+    sub: "Keys rotate when membership changes; delivery must finish before sending.",
   },
   {
     icon: "shield",
@@ -66,13 +72,13 @@ const TIPS = [
   },
   {
     icon: "eye",
-    text: "Metadata matters. Veil minimizes what the\nserver knows about who talks to whom.",
-    sub: "Privacy is more than just encryption.",
+    text: "Encryption protects message contents, not all metadata.\nThe server still routes accounts and conversations.",
+    sub: "Privacy is more than message encryption.",
   },
   {
     icon: "lock",
-    text: "Your PIN protects local keys with\nArgon2id key derivation — brute-force resistant.",
-    sub: "A strong PIN is your first line of defense.",
+    text: "Your app PIN is checked with Argon2id\nand native retry throttling.",
+    sub: "It complements Windows account and device security; it does not replace them.",
   },
 ];
 
@@ -222,14 +228,6 @@ const App: Component = () => {
     const text = inputText().trim();
     if (!text || !conv() || text.length > MAX_MSG_LEN) return;
     const reply = replyingTo();
-    appStore.addMessage({
-      id: crypto.randomUUID(),
-      conversationId: conv()!.id,
-      senderName: "You",
-      senderKey: appStore.identity() ?? "",
-      text, timestamp: Date.now(), isOwn: true,
-      replyToId: reply?.id,
-    });
     setInputText("");
     setReplyingTo(null);
     if (inputRef) inputRef.style.height = "21px";
@@ -237,6 +235,7 @@ const App: Component = () => {
   };
 
   const startEdit = (msg: Message) => {
+    if (msg.pending) return;
     setEditingMessage(msg);
     setEditText(msg.text);
     setReplyingTo(null);
@@ -254,8 +253,11 @@ const App: Component = () => {
   };
 
   const handleDelete = (msg: Message) => {
+    if (msg.pending) return;
+    const sessionEpoch = captureUiSessionEpoch();
     setDeletingIds((prev) => { const s = new Set(prev); s.add(msg.id); return s; });
     setTimeout(() => {
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       appStore.deleteMessage(msg.id);
       setDeletingIds((prev) => { const s = new Set(prev); s.delete(msg.id); return s; });
     }, 350);
@@ -280,22 +282,27 @@ const App: Component = () => {
     document.addEventListener("contextmenu", (e) => e.preventDefault(), { capture: true });
 
     try {
-      const seed = await invoke<string | null>("get_stored_seed");
-      if (seed) {
-        const key = await invoke<string>("init_identity", { mnemonic: seed });
+      const hasIdentity = await invoke<boolean>("has_stored_identity");
+      if (!hasIdentity) {
+        appStore.setScreen("onboarding");
+      } else if (await appStore.hasPin()) {
+        // The native client stays uninitialized while the PIN screen is active.
+        appStore.setScreen("locked");
+      } else {
+        const key = await invoke<string>("init_from_seed");
         appStore.setIdentity(key);
-        const hasPin = await invoke<boolean>("has_pin");
-        appStore.setScreen(hasPin ? "locked" : "chat");
-        if (!hasPin) {
-          await appStore.loadConversations();
-          await appStore.connectToServer();
-          // Phase 6 — bring up the MLS client (restores prior groups
-          // from SQLCipher snapshot if any). Fire-and-forget.
-          appStore.bootstrapMls().catch(() => {});
-        }
+        appStore.setScreen("chat");
+        await appStore.loadConversations();
+        appStore.connectToServer().catch((e) => console.warn("secure connect failed:", e));
+        invoke<number>("ensure_search_backfill").catch((e) =>
+          console.warn("ensure_search_backfill failed:", e),
+        );
       }
     } catch { appStore.setScreen("onboarding"); }
     await appStore.setupEventListeners();
+    await appStore.loadAutoLockSetting().catch((e) =>
+      console.warn("auto-lock setting load failed:", e),
+    );
     appStore.startAutoLock();
   });
 
@@ -331,6 +338,33 @@ const App: Component = () => {
   const [showJoinServer, setShowJoinServer] = createSignal(false);
   const [showCreateChannel, setShowCreateChannel] = createSignal(false);
   const [showCreateInvite, setShowCreateInvite] = createSignal(false);
+
+  // Store state is not the only place where plaintext lives. Drafts, edit and
+  // reply references, search text and globally-mounted overlays belong to this
+  // root component and otherwise survive a screen switch. Purge them whenever
+  // the native boundary moves to the locked state.
+  createEffect(() => {
+    if (appStore.screen() !== "locked") return;
+    setInputText("");
+    setSearch("");
+    setNewPeerId("");
+    setNewGroupName("");
+    setGroupMembers([]);
+    setReplyingTo(null);
+    setEditingMessage(null);
+    setEditText("");
+    setDeletingIds(new Set<string>());
+    setMemberPanelOpen(false);
+    setShowFriendsPanel(false);
+    setShowNewDm(false);
+    setShowNewGroup(false);
+    setCmdkOpen(false);
+    setShowCreateServer(false);
+    setShowJoinServer(false);
+    setShowCreateChannel(false);
+    setShowCreateInvite(false);
+    setActiveServer("home");
+  });
   // Collapsed category IDs (per-server). Default: all expanded.
   const [collapsedCats, setCollapsedCats] = createSignal<Set<string>>(new Set());
   const toggleCategory = (id: string) => {
@@ -373,7 +407,11 @@ const App: Component = () => {
   });
 
   return (
-    <div style={S.root} onMouseDown={() => appStore.touchActivity()}>
+    <div
+      style={S.root}
+      onPointerDown={() => appStore.touchActivity()}
+      onKeyDown={() => appStore.touchActivity()}
+    >
 
       {/* ── TITLEBAR ── */}
       <div style={S.titlebar} data-tauri-drag-region>
@@ -503,9 +541,13 @@ const App: Component = () => {
                           title="Members"
                           onClick={async () => {
                             if (!memberPanelOpen()) {
+                              const sessionEpoch = captureUiSessionEpoch();
                               await appStore.loadServerMembers(sid()).catch(() => {});
+                              if (!isUiSessionEpochCurrent(sessionEpoch)) return;
                               setMemberPanelOpen(true);
-                              setTimeout(() => setIsland4Vis(true), 50);
+                              setTimeout(() => {
+                                if (isUiSessionEpochCurrent(sessionEpoch)) setIsland4Vis(true);
+                              }, 50);
                             } else {
                               setIsland4Vis(false);
                               setTimeout(() => setMemberPanelOpen(false), 450);
@@ -1112,10 +1154,18 @@ const App: Component = () => {
                           style={{ padding: "4px 10px", "border-radius": "6px", background: memberPanelOpen() ? "rgba(124,107,245,0.15)" : "rgba(255,255,255,0.04)", border: "none", color: memberPanelOpen() ? "#7c6bf5" : "#888", cursor: "pointer", "font-size": "11px", transition: "background 0.15s" }}
                           onClick={async () => {
                             if (!memberPanelOpen()) {
-                              const members = await appStore.getGroupMembers(c().id);
-                              setGroupMembers(members);
-                              setMemberPanelOpen(true);
-                              setTimeout(() => setIsland4Vis(true), 50);
+                              try {
+                                const sessionEpoch = captureUiSessionEpoch();
+                                const members = await appStore.getGroupMembers(c().id);
+                                if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+                                setGroupMembers(members);
+                                setMemberPanelOpen(true);
+                                setTimeout(() => {
+                                  if (isUiSessionEpochCurrent(sessionEpoch)) setIsland4Vis(true);
+                                }, 50);
+                              } catch (e) {
+                                console.warn("group member directory unavailable:", e);
+                              }
                             } else {
                               setIsland4Vis(false);
                               setTimeout(() => setMemberPanelOpen(false), 450);
@@ -1259,6 +1309,9 @@ const App: Component = () => {
                                           >Esc</button>
                                         </div>
                                       </Show>
+                                      <Show when={msg.pending}>
+                                        <div style={{ "font-size": "10px", color: "#777", "margin-top": "2px" }}>Sending…</div>
+                                      </Show>
                                       {/* Reaction pills */}
                                       {(() => {
                                         const msgReactions = () => appStore.reactions()[msg.id] ?? {};
@@ -1317,14 +1370,14 @@ const App: Component = () => {
                                     </For>
                                   </div>
                                   <ContextMenuSeparator />
-                                  <ContextMenuItem onSelect={() => setReplyingTo(msg)}>
+                                  <ContextMenuItem disabled={msg.pending} onSelect={() => setReplyingTo(msg)}>
                                     <ContextMenuIcon>
                                       <Reply size={16} strokeWidth={2} />
                                     </ContextMenuIcon>
                                     Reply
                                   </ContextMenuItem>
                                   <Show when={msg.isOwn}>
-                                    <ContextMenuItem onSelect={() => startEdit(msg)}>
+                                    <ContextMenuItem disabled={msg.pending} onSelect={() => startEdit(msg)}>
                                       <ContextMenuIcon>
                                         <Pencil size={16} strokeWidth={2} />
                                       </ContextMenuIcon>
@@ -1339,7 +1392,7 @@ const App: Component = () => {
                                     Copy text
                                     <ContextMenuShortcut>⌘C</ContextMenuShortcut>
                                   </ContextMenuItem>
-                                  <ContextMenuItem onSelect={() => navigator.clipboard.writeText(msg.id)}>
+                                  <ContextMenuItem disabled={msg.pending} onSelect={() => navigator.clipboard.writeText(msg.id)}>
                                     <ContextMenuIcon>
                                       <Link2 size={16} strokeWidth={2} />
                                     </ContextMenuIcon>
@@ -1347,7 +1400,7 @@ const App: Component = () => {
                                   </ContextMenuItem>
                                   <Show when={msg.isOwn}>
                                     <ContextMenuSeparator />
-                                    <ContextMenuItem variant="danger" onSelect={() => handleDelete(msg)}>
+                                    <ContextMenuItem disabled={msg.pending} variant="danger" onSelect={() => handleDelete(msg)}>
                                       <ContextMenuIcon>
                                         <Trash2 size={16} strokeWidth={2} />
                                       </ContextMenuIcon>

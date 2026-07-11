@@ -1,5 +1,11 @@
 # Veil
 
+> Security boundary: private-key operations and decrypted storage stay in
+> Rust. The recovery mnemonic is present in the WebView only during explicit
+> onboarding or a PIN-reauthenticated recovery reveal; it is never returned by
+> a generic IPC command. Network message paths fail closed when E2EE setup is
+> unavailable.
+
 E2EE мессенджер. Вся крипто — в Rust, UI просто рендерит то что приходит с Rust-стороны. Ключи не пересекают FFI-границу.
 
 Переписал с нуля после того, как EREZ Secret вырос до 22k LOC монолита с криптой на TweetNaCl в JS. Подробнее в [VEIL_DESIGN.md](VEIL_DESIGN.md).
@@ -37,8 +43,14 @@ cd veil-mobile  && pnpm install && npx expo start
 ## Запуск локально
 
 ```bash
+cp .env.example .env
+# Replace VEIL_DB_PASSWORD in .env with: openssl rand -hex 32
 docker compose up -d
 ```
+
+PostgreSQL is reachable only from the internal Compose network. The `migrate`
+service applies every ordered SQL migration before the gateway starts; a
+migration failure prevents an unsafe partial deployment.
 
 Переменные для фаз 3 и 4. Без них соответствующие подсистемы стартуют в disabled-режиме — эндпоинты живые, трафик не пропускается:
 
@@ -62,7 +74,7 @@ docker compose --profile proxy up -d
 
 ## Крипто
 
-XChaCha20-Poly1305 везде. X3DH для установки сессии, Double Ratchet для forward secrecy. Sender Keys для больших групп (>500 участников). Файлы — chunked AEAD, каждый чанк привязан к индексу и флагу final в nonce и AAD, детектирует перестановку/обрезание/замену. Push preview шифруется отдельным `K_push` — HKDF из ratchet root с domain separator. Взлом push = видны превью, не сами сообщения. SQLCipher, `cipher_memory_security = ON`. Seed в OS Keychain. На Linux: `keyring` v3 обязательно с фичами `sync-secret-service` + `crypto-rust`, иначе будет in-memory mock и всё потеряется при перезапуске. Сервер видит только ciphertext + метаданные (размер, тайминг).
+XChaCha20-Poly1305 используется для содержимого. X3DH устанавливает сессию, Double Ratchet даёт forward secrecy в DM; ratchet-header аутентифицирован, но не скрыт от сервера. Группы и каналы используют Sender Keys v5: каждое сообщение дополнительно подписано Ed25519 владельцем ключа, состав привязан к обязательной ротации, а незавершённая раздача блокирует отправку. MLS остаётся отдельным экспериментальным crate и не включён в desktop runtime. Файлы — chunked AEAD с привязкой индекса/final и атомарной публикацией только после полной проверки; текущий one-shot adapter ограничен 64 MiB. Push-транспорт существует, но содержимое push-preview в desktop пока отключено до полного `K_push` workflow. SQLCipher работает с `cipher_memory_security = ON` и `synchronous = FULL`, seed хранится в OS Keychain. Копирование recovery phrase из UI отключено из-за Windows Clipboard History/cloud sync. На Linux `keyring` v3 собирается с `sync-secret-service` + `crypto-rust`. Сервер видит ciphertext и неизбежные метаданные (размер, тайминг, участники/маршрутизация).
 
 ## Где что сделано
 

@@ -3,7 +3,6 @@
 package httpmw
 
 import (
-	"net"
 	"net/http"
 	"strings"
 )
@@ -79,21 +78,4 @@ func Chain(mw ...func(http.Handler) http.Handler) func(http.Handler) http.Handle
 		}
 		return h
 	}
-}
-
-// clientIP extracts the originating client IP, honouring X-Forwarded-For
-// when present (trusts only the first hop). Mirrors authmw's helper but
-// kept package-local to avoid an import cycle.
-func clientIP(r *http.Request) string {
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		if comma := strings.IndexByte(xff, ','); comma >= 0 {
-			return strings.TrimSpace(xff[:comma])
-		}
-		return strings.TrimSpace(xff)
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }

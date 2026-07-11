@@ -30,7 +30,7 @@ export const LockScreen: Component = () => {
   const [entering, setEntering] = createSignal(true);
   let submitting = false;
 
-  const MAX_PIN = 6;
+  const MAX_PIN = 12;
 
   onMount(() => {
     const drops: RainDrop[] = Array.from({ length: 40 }, (_, i) => ({

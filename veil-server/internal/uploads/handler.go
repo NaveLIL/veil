@@ -58,6 +58,8 @@ func New(cfg Config, tokenKey []byte, store Store, logger *slog.Logger) (*Servic
 		BasePath:                cfg.BasePath,
 		StoreComposer:           composer,
 		MaxSize:                 cfg.MaxUploadSize,
+		DisableDownload:         true,
+		DisableConcatenation:    true,
 		PreUploadCreateCallback: h.PreCreate,
 		PreFinishResponseCallback: func(e tusd.HookEvent) (tusd.HTTPResponse, error) {
 			return h.PreFinish(e)
@@ -93,11 +95,11 @@ func (s *Service) Enabled() bool { return len(s.tokenKey) >= MinTokenKeyLen }
 // Ed25519 sigs.
 func (s *Service) RegisterRoutes(mux *http.ServeMux, signedMw *authmw.Middleware, rl *authmw.RateLimit) {
 	signed := func(f http.HandlerFunc) http.HandlerFunc {
-		if signedMw != nil {
-			f = signedMw.RequireSigned(f)
-		}
 		if rl != nil {
 			f = rl.Wrap(f)
+		}
+		if signedMw != nil {
+			f = signedMw.RequireSigned(f)
 		}
 		return f
 	}
@@ -192,6 +194,26 @@ func (s *Service) bearerMiddleware(next http.Handler) http.HandlerFunc {
 				map[string]string{"error": err.Error()})
 			return
 		}
+		if requiresTusOwnerCheck(r.Method) {
+			fileID, ok := tusFileIDFromPath(s.cfg.BasePath, r.URL.Path)
+			if !ok {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid upload path"})
+				return
+			}
+			row, lookupErr := s.store.GetTusUpload(r.Context(), fileID)
+			if lookupErr != nil || row == nil {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "upload not found"})
+				return
+			}
+			if !row.ExpiresAt.After(time.Now()) {
+				writeJSON(w, http.StatusNotFound, map[string]string{"error": "upload not found"})
+				return
+			}
+			if row.UserID != userID {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+				return
+			}
+		}
 		r.Header.Set(headerVeilUser, userID)
 		next.ServeHTTP(w, r)
 	}
@@ -208,15 +230,27 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
 		return
 	}
+	if !row.ExpiresAt.After(time.Now()) {
+		// Treat expired blobs as absent even before the sweeper removes them.
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
 	if row.FinishedAt == nil {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "upload incomplete"})
 		return
 	}
-	// v1 authorisation: only the uploader may fetch the blob. Phase 6
-	// will swap this for "any participant of the conversation the file
-	// was attached to" — for now we keep it simple and avoid leaking
-	// blobs by lookup of a guessed fileID.
-	if row.UserID != r.Header.Get(headerVeilUser) {
+	// The uploader and current participants of a live message conversation
+	// may fetch the opaque ciphertext. Channel permissions are re-evaluated
+	// on every request.
+	allowed, err := s.store.CanDownloadTusUpload(
+		r.Context(), fileID, r.Header.Get(headerVeilUser),
+	)
+	if err != nil {
+		s.logger.Warn("uploads: download authorization failed", "id", fileID, "err", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "authorization failed"})
+		return
+	}
+	if !allowed {
 		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
 		return
 	}
@@ -230,6 +264,21 @@ func (s *Service) handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Cache-Control", "private, no-store")
 	http.ServeContent(w, r, fileID, row.CreatedAt, f)
+}
+
+func requiresTusOwnerCheck(method string) bool {
+	return method == http.MethodHead || method == http.MethodPatch || method == http.MethodDelete
+}
+
+func tusFileIDFromPath(basePath, requestPath string) (string, bool) {
+	if !strings.HasSuffix(basePath, "/") || !strings.HasPrefix(requestPath, basePath) {
+		return "", false
+	}
+	fileID := strings.TrimPrefix(requestPath, basePath)
+	if strings.Contains(fileID, "/") || !looksLikeFileID(fileID) {
+		return "", false
+	}
+	return fileID, true
 }
 
 // Sweeper is the long-running goroutine that drops expired uploads.

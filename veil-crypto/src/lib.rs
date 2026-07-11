@@ -30,5 +30,7 @@ pub mod x3dh;
 
 pub use keys::{IdentityKeyPair, KeyBundle};
 pub use ratchet::RatchetSession;
-pub use sender_key::{SenderKeyDistribution, SenderKeyStore};
+pub use sender_key::{
+    AuthenticatedSkdm, SenderKeyDistribution, SenderKeyStore, UnverifiedSkdmMetadata,
+};
 pub use x3dh::{PreKeyBundle, X3DHResult};

@@ -8,10 +8,10 @@ license = "MIT"
 
 [dependencies]
 # Key exchange
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 
 # Signatures
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 
 # AEAD (message encryption)
 chacha20poly1305 = "0.10"
@@ -23,7 +23,7 @@ hmac = "0.12"
 argon2 = "0.5"
 
 # BIP39 mnemonic
-bip39 = "2"
+bip39 = { version = "2", features = ["zeroize"] }
 
 # Random number generation
 rand = "0.8"

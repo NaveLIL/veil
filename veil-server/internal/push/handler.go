@@ -2,8 +2,10 @@ package push
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
+	"unicode/utf8"
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
@@ -12,25 +14,33 @@ import (
 // Handler exposes the REST surface for managing push subscriptions.
 // All routes require a signed request (the existing X-Veil triplet).
 type Handler struct {
-	db *db.DB
-	mw *authmw.Middleware
-	rl *authmw.RateLimit
+	db     *db.DB
+	mw     *authmw.Middleware
+	rl     *authmw.RateLimit
+	policy *EndpointPolicy
 }
 
 // NewHandler builds the handler. mw and rl may be nil to disable
 // signature checks / rate limiting (used in tests).
 func NewHandler(database *db.DB, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
-	return &Handler{db: database, mw: mw, rl: rl}
+	return NewHandlerWithEndpointPolicy(database, mw, rl, defaultEndpointPolicy())
+}
+
+func NewHandlerWithEndpointPolicy(database *db.DB, mw *authmw.Middleware, rl *authmw.RateLimit, policy *EndpointPolicy) *Handler {
+	if policy == nil {
+		policy = defaultEndpointPolicy()
+	}
+	return &Handler{db: database, mw: mw, rl: rl, policy: policy}
 }
 
 // RegisterRoutes mounts the handler onto a mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	signed := func(f http.HandlerFunc) http.HandlerFunc {
-		if h.mw != nil {
-			f = h.mw.RequireSigned(f)
-		}
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
+		}
+		if h.mw != nil {
+			f = h.mw.RequireSigned(f)
 		}
 		return f
 	}
@@ -65,26 +75,45 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
-	if req.Endpoint == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "endpoint required"})
+	if err := validateSubscriptionRequest(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if len(req.Endpoint) > 2048 {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "endpoint too long"})
+	endpoint, err := h.policy.ValidateEndpoint(r.Context(), req.Endpoint)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid or unsafe endpoint"})
 		return
 	}
-	if len(req.DeviceLabel) > 128 {
-		req.DeviceLabel = req.DeviceLabel[:128]
-	}
-	if req.Kind == "" {
-		req.Kind = "unifiedpush"
-	}
+	req.Endpoint = endpoint.String()
 	id, err := h.db.CreatePushSubscription(r.Context(), userID, req.Endpoint, req.DeviceLabel, req.Kind)
 	if err != nil {
+		if errors.Is(err, db.ErrPushSubscriptionLimit) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "push subscription limit reached"})
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "create failed"})
 		return
 	}
 	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+}
+
+func validateSubscriptionRequest(req *createReq) error {
+	if req == nil || req.Endpoint == "" {
+		return errors.New("endpoint required")
+	}
+	if len(req.Endpoint) > 2048 {
+		return errors.New("endpoint too long")
+	}
+	if !utf8.ValidString(req.DeviceLabel) || len(req.DeviceLabel) > 128 {
+		return errors.New("device_label must be valid UTF-8 up to 128 bytes")
+	}
+	if req.Kind == "" {
+		req.Kind = "unifiedpush"
+	}
+	if req.Kind != "unifiedpush" {
+		return errors.New("unsupported push kind")
+	}
+	return nil
 }
 
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {

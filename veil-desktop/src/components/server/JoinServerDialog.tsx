@@ -1,6 +1,6 @@
-import { Component, createSignal, Show } from "solid-js";
+import { Component, createEffect, createSignal, Show } from "solid-js";
 import { Compass, ArrowRight, Loader2, Users } from "lucide-solid";
-import { appStore } from "@/stores/app";
+import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
 import { IslandDialog, dlgStyles as ds } from "@/components/ui/IslandDialog";
 
 interface Props {
@@ -34,30 +34,47 @@ export const JoinServerDialog: Component<Props> = (props) => {
   const reset = () => { setCode(""); setPreview(null); setError(""); };
   const close = () => { if (joining() || previewing()) return; reset(); props.onClose(); };
 
+  createEffect(() => {
+    if (!props.open) {
+      reset();
+      setPreviewing(false);
+      setJoining(false);
+    }
+  });
+
   const handlePreview = async () => {
     const c = extractCode(code());
     if (!c) return;
+    const sessionEpoch = captureUiSessionEpoch();
     setPreviewing(true); setError(""); setPreview(null);
     try {
       const data = (await appStore.previewInvite(c)) as InvitePreview;
-      setPreview(data);
-    } catch (e) { setError(String(e)); }
-    finally { setPreviewing(false); }
+      if (isUiSessionEpochCurrent(sessionEpoch)) setPreview(data);
+    } catch (e) {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setError(String(e));
+    } finally {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setPreviewing(false);
+    }
   };
 
   const handleJoin = async () => {
     const c = extractCode(code());
     if (!c) return;
+    const sessionEpoch = captureUiSessionEpoch();
     setJoining(true); setError("");
     try {
       const joined = await appStore.useInvite(c);
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       if (joined) {
         appStore.selectServer(joined.id);
         reset();
         props.onClose();
       } else setError("Failed to join server");
-    } catch (e) { setError(String(e)); }
-    finally { setJoining(false); }
+    } catch (e) {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setError(String(e));
+    } finally {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setJoining(false);
+    }
   };
 
   const onKey = (e: KeyboardEvent) => {
