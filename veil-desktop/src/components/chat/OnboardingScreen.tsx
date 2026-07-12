@@ -1,9 +1,10 @@
 import { Component, createSignal, Show, For, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { appStore } from "@/stores/app";
-import { AlertTriangle, Eye, EyeOff } from "lucide-solid";
+import { AlertTriangle, ArrowRightLeft, Eye, EyeOff, LogIn } from "lucide-solid";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { Z } from "@/lib/zIndex";
+import { promptDecision } from "@/lib/decisionDialog";
 
 /* ═══════════════════════════════════════════════════════
    ONBOARDING — Hebrew rain + bottom island + transitions
@@ -42,6 +43,7 @@ export const OnboardingScreen: Component = () => {
   const [showPhrase, setShowPhrase] = createSignal(true);
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [existingIdentity, setExistingIdentity] = createSignal(false);
   const [taglineIdx, setTaglineIdx] = createSignal(0);
   const [taglineFade, setTaglineFade] = createSignal(true);
   const [rainDrops, setRainDrops] = createSignal<RainDrop[]>([]);
@@ -61,6 +63,14 @@ export const OnboardingScreen: Component = () => {
       opacity: 0.03 + Math.random() * 0.08,
     }));
     setRainDrops(drops);
+  });
+
+  onMount(async () => {
+    try {
+      setExistingIdentity(await invoke<boolean>("has_stored_identity"));
+    } catch {
+      setExistingIdentity(false);
+    }
   });
 
   let taglineTimer: ReturnType<typeof setInterval>;
@@ -132,7 +142,13 @@ export const OnboardingScreen: Component = () => {
       await appStore.connectToServer();
       appStore.setScreen("disclaimer");
     } catch (e) {
-      setError(String(e));
+      const detail = String(e);
+      if (detail.includes("a different identity already exists")) {
+        setExistingIdentity(true);
+        setError("This device already has a Veil identity. Continue with it or switch accounts before creating another one.");
+      } else {
+        setError(detail);
+      }
     } finally {
       // Publication can fail while offline after the identity is already
       // durable. Do not keep another UI copy of the phrase in that case.
@@ -140,6 +156,52 @@ export const OnboardingScreen: Component = () => {
         setMnemonic("");
         setRestoreInput("");
       }
+      setLoading(false);
+    }
+  };
+
+  const continueWithExistingIdentity = async () => {
+    if (loading()) return;
+    setLoading(true);
+    setError("");
+    try {
+      if (await appStore.hasPin()) {
+        appStore.setScreen("locked");
+        return;
+      }
+      const key = await invoke<string>("init_from_seed");
+      appStore.setIdentity(key);
+      appStore.setScreen("chat");
+      await appStore.loadConversations();
+      await appStore.connectToServer().catch((e) => console.warn("secure connect failed:", e));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const switchAccount = async () => {
+    if (loading()) return;
+    const confirmation = await promptDecision({
+      title: "Switch account",
+      message: "The current identity will be signed out from this device. Its server account is not deleted and its encrypted local vault remains recoverable with the recovery phrase. Type SWITCH ACCOUNT to continue.",
+      confirmLabel: "Switch account",
+      cancelLabel: "Cancel",
+      danger: true,
+      placeholder: "SWITCH ACCOUNT",
+      requiredValue: "SWITCH ACCOUNT",
+    });
+    if (confirmation !== "SWITCH ACCOUNT") return;
+    setLoading(true);
+    setError("");
+    try {
+      await appStore.signOut();
+      setExistingIdentity(false);
+      setStep("welcome");
+    } catch (e) {
+      setError(String(e));
+    } finally {
       setLoading(false);
     }
   };
@@ -330,6 +392,44 @@ export const OnboardingScreen: Component = () => {
       </Show>
 
       {/* ═══ WELCOME — horizontal island at bottom ═══ */}
+      <Show when={step() === "welcome" && existingIdentity()}>
+        <div style={{
+          position: "relative", "z-index": "2", width: "calc(100% - 48px)", "max-width": "620px",
+          background: "color-mix(in srgb, var(--veil-window) 94%, transparent)", "backdrop-filter": "blur(22px)",
+          border: "1px solid color-mix(in srgb, var(--veil-warning) 24%, var(--veil-contrast-06))",
+          "border-radius": "16px", padding: "18px 20px", "margin-bottom": "14px",
+          "box-shadow": "0 8px 32px var(--veil-shadow)", transition: "opacity 0.35s ease, transform 0.35s ease",
+        }}>
+          <div style={{ display: "flex", "align-items": "flex-start", gap: "12px" }}>
+            <div style={{
+              width: "34px", height: "34px", "flex-shrink": "0", "border-radius": "10px",
+              display: "flex", "align-items": "center", "justify-content": "center",
+              background: "color-mix(in srgb, var(--veil-accent) 14%, transparent)", color: "var(--veil-accent)",
+            }}><LogIn size={17} strokeWidth={1.8} /></div>
+            <div style={{ flex: "1", "min-width": "0" }}>
+              <div style={{ "font-size": "13px", "font-weight": "650", color: "var(--veil-contrast-85)", "margin-bottom": "4px" }}>
+                An identity is already on this device
+              </div>
+              <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "line-height": "1.55" }}>
+                Continue with the existing vault, or switch accounts first. Veil will never replace an encrypted identity database implicitly.
+              </div>
+              <div style={{ display: "flex", gap: "8px", "margin-top": "14px", "flex-wrap": "wrap" }}>
+                <button
+                  style={{ ...S.btnPrimary, height: "36px", padding: "0 14px", "font-size": "12px" }}
+                  disabled={loading()}
+                  onClick={() => void continueWithExistingIdentity()}
+                ><LogIn size={14} strokeWidth={1.9} /> Continue with existing identity</button>
+                <button
+                  style={{ ...S.btnSecondary, height: "36px", padding: "0 14px", "font-size": "12px" }}
+                  disabled={loading()}
+                  onClick={() => void switchAccount()}
+                ><ArrowRightLeft size={14} strokeWidth={1.9} /> Switch account</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Show>
+
       <Show when={step() === "welcome"}>
         <div style={{ ...S.welcomeIsland, ...animStyle() }}>
           <div style={S.logo}>
@@ -376,7 +476,7 @@ export const OnboardingScreen: Component = () => {
             <button
               style={S.btnPrimary}
               onClick={generateMnemonic}
-              disabled={loading()}
+              disabled={loading() || existingIdentity()}
               onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(var(--veil-accent-rgb),0.35)"; }}
               onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(var(--veil-accent-rgb),0.25)"; }}
             >
@@ -388,6 +488,7 @@ export const OnboardingScreen: Component = () => {
             <button
               style={S.btnSecondary}
               onClick={() => transitionTo("restore")}
+              disabled={loading() || existingIdentity()}
               onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-07)"; e.currentTarget.style.color = "var(--veil-contrast-80)"; }}
               onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
             >
