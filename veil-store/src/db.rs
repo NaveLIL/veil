@@ -1,4 +1,7 @@
-use crate::models::{AccountSnapshot, AccountSnapshotSource, Message, ProfileLocator};
+use crate::models::{
+    AccountSnapshot, AccountSnapshotSource, LocalIdentityVerification, Message, NetworkProfile,
+    ProfileLocator,
+};
 use rusqlite::{Connection, OptionalExtension, Row};
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
@@ -46,6 +49,8 @@ const MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER: usize = 128;
 const MAX_CANONICAL_SERVER_ORIGIN_BYTES: usize = 512;
 const MAX_PROFILE_ORIGIN_BYTES: usize = 512;
 const MAX_ACCOUNT_PRESENTATION_BYTES: usize = 256;
+const MAX_NETWORK_PROFILE_DISPLAY_BYTES: usize = 512;
+const MAX_NETWORK_PROFILE_ABOUT_BYTES: usize = 2048;
 const MAX_OBSERVED_AT_BYTES: usize = 64;
 
 struct RawAccountSnapshot {
@@ -231,6 +236,78 @@ fn validate_profile_locator(locator: &ProfileLocator) -> Result<(), String> {
         return Err("profile locator identity key must not be all zero".to_string());
     }
     Ok(())
+}
+
+fn is_directional_control(value: char) -> bool {
+    matches!(
+        value,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'
+            | '\u{202b}'
+            | '\u{202c}'
+            | '\u{202d}'
+            | '\u{202e}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+            | '\u{206a}'
+            | '\u{206b}'
+            | '\u{206c}'
+            | '\u{206d}'
+            | '\u{206e}'
+            | '\u{206f}'
+    )
+}
+
+fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
+    validate_profile_locator(&profile.locator)?;
+    validate_bounded_text(
+        "network profile username",
+        &profile.username,
+        MAX_ACCOUNT_PRESENTATION_BYTES,
+        false,
+    )?;
+    if let Some(display_name) = profile.display_name.as_deref() {
+        validate_bounded_text(
+            "network profile display name",
+            display_name,
+            MAX_NETWORK_PROFILE_DISPLAY_BYTES,
+            false,
+        )?;
+    }
+    if profile.about.len() > MAX_NETWORK_PROFILE_ABOUT_BYTES {
+        return Err("network profile presentation text is oversized".to_string());
+    }
+    for value in std::iter::once(&profile.username)
+        .chain(profile.display_name.iter())
+        .chain(std::iter::once(&profile.about))
+    {
+        if value.chars().any(is_directional_control) {
+            return Err("network profile contains directional controls".to_string());
+        }
+    }
+    if profile
+        .about
+        .chars()
+        .any(|character| character != '\n' && character.is_control())
+    {
+        return Err("network profile about contains control characters".to_string());
+    }
+    validate_bounded_text(
+        "network profile update timestamp",
+        &profile.profile_updated_at,
+        MAX_OBSERVED_AT_BYTES,
+        false,
+    )?;
+    validate_bounded_text(
+        "network profile observation timestamp",
+        &profile.observed_at,
+        MAX_OBSERVED_AT_BYTES,
+        false,
+    )
 }
 
 fn validate_account_snapshot(snapshot: &AccountSnapshot) -> Result<(), String> {
@@ -947,6 +1024,44 @@ impl VeilDb {
             -- guessing which development row to retain.
             CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_directory_v1_origin_signing
                 ON identity_directory_v1(canonical_server_origin, signing_key);
+
+            -- Signed network profile cache. It is presentation-only and may
+            -- exist only for an exact account already pinned in the directory.
+            CREATE TABLE IF NOT EXISTS network_profiles_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                identity_key BLOB NOT NULL CHECK(length(identity_key) = 32),
+                username TEXT NOT NULL
+                    CHECK(length(CAST(username AS BLOB)) BETWEEN 1 AND 256),
+                display_name TEXT
+                    CHECK(display_name IS NULL OR
+                          length(CAST(display_name AS BLOB)) BETWEEN 1 AND 512),
+                about TEXT NOT NULL
+                    CHECK(length(CAST(about AS BLOB)) <= 2048),
+                profile_version BLOB NOT NULL CHECK(length(profile_version) = 8),
+                profile_updated_at TEXT NOT NULL
+                    CHECK(length(profile_updated_at) BETWEEN 1 AND 64),
+                observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
+                PRIMARY KEY (canonical_server_origin, user_id, identity_key),
+                FOREIGN KEY (canonical_server_origin, user_id, identity_key)
+                    REFERENCES identity_directory_v1
+                        (canonical_server_origin, user_id, identity_key)
+                    ON DELETE CASCADE
+            );
+
+            -- Explicit physical/out-of-band comparison made on this device.
+            -- No foreign key is intentional: the verified old key must remain
+            -- available to diagnose a later identity change.
+            CREATE TABLE IF NOT EXISTS local_identity_verifications_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                verified_identity_key BLOB NOT NULL
+                    CHECK(length(verified_identity_key) = 32),
+                verified_at TEXT NOT NULL CHECK(length(verified_at) BETWEEN 1 AND 64),
+                PRIMARY KEY (canonical_server_origin, user_id)
+            );
 
             -- Durable binding between this SQLCipher identity and the account
             -- assigned by each authenticated server origin. The first
@@ -1832,6 +1947,209 @@ impl VeilDb {
     ) -> Result<Option<AccountSnapshot>, String> {
         validate_profile_locator(locator)?;
         load_exact_account(&self.conn, locator)
+    }
+
+    /// Store one signed network profile against an exact pinned account.
+    /// Rollback and equal-version equivocation fail closed.
+    pub fn upsert_network_profile(&self, profile: &NetworkProfile) -> Result<(), String> {
+        validate_network_profile(profile)?;
+        run_savepoint(&self.conn, "veil_network_profile_upsert", || {
+            if load_exact_account(&self.conn, &profile.locator)?.is_none() {
+                return Err("network profile has no exact pinned account directory entry".into());
+            }
+            let existing = self
+                .conn
+                .query_row(
+                    "SELECT username, display_name, about, profile_version,
+                            profile_updated_at
+                     FROM network_profiles_v1
+                     WHERE canonical_server_origin = ?1 AND user_id = ?2
+                       AND identity_key = ?3",
+                    rusqlite::params![
+                        profile.locator.canonical_server_origin,
+                        profile.locator.user_id,
+                        profile.locator.identity_key.as_slice(),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Vec<u8>>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| format!("load existing network profile: {error}"))?;
+            if let Some((username, display_name, about, version, updated_at)) = existing {
+                let version =
+                    fixed_bytes::<8>("network profile version", version).map(u64::from_be_bytes)?;
+                if profile.profile_version < version {
+                    return Err("network profile version rollback rejected".into());
+                }
+                if profile.profile_version == version
+                    && (profile.username != username
+                        || profile.display_name != display_name
+                        || profile.about != about
+                        || profile.profile_updated_at != updated_at)
+                {
+                    return Err("network profile changed without a version advance".into());
+                }
+            }
+
+            let version = profile.profile_version.to_be_bytes();
+            self.conn
+                .execute(
+                    "INSERT INTO network_profiles_v1
+                        (canonical_server_origin, user_id, identity_key,
+                         username, display_name, about, profile_version,
+                         profile_updated_at, observed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     ON CONFLICT(canonical_server_origin, user_id, identity_key)
+                     DO UPDATE SET username = excluded.username,
+                         display_name = excluded.display_name,
+                         about = excluded.about,
+                         profile_version = excluded.profile_version,
+                         profile_updated_at = excluded.profile_updated_at,
+                         observed_at = excluded.observed_at",
+                    rusqlite::params![
+                        profile.locator.canonical_server_origin,
+                        profile.locator.user_id,
+                        profile.locator.identity_key.as_slice(),
+                        profile.username,
+                        profile.display_name,
+                        profile.about,
+                        version.as_slice(),
+                        profile.profile_updated_at,
+                        profile.observed_at,
+                    ],
+                )
+                .map_err(|error| format!("upsert network profile: {error}"))?;
+            Ok(())
+        })
+    }
+
+    /// Load one exact origin/user/key-bound signed profile cache row.
+    pub fn load_network_profile(
+        &self,
+        locator: &ProfileLocator,
+    ) -> Result<Option<NetworkProfile>, String> {
+        validate_profile_locator(locator)?;
+        self.conn
+            .query_row(
+                "SELECT username, display_name, about, profile_version,
+                        profile_updated_at, observed_at
+                 FROM network_profiles_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2
+                   AND identity_key = ?3",
+                rusqlite::params![
+                    locator.canonical_server_origin,
+                    locator.user_id,
+                    locator.identity_key.as_slice(),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load network profile: {error}"))?
+            .map(
+                |(username, display_name, about, version, profile_updated_at, observed_at)| {
+                    let profile = NetworkProfile {
+                        locator: locator.clone(),
+                        username,
+                        display_name,
+                        about,
+                        profile_version: fixed_bytes::<8>("network profile version", version)
+                            .map(u64::from_be_bytes)?,
+                        profile_updated_at,
+                        observed_at,
+                    };
+                    validate_network_profile(&profile)?;
+                    Ok(profile)
+                },
+            )
+            .transpose()
+    }
+
+    /// Record an explicit comparison of one exact identity on this device.
+    pub fn mark_identity_verified(
+        &self,
+        locator: &ProfileLocator,
+        verified_at: &str,
+    ) -> Result<(), String> {
+        validate_profile_locator(locator)?;
+        validate_bounded_text(
+            "identity verification timestamp",
+            verified_at,
+            MAX_OBSERVED_AT_BYTES,
+            false,
+        )?;
+        if load_exact_account(&self.conn, locator)?.is_none() {
+            return Err("cannot verify an identity absent from the pinned directory".into());
+        }
+        if load_authenticated_self_binding(&self.conn, &locator.canonical_server_origin)?
+            .is_some_and(|binding| {
+                binding.user_id == locator.user_id && binding.identity_key == locator.identity_key
+            })
+        {
+            return Err("the current account cannot verify itself".into());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO local_identity_verifications_v1
+                    (canonical_server_origin, user_id, verified_identity_key, verified_at)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(canonical_server_origin, user_id)
+                 DO UPDATE SET verified_identity_key = excluded.verified_identity_key,
+                               verified_at = excluded.verified_at",
+                rusqlite::params![
+                    locator.canonical_server_origin,
+                    locator.user_id,
+                    locator.identity_key.as_slice(),
+                    verified_at,
+                ],
+            )
+            .map_err(|error| format!("store local identity verification: {error}"))?;
+        Ok(())
+    }
+
+    /// Compare the currently observed locator to this device's explicit pin.
+    pub fn local_identity_verification(
+        &self,
+        locator: &ProfileLocator,
+    ) -> Result<LocalIdentityVerification, String> {
+        validate_profile_locator(locator)?;
+        let verified_key = self
+            .conn
+            .query_row(
+                "SELECT verified_identity_key
+                 FROM local_identity_verifications_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2",
+                rusqlite::params![locator.canonical_server_origin, locator.user_id],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(|error| format!("load local identity verification: {error}"))?;
+        match verified_key {
+            None => Ok(LocalIdentityVerification::NotCompared),
+            Some(value) => {
+                let value = fixed_bytes::<32>("verified identity key", value)?;
+                if value == locator.identity_key {
+                    Ok(LocalIdentityVerification::VerifiedOnThisDevice)
+                } else {
+                    Ok(LocalIdentityVerification::IdentityChanged)
+                }
+            }
+        }
     }
 
     /// Resolve a message sender within the authoritative origin already bound
@@ -5209,6 +5527,18 @@ mod tests {
         }
     }
 
+    fn sample_network_profile(account: &AccountSnapshot, version: u64) -> NetworkProfile {
+        NetworkProfile {
+            locator: account.locator.clone(),
+            username: account.username.clone().unwrap(),
+            display_name: account.display_name.clone(),
+            about: "A signed origin-scoped profile.".to_string(),
+            profile_version: version,
+            profile_updated_at: "2026-07-13T02:00:00Z".to_string(),
+            observed_at: "2026-07-13T02:00:01Z".to_string(),
+        }
+    }
+
     fn sample_device_identity(device_id: [u8; 16]) -> LocalDeviceIdentityV1 {
         LocalDeviceIdentityV1 {
             device_id,
@@ -7069,6 +7399,157 @@ mod tests {
                 .unwrap()
                 .unwrap(),
             version_three
+        );
+    }
+
+    #[test]
+    fn network_profile_requires_an_exact_directory_and_is_origin_scoped() {
+        let db = VeilDb::open_memory(&[0xC1; 32]).unwrap();
+        let alpha = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x51,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(1),
+        );
+        let beta = sample_account(
+            ORIGIN_B,
+            USER_A,
+            0x52,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(1),
+        );
+        let alpha_profile = sample_network_profile(&alpha, 1);
+        assert!(db.upsert_network_profile(&alpha_profile).is_err());
+
+        db.upsert_identity_directory(&[alpha.clone(), beta.clone()])
+            .unwrap();
+        let mut beta_profile = sample_network_profile(&beta, 1);
+        beta_profile.display_name = Some("Beta account".to_string());
+        db.upsert_network_profile(&alpha_profile).unwrap();
+        db.upsert_network_profile(&beta_profile).unwrap();
+
+        assert_eq!(
+            db.load_network_profile(&alpha.locator).unwrap(),
+            Some(alpha_profile)
+        );
+        assert_eq!(
+            db.load_network_profile(&beta.locator).unwrap(),
+            Some(beta_profile)
+        );
+    }
+
+    #[test]
+    fn network_profile_rejects_rollback_equivocation_and_unsafe_text() {
+        let db = VeilDb::open_memory(&[0xC2; 32]).unwrap();
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x53,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(3),
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&account))
+            .unwrap();
+        let mut current = sample_network_profile(&account, 3);
+        current.about = "first line\nsecond line".to_string();
+        db.upsert_network_profile(&current).unwrap();
+
+        let mut rollback = current.clone();
+        rollback.profile_version = 2;
+        assert!(db.upsert_network_profile(&rollback).is_err());
+
+        let mut equivocation = current.clone();
+        equivocation.about = "changed at the same revision".to_string();
+        assert!(db.upsert_network_profile(&equivocation).is_err());
+
+        let mut bidi = current.clone();
+        bidi.profile_version = 4;
+        bidi.about = "safe\u{202e}evil".to_string();
+        assert!(db.upsert_network_profile(&bidi).is_err());
+        assert_eq!(
+            db.load_network_profile(&account.locator).unwrap(),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn local_verification_is_device_local_and_detects_identity_change_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-local-identity-verification-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xC3; 32];
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x54,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.upsert_identity_directory(std::slice::from_ref(&account))
+                .unwrap();
+            assert_eq!(
+                db.local_identity_verification(&account.locator).unwrap(),
+                LocalIdentityVerification::NotCompared
+            );
+            db.mark_identity_verified(&account.locator, "2026-07-13T02:10:00Z")
+                .unwrap();
+        }
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                db.local_identity_verification(&account.locator).unwrap(),
+                LocalIdentityVerification::VerifiedOnThisDevice
+            );
+            let mut changed = account.locator.clone();
+            changed.identity_key = [0x55; 32];
+            assert_eq!(
+                db.local_identity_verification(&changed).unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+            let other_origin = ProfileLocator {
+                canonical_server_origin: ORIGIN_B.to_string(),
+                ..changed
+            };
+            assert_eq!(
+                db.local_identity_verification(&other_origin).unwrap(),
+                LocalIdentityVerification::NotCompared
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn local_verification_rejects_the_authenticated_self_identity() {
+        let db = VeilDb::open_memory(&[0xC4; 32]).unwrap();
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x56,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &account.locator.identity_key,
+            &account.signing_key,
+        )
+        .unwrap();
+        db.upsert_identity_directory(std::slice::from_ref(&account))
+            .unwrap();
+        assert!(db
+            .mark_identity_verified(&account.locator, "2026-07-13T02:20:00Z")
+            .is_err());
+        assert_eq!(
+            db.local_identity_verification(&account.locator).unwrap(),
+            LocalIdentityVerification::NotCompared
         );
     }
 

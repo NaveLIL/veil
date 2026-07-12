@@ -695,6 +695,15 @@ ciphertext, имеет message ACL и retention, поэтому сервер н�
 
 ### Local identity proof
 
+**Durable client checkpoint 2026-07-13:** SQLCipher теперь имеет отдельный
+`network_profiles_v1`, который принимает versioned profile только для уже
+закреплённого exact `(origin, user_id, identity_key)` и отклоняет rollback/
+equal-version equivocation. `local_identity_verifications_v1` хранит явное
+физическое сравнение отдельно от profile metadata, переживает restart и
+возвращает `Identity changed` при другом наблюдаемом ключе; self-verification
+запрещена самим storage layer. Native REST/event commands, renderer editor и
+интерактивный proof flow ещё не подключены, поэтому deliverable не закрыт.
+
 - Native API возвращает стабильный fingerprint в hex + визуальном/emoji формате.
 - SQLCipher хранит verification по server origin, account и наблюдаемой identity,
   а не только по mutable имени.

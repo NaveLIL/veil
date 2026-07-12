@@ -65,6 +65,29 @@ pub struct AccountSnapshot {
     pub observed_at: String,
 }
 
+/// Versioned presentation metadata fetched through the signed profile API.
+///
+/// This record is origin-scoped and bound to an already pinned account
+/// locator. It is never an input to identity trust, ACLs or key rotation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NetworkProfile {
+    pub locator: ProfileLocator,
+    pub username: String,
+    pub display_name: Option<String>,
+    pub about: String,
+    pub profile_version: u64,
+    pub profile_updated_at: String,
+    pub observed_at: String,
+}
+
+/// Local-only comparison state for one exact origin-scoped account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LocalIdentityVerification {
+    NotCompared,
+    VerifiedOnThisDevice,
+    IdentityChanged,
+}
+
 /// Message delivery status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
