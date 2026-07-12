@@ -885,6 +885,14 @@ Migration plan:
 
 ## Phase 7 — LiveKit звонки
 
+**Текущее состояние:** протокольный фундамент заложен, но runtime звонков не
+начат. `veil-proto/veil/v1/voice.proto` определяет запрос/ответ voice token,
+`veil-client/build.rs` уже компилирует этот контракт, channel type `voice` и
+push kind `KindCall` зарезервированы. Это не означает готовый signaling или
+media path: `veil-voice`, LiveKit/coturn deployment, выдача токенов, WebRTC
+permissions/lifecycle и E2EE media ещё отсутствуют и обязаны пройти отдельный
+ADR/threat-model gate до включения микрофона или камеры.
+
 1:1 + групповые войс-румы. E2EE через LiveKit insertable streams, ключи деривируются из MLS exporter secret (или sender-key chain) с меткой `"livekit-call-v1"`.
 
 SFU видит только encrypted RTP. Ротация ключей при kick — нужно успеть до следующего фрейма, иначе отрезанный участник всё ещё слышит. Цель — < 1 RTT.
@@ -914,6 +922,68 @@ Visual regression, updater, полный signed matrix и public beta ещё н�
   без содержимого сообщений, ключей и стабильных user identifiers
 - Release gate: desktop/mobile E2E, process-death/offline tests, restore drill,
   secret scan, dependency review и проверка отсутствия mock crypto
+
+### Публичный сайт, документация и загрузки
+
+Публичный продуктовый сайт и documentation/download surface являются
+обязательным launch deliverable до public beta, а не необязательным маркетингом:
+
+- отдельный статический product site знакомит с Veil, его native-only моделью,
+  возможностями, ограничениями, E2EE/TOFU и self-hosting без преувеличений;
+- versioned documentation содержит onboarding, account recovery, identity
+  verification, server administration, threat model, privacy/disclosure policy
+  и инструкции self-hosting/backup/upgrade;
+- download surface публикует только подписанные desktop/mobile артефакты,
+  release notes, SHA-256, signing-key information и reproducibility evidence;
+- сайт не содержит аккаунты, сообщения, recovery flow, JS-криптографию или
+  authenticated gateway session; assets/fonts self-hosted, third-party scripts
+  и tracking отсутствуют, CSP и immutable versioned assets обязательны;
+- существующая встроенная gateway landing/download page остаётся локальной
+  страницей конкретного self-hosted instance и не подменяет канонический сайт
+  продукта;
+- браузерного клиента Veil не будет. Единственное узкое web-исключение — уже
+  отделённый one-time Share Viewer с собственным ограниченным threat model; он
+  никогда не становится web messenger и не получает account identity/session.
+
+Компрометация сайта не должна позволять выдать изменённый клиент за Veil:
+подпись приложения проверяется ОС, hashes/signing metadata дублируются в
+GitHub release, а updater использует отдельную подписанную manifest chain.
+
+### Локализация в конце разработки
+
+Полная локализация выполняется в Phase 8, когда основная продуктовая IA
+стабилизирована. Первый обязательный набор — `en` как canonical fallback и `ru`
+как полноценно поддерживаемая локаль. Чтобы поздняя локализация не потребовала
+переписывать протоколы, до Phase 8 сохраняются следующие правила:
+
+- сервер возвращает стабильные machine-readable error/event codes; локализует
+  их клиент, wire values, IDs, keys, origins и crypto labels не переводятся;
+- новые UI-фразы не собираются конкатенацией из грамматических фрагментов;
+  пользовательские имена/текст передаются отдельными variables и изолируются
+  по направлению, но никогда не переводятся;
+- trust-термины имеют единый glossary: `Not compared`, `Verified on this
+  device`, `Identity changed`, `Current account`, `Recovery phrase` и
+  `Phaseprint`; перевод не имеет права повышать заявленный trust state.
+
+Финальная реализация:
+
+1. Один versioned Fluent-compatible catalog contract для desktop, mobile,
+   installer и публичных web surfaces; semantic keys, translator comments,
+   plurals/cases, dates/numbers и accessibility labels.
+2. Явный выбор языка в приложении, системная locale по умолчанию, offline
+   bundled catalogs, deterministic English fallback и отсутствие remote
+   translation/code loading.
+3. Последовательный перенос onboarding → shell/chat → identity/settings →
+   server/mobile → installer/site/docs без смешанного языка внутри одного flow.
+4. CI проверяет missing/unused keys, variable parity и forbidden raw strings;
+   pseudo-locale/long-text, `en`, `ru`, 125–200% scale и RTL/bidi isolation
+   входят в component/visual/accessibility matrix.
+5. Security review подтверждает, что локализация не меняет ACL/crypto decisions,
+   не скрывает identity-change warnings и не вставляет переводы как HTML.
+
+Локализация считается готовой только когда оба языка покрывают все release
+flows, включая installer, recovery, errors, notifications, сайт и документацию;
+частичный русский интерфейс не проходит public-beta gate.
 
 ---
 
