@@ -31,12 +31,13 @@ services:
     build:
       context: ./veil-server
       dockerfile: Dockerfile
+    restart: unless-stopped
     ports:
       - "127.0.0.1:9080:8080"
     environment:
       PORT: "8080"
       DATABASE_URL: "postgres://veil:${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in .env}@postgres:5432/veil?sslmode=disable"
-      VEIL_WS_ORIGINS:           "${VEIL_WS_ORIGINS:-https://secret.erez.pro}"
+      VEIL_WS_ORIGINS:           "${VEIL_WS_ORIGINS:?set VEIL_WS_ORIGINS in .env}"
       VEIL_WS_MAX_CONNS_PER_IP:  "${VEIL_WS_MAX_CONNS_PER_IP:-64}"
       # Compose traffic may arrive through the bundled Caddy proxy. Outside
       # this topology the application default remains false/fail-closed.
