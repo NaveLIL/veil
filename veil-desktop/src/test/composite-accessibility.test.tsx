@@ -68,7 +68,7 @@ describe("composite widget accessibility", () => {
   });
 
   it("exposes Friends filters as arrow-key navigable tabs and panels", async () => {
-    render(() => <FriendsPanel />);
+    render(() => <FriendsPanel onOpenIdentity={vi.fn()} />);
     const user = userEvent.setup();
     const all = screen.getByRole("tab", { name: "All" });
 
@@ -102,7 +102,7 @@ describe("composite widget accessibility", () => {
     vi.spyOn(appStore, "friendRequests").mockReturnValue(requests);
 
     const user = userEvent.setup();
-    const { container } = render(() => <FriendsPanel />);
+    const { container } = render(() => <FriendsPanel onOpenIdentity={vi.fn()} />);
 
     expect(container.querySelectorAll("[data-user-avatar]")).toHaveLength(IDENTITY_ROW_RENDER_BUDGET);
     expect(screen.getByRole("status")).toHaveTextContent("Showing the first 256 of 300 friends");
@@ -110,6 +110,31 @@ describe("composite widget accessibility", () => {
     await user.click(screen.getByRole("tab", { name: /Pending/ }));
     expect(container.querySelectorAll("[data-user-avatar]")).toHaveLength(IDENTITY_ROW_RENDER_BUDGET);
     expect(screen.getByRole("status")).toHaveTextContent("Showing the first 256 of 300 requests");
+  }, 15_000);
+
+  it("does not reuse the local account ID for an outgoing request identity", async () => {
+    const outgoing: FriendRequest = {
+      requestId: "request-outgoing",
+      fromUserId: "550e8400-e29b-41d4-a716-446655440000",
+      fromUsername: "remote-recipient",
+      timestamp: 1,
+      outgoing: true,
+    };
+    vi.spyOn(appStore, "friends").mockReturnValue([]);
+    vi.spyOn(appStore, "friendRequests").mockReturnValue([outgoing]);
+    const openIdentity = vi.fn();
+    const user = userEvent.setup();
+    render(() => <FriendsPanel onOpenIdentity={openIdentity} />);
+
+    await user.click(screen.getByRole("tab", { name: "Pending" }));
+    await user.click(screen.getByRole("button", { name: "View identity for remote-recipient" }));
+
+    expect(openIdentity).toHaveBeenCalledOnce();
+    expect(openIdentity.mock.calls[0][0]).toMatchObject({
+      userId: undefined,
+      technicalUsername: "remote-recipient",
+      contextKind: "friend-request",
+    });
   });
 
   it("restores focus when a controlled island dialog closes with Escape", async () => {

@@ -20,10 +20,10 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 
 1. Completion gate фаз 1–4C пройден и опубликован в
    [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-2. Завершить Identity foundation: выполнить pre-release origin namespace
-   cutover без runtime legacy fallback и довести оставшиеся consumers identity
-   directory; затем реализовать Phaseprint и общий `UserAvatar`;
-   network profile и avatar ingest подключать только после отдельных gates.
+2. Закрепить completion evidence для local-data Identity Island. Затем провести
+   отдельный schema/privacy/security review versioned text profile и локальной
+   verification/identity-change flow; network avatar ingest остаётся за своим
+   decoder/privacy gate.
 3. Довести вынесенные продуктовые scopes: Phase 3B (attachment UX), Phase 4P
    (device push clients) и Phase 4E (server experience), не смешивая их с
    завершёнными protocol/runtime baselines.
@@ -42,7 +42,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | Identity foundation в работе; дальше Phaseprint/UserAvatar и Identity Island |
+| 4D | Identity Island & Profiles | foundation, Phaseprint/UserAvatar и local-data Identity Island реализованы; дальше text profile/proof/avatar boundary |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -357,15 +357,14 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 
 ## Phase 4D — Identity Island & Profiles
 
-**Статус 2026-07-12:** Phase 4D начата. Entry gate и формальное решение
+**Статус 2026-07-12:** Phase 4D в активной реализации. Entry gate и формальное решение
 опубликованы в
 [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-Два implementation checkpoint — canonical local identity snapshots и
-authenticated origin/binding transition fence —
-реализованы и проверены. Они закрывают минимальный локальный identity foundation
-и безопасную смену authenticated namespace, но не завершают Phase 4D:
-Phaseprint, общий `UserAvatar`, Identity Island, text profile,
-identity proof и avatar ingest ещё не реализованы.
+Реализованы и проверены три прямых deliverable: canonical local identity
+foundation с authenticated origin/binding fence, детерминированный Phaseprint с
+единым `UserAvatar`, а также Identity Island на уже доступных локальных данных.
+Network text profile, локально сохраняемая verification/identity-change flow и
+изолированный avatar ingest ещё не реализованы, поэтому Phase 4D не завершена.
 
 Цель — дать одному человеку единое и узнаваемое представление во всех местах
 Veil: собственный footer, друзья, DM, группы, сообщения, server members и
@@ -600,10 +599,46 @@ budget в 256 rows с честным truncation status до pagination/virtualiz
 никогда не ограничивает полный store/native state для friendship, ACL,
 authorization и Sender Keys.
 
-Identity Island и profile navigation остаются следующим product deliverable.
-Friend/request DTO пока не несут полный account locator, поэтом честно
-используют origin-scoped user/name fallback; они не объявляются identity-
-verified до отдельной consumer/DTO normalization.
+Identity Island теперь использует один локальный `closed | members | identity`
+route вместо набора boolean overlays. На wide desktop сохраняется тот же DOM-
+остров: `Members` морфит в `Identity` и обратно без закрытия ширины и потери
+member scroll/focus. На `<=1080px` тот же route показывается одним modal
+`IslandSheet`: background inert, Tab trapped, Escape/close возвращают focus в
+исходную кнопку. Старые unguarded 50/450 ms open/close timers удалены.
+
+Профиль имеет только три блока `Person`, `Context`, `Identity Proof`; без banner,
+badge cloud и remote image. `Not compared` прямо объясняет service-mediated TOFU
+и никогда не выводится как `Verified`. Неполный locator показывает
+`Identity unavailable`, self не предлагает Verify. Nickname, owner и максимум
+три роли остаются только Context и не меняют Phaseprint/trust/ACL/Sender Keys.
+
+Точки открытия подключены к self footer, DM row/header, message author,
+friend/request/user-search row, group/server members, server member context menu
+и server settings. Reply preview по-прежнему только переходит к сообщению.
+`Message` сначала ищет ровно один origin/user/key-compatible local DM, а новую
+conversation создаёт только в текущем published authenticated scope; UI не
+предполагает заранее, что privacy/server policy разрешит действие.
+Показанный identity key передаётся в native `create_dm` как ожидаемый: ответ
+`POST` и подписанный member directory обязаны согласоваться с ним до первой
+локальной durable/runtime публикации. Поздний async-ответ привязан к session,
+profile и action epoch и не может переключить уже закрытый либо сменившийся
+Identity Island. Открытие единственного exact local DM остаётся доступно offline.
+
+Completion evidence local-data Identity Island checkpoint (2026-07-12):
+`cargo fmt`, workspace `clippy -D warnings` и workspace/all-targets tests;
+`go test`, `go vet` и Docker integration suite; frontend 66/66 tests и
+production build; visual matrix 20 passed / 4 expected skips; Windows release,
+launch smoke, MSI и NSIS. NSIS SHA-256:
+`39ED964D4634AA1E78510F9AA2F0B896FA94A20AA365721FDAB457A4A396E756`.
+Installer всё ещё не подписан, как и зафиксировано в residual risks.
+
+Outgoing friend request не использует перегруженный self `fromUserId`: он
+открывает только ограниченный username/origin view без proof/DM action. Текущий
+global Command Palette остаётся message search и не открывает identity по строке
+`sender`, потому что его hit DTO не содержит origin/user/key. Friend/request DTO
+без полного locator честно используют partial view и не объявляются verified.
+Новый network profile API, network avatar fetch и crypto/storage protocol этим
+checkpoint не добавлены.
 
 ### Versioned text profile
 
@@ -663,17 +698,18 @@ ciphertext, имеет message ACL и retention, поэтому сервер н�
 
 ### Порядок реализации 4D
 
-1. **Закрыто в 4D.1a + 4D.1b.1:** canonical identity mapping, origin-scoped
-   local directory, persisted author metadata и authenticated origin/binding
-   transition fence.
-2. Выполнить pre-release 4D.1c storage cutover без runtime legacy fallback.
-3. Довести оставшиеся consumers origin-scoped directory, затем реализовать
-   Phaseprint и общий `UserAvatar`.
-4. Ввести единый right-island state и Identity Island на уже доступных данных.
-5. Добавить versioned signed text profile API/cache/event.
-6. Добавить server context/nickname и все profile triggers.
-7. Реализовать local identity verification и identity-change flow.
-8. Только затем добавить изолированный avatar pipeline и mobile adaptation.
+1. **Закрыто:** canonical identity mapping, origin-scoped local directory,
+   pre-release storage cutover, persisted author metadata и authenticated
+   origin/binding transition fence.
+2. **Закрыто:** детерминированный Phaseprint и единый `UserAvatar` во всех
+   существующих person surfaces.
+3. **Закрыто:** единый right-island route,
+   responsive Identity Island, server context и безопасные profile triggers на
+   уже доступных locator-bearing данных.
+4. Добавить versioned signed text profile API/cache/event после отдельного
+   schema/privacy/security review и нормализовать identity-bearing search DTO.
+5. Реализовать local identity verification и identity-change flow.
+6. Только затем добавить изолированный avatar pipeline и mobile adaptation.
 
 ### Критерии готовности 4D
 

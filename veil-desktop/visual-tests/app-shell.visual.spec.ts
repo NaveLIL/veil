@@ -1,9 +1,23 @@
 import { expect, test, type Page } from "@playwright/test";
 
-async function openFixture(page: Page, state: "wallpaper" | "members" | "focus" | "lock") {
+async function openFixture(
+  page: Page,
+  state: "wallpaper" | "members" | "identity" | "focus" | "lock",
+) {
   await page.goto(`/visual.html?state=${state}`, { waitUntil: "networkidle" });
   await expect(page.getByTestId("app-shell")).toHaveAttribute("data-visual-state", state);
   await expect(page.locator("#root")).toHaveAttribute("data-fixture-ready", "true");
+  const sheets = page.locator(".veil-island-sheet");
+  if (await sheets.count()) {
+    // Geometry assertions describe the settled layout. During the intentional
+    // 220 ms entrance, the fixed sheet is translated 24 px beyond the viewport
+    // and must not be mistaken for persistent document overflow.
+    await sheets.evaluateAll(async (elements) => {
+      await Promise.all(elements.flatMap((element) =>
+        element.getAnimations().map((animation) => animation.finished.catch(() => undefined))
+      ));
+    });
+  }
 }
 
 async function enterLockPinWithKeyboard(page: Page) {
@@ -231,41 +245,64 @@ test("theme tokens preserve readable small text and accent labels", async ({ pag
   }
 });
 
-test("members island overlays only below the four-column breakpoint", async ({ page }) => {
+test("members island becomes a focus-trapped sheet below the four-column breakpoint", async ({ page }) => {
   await openFixture(page, "members");
   await expectNoDocumentOverflow(page);
   await expectComposerGeometry(page);
 
-  const wrapper = page.getByRole("complementary", { name: "Conversation members" });
-  await expect(wrapper).toHaveAttribute("aria-hidden", "false");
   const identityPhaseprints = page.locator("[data-phaseprint-seed-kind='identity-key']");
   expect(await identityPhaseprints.count()).toBeGreaterThanOrEqual(7);
   await expect(identityPhaseprints.first()).toBeVisible();
-  const [bodyBox, chatBox, membersBox] = await Promise.all([
-    page.getByTestId("app-body").boundingBox(),
-    page.getByTestId("chat-island").boundingBox(),
-    wrapper.boundingBox(),
-  ]);
-  expect(bodyBox).not.toBeNull();
-  expect(chatBox).not.toBeNull();
-  expect(membersBox).not.toBeNull();
-
-  const position = await wrapper.evaluate((element) => getComputedStyle(element).position);
   const viewport = page.viewportSize();
   expect(viewport).not.toBeNull();
-  if (viewport && bodyBox && chatBox && membersBox) {
-    expect(Math.abs(membersBox.width - 240)).toBeLessThanOrEqual(1);
-    if (viewport.width <= 1080) {
-      expect(position).toBe("absolute");
-      expect(Math.abs(membersBox.x + membersBox.width - (bodyBox.x + bodyBox.width))).toBeLessThanOrEqual(1);
-      expect(Math.abs(chatBox.x + chatBox.width - (bodyBox.x + bodyBox.width))).toBeLessThanOrEqual(1);
-    } else {
-      expect(position).toBe("static");
+  if (viewport && viewport.width <= 1080) {
+    const sheet = page.getByRole("dialog", { name: /Members/ });
+    await expect(sheet).toBeVisible();
+    const sheetBox = await sheet.boundingBox();
+    expect(sheetBox).not.toBeNull();
+    if (sheetBox) expect(Math.abs(sheetBox.x + sheetBox.width - viewport.width)).toBeLessThanOrEqual(1);
+    await page.keyboard.press("Tab");
+    expect(await sheet.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+  } else {
+    const wrapper = page.getByRole("complementary", { name: "Conversation members" });
+    await expect(wrapper).toHaveAttribute("aria-hidden", "false");
+    const [chatBox, membersBox] = await Promise.all([
+      page.getByTestId("chat-island").boundingBox(),
+      wrapper.boundingBox(),
+    ]);
+    expect(chatBox).not.toBeNull();
+    expect(membersBox).not.toBeNull();
+    if (chatBox && membersBox) {
+      expect(Math.abs(membersBox.width - 240)).toBeLessThanOrEqual(1);
       expect(membersBox.x - (chatBox.x + chatBox.width)).toBeGreaterThanOrEqual(7);
     }
   }
 
   await expect(page).toHaveScreenshot("app-shell-members.png");
+});
+
+test("identity island keeps proof language and responsive geometry calm", async ({ page }) => {
+  await openFixture(page, "identity");
+  await expectNoDocumentOverflow(page);
+  await expectComposerGeometry(page);
+  await expect(page.getByRole("heading", { name: "Person" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Context" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Identity Proof" })).toBeVisible();
+  await expect(page.getByText("Not compared")).toBeVisible();
+  await expect(page.getByText(/^Verified$/i)).toHaveCount(0);
+
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  if (viewport && viewport.width <= 1080) {
+    await expect(page.getByRole("dialog", { name: "Identity" })).toBeVisible();
+  } else {
+    const island = page.getByRole("complementary", { name: "Identity" });
+    const box = await island.boundingBox();
+    expect(box).not.toBeNull();
+    if (box) expect(Math.abs(box.width - 288)).toBeLessThanOrEqual(1);
+  }
+
+  await expect(page).toHaveScreenshot("app-shell-identity.png");
 });
 
 test("composer focus ring follows the full composer geometry", async ({ page }) => {

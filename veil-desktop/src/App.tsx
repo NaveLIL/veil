@@ -3,9 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   appStore,
-  canonicalServerOriginFromHttpUrl,
   captureUiSessionEpoch,
   isUiSessionEpochCurrent,
+  type Conversation,
   type GroupMember,
   type Message,
 } from "@/stores/app";
@@ -18,7 +18,7 @@ import { CreateServerDialog } from "@/components/server/CreateServerDialog";
 import { JoinServerDialog } from "@/components/server/JoinServerDialog";
 import { CreateChannelDialog } from "@/components/server/CreateChannelDialog";
 import { CreateInviteDialog } from "@/components/server/CreateInviteDialog";
-import { MembersIsland } from "@/components/layout/MembersIsland";
+import { RightIsland } from "@/components/layout/RightIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 import { conversationCryptoUiState } from "@/security/conversationCrypto";
@@ -36,6 +36,17 @@ import { MessageRenderer } from "@/components/chat/MessageRenderer";
 import { FriendsPanel } from "@/components/chat/FriendsPanel";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { UserAvatar } from "@/components/identity/UserAvatar";
+import { IdentityTrigger } from "@/components/identity/IdentityTrigger";
+import {
+  canMessageIdentity,
+  canonicalIdentityKey,
+  canonicalIdentityOrigin,
+  canonicalIdentityUserId,
+  identityAllowsKeylessDmResolution,
+  identityProfileKey,
+  isSameCanonicalIdentity,
+  type IdentityIslandProfile,
+} from "@/components/identity/identityProfile";
 import { toast, ToastViewport } from "@/components/ui/toast";
 import { CommandPalette, useCommandPaletteHotkey } from "@/components/ui/CommandPalette";
 import { DecisionDialogHost } from "@/components/ui/DecisionDialogHost";
@@ -45,6 +56,16 @@ import {
   ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
   Volume2, MessageSquare, Eye, Shield, Send,
 } from "lucide-solid";
+
+type RightIslandRoute =
+  | { kind: "closed" }
+  | { kind: "members"; opener: HTMLElement | null }
+  | {
+      kind: "identity";
+      profile: IdentityIslandProfile;
+      backToMembers: boolean;
+      opener: HTMLElement | null;
+    };
 
 const appWindow = getCurrentWindow();
 
@@ -175,7 +196,8 @@ const App: Component = () => {
   const [newPeerId, setNewPeerId] = createSignal("");
   const [newGroupName, setNewGroupName] = createSignal("");
   const [sidebarTab, setSidebarTab] = createSignal<"all" | "dm" | "group">("all");
-  const [memberPanelOpen, setMemberPanelOpen] = createSignal(false);
+  const [rightIslandRoute, setRightIslandRoute] = createSignal<RightIslandRoute>({ kind: "closed" });
+  const [identityMessageBusy, setIdentityMessageBusy] = createSignal(false);
   const [windowMaximized, setWindowMaximized] = createSignal(false);
   const [groupMembers, setGroupMembers] = createSignal<GroupMember[]>([]);
   const [replyingTo, setReplyingTo] = createSignal<Message | null>(null);
@@ -199,6 +221,112 @@ const App: Component = () => {
   let newGroupInputRef: HTMLInputElement | undefined;
   let sendTokenCounter = 0;
   let activeSendToken: number | null = null;
+  let rightIslandTransitionEpoch = 0;
+  let rightIslandAnimationFrame: number | undefined;
+  let identityDmActionToken = 0;
+
+  const memberPanelOpen = () => rightIslandRoute().kind === "members" && island4Vis();
+  const rightIslandOpen = () => rightIslandRoute().kind !== "closed" && island4Vis();
+  const selectedIdentity = () => {
+    const route = rightIslandRoute();
+    return route.kind === "identity" ? route.profile : null;
+  };
+  const identityBackToMembers = () => {
+    const route = rightIslandRoute();
+    return route.kind === "identity" && route.backToMembers;
+  };
+
+  const cancelRightIslandAnimationFrame = () => {
+    if (rightIslandAnimationFrame === undefined) return;
+    cancelAnimationFrame(rightIslandAnimationFrame);
+    rightIslandAnimationFrame = undefined;
+  };
+
+  const showRightIslandRoute = (route: Exclude<RightIslandRoute, { kind: "closed" }>) => {
+    const wasClosed = rightIslandRoute().kind === "closed" || !island4Vis();
+    rightIslandTransitionEpoch += 1;
+    identityDmActionToken += 1;
+    cancelRightIslandAnimationFrame();
+    setRightIslandRoute(route);
+    setIdentityMessageBusy(false);
+    if (!wasClosed) {
+      setIsland4Vis(true);
+      return;
+    }
+    setIsland4Vis(false);
+    const epoch = rightIslandTransitionEpoch;
+    rightIslandAnimationFrame = requestAnimationFrame(() => {
+      rightIslandAnimationFrame = undefined;
+      if (epoch === rightIslandTransitionEpoch) setIsland4Vis(true);
+    });
+  };
+
+  const openMembersIsland = (opener: HTMLElement | null = null) => {
+    const current = rightIslandRoute();
+    showRightIslandRoute({
+      kind: "members",
+      opener: opener ?? (current.kind === "identity" ? current.opener : null),
+    });
+  };
+
+  const openIdentityIsland = (
+    profile: IdentityIslandProfile,
+    opener: HTMLElement | null = null,
+    backToMembers = rightIslandRoute().kind === "members",
+  ) => {
+    const current = rightIslandRoute();
+    const focusedElement = document.activeElement instanceof HTMLElement
+      && document.activeElement !== document.body
+      ? document.activeElement
+      : null;
+    showRightIslandRoute({
+      kind: "identity",
+      profile,
+      backToMembers: backToMembers || (current.kind === "identity" && current.backToMembers),
+      opener: opener
+        ?? (current.kind === "members" || current.kind === "identity" ? current.opener : null)
+        ?? focusedElement,
+    });
+  };
+
+  const backToMembersIsland = () => {
+    const route = rightIslandRoute();
+    if (route.kind === "identity" && route.backToMembers) {
+      showRightIslandRoute({ kind: "members", opener: route.opener });
+    }
+  };
+
+  const closeRightIsland = (immediate = false) => {
+    const route = untrack(rightIslandRoute);
+    const opener = route.kind === "closed" ? null : route.opener;
+    const activeAtClose = document.activeElement;
+    const epoch = ++rightIslandTransitionEpoch;
+    identityDmActionToken += 1;
+    cancelRightIslandAnimationFrame();
+    setIdentityMessageBusy(false);
+    setIsland4Vis(false);
+    const finish = () => {
+      if (epoch !== rightIslandTransitionEpoch) return;
+      if (untrack(rightIslandRoute).kind !== "closed") {
+        setRightIslandRoute({ kind: "closed" });
+      }
+      const activeNow = document.activeElement;
+      const focusUnclaimed = activeNow === activeAtClose
+        || activeNow === document.body
+        || !(activeNow instanceof HTMLElement)
+        || !activeNow.isConnected;
+      if (
+        focusUnclaimed
+        && opener?.isConnected
+        && !opener.hasAttribute("disabled")
+        && opener.getAttribute("aria-disabled") !== "true"
+      ) opener.focus({ preventScroll: true });
+    };
+    const reduceMotion = (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false)
+      || document.documentElement.dataset.reduceMotion === "true";
+    if (immediate || reduceMotion) finish();
+    else window.setTimeout(finish, 400);
+  };
 
   const conv = () => appStore.activeConversation();
   const cryptoGate = () => conversationCryptoUiState(
@@ -232,8 +360,7 @@ const App: Component = () => {
   };
   const msgs = () => appStore.messages().filter((m) => m.conversationId === conv()?.id);
   const shortId = () => (appStore.userId() || appStore.identity() || "---").slice(0, 8);
-  const avatarServerOrigin = () => appStore.authenticatedServerScope()?.canonicalServerOrigin
-    ?? canonicalServerOriginFromHttpUrl(appStore.serverHttpUrl());
+  const avatarServerOrigin = () => appStore.authenticatedServerScope()?.canonicalServerOrigin;
   const connectionLabel = () => appStore.connected()
     ? "Online"
     : appStore.reconnecting()
@@ -244,6 +371,134 @@ const App: Component = () => {
     : appStore.reconnecting()
       ? "var(--veil-warning)"
       : "var(--veil-text-subtle)";
+
+  const currentIdentityLocator = () => ({
+    canonicalServerOrigin: appStore.authenticatedServerScope()?.canonicalServerOrigin,
+    userId: appStore.userId(),
+    identityKey: appStore.identity(),
+  });
+
+  const selfIdentityProfile = (): IdentityIslandProfile => {
+    const profile: IdentityIslandProfile = {
+      ...currentIdentityLocator(),
+      displayName: "You",
+      contextKind: "self",
+      contextLabel: "Current Veil account",
+      contextDetail: connectionLabel(),
+    };
+    return { ...profile, selfIdentity: currentIdentityLocator() };
+  };
+
+  const dmIdentityProfile = (conversation: Conversation): IdentityIslandProfile => {
+    const profile: IdentityIslandProfile = {
+      canonicalServerOrigin: conversation.serverOrigin,
+      userId: conversation.peerUserId,
+      identityKey: conversation.peerKey,
+      displayName: conversation.name,
+      contextKind: "direct-message",
+      contextLabel: "Direct message",
+      contextDetail: "Encrypted one-to-one conversation",
+    };
+    return { ...profile, selfIdentity: currentIdentityLocator() };
+  };
+
+  const messageIdentityProfile = (message: Message): IdentityIslandProfile => {
+    const profile: IdentityIslandProfile = {
+    canonicalServerOrigin: message.senderOrigin ?? message.senderProfileOrigin,
+    userId: message.senderUserId,
+    identityKey: message.senderKey,
+    signingKey: message.senderSigningKey,
+    displayName: message.senderName,
+    profileVersion: message.senderProfileVersion,
+    profileOrigin: message.senderProfileOrigin,
+    contextKind: "message-author",
+    contextLabel: "Message author",
+    contextDetail: conv()?.name ? `Conversation · ${conv()!.name}` : "Conversation history",
+    };
+    const isSelf = isSameCanonicalIdentity(profile, currentIdentityLocator());
+    return {
+      ...profile,
+      contextLabel: isSelf ? "Your message" : profile.contextLabel,
+      selfIdentity: currentIdentityLocator(),
+    };
+  };
+
+  const selectedIdentityDmResolution = () => {
+    const profile = selectedIdentity();
+    const targetOrigin = canonicalIdentityOrigin(profile?.canonicalServerOrigin);
+    const targetUserId = canonicalIdentityUserId(profile?.userId);
+    const targetIdentityKey = canonicalIdentityKey(profile?.identityKey);
+    if (!profile || !targetOrigin || !targetUserId) {
+      return {
+        profile,
+        targetOrigin,
+        targetUserId,
+        targetIdentityKey,
+        matchingDms: [] as Conversation[],
+        conflictingKey: false,
+        ambiguous: false,
+      };
+    }
+
+    const sameAccountDms = appStore.conversations().filter((conversation) =>
+      conversation.type === "dm"
+      && canonicalIdentityOrigin(conversation.serverOrigin) === targetOrigin
+      && canonicalIdentityUserId(conversation.peerUserId) === targetUserId
+    );
+    const matchingDms = targetIdentityKey
+      ? sameAccountDms.filter((conversation) => canonicalIdentityKey(conversation.peerKey) === targetIdentityKey)
+      : sameAccountDms;
+    const conflictingKey = !!targetIdentityKey && sameAccountDms.some((conversation) => {
+      const existingKey = canonicalIdentityKey(conversation.peerKey);
+      return !!existingKey && existingKey !== targetIdentityKey;
+    });
+    return {
+      profile,
+      targetOrigin,
+      targetUserId,
+      targetIdentityKey,
+      matchingDms,
+      conflictingKey,
+      ambiguous: matchingDms.length > 1,
+    };
+  };
+
+  const selectedIdentityAccountCanMessage = () => {
+    const resolution = selectedIdentityDmResolution();
+    const scope = appStore.authenticatedServerScope();
+    return !!resolution.profile
+      && (!!resolution.targetIdentityKey || identityAllowsKeylessDmResolution(resolution.profile))
+      && canMessageIdentity(resolution.profile, scope?.canonicalServerOrigin, appStore.userId())
+      && !resolution.conflictingKey
+      && !resolution.ambiguous;
+  };
+
+  const selectedIdentityCanCreateDm = () => selectedIdentityAccountCanMessage()
+    && appStore.connected()
+    && !appStore.bindingTransitioning()
+    && !appStore.originTransitioning();
+
+  const selectedIdentityCanOpenLocalDm = () => {
+    const resolution = selectedIdentityDmResolution();
+    if (
+      resolution.conflictingKey
+      || resolution.ambiguous
+      || resolution.matchingDms.length !== 1
+      || !resolution.targetOrigin
+      || !resolution.targetUserId
+      || (!resolution.targetIdentityKey && (
+        !resolution.profile || !identityAllowsKeylessDmResolution(resolution.profile)
+      ))
+    ) return false;
+    const scope = appStore.authenticatedServerScope();
+    const knownSelf = canonicalIdentityOrigin(scope?.canonicalServerOrigin) === resolution.targetOrigin
+      && canonicalIdentityUserId(scope?.userId) === resolution.targetUserId;
+    return !knownSelf;
+  };
+
+  const selectedIdentityCanMessage = () => {
+    return selectedIdentityCanOpenLocalDm() || selectedIdentityCanCreateDm();
+  };
 
   const filtered = () => {
     const q = search().toLowerCase();
@@ -312,7 +567,7 @@ const App: Component = () => {
       setSendNotice("");
       if (inputRef) inputRef.style.height = "21px";
       previousConversationId = id;
-      setMemberPanelOpen(false);
+      closeRightIsland();
       setEditingMessage(null);
     }
     if (id) untrack(() => void appStore.loadMessages(id));
@@ -340,6 +595,7 @@ const App: Component = () => {
 
     // Keep islands hidden outside chat so re-entry always starts from hidden state.
     if (screen !== "chat") {
+      closeRightIsland(true);
       setIsland1Vis(false); setIsland2Vis(false); setIsland3Vis(false); setIsland4Vis(false);
       return;
     }
@@ -348,7 +604,9 @@ const App: Component = () => {
     const t1 = setTimeout(() => setIsland1Vis(true), 80);
     const t2 = setTimeout(() => setIsland2Vis(true), 200);
     const t3 = setTimeout(() => setIsland3Vis(true), 340);
-    const t4 = untrack(() => memberPanelOpen()) ? setTimeout(() => setIsland4Vis(true), 480) : undefined;
+    const t4 = untrack(() => rightIslandRoute().kind !== "closed")
+      ? setTimeout(() => setIsland4Vis(true), 480)
+      : undefined;
 
     onCleanup(() => {
       clearTimeout(t1);
@@ -481,10 +739,11 @@ const App: Component = () => {
     const sessionEpoch = captureUiSessionEpoch();
     setCreatingDm(true);
     try {
-      await appStore.createDm(id);
+      const conversationId = await appStore.createDm(id);
       if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       setNewPeerId("");
       setShowNewDm(false);
+      openConversation(conversationId);
     } catch (reason) {
       if (isUiSessionEpochCurrent(sessionEpoch)) {
         toast.error("Conversation not created", String(reason).replace(/^Error:\s*/, ""));
@@ -508,6 +767,7 @@ const App: Component = () => {
       if (!conversationId) throw new Error("The server did not confirm group creation");
       setNewGroupName("");
       setShowNewGroup(false);
+      openConversation(conversationId);
     } catch (reason) {
       if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       const message = String(reason).replace(/^Error:\s*/, "");
@@ -640,15 +900,141 @@ const App: Component = () => {
   };
 
   const openConversation = (id: string) => {
+    const alreadyActive = appStore.activeConversationId() === id;
     closeHomeTransientUi();
     setShowFriendsPanel(false);
     setActiveServer("home");
     appStore.selectConversation(id);
+    if (alreadyActive && rightIslandRoute().kind !== "closed") closeRightIsland();
     const selected = appStore.conversations().find((conversation) => conversation.id === id);
     if (selected?.type === "group" && !appStore.conversationCryptoDiagnostics()[id]) {
       void appStore.distributeSenderKey(id).catch((error) => {
         console.warn("group encryption check failed:", error);
       });
+    }
+  };
+
+  const openRetainedLocalDm = (id: string): boolean => {
+    const alreadyActive = appStore.activeConversationId() === id;
+    closeHomeTransientUi();
+    setShowFriendsPanel(false);
+    setActiveServer("home");
+    if (!appStore.selectRetainedLocalDm(id)) return false;
+    if (alreadyActive && rightIslandRoute().kind !== "closed") closeRightIsland();
+    return true;
+  };
+
+  const handleIdentityMessage = async () => {
+    if (identityMessageBusy()) return;
+    const route = rightIslandRoute();
+    if (route.kind !== "identity") return;
+
+    const profile = route.profile;
+    const profileKey = identityProfileKey(profile);
+    const resolution = selectedIdentityDmResolution();
+    const { targetOrigin, targetUserId, targetIdentityKey } = resolution;
+    if (!targetOrigin || !targetUserId) {
+      toast.error("Conversation not created", "The selected identity has no exact account locator on this server.");
+      return;
+    }
+    if (!targetIdentityKey && !identityAllowsKeylessDmResolution(profile)) {
+      toast.error("Conversation not opened", "This identity-bearing context has no valid identity key. Veil stopped before DM navigation.");
+      return;
+    }
+
+    if (resolution.conflictingKey || resolution.ambiguous) {
+      toast.error("Conversation not opened", "The local DM identity is ambiguous or has a different key. Veil stopped before navigation.");
+      return;
+    }
+    if (selectedIdentityCanOpenLocalDm()) {
+      if (!openRetainedLocalDm(resolution.matchingDms[0].id)) {
+        toast.error("Conversation not opened", "The retained local DM is no longer available in this origin namespace.");
+      }
+      return;
+    }
+    if (!selectedIdentityAccountCanMessage()) {
+      toast.error("Conversation not opened", "This identity is not an exact non-self account in the current authenticated server scope.");
+      return;
+    }
+    if (!selectedIdentityCanCreateDm()) {
+      toast.error("Conversation not created", "Connect to the current Veil server before creating this encrypted conversation.");
+      return;
+    }
+
+    const sessionEpoch = captureUiSessionEpoch();
+    const actionToken = ++identityDmActionToken;
+    setIdentityMessageBusy(true);
+    const actionStillCurrent = () => {
+      const currentRoute = rightIslandRoute();
+      return actionToken === identityDmActionToken
+        && isUiSessionEpochCurrent(sessionEpoch)
+        && island4Vis()
+        && currentRoute.kind === "identity"
+        && identityProfileKey(currentRoute.profile) === profileKey;
+    };
+    try {
+      const conversationId = await appStore.createDm(
+        targetUserId,
+        profile.technicalUsername || undefined,
+        targetIdentityKey || undefined,
+      );
+      if (!actionStillCurrent()) return;
+      openConversation(conversationId);
+    } catch (error) {
+      if (actionStillCurrent()) {
+        toast.error("Conversation not created", String(error).replace(/^Error:\s*/, ""));
+      }
+    } finally {
+      if (actionToken === identityDmActionToken && isUiSessionEpochCurrent(sessionEpoch)) {
+        setIdentityMessageBusy(false);
+      }
+    }
+  };
+
+  const handleRightIslandCreateDm = async (
+    userId: string,
+    username?: string,
+    expectedIdentityKey?: string,
+  ) => {
+    const route = rightIslandRoute();
+    if (route.kind === "closed" || !island4Vis()) return;
+    const scope = appStore.authenticatedServerScope();
+    const targetUserId = canonicalIdentityUserId(userId);
+    const targetIdentityKey = canonicalIdentityKey(expectedIdentityKey);
+    if (
+      !scope
+      || !targetUserId
+      || !targetIdentityKey
+      || targetUserId === canonicalIdentityUserId(scope.userId)
+      || !appStore.connected()
+      || appStore.bindingTransitioning()
+      || appStore.originTransitioning()
+    ) {
+      toast.error("Conversation not created", "This member does not have an exact non-self identity in the current authenticated server scope.");
+      return;
+    }
+    const routeKey = route.kind === "identity"
+      ? `identity\0${identityProfileKey(route.profile)}`
+      : "members";
+    const sessionEpoch = captureUiSessionEpoch();
+    const actionToken = ++identityDmActionToken;
+    const actionStillCurrent = () => {
+      const currentRoute = rightIslandRoute();
+      const currentRouteKey = currentRoute.kind === "identity"
+        ? `identity\0${identityProfileKey(currentRoute.profile)}`
+        : currentRoute.kind;
+      return actionToken === identityDmActionToken
+        && isUiSessionEpochCurrent(sessionEpoch)
+        && island4Vis()
+        && currentRouteKey === routeKey;
+    };
+    try {
+      const conversationId = await appStore.createDm(targetUserId, username, targetIdentityKey);
+      if (actionStillCurrent()) openConversation(conversationId);
+    } catch (error) {
+      if (actionStillCurrent()) {
+        toast.error("Conversation not created", String(error).replace(/^Error:\s*/, ""));
+      }
     }
   };
 
@@ -733,6 +1119,7 @@ const App: Component = () => {
     windowListenerDisposed = true;
     stopWindowResizeListener?.();
     if (messagesScrollFrame !== undefined) cancelAnimationFrame(messagesScrollFrame);
+    cancelRightIslandAnimationFrame();
   });
 
   createEffect(() => {
@@ -801,8 +1188,7 @@ const App: Component = () => {
     setEditingMessage(null);
     setEditText("");
     setDeletingIds(new Set<string>());
-    setMemberPanelOpen(false);
-    setIsland4Vis(false);
+    closeRightIsland(true);
     setShowFriendsPanel(false);
     setShowNewDm(false);
     setShowNewGroup(false);
@@ -832,6 +1218,7 @@ const App: Component = () => {
     setShowJoinServer(false);
     setShowCreateChannel(false);
     setShowCreateInvite(false);
+    closeRightIsland(true);
   });
 
   // Store state is not the only place where plaintext lives. Drafts, edit and
@@ -1004,22 +1391,19 @@ const App: Component = () => {
                         </div>
                         <button
                           type="button"
-                          style={headerBtn(memberPanelOpen())}
+                          style={headerBtn(rightIslandOpen())}
                           title="Members"
                           aria-label="Show server members"
-                          onClick={async () => {
-                            if (!memberPanelOpen()) {
-                              const sessionEpoch = captureUiSessionEpoch();
-                              await appStore.loadServerMembers(sid()).catch(() => {});
-                              if (!isUiSessionEpochCurrent(sessionEpoch)) return;
-                              setMemberPanelOpen(true);
-                              setTimeout(() => {
-                                if (isUiSessionEpochCurrent(sessionEpoch)) setIsland4Vis(true);
-                              }, 50);
-                            } else {
-                              setIsland4Vis(false);
-                              setTimeout(() => setMemberPanelOpen(false), 450);
+                          onClick={async (event) => {
+                            const opener = event.currentTarget;
+                            if (memberPanelOpen()) {
+                              closeRightIsland();
+                              return;
                             }
+                            const sessionEpoch = captureUiSessionEpoch();
+                            await appStore.loadServerMembers(sid()).catch(() => {});
+                            if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+                            openMembersIsland(opener);
                           }}
                         >
                           <Users size={14} strokeWidth={1.8} />
@@ -1366,18 +1750,24 @@ const App: Component = () => {
 
                       {/* User panel (same as home) */}
                       <div style={S.userPanel}>
-                        <UserAvatar
-                          identityKey={appStore.identity()}
-                          canonicalServerOrigin={avatarServerOrigin()}
-                          userId={appStore.userId()}
-                          size={34}
-                        />
-                        <div style={{ flex: "1", "min-width": "0" }}>
-                          <div style={{ "font-size": "12px", "font-weight": "500", color: "var(--veil-text-muted)", "font-family": "monospace" }}>{shortId()}</div>
-                          <div style={{ "font-size": "10px", color: connectionColor(), "margin-top": "1px" }}>
-                            {connectionLabel()}
+                        <IdentityTrigger
+                          label="View your identity"
+                          onOpen={(trigger) => openIdentityIsland(selfIdentityProfile(), trigger)}
+                          style={{ display: "flex", "align-items": "center", gap: "12px", flex: "1", "min-width": "0", "border-radius": "8px" }}
+                        >
+                          <UserAvatar
+                            identityKey={appStore.identity()}
+                            canonicalServerOrigin={avatarServerOrigin()}
+                            userId={appStore.userId()}
+                            size={34}
+                          />
+                          <div style={{ flex: "1", "min-width": "0" }}>
+                            <div style={{ "font-size": "12px", "font-weight": "500", color: "var(--veil-text-muted)", "font-family": "monospace" }}>{shortId()}</div>
+                            <div style={{ "font-size": "10px", color: connectionColor(), "margin-top": "1px" }}>
+                              {connectionLabel()}
+                            </div>
                           </div>
-                        </div>
+                        </IdentityTrigger>
                         <button
                           style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
                           onClick={() => appStore.setScreen("settings")}
@@ -1563,6 +1953,7 @@ const App: Component = () => {
                 >
                   <For each={filtered()}>
                     {(c) => {
+                      let conversationOpenButton: HTMLButtonElement | undefined;
                       const peerUserId = () => c.type === "dm" ? c.peerUserId : undefined;
                       const friend = () => {
                         const userId = peerUserId();
@@ -1573,15 +1964,46 @@ const App: Component = () => {
                       return (
                       <ContextMenu>
                         <ContextMenuTrigger>
-                          <button
+                          <div
                             style={S.contactBtn(appStore.activeConversationId() === c.id)}
-                            onClick={() => openConversation(c.id)}
                             onMouseEnter={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "var(--veil-contrast-03)"; }}
                             onMouseLeave={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "transparent"; }}
                           >
-                            <Show
-                              when={c.type === "dm"}
-                              fallback={(
+                            <Show when={c.type === "dm"}>
+                              <IdentityTrigger
+                                label={`View identity for ${c.name}`}
+                                onOpen={(trigger) => openIdentityIsland(dmIdentityProfile(c), trigger)}
+                                style={{ "border-radius": "50%", "flex-shrink": "0" }}
+                              >
+                                <UserAvatar
+                                  identityKey={c.peerKey}
+                                  canonicalServerOrigin={c.serverOrigin}
+                                  userId={c.peerUserId}
+                                  size={36}
+                                />
+                              </IdentityTrigger>
+                            </Show>
+                            <button
+                              ref={conversationOpenButton}
+                              type="button"
+                              aria-label={`Open ${c.name}`}
+                              onClick={() => openConversation(c.id)}
+                              style={{
+                                "min-width": "0",
+                                flex: "1",
+                                display: "flex",
+                                "align-items": "center",
+                                gap: "12px",
+                                padding: "0",
+                                border: "none",
+                                background: "transparent",
+                                color: "inherit",
+                                "text-align": "left",
+                                cursor: "pointer",
+                                "font-family": "inherit",
+                              }}
+                            >
+                              <Show when={c.type !== "dm"}>
                                 <div style={{
                                   width: "36px",
                                   height: "36px",
@@ -1597,15 +2019,7 @@ const App: Component = () => {
                                     ? <Users size={16} strokeWidth={1.9} />
                                     : <MessageSquare size={16} strokeWidth={1.9} />}
                                 </div>
-                              )}
-                            >
-                              <UserAvatar
-                                identityKey={c.peerKey}
-                                canonicalServerOrigin={c.serverOrigin ?? avatarServerOrigin()}
-                                userId={c.peerUserId}
-                                size={36}
-                              />
-                            </Show>
+                              </Show>
                             <div style={{ flex: "1", "min-width": "0" }}>
                               <div style={{ display: "flex", "align-items": "center", gap: "6px" }}>
                                 <span style={{ "font-size": "13px", "font-weight": "500", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{c.name}</span>
@@ -1622,7 +2036,8 @@ const App: Component = () => {
                                 {c.unreadCount}
                               </div>
                             </Show>
-                          </button>
+                            </button>
+                          </div>
                         </ContextMenuTrigger>
                         <ContextMenuContent>
                           <ContextMenuItem onSelect={() => openConversation(c.id)}>
@@ -1630,6 +2045,13 @@ const App: Component = () => {
                             Open
                           </ContextMenuItem>
                           <Show when={c.type === "dm"}>
+                            <ContextMenuItem onSelect={() => queueMicrotask(() => openIdentityIsland(
+                              dmIdentityProfile(c),
+                              conversationOpenButton ?? null,
+                            ))}>
+                              <ContextMenuIcon><Eye size={14} strokeWidth={2} /></ContextMenuIcon>
+                              View Identity
+                            </ContextMenuItem>
                             <ContextMenuSeparator />
                             <Show
                               when={peerUserId() && appStore.friendDirectoryReady()}
@@ -1667,18 +2089,24 @@ const App: Component = () => {
               </div>
 
               <div style={S.userPanel}>
-                <UserAvatar
-                  identityKey={appStore.identity()}
-                  canonicalServerOrigin={avatarServerOrigin()}
-                  userId={appStore.userId()}
-                  size={34}
-                />
-                <div style={{ flex: "1", "min-width": "0" }}>
-                  <div style={{ "font-size": "12px", "font-weight": "500", color: "var(--veil-text-muted)", "font-family": "monospace" }}>{shortId()}</div>
-                  <div style={{ "font-size": "10px", color: connectionColor(), "margin-top": "1px" }}>
-                    {connectionLabel()}
+                <IdentityTrigger
+                  label="View your identity"
+                  onOpen={(trigger) => openIdentityIsland(selfIdentityProfile(), trigger)}
+                  style={{ display: "flex", "align-items": "center", gap: "12px", flex: "1", "min-width": "0", "border-radius": "8px" }}
+                >
+                  <UserAvatar
+                    identityKey={appStore.identity()}
+                    canonicalServerOrigin={avatarServerOrigin()}
+                    userId={appStore.userId()}
+                    size={34}
+                  />
+                  <div style={{ flex: "1", "min-width": "0" }}>
+                    <div style={{ "font-size": "12px", "font-weight": "500", color: "var(--veil-text-muted)", "font-family": "monospace" }}>{shortId()}</div>
+                    <div style={{ "font-size": "10px", color: connectionColor(), "margin-top": "1px" }}>
+                      {connectionLabel()}
+                    </div>
                   </div>
-                </div>
+                </IdentityTrigger>
                 <button
                   type="button"
                   style={{ width: "28px", height: "28px", "border-radius": "6px", background: "transparent", border: "none", color: "var(--veil-text-faint)", cursor: "pointer", "font-size": "14px" }}
@@ -1705,7 +2133,15 @@ const App: Component = () => {
               aria-label={showFriendsPanel() ? "Friends" : conv()?.name ? `Conversation: ${conv()?.name}` : "Conversation"}
               style={{ ...S.island(), ...S.islandAnim(island3Vis(), 0) }}
             >
-              <Show when={!showFriendsPanel()} fallback={<FriendsPanel onNavigate={() => setShowFriendsPanel(false)} />}>
+              <Show
+                when={!showFriendsPanel()}
+                fallback={(
+                  <FriendsPanel
+                    onNavigate={() => setShowFriendsPanel(false)}
+                    onOpenIdentity={(profile, trigger) => openIdentityIsland(profile, trigger ?? null)}
+                  />
+                )}
+              >
               <Show when={conv()} fallback={
                 <div style={{ flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" }}>
                   <div style={{ width: "56px", height: "56px", "border-radius": "16px", background: "rgba(var(--veil-accent-rgb),0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" }}>
@@ -1749,12 +2185,18 @@ const App: Component = () => {
                           </div>
                         )}
                       >
-                        <UserAvatar
-                          identityKey={c().peerKey}
-                          canonicalServerOrigin={c().serverOrigin ?? avatarServerOrigin()}
-                          userId={c().peerUserId}
-                          size={32}
-                        />
+                        <IdentityTrigger
+                          label={`View identity for ${c().name}`}
+                          onOpen={(trigger) => openIdentityIsland(dmIdentityProfile(c()), trigger)}
+                          style={{ "border-radius": "50%", "flex-shrink": "0" }}
+                        >
+                          <UserAvatar
+                            identityKey={c().peerKey}
+                            canonicalServerOrigin={c().serverOrigin}
+                            userId={c().peerUserId}
+                            size={32}
+                          />
+                        </IdentityTrigger>
                       </Show>
                       <div style={{ flex: "1" }}>
                         <div style={{ "font-size": "14px", "font-weight": "600", color: "var(--veil-text-strong)" }}>{c().name}</div>
@@ -1772,24 +2214,21 @@ const App: Component = () => {
                       </div>
                       <Show when={c().type === "group"}>
                         <button
-                          style={{ padding: "4px 10px", "border-radius": "6px", background: memberPanelOpen() ? "rgba(var(--veil-accent-rgb),0.15)" : "var(--veil-contrast-04)", border: "none", color: memberPanelOpen() ? "var(--veil-accent)" : "var(--veil-text-muted)", cursor: "pointer", "font-size": "11px", transition: "background 0.15s" }}
-                          onClick={async () => {
-                            if (!memberPanelOpen()) {
-                              try {
-                                const sessionEpoch = captureUiSessionEpoch();
-                                const members = await appStore.getGroupMembers(c().id);
-                                if (!isUiSessionEpochCurrent(sessionEpoch)) return;
-                                setGroupMembers(members);
-                                setMemberPanelOpen(true);
-                                setTimeout(() => {
-                                  if (isUiSessionEpochCurrent(sessionEpoch)) setIsland4Vis(true);
-                                }, 50);
-                              } catch (e) {
-                                console.warn("group member directory unavailable:", e);
-                              }
-                            } else {
-                              setIsland4Vis(false);
-                              setTimeout(() => setMemberPanelOpen(false), 450);
+                          style={{ padding: "4px 10px", "border-radius": "6px", background: rightIslandOpen() ? "rgba(var(--veil-accent-rgb),0.15)" : "var(--veil-contrast-04)", border: "none", color: rightIslandOpen() ? "var(--veil-accent)" : "var(--veil-text-muted)", cursor: "pointer", "font-size": "11px", transition: "background 0.15s" }}
+                          onClick={async (event) => {
+                            const opener = event.currentTarget;
+                            if (memberPanelOpen()) {
+                              closeRightIsland();
+                              return;
+                            }
+                            try {
+                              const sessionEpoch = captureUiSessionEpoch();
+                              const members = await appStore.getGroupMembers(c().id);
+                              if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+                              setGroupMembers(members);
+                              openMembersIsland(opener);
+                            } catch (e) {
+                              console.warn("group member directory unavailable:", e);
                             }
                           }}
                           title="Group members"
@@ -1806,6 +2245,7 @@ const App: Component = () => {
                       </Show>
                       <For each={msgs()}>
                         {(msg, idx) => {
+                          let messageContextOpener: HTMLDivElement | undefined;
                           const prev = () => idx() > 0 ? msgs()[idx() - 1] : null;
                           const gap = () => !prev() || prev()!.senderKey !== msg.senderKey || msg.timestamp - prev()!.timestamp > 300000;
                           const time = () => new Date(msg.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -1840,20 +2280,37 @@ const App: Component = () => {
                               </Show>
                               <ContextMenu>
                                 <ContextMenuTrigger>
-                                  <div id={`msg-${msg.id}`} style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px", transition: "background 0.3s" }}>
+                                  <div
+                                    ref={messageContextOpener}
+                                    id={`msg-${msg.id}`}
+                                    tabIndex={-1}
+                                    aria-label={`Message from ${msg.senderName}`}
+                                    style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px", transition: "background 0.3s" }}
+                                  >
                                     <Show when={gap()} fallback={<div style={{ width: "36px", "flex-shrink": "0" }} />}>
-                                      <UserAvatar
-                                        identityKey={msg.senderKey}
-                                        canonicalServerOrigin={msg.senderOrigin ?? msg.senderProfileOrigin ?? avatarServerOrigin()}
-                                        userId={msg.senderUserId}
-                                        size={36}
-                                        style={{ "margin-top": "2px" }}
-                                      />
+                                      <IdentityTrigger
+                                        label={`View identity for ${msg.senderName}`}
+                                        onOpen={(trigger) => openIdentityIsland(messageIdentityProfile(msg), trigger)}
+                                        style={{ "border-radius": "50%", "align-self": "flex-start", "margin-top": "2px" }}
+                                      >
+                                        <UserAvatar
+                                          identityKey={msg.senderKey}
+                                          canonicalServerOrigin={msg.senderOrigin ?? msg.senderProfileOrigin}
+                                          userId={msg.senderUserId}
+                                          size={36}
+                                        />
+                                      </IdentityTrigger>
                                     </Show>
                                     <div style={{ flex: "1", "min-width": "0" }}>
                                       <Show when={gap()}>
                                         <div style={{ display: "flex", "align-items": "baseline", gap: "8px", "margin-bottom": "3px" }}>
-                                          <span style={{ "font-size": "13px", "font-weight": "600", color: msg.isOwn ? "var(--veil-accent)" : "var(--veil-text)" }}>{msg.senderName}</span>
+                                          <IdentityTrigger
+                                            label={`View identity for ${msg.senderName}`}
+                                            onOpen={(trigger) => openIdentityIsland(messageIdentityProfile(msg), trigger)}
+                                            style={{ "font-size": "13px", "font-weight": "600", color: msg.isOwn ? "var(--veil-accent)" : "var(--veil-text)", "border-radius": "4px" }}
+                                          >
+                                            {msg.senderName}
+                                          </IdentityTrigger>
                                           <span style={{ "font-size": "10px", color: "var(--veil-text-faint)", "font-family": "monospace" }}>{time()}</span>
                                         </div>
                                       </Show>
@@ -2044,6 +2501,15 @@ const App: Component = () => {
                                     </For>
                                   </div>
                                   <ContextMenuSeparator />
+                                  <ContextMenuItem onSelect={() => queueMicrotask(() => openIdentityIsland(
+                                    messageIdentityProfile(msg),
+                                    messageContextOpener ?? null,
+                                  ))}>
+                                    <ContextMenuIcon>
+                                      <Eye size={16} strokeWidth={2} />
+                                    </ContextMenuIcon>
+                                    View Identity
+                                  </ContextMenuItem>
                                   <ContextMenuItem disabled={isLocalOnlyMessage(msg)} onSelect={() => setReplyingTo(msg)}>
                                     <ContextMenuIcon>
                                       <Reply size={16} strokeWidth={2} />
@@ -2290,14 +2756,24 @@ const App: Component = () => {
               </Show>
             </main>
 
-            {/* ISLAND 4 — Members Panel */}
-            <MembersIsland
-              open={memberPanelOpen()}
+            {/* ISLAND 4 — Members ↔ Identity */}
+            <RightIsland
+              present={rightIslandRoute().kind !== "closed"}
+              open={rightIslandOpen()}
               visible={island4Vis()}
+              view={rightIslandRoute().kind === "identity" ? "identity" : "members"}
+              identityProfile={selectedIdentity()}
+              identityBackToMembers={identityBackToMembers()}
+              identityCanMessage={selectedIdentityCanMessage()}
+              identityMessageBusy={identityMessageBusy()}
               serverId={appStore.activeServerId()}
-              canonicalServerOrigin={avatarServerOrigin()}
+              contextName={appStore.activeServerId()
+                ? appStore.servers().find((server) => server.id === appStore.activeServerId())?.name
+                : conv()?.type === "group" ? conv()?.name : undefined}
+              canonicalServerOrigin={appStore.authenticatedServerScope()?.canonicalServerOrigin}
               serverOwnerId={appStore.servers().find((server) => server.id === appStore.activeServerId())?.ownerId}
               currentUserId={appStore.userId()}
+              currentIdentityKey={appStore.identity()}
               serverMembers={appStore.activeServerId()
                 ? (appStore.serverMembers()[appStore.activeServerId()!] ?? [])
                 : []}
@@ -2305,10 +2781,12 @@ const App: Component = () => {
                 ? (appStore.serverRoles()[appStore.activeServerId()!] ?? [])
                 : []}
               groupMembers={groupMembers()}
-              onCreateDm={(userId, username) => {
-                void appStore.createDm(userId, username).catch((error) => {
-                  toast.error("Conversation not created", String(error).replace(/^Error:\s*/, ""));
-                });
+              onOpenIdentity={(profile) => openIdentityIsland(profile, null, true)}
+              onBackToMembers={backToMembersIsland}
+              onClose={() => closeRightIsland()}
+              onMessageIdentity={() => void handleIdentityMessage()}
+              onCreateDm={(userId, username, expectedIdentityKey) => {
+                void handleRightIslandCreateDm(userId, username, expectedIdentityKey);
               }}
               onAssignRole={(serverId, userId, roleId) => {
                 void appStore.assignRole(serverId, userId, roleId);

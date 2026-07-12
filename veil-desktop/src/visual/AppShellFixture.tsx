@@ -9,11 +9,12 @@ import {
   UserPlus,
   Users,
 } from "lucide-solid";
-import { MembersIsland } from "@/components/layout/MembersIsland";
+import { RightIsland } from "@/components/layout/RightIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 import { LockScreen } from "@/components/chat/LockScreen";
 import { UserAvatar } from "@/components/identity/UserAvatar";
+import type { IdentityIslandProfile } from "@/components/identity/identityProfile";
 import type { Role, Server, ServerMember } from "@/stores/app";
 
 const WALLPAPER_URL = "/visual/wallpaper.svg";
@@ -448,7 +449,33 @@ export const AppShellFixture: Component = () => {
   const state = params.get("state") ?? "wallpaper";
   const lockScreen = state === "lock";
   const wallpaper = !lockScreen && state !== "plain";
-  const [membersOpen, setMembersOpen] = createSignal(state === "members");
+  const identityState = state === "identity";
+  const [membersOpen, setMembersOpen] = createSignal(state === "members" || identityState);
+  const [rightView, setRightView] = createSignal<"members" | "identity">(identityState ? "identity" : "members");
+  const [identityProfile, setIdentityProfile] = createSignal<IdentityIslandProfile | null>(identityState ? {
+    canonicalServerOrigin: FIXTURE_ORIGIN,
+    userId: SABLE_USER_ID,
+    identityKey: "22".repeat(32),
+    signingKey: "2a".repeat(32),
+    technicalUsername: "sable-arc",
+    displayName: "Sable Arc",
+    nickname: "Sable",
+    contextKind: "server-member",
+    contextLabel: "Server member",
+    contextDetail: "Server · Secure Lab",
+    joinedAt: "2026-07-02T12:30:00Z",
+    roles: [{ name: "Operator", color: "#34d399" }],
+  } : null);
+
+  const toggleMembers = () => {
+    if (membersOpen()) {
+      setMembersOpen(false);
+      return;
+    }
+    setRightView("members");
+    setIdentityProfile(null);
+    setMembersOpen(true);
+  };
 
   return (
     <div class="veil-app-shell" data-testid="app-shell" data-visual-state={state} style={rootStyle}>
@@ -484,18 +511,30 @@ export const AppShellFixture: Component = () => {
               onCreateServer={() => undefined}
               onJoinServer={() => undefined}
             />
-            <Sidebar membersOpen={membersOpen()} onToggleMembers={() => setMembersOpen((open) => !open)} />
+            <Sidebar membersOpen={membersOpen()} onToggleMembers={toggleMembers} />
             <Chat focusState={state === "focus"} />
-            <MembersIsland
+            <RightIsland
+              present={membersOpen()}
               open={membersOpen()}
               visible={membersOpen()}
               serverId="secure-lab"
               canonicalServerOrigin={FIXTURE_ORIGIN}
               serverOwnerId={CURRENT_USER_ID}
               currentUserId={CURRENT_USER_ID}
+              currentIdentityKey={"11".repeat(32)}
               serverMembers={members}
               serverRoles={roles}
               groupMembers={[]}
+              view={rightView()}
+              identityProfile={identityProfile()}
+              identityBackToMembers={rightView() === "identity"}
+              identityCanMessage={false}
+              identityMessageBusy={false}
+              contextName="Secure Lab"
+              onOpenIdentity={(profile) => { setIdentityProfile(profile); setRightView("identity"); }}
+              onBackToMembers={() => { setIdentityProfile(null); setRightView("members"); }}
+              onClose={() => setMembersOpen(false)}
+              onMessageIdentity={() => undefined}
               onCreateDm={() => undefined}
               onAssignRole={() => undefined}
               onUnassignRole={() => undefined}

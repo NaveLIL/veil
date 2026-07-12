@@ -2,7 +2,8 @@ import { Tabs as KTabs } from "@kobalte/core/tabs";
 import { Component, For, Show, createEffect, createMemo, createSignal, type JSX } from "solid-js";
 import {
   appStore,
-  canonicalServerOriginFromHttpUrl,
+  captureUiSessionEpoch,
+  isUiSessionEpochCurrent,
   type Friend,
   type FriendRequest,
 } from "@/stores/app";
@@ -10,6 +11,8 @@ import { Inbox, MessageCircle, UserMinus, Users } from "lucide-solid";
 import { toast } from "@/components/ui/toast";
 import { UserAvatar, type UserAvatarStatus } from "@/components/identity/UserAvatar";
 import { phaseprintIdentityForFriendRequest } from "@/components/identity/avatarIdentity";
+import { IdentityTrigger } from "@/components/identity/IdentityTrigger";
+import type { IdentityIslandProfile } from "@/components/identity/identityProfile";
 import {
   boundedIdentityRows,
   IDENTITY_ROW_RENDER_BUDGET,
@@ -62,12 +65,16 @@ const avatarStatus = (status: number): UserAvatarStatus => {
   }
 };
 
-const avatarServerOrigin = () => appStore.authenticatedServerScope()?.canonicalServerOrigin
-  ?? canonicalServerOriginFromHttpUrl(appStore.serverHttpUrl());
+const avatarServerOrigin = () => appStore.authenticatedServerScope()?.canonicalServerOrigin;
 
 /* ─── Add Friend Section ─── */
 
-const AddFriendSection: Component = () => {
+interface FriendsPanelProps {
+  onNavigate?: () => void;
+  onOpenIdentity: (profile: IdentityIslandProfile, trigger?: HTMLButtonElement) => void;
+}
+
+const AddFriendSection: Component<Pick<FriendsPanelProps, "onOpenIdentity">> = (props) => {
   const [username, setUsername] = createSignal("");
   const [status, setStatus] = createSignal<"idle" | "searching" | "found" | "sent" | "error">("idle");
   const [foundUser, setFoundUser] = createSignal<{ userId: string; username: string; identityKey: string } | null>(null);
@@ -156,17 +163,32 @@ const AddFriendSection: Component = () => {
 
       <Show when={status() === "found" && foundUser()}>
         <div style={{ display: "flex", "align-items": "center", gap: "12px", "margin-top": "16px", padding: "12px 14px", background: "var(--veil-contrast-03)", "border-radius": "10px", border: "1px solid var(--veil-contrast-06)" }}>
-          <UserAvatar
-            identityKey={foundUser()!.identityKey}
-            canonicalServerOrigin={avatarServerOrigin()}
-            userId={foundUser()!.userId}
-            technicalUsername={foundUser()!.username}
-            size={36}
-          />
-          <div style={{ flex: "1", "min-width": "0" }}>
-            <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)" }}>{foundUser()!.username}</div>
-            <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "font-family": "monospace", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{foundUser()!.userId.slice(0, 16)}...</div>
-          </div>
+          <IdentityTrigger
+            label={`View identity for ${foundUser()!.username}`}
+            onOpen={(trigger) => props.onOpenIdentity({
+              canonicalServerOrigin: avatarServerOrigin(),
+              userId: foundUser()!.userId,
+              identityKey: foundUser()!.identityKey,
+              technicalUsername: foundUser()!.username,
+              displayName: foundUser()!.username,
+              contextKind: "user-search",
+              contextLabel: "User search result",
+              contextDetail: "Authenticated server directory",
+            }, trigger)}
+            style={{ display: "flex", "align-items": "center", gap: "12px", flex: "1", "min-width": "0", "border-radius": "8px" }}
+          >
+            <UserAvatar
+              identityKey={foundUser()!.identityKey}
+              canonicalServerOrigin={avatarServerOrigin()}
+              userId={foundUser()!.userId}
+              technicalUsername={foundUser()!.username}
+              size={36}
+            />
+            <div style={{ flex: "1", "min-width": "0" }}>
+              <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)" }}>{foundUser()!.username}</div>
+              <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "font-family": "monospace", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{foundUser()!.userId.slice(0, 16)}...</div>
+            </div>
+          </IdentityTrigger>
           <button style={S.actionBtn} onClick={sendRequest}>Add</button>
         </div>
       </Show>
@@ -190,7 +212,10 @@ const AddFriendSection: Component = () => {
 
 /* ─── Request Item ─── */
 
-const RequestItem: Component<{ request: FriendRequest }> = (props) => {
+const RequestItem: Component<{
+  request: FriendRequest;
+  onOpenIdentity: FriendsPanelProps["onOpenIdentity"];
+}> = (props) => {
   const [responding, setResponding] = createSignal(false);
 
   const accept = async () => {
@@ -214,22 +239,39 @@ const RequestItem: Component<{ request: FriendRequest }> = (props) => {
     if (hours < 24) return `${hours}h ago`;
     return `${Math.floor(hours / 24)}d ago`;
   };
+  const identityProfile = (): IdentityIslandProfile => ({
+    canonicalServerOrigin: avatarServerOrigin(),
+    userId: props.request.outgoing ? undefined : props.request.fromUserId,
+    technicalUsername: props.request.fromUsername,
+    displayName: props.request.fromUsername,
+    contextKind: "friend-request",
+    contextLabel: props.request.outgoing ? "Outgoing friend request" : "Incoming friend request",
+    contextDetail: props.request.outgoing
+      ? "Recipient account locator is unavailable in this response"
+      : "Pending friendship request",
+  });
 
   return (
     <div style={S.rowBtn(false)}>
-      <UserAvatar
-        {...phaseprintIdentityForFriendRequest(props.request, avatarServerOrigin())}
-        size={36}
-      />
-      <div style={{ flex: "1", "min-width": "0" }}>
-        <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-          <span style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.request.fromUsername}</span>
-          <Show when={props.request.outgoing}>
-            <span style={{ "font-size": "10px", color: "var(--veil-text-faint)", background: "var(--veil-contrast-04)", padding: "2px 6px", "border-radius": "4px" }}>Outgoing</span>
-          </Show>
+      <IdentityTrigger
+        label={`View identity for ${props.request.fromUsername}`}
+        onOpen={(trigger) => props.onOpenIdentity(identityProfile(), trigger)}
+        style={{ display: "flex", "align-items": "center", gap: "12px", flex: "1", "min-width": "0", "border-radius": "8px" }}
+      >
+        <UserAvatar
+          {...phaseprintIdentityForFriendRequest(props.request, avatarServerOrigin())}
+          size={36}
+        />
+        <div style={{ flex: "1", "min-width": "0" }}>
+          <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
+            <span style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.request.fromUsername}</span>
+            <Show when={props.request.outgoing}>
+              <span style={{ "font-size": "10px", color: "var(--veil-text-faint)", background: "var(--veil-contrast-04)", padding: "2px 6px", "border-radius": "4px" }}>Outgoing</span>
+            </Show>
+          </div>
+          <span style={{ "font-size": "11px", color: "var(--veil-text-faint)" }}>{timeAgo()}</span>
         </div>
-        <span style={{ "font-size": "11px", color: "var(--veil-text-faint)" }}>{timeAgo()}</span>
-      </div>
+      </IdentityTrigger>
       <Show when={!props.request.outgoing}>
         <div style={{ display: "flex", gap: "6px" }}>
           <button
@@ -256,27 +298,49 @@ const FriendItem: Component<{
   friend: Friend;
   onMessage: (friend: Friend) => void;
   onRemove: (friend: Friend) => void;
+  onOpenIdentity: FriendsPanelProps["onOpenIdentity"];
 }> = (props) => {
   const [hovered, setHovered] = createSignal(false);
+  const [focusedWithin, setFocusedWithin] = createSignal(false);
 
   return (
     <div
       style={S.rowBtn(false)}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
+      onFocusIn={() => setFocusedWithin(true)}
+      onFocusOut={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) {
+          setFocusedWithin(false);
+        }
+      }}
     >
-      <UserAvatar
-        canonicalServerOrigin={avatarServerOrigin()}
-        userId={props.friend.userId}
-        technicalUsername={props.friend.username}
-        status={avatarStatus(props.friend.status)}
-        size={36}
-      />
-      <div style={{ flex: "1", "min-width": "0" }}>
-        <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.friend.username}</div>
-        <div style={{ "font-size": "11px", color: statusColor(props.friend.status) }}>{statusLabel(props.friend.status)}</div>
-      </div>
-      <div style={{ display: "flex", gap: "4px", opacity: hovered() ? 1 : 0, transition: "opacity 0.15s" }}>
+      <IdentityTrigger
+        label={`View identity for ${props.friend.username}`}
+        onOpen={(trigger) => props.onOpenIdentity({
+          canonicalServerOrigin: avatarServerOrigin(),
+          userId: props.friend.userId,
+          technicalUsername: props.friend.username,
+          displayName: props.friend.username,
+          contextKind: "friend",
+          contextLabel: "Friend",
+          contextDetail: statusLabel(props.friend.status),
+        }, trigger)}
+        style={{ display: "flex", "align-items": "center", gap: "12px", flex: "1", "min-width": "0", "border-radius": "8px" }}
+      >
+        <UserAvatar
+          canonicalServerOrigin={avatarServerOrigin()}
+          userId={props.friend.userId}
+          technicalUsername={props.friend.username}
+          status={avatarStatus(props.friend.status)}
+          size={36}
+        />
+        <div style={{ flex: "1", "min-width": "0" }}>
+          <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.friend.username}</div>
+          <div style={{ "font-size": "11px", color: statusColor(props.friend.status) }}>{statusLabel(props.friend.status)}</div>
+        </div>
+      </IdentityTrigger>
+      <div style={{ display: "flex", gap: "4px", opacity: hovered() || focusedWithin() ? 1 : 0, transition: "opacity 0.15s" }}>
         <button
           style={S.smallBtn("var(--veil-contrast-06)", "var(--veil-text-muted)")}
           onClick={() => props.onMessage(props.friend)}
@@ -300,7 +364,7 @@ type FriendsTab = "all" | "online" | "pending" | "add";
 
 /* ─── Main Panel ─── */
 
-export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
+export const FriendsPanel: Component<FriendsPanelProps> = (props) => {
   const [activeTab, setActiveTab] = createSignal<FriendsTab>("all");
 
   let lastOriginEpoch = appStore.originEpoch();
@@ -324,8 +388,11 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
   );
 
   const handleMessage = async (friend: Friend) => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
-      await appStore.createDm(friend.userId, friend.username);
+      const conversationId = await appStore.createDm(friend.userId, friend.username);
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+      appStore.selectConversation(conversationId);
       props.onNavigate?.();
     } catch (error) {
       toast.error("Conversation not created", String(error).replace(/^Error:\s*/, ""));
@@ -370,7 +437,7 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
       </div>
 
       <KTabs.Content value="add" style={S.content}>
-          <AddFriendSection />
+          <AddFriendSection onOpenIdentity={props.onOpenIdentity} />
       </KTabs.Content>
 
       <KTabs.Content value="pending" style={S.content}>
@@ -390,7 +457,7 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
               Pending — {appStore.friendRequests().length}
             </div>
             <For each={visibleRequests()}>
-              {(req) => <RequestItem request={req} />}
+              {(req) => <RequestItem request={req} onOpenIdentity={props.onOpenIdentity} />}
             </For>
             <Show when={appStore.friendRequests().length > IDENTITY_ROW_RENDER_BUDGET}>
               <div role="status" style={S.renderStatus}>
@@ -438,6 +505,7 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
                   friend={friend}
                   onMessage={handleMessage}
                   onRemove={handleRemove}
+                  onOpenIdentity={props.onOpenIdentity}
                 />
               )}
             </For>

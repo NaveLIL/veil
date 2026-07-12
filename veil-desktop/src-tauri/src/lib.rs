@@ -1904,6 +1904,56 @@ fn decode_lower_hex_32(field: &str, value: &str) -> Result<[u8; 32], String> {
     decode_lower_hex_fixed(field, value)
 }
 
+fn parse_expected_dm_peer_identity_key(value: Option<&str>) -> Result<Option<[u8; 32]>, String> {
+    value
+        .map(|value| decode_lower_hex_32("expected DM peer identity key", value))
+        .transpose()
+}
+
+fn validate_expected_dm_peer_identity_key(
+    expected: Option<&[u8; 32]>,
+    authenticated: &[u8; 32],
+) -> Result<(), String> {
+    if expected.is_some_and(|expected| expected != authenticated) {
+        return Err(
+            "authenticated DM peer identity key does not match the requested identity".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_created_dm_account_directory<'a>(
+    directory: &'a std::collections::HashMap<String, PinnedDirectoryMember>,
+    authenticated_user_id: &str,
+    local_identity_key: &[u8; 32],
+    local_signing_key: &[u8; 32],
+    peer_user_id: &str,
+    peer_identity_key: &[u8; 32],
+    peer_signing_key: &[u8; 32],
+) -> Result<&'a PinnedDirectoryMember, String> {
+    if peer_user_id == authenticated_user_id {
+        return Err("DM peer must differ from the authenticated account".to_string());
+    }
+    if directory.len() != 2 {
+        return Err("created DM directory must contain exactly two accounts".to_string());
+    }
+    validate_pinned_directory_self(
+        directory,
+        authenticated_user_id,
+        local_identity_key,
+        local_signing_key,
+    )?;
+    let peer = directory
+        .get(peer_user_id)
+        .ok_or("created DM directory is missing the requested peer")?;
+    if peer.identity_key != *peer_identity_key || peer.signing_key != *peer_signing_key {
+        return Err(
+            "created DM response conflicts with its authenticated member directory".to_string(),
+        );
+    }
+    Ok(peer)
+}
+
 fn decode_lower_hex_fixed<const N: usize>(field: &str, value: &str) -> Result<[u8; N], String> {
     if value.len() != N * 2
         || !value
@@ -5046,11 +5096,18 @@ fn create_dm(
     server_http_url: String,
     our_user_id: String,
     peer_user_id: String,
+    expected_peer_identity_key: Option<String>,
 ) -> Result<String, String> {
     require_unlocked(&state)?;
     let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
     let live_action_binding = capture_confirmed_live_action_binding(&state)?;
     decode_canonical_uuid("DM peer user id", &peer_user_id)?;
+    // Reject malformed renderer input before the POST can create a server-side
+    // conversation. The decoded value remains process-local and is compared
+    // with the authenticated response before any local durable/runtime state
+    // is published.
+    let expected_peer_identity_key =
+        parse_expected_dm_peer_identity_key(expected_peer_identity_key.as_deref())?;
     let authenticated_user_id = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
         require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
@@ -5060,6 +5117,9 @@ fn create_dm(
         }
         authenticated_user_id
     };
+    if peer_user_id == authenticated_user_id {
+        return Err("DM peer must differ from the authenticated account".to_string());
+    }
 
     let body = state.runtime.block_on(rest_send_json(
         &state,
@@ -5084,6 +5144,10 @@ fn create_dm(
             .as_str()
             .ok_or_else(|| "DM response missing peer_identity_key".to_string())?,
     )?;
+    validate_expected_dm_peer_identity_key(
+        expected_peer_identity_key.as_ref(),
+        &peer_identity_key,
+    )?;
     let peer_signing_key = decode_b64_array::<32>(
         "peer_signing_key",
         body["peer_signing_key"]
@@ -5096,29 +5160,13 @@ fn create_dm(
         .origin
         .canonical_server_origin();
     let created_at = identity_observed_at();
-    {
-        let client = state.client.lock().map_err(|e| e.to_string())?;
-        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-        client
-            .db()
-            .ok_or("database not initialized")?
-            .upsert_directory_conversation(
-                &conversation_id,
-                0,
-                &canonical_server_origin,
-                None,
-                Some(&peer_user_id),
-                Some(peer_identity_key.as_slice()),
-                None,
-                &created_at,
-            )?;
-    }
 
-    // Re-read the existing signed member directory so the durable DM binding
-    // contains the peer account UUID and authenticated origin before it is
-    // published into the live ratchet map. The POST response alone carries
-    // keys but not the authoritative presentation label.
-    let members = fetch_authorized_conversation_directory(
+    // Fetch and validate the authenticated member directory without publishing
+    // it yet. A newly created server conversation has no local origin row, so
+    // the normal existing-conversation directory path cannot be used for this
+    // preflight. Every substitution/continuity check below completes before
+    // the first local durable/runtime binding is written.
+    let members = fetch_conversation_directory_members(
         &state,
         &server_http_url,
         &authenticated_user_id,
@@ -5126,21 +5174,49 @@ fn create_dm(
         Some(&live_action_binding),
     )?;
     let directory = pinned_account_directory_from_json(&members)?;
-    let peer = directory
-        .get(&peer_user_id)
-        .ok_or("created DM directory is missing the requested peer")?;
-    if peer.identity_key != peer_identity_key || peer.signing_key != peer_signing_key {
-        return Err(
-            "created DM response conflicts with its authenticated member directory".to_string(),
-        );
-    }
     {
-        let client = state.client.lock().map_err(|e| e.to_string())?;
+        let mut client = state.client.lock().map_err(|e| e.to_string())?;
         require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-        client
-            .db()
-            .ok_or("database not initialized")?
-            .upsert_directory_conversation(
+        if client.authenticated_user_id()? != authenticated_user_id {
+            return Err("created DM directory user differs from authenticated session".to_string());
+        }
+        let peer = validate_created_dm_account_directory(
+            &directory,
+            &authenticated_user_id,
+            &client.identity_key()?,
+            &client.signing_key()?,
+            &peer_user_id,
+            &peer_identity_key,
+            &peer_signing_key,
+        )?;
+        for (member_user_id, member) in &directory {
+            client.ensure_user_identity_binding_compatible(member_user_id, member.identity_key)?;
+            client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
+        }
+        let snapshots: Vec<AccountSnapshot> = directory
+            .iter()
+            .map(|(member_user_id, member)| AccountSnapshot {
+                locator: ProfileLocator {
+                    canonical_server_origin: canonical_server_origin.clone(),
+                    user_id: member_user_id.clone(),
+                    identity_key: member.identity_key,
+                },
+                signing_key: member.signing_key,
+                username: Some(member.username.clone()),
+                display_name: None,
+                profile_version: None,
+                profile_origin: canonical_server_origin.clone(),
+                source: AccountSnapshotSource::AuthenticatedConversationDirectory,
+                observed_at: created_at.clone(),
+            })
+            .collect();
+        {
+            let db = client.db().ok_or("database not initialized")?;
+            // Persist the validated identity snapshots first. A durable
+            // continuity conflict therefore fails before the conversation can
+            // become addressable by its bare UUID.
+            db.upsert_identity_directory(&snapshots)?;
+            db.upsert_directory_conversation(
                 &conversation_id,
                 0,
                 &canonical_server_origin,
@@ -5150,21 +5226,24 @@ fn create_dm(
                 None,
                 &created_at,
             )?;
+        }
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        for (member_user_id, member) in &directory {
+            client.remember_user_identity(member_user_id, member.identity_key)?;
+            client.pin_peer_signing_key(member.identity_key, member.signing_key)?;
+        }
+        client.replace_authorized_conversation_senders(
+            &conversation_id,
+            directory.values().map(|member| member.identity_key),
+        )?;
     }
 
     // Reopening an existing deterministic DM must never replace a healthy
-    // Double Ratchet with a fresh one. Pin the directory response first; only
-    // fetch/consume a new prekey bundle when no session exists locally.
+    // Double Ratchet with a fresh one. Only fetch/consume a new prekey bundle
+    // when no session exists locally.
     let session_exists = {
         let mut client = state.client.lock().map_err(|e| e.to_string())?;
         require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-        client.pin_peer_signing_key(peer_identity_key, peer_signing_key)?;
-        client.remember_user_identity(&peer_user_id, peer_identity_key)?;
-        let our_identity_key = client.identity_key()?;
-        client.replace_authorized_conversation_senders(
-            &conversation_id,
-            [our_identity_key, peer_identity_key],
-        )?;
         let exists = client.has_session(&peer_identity_key);
         if exists {
             client.bind_dm_conversation(&conversation_id, peer_identity_key)?;
@@ -5372,7 +5451,7 @@ fn pin_directory_member_keys(
     Ok(())
 }
 
-fn fetch_authorized_conversation_directory(
+fn fetch_conversation_directory_members(
     state: &AppState,
     server_http_url: &str,
     user_id: &str,
@@ -5416,6 +5495,23 @@ fn fetch_authorized_conversation_directory(
     if members.is_empty() || members.len() > 1_024 {
         return Err("conversation directory member count is outside client limits".to_string());
     }
+    Ok(members)
+}
+
+fn fetch_authorized_conversation_directory(
+    state: &AppState,
+    server_http_url: &str,
+    user_id: &str,
+    conversation_id: &str,
+    live_action_binding: Option<&RestBinding>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let members = fetch_conversation_directory_members(
+        state,
+        server_http_url,
+        user_id,
+        conversation_id,
+        live_action_binding,
+    )?;
 
     let mut validated = Vec::with_capacity(members.len());
     let mut user_ids = std::collections::HashSet::new();
@@ -5532,6 +5628,7 @@ fn pinned_account_directory_from_json(
     members: &[serde_json::Value],
 ) -> Result<std::collections::HashMap<String, PinnedDirectoryMember>, String> {
     let mut directory = std::collections::HashMap::with_capacity(members.len());
+    let mut identities = std::collections::HashSet::with_capacity(members.len());
     for member in members {
         let user_id = member
             .get("user_id")
@@ -5562,6 +5659,9 @@ fn pinned_account_directory_from_json(
                 .and_then(serde_json::Value::as_str)
                 .ok_or("conversation directory member is missing signing_key")?,
         )?;
+        if !identities.insert(identity_key) {
+            return Err("conversation directory maps one identity to multiple users".to_string());
+        }
         if directory
             .insert(
                 user_id.to_string(),
@@ -7759,17 +7859,19 @@ mod e2ee_rest_tests {
     use super::{
         authenticated_event_payload, consume_pending_lock_event,
         exact_confirmed_live_action_binding, invalidate_disconnected_binding, offline_sync_url,
-        parse_device_directory, parse_message_crypto_context, parse_prekey_bundle,
-        preserve_created_group_outcome, publish_unlocked_session, resolve_auto_lock_seconds,
-        rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
-        valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
-        validate_expected_live_action_binding, validate_expected_rest_binding,
-        validate_live_action_rest_origin, validate_live_message_security_context,
-        validate_next_cursor, validate_persisted_message_conversation,
-        validate_pinned_directory_self, validate_rest_url, validate_server_endpoint_pair,
-        validate_utc_rfc3339_nano, verify_device_directory_account_keys, AuthenticatedSessionScope,
-        ConversationSyncIsolation, ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding,
-        RestOrigin, DEFAULT_AUTO_LOCK_SECONDS,
+        parse_device_directory, parse_expected_dm_peer_identity_key, parse_message_crypto_context,
+        parse_prekey_bundle, preserve_created_group_outcome, publish_unlocked_session,
+        resolve_auto_lock_seconds, rest_api_url, rest_authority, rest_canonical, rest_origin,
+        rest_request_target, valid_auto_lock_seconds, valid_unlock_pin,
+        validate_authenticated_binding_commit, validate_created_dm_account_directory,
+        validate_expected_dm_peer_identity_key, validate_expected_live_action_binding,
+        validate_expected_rest_binding, validate_live_action_rest_origin,
+        validate_live_message_security_context, validate_next_cursor,
+        validate_persisted_message_conversation, validate_pinned_directory_self, validate_rest_url,
+        validate_server_endpoint_pair, validate_utc_rfc3339_nano,
+        verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
+        ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
+        DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
 
@@ -7802,6 +7904,124 @@ mod e2ee_rest_tests {
         assert_eq!(bundle.signed_prekey_id, 7);
         assert_eq!(bundle.one_time_prekey_id, Some(9));
         assert!(parse_prekey_bundle(value, &[8u8; 32]).is_err());
+    }
+
+    #[test]
+    fn expected_dm_peer_identity_key_accepts_an_exact_authenticated_match() {
+        let authenticated = [0x2au8; 32];
+        let encoded = hex::encode(authenticated);
+        let expected = parse_expected_dm_peer_identity_key(Some(&encoded))
+            .unwrap()
+            .expect("expected key must be decoded");
+
+        assert_eq!(expected, authenticated);
+        assert!(validate_expected_dm_peer_identity_key(Some(&expected), &authenticated).is_ok());
+    }
+
+    #[test]
+    fn expected_dm_peer_identity_key_rejects_an_authenticated_mismatch() {
+        let expected = [0x2au8; 32];
+        let authenticated = [0x2bu8; 32];
+
+        let error = validate_expected_dm_peer_identity_key(Some(&expected), &authenticated)
+            .expect_err("identity substitution must fail closed");
+        assert!(error.contains("does not match"));
+    }
+
+    #[test]
+    fn expected_dm_peer_identity_key_rejects_noncanonical_hex() {
+        assert!(parse_expected_dm_peer_identity_key(Some(&"2a".repeat(31))).is_err());
+        assert!(parse_expected_dm_peer_identity_key(Some(&"2A".repeat(32))).is_err());
+        assert!(parse_expected_dm_peer_identity_key(Some(&"zz".repeat(32))).is_err());
+    }
+
+    #[test]
+    fn absent_expected_dm_peer_identity_key_preserves_directory_driven_creation() {
+        let authenticated = [0x2au8; 32];
+        let expected = parse_expected_dm_peer_identity_key(None).unwrap();
+
+        assert!(expected.is_none());
+        assert!(validate_expected_dm_peer_identity_key(expected.as_ref(), &authenticated).is_ok());
+    }
+
+    #[test]
+    fn created_dm_directory_requires_an_exact_two_account_binding() {
+        let local_user_id = "00000000-0000-0000-0000-000000000001";
+        let peer_user_id = "00000000-0000-0000-0000-000000000002";
+        let local_identity = [0x11; 32];
+        let local_signing = [0x12; 32];
+        let peer_identity = [0x21; 32];
+        let peer_signing = [0x22; 32];
+        let mut directory = std::collections::HashMap::from([
+            (
+                local_user_id.to_string(),
+                PinnedDirectoryMember {
+                    username: "alice".to_string(),
+                    identity_key: local_identity,
+                    signing_key: local_signing,
+                },
+            ),
+            (
+                peer_user_id.to_string(),
+                PinnedDirectoryMember {
+                    username: "bob".to_string(),
+                    identity_key: peer_identity,
+                    signing_key: peer_signing,
+                },
+            ),
+        ]);
+
+        let peer = validate_created_dm_account_directory(
+            &directory,
+            local_user_id,
+            &local_identity,
+            &local_signing,
+            peer_user_id,
+            &peer_identity,
+            &peer_signing,
+        )
+        .unwrap();
+        assert_eq!(peer.username, "bob");
+
+        assert!(validate_created_dm_account_directory(
+            &directory,
+            local_user_id,
+            &local_identity,
+            &local_signing,
+            local_user_id,
+            &local_identity,
+            &local_signing,
+        )
+        .is_err());
+        assert!(validate_created_dm_account_directory(
+            &directory,
+            local_user_id,
+            &local_identity,
+            &local_signing,
+            peer_user_id,
+            &[0x23; 32],
+            &peer_signing,
+        )
+        .is_err());
+
+        directory.insert(
+            "00000000-0000-0000-0000-000000000003".to_string(),
+            PinnedDirectoryMember {
+                username: "mallory".to_string(),
+                identity_key: [0x31; 32],
+                signing_key: [0x32; 32],
+            },
+        );
+        assert!(validate_created_dm_account_directory(
+            &directory,
+            local_user_id,
+            &local_identity,
+            &local_signing,
+            peer_user_id,
+            &peer_identity,
+            &peer_signing,
+        )
+        .is_err());
     }
 
     #[test]

@@ -1,7 +1,8 @@
 import { Component, createSignal, createMemo, Show, For, Switch, Match, onMount, onCleanup, createEffect, on } from "solid-js";
 import {
   appStore,
-  canonicalServerOriginFromHttpUrl,
+  captureUiSessionEpoch,
+  isUiSessionEpochCurrent,
   type Channel,
   type Role,
   type ServerMember,
@@ -11,6 +12,17 @@ import { Popover as KPopover } from "@kobalte/core/popover";
 import { Z } from "@/lib/zIndex";
 import { alertDecision, confirmDecision, promptDecision } from "@/lib/decisionDialog";
 import { UserAvatar } from "@/components/identity/UserAvatar";
+import { IdentityTrigger } from "@/components/identity/IdentityTrigger";
+import { IdentityIslandSheet } from "@/components/identity/IdentityIsland";
+import {
+  boundedIdentityRoles,
+  canonicalIdentityKey,
+  canonicalIdentityOrigin,
+  canonicalIdentityUserId,
+  identityProfileKey,
+  IDENTITY_ROLE_PRESENTATION_BUDGET,
+  type IdentityIslandProfile,
+} from "@/components/identity/identityProfile";
 import {
   boundedIdentityRows,
   IDENTITY_ROW_RENDER_BUDGET,
@@ -98,7 +110,10 @@ export const ServerSettingsScreen: Component = () => {
   const [section, setSection] = createSignal<Section>("overview");
   const [entering, setEntering] = createSignal(true);
   const [copied, setCopied] = createSignal("");
+  const [selectedIdentity, setSelectedIdentity] = createSignal<IdentityIslandProfile | null>(null);
+  const [identityMessageBusy, setIdentityMessageBusy] = createSignal(false);
   const timers = new Set<ReturnType<typeof setTimeout>>();
+  let identityMessageActionToken = 0;
   let closing = false;
   const later = (callback: () => void, delayMs: number) => {
     const timer = setTimeout(() => {
@@ -139,6 +154,34 @@ export const ServerSettingsScreen: Component = () => {
     if (!id) return [];
     return appStore.serverMembers()[id] ?? [];
   });
+  const identityPresentationRoles = createMemo<Role[]>(() => {
+    const id = sid();
+    if (!id) return [];
+    const source = appStore.serverRoles()[id] ?? [];
+    return [...boundedIdentityRoles(source)].sort(
+      (a, b) => b.position - a.position,
+    );
+  });
+  const assignableIdentityRoles = createMemo(() =>
+    identityPresentationRoles().filter((role) => !role.isDefault),
+  );
+  const identityRolesTruncated = () => {
+    const id = sid();
+    return !!id && (appStore.serverRoles()[id]?.length ?? 0) > IDENTITY_ROLE_PRESENTATION_BUDGET;
+  };
+
+  const invalidateIdentityMessageAction = () => {
+    identityMessageActionToken += 1;
+    setIdentityMessageBusy(false);
+  };
+  const closeSelectedIdentity = () => {
+    invalidateIdentityMessageAction();
+    setSelectedIdentity(null);
+  };
+  const openSelectedIdentity = (profile: IdentityIslandProfile) => {
+    invalidateIdentityMessageAction();
+    setSelectedIdentity(profile);
+  };
 
   // ─── Lifecycle ─────────────────────────────────────
   onMount(() => {
@@ -146,6 +189,7 @@ export const ServerSettingsScreen: Component = () => {
     document.addEventListener("keydown", handleKey);
   });
   onCleanup(() => {
+    identityMessageActionToken += 1;
     timers.forEach(clearTimeout);
     timers.clear();
     document.removeEventListener("keydown", handleKey);
@@ -165,12 +209,19 @@ export const ServerSettingsScreen: Component = () => {
   const goBack = () => {
     if (closing) return;
     closing = true;
+    closeSelectedIdentity();
     setEntering(true);
     later(() => appStore.closeServerSettings(), 250);
   };
 
   const handleKey = (e: KeyboardEvent) => {
-    if (e.key === "Escape") goBack();
+    if (e.key !== "Escape" || e.isComposing) return;
+    // Kobalte layers handle Escape synchronously and call preventDefault().
+    // Defer the settings-level fallback so the topmost sheet/menu/dialog gets
+    // first refusal regardless of document-listener registration order.
+    queueMicrotask(() => {
+      if (!e.defaultPrevented) goBack();
+    });
   };
 
   const copyText = async (text: string, label: string) => {
@@ -969,6 +1020,135 @@ export const ServerSettingsScreen: Component = () => {
       m.userId.toLowerCase().includes(q),
     );
   });
+
+  let identityOriginEpoch = appStore.originEpoch();
+  createEffect(() => {
+    const currentOriginEpoch = appStore.originEpoch();
+    if (!appStore.bindingTransitioning() && currentOriginEpoch === identityOriginEpoch) return;
+    identityOriginEpoch = currentOriginEpoch;
+    closeSelectedIdentity();
+  });
+
+  const authenticatedIdentityLocator = () => {
+    const scope = appStore.authenticatedServerScope();
+    const canonicalServerOrigin = canonicalIdentityOrigin(scope?.canonicalServerOrigin);
+    const userId = canonicalIdentityUserId(scope?.userId);
+    const rendererUserId = canonicalIdentityUserId(appStore.userId());
+    const identityKey = canonicalIdentityKey(appStore.identity());
+    if (!canonicalServerOrigin || !userId || rendererUserId !== userId || !identityKey) return null;
+    return { canonicalServerOrigin, userId, identityKey };
+  };
+
+  const isExactCurrentIdentity = (
+    canonicalServerOrigin: string | null | undefined,
+    userId: string | null | undefined,
+    identityKey: string | null | undefined,
+  ) => {
+    const current = authenticatedIdentityLocator();
+    return !!current
+      && canonicalIdentityOrigin(canonicalServerOrigin) === current.canonicalServerOrigin
+      && canonicalIdentityUserId(userId) === current.userId
+      && canonicalIdentityKey(identityKey) === current.identityKey;
+  };
+
+  const selectedIdentityDmState = createMemo(() => {
+    const profile = selectedIdentity();
+    const targetOrigin = canonicalIdentityOrigin(profile?.canonicalServerOrigin);
+    const targetUserId = canonicalIdentityUserId(profile?.userId);
+    const targetIdentityKey = canonicalIdentityKey(profile?.identityKey);
+    if (!profile || !targetOrigin || !targetUserId || !targetIdentityKey) {
+      return {
+        targetUserId: null,
+        targetIdentityKey: null,
+        localConversationId: null,
+        canCreate: false,
+      };
+    }
+
+    const sameAccountDms = appStore.conversations().filter((conversation) =>
+      conversation.type === "dm"
+      && canonicalIdentityOrigin(conversation.serverOrigin) === targetOrigin
+      && canonicalIdentityUserId(conversation.peerUserId) === targetUserId
+    );
+    const matchingDms = sameAccountDms.filter(
+      (conversation) => canonicalIdentityKey(conversation.peerKey) === targetIdentityKey,
+    );
+    const conflictingKey = sameAccountDms.some((conversation) => {
+      const localKey = canonicalIdentityKey(conversation.peerKey);
+      return !!localKey && localKey !== targetIdentityKey;
+    });
+    const exactSelf = isExactCurrentIdentity(targetOrigin, targetUserId, targetIdentityKey);
+    const current = authenticatedIdentityLocator();
+    const currentAccountConflict = !!current
+      && current.canonicalServerOrigin === targetOrigin
+      && current.userId === targetUserId
+      && current.identityKey !== targetIdentityKey;
+    const blocked = exactSelf || currentAccountConflict || conflictingKey || matchingDms.length > 1;
+
+    return {
+      targetUserId,
+      targetIdentityKey,
+      localConversationId: !blocked && matchingDms.length === 1
+        ? matchingDms[0].id
+        : null,
+      canCreate: !blocked
+        && matchingDms.length === 0
+        && !!current
+        && current.canonicalServerOrigin === targetOrigin
+        && current.userId !== targetUserId
+        && appStore.connected()
+        && !appStore.bindingTransitioning()
+        && !appStore.originTransitioning(),
+    };
+  });
+
+  const selectedIdentityCanMessage = () => {
+    if (appStore.bindingTransitioning() || appStore.originTransitioning()) return false;
+    const state = selectedIdentityDmState();
+    return !!state.localConversationId || state.canCreate;
+  };
+
+  const messageSelectedIdentity = async () => {
+    const profile = selectedIdentity();
+    const dmState = selectedIdentityDmState();
+    if (!profile || !selectedIdentityCanMessage() || identityMessageBusy()) return;
+
+    if (dmState.localConversationId) {
+      if (!appStore.selectRetainedLocalDm(dmState.localConversationId)) return;
+      closeSelectedIdentity();
+      appStore.setScreen("chat");
+      return;
+    }
+    if (!dmState.canCreate || !dmState.targetUserId || !dmState.targetIdentityKey) return;
+
+    const actionToken = ++identityMessageActionToken;
+    const sessionEpoch = captureUiSessionEpoch();
+    const profileKey = identityProfileKey(profile);
+    const actionIsCurrent = () => {
+      const currentProfile = selectedIdentity();
+      return identityMessageActionToken === actionToken
+        && isUiSessionEpochCurrent(sessionEpoch)
+        && !!currentProfile
+        && identityProfileKey(currentProfile) === profileKey;
+    };
+    setIdentityMessageBusy(true);
+    try {
+      const conversationId = await appStore.createDm(
+        dmState.targetUserId,
+        profile.technicalUsername || undefined,
+        dmState.targetIdentityKey,
+      );
+      if (!actionIsCurrent()) return;
+      appStore.selectConversation(conversationId);
+      closeSelectedIdentity();
+      appStore.setScreen("chat");
+    } catch (error) {
+      if (!actionIsCurrent()) return;
+      await alertDecision({ title: "Conversation not created", message: String(error).replace(/^Error:\s*/, "") });
+    } finally {
+      if (identityMessageActionToken === actionToken) setIdentityMessageBusy(false);
+    }
+  };
   const visibleMembers = createMemo(() => [...boundedIdentityRows(filteredMembers())].sort((a, b) =>
     (a.nickname || a.username).localeCompare(b.nickname || b.username),
   ));
@@ -1025,32 +1205,66 @@ export const ServerSettingsScreen: Component = () => {
         >
           <For each={visibleMembers()}>
             {(m) => {
-              const isMe = () => m.userId === appStore.userId();
+              const isMe = () => isExactCurrentIdentity(
+                appStore.authenticatedServerScope()?.canonicalServerOrigin,
+                m.userId,
+                m.identityKey,
+              );
               const isServerOwner = () => m.userId === server()?.ownerId;
+              const identityProfile = (): IdentityIslandProfile => {
+                const roleIds = new Set(boundedIdentityRoles(m.roleIds));
+                const contextualRoles = identityPresentationRoles()
+                  .filter((role) => roleIds.has(role.id) && !role.isDefault);
+                return {
+                  canonicalServerOrigin: appStore.authenticatedServerScope()?.canonicalServerOrigin,
+                  userId: m.userId,
+                  identityKey: m.identityKey,
+                  technicalUsername: m.username,
+                  displayName: m.nickname || m.username,
+                  nickname: m.nickname,
+                  contextKind: "server-member",
+                  contextLabel: isServerOwner() ? "Server owner" : "Server member",
+                  contextDetail: server()?.name ? `Server · ${server()!.name}` : "Server settings",
+                  joinedAt: m.joinedAt,
+                  isOwner: isServerOwner(),
+                  selfIdentity: authenticatedIdentityLocator(),
+                  roles: contextualRoles
+                    .slice(0, 3)
+                    .map((role) => ({ name: role.name, color: colorToHex(role.color) })),
+                  rolesTruncated: identityRolesTruncated()
+                    || m.roleIds.length > IDENTITY_ROLE_PRESENTATION_BUDGET
+                    || contextualRoles.length > 3,
+                };
+              };
               return (
                 <div style={S.listRow}>
-                  <UserAvatar
-                    identityKey={m.identityKey}
-                    canonicalServerOrigin={appStore.authenticatedServerScope()?.canonicalServerOrigin
-                      ?? canonicalServerOriginFromHttpUrl(appStore.serverHttpUrl())}
-                    userId={m.userId}
-                    technicalUsername={m.username}
-                    size={32}
-                  />
-                  <div style={{ flex: "1", "min-width": "0" }}>
-                    <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600" }}>
-                      {m.nickname || m.username}
-                      <Show when={isServerOwner()}>
-                        <span style={{ ...S.badge("var(--veil-warning)"), "margin-left": "8px" }}>Owner</span>
-                      </Show>
-                      <Show when={isMe() && !isServerOwner()}>
-                        <span style={{ ...S.badge("var(--veil-accent)"), "margin-left": "8px" }}>You</span>
-                      </Show>
+                  <IdentityTrigger
+                    label={`View identity for ${m.nickname || m.username}`}
+                    onOpen={() => openSelectedIdentity(identityProfile())}
+                    style={{ display: "flex", "align-items": "center", gap: "12px", flex: "1", "min-width": "0", "border-radius": "8px" }}
+                  >
+                    <UserAvatar
+                      identityKey={m.identityKey}
+                      canonicalServerOrigin={appStore.authenticatedServerScope()?.canonicalServerOrigin}
+                      userId={m.userId}
+                      technicalUsername={m.username}
+                      size={32}
+                    />
+                    <div style={{ flex: "1", "min-width": "0" }}>
+                      <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600" }}>
+                        {m.nickname || m.username}
+                        <Show when={isServerOwner()}>
+                          <span style={{ ...S.badge("var(--veil-warning)"), "margin-left": "8px" }}>Owner</span>
+                        </Show>
+                        <Show when={isMe() && !isServerOwner()}>
+                          <span style={{ ...S.badge("var(--veil-accent)"), "margin-left": "8px" }}>You</span>
+                        </Show>
+                      </div>
+                      <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px", "font-family": "monospace" }}>
+                        {m.userId.slice(0, 16)}…
+                      </div>
                     </div>
-                    <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px", "font-family": "monospace" }}>
-                      {m.userId.slice(0, 16)}…
-                    </div>
-                  </div>
+                  </IdentityTrigger>
 
                   <Show when={isOwner() && !isServerOwner()}>
                     <KPopover placement="bottom-end" gutter={6}>
@@ -1072,7 +1286,7 @@ export const ServerSettingsScreen: Component = () => {
                           <KPopover.Title style={{ padding: "4px 10px 7px", "font-size": "11px", "font-weight": "600", color: "var(--veil-text-muted)" }}>
                             Roles for {m.nickname || m.username}
                           </KPopover.Title>
-                          <For each={roles().filter((r) => !r.isDefault)}>
+                          <For each={assignableIdentityRoles()}>
                             {(r) => {
                               const has = () => m.roleIds.includes(r.id);
                               return (
@@ -1106,9 +1320,17 @@ export const ServerSettingsScreen: Component = () => {
                               );
                             }}
                           </For>
-                          <Show when={roles().filter((r) => !r.isDefault).length === 0}>
+                          <Show when={assignableIdentityRoles().length === 0 && !identityRolesTruncated()}>
                             <div style={{ padding: "8px 10px", "font-size": "11px", color: "var(--veil-text-faint)" }}>
                               No assignable roles. Create one in Roles tab.
+                            </div>
+                          </Show>
+                          <Show when={identityRolesTruncated()}>
+                            <div
+                              role="status"
+                              style={{ padding: "8px 10px", "font-size": "10px", color: "var(--veil-text-faint)", "line-height": "1.4" }}
+                            >
+                              Showing the first {IDENTITY_ROLE_PRESENTATION_BUDGET} role records. Manage remaining roles in the Roles tab.
                             </div>
                           </Show>
                         </KPopover.Content>
@@ -1374,13 +1596,14 @@ export const ServerSettingsScreen: Component = () => {
 
   // ─── Render ────────────────────────────────────────
   return (
-    <Show when={server()} fallback={
-      <div style={{ ...S.overlay, ...animStyle(), "align-items": "center", "justify-content": "center" }}>
-        <div style={{ color: "var(--veil-text-muted)", "font-size": "13px" }}>Server not found.</div>
-        <button type="button" style={{ ...S.backBtn, position: "absolute" as const }} onClick={goBack} title="Back to chat" aria-label="Back to chat"><ArrowLeft size={17} strokeWidth={1.8} /></button>
-      </div>
-    }>
-      <div style={{ ...S.overlay, ...animStyle() }}>
+    <>
+      <Show when={server()} fallback={
+        <div style={{ ...S.overlay, ...animStyle(), "align-items": "center", "justify-content": "center" }}>
+          <div style={{ color: "var(--veil-text-muted)", "font-size": "13px" }}>Server not found.</div>
+          <button type="button" style={{ ...S.backBtn, position: "absolute" as const }} onClick={goBack} title="Back to chat" aria-label="Back to chat"><ArrowLeft size={17} strokeWidth={1.8} /></button>
+        </div>
+      }>
+        <div style={{ ...S.overlay, ...animStyle() }}>
         {/* Close button */}
         <button
           type="button"
@@ -1429,7 +1652,20 @@ export const ServerSettingsScreen: Component = () => {
             <Match when={section() === "danger"}><DangerSection /></Match>
           </Switch>
         </main>
-      </div>
-    </Show>
+        </div>
+      </Show>
+      <IdentityIslandSheet
+        open={!!selectedIdentity()}
+        profile={selectedIdentity() ?? {
+          displayName: "Unknown account",
+          contextKind: "server-member",
+          contextLabel: "Server member",
+        }}
+        canMessage={selectedIdentityCanMessage()}
+        messageBusy={identityMessageBusy()}
+        onMessage={() => void messageSelectedIdentity()}
+        onClose={closeSelectedIdentity}
+      />
+    </>
   );
 };

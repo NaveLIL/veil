@@ -2,7 +2,7 @@ import { fireEvent, render, screen } from "@solidjs/testing-library";
 import userEvent from "@testing-library/user-event";
 import { createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
-import { MembersIsland } from "@/components/layout/MembersIsland";
+import { RightIsland } from "@/components/layout/RightIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 import type { GroupMember, Role, Server, ServerMember } from "@/stores/app";
@@ -111,7 +111,8 @@ describe("active AppShell components", () => {
     const [serverId, setServerId] = createSignal<string | null>(null);
 
     const { container } = render(() => (
-      <MembersIsland
+      <RightIsland
+        present
         open
         visible
         serverId={serverId()}
@@ -121,6 +122,15 @@ describe("active AppShell components", () => {
         serverMembers={serverMembers()}
         serverRoles={roles}
         groupMembers={groupMembers}
+        view="members"
+        identityProfile={null}
+        identityBackToMembers={false}
+        identityCanMessage={false}
+        identityMessageBusy={false}
+        onOpenIdentity={noop}
+        onBackToMembers={noop}
+        onClose={noop}
+        onMessageIdentity={noop}
         onCreateDm={noop}
         onAssignRole={noop}
         onUnassignRole={noop}
@@ -161,7 +171,8 @@ describe("active AppShell components", () => {
     }));
     const noop = vi.fn();
     const { container } = render(() => (
-      <MembersIsland
+      <RightIsland
+        present={open()}
         open={open()}
         visible={open()}
         serverId="server-large"
@@ -171,6 +182,15 @@ describe("active AppShell components", () => {
         serverMembers={serverMembers}
         serverRoles={[]}
         groupMembers={[]}
+        view="members"
+        identityProfile={null}
+        identityBackToMembers={false}
+        identityCanMessage={false}
+        identityMessageBusy={false}
+        onOpenIdentity={noop}
+        onBackToMembers={noop}
+        onClose={noop}
+        onMessageIdentity={noop}
         onCreateDm={noop}
         onAssignRole={noop}
         onUnassignRole={noop}

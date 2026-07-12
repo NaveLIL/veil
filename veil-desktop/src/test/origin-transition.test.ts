@@ -298,6 +298,7 @@ describe("origin-scoped renderer boundary", () => {
     const mockedInvoke = vi.mocked(invoke);
     const conversationId = "550e8400-e29b-41d4-a716-446655440070";
     const peerUserId = "550e8400-e29b-41d4-a716-446655440071";
+    const expectedPeerIdentityKey = "42".repeat(32);
     appStore.setServerEndpoints(
       "wss://dm.example.test/ws",
       "https://dm.example.test",
@@ -319,13 +320,21 @@ describe("origin-scoped renderer boundary", () => {
       return undefined as never;
     });
     await appStore.connectToServer();
-    await appStore.createDm(peerUserId, "Origin-bound peer");
+    const activeConversationBeforeCreate = appStore.activeConversationId();
+    await appStore.createDm(peerUserId, "Origin-bound peer", expectedPeerIdentityKey);
+
+    expect(mockedInvoke).toHaveBeenCalledWith("create_dm", expect.objectContaining({
+      peerUserId,
+      expectedPeerIdentityKey,
+    }));
 
     expect(appStore.conversations().find((conversation) => conversation.id === conversationId))
       .toMatchObject({
         peerUserId,
+        peerKey: expectedPeerIdentityKey,
         serverOrigin: "https://dm.example.test:443",
       });
+    expect(appStore.activeConversationId()).toBe(activeConversationBeforeCreate);
 
     const pendingReconnect = deferred<unknown>();
     mockedInvoke.mockImplementation(async (command: string) => {
@@ -339,6 +348,10 @@ describe("origin-scoped renderer boundary", () => {
     });
     const reconnect = appStore.connectToServer();
     expect(appStore.authenticatedServerScope()).toBeNull();
+    appStore.setActiveConversationId(null);
+    expect(appStore.selectRetainedLocalDm(conversationId)).toBe(true);
+    expect(appStore.activeConversationId()).toBe(conversationId);
+    expect(appStore.selectRetainedLocalDm("550e8400-e29b-41d4-a716-446655440099")).toBe(false);
     expect(appStore.conversations().find((conversation) => conversation.id === conversationId)?.serverOrigin)
       .toBe("https://dm.example.test:443");
 

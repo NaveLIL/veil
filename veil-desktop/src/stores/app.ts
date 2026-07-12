@@ -803,6 +803,24 @@ export const appStore = {
     setActiveConversationId(id);
   },
 
+  /**
+   * Navigate to an already-retained local DM while the same origin is
+   * reconnecting. This never creates state, accepts no remote event payload,
+   * and remains blocked across lock or origin transitions.
+   */
+  selectRetainedLocalDm: (id: string): boolean => {
+    if (
+      !uiSessionActive
+      || screen() === "locked"
+      || originTransitioning()
+      || !conversations().some((conversation) => conversation.id === id && conversation.type === "dm")
+    ) return false;
+    setActiveServerId(null);
+    setActiveChannelId(null);
+    setActiveConversationId(id);
+    return true;
+  },
+
   resolveChannelContext: async (conversationId: string): Promise<{ serverId: string; channelId: string } | null> => {
     const findLoaded = () => {
       for (const [serverId, channels] of Object.entries(channelsByServer())) {
@@ -1268,8 +1286,19 @@ export const appStore = {
     }
   },
 
-  /** Create a DM conversation with a peer (by their user_id). */
-  createDm: async (peerUserId: string, peerName?: string): Promise<string> => {
+  /**
+   * Create a DM conversation with a peer (by their user_id).
+   *
+   * When the caller is acting from an identity-bearing surface it must pass
+   * the identity key shown to the user. Native code binds the server response
+   * to that key before committing any conversation state. Keyless discovery
+   * surfaces may omit it and retain the signed-directory fail-closed checks.
+   */
+  createDm: async (
+    peerUserId: string,
+    peerName?: string,
+    expectedPeerIdentityKey?: string,
+  ): Promise<string> => {
     const sessionEpoch = captureUiSessionEpoch();
     const ourId = userId();
     if (!ourId || !connected()) {
@@ -1281,6 +1310,7 @@ export const appStore = {
         serverHttpUrl: serverHttpUrl(),
         ourUserId: ourId,
         peerUserId,
+        expectedPeerIdentityKey: expectedPeerIdentityKey ?? null,
       });
       requireCurrentMutationScope(sessionEpoch, mutationScope);
       // Add conversation to local list
@@ -1294,11 +1324,22 @@ export const appStore = {
             name: peerName || peerUserId.slice(0, 8),
             serverOrigin: mutationScope.canonicalServerOrigin,
             peerUserId,
+            peerKey: expectedPeerIdentityKey,
             unreadCount: 0,
           },
         ]);
+      } else if (expectedPeerIdentityKey) {
+        setConversations((prev) => prev.map((conversation) =>
+          conversation.id === convId && conversation.type === "dm"
+            ? {
+              ...conversation,
+              serverOrigin: mutationScope.canonicalServerOrigin,
+              peerUserId,
+              peerKey: expectedPeerIdentityKey,
+            }
+            : conversation,
+        ));
       }
-      setActiveConversationId(convId);
       return convId;
     } catch (e) {
       rethrowIfStale(e);
@@ -1586,7 +1627,6 @@ export const appStore = {
       setConversations((prev) => prev.some((conversation) => conversation.id === convId)
         ? prev
         : [...prev, { id: convId, type: "group" as const, name, unreadCount: 0 }]);
-      setActiveConversationId(convId);
       return convId;
     } catch (e) {
       rethrowIfStale(e);

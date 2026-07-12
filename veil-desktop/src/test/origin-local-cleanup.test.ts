@@ -39,8 +39,7 @@ describe("origin-local App cleanup", () => {
       'setGroupCreateError("")',
       "setSendBusy(false)",
       "setDeletingIds(new Set<string>())",
-      "setMemberPanelOpen(false)",
-      "setIsland4Vis(false)",
+      "closeRightIsland(true)",
       "setShowFriendsPanel(false)",
       "setShowNewDm(false)",
       "setShowNewGroup(false)",
@@ -81,6 +80,7 @@ describe("origin-local App cleanup", () => {
     const groupFlow = section("const handleNewGroup = async () => {", "const restoreFailedDraft");
     expect(groupFlow).toContain("const sessionEpoch = captureUiSessionEpoch()");
     expect(groupFlow).toContain("if (!isUiSessionEpochCurrent(sessionEpoch)) return");
+    expect(groupFlow).toContain("openConversation(conversationId)");
     expect(groupFlow).toContain(
       "if (isUiSessionEpochCurrent(sessionEpoch)) setCreatingGroup(false)",
     );
@@ -96,8 +96,35 @@ describe("origin-local App cleanup", () => {
     expect(bindingCleanup).toContain("setCreatingDm(false)");
     expect(bindingCleanup).toContain("setCreatingGroup(false)");
     expect(bindingCleanup).toContain("setDeletingIds(new Set<string>())");
+    expect(bindingCleanup).toContain("closeRightIsland(true)");
     expect(bindingCleanup).not.toContain("setDeferredSendDrafts({})");
     expect(bindingCleanup).not.toContain('setInputText("")');
+  });
+
+  it("invalidates late Identity DM actions and binds creation to the displayed key", () => {
+    const routeLifecycle = section(
+      "const showRightIslandRoute =",
+      "const conv = () => appStore.activeConversation();",
+    );
+    expect(routeLifecycle.match(/identityDmActionToken \+= 1/g)).toHaveLength(2);
+    expect(routeLifecycle).toContain("const route = untrack(rightIslandRoute)");
+    expect(routeLifecycle).toContain('if (untrack(rightIslandRoute).kind !== "closed")');
+    expect(routeLifecycle).toContain("setIsland4Vis(false)");
+    expect(routeLifecycle).toContain("prefers-reduced-motion: reduce");
+
+    const identityDmFlow = section(
+      "const handleIdentityMessage = async () => {",
+      "const handleRightIslandCreateDm = async",
+    );
+    expect(identityDmFlow).toContain("const actionToken = ++identityDmActionToken");
+    expect(identityDmFlow).toContain("actionToken === identityDmActionToken");
+    expect(identityDmFlow).toContain("isUiSessionEpochCurrent(sessionEpoch)");
+    expect(identityDmFlow).toContain("identityProfileKey(currentRoute.profile) === profileKey");
+    expect(identityDmFlow).toContain("identityAllowsKeylessDmResolution(profile)");
+    expect(identityDmFlow).toContain("This identity-bearing context has no valid identity key");
+    expect(identityDmFlow).toContain("targetIdentityKey || undefined");
+    expect(identityDmFlow.indexOf("if (selectedIdentityCanOpenLocalDm())"))
+      .toBeLessThan(identityDmFlow.indexOf("appStore.createDm("));
   });
 
   it("installs native event listeners before the first transport connect", () => {

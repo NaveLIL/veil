@@ -14,7 +14,7 @@ export interface FriendRequestAvatarSource {
  */
 export function phaseprintIdentityForFriendRequest(
   request: FriendRequestAvatarSource,
-  canonicalServerOrigin: string,
+  canonicalServerOrigin: string | undefined,
 ): PhaseprintIdentity {
   return {
     canonicalServerOrigin,
