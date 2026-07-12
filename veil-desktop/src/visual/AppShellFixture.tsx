@@ -13,19 +13,25 @@ import { MembersIsland } from "@/components/layout/MembersIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 import { LockScreen } from "@/components/chat/LockScreen";
+import { UserAvatar } from "@/components/identity/UserAvatar";
 import type { Role, Server, ServerMember } from "@/stores/app";
 
 const WALLPAPER_URL = "/visual/wallpaper.svg";
+const FIXTURE_ORIGIN = "https://visual.veil.test:443";
+const CURRENT_USER_ID = "550e8400-e29b-41d4-a716-446655440000";
+const SABLE_USER_ID = "550e8400-e29b-41d4-a716-446655440001";
+const ORBIT_USER_ID = "550e8400-e29b-41d4-a716-446655440002";
 
 const servers: Server[] = [
-  { id: "secure-lab", name: "Secure Lab", ownerId: "user-current" },
-  { id: "field-notes", name: "Field Notes", ownerId: "user-sable" },
+  { id: "secure-lab", name: "Secure Lab", ownerId: CURRENT_USER_ID },
+  { id: "field-notes", name: "Field Notes", ownerId: SABLE_USER_ID },
 ];
 
 const members: ServerMember[] = [
   {
     serverId: "secure-lab",
-    userId: "user-current",
+    userId: CURRENT_USER_ID,
+    identityKey: "11".repeat(32),
     username: "northern-light",
     nickname: "Northern Light",
     roleIds: ["role-owner"],
@@ -33,7 +39,8 @@ const members: ServerMember[] = [
   },
   {
     serverId: "secure-lab",
-    userId: "user-sable",
+    userId: SABLE_USER_ID,
+    identityKey: "22".repeat(32),
     username: "sable",
     nickname: "Sable",
     roleIds: ["role-reviewer"],
@@ -41,7 +48,8 @@ const members: ServerMember[] = [
   },
   {
     serverId: "secure-lab",
-    userId: "user-orbit",
+    userId: ORBIT_USER_ID,
+    identityKey: "33".repeat(32),
     username: "orbit",
     roleIds: [],
     joinedAt: "2026-07-05T09:00:00Z",
@@ -131,9 +139,9 @@ const inputStyle: JSX.CSSProperties = {
 };
 
 const messages = [
-  { author: "Sable", initial: "S", time: "09:41", text: "The local relay is stable again." },
-  { author: "Northern Light", initial: "N", time: "09:43", text: "Good. The resumed attachment kept its verified offset." },
-  { author: "Orbit", initial: "O", time: "09:47", text: "I will review the channel permissions before the field test." },
+  { author: "Sable", technicalUsername: "sable", identityKey: "22".repeat(32), userId: SABLE_USER_ID, time: "09:41", text: "The local relay is stable again." },
+  { author: "Northern Light", technicalUsername: "northern-light", identityKey: "11".repeat(32), userId: CURRENT_USER_ID, time: "09:43", text: "Good. The resumed attachment kept its verified offset." },
+  { author: "Orbit", technicalUsername: "orbit", identityKey: "33".repeat(32), userId: ORBIT_USER_ID, time: "09:47", text: "I will review the channel permissions before the field test." },
 ];
 
 const Sidebar: Component<{ membersOpen: boolean; onToggleMembers: () => void }> = (props) => (
@@ -261,21 +269,13 @@ const Sidebar: Component<{ membersOpen: boolean; onToggleMembers: () => void }> 
         gap: "12px",
       }}
     >
-      <div
-        aria-hidden="true"
-        style={{
-          width: "30px",
-          height: "30px",
-          "border-radius": "50%",
-          background: "var(--veil-surface-raised)",
-          display: "flex",
-          "align-items": "center",
-          "justify-content": "center",
-          "font-size": "10px",
-        }}
-      >
-        NL
-      </div>
+      <UserAvatar
+        identityKey={"11".repeat(32)}
+        canonicalServerOrigin={FIXTURE_ORIGIN}
+        userId={CURRENT_USER_ID}
+        technicalUsername="northern-light"
+        size={30}
+      />
       <div style={{ "min-width": "0" }}>
         <div style={{ "font-size": "11px", color: "var(--veil-text)" }}>northern-light</div>
         <div style={{ "font-size": "9px", color: "var(--veil-success)" }}>Online</div>
@@ -295,7 +295,7 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
     if (!text) return;
     setTimeline((current) => [
       ...current,
-      { author: "Northern Light", initial: "N", time: "09:51", text },
+      { author: "Northern Light", technicalUsername: "northern-light", identityKey: "11".repeat(32), userId: CURRENT_USER_ID, time: "09:51", text },
     ]);
     setDraft("");
     if (composerInput) composerInput.style.height = "21px";
@@ -366,23 +366,13 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
         <For each={timeline()}>
           {(message) => (
             <article style={{ display: "flex", gap: "12px", padding: "8px 0" }}>
-              <div
-                aria-hidden="true"
-                style={{
-                  width: "32px",
-                  height: "32px",
-                  "border-radius": "50%",
-                  background: "var(--veil-surface-raised)",
-                  display: "flex",
-                  "align-items": "center",
-                  "justify-content": "center",
-                  color: "var(--veil-text-muted)",
-                  "font-size": "11px",
-                  "flex-shrink": "0",
-                }}
-              >
-                {message.initial}
-              </div>
+              <UserAvatar
+                identityKey={message.identityKey}
+                canonicalServerOrigin={FIXTURE_ORIGIN}
+                userId={message.userId}
+                technicalUsername={message.technicalUsername}
+                size={32}
+              />
               <div style={{ "min-width": "0" }}>
                 <div style={{ display: "flex", "align-items": "baseline", gap: "8px" }}>
                   <span style={{ color: "var(--veil-accent)", "font-size": "12px", "font-weight": "600" }}>
@@ -500,8 +490,9 @@ export const AppShellFixture: Component = () => {
               open={membersOpen()}
               visible={membersOpen()}
               serverId="secure-lab"
-              serverOwnerId="user-current"
-              currentUserId="user-current"
+              canonicalServerOrigin={FIXTURE_ORIGIN}
+              serverOwnerId={CURRENT_USER_ID}
+              currentUserId={CURRENT_USER_ID}
               serverMembers={members}
               serverRoles={roles}
               groupMembers={[]}

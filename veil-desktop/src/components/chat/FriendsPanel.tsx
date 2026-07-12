@@ -1,15 +1,25 @@
 import { Tabs as KTabs } from "@kobalte/core/tabs";
-import { Component, For, Show, createEffect, createSignal, type JSX } from "solid-js";
-import { appStore, type Friend, type FriendRequest } from "@/stores/app";
+import { Component, For, Show, createEffect, createMemo, createSignal, type JSX } from "solid-js";
+import {
+  appStore,
+  canonicalServerOriginFromHttpUrl,
+  type Friend,
+  type FriendRequest,
+} from "@/stores/app";
 import { Inbox, MessageCircle, UserMinus, Users } from "lucide-solid";
 import { toast } from "@/components/ui/toast";
+import { UserAvatar, type UserAvatarStatus } from "@/components/identity/UserAvatar";
+import { phaseprintIdentityForFriendRequest } from "@/components/identity/avatarIdentity";
+import {
+  boundedIdentityRows,
+  IDENTITY_ROW_RENDER_BUDGET,
+} from "@/components/identity/identityRenderBudget";
 
 /* ─── Inline styles matching the app design system ─── */
 
 const S = {
   header: { height: "56px", padding: "0 24px", display: "flex", "align-items": "center", gap: "12px", "border-bottom": "1px solid var(--veil-contrast-04)", "flex-shrink": "0" } as JSX.CSSProperties,
   content: { flex: "1", "overflow-y": "auto", padding: "20px 24px", "min-height": "0" } as JSX.CSSProperties,
-  avatar: (size: number) => ({ width: `${size}px`, height: `${size}px`, "border-radius": "50%", background: "var(--veil-surface-raised)", display: "flex", "align-items": "center", "justify-content": "center", "font-size": `${size * 0.38}px`, "font-weight": "600", color: "var(--veil-text-muted)", "flex-shrink": "0" } as JSX.CSSProperties),
   tabBar: { display: "flex", gap: "2px", background: "var(--veil-control)", "border-radius": "8px", padding: "3px" } as JSX.CSSProperties,
   tab: (active: boolean) => ({ flex: "1", padding: "5px 10px", "border-radius": "6px", border: "none", background: active ? "rgba(var(--veil-accent-rgb),0.15)" : "transparent", color: active ? "var(--veil-accent)" : "var(--veil-text-faint)", "font-size": "11px", "font-weight": "600", cursor: "pointer", transition: "background 0.15s, color 0.15s", "white-space": "nowrap" } as JSX.CSSProperties),
   searchBox: { width: "100%", height: "34px", background: "var(--veil-control)", border: "none", "border-radius": "8px", padding: "0 14px", color: "var(--veil-text)", "font-size": "13px", outline: "none" } as JSX.CSSProperties,
@@ -18,6 +28,7 @@ const S = {
   smallBtn: (bg: string, fg: string) => ({ width: "30px", height: "30px", "border-radius": "8px", background: bg, border: "none", color: fg, cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "14px", transition: "opacity 0.15s" } as JSX.CSSProperties),
   badge: { "min-width": "18px", height: "18px", "border-radius": "9px", background: "rgba(var(--veil-accent-rgb),0.2)", color: "var(--veil-accent)", "font-size": "10px", "font-weight": "700", display: "inline-flex", "align-items": "center", "justify-content": "center", padding: "0 5px", "margin-left": "6px" } as JSX.CSSProperties,
   sectionLabel: { "font-size": "10px", "font-weight": "600", color: "var(--veil-text-faint)", "text-transform": "uppercase", "letter-spacing": "0.1em", "margin-bottom": "8px" } as JSX.CSSProperties,
+  renderStatus: { padding: "10px 14px", color: "var(--veil-text-faint)", "font-size": "11px" } as JSX.CSSProperties,
   emptyWrap: { flex: "1", display: "flex", "flex-direction": "column", "align-items": "center", "justify-content": "center" } as JSX.CSSProperties,
   emptyIcon: { width: "56px", height: "56px", "border-radius": "16px", background: "rgba(var(--veil-accent-rgb),0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" } as JSX.CSSProperties,
 };
@@ -41,6 +52,18 @@ const statusLabel = (s: number) => {
     default: return "Offline";
   }
 };
+
+const avatarStatus = (status: number): UserAvatarStatus => {
+  switch (status) {
+    case 1: return "online";
+    case 3: return "idle";
+    case 4: return "dnd";
+    default: return "offline";
+  }
+};
+
+const avatarServerOrigin = () => appStore.authenticatedServerScope()?.canonicalServerOrigin
+  ?? canonicalServerOriginFromHttpUrl(appStore.serverHttpUrl());
 
 /* ─── Add Friend Section ─── */
 
@@ -133,7 +156,13 @@ const AddFriendSection: Component = () => {
 
       <Show when={status() === "found" && foundUser()}>
         <div style={{ display: "flex", "align-items": "center", gap: "12px", "margin-top": "16px", padding: "12px 14px", background: "var(--veil-contrast-03)", "border-radius": "10px", border: "1px solid var(--veil-contrast-06)" }}>
-          <div style={S.avatar(36)}>{foundUser()!.username.charAt(0).toUpperCase()}</div>
+          <UserAvatar
+            identityKey={foundUser()!.identityKey}
+            canonicalServerOrigin={avatarServerOrigin()}
+            userId={foundUser()!.userId}
+            technicalUsername={foundUser()!.username}
+            size={36}
+          />
           <div style={{ flex: "1", "min-width": "0" }}>
             <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)" }}>{foundUser()!.username}</div>
             <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "font-family": "monospace", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{foundUser()!.userId.slice(0, 16)}...</div>
@@ -188,7 +217,10 @@ const RequestItem: Component<{ request: FriendRequest }> = (props) => {
 
   return (
     <div style={S.rowBtn(false)}>
-      <div style={S.avatar(36)}>{props.request.fromUsername.charAt(0).toUpperCase()}</div>
+      <UserAvatar
+        {...phaseprintIdentityForFriendRequest(props.request, avatarServerOrigin())}
+        size={36}
+      />
       <div style={{ flex: "1", "min-width": "0" }}>
         <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
           <span style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.request.fromUsername}</span>
@@ -233,16 +265,13 @@ const FriendItem: Component<{
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
     >
-      {/* Avatar with status dot */}
-      <div style={{ position: "relative", "flex-shrink": "0" }}>
-        <div style={S.avatar(36)}>{props.friend.username.charAt(0).toUpperCase()}</div>
-        <div style={{
-          position: "absolute", bottom: "-1px", right: "-1px",
-          width: "12px", height: "12px", "border-radius": "50%",
-          background: statusColor(props.friend.status),
-          border: "2.5px solid var(--veil-island)",
-        }} />
-      </div>
+      <UserAvatar
+        canonicalServerOrigin={avatarServerOrigin()}
+        userId={props.friend.userId}
+        technicalUsername={props.friend.username}
+        status={avatarStatus(props.friend.status)}
+        size={36}
+      />
       <div style={{ flex: "1", "min-width": "0" }}>
         <div style={{ "font-size": "13px", "font-weight": "600", color: "var(--veil-text-strong)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{props.friend.username}</div>
         <div style={{ "font-size": "11px", color: statusColor(props.friend.status) }}>{statusLabel(props.friend.status)}</div>
@@ -282,8 +311,17 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
     setActiveTab("all");
   });
 
-  const incomingRequests = () => appStore.friendRequests().filter((r) => !r.outgoing);
-  const onlineFriends = () => appStore.friends().filter((f) => f.status === 1);
+  const incomingRequests = createMemo(() => appStore.friendRequests().filter((r) => !r.outgoing));
+  const onlineFriends = createMemo(() => appStore.friends().filter((f) => f.status === 1));
+  const visibleRequests = createMemo(() => boundedIdentityRows(appStore.friendRequests()));
+  const visibleAllFriends = createMemo(() => boundedIdentityRows(appStore.friends()));
+  const visibleOnlineFriends = createMemo(() => boundedIdentityRows(onlineFriends()));
+  const friendsForPanel = (panel: "all" | "online") => (
+    panel === "online" ? onlineFriends() : appStore.friends()
+  );
+  const visibleFriendsForPanel = (panel: "all" | "online") => (
+    panel === "online" ? visibleOnlineFriends() : visibleAllFriends()
+  );
 
   const handleMessage = async (friend: Friend) => {
     try {
@@ -336,6 +374,7 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
       </KTabs.Content>
 
       <KTabs.Content value="pending" style={S.content}>
+        <Show when={activeTab() === "pending"}>
           <Show
             when={appStore.friendRequests().length > 0}
             fallback={
@@ -350,17 +389,24 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
             <div style={S.sectionLabel}>
               Pending — {appStore.friendRequests().length}
             </div>
-            <For each={appStore.friendRequests()}>
+            <For each={visibleRequests()}>
               {(req) => <RequestItem request={req} />}
             </For>
+            <Show when={appStore.friendRequests().length > IDENTITY_ROW_RENDER_BUDGET}>
+              <div role="status" style={S.renderStatus}>
+                Showing the first {IDENTITY_ROW_RENDER_BUDGET} of {appStore.friendRequests().length} requests.
+              </div>
+            </Show>
           </Show>
+        </Show>
       </KTabs.Content>
 
       <For each={["all", "online"] as const}>
         {(panel) => (
           <KTabs.Content value={panel} style={S.content}>
+          <Show when={activeTab() === panel}>
           <Show
-            when={(panel === "online" ? onlineFriends() : appStore.friends()).length > 0}
+            when={friendsForPanel(panel).length > 0}
             fallback={
               <div style={S.emptyWrap}>
                 <div style={S.emptyIcon}>
@@ -386,7 +432,7 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
                 ? `Online \u2014 ${onlineFriends().length}`
                 : `All friends \u2014 ${appStore.friends().length}`}
             </div>
-            <For each={panel === "online" ? onlineFriends() : appStore.friends()}>
+            <For each={visibleFriendsForPanel(panel)}>
               {(friend) => (
                 <FriendItem
                   friend={friend}
@@ -395,6 +441,12 @@ export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
                 />
               )}
             </For>
+            <Show when={friendsForPanel(panel).length > IDENTITY_ROW_RENDER_BUDGET}>
+              <div role="status" style={S.renderStatus}>
+                Showing the first {IDENTITY_ROW_RENDER_BUDGET} of {friendsForPanel(panel).length} friends.
+              </div>
+            </Show>
+          </Show>
           </Show>
           </KTabs.Content>
         )}

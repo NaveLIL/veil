@@ -293,6 +293,63 @@ describe("origin-scoped renderer boundary", () => {
     expect(appStore.serverMembers()[serverId]).toBeUndefined();
   });
 
+  it("keeps a newly created DM fallback bound to its origin during reconnect", async () => {
+    await appStore.setupEventListeners();
+    const mockedInvoke = vi.mocked(invoke);
+    const conversationId = "550e8400-e29b-41d4-a716-446655440070";
+    const peerUserId = "550e8400-e29b-41d4-a716-446655440071";
+    appStore.setServerEndpoints(
+      "wss://dm.example.test/ws",
+      "https://dm.example.test",
+    );
+    mockedInvoke.mockImplementation(async (command: string) => {
+      if (command === "connect_to_server") {
+        return {
+          userId: USER_ID,
+          canonicalServerOrigin: "https://dm.example.test:443",
+          bindingGeneration: "300",
+        } as never;
+      }
+      if (command === "create_dm") return conversationId as never;
+      if (
+        command === "get_conversation_crypto_diagnostics"
+        || command === "get_conversations"
+        || command === "list_servers"
+      ) return [] as never;
+      return undefined as never;
+    });
+    await appStore.connectToServer();
+    await appStore.createDm(peerUserId, "Origin-bound peer");
+
+    expect(appStore.conversations().find((conversation) => conversation.id === conversationId))
+      .toMatchObject({
+        peerUserId,
+        serverOrigin: "https://dm.example.test:443",
+      });
+
+    const pendingReconnect = deferred<unknown>();
+    mockedInvoke.mockImplementation(async (command: string) => {
+      if (command === "connect_to_server") return pendingReconnect.promise as never;
+      if (
+        command === "get_conversation_crypto_diagnostics"
+        || command === "get_conversations"
+        || command === "list_servers"
+      ) return [] as never;
+      return undefined as never;
+    });
+    const reconnect = appStore.connectToServer();
+    expect(appStore.authenticatedServerScope()).toBeNull();
+    expect(appStore.conversations().find((conversation) => conversation.id === conversationId)?.serverOrigin)
+      .toBe("https://dm.example.test:443");
+
+    pendingReconnect.resolve({
+      userId: USER_ID,
+      canonicalServerOrigin: "https://dm.example.test:443",
+      bindingGeneration: "301",
+    });
+    await reconnect;
+  });
+
   it("skips a queued endpoint after a newer origin is selected", async () => {
     await appStore.setupEventListeners();
     const mockedInvoke = vi.mocked(invoke);

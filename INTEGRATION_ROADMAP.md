@@ -578,6 +578,33 @@ development БД и полный restart/collision/recovery test matrix.
   technical handle; owner и первые три роли показываются отдельно и не меняют
   identity trust.
 
+Phaseprint v1 foundation реализован как чистая синхронная presentation-
+функция и inline SVG без network/canvas/HTML injection. Это не crypto fingerprint
+и не сигнал `Verified`: результат нигде не участвует в trust, ACL или
+Sender-Key rotation. Seed берёт только valid non-zero identity key, иначе
+canonical `(origin, user_id)`, затем `(origin, technical_username)`; без valid
+origin показывается нейтральный anonymous print, а не bare-UUID identity.
+
+Единый `UserAvatar` уже используется в self footer, DM rows/header,
+message authors, friend/search/request rows, group/server members и server settings.
+Group/channel/server entity icons остаются отдельными от person avatar. Nickname
+не передаётся в seed, а keyed member row не remount-ит Phaseprint при его
+смене. Remote/data image URL отклоняются; будущий native-validated
+`blob:` должен успешно decode-нуться над уже отрисованным Phaseprint;
+error/abort не даёт broken-image flash. Сам image pipeline и сетевые аватары
+на этом checkpoint не реализованы.
+Закрытый Members island не mount-ит row/SVG DOM, а открытый Members,
+Server Settings и активная вкладка friends/requests имеют явный presentation
+budget в 256 rows с честным truncation status до pagination/virtualization.
+Неактивные friends tabs не держат скрытые Phaseprint trees. Этот renderer budget
+никогда не ограничивает полный store/native state для friendship, ACL,
+authorization и Sender Keys.
+
+Identity Island и profile navigation остаются следующим product deliverable.
+Friend/request DTO пока не несут полный account locator, поэтом честно
+используют origin-scoped user/name fallback; они не объявляются identity-
+verified до отдельной consumer/DTO normalization.
+
 ### Versioned text profile
 
 Первый сетевой релиз профилей не требует avatar upload:

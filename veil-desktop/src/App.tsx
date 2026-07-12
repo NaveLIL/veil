@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   appStore,
+  canonicalServerOriginFromHttpUrl,
   captureUiSessionEpoch,
   isUiSessionEpochCurrent,
   type GroupMember,
@@ -34,6 +35,7 @@ import { EmojiPicker } from "@/components/ui/emoji-picker";
 import { MessageRenderer } from "@/components/chat/MessageRenderer";
 import { FriendsPanel } from "@/components/chat/FriendsPanel";
 import { VeilMark } from "@/components/brand/VeilMark";
+import { UserAvatar } from "@/components/identity/UserAvatar";
 import { toast, ToastViewport } from "@/components/ui/toast";
 import { CommandPalette, useCommandPaletteHotkey } from "@/components/ui/CommandPalette";
 import { DecisionDialogHost } from "@/components/ui/DecisionDialogHost";
@@ -230,6 +232,8 @@ const App: Component = () => {
   };
   const msgs = () => appStore.messages().filter((m) => m.conversationId === conv()?.id);
   const shortId = () => (appStore.userId() || appStore.identity() || "---").slice(0, 8);
+  const avatarServerOrigin = () => appStore.authenticatedServerScope()?.canonicalServerOrigin
+    ?? canonicalServerOriginFromHttpUrl(appStore.serverHttpUrl());
   const connectionLabel = () => appStore.connected()
     ? "Online"
     : appStore.reconnecting()
@@ -762,7 +766,6 @@ const App: Component = () => {
     searchBox: { width: "100%", height: "34px", background: "var(--veil-control)", border: "none", "border-radius": "8px", padding: "0 14px", color: "var(--veil-text)", "font-size": "13px", outline: "none" },
     contactList: { flex: "1", "overflow-y": "auto" as const, padding: "6px 12px", "min-height": "0" },
     contactBtn: (active: boolean) => ({ display: "flex", "align-items": "center", gap: "12px", width: "100%", padding: "10px 14px", background: active ? "var(--veil-contrast-06)" : "transparent", border: "none", "border-radius": "10px", cursor: "pointer", "text-align": "left" as const, "margin-bottom": "2px", transition: "background 0.15s", color: "var(--veil-text)" }),
-    avatar: (size: number) => ({ width: `${size}px`, height: `${size}px`, "border-radius": "50%", background: "var(--veil-surface-raised)", display: "flex", "align-items": "center", "justify-content": "center", "font-size": `${size * 0.38}px`, "font-weight": "600", color: "var(--veil-text-muted)", "flex-shrink": "0" }),
     userPanel: { padding: "14px 18px", "border-top": "1px solid var(--veil-contrast-04)", "flex-shrink": "0", display: "flex", "align-items": "center", gap: "12px" },
     chatHeader: { height: "56px", padding: "0 24px", display: "flex", "align-items": "center", gap: "12px", "border-bottom": "1px solid var(--veil-contrast-04)", "flex-shrink": "0" },
     msgArea: { flex: "1", "overflow-y": "auto" as const, padding: "20px 24px", "min-height": "0" },
@@ -1363,7 +1366,12 @@ const App: Component = () => {
 
                       {/* User panel (same as home) */}
                       <div style={S.userPanel}>
-                        <div style={{ ...S.avatar(34), background: "rgba(var(--veil-accent-rgb),0.15)", color: "var(--veil-accent)", "font-size": "11px", "font-weight": "800" }}>ME</div>
+                        <UserAvatar
+                          identityKey={appStore.identity()}
+                          canonicalServerOrigin={avatarServerOrigin()}
+                          userId={appStore.userId()}
+                          size={34}
+                        />
                         <div style={{ flex: "1", "min-width": "0" }}>
                           <div style={{ "font-size": "12px", "font-weight": "500", color: "var(--veil-text-muted)", "font-family": "monospace" }}>{shortId()}</div>
                           <div style={{ "font-size": "10px", color: connectionColor(), "margin-top": "1px" }}>
@@ -1571,14 +1579,33 @@ const App: Component = () => {
                             onMouseEnter={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "var(--veil-contrast-03)"; }}
                             onMouseLeave={(e) => { if (appStore.activeConversationId() !== c.id) e.currentTarget.style.background = "transparent"; }}
                           >
-                            <div style={{
-                              ...S.avatar(36),
-                              "border-radius": c.type === "group" ? "10px" : "50%",
-                              background: c.type === "group" ? "rgba(var(--veil-accent-rgb),0.12)" : "var(--veil-surface-raised)",
-                              color: c.type === "group" ? "var(--veil-accent)" : "var(--veil-text-muted)",
-                            }}>
-                              {c.type === "group" ? <Users size={16} strokeWidth={1.9} /> : c.name.charAt(0).toUpperCase()}
-                            </div>
+                            <Show
+                              when={c.type === "dm"}
+                              fallback={(
+                                <div style={{
+                                  width: "36px",
+                                  height: "36px",
+                                  "border-radius": "10px",
+                                  background: "rgba(var(--veil-accent-rgb),0.12)",
+                                  color: "var(--veil-accent)",
+                                  display: "flex",
+                                  "align-items": "center",
+                                  "justify-content": "center",
+                                  "flex-shrink": "0",
+                                }}>
+                                  {c.type === "group"
+                                    ? <Users size={16} strokeWidth={1.9} />
+                                    : <MessageSquare size={16} strokeWidth={1.9} />}
+                                </div>
+                              )}
+                            >
+                              <UserAvatar
+                                identityKey={c.peerKey}
+                                canonicalServerOrigin={c.serverOrigin ?? avatarServerOrigin()}
+                                userId={c.peerUserId}
+                                size={36}
+                              />
+                            </Show>
                             <div style={{ flex: "1", "min-width": "0" }}>
                               <div style={{ display: "flex", "align-items": "center", gap: "6px" }}>
                                 <span style={{ "font-size": "13px", "font-weight": "500", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{c.name}</span>
@@ -1640,7 +1667,12 @@ const App: Component = () => {
               </div>
 
               <div style={S.userPanel}>
-                <div style={{ ...S.avatar(34), background: "rgba(var(--veil-accent-rgb),0.15)", color: "var(--veil-accent)", "font-size": "11px", "font-weight": "800" }}>ME</div>
+                <UserAvatar
+                  identityKey={appStore.identity()}
+                  canonicalServerOrigin={avatarServerOrigin()}
+                  userId={appStore.userId()}
+                  size={34}
+                />
                 <div style={{ flex: "1", "min-width": "0" }}>
                   <div style={{ "font-size": "12px", "font-weight": "500", color: "var(--veil-text-muted)", "font-family": "monospace" }}>{shortId()}</div>
                   <div style={{ "font-size": "10px", color: connectionColor(), "margin-top": "1px" }}>
@@ -1697,18 +1729,33 @@ const App: Component = () => {
                 {(c) => (
                   <>
                     <div style={S.chatHeader}>
-                      <div style={{
-                        ...S.avatar(32),
-                        "border-radius": c().type !== "dm" ? "10px" : "50%",
-                        background: c().type !== "dm" ? "rgba(var(--veil-accent-rgb),0.12)" : "var(--veil-surface-raised)",
-                        color: c().type !== "dm" ? "var(--veil-accent)" : "var(--veil-text-muted)",
-                      }}>
-                        {c().type === "channel"
-                          ? <MessageSquare size={15} strokeWidth={1.9} />
-                          : c().type === "group"
-                            ? <Users size={15} strokeWidth={1.9} />
-                            : c().name.charAt(0).toUpperCase()}
-                      </div>
+                      <Show
+                        when={c().type === "dm"}
+                        fallback={(
+                          <div style={{
+                            width: "32px",
+                            height: "32px",
+                            "border-radius": "10px",
+                            background: "rgba(var(--veil-accent-rgb),0.12)",
+                            color: "var(--veil-accent)",
+                            display: "flex",
+                            "align-items": "center",
+                            "justify-content": "center",
+                            "flex-shrink": "0",
+                          }}>
+                            {c().type === "channel"
+                              ? <MessageSquare size={15} strokeWidth={1.9} />
+                              : <Users size={15} strokeWidth={1.9} />}
+                          </div>
+                        )}
+                      >
+                        <UserAvatar
+                          identityKey={c().peerKey}
+                          canonicalServerOrigin={c().serverOrigin ?? avatarServerOrigin()}
+                          userId={c().peerUserId}
+                          size={32}
+                        />
+                      </Show>
                       <div style={{ flex: "1" }}>
                         <div style={{ "font-size": "14px", "font-weight": "600", color: "var(--veil-text-strong)" }}>{c().name}</div>
                         <div
@@ -1795,7 +1842,13 @@ const App: Component = () => {
                                 <ContextMenuTrigger>
                                   <div id={`msg-${msg.id}`} style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px", transition: "background 0.3s" }}>
                                     <Show when={gap()} fallback={<div style={{ width: "36px", "flex-shrink": "0" }} />}>
-                                      <div style={{ ...S.avatar(36), "margin-top": "2px" }}>{msg.senderName.charAt(0).toUpperCase()}</div>
+                                      <UserAvatar
+                                        identityKey={msg.senderKey}
+                                        canonicalServerOrigin={msg.senderOrigin ?? msg.senderProfileOrigin ?? avatarServerOrigin()}
+                                        userId={msg.senderUserId}
+                                        size={36}
+                                        style={{ "margin-top": "2px" }}
+                                      />
                                     </Show>
                                     <div style={{ flex: "1", "min-width": "0" }}>
                                       <Show when={gap()}>
@@ -2242,6 +2295,7 @@ const App: Component = () => {
               open={memberPanelOpen()}
               visible={island4Vis()}
               serverId={appStore.activeServerId()}
+              canonicalServerOrigin={avatarServerOrigin()}
               serverOwnerId={appStore.servers().find((server) => server.id === appStore.activeServerId())?.ownerId}
               currentUserId={appStore.userId()}
               serverMembers={appStore.activeServerId()

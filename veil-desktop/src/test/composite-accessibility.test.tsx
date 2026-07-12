@@ -2,11 +2,13 @@ import { fireEvent, render, screen, waitFor } from "@solidjs/testing-library";
 import userEvent from "@testing-library/user-event";
 import axe from "axe-core";
 import { createSignal } from "solid-js";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FriendsPanel } from "@/components/chat/FriendsPanel";
 import { CommandPalette } from "@/components/ui/CommandPalette";
 import { EmojiPicker } from "@/components/ui/emoji-picker";
 import { IslandDialog } from "@/components/ui/IslandDialog";
+import { appStore, type Friend, type FriendRequest } from "@/stores/app";
+import { IDENTITY_ROW_RENDER_BUDGET } from "@/components/identity/identityRenderBudget";
 
 const invokeMock = vi.hoisted(() => vi.fn());
 
@@ -24,6 +26,10 @@ const axeOptions = {
 describe("composite widget accessibility", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("provides a searchable, named emoji popover with roving category tabs", async () => {
@@ -77,6 +83,33 @@ describe("composite widget accessibility", () => {
     await user.keyboard("{End}");
     expect(screen.getByRole("tab", { name: "Add" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tabpanel", { name: "Add" })).toBeInTheDocument();
+  });
+
+  it("bounds remote friend and request rows to the active presentation window", async () => {
+    const friends: Friend[] = Array.from({ length: 300 }, (_, index) => ({
+      userId: `550e8400-e29b-41d4-a716-${(index + 1).toString(16).padStart(12, "0")}`,
+      username: `friend-${index + 1}`,
+      status: 1,
+    }));
+    const requests: FriendRequest[] = Array.from({ length: 300 }, (_, index) => ({
+      requestId: `request-${index + 1}`,
+      fromUserId: `550e8400-e29b-41d4-a716-${(index + 301).toString(16).padStart(12, "0")}`,
+      fromUsername: `requester-${index + 1}`,
+      timestamp: index,
+      outgoing: false,
+    }));
+    vi.spyOn(appStore, "friends").mockReturnValue(friends);
+    vi.spyOn(appStore, "friendRequests").mockReturnValue(requests);
+
+    const user = userEvent.setup();
+    const { container } = render(() => <FriendsPanel />);
+
+    expect(container.querySelectorAll("[data-user-avatar]")).toHaveLength(IDENTITY_ROW_RENDER_BUDGET);
+    expect(screen.getByRole("status")).toHaveTextContent("Showing the first 256 of 300 friends");
+
+    await user.click(screen.getByRole("tab", { name: /Pending/ }));
+    expect(container.querySelectorAll("[data-user-avatar]")).toHaveLength(IDENTITY_ROW_RENDER_BUDGET);
+    expect(screen.getByRole("status")).toHaveTextContent("Showing the first 256 of 300 requests");
   });
 
   it("restores focus when a controlled island dialog closes with Escape", async () => {

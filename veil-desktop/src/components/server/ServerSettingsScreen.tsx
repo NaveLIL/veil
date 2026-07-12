@@ -1,9 +1,20 @@
 import { Component, createSignal, createMemo, Show, For, Switch, Match, onMount, onCleanup, createEffect, on } from "solid-js";
-import { appStore, type Channel, type Role, type ServerMember } from "@/stores/app";
+import {
+  appStore,
+  canonicalServerOriginFromHttpUrl,
+  type Channel,
+  type Role,
+  type ServerMember,
+} from "@/stores/app";
 import { IslandSelect } from "@/components/ui/IslandSelect";
 import { Popover as KPopover } from "@kobalte/core/popover";
 import { Z } from "@/lib/zIndex";
 import { alertDecision, confirmDecision, promptDecision } from "@/lib/decisionDialog";
+import { UserAvatar } from "@/components/identity/UserAvatar";
+import {
+  boundedIdentityRows,
+  IDENTITY_ROW_RENDER_BUDGET,
+} from "@/components/identity/identityRenderBudget";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -950,9 +961,7 @@ export const ServerSettingsScreen: Component = () => {
   const [memberSearch, setMemberSearch] = createSignal("");
   const filteredMembers = createMemo(() => {
     const q = memberSearch().trim().toLowerCase();
-    const list = [...members()].sort((a, b) =>
-      (a.nickname || a.username).localeCompare(b.nickname || b.username),
-    );
+    const list = members();
     if (!q) return list;
     return list.filter((m) =>
       (m.nickname || "").toLowerCase().includes(q) ||
@@ -960,6 +969,9 @@ export const ServerSettingsScreen: Component = () => {
       m.userId.toLowerCase().includes(q),
     );
   });
+  const visibleMembers = createMemo(() => [...boundedIdentityRows(filteredMembers())].sort((a, b) =>
+    (a.nickname || a.username).localeCompare(b.nickname || b.username),
+  ));
 
   const kickMember = async (m: ServerMember) => {
     const srv = server();
@@ -1011,21 +1023,20 @@ export const ServerSettingsScreen: Component = () => {
           when={filteredMembers().length > 0}
           fallback={<div style={S.paragraph}>No members match your search.</div>}
         >
-          <For each={filteredMembers()}>
+          <For each={visibleMembers()}>
             {(m) => {
               const isMe = () => m.userId === appStore.userId();
               const isServerOwner = () => m.userId === server()?.ownerId;
               return (
                 <div style={S.listRow}>
-                  <div style={{
-                    width: "32px", height: "32px", "border-radius": "50%",
-                    background: "rgba(var(--veil-accent-rgb),0.18)",
-                    color: "var(--veil-accent-hi)",
-                    display: "flex", "align-items": "center", "justify-content": "center",
-                    "font-size": "12px", "font-weight": "700", "flex-shrink": "0",
-                  }}>
-                    {(m.nickname || m.username || "?").slice(0, 2).toUpperCase()}
-                  </div>
+                  <UserAvatar
+                    identityKey={m.identityKey}
+                    canonicalServerOrigin={appStore.authenticatedServerScope()?.canonicalServerOrigin
+                      ?? canonicalServerOriginFromHttpUrl(appStore.serverHttpUrl())}
+                    userId={m.userId}
+                    technicalUsername={m.username}
+                    size={32}
+                  />
                   <div style={{ flex: "1", "min-width": "0" }}>
                     <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600" }}>
                       {m.nickname || m.username}
@@ -1109,6 +1120,21 @@ export const ServerSettingsScreen: Component = () => {
               );
             }}
           </For>
+          <Show when={filteredMembers().length > IDENTITY_ROW_RENDER_BUDGET}>
+            <div
+              role="status"
+              style={{
+                ...S.paragraph,
+                "margin-top": "12px",
+                padding: "10px 12px",
+                background: "var(--veil-contrast-03)",
+                "border-radius": "8px",
+              }}
+            >
+              Showing the first {IDENTITY_ROW_RENDER_BUDGET} of {filteredMembers().length} matches.
+              Narrow the search, or wait for paginated member management, to reach the rest.
+            </div>
+          </Show>
         </Show>
       </div>
     </>

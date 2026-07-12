@@ -50,6 +50,7 @@
   --veil-contrast-90: rgba(255, 255, 255, 0.9);
   --veil-border: rgba(255, 255, 255, 0.06);
   --veil-border-soft: rgba(255, 255, 255, 0.04);
+  --veil-phaseprint-border: rgba(255, 255, 255, 0.15);
   --veil-success: #34d399;
   --veil-warning: #fbbf24;
   --veil-danger: #f04848;
@@ -132,6 +133,31 @@
 }
 
 /* ─── Veil Dark Theme ──────────────────────────────── */
+@media (forced-colors: active) {
+  .veil-phaseprint {
+    forced-color-adjust: none;
+    background: Canvas !important;
+    box-shadow: inset 0 0 0 1px CanvasText !important;
+  }
+
+  .veil-phaseprint rect {
+    fill: CanvasText !important;
+    opacity: 1 !important;
+  }
+
+  .veil-phaseprint circle:first-of-type {
+    fill: Highlight !important;
+    stroke: none !important;
+    opacity: 0.35 !important;
+  }
+
+  .veil-phaseprint circle:nth-of-type(2) {
+    fill: none !important;
+    stroke: Highlight !important;
+    opacity: 1 !important;
+  }
+}
+
 @theme {
   /* ─── Island Layout ──────────────────────────────── */
   --color-window: var(--veil-window);

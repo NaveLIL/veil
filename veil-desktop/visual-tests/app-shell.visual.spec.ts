@@ -238,6 +238,9 @@ test("members island overlays only below the four-column breakpoint", async ({ p
 
   const wrapper = page.getByRole("complementary", { name: "Conversation members" });
   await expect(wrapper).toHaveAttribute("aria-hidden", "false");
+  const identityPhaseprints = page.locator("[data-phaseprint-seed-kind='identity-key']");
+  expect(await identityPhaseprints.count()).toBeGreaterThanOrEqual(7);
+  await expect(identityPhaseprints.first()).toBeVisible();
   const [bodyBox, chatBox, membersBox] = await Promise.all([
     page.getByTestId("app-body").boundingBox(),
     page.getByTestId("chat-island").boundingBox(),

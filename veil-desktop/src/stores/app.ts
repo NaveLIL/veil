@@ -14,7 +14,6 @@ export interface Conversation {
   serverOrigin?: string;
   peerUserId?: string;
   peerKey?: string;
-  avatarUrl?: string;
   lastMessage?: string;
   lastMessageTime?: number;
   unreadCount: number;
@@ -1276,13 +1275,14 @@ export const appStore = {
     if (!ourId || !connected()) {
       throw new Error("Connect to the Veil server before creating an encrypted conversation");
     }
+    const mutationScope = requirePublishedMutationScope();
     try {
       const convId = await invoke<string>("create_dm", {
         serverHttpUrl: serverHttpUrl(),
         ourUserId: ourId,
         peerUserId,
       });
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       // Add conversation to local list
       const exists = conversations().some((c) => c.id === convId);
       if (!exists) {
@@ -1292,6 +1292,7 @@ export const appStore = {
             id: convId,
             type: "dm" as const,
             name: peerName || peerUserId.slice(0, 8),
+            serverOrigin: mutationScope.canonicalServerOrigin,
             peerUserId,
             unreadCount: 0,
           },
