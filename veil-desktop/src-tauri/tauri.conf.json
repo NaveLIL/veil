@@ -47,6 +47,18 @@
       "icons/icon.ico",
       "icons/icon.png"
     ],
+    "windows": {
+      "nsis": {
+        "headerImage": "installer/header.bmp",
+        "sidebarImage": "installer/sidebar.bmp",
+        "installerIcon": "icons/icon.ico",
+        "uninstallerIcon": "icons/icon.ico",
+        "installMode": "currentUser",
+        "languages": ["Russian", "English"],
+        "displayLanguageSelector": false,
+        "compression": "lzma"
+      }
+    },
     "category": "SocialNetworking",
     "shortDescription": "E2EE мессенджер",
     "longDescription": "Veil — мессенджер со сквозным шифрованием. Криптография и секретный ключевой материал остаются в нативном Rust-слое."
