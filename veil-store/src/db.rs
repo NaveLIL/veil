@@ -2030,6 +2030,44 @@ impl VeilDb {
         })
     }
 
+    /// Atomically merge an authenticated account snapshot and its signed
+    /// network profile. This is used for the current account on a fresh
+    /// device, where no conversation directory entry exists yet.
+    ///
+    /// The presentation fields remain non-authoritative for crypto trust: the
+    /// caller must supply identity and signing keys from the already
+    /// authenticated native session. Any conflict or profile rejection rolls
+    /// the directory merge back with the profile write.
+    pub fn upsert_authenticated_network_profile(
+        &self,
+        profile: &NetworkProfile,
+        signing_key: [u8; 32],
+    ) -> Result<(), String> {
+        validate_network_profile(profile)?;
+        let snapshot = AccountSnapshot {
+            locator: profile.locator.clone(),
+            signing_key,
+            username: Some(profile.username.clone()),
+            display_name: profile.display_name.clone(),
+            profile_version: Some(profile.profile_version),
+            profile_origin: profile.locator.canonical_server_origin.clone(),
+            source: AccountSnapshotSource::AuthenticatedConversationDirectory,
+            observed_at: profile.observed_at.clone(),
+        };
+        validate_account_snapshot(&snapshot)?;
+
+        run_savepoint(&self.conn, "veil_authenticated_network_profile", || {
+            let self_binding = validated_self_binding_for_origin(
+                &self.conn,
+                &profile.locator.canonical_server_origin,
+            )?
+            .ok_or("authenticated network profile has no pinned self binding")?;
+            ensure_account_snapshot_compatible_with_self(&snapshot, Some(&self_binding))?;
+            merge_prevalidated_account_snapshot(&self.conn, &snapshot)?;
+            self.upsert_network_profile(profile)
+        })
+    }
+
     /// Load one exact origin/user/key-bound signed profile cache row.
     pub fn load_network_profile(
         &self,
@@ -7470,6 +7508,59 @@ mod tests {
         assert_eq!(
             db.load_network_profile(&account.locator).unwrap(),
             Some(current)
+        );
+    }
+
+    #[test]
+    fn authenticated_network_profile_bootstraps_fresh_self_atomically() {
+        let db = VeilDb::open_memory(&[0xC5; 32]).unwrap();
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x57,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(1),
+        );
+        let profile = sample_network_profile(&account, 1);
+        assert!(db
+            .upsert_authenticated_network_profile(&profile, account.signing_key)
+            .is_err());
+        assert!(db
+            .resolve_account_snapshot(&account.locator)
+            .unwrap()
+            .is_none());
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &account.locator.identity_key,
+            &account.signing_key,
+        )
+        .unwrap();
+
+        db.upsert_authenticated_network_profile(&profile, account.signing_key)
+            .unwrap();
+        assert_eq!(
+            db.load_network_profile(&account.locator).unwrap(),
+            Some(profile.clone())
+        );
+        assert_eq!(
+            db.resolve_account_snapshot(&account.locator)
+                .unwrap()
+                .unwrap()
+                .signing_key,
+            account.signing_key
+        );
+
+        let conflicting_signing_key = [0x59; 32];
+        let mut advanced = profile.clone();
+        advanced.profile_version = 2;
+        advanced.display_name = Some("Must roll back".to_string());
+        assert!(db
+            .upsert_authenticated_network_profile(&advanced, conflicting_signing_key)
+            .is_err());
+        assert_eq!(
+            db.load_network_profile(&account.locator).unwrap(),
+            Some(profile)
         );
     }
 

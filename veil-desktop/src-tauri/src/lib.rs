@@ -15,7 +15,10 @@ use veil_client::api::{
 use veil_client::connection::ConnectionEvent;
 use veil_search::{Indexer, SearchHit};
 use veil_store::keychain;
-use veil_store::models::{AccountSnapshot, AccountSnapshotSource, ProfileLocator};
+use veil_store::models::{
+    AccountSnapshot, AccountSnapshotSource, LocalIdentityVerification, NetworkProfile,
+    ProfileLocator,
+};
 use zeroize::{Zeroize, Zeroizing};
 
 mod appearance;
@@ -28,6 +31,32 @@ struct ConversationCryptoDiagnostic {
     conversation_id: String,
     code: String,
     detail: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkProfileResponse {
+    user_id: String,
+    username: String,
+    display_name: Option<String>,
+    about: String,
+    profile_version: u64,
+    profile_updated_at: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkProfileView {
+    canonical_server_origin: String,
+    user_id: String,
+    identity_key: String,
+    username: String,
+    display_name: Option<String>,
+    about: String,
+    profile_version: String,
+    profile_updated_at: String,
+    observed_at: String,
+    proof_state: String,
 }
 
 #[derive(Default)]
@@ -2230,6 +2259,99 @@ fn validate_directory_text(
         return Err(format!("{field} is empty, oversized, or contains controls"));
     }
     Ok(())
+}
+
+fn contains_bidi_override(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+    })
+}
+
+fn validate_profile_text(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+    allow_line_feed: bool,
+) -> Result<(), String> {
+    if value.len() > max_bytes
+        || contains_bidi_override(value)
+        || value
+            .chars()
+            .any(|character| character.is_control() && !(allow_line_feed && character == '\n'))
+    {
+        return Err(format!("{field} is oversized or contains unsafe controls"));
+    }
+    Ok(())
+}
+
+fn canonical_profile_version(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| "profile version is invalid".to_string())?;
+    if parsed.to_string() != value {
+        return Err("profile version is non-canonical".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_network_profile_response(
+    value: serde_json::Value,
+    expected_user_id: &str,
+) -> Result<NetworkProfileResponse, String> {
+    let profile: NetworkProfileResponse = serde_json::from_value(value)
+        .map_err(|error| format!("invalid network profile response: {error}"))?;
+    decode_canonical_uuid("network profile user id", &profile.user_id)?;
+    if profile.user_id != expected_user_id {
+        return Err("network profile response changed its user id".to_string());
+    }
+    validate_profile_text("network profile username", &profile.username, 256, false)?;
+    if profile.username.is_empty() {
+        return Err("network profile username is empty".to_string());
+    }
+    if let Some(display_name) = profile.display_name.as_deref() {
+        validate_profile_text("network profile display name", display_name, 512, false)?;
+    }
+    validate_profile_text("network profile about", &profile.about, 2048, true)?;
+    validate_utc_rfc3339_nano(
+        "network profile updated timestamp",
+        &profile.profile_updated_at,
+    )?;
+    Ok(profile)
+}
+
+fn network_profile_view(
+    profile: &NetworkProfile,
+    proof: LocalIdentityVerification,
+    is_self: bool,
+) -> NetworkProfileView {
+    let proof_state = if is_self {
+        "current_account"
+    } else {
+        match proof {
+            LocalIdentityVerification::NotCompared => "not_compared",
+            LocalIdentityVerification::VerifiedOnThisDevice => "verified_on_this_device",
+            LocalIdentityVerification::IdentityChanged => "identity_changed",
+        }
+    };
+    NetworkProfileView {
+        canonical_server_origin: profile.locator.canonical_server_origin.clone(),
+        user_id: profile.locator.user_id.clone(),
+        identity_key: hex::encode(profile.locator.identity_key),
+        username: profile.username.clone(),
+        display_name: profile.display_name.clone(),
+        about: profile.about.clone(),
+        profile_version: profile.profile_version.to_string(),
+        profile_updated_at: profile.profile_updated_at.clone(),
+        observed_at: profile.observed_at.clone(),
+        proof_state: proof_state.to_string(),
+    }
 }
 
 fn validate_directory_reason(field: &str, value: &str) -> Result<(), String> {
@@ -6435,6 +6557,188 @@ fn get_server(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Security scope fields stay explicit at the IPC boundary.
+fn get_network_profile(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    target_user_id: String,
+    expected_identity_key: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<NetworkProfileView, String> {
+    decode_canonical_uuid("profile requester user id", &user_id)?;
+    decode_canonical_uuid("profile target user id", &target_user_id)?;
+    let identity_key =
+        decode_lower_hex_fixed::<32>("profile expected identity key", &expected_identity_key)?;
+    let live_action_binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "users", &target_user_id, "profile"],
+    )?;
+    validate_live_action_rest_origin(&live_action_binding, &request_url)?;
+    let canonical_server_origin = live_action_binding.origin.canonical_server_origin();
+    let locator = ProfileLocator {
+        canonical_server_origin: canonical_server_origin.clone(),
+        user_id: target_user_id.clone(),
+        identity_key,
+    };
+
+    {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        if client.authenticated_user_id()? != user_id {
+            return Err("profile requester differs from authenticated session".to_string());
+        }
+        let is_self = target_user_id == user_id;
+        if is_self {
+            if client.identity_key()? != identity_key {
+                return Err("profile identity differs from the authenticated self".to_string());
+            }
+        } else if client
+            .db()
+            .ok_or("database not initialized")?
+            .resolve_account_snapshot(&locator)?
+            .is_none()
+        {
+            return Err("profile target has no exact pinned account entry".to_string());
+        }
+    }
+
+    let response = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::GET,
+        request_url,
+        &user_id,
+        None,
+        &live_action_binding,
+    ))?;
+    let response = parse_network_profile_response(response, &target_user_id)?;
+    let profile = NetworkProfile {
+        locator,
+        username: response.username,
+        display_name: response.display_name,
+        about: response.about,
+        profile_version: response.profile_version,
+        profile_updated_at: response.profile_updated_at,
+        observed_at: identity_observed_at(),
+    };
+
+    let _session_transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("authenticated user changed before profile storage".to_string());
+    }
+    let is_self = target_user_id == user_id;
+    let db = client.db().ok_or("database not initialized")?;
+    if is_self {
+        if client.identity_key()? != identity_key {
+            return Err("authenticated identity changed before profile storage".to_string());
+        }
+        db.upsert_authenticated_network_profile(&profile, client.signing_key()?)?;
+    } else {
+        if db.resolve_account_snapshot(&profile.locator)?.is_none() {
+            return Err("profile target binding disappeared before storage".to_string());
+        }
+        db.upsert_network_profile(&profile)?;
+    }
+    let proof = db.local_identity_verification(&profile.locator)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    Ok(network_profile_view(&profile, proof, is_self))
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Security scope fields stay explicit at the IPC boundary.
+fn update_network_profile(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    expected_version: String,
+    display_name: Option<String>,
+    about: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<NetworkProfileView, String> {
+    decode_canonical_uuid("profile user id", &user_id)?;
+    let expected_version = canonical_profile_version(&expected_version)?;
+    if expected_version > i64::MAX as u64 {
+        return Err("profile version exceeds the server contract".to_string());
+    }
+    if let Some(display_name) = display_name.as_deref() {
+        validate_profile_text("profile display name", display_name, 512, false)?;
+    }
+    validate_profile_text("profile about", &about, 2048, true)?;
+    let live_action_binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(&server_http_url, &["v1", "users", "me", "profile"])?;
+    validate_live_action_rest_origin(&live_action_binding, &request_url)?;
+    {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        if client.authenticated_user_id()? != user_id {
+            return Err("profile update user differs from authenticated session".to_string());
+        }
+    }
+    let response = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::PUT,
+        request_url,
+        &user_id,
+        Some(serde_json::json!({
+            "expected_version": expected_version,
+            "display_name": display_name,
+            "about": about,
+        })),
+        &live_action_binding,
+    ))?;
+    let response = parse_network_profile_response(response, &user_id)?;
+
+    let _session_transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("authenticated user changed before profile storage".to_string());
+    }
+    let profile = NetworkProfile {
+        locator: ProfileLocator {
+            canonical_server_origin: live_action_binding.origin.canonical_server_origin(),
+            user_id,
+            identity_key: client.identity_key()?,
+        },
+        username: response.username,
+        display_name: response.display_name,
+        about: response.about,
+        profile_version: response.profile_version,
+        profile_updated_at: response.profile_updated_at,
+        observed_at: identity_observed_at(),
+    };
+    let db = client.db().ok_or("database not initialized")?;
+    db.upsert_authenticated_network_profile(&profile, client.signing_key()?)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    Ok(network_profile_view(
+        &profile,
+        LocalIdentityVerification::NotCompared,
+        true,
+    ))
+}
+
+#[tauri::command]
 fn update_server(
     state: State<'_, AppState>,
     server_http_url: String,
@@ -7993,6 +8297,8 @@ pub fn run() {
             create_server,
             list_servers,
             get_server,
+            get_network_profile,
+            update_network_profile,
             update_server,
             delete_server,
             leave_server,
@@ -8026,21 +8332,21 @@ pub fn run() {
 #[cfg(test)]
 mod e2ee_rest_tests {
     use super::{
-        authenticated_event_payload, consume_pending_lock_event,
+        authenticated_event_payload, canonical_profile_version, consume_pending_lock_event,
         exact_confirmed_live_action_binding, invalidate_disconnected_binding, offline_sync_url,
         parse_device_directory, parse_expected_dm_peer_identity_key, parse_message_crypto_context,
-        parse_prekey_bundle, preserve_created_group_outcome, publish_unlocked_session,
-        resolve_auto_lock_seconds, rest_api_url, rest_authority, rest_canonical, rest_origin,
-        rest_request_target, valid_auto_lock_seconds, valid_unlock_pin,
-        validate_authenticated_binding_commit, validate_created_dm_account_directory,
-        validate_expected_dm_peer_identity_key, validate_expected_live_action_binding,
-        validate_expected_rest_binding, validate_live_action_rest_origin,
-        validate_live_message_security_context, validate_next_cursor,
-        validate_persisted_message_conversation, validate_pinned_directory_self, validate_rest_url,
-        validate_server_endpoint_pair, validate_utc_rfc3339_nano,
-        verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
-        ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
-        DEFAULT_AUTO_LOCK_SECONDS,
+        parse_network_profile_response, parse_prekey_bundle, preserve_created_group_outcome,
+        publish_unlocked_session, resolve_auto_lock_seconds, rest_api_url, rest_authority,
+        rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
+        valid_unlock_pin, validate_authenticated_binding_commit,
+        validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
+        validate_expected_live_action_binding, validate_expected_rest_binding,
+        validate_live_action_rest_origin, validate_live_message_security_context,
+        validate_next_cursor, validate_persisted_message_conversation,
+        validate_pinned_directory_self, validate_rest_url, validate_server_endpoint_pair,
+        validate_utc_rfc3339_nano, verify_device_directory_account_keys, AuthenticatedSessionScope,
+        ConversationSyncIsolation, ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding,
+        RestOrigin, DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
 
@@ -8948,6 +9254,46 @@ mod e2ee_rest_tests {
             "2026-07-11t18:00:00Z",
         ] {
             assert!(validate_utc_rfc3339_nano("created_at", invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn network_profile_response_is_strict_and_bound_to_the_requested_user() {
+        let user_id = "00000000-0000-0000-0000-0000000000a1";
+        let valid = serde_json::json!({
+            "user_id": user_id,
+            "username": "alice",
+            "display_name": "Alice",
+            "about": "first line\nsecond line",
+            "profile_version": 7,
+            "profile_updated_at": "2026-07-13T08:00:00Z"
+        });
+        assert_eq!(
+            parse_network_profile_response(valid.clone(), user_id)
+                .unwrap()
+                .profile_version,
+            7
+        );
+
+        let mut other_user = valid.clone();
+        other_user["user_id"] = serde_json::json!("00000000-0000-0000-0000-0000000000a2");
+        assert!(parse_network_profile_response(other_user, user_id).is_err());
+
+        let mut unknown_field = valid.clone();
+        unknown_field["avatar_url"] = serde_json::json!("https://example.test/avatar.png");
+        assert!(parse_network_profile_response(unknown_field, user_id).is_err());
+
+        let mut bidi = valid;
+        bidi["about"] = serde_json::json!("safe\u{202e}evil");
+        assert!(parse_network_profile_response(bidi, user_id).is_err());
+    }
+
+    #[test]
+    fn profile_version_from_renderer_is_canonical() {
+        assert_eq!(canonical_profile_version("0").unwrap(), 0);
+        assert_eq!(canonical_profile_version("42").unwrap(), 42);
+        for invalid in ["", "00", "01", "+1", "-1", " 1"] {
+            assert!(canonical_profile_version(invalid).is_err());
         }
     }
 }

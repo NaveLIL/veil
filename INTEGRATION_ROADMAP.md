@@ -701,8 +701,17 @@ ciphertext, имеет message ACL и retention, поэтому сервер н�
 equal-version equivocation. `local_identity_verifications_v1` хранит явное
 физическое сравнение отдельно от profile metadata, переживает restart и
 возвращает `Identity changed` при другом наблюдаемом ключе; self-verification
-запрещена самим storage layer. Native REST/event commands, renderer editor и
-интерактивный proof flow ещё не подключены, поэтому deliverable не закрыт.
+запрещена самим storage layer.
+
+**Native profile checkpoint 2026-07-13:** signed GET/self PUT подключены к
+нативной origin/generation-bound REST boundary. Ответ строго проверяет schema,
+UUID, bounded text, bidi/control characters и monotonic version до SQLCipher.
+Peer принимается только для уже закреплённого exact locator; fresh self может
+создать directory snapshot только из ключей текущей аутентифицированной native
+session и существующего immutable self-binding. Directory + profile сохраняются
+одной транзакцией, а binding и session повторно проверяются после сетевого
+ожидания. Profile event, renderer editor и интерактивный proof flow ещё не
+подключены, поэтому deliverable не закрыт.
 
 - Native API возвращает стабильный fingerprint в hex + визуальном/emoji формате.
 - SQLCipher хранит verification по server origin, account и наблюдаемой identity,
