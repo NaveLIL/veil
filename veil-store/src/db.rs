@@ -798,6 +798,22 @@ impl VeilDb {
                 UNIQUE (canonical_server_origin, identity_key)
             );
 
+            -- Durable binding between this SQLCipher identity and the account
+            -- assigned by each authenticated server origin. The first
+            -- successful WebSocket authentication pins all account
+            -- coordinates; later reconnects and process restarts may only
+            -- refresh the observation timestamp, never remap the account.
+            CREATE TABLE IF NOT EXISTS authenticated_self_bindings_v1 (
+                canonical_server_origin TEXT PRIMARY KEY
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                identity_key BLOB NOT NULL CHECK(length(identity_key) = 32),
+                signing_key BLOB NOT NULL CHECK(length(signing_key) = 32),
+                first_authenticated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_authenticated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK(identity_key <> signing_key)
+            );
+
             -- Immutable author attribution captured when plaintext is
             -- committed. It follows an outgoing local UUID when the server
             -- ACK replaces that UUID and is removed with the message.
@@ -1552,6 +1568,108 @@ impl VeilDb {
     /// Get a reference to the underlying connection (for advanced queries).
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Pin the exact self account assigned by one authenticated origin.
+    ///
+    /// This executes before offline sync. A server may assign the same user
+    /// UUID as another self-hosted instance, but one origin may never remap
+    /// the local account UUID or either long-term account key after the first
+    /// successful authentication, including across process restarts.
+    pub fn bind_authenticated_self(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        identity_key: &[u8; 32],
+        signing_key: &[u8; 32],
+    ) -> Result<(), String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("authenticated self user id", user_id)?;
+        if identity_key == &[0u8; 32] || signing_key == &[0u8; 32] {
+            return Err("authenticated self keys must not be all zero".to_string());
+        }
+        if identity_key == signing_key {
+            return Err(
+                "authenticated self identity and signing keys must be distinct".to_string(),
+            );
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin authenticated self binding: {error}"))?;
+        let existing = tx
+            .query_row(
+                "SELECT user_id, identity_key, signing_key
+                 FROM authenticated_self_bindings_v1
+                 WHERE canonical_server_origin = ?1",
+                rusqlite::params![canonical_server_origin],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load authenticated self binding: {error}"))?;
+
+        match existing {
+            Some((stored_user_id, stored_identity_key, stored_signing_key)) => {
+                let stored_identity_key =
+                    fixed_bytes::<32>("authenticated self identity key", stored_identity_key)?;
+                let stored_signing_key =
+                    fixed_bytes::<32>("authenticated self signing key", stored_signing_key)?;
+                if stored_user_id != user_id
+                    || stored_identity_key != *identity_key
+                    || stored_signing_key != *signing_key
+                {
+                    return Err(
+                        "authenticated server attempted to remap the durable self account"
+                            .to_string(),
+                    );
+                }
+                tx.execute(
+                    "UPDATE authenticated_self_bindings_v1
+                     SET last_authenticated_at = datetime('now')
+                     WHERE canonical_server_origin = ?1",
+                    rusqlite::params![canonical_server_origin],
+                )
+                .map_err(|error| format!("refresh authenticated self binding: {error}"))?;
+            }
+            None => {
+                let existing_user =
+                    load_account_by_origin_user(&tx, canonical_server_origin, user_id)?;
+                let existing_identity =
+                    load_account_by_origin_identity(&tx, canonical_server_origin, identity_key)?;
+                for existing in [existing_user, existing_identity].into_iter().flatten() {
+                    if existing.locator.user_id != user_id
+                        || existing.locator.identity_key != *identity_key
+                        || existing.signing_key != *signing_key
+                    {
+                        return Err(
+                            "authenticated self binding conflicts with the persisted identity directory"
+                                .to_string(),
+                        );
+                    }
+                }
+                tx.execute(
+                    "INSERT INTO authenticated_self_bindings_v1
+                        (canonical_server_origin, user_id, identity_key, signing_key)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        canonical_server_origin,
+                        user_id,
+                        identity_key.as_slice(),
+                        signing_key.as_slice(),
+                    ],
+                )
+                .map_err(|error| format!("insert authenticated self binding: {error}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|error| format!("commit authenticated self binding: {error}"))
     }
 
     /// Merge a complete authenticated account-directory batch atomically.
@@ -6291,6 +6409,106 @@ mod tests {
             db.resolve_account_snapshot(&beta.locator).unwrap(),
             Some(beta)
         );
+    }
+
+    #[test]
+    fn authenticated_self_binding_is_origin_scoped_and_immutable() {
+        let db = VeilDb::open_memory(&[0xA1; 32]).unwrap();
+        let identity_key = [0x11; 32];
+        let signing_key = [0x12; 32];
+
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        db.bind_authenticated_self(ORIGIN_B, USER_B, &identity_key, &signing_key)
+            .unwrap();
+
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_B, &identity_key, &signing_key)
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &[0x13; 32], &signing_key)
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &[0x14; 32])
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &[0u8; 32], &signing_key)
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &identity_key)
+            .is_err());
+    }
+
+    #[test]
+    fn authenticated_self_binding_survives_file_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-authenticated-self-binding-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xA2; 32];
+        let identity_key = [0x21; 32];
+        let signing_key = [0x22; 32];
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+                .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            reopened
+                .bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+                .unwrap();
+            assert!(reopened
+                .bind_authenticated_self(ORIGIN_A, USER_B, &identity_key, &signing_key)
+                .is_err());
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn authenticated_self_binding_rejects_upgrade_poisoning_before_insert() {
+        let db = VeilDb::open_memory(&[0xA3; 32]).unwrap();
+        let persisted_self = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x31,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&persisted_self))
+            .unwrap();
+
+        assert!(db
+            .bind_authenticated_self(
+                ORIGIN_A,
+                USER_B,
+                &persisted_self.locator.identity_key,
+                &persisted_self.signing_key,
+            )
+            .is_err());
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &persisted_self.locator.identity_key,
+            &persisted_self.signing_key,
+        )
+        .unwrap();
+
+        let stored_user: String = db
+            .conn
+            .query_row(
+                "SELECT user_id FROM authenticated_self_bindings_v1
+                 WHERE canonical_server_origin = ?1",
+                rusqlite::params![ORIGIN_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_user, USER_A);
     }
 
     #[test]

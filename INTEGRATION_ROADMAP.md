@@ -20,9 +20,9 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 
 1. Completion gate фаз 1–4C пройден и опубликован в
    [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-2. После защитного checkpoint 4D.1b.1 выполнить pre-release 4D.1c origin
-   namespace cutover без runtime legacy fallback, довести оставшиеся consumers
-   identity directory, затем реализовать Phaseprint и общий `UserAvatar`;
+2. Завершить Identity foundation: выполнить pre-release origin namespace
+   cutover без runtime legacy fallback и довести оставшиеся consumers identity
+   directory; затем реализовать Phaseprint и общий `UserAvatar`;
    network profile и avatar ingest подключать только после отдельных gates.
 3. Довести вынесенные продуктовые scopes: Phase 3B (attachment UX), Phase 4P
    (device push clients) и Phase 4E (server experience), не смешивая их с
@@ -42,7 +42,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | 4D.1a и защитный 4D.1b.1 закрыты; pre-release 4D.1c storage cutover следующий |
+| 4D | Identity Island & Profiles | Identity foundation в работе; дальше Phaseprint/UserAvatar и Identity Island |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -360,17 +360,30 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 **Статус 2026-07-12:** Phase 4D начата. Entry gate и формальное решение
 опубликованы в
 [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-Checkpoint **4D.1a — Canonical local identity snapshots** и следующий защитный
-checkpoint **4D.1b.1 — Authenticated origin/binding transition fence**
+Два implementation checkpoint — canonical local identity snapshots и
+authenticated origin/binding transition fence —
 реализованы и проверены. Они закрывают минимальный локальный identity foundation
-и безопасную смену authenticated namespace, но не завершают ни 4D.1 целиком,
-ни Phase 4D: Phaseprint, общий `UserAvatar`, Identity Island, text profile,
+и безопасную смену authenticated namespace, но не завершают Phase 4D:
+Phaseprint, общий `UserAvatar`, Identity Island, text profile,
 identity proof и avatar ingest ещё не реализованы.
 
 Цель — дать одному человеку единое и узнаваемое представление во всех местах
 Veil: собственный footer, друзья, DM, группы, сообщения, server members и
 settings. Профиль называется **Identity Island** и продолжает язык Phase Shift,
 а не копирует banner/popover Discord.
+
+Phase 4D отслеживается как пять прямых продуктовых deliverables без вложенных
+«фаз внутри фаз»:
+
+1. Identity foundation: durable origin binding, hard namespace cutover и
+   удаление originless runtime legacy.
+2. Детерминированный Phaseprint и единый `UserAvatar`.
+3. Identity Island, все точки открытия, плавная навигация и переходы в DM.
+4. Versioned text profile, Identity Proof и privacy/security review.
+5. Изолированный безопасный avatar pipeline и финальный completion gate.
+
+Малые migration/security commits внутри deliverable являются только
+проверяемыми Git-checkpoint'ами, а не новыми уровнями roadmap.
 
 ### Entry gate 4D
 
@@ -423,7 +436,7 @@ smoke:
   profile manifest с monotonic revision допустим позже, но не заменяет
   авторизацию REST и требует отдельной threat-model проверки replay/rollback.
 
-### Checkpoint 4D.1a — Canonical local identity snapshots
+### Реализовано в Identity foundation: canonical local identity snapshots
 
 - `ProfileLocator` фиксирует `(canonical_server_origin, user_id, identity_key)`;
   UUID пользователя не считается глобальным между self-hosted origins.
@@ -450,7 +463,7 @@ rows не получают активный origin по догадке и тре
 migration/cutover. Также остаются открыты полная нормализация friend/request/
 group/server contexts и семантика `Former member`.
 
-### Checkpoint 4D.1b.1 — Authenticated origin/binding transition fence
+### Реализовано в Identity foundation: authenticated transition fence
 
 - Native публикует renderer не отдельный UUID, а точный authenticated scope:
   canonical server origin, user ID и монотонную binding generation. Generation
@@ -487,7 +500,7 @@ request/group/server consumer normalization, origin-scoped server cache v2,
 `Former member`, одновременное хранение colliding namespaces и generation-bound
 проверка каждого identity-mutating REST результата.
 
-### Следующий checkpoint 4D.1c — Pre-release origin namespace cutover
+### Identity foundation: pre-release origin namespace cutover
 
 До Phaseprint нужен один явно описанный storage cutover. Поскольку публичного
 релиза не было, сохранять runtime-совместимость с originless development rows
@@ -506,11 +519,21 @@ request/group/server consumer normalization, origin-scoped server cache v2,
   cutover их явно отвергает или удаляет после backup. Crypto payload formats,
   Double Ratchet и Sender-Key protocol при этом не меняются.
 
+Durable self binding уже перенесён из process-only map в SQLCipher и проверяется
+сразу после authenticated WebSocket result, до публикации REST binding и
+offline sync. Повторное точное наблюдение разрешено, а замена user/identity/
+signing key на одном origin отклоняется также после file-backed restart.
+`get_group_members` теперь применяет directory только под exact renderer
+origin/generation; server kick предварительно quarantine-ит origin-scoped
+channel rosters. Неиспользуемые standalone session/group-member IPC удалены.
+Перед изменением схемы сохранена совпадающая по SHA-256 копия development DB,
+WAL и SHM в локальной игнорируемой `backups/`.
+
 Этот блок затрагивает адресацию локального хранения сообщений, поэтому перед
 реализацией требуется отдельное объяснение schema/cutover, backup реальной
 development БД и полный restart/collision/recovery test matrix.
 
-### 4D.1 — Canonical identity directory
+### Identity foundation: canonical identity directory
 
 1. Ввести origin-scoped каталог профилей и общий `ProfileLocator`.
 2. Нормализовать данные self, DM peer, friend/request, message author,
@@ -523,7 +546,7 @@ development БД и полный restart/collision/recovery test matrix.
 5. Для удалённого/бывшего участника сохранять историческую author snapshot, но
    помечать её как `Former member`, а не приписывать текущие роли или presence.
 
-### 4D.2 — Phaseprint, UserAvatar и Identity Island
+### Phaseprint, UserAvatar и Identity Island
 
 - Один `UserAvatar` для footer, списков, header, сообщений, друзей и members.
 - До настоящих картинок использовать детерминированный **Phaseprint** из
@@ -542,7 +565,7 @@ development БД и полный restart/collision/recovery test matrix.
   technical handle; owner и первые три роли показываются отдельно и не меняют
   identity trust.
 
-### 4D.3 — Versioned text profile
+### Versioned text profile
 
 Первый сетевой релиз профилей не требует avatar upload:
 
@@ -562,7 +585,7 @@ development БД и полный restart/collision/recovery test matrix.
 - profile endpoint не возвращает recovery data, private keys, email, IP,
   presence history или device secrets.
 
-### 4D.4 — Isolated avatar asset pipeline
+### Isolated avatar asset pipeline
 
 Существующий tus attachment pipeline переиспользовать нельзя: он принимает E2EE
 ciphertext, имеет message ACL и retention, поэтому сервер не может очистить
@@ -586,7 +609,7 @@ ciphertext, имеет message ACL и retention, поэтому сервер н�
 - UI предупреждает: avatar и текст профиля видны оператору выбранного сервера и
   не являются содержимым E2EE-сообщения.
 
-### 4D.5 — Local identity proof
+### Local identity proof
 
 - Native API возвращает стабильный fingerprint в hex + визуальном/emoji формате.
 - SQLCipher хранит verification по server origin, account и наблюдаемой identity,

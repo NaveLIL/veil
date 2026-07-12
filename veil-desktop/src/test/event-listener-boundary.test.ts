@@ -39,6 +39,7 @@ describe("authenticated event listener boundary", () => {
         command === "get_conversation_crypto_diagnostics"
         || command === "get_conversations"
         || command === "get_messages"
+        || command === "get_group_members"
         || command === "list_servers"
       ) return [];
       return undefined;
@@ -108,6 +109,19 @@ describe("authenticated event listener boundary", () => {
         expectedBindingGeneration: "1",
       }));
     }
+    await expect(appStore.getGroupMembers(conversationId)).resolves.toEqual([]);
+    expect(mocks.invoke).toHaveBeenCalledWith("get_group_members", expect.objectContaining({
+      expectedServerOrigin: "http://127.0.0.1:9080",
+      expectedBindingGeneration: "1",
+    }));
+    await appStore.kickMember(
+      "550e8400-e29b-41d4-a716-446655440020",
+      "550e8400-e29b-41d4-a716-446655440022",
+    );
+    expect(mocks.invoke).toHaveBeenCalledWith("kick_server_member", expect.objectContaining({
+      expectedServerOrigin: "http://127.0.0.1:9080",
+      expectedBindingGeneration: "1",
+    }));
     const confirmation = confirmDecision({ title: "Old binding", message: "Retire me" });
     vi.useFakeTimers();
     mocks.handlers.get("veil://disconnected")?.({

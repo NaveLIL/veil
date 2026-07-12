@@ -75,11 +75,6 @@ struct AppState {
     /// live mutations are forbidden until this equals the transport binding.
     renderer_confirmed_rest_binding: Mutex<Option<RestBinding>>,
     rest_binding_generation: AtomicU64,
-    /// A gateway may assign user UUIDs, but it may not silently remap the same
-    /// local cryptographic identity to another account on a known origin.
-    /// This process-lifetime continuity gate runs before offline sync mutates
-    /// SQLCipher or runtime ratchets.
-    authenticated_account_continuity: Mutex<AuthenticatedAccountContinuity>,
     /// Native security boundary. Sensitive commands also require an
     /// initialized client, but this flag prevents reopening the keychain/DB
     /// through IPC while the PIN screen is active.
@@ -151,37 +146,6 @@ struct RestBinding {
     generation: u64,
 }
 
-#[derive(Default)]
-struct AuthenticatedAccountContinuity {
-    local_identity_key: Option<[u8; 32]>,
-    users_by_origin: std::collections::HashMap<String, String>,
-}
-
-fn bind_authenticated_account(
-    continuity: &mut AuthenticatedAccountContinuity,
-    local_identity_key: [u8; 32],
-    canonical_server_origin: &str,
-    user_id: &str,
-) -> Result<(), String> {
-    if continuity.local_identity_key != Some(local_identity_key) {
-        continuity.users_by_origin.clear();
-        continuity.local_identity_key = Some(local_identity_key);
-    }
-    if let Some(previous_user_id) = continuity.users_by_origin.get(canonical_server_origin) {
-        if previous_user_id != user_id {
-            return Err(
-                "authenticated server attempted to remap the local identity to another account"
-                    .to_string(),
-            );
-        }
-        return Ok(());
-    }
-    continuity
-        .users_by_origin
-        .insert(canonical_server_origin.to_string(), user_id.to_string());
-    Ok(())
-}
-
 /// Authenticated namespace published to the renderer only after the complete
 /// WS-authenticated REST backlog has passed the origin and continuity gates.
 /// The generation is serialized as text so JavaScript can never lose u64
@@ -192,6 +156,27 @@ struct AuthenticatedSessionScope {
     user_id: String,
     canonical_server_origin: String,
     binding_generation: String,
+}
+
+fn validate_authenticated_binding_commit(
+    session_unlocked: bool,
+    expected_user_id: &str,
+    current_user_id: &str,
+    expected_identity_key: &[u8; 32],
+    current_identity_key: &[u8; 32],
+    expected_signing_key: &[u8; 32],
+    current_signing_key: &[u8; 32],
+) -> Result<(), String> {
+    if !session_unlocked {
+        return Err("application locked before durable account binding".to_string());
+    }
+    if current_user_id != expected_user_id
+        || current_identity_key != expected_identity_key
+        || current_signing_key != expected_signing_key
+    {
+        return Err("authenticated client changed before durable account binding".to_string());
+    }
+    Ok(())
 }
 
 fn authenticated_event_payload<T: serde::Serialize>(
@@ -584,6 +569,20 @@ fn validate_expected_live_action_binding(
     Ok(())
 }
 
+fn capture_expected_live_action_binding(
+    state: &AppState,
+    expected_server_origin: &str,
+    expected_binding_generation: &str,
+) -> Result<RestBinding, String> {
+    let binding = capture_confirmed_live_action_binding(state)?;
+    validate_expected_live_action_binding(
+        &binding,
+        expected_server_origin,
+        expected_binding_generation,
+    )?;
+    Ok(binding)
+}
+
 fn validate_live_action_rest_origin(
     binding: &RestBinding,
     request_url: &str,
@@ -879,14 +878,6 @@ fn initialize_client(state: &AppState, mnemonic: &str) -> Result<String, String>
     let identity_key = fresh.identity_key()?;
     let key = hex::encode(identity_key);
     *state.client.lock().map_err(|e| e.to_string())? = fresh;
-    let mut continuity = state
-        .authenticated_account_continuity
-        .lock()
-        .map_err(|e| e.to_string())?;
-    if continuity.local_identity_key != Some(identity_key) {
-        continuity.users_by_origin.clear();
-        continuity.local_identity_key = Some(identity_key);
-    }
     state
         .unavailable_conversations
         .lock()
@@ -1632,7 +1623,7 @@ fn establish_session_for_peer(
         require_confirmed_live_action_binding_current(state, live_action_binding)?;
         client.authenticated_user_id()?
     };
-    let value = state.runtime.block_on(rest_send_json(
+    let value = state.runtime.block_on(rest_send_json_for_binding(
         state,
         reqwest::Method::GET,
         rest_api_url(
@@ -1641,6 +1632,7 @@ fn establish_session_for_peer(
         )?,
         &user_id,
         None,
+        live_action_binding,
     ))?;
     let bundle = parse_prekey_bundle(value, &peer_identity_key)?;
     if let Some(expected) = expected_signing_key {
@@ -1652,27 +1644,6 @@ fn establish_session_for_peer(
     require_confirmed_live_action_binding_current(state, live_action_binding)?;
     client.pin_peer_signing_key(peer_identity_key, bundle.signing_key)?;
     client.establish_session(&peer_identity_key, &bundle)
-}
-
-/// Fetch a peer's prekey bundle and establish an encrypted session.
-#[tauri::command]
-fn establish_session(
-    state: State<'_, AppState>,
-    server_http_url: String,
-    peer_identity_key: String,
-) -> Result<(), String> {
-    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
-    let peer_identity_key: [u8; 32] = hex::decode(peer_identity_key.trim())
-        .map_err(|e| format!("decode peer identity key: {e}"))?
-        .try_into()
-        .map_err(|v: Vec<u8>| format!("peer identity key must be 32 bytes, got {}", v.len()))?;
-    establish_session_for_peer(
-        &state,
-        &server_http_url,
-        peer_identity_key,
-        None,
-        &live_action_binding,
-    )
 }
 
 // ─── Connection ───────────────────────────────────────
@@ -3518,32 +3489,38 @@ fn connect_to_server(
     let result = state.runtime.block_on(client.connect(&server_url))?;
     decode_canonical_uuid("authenticated user id", &result)?;
     let local_identity_key = client.identity_key()?;
-    {
-        let mut continuity = state
-            .authenticated_account_continuity
-            .lock()
-            .map_err(|e| e.to_string())?;
-        bind_authenticated_account(
-            &mut continuity,
-            local_identity_key,
-            &canonical_server_origin,
-            &result,
-        )?;
-    }
+    let local_signing_key = client.signing_key()?;
     drop(client);
 
-    // Bind REST only after successful WS authentication, serialized against a
-    // concurrent native lock. A reconnect starts with no binding, so an old
-    // authenticated origin cannot authorize requests for the new session.
+    // Durable account trust and REST publication share the same ordered
+    // session transition. A lock that started while WebSocket auth held the
+    // client mutex completes first and prevents the AuthResult from becoming
+    // a persisted trust binding or a published REST origin.
     {
         let _session_transition = state.session_transition.lock().map_err(|e| e.to_string())?;
-        if !state.unlocked.load(Ordering::Acquire) {
-            return Err("application locked while authenticating".to_string());
-        }
-        if inactivity_expired(&state)? {
-            reset_sensitive_state_locked(&state)?;
-            return Err("application auto-locked while authenticating".to_string());
-        }
+        require_unlocked_locked(&state)?;
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        let current_user_id = client.authenticated_user_id()?;
+        let current_identity_key = client.identity_key()?;
+        let current_signing_key = client.signing_key()?;
+        validate_authenticated_binding_commit(
+            state.unlocked.load(Ordering::Acquire),
+            &result,
+            &current_user_id,
+            &local_identity_key,
+            &current_identity_key,
+            &local_signing_key,
+            &current_signing_key,
+        )?;
+        client
+            .db()
+            .ok_or("database not initialized")?
+            .bind_authenticated_self(
+                &canonical_server_origin,
+                &result,
+                &local_identity_key,
+                &local_signing_key,
+            )?;
         *state
             .authenticated_rest_origin
             .lock()
@@ -5363,77 +5340,6 @@ fn create_group(
     Ok(conv_id)
 }
 
-/// Add a member to a group via the server.
-#[tauri::command]
-fn add_group_member(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    server_http_url: String,
-    user_id: String,
-    group_id: String,
-    target_user_id: String,
-) -> Result<(), String> {
-    let event_app = AuthenticatedEventAppHandle::for_current(&app)?;
-    state.runtime.block_on(rest_send_json(
-        &state,
-        reqwest::Method::POST,
-        rest_api_url(&server_http_url, &["v1", "groups", &group_id, "members"])?,
-        &user_id,
-        Some(serde_json::json!({ "user_id": target_user_id })),
-    ))?;
-    {
-        let mut client = state.client.lock().map_err(|error| error.to_string())?;
-        client.invalidate_device_roster_v1(&group_id);
-        client.mark_channel_conversation(&group_id);
-    }
-    let diagnostic = quarantine_conversation_state(
-        &state,
-        &group_id,
-        "membership_refresh_required",
-        "group membership changed; refresh its exact-device roster",
-    )?;
-    emit_authenticated_conversation_crypto_unavailable(&event_app, &diagnostic);
-    emit_conversation_membership_refresh_required(&event_app, &group_id);
-    Ok(())
-}
-
-/// Remove a member from a group (or leave).
-#[tauri::command]
-fn remove_group_member(
-    state: State<'_, AppState>,
-    app: AppHandle,
-    server_http_url: String,
-    user_id: String,
-    group_id: String,
-    target_user_id: String,
-) -> Result<(), String> {
-    let event_app = AuthenticatedEventAppHandle::for_current(&app)?;
-    state.runtime.block_on(rest_send_json(
-        &state,
-        reqwest::Method::DELETE,
-        rest_api_url(
-            &server_http_url,
-            &["v1", "groups", &group_id, "members", &target_user_id],
-        )?,
-        &user_id,
-        None,
-    ))?;
-    {
-        let mut client = state.client.lock().map_err(|error| error.to_string())?;
-        client.invalidate_device_roster_v1(&group_id);
-        client.mark_channel_conversation(&group_id);
-    }
-    let diagnostic = quarantine_conversation_state(
-        &state,
-        &group_id,
-        "membership_refresh_required",
-        "group membership changed; refresh its exact-device roster",
-    )?;
-    emit_authenticated_conversation_crypto_unavailable(&event_app, &diagnostic);
-    emit_conversation_membership_refresh_required(&event_app, &group_id);
-    Ok(())
-}
-
 /// Get group members from the server.
 fn pin_directory_member_keys(
     client: &mut VeilClient,
@@ -5474,16 +5380,27 @@ fn fetch_authorized_conversation_directory(
     live_action_binding: Option<&RestBinding>,
 ) -> Result<Vec<serde_json::Value>, String> {
     decode_canonical_uuid("conversation directory request id", conversation_id)?;
-    let response = state.runtime.block_on(rest_send_json(
-        state,
-        reqwest::Method::GET,
-        rest_api_url(
-            server_http_url,
-            &["v1", "conversations", conversation_id, "members"],
-        )?,
-        user_id,
-        None,
-    ))?;
+    let request_url = rest_api_url(
+        server_http_url,
+        &["v1", "conversations", conversation_id, "members"],
+    )?;
+    let response = match live_action_binding {
+        Some(binding) => state.runtime.block_on(rest_send_json_for_binding(
+            state,
+            reqwest::Method::GET,
+            request_url,
+            user_id,
+            None,
+            binding,
+        )),
+        None => state.runtime.block_on(rest_send_json(
+            state,
+            reqwest::Method::GET,
+            request_url,
+            user_id,
+            None,
+        )),
+    }?;
     if response
         .get("conversation_id")
         .and_then(serde_json::Value::as_str)
@@ -5765,52 +5682,26 @@ fn fetch_and_install_authenticated_device_directory(
 }
 
 #[tauri::command]
-fn get_conversation_members(
-    state: State<'_, AppState>,
-    server_http_url: String,
-    user_id: String,
-    conversation_id: String,
-) -> Result<Vec<serde_json::Value>, String> {
-    require_unlocked(&state)?;
-    fetch_authorized_conversation_directory(
-        &state,
-        &server_http_url,
-        &user_id,
-        &conversation_id,
-        None,
-    )
-}
-
-#[tauri::command]
 fn get_group_members(
     state: State<'_, AppState>,
     server_http_url: String,
     user_id: String,
     group_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    require_unlocked(&state)?;
-    let members = fetch_authorized_conversation_directory(
+    let live_action_binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    fetch_authorized_conversation_directory(
         &state,
         &server_http_url,
         &user_id,
         &group_id,
-        None,
-    )?;
-
-    // Also persist members locally
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    if let Some(db) = client.db() {
-        for m in &members {
-            if let (Some(ik_hex), Some(role)) = (m["identity_key"].as_str(), m["role"].as_i64()) {
-                if let Ok(ik) = hex::decode(ik_hex) {
-                    let _ = db.insert_group_member(&group_id, &ik, role as u8);
-                }
-            }
-        }
-    }
-
-    require_session_still_unlocked(&state)?;
-    Ok(members)
+        Some(&live_action_binding),
+    )
 }
 
 // ─── Servers / Channels / Roles / Invites ─────────────
@@ -6299,16 +6190,6 @@ fn emit_server_membership_refresh_required(app: &AuthenticatedEventAppHandle, se
     );
 }
 
-fn emit_conversation_membership_refresh_required(
-    app: &AuthenticatedEventAppHandle,
-    conversation_id: &str,
-) {
-    let _ = app.emit(
-        "veil://membership-refresh-required",
-        serde_json::json!({ "conversationId": conversation_id }),
-    );
-}
-
 #[tauri::command]
 fn create_server(
     state: State<'_, AppState>,
@@ -6480,26 +6361,41 @@ fn list_server_members(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri IPC fields intentionally stay explicit.
 fn kick_server_member(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     user_id: String,
     server_id: String,
     target_user_id: String,
     reason: Option<String>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
     let body = reason.map(|r| serde_json::json!({ "reason": r }));
-    state.runtime.block_on(rest_send_json(
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "members", &target_user_id],
+    )?;
+    let event_app = prepare_server_authorization_change(
+        &state,
+        &app,
+        &request_url,
+        &server_id,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let result = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::DELETE,
-        rest_api_url(
-            &server_http_url,
-            &["v1", "servers", &server_id, "members", &target_user_id],
-        )?,
+        request_url,
         &user_id,
         body,
-    ))?;
-    Ok(())
+        &event_app.binding,
+    ));
+    emit_server_membership_refresh_required(&event_app, &server_id);
+    result.map(|_| ())
 }
 
 #[tauri::command]
@@ -7606,9 +7502,6 @@ pub fn run() {
                 authenticated_rest_origin: Mutex::new(None),
                 renderer_confirmed_rest_binding: Mutex::new(None),
                 rest_binding_generation: AtomicU64::new(0),
-                authenticated_account_continuity: Mutex::new(
-                    AuthenticatedAccountContinuity::default(),
-                ),
                 unlocked: AtomicBool::new(!pin_configured),
                 pin_configured: AtomicBool::new(pin_configured),
                 event_poller_started: AtomicBool::new(false),
@@ -7765,7 +7658,6 @@ pub fn run() {
             get_conversation_crypto_diagnostics,
             get_messages,
             upload_prekeys,
-            establish_session,
             connect_to_server,
             confirm_authenticated_session_scope,
             send_message,
@@ -7787,10 +7679,7 @@ pub fn run() {
             appearance::load_appearance_wallpaper,
             appearance::remove_appearance_wallpaper,
             create_group,
-            add_group_member,
-            remove_group_member,
             get_group_members,
-            get_conversation_members,
             send_friend_request,
             respond_friend_request,
             remove_friend,
@@ -7833,17 +7722,17 @@ pub fn run() {
 #[cfg(test)]
 mod e2ee_rest_tests {
     use super::{
-        authenticated_event_payload, bind_authenticated_account, consume_pending_lock_event,
+        authenticated_event_payload, consume_pending_lock_event,
         exact_confirmed_live_action_binding, invalidate_disconnected_binding, offline_sync_url,
         parse_device_directory, parse_message_crypto_context, parse_prekey_bundle,
         preserve_created_group_outcome, publish_unlocked_session, resolve_auto_lock_seconds,
         rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
-        valid_auto_lock_seconds, valid_unlock_pin, validate_expected_live_action_binding,
-        validate_expected_rest_binding, validate_live_action_rest_origin,
-        validate_live_message_security_context, validate_next_cursor,
-        validate_persisted_message_conversation, validate_rest_url, validate_server_endpoint_pair,
-        validate_utc_rfc3339_nano, verify_device_directory_account_keys,
-        AuthenticatedAccountContinuity, AuthenticatedSessionScope, ConversationSyncIsolation,
+        valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
+        validate_expected_live_action_binding, validate_expected_rest_binding,
+        validate_live_action_rest_origin, validate_live_message_security_context,
+        validate_next_cursor, validate_persisted_message_conversation, validate_rest_url,
+        validate_server_endpoint_pair, validate_utc_rfc3339_nano,
+        verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
         ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
         DEFAULT_AUTO_LOCK_SECONDS,
     };
@@ -8041,6 +7930,54 @@ mod e2ee_rest_tests {
     }
 
     #[test]
+    fn durable_account_binding_commit_rejects_lock_and_client_replacement() {
+        let user_id = "550e8400-e29b-41d4-a716-446655440000";
+        let identity_key = [0x11; 32];
+        let signing_key = [0x12; 32];
+
+        assert!(validate_authenticated_binding_commit(
+            true,
+            user_id,
+            user_id,
+            &identity_key,
+            &identity_key,
+            &signing_key,
+            &signing_key,
+        )
+        .is_ok());
+        assert!(validate_authenticated_binding_commit(
+            false,
+            user_id,
+            user_id,
+            &identity_key,
+            &identity_key,
+            &signing_key,
+            &signing_key,
+        )
+        .is_err());
+        assert!(validate_authenticated_binding_commit(
+            true,
+            user_id,
+            "550e8400-e29b-41d4-a716-446655440009",
+            &identity_key,
+            &identity_key,
+            &signing_key,
+            &signing_key,
+        )
+        .is_err());
+        assert!(validate_authenticated_binding_commit(
+            true,
+            user_id,
+            user_id,
+            &identity_key,
+            &[0x21; 32],
+            &signing_key,
+            &signing_key,
+        )
+        .is_err());
+    }
+
+    #[test]
     fn authenticated_event_payload_uses_the_exact_captured_binding() {
         let binding = authenticated_test_binding("chat.example.test", u64::MAX);
         let payload = authenticated_event_payload(
@@ -8182,44 +8119,6 @@ mod e2ee_rest_tests {
             &replacement_binding
         ));
         assert_eq!(current, None);
-    }
-
-    #[test]
-    fn authenticated_account_continuity_rejects_same_origin_remapping_before_sync() {
-        let mut continuity = AuthenticatedAccountContinuity::default();
-        let local_identity = [7u8; 32];
-
-        bind_authenticated_account(
-            &mut continuity,
-            local_identity,
-            "https://one.example.test:443",
-            "550e8400-e29b-41d4-a716-446655440000",
-        )
-        .unwrap();
-        bind_authenticated_account(
-            &mut continuity,
-            local_identity,
-            "https://two.example.test:443",
-            "550e8400-e29b-41d4-a716-446655440009",
-        )
-        .unwrap();
-        assert!(bind_authenticated_account(
-            &mut continuity,
-            local_identity,
-            "https://one.example.test:443",
-            "550e8400-e29b-41d4-a716-446655440009",
-        )
-        .is_err());
-
-        // Importing a genuinely different local identity starts a new account
-        // continuity namespace instead of inheriting the prior seed's map.
-        bind_authenticated_account(
-            &mut continuity,
-            [8u8; 32],
-            "https://one.example.test:443",
-            "550e8400-e29b-41d4-a716-446655440009",
-        )
-        .unwrap();
     }
 
     #[test]

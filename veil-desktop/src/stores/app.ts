@@ -1559,19 +1559,6 @@ export const appStore = {
     }
   },
 
-  /** Establish an E2E encrypted session with a peer. */
-  establishSession: async (peerIdentityKey: string) => {
-    try {
-      await invoke("establish_session", {
-        serverHttpUrl: serverHttpUrl(),
-        peerIdentityKey,
-      });
-    } catch (e) {
-      console.error("establishSession failed:", e);
-      throw e;
-    }
-  },
-
   // ─── Groups ─────────────────────────────────────────
 
   /** Create a group only after the server confirms its authenticated roster. */
@@ -1607,45 +1594,12 @@ export const appStore = {
     }
   },
 
-  /** Add a member to a group. */
-  addGroupMember: async (groupId: string, targetUserId: string) => {
-    const uid = userId();
-    if (!uid) return;
-    try {
-      await invoke("add_group_member", {
-        serverHttpUrl: serverHttpUrl(),
-        userId: uid,
-        groupId,
-        targetUserId,
-      });
-    } catch (e) {
-      console.error("addGroupMember failed:", e);
-      throw e;
-    }
-  },
-
-  /** Remove a member from a group (or leave). */
-  removeGroupMember: async (groupId: string, targetUserId: string) => {
-    const uid = userId();
-    if (!uid) return;
-    try {
-      await invoke("remove_group_member", {
-        serverHttpUrl: serverHttpUrl(),
-        userId: uid,
-        groupId,
-        targetUserId,
-      });
-    } catch (e) {
-      console.error("removeGroupMember failed:", e);
-      throw e;
-    }
-  },
-
   /** Get group members from the server. */
   getGroupMembers: async (groupId: string): Promise<GroupMember[]> => {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
     try {
       const members = await invoke<Array<{
         user_id: string;
@@ -1657,8 +1611,9 @@ export const appStore = {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         groupId,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       return members.map((m) => ({
         userId: m.user_id,
         identityKey: m.identity_key,
@@ -2368,14 +2323,16 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("kick_server_member", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
       targetUserId,
       reason: reason ?? null,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
-    requireCurrentUiSession(sessionEpoch);
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).filter((m) => m.userId !== targetUserId),
