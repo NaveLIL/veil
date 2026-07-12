@@ -243,6 +243,7 @@ const rejectedOutgoingMessageIds = new Set<string>();
 const acknowledgedOutgoingMessageIds = new Map<string, string>();
 const discardedOutgoingMessageIds = new Set<string>();
 const messageLoadGenerations = new Map<string, number>();
+const senderKeyDistributionFlights = new Map<string, Promise<void>>();
 
 function nextMessageLoadGeneration(conversationId: string): number {
   const generation = (messageLoadGenerations.get(conversationId) ?? 0) + 1;
@@ -1734,17 +1735,29 @@ export const appStore = {
       // with sender keys; hydrate any persisted sender-key state from the local DB.
       if (mutationScope) {
         const scopeArgs = authenticatedMutationScopeArgs(mutationScope);
-        invoke("mark_channel_conversation", { conversationId: convId, ...scopeArgs }).catch(() => {});
-        invoke("hydrate_channel_sender_keys", { conversationId: convId, ...scopeArgs }).catch(() => {});
+        // A fresh channel has no local crypto classification yet. Marking and
+        // hydration are strict prerequisites for roster installation; running
+        // all three IPC calls concurrently made the first distribution race
+        // the classification and fail closed until the user reopened it.
+        void (async () => {
+          try {
+            await invoke("mark_channel_conversation", {
+              conversationId: convId,
+              ...scopeArgs,
+            });
+            await invoke("hydrate_channel_sender_keys", {
+              conversationId: convId,
+              ...scopeArgs,
+            });
+            await appStore.distributeSenderKey(convId);
+          } catch (error) {
+            if (!(error instanceof StaleUiSessionError)) {
+              console.warn("channel encryption preparation failed:", error);
+            }
+          }
+        })();
       }
       appStore.loadMessages(convId).catch(() => {});
-      // Native fetches and authorizes the current member directory. Renderer
-      // cache contents are deliberately not accepted as key recipients.
-      if (mutationScope) {
-        appStore.distributeSenderKey(convId).catch((e) =>
-          console.warn("distribute_sender_key failed:", e),
-        );
-      }
     } else {
       setActiveConversationId(null);
     }
@@ -1834,55 +1847,69 @@ export const appStore = {
   distributeSenderKey: async (conversationId: string): Promise<void> => {
     const sessionEpoch = captureUiSessionEpoch();
     const mutationScope = requirePublishedMutationScope();
-    const selfUserId = userId();
-    if (!selfUserId) throw new Error("sender-key distribution requires an authenticated user");
-    setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "checking" }));
-    try {
-      await invoke<number>("distribute_sender_key", {
-        conversationId,
-        serverHttpUrl: serverHttpUrl(),
-        userId: selfUserId,
-        ...authenticatedMutationScopeArgs(mutationScope),
-      });
-      requireCurrentMutationScope(sessionEpoch, mutationScope);
-      let status = await appStore.refreshSenderKeyStatus(conversationId);
-      requireCurrentMutationScope(sessionEpoch, mutationScope);
+    const flightKey = `${mutationScope.canonicalServerOrigin}\n${mutationScope.bindingGeneration}\n${conversationId}`;
+    const existingFlight = senderKeyDistributionFlights.get(flightKey);
+    if (existingFlight) return existingFlight;
 
-      // Distribution fan-out completes before every recipient ACK arrives.
-      // Keep the original Send action pending for a short bounded window so a
-      // normal online group does not make the user click Send twice. No message
-      // is persisted or transmitted until native reports the generation ready.
-      const deadline = Date.now() + 8_000;
-      while (status === "checking" || status === "pending") {
-        if (Date.now() >= deadline) {
-          throw new Error(
-            "Sender-key acknowledgement is still pending; your draft was kept and sending remains blocked",
-          );
-        }
-        await new Promise<void>((resolve) => setTimeout(resolve, 250));
-        requireCurrentMutationScope(sessionEpoch, mutationScope);
-        status = await appStore.refreshSenderKeyStatus(conversationId);
-        requireCurrentMutationScope(sessionEpoch, mutationScope);
-      }
-      if (status !== "ready") {
-        throw new Error("Sender-key distribution failed; sending remains blocked");
-      }
-    } catch (error) {
-      requireCurrentMutationScope(sessionEpoch, mutationScope);
+    const flight = (async () => {
+      const selfUserId = userId();
+      if (!selfUserId) throw new Error("sender-key distribution requires an authenticated user");
+      setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "checking" }));
       try {
-        // Whatever native reports after the failed distribution attempt is
-        // authoritative. In particular, a final ACK may have made it ready
-        // between the command error and this refresh.
-        const refreshed = await appStore.refreshSenderKeyStatus(conversationId);
+        await invoke<number>("distribute_sender_key", {
+          conversationId,
+          serverHttpUrl: serverHttpUrl(),
+          userId: selfUserId,
+          ...authenticatedMutationScopeArgs(mutationScope),
+        });
         requireCurrentMutationScope(sessionEpoch, mutationScope);
-        if (refreshed === "checking") {
+        let status = await appStore.refreshSenderKeyStatus(conversationId);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
+
+        // Distribution fan-out completes before every recipient ACK arrives.
+        // Keep the original Send action pending for a short bounded window so a
+        // normal online group does not make the user click Send twice. No message
+        // is persisted or transmitted until native reports the generation ready.
+        const deadline = Date.now() + 8_000;
+        while (status === "checking" || status === "pending") {
+          if (Date.now() >= deadline) {
+            throw new Error(
+              "Sender-key acknowledgement is still pending; your draft was kept and sending remains blocked",
+            );
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 250));
+          requireCurrentMutationScope(sessionEpoch, mutationScope);
+          status = await appStore.refreshSenderKeyStatus(conversationId);
+          requireCurrentMutationScope(sessionEpoch, mutationScope);
+        }
+        if (status !== "ready") {
+          throw new Error("Sender-key distribution failed; sending remains blocked");
+        }
+      } catch (error) {
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
+        try {
+          // Whatever native reports after the failed distribution attempt is
+          // authoritative. In particular, a final ACK may have made it ready
+          // between the command error and this refresh.
+          const refreshed = await appStore.refreshSenderKeyStatus(conversationId);
+          requireCurrentMutationScope(sessionEpoch, mutationScope);
+          if (refreshed === "checking") {
+            setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "error" }));
+          }
+        } catch (refreshError) {
+          rethrowIfStale(refreshError);
           setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "error" }));
         }
-      } catch (refreshError) {
-        rethrowIfStale(refreshError);
-        setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "error" }));
+        throw error;
       }
-      throw error;
+    })();
+    senderKeyDistributionFlights.set(flightKey, flight);
+    try {
+      await flight;
+    } finally {
+      if (senderKeyDistributionFlights.get(flightKey) === flight) {
+        senderKeyDistributionFlights.delete(flightKey);
+      }
     }
   },
 

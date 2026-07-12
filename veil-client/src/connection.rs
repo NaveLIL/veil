@@ -956,12 +956,16 @@ fn message_security_context_from_proto(
 }
 
 fn sender_key_ack_from_proto(ack: &proto::MessageAck) -> Option<Option<SenderKeyAckMetadataV1>> {
-    let absent = ack.target_device_id.is_empty()
+    let route_fields_absent = ack.target_device_id.is_empty()
         && ack.conversation_id.is_none()
         && ack.sender_key_generation.is_none()
-        && ack.roster_version.is_none()
         && ack.envelope_commitment.is_none();
-    if absent {
+    // A durable chat-message ACK may carry the roster version used to accept
+    // that ciphertext, but it is not a Sender-Key distribution ACK. Exact
+    // distribution/receipt acknowledgement is identified by the complete
+    // device route tuple below and remains fail-closed when any field is
+    // missing or malformed.
+    if route_fields_absent {
         return Some(None);
     }
     let conversation_id = ack.conversation_id.clone()?;
@@ -1290,6 +1294,22 @@ mod tests {
             ..Default::default()
         };
         assert!(sender_key_ack_from_proto(&partial_ack).is_none());
+        let secure_message_ack = proto::MessageAck {
+            message_id: "message-1".to_string(),
+            roster_version: Some(4),
+            ..Default::default()
+        };
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageAck(secure_message_ack)),
+                ..Default::default()
+            }),
+            Some(ConnectionEvent::MessageAcked {
+                message_id,
+                sender_key: None,
+                ..
+            }) if message_id == "message-1"
+        ));
         let exact_ack = proto::MessageAck {
             target_device_id: vec![0x22; 16],
             conversation_id: Some("conversation-1".to_string()),

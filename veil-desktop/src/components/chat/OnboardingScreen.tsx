@@ -1,7 +1,7 @@
 import { Component, createSignal, Show, For, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { appStore } from "@/stores/app";
-import { AlertTriangle, ArrowRightLeft, Eye, EyeOff, LogIn } from "lucide-solid";
+import { appStore, StaleUiSessionError } from "@/stores/app";
+import { AlertTriangle, ArrowRightLeft, Eye, EyeOff, KeyRound, LogIn, ShieldCheck } from "lucide-solid";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { Z } from "@/lib/zIndex";
 import { promptDecision } from "@/lib/decisionDialog";
@@ -30,6 +30,7 @@ const TAGLINES = [
 ];
 
 type Step = "welcome" | "generate" | "restore";
+type IdentityState = "checking" | "empty" | "existing" | "unavailable";
 
 interface RainDrop {
   id: number; word: string; x: number; delay: number;
@@ -43,7 +44,7 @@ export const OnboardingScreen: Component = () => {
   const [showPhrase, setShowPhrase] = createSignal(true);
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal("");
-  const [existingIdentity, setExistingIdentity] = createSignal(false);
+  const [identityState, setIdentityState] = createSignal<IdentityState>("checking");
   const [taglineIdx, setTaglineIdx] = createSignal(0);
   const [taglineFade, setTaglineFade] = createSignal(true);
   const [rainDrops, setRainDrops] = createSignal<RainDrop[]>([]);
@@ -51,6 +52,19 @@ export const OnboardingScreen: Component = () => {
   const [entering, setEntering] = createSignal(false);
 
   const words = () => mnemonic().split(" ").filter(Boolean);
+  const existingIdentity = () => identityState() === "existing";
+
+  const refreshIdentityState = async (): Promise<IdentityState> => {
+    try {
+      const next = await invoke<boolean>("has_stored_identity") ? "existing" : "empty";
+      setIdentityState(next);
+      return next;
+    } catch {
+      setIdentityState("unavailable");
+      setError("Veil could not inspect the encrypted identity vault. Account creation stays blocked until the vault is available.");
+      return "unavailable";
+    }
+  };
 
   onMount(() => {
     const drops: RainDrop[] = Array.from({ length: 50 }, (_, i) => ({
@@ -66,11 +80,7 @@ export const OnboardingScreen: Component = () => {
   });
 
   onMount(async () => {
-    try {
-      setExistingIdentity(await invoke<boolean>("has_stored_identity"));
-    } catch {
-      setExistingIdentity(false);
-    }
+    await refreshIdentityState();
   });
 
   let taglineTimer: ReturnType<typeof setInterval>;
@@ -103,6 +113,8 @@ export const OnboardingScreen: Component = () => {
     try {
       setError("");
       setLoading(true);
+      const currentIdentityState = await refreshIdentityState();
+      if (currentIdentityState !== "empty") return;
       const m = await invoke<string>("generate_mnemonic");
       setMnemonic(m);
       transitionTo("generate");
@@ -144,8 +156,22 @@ export const OnboardingScreen: Component = () => {
     } catch (e) {
       const detail = String(e);
       if (detail.includes("a different identity already exists")) {
-        setExistingIdentity(true);
-        setError("This device already has a Veil identity. Continue with it or switch accounts before creating another one.");
+        setMnemonic("");
+        setRestoreInput("");
+        setIdentityState("existing");
+        setStep("welcome");
+        setError("");
+      } else if (
+        e instanceof StaleUiSessionError
+        || detail.includes("renderer session changed while IPC was in flight")
+      ) {
+        // Signing out deliberately invalidates every renderer IPC started by
+        // the old session. This is an expected boundary, never a user-facing
+        // cryptographic failure.
+        setMnemonic("");
+        setRestoreInput("");
+        setStep("welcome");
+        await refreshIdentityState();
       } else {
         setError(detail);
       }
@@ -197,10 +223,16 @@ export const OnboardingScreen: Component = () => {
     setError("");
     try {
       await appStore.signOut();
-      setExistingIdentity(false);
+      setIdentityState("empty");
       setStep("welcome");
     } catch (e) {
-      setError(String(e));
+      const detail = String(e);
+      if (e instanceof StaleUiSessionError || detail.includes("renderer session changed while IPC was in flight")) {
+        setIdentityState("empty");
+        setStep("welcome");
+      } else {
+        setError(detail);
+      }
     } finally {
       setLoading(false);
     }
@@ -251,12 +283,12 @@ export const OnboardingScreen: Component = () => {
     },
     centerIsland: {
       position: "relative" as const, "z-index": "2",
-      width: "calc(100% - 48px)", "max-width": "560px",
+      width: "calc(100% - 48px)", "max-width": "780px",
       background: "color-mix(in srgb, var(--veil-window) 90%, transparent)", "backdrop-filter": "blur(20px)",
-      border: "1px solid var(--veil-contrast-06)",
-      "border-radius": "20px", padding: "36px 40px",
+      border: "1px solid color-mix(in srgb, var(--veil-accent) 13%, var(--veil-contrast-06))",
+      "border-radius": "24px", padding: "0", overflow: "hidden",
       margin: "auto",
-      "box-shadow": "0 8px 40px var(--veil-shadow), 0 0 80px rgba(var(--veil-accent-rgb),0.04)",
+      "box-shadow": "0 24px 80px var(--veil-shadow), 0 0 100px rgba(var(--veil-accent-rgb),0.07)",
       transition: "opacity 0.35s ease, transform 0.35s ease",
     },
     logo: {
@@ -476,7 +508,7 @@ export const OnboardingScreen: Component = () => {
             <button
               style={S.btnPrimary}
               onClick={generateMnemonic}
-              disabled={loading() || existingIdentity()}
+              disabled={loading() || identityState() !== "empty"}
               onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(var(--veil-accent-rgb),0.35)"; }}
               onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(var(--veil-accent-rgb),0.25)"; }}
             >
@@ -488,7 +520,7 @@ export const OnboardingScreen: Component = () => {
             <button
               style={S.btnSecondary}
               onClick={() => transitionTo("restore")}
-              disabled={loading() || existingIdentity()}
+              disabled={loading() || identityState() !== "empty"}
               onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-07)"; e.currentTarget.style.color = "var(--veil-contrast-80)"; }}
               onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
             >
@@ -504,83 +536,73 @@ export const OnboardingScreen: Component = () => {
       {/* ═══ GENERATE — center island, word grid ═══ */}
       <Show when={step() === "generate"}>
         <div style={{ ...S.centerIsland, ...animStyle() }}>
-          <div style={S.sectionTitle}>Recovery Phrase</div>
-          <div style={S.sectionSub}>Write down these 12 words in order. They are your only backup.</div>
-
-          <div style={{ position: "relative", "margin-bottom": "20px" }}>
-            <div style={{
-              ...S.wordGrid,
-              filter: showPhrase() ? "none" : "blur(8px)",
-              "user-select": showPhrase() ? "text" : "none",
-              transition: "filter 0.3s",
-            }}>
-              <For each={words()}>
-                {(word, i) => (
-                  <div style={S.wordCell}>
-                    <span style={S.wordNum}>{i() + 1}</span>
-                    <span style={S.wordText}>{word}</span>
-                  </div>
-                )}
-              </For>
+          <div class="onboarding-vault-head">
+            <div class="onboarding-vault-emblem"><VeilMark size={20} /></div>
+            <div>
+              <div class="onboarding-vault-kicker">VEIL IDENTITY VAULT</div>
+              <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>Local cryptographic identity · step 1 of 2</div>
             </div>
-            <button
-              style={{
-                position: "absolute", top: "8px", right: "8px",
-                width: "32px", height: "32px", "border-radius": "8px",
-                background: "var(--veil-contrast-04)", border: "none",
-                color: "var(--veil-text-faint)", cursor: "pointer",
-                display: "flex", "align-items": "center", "justify-content": "center",
-                "font-size": "14px", transition: "background 0.15s",
-              }}
-              onClick={() => setShowPhrase(!showPhrase())}
-              aria-label={showPhrase() ? "Hide recovery phrase" : "Show recovery phrase"}
-              title={showPhrase() ? "Hide recovery phrase" : "Show recovery phrase"}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-08)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; }}
-            >
-              {showPhrase() ? <EyeOff size={15} strokeWidth={1.9} /> : <Eye size={15} strokeWidth={1.9} />}
+            <div class="onboarding-vault-status"><ShieldCheck size={13} /> GENERATED ON DEVICE</div>
+          </div>
+          <div class="onboarding-vault-body">
+            <div class="onboarding-vault-primary">
+              <div style={S.sectionTitle}>Your recovery phrase</div>
+              <div style={S.sectionSub}>Keep these words in order. Veil cannot recover or replace them for you.</div>
+              <div style={{ position: "relative" }}>
+                <div style={{
+                  ...S.wordGrid,
+                  filter: showPhrase() ? "none" : "blur(9px)",
+                  "user-select": showPhrase() ? "text" : "none",
+                  transition: "filter 0.28s ease",
+                }}>
+                  <For each={words()}>
+                    {(word, i) => (
+                      <div style={S.wordCell}>
+                        <span style={S.wordNum}>{String(i() + 1).padStart(2, "0")}</span>
+                        <span style={S.wordText}>{word}</span>
+                      </div>
+                    )}
+                  </For>
+                </div>
+                <button class="onboarding-phrase-visibility" onClick={() => setShowPhrase(!showPhrase())}
+                  aria-label={showPhrase() ? "Hide recovery phrase" : "Show recovery phrase"}
+                  title={showPhrase() ? "Hide recovery phrase" : "Show recovery phrase"}>
+                  {showPhrase() ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              </div>
+            </div>
+            <aside class="onboarding-vault-aside">
+              <div class="onboarding-vault-aside-icon"><KeyRound size={18} /></div>
+              <div style={{ "font-size": "13px", "font-weight": "650", color: "var(--veil-contrast-85)" }}>One key. No reset link.</div>
+              <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "line-height": "1.6" }}>
+                Store it on paper or directly in a trusted password manager. Never send it through chat or cloud notes.
+              </div>
+              <div class="onboarding-vault-rule" />
+              <div style={{ "font-size": "11px", color: "color-mix(in srgb, var(--veil-warning) 72%, transparent)", "line-height": "1.55" }}>
+                Clipboard copy is disabled because Windows history and cloud sync may retain secrets.
+              </div>
+            </aside>
+          </div>
+          <div class="onboarding-vault-actions">
+            <button style={{ ...S.backBtn, width: "auto", margin: "0", padding: "0 12px" }} onClick={() => transitionTo("welcome")}>{"\u2190 Back"}</button>
+            <button style={{ ...S.btnPrimary, padding: "0 22px", opacity: mnemonic().trim() && !loading() ? "1" : "0.4" }}
+              onClick={() => initIdentity(mnemonic())} disabled={loading() || !mnemonic().trim()}>
+              {loading() ? "Securing identity..." : "I stored it safely \u2192"}
             </button>
           </div>
-
-          <div style={{ ...S.warningBox, "margin-top": "16px" }}>
-            <AlertTriangle size={14} strokeWidth={2} style={{ "flex-shrink": "0", "margin-top": "1px" }} />
-            <span style={{ "font-size": "12px", color: "color-mix(in srgb, var(--veil-warning) 60%, transparent)", "line-height": "1.5" }}>
-              Write these 12 words down or save them directly in a trusted password manager. Clipboard copy is disabled because Windows may retain secrets in Clipboard History or cloud sync. They are the <strong style={{ color: "color-mix(in srgb, var(--veil-warning) 85%, transparent)" }}>only way</strong> to recover your identity.
-            </span>
-          </div>
-
-          <button
-            style={{
-              ...S.btnPrimary,
-              width: "100%",
-              "margin-top": "20px",
-              opacity: mnemonic().trim() && !loading() ? "1" : "0.4",
-              cursor: mnemonic().trim() && !loading() ? "pointer" : "not-allowed",
-            }}
-            onClick={() => initIdentity(mnemonic())}
-            disabled={loading() || !mnemonic().trim()}
-            onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(var(--veil-accent-rgb),0.35)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(var(--veil-accent-rgb),0.25)"; }}
-          >
-            {loading() ? "Initializing..." : "I've saved my phrase \u2192"}
-          </button>
-
-          <button
-            style={S.backBtn}
-            onClick={() => transitionTo("welcome")}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-text-faint)"; }}
-          >
-            {"\u2190 Back"}
-          </button>
         </div>
       </Show>
 
       {/* ═══ RESTORE — center island, large textarea ═══ */}
       <Show when={step() === "restore"}>
         <div style={{ ...S.centerIsland, ...animStyle() }}>
-          <div style={S.sectionTitle}>Restore Identity</div>
-          <div style={S.sectionSub}>Enter your 12-word recovery phrase to restore access.</div>
+          <div class="onboarding-vault-head">
+            <div class="onboarding-vault-emblem"><VeilMark size={20} /></div>
+            <div><div class="onboarding-vault-kicker">RESTORE VEIL IDENTITY</div><div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>Encrypted locally before network authentication</div></div>
+          </div>
+          <div class="onboarding-restore-body">
+          <div style={S.sectionTitle}>Enter your recovery phrase</div>
+          <div style={S.sectionSub}>The phrase is validated and processed inside the native security boundary.</div>
 
           <textarea
             style={S.textarea}
@@ -628,6 +650,7 @@ export const OnboardingScreen: Component = () => {
           >
             {"\u2190 Back"}
           </button>
+          </div>
         </div>
       </Show>
     </div>
