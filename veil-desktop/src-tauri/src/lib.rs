@@ -1341,6 +1341,13 @@ fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
         .lock()
         .map_err(|e| e.to_string())?
         .reset();
+    // No identity/PIN remains, so onboarding is intentionally allowed to
+    // initialize the next account without passing through a lock screen.
+    publish_unlocked_session(
+        &state.lock_event_pending,
+        &state.unlocked,
+        &state.session_epoch,
+    );
     Ok(())
 }
 
