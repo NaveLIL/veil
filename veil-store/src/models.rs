@@ -9,6 +9,62 @@ pub enum ConversationType {
     Channel = 2,
 }
 
+/// Canonical account locator within one authenticated server origin.
+///
+/// A server-assigned user UUID is deliberately not treated as globally
+/// unique: self-hosted Veil instances may issue the same UUID independently.
+/// The account X25519 identity is part of the locator so a future, explicit
+/// identity-change flow can distinguish old and new cryptographic identities.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProfileLocator {
+    pub canonical_server_origin: String,
+    pub user_id: String,
+    pub identity_key: [u8; 32],
+}
+
+/// Authority of an account snapshot's presentation metadata.
+///
+/// Ordering is intentional. Historical message metadata is authenticated by
+/// the retained message/device proof, but a current authenticated conversation
+/// directory is authoritative for the current account presentation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum AccountSnapshotSource {
+    AuthenticatedHistory = 1,
+    AuthenticatedConversationDirectory = 2,
+}
+
+impl AccountSnapshotSource {
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::AuthenticatedHistory),
+            2 => Some(Self::AuthenticatedConversationDirectory),
+            _ => None,
+        }
+    }
+}
+
+/// Origin-scoped account metadata retained inside SQLCipher.
+///
+/// Presentation fields never participate in crypto trust, ACL decisions, or
+/// Sender-Key rotation. `profile_version = None` is a truthful statement that
+/// the authenticated source did not provide versioned profile metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AccountSnapshot {
+    pub locator: ProfileLocator,
+    pub signing_key: [u8; 32],
+    pub username: Option<String>,
+    pub display_name: Option<String>,
+    pub profile_version: Option<u64>,
+    pub profile_origin: String,
+    pub source: AccountSnapshotSource,
+    pub observed_at: String,
+}
+
 /// Message delivery status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -28,6 +84,8 @@ pub struct Conversation {
     pub conv_type: ConversationType,
     pub peer_identity_key: Option<Vec<u8>>,
     pub server_id: Option<String>,
+    pub server_origin: Option<String>,
+    pub peer_user_id: Option<String>,
     pub name: Option<String>,
     pub last_message_at: Option<String>,
     pub created_at: String,
@@ -47,6 +105,7 @@ pub struct Message {
     pub expires_at: Option<String>,
     pub server_timestamp: Option<i64>,
     pub created_at: String,
+    pub author: Option<AccountSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

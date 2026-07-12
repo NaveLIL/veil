@@ -22,4 +22,24 @@ describe("desktop interaction boundaries", () => {
     expect(app).not.toMatch(/role=["']button["']/);
     expect(app).not.toMatch(/tabindex=["']-1["']/i);
   });
+
+  it("keeps account actions separate from conversation IDs and author key prefixes", () => {
+    const normalized = Object.entries(interactiveSources).map(([path, source]) => [
+      path.replaceAll("\\", "/"),
+      source,
+    ] as const);
+    const app = normalized.find(([path]) => path.endsWith("/App.tsx"))?.[1];
+    const store = normalized.find(([path]) => path.endsWith("/stores/app.ts"))?.[1];
+
+    expect(app).toBeTypeOf("string");
+    expect(store).toBeTypeOf("string");
+    expect(app).not.toMatch(/sendFriendRequest\s*\(\s*c\.id\s*\)/);
+    expect(app).not.toMatch(/[\w.]+\.userId\s*===\s*c\.id\b/);
+    expect(app).not.toMatch(/\bc\.id\s*===\s*[\w.]+\.userId\b/);
+    expect(store).not.toMatch(/senderKey\.slice\s*\(/);
+    expect(store).not.toMatch(/peerUserId:\s*d\.senderUserId/);
+    expect(store).toMatch(/peerUserId:[^\n]*d\.conversationPeerUserId/);
+    expect(store).toMatch(/conversationType\s*===\s*["']dm["']/);
+    expect(store).toMatch(/conversationType\s*===\s*["']group["']/);
+  });
 });

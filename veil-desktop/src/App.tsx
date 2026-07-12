@@ -1490,7 +1490,13 @@ const App: Component = () => {
                 >
                   <For each={filtered()}>
                     {(c) => {
-                      const isFriend = () => c.type === "dm" && appStore.friends().some(f => f.username === c.name || f.userId === c.id);
+                      const peerUserId = () => c.type === "dm" ? c.peerUserId : undefined;
+                      const friend = () => {
+                        const userId = peerUserId();
+                        return userId
+                          ? appStore.friends().find((candidate) => candidate.userId === userId)
+                          : undefined;
+                      };
                       return (
                       <ContextMenu>
                         <ContextMenuTrigger>
@@ -1533,19 +1539,32 @@ const App: Component = () => {
                           </ContextMenuItem>
                           <Show when={c.type === "dm"}>
                             <ContextMenuSeparator />
-                            <Show when={!isFriend()} fallback={
-                              <ContextMenuItem variant="danger" onSelect={() => {
-                                const friend = appStore.friends().find(f => f.username === c.name || f.userId === c.id);
-                                if (friend) appStore.removeFriend(friend.userId);
-                              }}>
-                                <ContextMenuIcon><UserMinus size={14} strokeWidth={2} /></ContextMenuIcon>
-                                Remove Friend
-                              </ContextMenuItem>
-                            }>
-                              <ContextMenuItem onSelect={() => appStore.sendFriendRequest(c.id)}>
-                                <ContextMenuIcon><UserPlus size={14} strokeWidth={2} /></ContextMenuIcon>
-                                Add Friend
-                              </ContextMenuItem>
+                            <Show
+                              when={peerUserId() && appStore.friendDirectoryReady()}
+                              fallback={
+                                <ContextMenuItem disabled>
+                                  <ContextMenuIcon><Shield size={14} strokeWidth={2} /></ContextMenuIcon>
+                                  {peerUserId() ? "Identity syncing" : "Identity unavailable"}
+                                </ContextMenuItem>
+                              }
+                            >
+                              <Show when={!friend()} fallback={
+                                <ContextMenuItem variant="danger" onSelect={() => {
+                                  const linkedFriend = friend();
+                                  if (linkedFriend) void appStore.removeFriend(linkedFriend.userId);
+                                }}>
+                                  <ContextMenuIcon><UserMinus size={14} strokeWidth={2} /></ContextMenuIcon>
+                                  Remove Friend
+                                </ContextMenuItem>
+                              }>
+                                <ContextMenuItem onSelect={() => {
+                                  const targetUserId = peerUserId();
+                                  if (targetUserId) void appStore.sendFriendRequest(targetUserId);
+                                }}>
+                                  <ContextMenuIcon><UserPlus size={14} strokeWidth={2} /></ContextMenuIcon>
+                                  Add Friend
+                                </ContextMenuItem>
+                              </Show>
                             </Show>
                           </Show>
                         </ContextMenuContent>

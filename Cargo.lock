@@ -7116,6 +7116,7 @@ name = "veil-desktop"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "hex",
  "image",
  "rand 0.8.6",

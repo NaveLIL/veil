@@ -1,4 +1,5 @@
-use rusqlite::{Connection, OptionalExtension};
+use crate::models::{AccountSnapshot, AccountSnapshotSource, Message, ProfileLocator};
+use rusqlite::{Connection, OptionalExtension, Row};
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -42,6 +43,440 @@ pub type TrustedSigningKeyBinding = ([u8; 32], [u8; 32]);
 pub type StoredSenderKey = (Vec<u8>, Vec<u8>, bool);
 type StoredSenderKeyMaterial = ([u8; 32], Zeroizing<Vec<u8>>);
 const MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER: usize = 128;
+const MAX_CANONICAL_SERVER_ORIGIN_BYTES: usize = 512;
+const MAX_PROFILE_ORIGIN_BYTES: usize = 512;
+const MAX_ACCOUNT_PRESENTATION_BYTES: usize = 256;
+const MAX_OBSERVED_AT_BYTES: usize = 64;
+
+struct RawAccountSnapshot {
+    canonical_server_origin: String,
+    user_id: String,
+    identity_key: Vec<u8>,
+    signing_key: Vec<u8>,
+    username: Option<String>,
+    display_name: Option<String>,
+    profile_version: Option<Vec<u8>>,
+    profile_origin: String,
+    source: u8,
+    observed_at: String,
+}
+
+impl RawAccountSnapshot {
+    fn decode(self) -> Result<AccountSnapshot, String> {
+        let identity_key = fixed_bytes::<32>("account identity key", self.identity_key)?;
+        let signing_key = fixed_bytes::<32>("account signing key", self.signing_key)?;
+        let profile_version = self
+            .profile_version
+            .map(|value| fixed_bytes::<8>("account profile version", value).map(u64::from_be_bytes))
+            .transpose()?;
+        let source = AccountSnapshotSource::from_u8(self.source)
+            .ok_or_else(|| format!("invalid persisted account snapshot source: {}", self.source))?;
+        let snapshot = AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: self.canonical_server_origin,
+                user_id: self.user_id,
+                identity_key,
+            },
+            signing_key,
+            username: self.username,
+            display_name: self.display_name,
+            profile_version,
+            profile_origin: self.profile_origin,
+            source,
+            observed_at: self.observed_at,
+        };
+        validate_account_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+}
+
+fn raw_account_snapshot_from_row(
+    row: &Row<'_>,
+    first_column: usize,
+) -> rusqlite::Result<Option<RawAccountSnapshot>> {
+    let canonical_server_origin: Option<String> = row.get(first_column)?;
+    Ok(match canonical_server_origin {
+        Some(canonical_server_origin) => Some(RawAccountSnapshot {
+            canonical_server_origin,
+            user_id: row.get(first_column + 1)?,
+            identity_key: row.get(first_column + 2)?,
+            signing_key: row.get(first_column + 3)?,
+            username: row.get(first_column + 4)?,
+            display_name: row.get(first_column + 5)?,
+            profile_version: row.get(first_column + 6)?,
+            profile_origin: row.get(first_column + 7)?,
+            source: row.get(first_column + 8)?,
+            observed_at: row.get(first_column + 9)?,
+        }),
+        None => None,
+    })
+}
+
+fn raw_account_snapshot_required_from_row(
+    row: &Row<'_>,
+    first_column: usize,
+) -> rusqlite::Result<RawAccountSnapshot> {
+    Ok(RawAccountSnapshot {
+        canonical_server_origin: row.get(first_column)?,
+        user_id: row.get(first_column + 1)?,
+        identity_key: row.get(first_column + 2)?,
+        signing_key: row.get(first_column + 3)?,
+        username: row.get(first_column + 4)?,
+        display_name: row.get(first_column + 5)?,
+        profile_version: row.get(first_column + 6)?,
+        profile_origin: row.get(first_column + 7)?,
+        source: row.get(first_column + 8)?,
+        observed_at: row.get(first_column + 9)?,
+    })
+}
+
+fn validate_canonical_uuid(label: &str, value: &str) -> Result<(), String> {
+    let parsed =
+        uuid::Uuid::parse_str(value).map_err(|_| format!("{label} must be a canonical UUID"))?;
+    if parsed.is_nil() || parsed.hyphenated().to_string() != value {
+        return Err(format!("{label} must be a non-nil canonical UUID"));
+    }
+    Ok(())
+}
+
+fn validate_canonical_server_origin(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > MAX_CANONICAL_SERVER_ORIGIN_BYTES
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err("canonical server origin is empty, oversized, or non-canonical".to_string());
+    }
+    let authority = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or_else(|| "canonical server origin must use http or https".to_string())?;
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err("canonical server origin must contain only an authority".to_string());
+    }
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, port) = bracketed.split_once("]:").ok_or_else(|| {
+            "canonical IPv6 server origin must include an explicit port".to_string()
+        })?;
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'))
+        {
+            return Err("canonical server origin contains an invalid IPv6 host".to_string());
+        }
+        (host, port)
+    } else {
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or_else(|| "canonical server origin must include an explicit port".to_string())?;
+        if host.is_empty()
+            || !host.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+            })
+        {
+            return Err("canonical server origin contains an invalid host".to_string());
+        }
+        (host, port)
+    };
+    if host.is_empty()
+        || port
+            .parse::<u16>()
+            .ok()
+            .is_none_or(|parsed| parsed == 0 || parsed.to_string() != port)
+    {
+        return Err("canonical server origin contains an invalid port".to_string());
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    label: &str,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), String> {
+    if value.len() > max_bytes
+        || (!allow_empty && value.is_empty())
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "{label} is empty, oversized, or contains control characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_presentation(label: &str, value: Option<&str>) -> Result<(), String> {
+    if let Some(value) = value {
+        validate_bounded_text(label, value, MAX_ACCOUNT_PRESENTATION_BYTES, false)?;
+    }
+    Ok(())
+}
+
+fn validate_profile_locator(locator: &ProfileLocator) -> Result<(), String> {
+    validate_canonical_server_origin(&locator.canonical_server_origin)?;
+    validate_canonical_uuid("profile locator user id", &locator.user_id)?;
+    if locator.identity_key == [0u8; 32] {
+        return Err("profile locator identity key must not be all zero".to_string());
+    }
+    Ok(())
+}
+
+fn validate_account_snapshot(snapshot: &AccountSnapshot) -> Result<(), String> {
+    validate_profile_locator(&snapshot.locator)?;
+    if snapshot.signing_key == [0u8; 32] {
+        return Err("account signing key must not be all zero".to_string());
+    }
+    validate_optional_presentation("account username", snapshot.username.as_deref())?;
+    validate_optional_presentation("account display name", snapshot.display_name.as_deref())?;
+    if snapshot.profile_origin.len() > MAX_PROFILE_ORIGIN_BYTES {
+        return Err("account profile origin is oversized".to_string());
+    }
+    validate_canonical_server_origin(&snapshot.profile_origin)?;
+    if snapshot.profile_origin != snapshot.locator.canonical_server_origin {
+        return Err("account profile origin differs from its locator origin".to_string());
+    }
+    validate_bounded_text(
+        "account observation timestamp",
+        &snapshot.observed_at,
+        MAX_OBSERVED_AT_BYTES,
+        false,
+    )
+}
+
+fn load_account_by_origin_user(
+    conn: &Connection,
+    canonical_server_origin: &str,
+    user_id: &str,
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM identity_directory_v1
+         WHERE canonical_server_origin = ?1 AND user_id = ?2",
+        rusqlite::params![canonical_server_origin, user_id],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load account directory entry by user: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn load_account_by_origin_identity(
+    conn: &Connection,
+    canonical_server_origin: &str,
+    identity_key: &[u8; 32],
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM identity_directory_v1
+         WHERE canonical_server_origin = ?1 AND identity_key = ?2",
+        rusqlite::params![canonical_server_origin, identity_key.as_slice()],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load account directory entry by identity: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn load_exact_account(
+    conn: &Connection,
+    locator: &ProfileLocator,
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM identity_directory_v1
+         WHERE canonical_server_origin = ?1 AND user_id = ?2 AND identity_key = ?3",
+        rusqlite::params![
+            locator.canonical_server_origin,
+            locator.user_id,
+            locator.identity_key.as_slice(),
+        ],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load exact account directory entry: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn load_message_author(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM message_author_snapshots_v1
+         WHERE message_id = ?1",
+        rusqlite::params![message_id],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load message author snapshot: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn merge_account_presentation(
+    existing: &AccountSnapshot,
+    incoming: &AccountSnapshot,
+) -> Result<AccountSnapshot, String> {
+    if let (Some(existing_version), Some(incoming_version)) =
+        (existing.profile_version, incoming.profile_version)
+    {
+        if incoming_version < existing_version {
+            return Err("account profile version rollback rejected".to_string());
+        }
+        if incoming_version == existing_version
+            && (incoming.username != existing.username
+                || incoming.display_name != existing.display_name
+                || incoming.profile_origin != existing.profile_origin)
+        {
+            return Err("account profile changed without a version advance".to_string());
+        }
+    }
+
+    if incoming.source < existing.source {
+        return Ok(existing.clone());
+    }
+
+    // A source which truthfully reports no version cannot erase or reinterpret
+    // presentation metadata which was already accepted at an exact version.
+    if existing.profile_version.is_some() && incoming.profile_version.is_none() {
+        return Ok(existing.clone());
+    }
+
+    Ok(incoming.clone())
+}
+
+fn merge_account_snapshot(
+    conn: &Connection,
+    incoming: &AccountSnapshot,
+) -> Result<AccountSnapshot, String> {
+    validate_account_snapshot(incoming)?;
+    let existing_user = load_account_by_origin_user(
+        conn,
+        &incoming.locator.canonical_server_origin,
+        &incoming.locator.user_id,
+    )?;
+    if let Some(existing) = existing_user.as_ref() {
+        if existing.locator.identity_key != incoming.locator.identity_key {
+            return Err("account identity changed for an origin-scoped user".to_string());
+        }
+        if existing.signing_key != incoming.signing_key {
+            return Err("account signing key changed for an origin-scoped user".to_string());
+        }
+    }
+    if let Some(existing) = load_account_by_origin_identity(
+        conn,
+        &incoming.locator.canonical_server_origin,
+        &incoming.locator.identity_key,
+    )? {
+        if existing.locator.user_id != incoming.locator.user_id {
+            return Err("account identity maps to another user on this server origin".to_string());
+        }
+        if existing.signing_key != incoming.signing_key {
+            return Err("account identity maps to another signing key".to_string());
+        }
+    }
+
+    let effective = match existing_user {
+        Some(existing) => merge_account_presentation(&existing, incoming)?,
+        None => incoming.clone(),
+    };
+    let profile_version = effective.profile_version.map(u64::to_be_bytes);
+    if load_exact_account(conn, &effective.locator)?.is_some() {
+        conn.execute(
+            "UPDATE identity_directory_v1
+             SET username = ?4, display_name = ?5, profile_version = ?6,
+                 profile_origin = ?7, source = ?8, observed_at = ?9
+             WHERE canonical_server_origin = ?1 AND user_id = ?2 AND identity_key = ?3",
+            rusqlite::params![
+                effective.locator.canonical_server_origin,
+                effective.locator.user_id,
+                effective.locator.identity_key.as_slice(),
+                effective.username,
+                effective.display_name,
+                profile_version.as_ref().map(<[u8; 8]>::as_slice),
+                effective.profile_origin,
+                effective.source.as_u8(),
+                effective.observed_at,
+            ],
+        )
+        .map_err(|e| format!("update account directory entry: {e}"))?;
+    } else {
+        conn.execute(
+            "INSERT INTO identity_directory_v1
+                (canonical_server_origin, user_id, identity_key, signing_key,
+                 username, display_name, profile_version, profile_origin,
+                 source, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                effective.locator.canonical_server_origin,
+                effective.locator.user_id,
+                effective.locator.identity_key.as_slice(),
+                effective.signing_key.as_slice(),
+                effective.username,
+                effective.display_name,
+                profile_version.as_ref().map(<[u8; 8]>::as_slice),
+                effective.profile_origin,
+                effective.source.as_u8(),
+                effective.observed_at,
+            ],
+        )
+        .map_err(|e| format!("insert account directory entry: {e}"))?;
+    }
+    Ok(effective)
+}
+
+fn run_savepoint<T>(
+    conn: &Connection,
+    name: &'static str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    conn.execute_batch(&format!("SAVEPOINT {name}"))
+        .map_err(|e| format!("begin {name}: {e}"))?;
+    match operation() {
+        Ok(value) => match conn.execute_batch(&format!("RELEASE SAVEPOINT {name}")) {
+            Ok(()) => Ok(value),
+            Err(commit_error) => {
+                let rollback = conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name};"
+                ));
+                Err(match rollback {
+                    Ok(()) => format!("commit {name}: {commit_error}"),
+                    Err(rollback_error) => format!(
+                        "commit {name}: {commit_error}; rollback also failed: {rollback_error}"
+                    ),
+                })
+            }
+        },
+        Err(error) => {
+            let rollback = conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name};"
+            ));
+            Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; {name} rollback also failed: {rollback_error}")
+                }
+            })
+        }
+    }
+}
 
 pub struct StoredIncomingSenderKeyGeneration {
     pub sender_identity_key: [u8; 32],
@@ -317,6 +752,8 @@ impl VeilDb {
                 conv_type INTEGER NOT NULL,  -- 0=DM, 1=GROUP, 2=CHANNEL
                 peer_identity_key BLOB,      -- DM: peer's X25519 public key
                 server_id TEXT,
+                server_origin TEXT,
+                peer_user_id TEXT,
                 name TEXT,
                 last_message_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -338,6 +775,50 @@ impl VeilDb {
 
             CREATE INDEX IF NOT EXISTS idx_messages_conv
                 ON messages(conversation_id, server_timestamp);
+
+            -- Origin-scoped, authoritative account directory. Account and
+            -- signing keys are immutable continuity bindings; only
+            -- presentation metadata can advance under the merge policy in
+            -- Rust. The exact locator remains explicit even though the
+            -- current immutable account model also makes origin/user unique.
+            CREATE TABLE IF NOT EXISTS identity_directory_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                identity_key BLOB NOT NULL CHECK(length(identity_key) = 32),
+                signing_key BLOB NOT NULL CHECK(length(signing_key) = 32),
+                username TEXT CHECK(username IS NULL OR length(username) BETWEEN 1 AND 256),
+                display_name TEXT CHECK(display_name IS NULL OR length(display_name) BETWEEN 1 AND 256),
+                profile_version BLOB CHECK(profile_version IS NULL OR length(profile_version) = 8),
+                profile_origin TEXT NOT NULL CHECK(length(profile_origin) BETWEEN 1 AND 512),
+                source INTEGER NOT NULL CHECK(source IN (1, 2)),
+                observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
+                PRIMARY KEY (canonical_server_origin, user_id, identity_key),
+                UNIQUE (canonical_server_origin, user_id),
+                UNIQUE (canonical_server_origin, identity_key)
+            );
+
+            -- Immutable author attribution captured when plaintext is
+            -- committed. It follows an outgoing local UUID when the server
+            -- ACK replaces that UUID and is removed with the message.
+            CREATE TABLE IF NOT EXISTS message_author_snapshots_v1 (
+                message_id TEXT PRIMARY KEY
+                    REFERENCES messages(id) ON UPDATE CASCADE ON DELETE CASCADE,
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                identity_key BLOB NOT NULL CHECK(length(identity_key) = 32),
+                signing_key BLOB NOT NULL CHECK(length(signing_key) = 32),
+                username TEXT CHECK(username IS NULL OR length(username) BETWEEN 1 AND 256),
+                display_name TEXT CHECK(display_name IS NULL OR length(display_name) BETWEEN 1 AND 256),
+                profile_version BLOB CHECK(profile_version IS NULL OR length(profile_version) = 8),
+                profile_origin TEXT NOT NULL CHECK(length(profile_origin) BETWEEN 1 AND 512),
+                source INTEGER NOT NULL CHECK(source IN (1, 2)),
+                observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
+                FOREIGN KEY (canonical_server_origin, user_id, identity_key)
+                    REFERENCES identity_directory_v1
+                        (canonical_server_origin, user_id, identity_key)
+            );
 
             CREATE TABLE IF NOT EXISTS remote_message_state (
                 message_id TEXT PRIMARY KEY,
@@ -633,6 +1114,7 @@ impl VeilDb {
             )
             .map_err(|e| format!("migrations: {e}"))?;
 
+        self.ensure_conversation_identity_schema()?;
         self.rebuild_interim_sender_key_tables()?;
         self.ensure_sender_key_historical_proof_schema()?;
 
@@ -654,6 +1136,47 @@ impl VeilDb {
             .map_err(|e| format!("normalize incoming message status: {e}"))?;
 
         Ok(())
+    }
+
+    /// Add the nullable origin/account coordinates used by authenticated
+    /// directory sync without guessing values for legacy rows. Introspection
+    /// and both ALTERs share one transaction so a partial upgrade cannot be
+    /// published if the second column addition fails.
+    fn ensure_conversation_identity_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin conversation identity schema upgrade: {e}"))?;
+        let has_server_origin: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversations')
+                    WHERE name = 'server_origin'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect conversation server origin column: {e}"))?;
+        if !has_server_origin {
+            tx.execute_batch("ALTER TABLE conversations ADD COLUMN server_origin TEXT;")
+                .map_err(|e| format!("add conversation server origin column: {e}"))?;
+        }
+        let has_peer_user_id: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversations')
+                    WHERE name = 'peer_user_id'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect conversation peer user id column: {e}"))?;
+        if !has_peer_user_id {
+            tx.execute_batch("ALTER TABLE conversations ADD COLUMN peer_user_id TEXT;")
+                .map_err(|e| format!("add conversation peer user id column: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit conversation identity schema upgrade: {e}"))
     }
 
     fn normalized_table_sql(&self, table: &str) -> Result<String, String> {
@@ -1031,6 +1554,130 @@ impl VeilDb {
         &self.conn
     }
 
+    /// Merge a complete authenticated account-directory batch atomically.
+    /// Any identity/signing substitution, alias, profile rollback, or
+    /// equal-version equivocation rolls the whole batch back.
+    pub fn upsert_identity_directory(&self, snapshots: &[AccountSnapshot]) -> Result<(), String> {
+        for snapshot in snapshots {
+            validate_account_snapshot(snapshot)?;
+        }
+        run_savepoint(&self.conn, "veil_identity_directory_batch", || {
+            for snapshot in snapshots {
+                merge_account_snapshot(&self.conn, snapshot)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Resolve one exact `(origin, user_id, identity_key)` locator.
+    pub fn resolve_account_snapshot(
+        &self,
+        locator: &ProfileLocator,
+    ) -> Result<Option<AccountSnapshot>, String> {
+        validate_profile_locator(locator)?;
+        load_exact_account(&self.conn, locator)
+    }
+
+    /// Resolve a message sender within the authoritative origin already bound
+    /// to its conversation. Legacy unscoped conversations return `None` rather
+    /// than borrowing the currently connected origin.
+    pub fn resolve_account_by_conversation_sender(
+        &self,
+        conversation_id: &str,
+        identity_key: &[u8; 32],
+    ) -> Result<Option<AccountSnapshot>, String> {
+        if conversation_id.is_empty() {
+            return Err("conversation id must not be empty".to_string());
+        }
+        let origin = self
+            .conn
+            .query_row(
+                "SELECT server_origin FROM conversations WHERE id = ?1",
+                rusqlite::params![conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| format!("load conversation origin for account resolution: {e}"))?
+            .flatten();
+        match origin {
+            Some(origin) => load_account_by_origin_identity(&self.conn, &origin, identity_key),
+            None => Ok(None),
+        }
+    }
+
+    /// Attach immutable author attribution to an already-persisted message.
+    /// The directory merge and author write share a nested-safe SAVEPOINT, so
+    /// this method can participate in the existing receive transaction.
+    pub fn attach_message_author(
+        &self,
+        message_id: &str,
+        snapshot: &AccountSnapshot,
+    ) -> Result<(), String> {
+        if message_id.is_empty() {
+            return Err("message id must not be empty".to_string());
+        }
+        validate_account_snapshot(snapshot)?;
+        run_savepoint(&self.conn, "veil_attach_message_author", || {
+            let effective = merge_account_snapshot(&self.conn, snapshot)?;
+            let message_binding = self
+                .conn
+                .query_row(
+                    "SELECT m.sender_key, c.server_origin
+                     FROM messages AS m
+                     JOIN conversations AS c ON c.id = m.conversation_id
+                     WHERE m.id = ?1",
+                    rusqlite::params![message_id],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(|e| format!("load message binding before author attach: {e}"))?
+                .ok_or("cannot attach an author to a missing message")?;
+            if message_binding.0.as_slice() != effective.locator.identity_key {
+                return Err("message sender key differs from its author identity".to_string());
+            }
+            if message_binding.1.as_deref()
+                != Some(effective.locator.canonical_server_origin.as_str())
+            {
+                return Err(
+                    "message conversation origin differs from its author locator".to_string(),
+                );
+            }
+            if let Some(existing) = load_message_author(&self.conn, message_id)? {
+                if existing.locator != effective.locator
+                    || existing.signing_key != effective.signing_key
+                {
+                    return Err("message author binding changed".to_string());
+                }
+                return Ok(());
+            }
+
+            let profile_version = effective.profile_version.map(u64::to_be_bytes);
+            self.conn
+                .execute(
+                    "INSERT INTO message_author_snapshots_v1
+                        (message_id, canonical_server_origin, user_id,
+                         identity_key, signing_key, username, display_name,
+                         profile_version, profile_origin, source, observed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    rusqlite::params![
+                        message_id,
+                        &effective.locator.canonical_server_origin,
+                        &effective.locator.user_id,
+                        effective.locator.identity_key.as_slice(),
+                        effective.signing_key.as_slice(),
+                        effective.username.as_deref(),
+                        effective.display_name.as_deref(),
+                        profile_version.as_ref().map(<[u8; 8]>::as_slice),
+                        &effective.profile_origin,
+                        effective.source.as_u8(),
+                        &effective.observed_at,
+                    ],
+                )
+                .map_err(|e| format!("attach message author snapshot: {e}"))?;
+            Ok(())
+        })
+    }
+
     // ─── CRUD: Conversations ──────────────────────────────
 
     pub fn insert_conversation(
@@ -1055,11 +1702,14 @@ impl VeilDb {
     /// directory.  Cryptographic bindings are immutable: a signed response may
     /// fill a previously-unknown DM peer/server, but it may never silently
     /// replace an existing binding or change the conversation kind.
+    #[allow(clippy::too_many_arguments)] // Persisted directory fields stay explicit at trust boundary.
     pub fn upsert_directory_conversation(
         &self,
         id: &str,
         conv_type: u8,
+        canonical_server_origin: &str,
         name: Option<&str>,
+        peer_user_id: Option<&str>,
         peer_identity_key: Option<&[u8]>,
         server_id: Option<&str>,
         created_at: &str,
@@ -1067,32 +1717,75 @@ impl VeilDb {
         if id.is_empty() || created_at.is_empty() {
             return Err("directory conversation id and created_at must not be empty".to_string());
         }
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_bounded_text(
+            "directory conversation created_at",
+            created_at,
+            MAX_OBSERVED_AT_BYTES,
+            false,
+        )?;
+        if let Some(name) = name {
+            validate_bounded_text(
+                "directory conversation name",
+                name,
+                MAX_ACCOUNT_PRESENTATION_BYTES,
+                true,
+            )?;
+        }
+        if let Some(server_id) = server_id {
+            validate_canonical_uuid("directory conversation server id", server_id)?;
+        }
         if conv_type > 2 {
             return Err("invalid directory conversation type".to_string());
         }
-        if conv_type == 0 && peer_identity_key.map(|key| key.len()) != Some(32) {
-            return Err("DM directory entry must contain a 32-byte peer identity key".to_string());
-        }
-        if conv_type != 0 && peer_identity_key.is_some() {
-            return Err("non-DM directory entry must not contain a peer identity key".to_string());
+        if conv_type == 0 {
+            let peer_user_id =
+                peer_user_id.ok_or("DM directory entry must contain a peer user id")?;
+            validate_canonical_uuid("DM directory peer user id", peer_user_id)?;
+            if peer_identity_key.map(<[u8]>::len) != Some(32) {
+                return Err(
+                    "DM directory entry must contain a 32-byte peer identity key".to_string(),
+                );
+            }
+            if peer_identity_key == Some([0u8; 32].as_slice()) {
+                return Err("DM directory peer identity key must not be all zero".to_string());
+            }
+        } else if peer_identity_key.is_some() || peer_user_id.is_some() {
+            return Err(
+                "non-DM directory entry must not contain a peer account binding".to_string(),
+            );
         }
 
         let existing = self.conn.query_row(
-            "SELECT conv_type, peer_identity_key, server_id FROM conversations WHERE id = ?1",
+            "SELECT conv_type, peer_identity_key, server_id, server_origin, peer_user_id
+             FROM conversations WHERE id = ?1",
             rusqlite::params![id],
             |row| {
                 Ok((
                     row.get::<_, u8>(0)?,
                     row.get::<_, Option<Vec<u8>>>(1)?,
                     row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         );
 
         match existing {
-            Ok((stored_type, stored_peer, stored_server)) => {
+            Ok((stored_type, stored_peer, stored_server, stored_origin, stored_peer_user_id)) => {
                 if stored_type != conv_type {
                     return Err("authenticated directory changed the conversation type".to_string());
+                }
+                if stored_origin.is_none() {
+                    return Err(
+                        "legacy unscoped conversation requires an explicit migration; refusing to adopt the active origin"
+                            .to_string(),
+                    );
+                }
+                if conv_type != 0 && (stored_peer.is_some() || stored_peer_user_id.is_some()) {
+                    return Err(
+                        "persisted non-DM conversation contains a peer account binding".to_string(),
+                    );
                 }
                 if let (Some(stored), Some(received)) = (stored_peer.as_deref(), peer_identity_key)
                 {
@@ -1107,6 +1800,20 @@ impl VeilDb {
                         return Err("authenticated directory changed the pinned server".to_string());
                     }
                 }
+                if stored_origin.as_deref() != Some(canonical_server_origin) {
+                    return Err(
+                        "authenticated directory changed the conversation origin".to_string()
+                    );
+                }
+                if let (Some(stored), Some(received)) =
+                    (stored_peer_user_id.as_deref(), peer_user_id)
+                {
+                    if stored != received {
+                        return Err(
+                            "authenticated directory changed the pinned DM peer user".to_string()
+                        );
+                    }
+                }
 
                 self.conn
                     .execute(
@@ -1114,9 +1821,19 @@ impl VeilDb {
                          SET name = ?2,
                              peer_identity_key = COALESCE(peer_identity_key, ?3),
                              server_id = COALESCE(server_id, ?4),
-                             created_at = ?5
+                             created_at = ?5,
+                             server_origin = ?6,
+                             peer_user_id = COALESCE(peer_user_id, ?7)
                          WHERE id = ?1",
-                        rusqlite::params![id, name, peer_identity_key, server_id, created_at],
+                        rusqlite::params![
+                            id,
+                            name,
+                            peer_identity_key,
+                            server_id,
+                            created_at,
+                            canonical_server_origin,
+                            peer_user_id,
+                        ],
                     )
                     .map_err(|e| format!("update directory conversation: {e}"))?;
             }
@@ -1124,15 +1841,18 @@ impl VeilDb {
                 self.conn
                     .execute(
                         "INSERT INTO conversations
-                           (id, conv_type, name, peer_identity_key, server_id, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                           (id, conv_type, name, peer_identity_key, server_id,
+                            created_at, server_origin, peer_user_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                         rusqlite::params![
                             id,
                             conv_type,
                             name,
                             peer_identity_key,
                             server_id,
-                            created_at
+                            created_at,
+                            canonical_server_origin,
+                            peer_user_id,
                         ],
                     )
                     .map_err(|e| format!("insert directory conversation: {e}"))?;
@@ -1146,7 +1866,8 @@ impl VeilDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, conv_type, peer_identity_key, server_id, name, last_message_at, created_at
+                "SELECT id, conv_type, peer_identity_key, server_id, server_origin,
+                        peer_user_id, name, last_message_at, created_at
                  FROM conversations ORDER BY last_message_at DESC NULLS LAST",
             )
             .map_err(|e| format!("prepare: {e}"))?;
@@ -1162,9 +1883,11 @@ impl VeilDb {
                     },
                     peer_identity_key: row.get(2)?,
                     server_id: row.get(3)?,
-                    name: row.get(4)?,
-                    last_message_at: row.get(5)?,
-                    created_at: row.get(6)?,
+                    server_origin: row.get(4)?,
+                    peer_user_id: row.get(5)?,
+                    name: row.get(6)?,
+                    last_message_at: row.get(7)?,
+                    created_at: row.get(8)?,
                 })
             })
             .map_err(|e| format!("query: {e}"))?;
@@ -1750,9 +2473,13 @@ impl VeilDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, conversation_id, sender_key, plaintext, msg_type, reply_to_id,
-                        is_outgoing, status, expires_at, server_timestamp, created_at,
-                        effective_timestamp, local_order
+                "SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                        m.msg_type, m.reply_to_id, m.is_outgoing, m.status,
+                        m.expires_at, m.server_timestamp, m.created_at,
+                        m.effective_timestamp, m.local_order,
+                        a.canonical_server_origin, a.user_id, a.identity_key,
+                        a.signing_key, a.username, a.display_name,
+                        a.profile_version, a.profile_origin, a.source, a.observed_at
                  FROM (
                    SELECT id, conversation_id, sender_key, plaintext, msg_type, reply_to_id,
                           is_outgoing, status, expires_at, server_timestamp, created_at,
@@ -1765,38 +2492,48 @@ impl VeilDb {
                    WHERE conversation_id = ?1
                    ORDER BY effective_timestamp DESC, local_order DESC
                    LIMIT ?2
-                 )
-                 ORDER BY effective_timestamp ASC, local_order ASC",
+                 ) AS m
+                 LEFT JOIN message_author_snapshots_v1 AS a ON a.message_id = m.id
+                 ORDER BY m.effective_timestamp ASC, m.local_order ASC",
             )
             .map_err(|e| format!("prepare: {e}"))?;
 
         let rows = stmt
             .query_map(rusqlite::params![conversation_id, limit], |row| {
-                Ok(crate::models::Message {
-                    id: row.get(0)?,
-                    conversation_id: row.get(1)?,
-                    sender_key: row.get(2)?,
-                    plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    msg_type: row.get(4)?,
-                    reply_to_id: row.get(5)?,
-                    is_outgoing: row.get::<_, u8>(6)? != 0,
-                    status: match row.get::<_, u8>(7)? {
-                        1 => crate::models::MessageStatus::Sent,
-                        2 => crate::models::MessageStatus::Delivered,
-                        3 => crate::models::MessageStatus::Read,
-                        4 => crate::models::MessageStatus::Failed,
-                        5 => crate::models::MessageStatus::Unknown,
-                        _ => crate::models::MessageStatus::Sending,
+                Ok((
+                    Message {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        sender_key: row.get(2)?,
+                        plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        msg_type: row.get(4)?,
+                        reply_to_id: row.get(5)?,
+                        is_outgoing: row.get::<_, u8>(6)? != 0,
+                        status: match row.get::<_, u8>(7)? {
+                            1 => crate::models::MessageStatus::Sent,
+                            2 => crate::models::MessageStatus::Delivered,
+                            3 => crate::models::MessageStatus::Read,
+                            4 => crate::models::MessageStatus::Failed,
+                            5 => crate::models::MessageStatus::Unknown,
+                            _ => crate::models::MessageStatus::Sending,
+                        },
+                        expires_at: row.get(8)?,
+                        server_timestamp: row.get(9)?,
+                        created_at: row.get(10)?,
+                        author: None,
                     },
-                    expires_at: row.get(8)?,
-                    server_timestamp: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
+                    raw_account_snapshot_from_row(row, 13)?,
+                ))
             })
             .map_err(|e| format!("query: {e}"))?;
 
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect: {e}"))
+        let mut messages = Vec::new();
+        for row in rows {
+            let (mut message, author) = row.map_err(|e| format!("collect message: {e}"))?;
+            message.author = author.map(RawAccountSnapshot::decode).transpose()?;
+            messages.push(message);
+        }
+        Ok(messages)
     }
 
     /// Update the plaintext of an existing message (edit).
@@ -4119,6 +4856,34 @@ impl VeilDb {
 mod tests {
     use super::*;
 
+    const ORIGIN_A: &str = "https://alpha.example:443";
+    const ORIGIN_B: &str = "https://beta.example:443";
+    const USER_A: &str = "00000000-0000-0000-0000-0000000000a1";
+    const USER_B: &str = "00000000-0000-0000-0000-0000000000b2";
+
+    fn sample_account(
+        canonical_server_origin: &str,
+        user_id: &str,
+        seed: u8,
+        source: AccountSnapshotSource,
+        profile_version: Option<u64>,
+    ) -> AccountSnapshot {
+        AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: canonical_server_origin.to_string(),
+                user_id: user_id.to_string(),
+                identity_key: [seed; 32],
+            },
+            signing_key: [seed.wrapping_add(1); 32],
+            username: Some(format!("user-{seed}")),
+            display_name: Some(format!("User {seed}")),
+            profile_version,
+            profile_origin: canonical_server_origin.to_string(),
+            source,
+            observed_at: "2026-07-12T12:00:00Z".to_string(),
+        }
+    }
+
     fn sample_device_identity(device_id: [u8; 16]) -> LocalDeviceIdentityV1 {
         LocalDeviceIdentityV1 {
             device_id,
@@ -5332,7 +6097,9 @@ mod tests {
         db.upsert_directory_conversation(
             "dm-directory",
             0,
+            ORIGIN_A,
             Some("Alice"),
+            Some(USER_A),
             Some(&peer),
             None,
             "2026-01-01T00:00:00Z",
@@ -5341,7 +6108,9 @@ mod tests {
         db.upsert_directory_conversation(
             "dm-directory",
             0,
+            ORIGIN_A,
             Some("Alice renamed"),
+            Some(USER_A),
             Some(&peer),
             None,
             "2026-01-01T00:00:00Z",
@@ -5355,7 +6124,9 @@ mod tests {
             .upsert_directory_conversation(
                 "dm-directory",
                 0,
+                ORIGIN_A,
                 Some("Mallory"),
+                Some(USER_A),
                 Some(&[5u8; 32]),
                 None,
                 "2026-01-01T00:00:00Z",
@@ -5365,12 +6136,478 @@ mod tests {
             .upsert_directory_conversation(
                 "dm-directory",
                 1,
+                ORIGIN_A,
                 Some("type swap"),
+                None,
                 None,
                 None,
                 "2026-01-01T00:00:00Z",
             )
             .is_err());
+    }
+
+    #[test]
+    fn identity_directory_scopes_the_same_user_uuid_by_origin() {
+        let db = VeilDb::open_memory(&[0xB1; 32]).unwrap();
+        let alpha = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x11,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let beta = sample_account(
+            ORIGIN_B,
+            USER_A,
+            0x22,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_identity_directory(&[alpha.clone(), beta.clone()])
+            .unwrap();
+
+        assert_eq!(
+            db.resolve_account_snapshot(&alpha.locator).unwrap(),
+            Some(alpha)
+        );
+        assert_eq!(
+            db.resolve_account_snapshot(&beta.locator).unwrap(),
+            Some(beta)
+        );
+    }
+
+    #[test]
+    fn identity_directory_substitution_or_alias_rolls_back_the_whole_batch() {
+        let db = VeilDb::open_memory(&[0xB2; 32]).unwrap();
+        let original = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x31,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+
+        let unrelated = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x32,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let mut substituted = original.clone();
+        substituted.locator.identity_key = [0x33; 32];
+        substituted.signing_key = [0x34; 32];
+        assert!(db
+            .upsert_identity_directory(&[unrelated.clone(), substituted])
+            .is_err());
+        assert!(db
+            .resolve_account_snapshot(&unrelated.locator)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.resolve_account_snapshot(&original.locator).unwrap(),
+            Some(original.clone())
+        );
+
+        let mut signing_substitution = original.clone();
+        signing_substitution.signing_key = [0x35; 32];
+        assert!(db
+            .upsert_identity_directory(&[signing_substitution])
+            .is_err());
+
+        let mut aliased = original.clone();
+        aliased.locator.user_id = USER_B.to_string();
+        assert!(db.upsert_identity_directory(&[aliased]).is_err());
+        assert_eq!(
+            db.resolve_account_snapshot(&original.locator).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn identity_directory_source_and_profile_versions_merge_fail_closed() {
+        let db = VeilDb::open_memory(&[0xB3; 32]).unwrap();
+        let mut historical = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x41,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        historical.display_name = Some("Historical".to_string());
+        db.upsert_identity_directory(&[historical.clone()]).unwrap();
+
+        let mut directory = historical.clone();
+        directory.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+        directory.display_name = Some("Directory".to_string());
+        directory.observed_at = "2026-07-12T12:01:00Z".to_string();
+        db.upsert_identity_directory(&[directory.clone()]).unwrap();
+
+        let mut stale_history = historical;
+        stale_history.display_name = Some("Stale history".to_string());
+        stale_history.observed_at = "2026-07-12T12:02:00Z".to_string();
+        db.upsert_identity_directory(&[stale_history]).unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&directory.locator)
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Directory")
+        );
+
+        directory.profile_version = Some(2);
+        directory.display_name = Some("Version two".to_string());
+        db.upsert_identity_directory(&[directory.clone()]).unwrap();
+
+        let mut rollback = directory.clone();
+        rollback.profile_version = Some(1);
+        assert!(db.upsert_identity_directory(&[rollback]).is_err());
+
+        let mut equivocation = directory.clone();
+        equivocation.display_name = Some("Different version two".to_string());
+        assert!(db.upsert_identity_directory(&[equivocation]).is_err());
+
+        let mut unversioned = directory.clone();
+        unversioned.profile_version = None;
+        unversioned.display_name = Some("Unversioned replacement".to_string());
+        db.upsert_identity_directory(&[unversioned]).unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&directory.locator)
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Version two")
+        );
+
+        let mut version_three = directory.clone();
+        version_three.profile_version = Some(3);
+        version_three.display_name = Some("Version three".to_string());
+        db.upsert_identity_directory(&[version_three.clone()])
+            .unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&directory.locator)
+                .unwrap()
+                .unwrap(),
+            version_three
+        );
+    }
+
+    #[test]
+    fn authoritative_conversation_keeps_conversation_and_peer_ids_distinct() {
+        let db = VeilDb::open_memory(&[0xB4; 32]).unwrap();
+        let conversation_id = "00000000-0000-0000-0000-0000000000c3";
+        let peer_key = [0x51; 32];
+        db.upsert_directory_conversation(
+            conversation_id,
+            0,
+            ORIGIN_A,
+            Some("Peer"),
+            Some(USER_A),
+            Some(&peer_key),
+            None,
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+
+        let stored = db.get_conversations().unwrap().remove(0);
+        assert_eq!(stored.id, conversation_id);
+        assert_eq!(stored.peer_user_id.as_deref(), Some(USER_A));
+        assert_ne!(stored.id, stored.peer_user_id.unwrap());
+        assert_eq!(stored.server_origin.as_deref(), Some(ORIGIN_A));
+
+        assert!(db
+            .upsert_directory_conversation(
+                conversation_id,
+                0,
+                ORIGIN_B,
+                Some("Cross-origin"),
+                Some(USER_A),
+                Some(&peer_key),
+                None,
+                "2026-07-12T12:00:00Z",
+            )
+            .is_err());
+        assert!(db
+            .upsert_directory_conversation(
+                conversation_id,
+                0,
+                ORIGIN_A,
+                Some("Different peer"),
+                Some(USER_B),
+                Some(&peer_key),
+                None,
+                "2026-07-12T12:00:00Z",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn account_snapshot_validation_rejects_zero_keys_and_cross_origin_profiles() {
+        let db = VeilDb::open_memory(&[0xB5; 32]).unwrap();
+        let mut zero_identity = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x61,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        zero_identity.locator.identity_key = [0; 32];
+        assert!(db.upsert_identity_directory(&[zero_identity]).is_err());
+
+        let mut zero_signing = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x62,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        zero_signing.signing_key = [0; 32];
+        assert!(db.upsert_identity_directory(&[zero_signing]).is_err());
+
+        let mut cross_origin = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x63,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        cross_origin.profile_origin = ORIGIN_B.to_string();
+        assert!(db.upsert_identity_directory(&[cross_origin]).is_err());
+    }
+
+    #[test]
+    fn author_attach_requires_exact_sender_and_scoped_conversation() {
+        let db = VeilDb::open_memory(&[0xB6; 32]).unwrap();
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x71,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.insert_conversation(
+            "legacy-author",
+            0,
+            None,
+            Some(&author.locator.identity_key),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            "legacy-message",
+            "legacy-author",
+            &author.locator.identity_key,
+            "legacy",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert!(db.attach_message_author("legacy-message", &author).is_err());
+        assert!(db
+            .resolve_account_snapshot(&author.locator)
+            .unwrap()
+            .is_none());
+        assert!(db.get_messages("legacy-author", 10).unwrap()[0]
+            .author
+            .is_none());
+
+        db.upsert_directory_conversation(
+            "scoped-author",
+            0,
+            ORIGIN_A,
+            Some("Peer"),
+            Some(USER_A),
+            Some(&author.locator.identity_key),
+            None,
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "wrong-sender-message",
+            "scoped-author",
+            &[0x72; 32],
+            "wrong sender",
+            false,
+            Some(2),
+            None,
+        )
+        .unwrap();
+        assert!(db
+            .attach_message_author("wrong-sender-message", &author)
+            .is_err());
+        assert!(db
+            .resolve_account_snapshot(&author.locator)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn author_snapshot_survives_a_file_backed_sqlcipher_restart() {
+        let path =
+            std::env::temp_dir().join(format!("veil-author-snapshot-{}.db", uuid::Uuid::new_v4()));
+        let db_key = [0xB7; 32];
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x81,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(7),
+        );
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.upsert_directory_conversation(
+                "restart-author-conversation",
+                0,
+                ORIGIN_A,
+                Some("Peer"),
+                Some(USER_A),
+                Some(&author.locator.identity_key),
+                None,
+                "2026-07-12T12:00:00Z",
+            )
+            .unwrap();
+            db.insert_message(
+                "restart-author-message",
+                "restart-author-conversation",
+                &author.locator.identity_key,
+                "persisted author",
+                false,
+                Some(10),
+                None,
+            )
+            .unwrap();
+            db.attach_message_author("restart-author-message", &author)
+                .unwrap();
+            db.attach_message_author("restart-author-message", &author)
+                .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            let message = reopened
+                .get_messages("restart-author-conversation", 10)
+                .unwrap()
+                .remove(0);
+            assert_eq!(message.author, Some(author));
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn outgoing_ack_cascades_the_author_snapshot_to_the_server_uuid() {
+        let db = VeilDb::open_memory(&[0xB8; 32]).unwrap();
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x91,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_directory_conversation(
+            "author-ack-conversation",
+            1,
+            ORIGIN_A,
+            Some("Group"),
+            None,
+            None,
+            None,
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+        db.insert_outgoing_pending_message(
+            "local-author-id",
+            "author-ack-conversation",
+            &author.locator.identity_key,
+            "pending",
+            None,
+        )
+        .unwrap();
+        db.attach_message_author("local-author-id", &author)
+            .unwrap();
+        db.acknowledge_outgoing_message("local-author-id", "server-author-id", 123)
+            .unwrap();
+
+        assert!(load_message_author(&db.conn, "local-author-id")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            load_message_author(&db.conn, "server-author-id").unwrap(),
+            Some(author.clone())
+        );
+        assert_eq!(
+            db.get_messages("author-ack-conversation", 10).unwrap()[0].author,
+            Some(author)
+        );
+    }
+
+    #[test]
+    fn conversation_identity_schema_upgrade_is_idempotent_and_does_not_guess_legacy_scope() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                conv_type INTEGER NOT NULL,
+                peer_identity_key BLOB,
+                server_id TEXT,
+                name TEXT,
+                last_message_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO conversations (id, conv_type, name)
+             VALUES ('legacy-unscoped', 1, 'Legacy');",
+        )
+        .unwrap();
+        let db = VeilDb { conn };
+        db.run_migrations().unwrap();
+        db.run_migrations().unwrap();
+
+        let columns: (bool, bool) = db
+            .conn
+            .query_row(
+                "SELECT
+                    EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='server_origin'),
+                    EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='peer_user_id')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(columns, (true, true));
+        let legacy = db.get_conversations().unwrap().remove(0);
+        assert!(legacy.server_origin.is_none());
+        assert!(legacy.peer_user_id.is_none());
+
+        db.insert_message(
+            "legacy-history-message",
+            "legacy-unscoped",
+            &[0xA1; 32],
+            "legacy history must keep its unknown origin",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert!(db
+            .upsert_directory_conversation(
+                "legacy-unscoped",
+                1,
+                ORIGIN_B,
+                Some("Attempted adoption"),
+                None,
+                None,
+                None,
+                "2026-07-12T12:00:00Z",
+            )
+            .is_err());
+        let legacy_after = db.get_conversations().unwrap().remove(0);
+        assert!(legacy_after.server_origin.is_none());
+        assert_eq!(db.get_messages("legacy-unscoped", 10).unwrap().len(), 1);
     }
 
     #[test]

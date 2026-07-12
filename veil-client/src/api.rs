@@ -15,7 +15,9 @@ use veil_store::db::{
     DeviceBindingPinV1, DeviceRosterSnapshotV1, HistoricalDeviceBindingProofV1,
     IncomingSenderKeyRouteV1, LocalPreKey, PendingSenderKeyDeviceEnvelopeV1, VeilDb,
 };
-use veil_store::models::{RemoteMessageStateKind, RemoteReaction};
+use veil_store::models::{
+    AccountSnapshot, ConversationType, RemoteMessageStateKind, RemoteReaction,
+};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
@@ -589,9 +591,9 @@ impl VeilClient {
             .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
         self.trusted_signing_keys = db.load_trusted_signing_keys()?.into_iter().collect();
 
-        // Restore explicit DM bindings. A conversation without a known peer is
-        // intentionally not sendable until its authenticated directory lookup
-        // and X3DH establishment complete.
+        // Restore ratchet material, but never publish bare conversation UUID
+        // routing before an authenticated origin directory is selected. Sync
+        // rebinds only conversations accepted for the current origin.
         self.dm_conversations.clear();
         self.authorized_conversation_senders.clear();
         self.ratchet_sessions.clear();
@@ -600,7 +602,6 @@ impl VeilClient {
         for conversation in db.get_conversations()? {
             if let Some(peer) = conversation.peer_identity_key {
                 if let Ok(peer) = <[u8; 32]>::try_from(peer.as_slice()) {
-                    self.dm_conversations.insert(conversation.id, peer);
                     if let Ok(Some(data)) = db.load_ratchet_session(&peer) {
                         let data = Zeroizing::new(data);
                         if let Ok(session) = serde_json::from_slice::<RatchetSession>(&data) {
@@ -1042,9 +1043,57 @@ impl VeilClient {
 
     /// Remember a server user ID to identity-key binding obtained from a signed
     /// directory response. This is deliberately not populated from UI input.
-    pub fn remember_user_identity(&mut self, user_id: &str, identity_key: [u8; 32]) {
+    pub fn remember_user_identity(
+        &mut self,
+        user_id: &str,
+        identity_key: [u8; 32],
+    ) -> Result<(), String> {
+        self.ensure_user_identity_binding_compatible(user_id, identity_key)?;
         self.known_user_keys
-            .insert(user_id.to_string(), identity_key);
+            .entry(user_id.to_string())
+            .or_insert(identity_key);
+        Ok(())
+    }
+
+    /// Validate a server-scoped user lookup without publishing it. Native
+    /// directory ingestion uses this for an all-or-nothing runtime preflight.
+    pub fn ensure_user_identity_binding_compatible(
+        &self,
+        user_id: &str,
+        identity_key: [u8; 32],
+    ) -> Result<(), String> {
+        if user_id.is_empty() {
+            return Err("user identity binding requires a non-empty user id".to_string());
+        }
+        if identity_key == [0u8; 32] {
+            return Err("user identity binding rejects an all-zero identity key".to_string());
+        }
+        if self
+            .known_user_keys
+            .get(user_id)
+            .is_some_and(|stored| stored != &identity_key)
+        {
+            return Err(
+                "authenticated directory changed the identity key for a known user".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Clear server-scoped user-ID bindings before authenticating a different
+    /// origin/session. Cryptographic identity-to-signing-key continuity pins
+    /// are intentionally retained and managed separately.
+    pub fn clear_known_user_identities(&mut self) {
+        self.known_user_keys.clear();
+    }
+
+    /// Clear bare conversation UUID routing before selecting another server
+    /// origin. Durable ratchets and Sender-Key material remain encrypted at
+    /// rest, but cannot be addressed until the current authenticated directory
+    /// republishes an origin-accepted conversation.
+    pub fn clear_server_scoped_conversation_routing(&mut self) {
+        self.dm_conversations.clear();
+        self.channel_conversations.clear();
     }
 
     pub fn known_user_identity(&self, user_id: &str) -> Option<[u8; 32]> {
@@ -1056,16 +1105,35 @@ impl VeilClient {
         identity_key: [u8; 32],
         signing_key: [u8; 32],
     ) -> Result<(), String> {
+        self.ensure_peer_signing_key_compatible(identity_key, signing_key)?;
         if let Some(existing) = self.trusted_signing_keys.get(&identity_key) {
-            if existing != &signing_key {
-                return Err("trusted signing key changed for peer identity".to_string());
-            }
+            debug_assert_eq!(existing, &signing_key);
             return Ok(());
         }
         if let Some(db) = self.db.as_ref() {
             db.pin_trusted_signing_key(&identity_key, &signing_key)?;
         }
         self.trusted_signing_keys.insert(identity_key, signing_key);
+        Ok(())
+    }
+
+    /// Validate an identity-to-signing-key continuity pin without changing
+    /// durable or runtime trust state.
+    pub fn ensure_peer_signing_key_compatible(
+        &self,
+        identity_key: [u8; 32],
+        signing_key: [u8; 32],
+    ) -> Result<(), String> {
+        if identity_key == [0u8; 32] || signing_key == [0u8; 32] {
+            return Err("trusted signing pin rejects all-zero account keys".to_string());
+        }
+        if self
+            .trusted_signing_keys
+            .get(&identity_key)
+            .is_some_and(|existing| existing != &signing_key)
+        {
+            return Err("trusted signing key changed for peer identity".to_string());
+        }
         Ok(())
     }
 
@@ -1081,13 +1149,54 @@ impl VeilClient {
 
     /// Bind a DM conversation to the authenticated peer identity. Sending is
     /// fail-closed unless this binding and a ratchet session both exist.
-    pub fn bind_dm_conversation(&mut self, conversation_id: &str, peer_identity_key: [u8; 32]) {
+    pub fn bind_dm_conversation(
+        &mut self,
+        conversation_id: &str,
+        peer_identity_key: [u8; 32],
+    ) -> Result<(), String> {
+        if conversation_id.is_empty() || peer_identity_key == [0u8; 32] {
+            return Err("DM binding requires a conversation id and peer identity".to_string());
+        }
+        if self
+            .dm_conversations
+            .get(conversation_id)
+            .is_some_and(|stored| stored != &peer_identity_key)
+        {
+            return Err("DM conversation is already bound to another peer identity".to_string());
+        }
+        if let Some(ref db) = self.db {
+            let conversations = db.get_conversations()?;
+            let stored = conversations
+                .iter()
+                .find(|conversation| conversation.id == conversation_id)
+                .ok_or("DM binding requires authoritative durable conversation metadata")?;
+            let stored_origin = stored
+                .server_origin
+                .as_deref()
+                .ok_or("durable DM conversation binding has no authoritative server origin")?;
+            if stored.conv_type != ConversationType::DM
+                || stored.peer_identity_key.as_deref() != Some(peer_identity_key.as_slice())
+                || stored.peer_user_id.is_none()
+            {
+                return Err(
+                    "durable DM conversation binding is unscoped or conflicts with the peer identity"
+                        .to_string(),
+                );
+            }
+            if conversations.iter().any(|candidate| {
+                candidate.id != conversation_id
+                    && candidate.peer_identity_key.as_deref() == Some(peer_identity_key.as_slice())
+                    && candidate.server_origin.as_deref() != Some(stored_origin)
+            }) {
+                return Err(
+                    "DM peer identity exists on multiple server origins; origin-scoped ratchet storage is required"
+                        .to_string(),
+                );
+            }
+        }
         self.dm_conversations
             .insert(conversation_id.to_string(), peer_identity_key);
-        if let Some(ref db) = self.db {
-            let _ =
-                db.insert_conversation(conversation_id, 0, None, Some(&peer_identity_key), None);
-        }
+        Ok(())
     }
 
     /// Sign an arbitrary message with our Ed25519 identity key. Used for
@@ -1740,6 +1849,29 @@ impl VeilClient {
                 plaintext,
                 reply_to_id,
             )?;
+            match db.resolve_account_by_conversation_sender(conversation_id, &our_key) {
+                Ok(Some(author_snapshot)) => {
+                    if let Err(error) =
+                        db.attach_message_author(&local_message_id, &author_snapshot)
+                    {
+                        db.mark_outgoing_message_failed(&local_message_id)?;
+                        return Err(format!(
+                            "persist outgoing message author attribution: {error}"
+                        ));
+                    }
+                }
+                Ok(None) => {
+                    // Legacy unscoped conversations remain usable; their own
+                    // messages are still rendered as `You`, without inventing
+                    // an origin or account locator.
+                }
+                Err(error) => {
+                    db.mark_outgoing_message_failed(&local_message_id)?;
+                    return Err(format!(
+                        "resolve outgoing message author attribution: {error}"
+                    ));
+                }
+            }
         }
         if let Some(indexer) = self.indexer.as_ref() {
             if let Err(error) = indexer.index_message(
@@ -3545,6 +3677,9 @@ impl VeilClient {
     ///
     /// `sender_key_mode` is the authenticated directory conversation kind,
     /// not a hint derived from the untrusted wire header.
+    /// `author_snapshot` is presentation metadata resolved from that same
+    /// authenticated origin. It is committed beside the plaintext row but is
+    /// never consulted for decryption, authorization, or key rotation.
     // These parameters are the authenticated wire and persistence context;
     // keeping borrowed slices avoids extra plaintext/ciphertext copies.
     #[allow(clippy::too_many_arguments)]
@@ -3553,6 +3688,7 @@ impl VeilClient {
         message_id: &str,
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
         sender_key_mode: bool,
         security_context: Option<&MessageSecurityContextV1>,
         fallback_conversation_name: Option<&str>,
@@ -3567,6 +3703,7 @@ impl VeilClient {
             message_id,
             conversation_id,
             sender_identity_key,
+            author_snapshot,
             sender_key_mode,
             security_context,
             fallback_conversation_name,
@@ -3587,6 +3724,7 @@ impl VeilClient {
         message_id: &str,
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
         sender_key_mode: bool,
         security_context: Option<&MessageSecurityContextV1>,
         fallback_conversation_name: Option<&str>,
@@ -3639,6 +3777,12 @@ impl VeilClient {
                 .ok_or("database not initialized")?
                 .message_exists(message_id)?
             {
+                if let Some(author_snapshot) = author_snapshot {
+                    self.db
+                        .as_ref()
+                        .ok_or("database not initialized")?
+                        .attach_message_author(message_id, author_snapshot)?;
+                }
                 return Ok(ReceiveMessageResult::Duplicate);
             }
             self.db
@@ -3685,6 +3829,12 @@ impl VeilClient {
                     server_timestamp,
                     reply_to_id,
                 )?;
+            if let Some(author_snapshot) = author_snapshot {
+                self.db
+                    .as_ref()
+                    .ok_or("database not initialized")?
+                    .attach_message_author(message_id, author_snapshot)?;
+            }
             if let Some(metadata) = remote_metadata {
                 let db = self.db.as_ref().ok_or("database not initialized")?;
                 db.record_remote_message_state(
@@ -3933,6 +4083,7 @@ impl VeilClient {
         message_id: &str,
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
         sender_key_mode: bool,
         header: &[u8],
         ciphertext: &[u8],
@@ -3943,6 +4094,7 @@ impl VeilClient {
             message_id,
             conversation_id,
             sender_identity_key,
+            author_snapshot,
             sender_key_mode,
             header,
             ciphertext,
@@ -3956,6 +4108,7 @@ impl VeilClient {
         message_id: &str,
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
         sender_key_mode: bool,
         header: &[u8],
         ciphertext: &[u8],
@@ -4013,6 +4166,9 @@ impl VeilClient {
                 sender_identity_key,
                 &plaintext,
             )?;
+            if let Some(author_snapshot) = author_snapshot {
+                db.attach_message_author(message_id, author_snapshot)?;
+            }
             if let Some(metadata) = remote_metadata {
                 db.record_remote_message_state(
                     message_id,
@@ -4676,6 +4832,162 @@ mod tests {
     #[test]
     fn generated_device_id_is_never_the_legacy_zero_value() {
         assert_ne!(VeilClient::new().device_id, [0u8; 16]);
+    }
+
+    #[test]
+    fn user_identity_binding_is_fill_once_and_idempotent() {
+        let mut client = VeilClient::new();
+        let identity_key = [0x11; 32];
+
+        assert!(client.remember_user_identity("", identity_key).is_err());
+        assert!(client.remember_user_identity("user-1", [0u8; 32]).is_err());
+        client
+            .remember_user_identity("user-1", identity_key)
+            .unwrap();
+        client
+            .remember_user_identity("user-1", identity_key)
+            .unwrap();
+
+        assert_eq!(client.known_user_identity("user-1"), Some(identity_key));
+    }
+
+    #[test]
+    fn user_identity_binding_rejects_conflicting_overwrite() {
+        let mut client = VeilClient::new();
+        let original = [0x21; 32];
+        client.remember_user_identity("user-1", original).unwrap();
+
+        assert!(client.remember_user_identity("user-1", [0x22; 32]).is_err());
+        assert_eq!(client.known_user_identity("user-1"), Some(original));
+    }
+
+    #[test]
+    fn clearing_user_identities_permits_clean_next_origin_namespace() {
+        let mut client = VeilClient::new();
+        client
+            .remember_user_identity("shared-user-id", [0x31; 32])
+            .unwrap();
+
+        client.clear_known_user_identities();
+        assert_eq!(client.known_user_identity("shared-user-id"), None);
+
+        let next_origin_identity = [0x32; 32];
+        client
+            .remember_user_identity("shared-user-id", next_origin_identity)
+            .unwrap();
+        assert_eq!(
+            client.known_user_identity("shared-user-id"),
+            Some(next_origin_identity)
+        );
+
+        client
+            .bind_dm_conversation("origin-a-dm", [0x33; 32])
+            .unwrap();
+        client.mark_channel_conversation("origin-a-channel");
+        client.clear_server_scoped_conversation_routing();
+        assert!(client.dm_conversations.is_empty());
+        assert!(!client.is_channel_conversation("origin-a-channel"));
+    }
+
+    #[test]
+    fn conflicting_durable_dm_binding_never_changes_the_live_peer() {
+        let original_peer = [0x41; 32];
+        let replacement_peer = [0x42; 32];
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        client.db = Some(VeilDb::open_memory(&[0x43; 32]).unwrap());
+        client
+            .db()
+            .unwrap()
+            .upsert_directory_conversation(
+                "dm-binding",
+                ConversationType::DM as u8,
+                "https://binding.test:443",
+                Some("Peer"),
+                Some("00000000-0000-0000-0000-000000000041"),
+                Some(original_peer.as_slice()),
+                None,
+                "2026-07-12T00:00:00Z",
+            )
+            .unwrap();
+
+        assert!(client
+            .bind_dm_conversation("dm-binding", replacement_peer)
+            .is_err());
+        assert!(!client.dm_conversations.contains_key("dm-binding"));
+
+        client
+            .bind_dm_conversation("dm-binding", original_peer)
+            .unwrap();
+        assert!(client
+            .bind_dm_conversation("dm-binding", replacement_peer)
+            .is_err());
+        assert_eq!(
+            client.dm_conversations.get("dm-binding"),
+            Some(&original_peer)
+        );
+    }
+
+    #[test]
+    fn unscoped_durable_dm_binding_is_never_published_live() {
+        let peer = [0x44; 32];
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        client.db = Some(VeilDb::open_memory(&[0x45; 32]).unwrap());
+        client
+            .db()
+            .unwrap()
+            .insert_conversation(
+                "legacy-dm-binding",
+                ConversationType::DM as u8,
+                Some("Legacy peer"),
+                Some(&peer),
+                None,
+            )
+            .unwrap();
+
+        assert!(client
+            .bind_dm_conversation("legacy-dm-binding", peer)
+            .is_err());
+        assert!(!client.dm_conversations.contains_key("legacy-dm-binding"));
+    }
+
+    #[test]
+    fn shared_peer_key_across_origins_is_not_routed_through_one_ratchet_namespace() {
+        let peer = [0x46; 32];
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        client.db = Some(VeilDb::open_memory(&[0x47; 32]).unwrap());
+        for (conversation_id, origin, peer_user_id) in [
+            (
+                "dm-origin-a",
+                "https://origin-a.test:443",
+                "00000000-0000-0000-0000-000000000048",
+            ),
+            (
+                "dm-origin-b",
+                "https://origin-b.test:443",
+                "00000000-0000-0000-0000-000000000049",
+            ),
+        ] {
+            client
+                .db()
+                .unwrap()
+                .upsert_directory_conversation(
+                    conversation_id,
+                    ConversationType::DM as u8,
+                    origin,
+                    Some("Peer"),
+                    Some(peer_user_id),
+                    Some(peer.as_slice()),
+                    None,
+                    "2026-07-12T00:00:00Z",
+                )
+                .unwrap();
+        }
+
+        assert!(client
+            .bind_dm_conversation("dm-origin-a", peer)
+            .unwrap_err()
+            .contains("origin-scoped ratchet storage"));
+        assert!(client.dm_conversations.is_empty());
     }
 
     #[test]
@@ -5832,7 +6144,7 @@ mod tests {
         let err = client.encrypt_outgoing("unknown", "secret").unwrap_err();
         assert!(err.contains("not bound to a peer"));
 
-        client.bind_dm_conversation("dm-1", peer);
+        client.bind_dm_conversation("dm-1", peer).unwrap();
         let err = client.encrypt_outgoing("dm-1", "secret").unwrap_err();
         assert!(err.contains("no ratchet session"));
     }
@@ -5890,7 +6202,7 @@ mod tests {
         };
 
         alice.establish_session(&bob_key, &bundle).unwrap();
-        alice.bind_dm_conversation("dm-1", bob_key);
+        alice.bind_dm_conversation("dm-1", bob_key).unwrap();
 
         let (ciphertext, initial_header) = alice.encrypt_outgoing("dm-1", "top secret").unwrap();
         assert_eq!(initial_header[0], HEADER_INITIAL);
@@ -5963,7 +6275,21 @@ mod tests {
         alice.init_with_mnemonic(&mnemonic, &path).unwrap();
         let alice_key = alice.identity_key().unwrap();
         alice.establish_session(&bob_key, &bundle).unwrap();
-        alice.bind_dm_conversation("dm-restart", bob_key);
+        alice
+            .db()
+            .unwrap()
+            .upsert_directory_conversation(
+                "dm-restart",
+                ConversationType::DM as u8,
+                "https://restart.test:443",
+                Some("Bob"),
+                Some("00000000-0000-0000-0000-000000000046"),
+                Some(bob_key.as_slice()),
+                None,
+                "2026-07-12T00:00:00Z",
+            )
+            .unwrap();
+        alice.bind_dm_conversation("dm-restart", bob_key).unwrap();
         let (_discarded_ciphertext, first_header) =
             alice.encrypt_outgoing("dm-restart", "discarded").unwrap();
         assert_eq!(first_header[0], HEADER_INITIAL);
@@ -5972,6 +6298,9 @@ mod tests {
         let mut restored = VeilClient::new();
         restored.init_with_mnemonic(&mnemonic, &path).unwrap();
         restored.pin_peer_signing_key(bob_key, bob_signing).unwrap();
+        restored
+            .bind_dm_conversation("dm-restart", bob_key)
+            .unwrap();
         let (ciphertext, header) = restored
             .encrypt_outgoing("dm-restart", "after restart")
             .unwrap();
@@ -5983,7 +6312,7 @@ mod tests {
             DecryptedPayload::Text(plaintext) => assert_eq!(plaintext, b"after restart"),
             DecryptedPayload::Control => panic!("text decoded as control frame"),
         }
-        bob.bind_dm_conversation("dm-restart", alice_key);
+        bob.bind_dm_conversation("dm-restart", alice_key).unwrap();
         let (reply_ciphertext, reply_header) =
             bob.encrypt_outgoing("dm-restart", "receipt").unwrap();
         assert_eq!(
@@ -5992,6 +6321,7 @@ mod tests {
                     "reply-message",
                     "dm-restart",
                     &bob_key,
+                    None,
                     false,
                     None,
                     Some("Bob"),
@@ -6032,9 +6362,36 @@ mod tests {
         let mut alice = VeilClient::from_identity(alice_identity);
         let mut bob = VeilClient::from_identity(bob_identity);
         bob.db = Some(VeilDb::open_memory(&[73u8; 32]).unwrap());
+        let author = AccountSnapshot {
+            locator: veil_store::models::ProfileLocator {
+                canonical_server_origin: "https://atomic.test:443".to_string(),
+                user_id: "00000000-0000-0000-0000-000000000047".to_string(),
+                identity_key: alice_key,
+            },
+            signing_key: alice_signing,
+            username: Some("Alice".to_string()),
+            display_name: Some("Alice Author".to_string()),
+            profile_version: Some(1),
+            profile_origin: "https://atomic.test:443".to_string(),
+            source: veil_store::models::AccountSnapshotSource::AuthenticatedConversationDirectory,
+            observed_at: "2026-07-12T00:00:00Z".to_string(),
+        };
         bob.db()
             .unwrap()
-            .insert_conversation("dm-atomic", 0, Some("Alice"), Some(&alice_key), None)
+            .upsert_identity_directory(std::slice::from_ref(&author))
+            .unwrap();
+        bob.db()
+            .unwrap()
+            .upsert_directory_conversation(
+                "dm-atomic",
+                0,
+                "https://atomic.test:443",
+                Some("Alice"),
+                Some("00000000-0000-0000-0000-000000000047"),
+                Some(alice_key.as_slice()),
+                None,
+                "2026-07-12T00:00:00Z",
+            )
             .unwrap();
         bob.pin_peer_signing_key(alice_key, alice_signing).unwrap();
 
@@ -6054,7 +6411,7 @@ mod tests {
                 },
             )
             .unwrap();
-        alice.bind_dm_conversation("dm-atomic", bob_key);
+        alice.bind_dm_conversation("dm-atomic", bob_key).unwrap();
         let (ciphertext, header) = alice
             .encrypt_outgoing("dm-atomic", "transactional")
             .unwrap();
@@ -6068,6 +6425,7 @@ mod tests {
                 "server-message",
                 "dm-atomic",
                 &alice_key,
+                None,
                 false,
                 None,
                 Some("Alice"),
@@ -6083,6 +6441,29 @@ mod tests {
         bob.replace_authorized_conversation_senders("dm-atomic", [bob_key, alice_key])
             .unwrap();
 
+        let mut wrong_origin_author = author.clone();
+        wrong_origin_author.locator.canonical_server_origin = "https://other.test:443".to_string();
+        wrong_origin_author.profile_origin = "https://other.test:443".to_string();
+        assert!(bob
+            .receive_and_persist_message(
+                "server-message",
+                "dm-atomic",
+                &alice_key,
+                Some(&wrong_origin_author),
+                false,
+                None,
+                Some("Alice"),
+                &header,
+                &ciphertext,
+                Some(1000),
+                None,
+                None,
+            )
+            .is_err());
+        assert!(!bob.has_session(&alice_key));
+        assert!(bob.otk_secrets.contains_key(&opk_id));
+        assert!(!bob.db().unwrap().message_exists("server-message").unwrap());
+
         bob.db()
             .unwrap()
             .conn()
@@ -6097,6 +6478,7 @@ mod tests {
                 "server-message",
                 "dm-atomic",
                 &alice_key,
+                Some(&author),
                 false,
                 None,
                 Some("Alice"),
@@ -6127,6 +6509,7 @@ mod tests {
                 "server-message",
                 "dm-atomic",
                 &alice_key,
+                Some(&author),
                 false,
                 None,
                 Some("Alice"),
@@ -6144,6 +6527,27 @@ mod tests {
         assert!(bob.has_session(&alice_key));
         assert!(!bob.otk_secrets.contains_key(&opk_id));
         assert!(bob.db().unwrap().message_exists("server-message").unwrap());
+        assert_eq!(
+            bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0]
+                .author
+                .as_ref(),
+            Some(&author)
+        );
+
+        // Simulate a row created before author snapshots existed. The edit
+        // transaction must either restore attribution together with plaintext
+        // or leave both unchanged on rollback.
+        bob.db()
+            .unwrap()
+            .conn()
+            .execute(
+                "DELETE FROM message_author_snapshots_v1 WHERE message_id = ?1",
+                rusqlite::params!["server-message"],
+            )
+            .unwrap();
+        assert!(bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0]
+            .author
+            .is_none());
 
         let (edit_ciphertext, edit_header) = alice
             .encrypt_outgoing("dm-atomic", "edited transactionally")
@@ -6162,6 +6566,7 @@ mod tests {
                 "server-message",
                 "dm-atomic",
                 &alice_key,
+                Some(&author),
                 false,
                 &edit_header,
                 &edit_ciphertext,
@@ -6172,6 +6577,9 @@ mod tests {
             bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0].plaintext,
             "transactional"
         );
+        assert!(bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0]
+            .author
+            .is_none());
         bob.db()
             .unwrap()
             .conn()
@@ -6182,6 +6590,7 @@ mod tests {
                 "server-message",
                 "dm-atomic",
                 &alice_key,
+                Some(&author),
                 false,
                 &edit_header,
                 &edit_ciphertext,
@@ -6189,6 +6598,12 @@ mod tests {
             )
             .unwrap(),
             "edited transactionally"
+        );
+        assert_eq!(
+            bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0]
+                .author
+                .as_ref(),
+            Some(&author)
         );
     }
 

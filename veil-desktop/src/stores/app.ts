@@ -11,6 +11,8 @@ export interface Conversation {
   id: string;
   type: "dm" | "group" | "channel";
   name: string;
+  serverOrigin?: string;
+  peerUserId?: string;
   peerKey?: string;
   avatarUrl?: string;
   lastMessage?: string;
@@ -74,7 +76,12 @@ export interface Message {
   id: string;
   conversationId: string;
   senderName: string;
+  senderUserId?: string;
   senderKey: string;
+  senderSigningKey?: string;
+  senderProfileVersion?: number;
+  senderProfileOrigin?: string;
+  senderOrigin?: string;
   text: string;
   timestamp: number;
   isOwn: boolean;
@@ -246,6 +253,7 @@ export interface FriendRequest {
 const [friends, setFriends] = createSignal<Friend[]>([]);
 const [friendRequests, setFriendRequests] = createSignal<FriendRequest[]>([]);
 const [presenceMap, setPresenceMap] = createSignal<Record<string, number>>({});
+const [friendDirectoryReady, setFriendDirectoryReady] = createSignal(false);
 const [pinConfigured, setPinConfigured] = createSignal(false);
 // identityKey → status
 
@@ -387,6 +395,7 @@ function clearSensitiveUi(): void {
   setFriends([]);
   setFriendRequests([]);
   setPresenceMap({});
+  setFriendDirectoryReady(false);
 }
 
 // ─── JSON ↔ store-type adapters (snake_case from Rust ↔ camelCase) ────
@@ -526,6 +535,7 @@ export const appStore = {
   friends,
   friendRequests,
   presenceMap,
+  friendDirectoryReady,
   autoLockSeconds,
   activeConversation: () => {
     const id = activeConversationId();
@@ -605,6 +615,10 @@ export const appStore = {
     // stale Online state while sends are intentionally unavailable.
     setConnected(false);
     setReconnecting(true);
+    setFriends([]);
+    setFriendRequests([]);
+    setPresenceMap({});
+    setFriendDirectoryReady(false);
     try {
       const uid = await invoke<string>("connect_to_server", {
         serverUrl: serverUrl(),
@@ -785,7 +799,7 @@ export const appStore = {
     const names: string[] = [];
     for (const key of set) {
       const msg = allMessages.find((m) => m.senderKey === key && !m.isOwn);
-      names.push(msg?.senderName ?? key.slice(0, 8));
+      names.push(msg?.senderName ?? "Unknown author");
     }
     return names;
   },
@@ -826,6 +840,7 @@ export const appStore = {
   /** Send a friend request. Returns "sent" | "already_pending" | "already_friends" | "error". */
   sendFriendRequest: async (targetUserId: string, message?: string): Promise<string> => {
     const sessionEpoch = captureUiSessionEpoch();
+    if (!connected() || !friendDirectoryReady()) return "error";
     // Local duplicate check — if already pending, don't even bother the server
     const existing = friendRequests().find(
       (r) => (r.outgoing && r.fromUserId === targetUserId) || (!r.outgoing && r.fromUserId === targetUserId),
@@ -863,6 +878,9 @@ export const appStore = {
   /** Accept or reject a friend request. */
   respondFriendRequest: async (requestId: string, accept: boolean) => {
     const sessionEpoch = captureUiSessionEpoch();
+    if (!connected() || !friendDirectoryReady()) {
+      throw new Error("friend directory is not ready for this server origin");
+    }
     try {
       await invoke("respond_friend_request", { requestId, accept });
       requireCurrentUiSession(sessionEpoch);
@@ -878,6 +896,9 @@ export const appStore = {
   /** Remove a friend. */
   removeFriend: async (targetUserId: string) => {
     const sessionEpoch = captureUiSessionEpoch();
+    if (!connected() || !friendDirectoryReady()) {
+      throw new Error("friend directory is not ready for this server origin");
+    }
     try {
       await invoke("remove_friend", { userId: targetUserId });
       requireCurrentUiSession(sessionEpoch);
@@ -901,6 +922,7 @@ export const appStore = {
   /** Search for a user by username. */
   searchUser: async (username: string): Promise<{ userId: string; username: string; identityKey: string } | null> => {
     const sessionEpoch = captureUiSessionEpoch();
+    if (!connected() || !friendDirectoryReady()) return null;
     try {
       const result = await invoke<{ user_id: string; username: string; identity_key: string }>(
         "search_user",
@@ -938,6 +960,7 @@ export const appStore = {
             id: convId,
             type: "dm" as const,
             name: peerName || peerUserId.slice(0, 8),
+            peerUserId,
             unreadCount: 0,
           },
         ]);
@@ -1085,7 +1108,15 @@ export const appStore = {
   loadConversations: async () => {
     const sessionEpoch = captureUiSessionEpoch();
     try {
-      const convs = await invoke<Array<{ id: string; type: string; name: string; peerKey?: string; lastMessageAt?: string }>>("get_conversations");
+      const convs = await invoke<Array<{
+        id: string;
+        type: string;
+        name: string;
+        serverOrigin?: string;
+        peerUserId?: string;
+        peerKey?: string;
+        lastMessageAt?: string;
+      }>>("get_conversations");
       requireCurrentUiSession(sessionEpoch);
       setConversations(
         convs
@@ -1096,6 +1127,8 @@ export const appStore = {
             id: c.id,
             type: (c.type === "group" ? "group" : "dm") as "dm" | "group",
             name: c.name || c.id.slice(0, 8),
+            serverOrigin: c.serverOrigin,
+            peerUserId: c.peerUserId,
             peerKey: c.peerKey,
             unreadCount: 0,
             lastMessageTime: c.lastMessageAt ? new Date(c.lastMessageAt).getTime() : undefined,
@@ -1112,7 +1145,25 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const generation = nextMessageLoadGeneration(conversationId);
     try {
-      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; pending: boolean; failed: boolean; deliveryUnknown: boolean; timestamp: number; createdAt: string; replyToId?: string }>>(
+      const msgs = await invoke<Array<{
+        id: string;
+        conversationId: string;
+        senderName?: string;
+        senderUserId?: string;
+        senderKey: string;
+        senderSigningKey?: string;
+        senderProfileVersion?: number;
+        senderProfileOrigin?: string;
+        senderOrigin?: string;
+        text: string;
+        isOwn: boolean;
+        pending: boolean;
+        failed: boolean;
+        deliveryUnknown: boolean;
+        timestamp: number;
+        createdAt: string;
+        replyToId?: string;
+      }>>(
         "get_messages",
         { conversationId },
       );
@@ -1121,24 +1172,29 @@ export const appStore = {
       const loaded: Message[] = msgs
         .filter((message) => !discardedOutgoingMessageIds.has(message.id))
         .map(m => {
-        const acknowledgedId = acknowledgedOutgoingMessageIds.get(m.id);
-        const rejected = rejectedOutgoingMessageIds.has(m.id);
-        return {
-        id: acknowledgedId ?? m.id,
-        conversationId: m.conversationId,
-        senderName: m.isOwn ? "You" : m.senderKey.slice(0, 8),
-        senderKey: m.senderKey,
-        text: m.text,
-        timestamp: m.timestamp || new Date(m.createdAt).getTime(),
-        isOwn: m.isOwn,
-        pending: !acknowledgedId && !rejected && m.pending,
-        failed: !acknowledgedId && (m.failed || rejected),
-        deliveryUnknown: !acknowledgedId && !rejected && m.deliveryUnknown,
-        replyToId: m.replyToId
-          ? acknowledgedOutgoingMessageIds.get(m.replyToId) ?? m.replyToId
-          : undefined,
-      };
-      });
+          const acknowledgedId = acknowledgedOutgoingMessageIds.get(m.id);
+          const rejected = rejectedOutgoingMessageIds.has(m.id);
+          return {
+            id: acknowledgedId ?? m.id,
+            conversationId: m.conversationId,
+            senderName: m.isOwn ? "You" : (m.senderName?.trim() || "Unknown author"),
+            senderUserId: m.senderUserId,
+            senderKey: m.senderKey,
+            senderSigningKey: m.senderSigningKey,
+            senderProfileVersion: m.senderProfileVersion,
+            senderProfileOrigin: m.senderProfileOrigin,
+            senderOrigin: m.senderOrigin,
+            text: m.text,
+            timestamp: m.timestamp || new Date(m.createdAt).getTime(),
+            isOwn: m.isOwn,
+            pending: !acknowledgedId && !rejected && m.pending,
+            failed: !acknowledgedId && (m.failed || rejected),
+            deliveryUnknown: !acknowledgedId && !rejected && m.deliveryUnknown,
+            replyToId: m.replyToId
+              ? acknowledgedOutgoingMessageIds.get(m.replyToId) ?? m.replyToId
+              : undefined,
+          };
+        });
       let merged: Message[] = [];
       setMessages(prev => {
         const loadedIds = new Set(loaded.map(m => m.id));
@@ -2075,33 +2131,60 @@ export const appStore = {
       },
     );
 
-    await listen<{ messageId: string; conversationId: string; senderKey: string; senderName: string; text: string; timestamp: number; replyToId?: string }>(
+    await listen<{
+      messageId: string;
+      conversationId: string;
+      conversationType?: "dm" | "group" | "channel";
+      conversationName?: string;
+      conversationPeerUserId?: string;
+      senderKey: string;
+      senderName?: string;
+      senderUserId?: string;
+      senderSigningKey?: string;
+      senderProfileVersion?: number;
+      senderProfileOrigin?: string;
+      senderOrigin?: string;
+      text: string;
+      timestamp: number;
+      replyToId?: string;
+    }>(
       "veil://message",
       (event) => {
         if (!acceptsSensitiveEvent()) return;
         const d = event.payload;
-        nextMessageLoadGeneration(d.conversationId);
         const isOwn = d.senderKey === identity();
+        const senderName = isOwn ? "You" : (d.senderName?.trim() || "Unknown author");
+        nextMessageLoadGeneration(d.conversationId);
         appStore.addMessage({
           id: d.messageId,
           conversationId: d.conversationId,
-          senderName: d.senderName || "Unknown",
+          senderName,
+          senderUserId: d.senderUserId,
           senderKey: d.senderKey,
+          senderSigningKey: d.senderSigningKey,
+          senderProfileVersion: d.senderProfileVersion,
+          senderProfileOrigin: d.senderProfileOrigin,
+          senderOrigin: d.senderOrigin,
           text: d.text,
           timestamp: d.timestamp,
           isOwn,
           replyToId: d.replyToId ?? undefined,
         });
 
-        // Auto-create conversation if not present
+        // Only the native, origin-scoped directory may choose a conversation
+        // kind. Server channels deliberately stay out of the DM/group rail.
         const exists = conversations().some((c) => c.id === d.conversationId);
-        if (!exists) {
+        const conversationType = d.conversationType;
+        if (!exists && (conversationType === "dm" || conversationType === "group")) {
           setConversations((prev) => [
             ...prev,
             {
               id: d.conversationId,
-              type: "dm",
-              name: d.senderName || d.senderKey.slice(0, 8),
+              type: conversationType,
+              name: d.conversationName?.trim()
+                || (conversationType === "dm" ? senderName : "Unknown conversation"),
+              serverOrigin: d.senderOrigin,
+              peerUserId: conversationType === "dm" ? d.conversationPeerUserId : undefined,
               lastMessage: d.text,
               lastMessageTime: d.timestamp,
               unreadCount: 1,
@@ -2115,6 +2198,10 @@ export const appStore = {
       if (!acceptsSensitiveEvent()) return;
       setConnected(false);
       setReconnecting(true);
+      setFriends([]);
+      setFriendRequests([]);
+      setPresenceMap({});
+      setFriendDirectoryReady(false);
       const affectedConversations = new Set<string>();
       let disconnectedSnapshot: Message[] = [];
       setMessages((previous) => {
@@ -2342,7 +2429,7 @@ export const appStore = {
     await listen<{ identityKey: string; status: number; statusText?: string; lastSeen?: number }>(
       "veil://presence",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsSensitiveEvent() || !connected()) return;
         const { identityKey, status } = event.payload;
         setPresenceMap((prev) => ({ ...prev, [identityKey]: status }));
         // Also update friend list status
@@ -2358,7 +2445,7 @@ export const appStore = {
     await listen<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number }>(
       "veil://friend-request",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsSensitiveEvent() || !connected()) return;
         const d = event.payload;
         setFriendRequests((prev) => [
           ...prev,
@@ -2377,7 +2464,7 @@ export const appStore = {
     await listen<{ userId: string; username: string }>(
       "veil://friend-accepted",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsSensitiveEvent() || !connected()) return;
         const { userId: uid, username } = event.payload;
         // Add to friends list
         setFriends((prev) => {
@@ -2392,7 +2479,7 @@ export const appStore = {
     await listen<{ userId: string }>(
       "veil://friend-removed",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsSensitiveEvent() || !connected()) return;
         const { userId: uid } = event.payload;
         setFriends((prev) => prev.filter((f) => f.userId !== uid));
       },
@@ -2404,7 +2491,7 @@ export const appStore = {
     }>(
       "veil://friend-list",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsSensitiveEvent() || !connected()) return;
         const d = event.payload;
         setFriends(d.friends.map((f) => ({ userId: f.userId, username: f.username, status: f.status, lastSeen: f.lastSeen })));
         setFriendRequests(d.pendingRequests.map((r) => ({
@@ -2415,6 +2502,7 @@ export const appStore = {
           timestamp: r.timestamp,
           outgoing: r.outgoing,
         })));
+        setFriendDirectoryReady(true);
       },
     );
 

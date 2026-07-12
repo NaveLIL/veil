@@ -15,6 +15,7 @@ use veil_client::api::{
 use veil_client::connection::ConnectionEvent;
 use veil_search::{Indexer, SearchHit};
 use veil_store::keychain;
+use veil_store::models::{AccountSnapshot, AccountSnapshotSource, ProfileLocator};
 use zeroize::{Zeroize, Zeroizing};
 
 mod appearance;
@@ -139,6 +140,22 @@ struct RestOrigin {
 struct RestBinding {
     origin: RestOrigin,
     generation: u64,
+}
+
+impl RestOrigin {
+    fn canonical_server_origin(&self) -> String {
+        let host = self.host.trim_start_matches('[').trim_end_matches(']');
+        let authority = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_string()
+        };
+        format!("{}://{}:{}", self.scheme, authority, self.port)
+    }
+}
+
+fn identity_observed_at() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
 // ─── Identity ─────────────────────────────────────────
@@ -347,6 +364,43 @@ fn require_live_transport_still_ready(state: &AppState) -> Result<(), String> {
     }
 }
 
+fn authenticated_rest_binding(state: &AppState) -> Result<RestBinding, String> {
+    state
+        .authenticated_rest_origin
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone()
+        .ok_or_else(|| "no server origin is bound to the authenticated session".to_string())
+}
+
+/// Temporary Phase 4D boundary while legacy conversation/ratchet tables still
+/// use bare UUID primary keys. A conversation from another self-hosted origin
+/// must never advance local crypto state through the active transport.
+fn require_authenticated_conversation_origin(
+    state: &AppState,
+    client: &VeilClient,
+    conversation_id: &str,
+) -> Result<(), String> {
+    let binding = authenticated_rest_binding(state)?;
+    let expected_origin = binding.origin.canonical_server_origin();
+    let conversation = client
+        .db()
+        .ok_or("database not initialized")?
+        .get_conversations()?
+        .into_iter()
+        .find(|conversation| conversation.id == conversation_id)
+        .ok_or("conversation is absent from the encrypted local directory")?;
+    if conversation.server_origin.as_deref() != Some(expected_origin.as_str()) {
+        return Err(
+            "conversation belongs to another or unknown authenticated server origin".to_string(),
+        );
+    }
+    if authenticated_rest_binding(state)? != binding {
+        return Err("authenticated server origin changed while resolving conversation".to_string());
+    }
+    Ok(())
+}
+
 fn bounded_diagnostic_detail(detail: &str) -> String {
     let sanitized: String = detail
         .chars()
@@ -456,6 +510,40 @@ fn quarantine_live_conversation(
     let diagnostic = quarantine_conversation_state(state, conversation_id, code, detail)?;
     emit_conversation_crypto_unavailable(app, &diagnostic);
     Ok(())
+}
+
+/// Reject every conversation-scoped live event whose bare UUID does not map
+/// to the current authenticated origin in SQLCipher. Runtime authorization is
+/// necessary but cannot by itself disambiguate equal UUIDs across self-hosted
+/// instances.
+fn live_conversation_origin_is_current(
+    state: &AppState,
+    app: &AppHandle,
+    client: &mut VeilClient,
+    conversation_id: &str,
+) -> bool {
+    if let Err(error) = require_authenticated_conversation_origin(state, client, conversation_id) {
+        let sender_key_mode = client.is_channel_conversation(conversation_id);
+        let detail = format!("live event origin rejected: {error}");
+        let _ = quarantine_live_conversation(
+            state,
+            app,
+            client,
+            conversation_id,
+            sender_key_mode,
+            "live_origin_rejected",
+            &detail,
+        );
+        let _ = app.emit(
+            "veil://error",
+            serde_json::json!({
+                "code": 4003,
+                "message": detail,
+            }),
+        );
+        return false;
+    }
+    true
 }
 
 fn consume_pending_lock_event(pending: &AtomicBool, unlocked: &AtomicBool) -> bool {
@@ -983,11 +1071,25 @@ async fn init_from_seed(state: State<'_, AppState>) -> Result<String, String> {
 #[tauri::command]
 fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
     require_unlocked(&state)?;
+    let binding = state
+        .authenticated_rest_origin
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let Some(binding) = binding else {
+        // A bare renderer endpoint is not an identity namespace. The complete
+        // list is refreshed after authenticated WS+REST binding succeeds.
+        return Ok(Vec::new());
+    };
+    let canonical_server_origin = binding.origin.canonical_server_origin();
     let client = state.client.lock().map_err(|e| e.to_string())?;
     let db = client.db().ok_or("database not initialized")?;
     let convs = db.get_conversations()?;
     let result = convs
         .into_iter()
+        .filter(|conversation| {
+            conversation.server_origin.as_deref() == Some(canonical_server_origin.as_str())
+        })
         .map(|c| {
             serde_json::json!({
                 "id": c.id,
@@ -998,10 +1100,15 @@ fn get_conversations(state: State<'_, AppState>) -> Result<Vec<serde_json::Value
                 },
                 "name": c.name.unwrap_or_default(),
                 "peerKey": c.peer_identity_key.map(hex::encode),
+                "peerUserId": c.peer_user_id,
+                "serverOrigin": c.server_origin,
                 "lastMessageAt": c.last_message_at,
             })
         })
         .collect();
+    if authenticated_rest_binding(&state)? != binding {
+        return Err("authenticated server origin changed while listing conversations".to_string());
+    }
     require_session_still_unlocked(&state)?;
     Ok(result)
 }
@@ -1035,15 +1142,29 @@ fn get_messages(
 ) -> Result<Vec<serde_json::Value>, String> {
     require_unlocked(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     let db = client.db().ok_or("database not initialized")?;
     let msgs = db.get_messages(&conversation_id, limit.unwrap_or(200))?;
     let result = msgs
         .into_iter()
         .map(|m| {
+            let author_name = m.author.as_ref().and_then(|author| {
+                author
+                    .display_name
+                    .as_ref()
+                    .or(author.username.as_ref())
+                    .cloned()
+            });
             serde_json::json!({
                 "id": m.id,
                 "conversationId": m.conversation_id,
                 "senderKey": hex::encode(&m.sender_key),
+                "senderName": author_name,
+                "senderUserId": m.author.as_ref().map(|author| &author.locator.user_id),
+                "senderSigningKey": m.author.as_ref().map(|author| hex::encode(author.signing_key)),
+                "senderProfileVersion": m.author.as_ref().and_then(|author| author.profile_version),
+                "senderProfileOrigin": m.author.as_ref().map(|author| &author.profile_origin),
+                "senderOrigin": m.author.as_ref().map(|author| &author.locator.canonical_server_origin),
                 "text": m.plaintext,
                 "isOwn": m.is_outgoing,
                 "pending": m.is_outgoing && m.status == veil_store::models::MessageStatus::Sending,
@@ -1055,6 +1176,7 @@ fn get_messages(
             })
         })
         .collect();
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     require_session_still_unlocked(&state)?;
     Ok(result)
 }
@@ -2150,6 +2272,7 @@ fn validate_next_cursor(
 fn pin_and_persist_sync_conversation(
     state: &AppState,
     authenticated_user_id: &str,
+    canonical_server_origin: &str,
     conversation: &SyncConversation,
 ) -> Result<
     (
@@ -2244,17 +2367,16 @@ fn pin_and_persist_sync_conversation(
         ));
     }
 
-    let (name, peer_identity_key) = if conversation.conv_type == 0 {
+    let (name, peer_user_id, peer_identity_key) = if conversation.conv_type == 0 {
         if directory.len() != 2 {
             return Err(format!(
                 "DM conversation {} must contain exactly two members",
                 conversation.id
             ));
         }
-        let peer = directory
+        let (peer_user_id, peer) = directory
             .iter()
             .find(|(user_id, _)| user_id.as_str() != authenticated_user_id)
-            .map(|(_, member)| member)
             .ok_or_else(|| format!("DM conversation {} has no peer", conversation.id))?;
         (
             conversation
@@ -2262,36 +2384,67 @@ fn pin_and_persist_sync_conversation(
                 .as_deref()
                 .filter(|name| !name.is_empty())
                 .unwrap_or(&peer.username),
+            Some(peer_user_id.as_str()),
             Some(peer.identity_key),
         )
     } else {
-        (conversation.name.as_deref().unwrap_or_default(), None)
+        (conversation.name.as_deref().unwrap_or_default(), None, None)
     };
 
-    // Only after the complete entry has passed structural/self-key checks do
-    // we commit TOFU pins learned from this authenticated directory page.
-    for (user_id, member) in &directory {
-        client.remember_user_identity(user_id, member.identity_key);
-        client.pin_peer_signing_key(member.identity_key, member.signing_key)?;
-    }
-    client.replace_authorized_conversation_senders(
-        &conversation.id,
-        directory.values().map(|member| member.identity_key),
-    )?;
+    // SQLCipher is the authoritative origin boundary. Presentation metadata
+    // and the canonical conversation scope must be accepted before any
+    // process-local lookup, signing pin, or live sender authorization is
+    // published.
     {
         let db = client.db().ok_or("database not initialized")?;
+        let observed_at = identity_observed_at();
+        let snapshots: Vec<AccountSnapshot> = directory
+            .iter()
+            .map(|(user_id, member)| AccountSnapshot {
+                locator: ProfileLocator {
+                    canonical_server_origin: canonical_server_origin.to_string(),
+                    user_id: user_id.clone(),
+                    identity_key: member.identity_key,
+                },
+                signing_key: member.signing_key,
+                username: Some(member.username.clone()),
+                display_name: None,
+                profile_version: None,
+                profile_origin: canonical_server_origin.to_string(),
+                source: AccountSnapshotSource::AuthenticatedConversationDirectory,
+                observed_at: observed_at.clone(),
+            })
+            .collect();
+        db.upsert_identity_directory(&snapshots)?;
         db.upsert_directory_conversation(
             &conversation.id,
             conversation.conv_type,
+            canonical_server_origin,
             Some(name),
+            peer_user_id,
             peer_identity_key.as_ref().map(<[u8; 32]>::as_slice),
             conversation.server_id.as_deref(),
             &conversation.created_at,
         )?;
     }
 
+    // Only after durable origin validation succeeds do we commit TOFU pins
+    // learned from this authenticated directory page.
+    for (user_id, member) in &directory {
+        client.ensure_user_identity_binding_compatible(user_id, member.identity_key)?;
+        client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
+    }
+    for (user_id, member) in &directory {
+        client.remember_user_identity(user_id, member.identity_key)?;
+        client.pin_peer_signing_key(member.identity_key, member.signing_key)?;
+    }
+    client.replace_authorized_conversation_senders(
+        &conversation.id,
+        directory.values().map(|member| member.identity_key),
+    )?;
+
     let sender_key_refresh = if let Some(peer_identity_key) = peer_identity_key {
-        client.bind_dm_conversation(&conversation.id, peer_identity_key);
+        client.bind_dm_conversation(&conversation.id, peer_identity_key)?;
         None
     } else {
         // Group/channel history is Sender-Key ciphertext. Marking first blocks
@@ -2307,6 +2460,7 @@ fn sync_conversation_messages(
     state: &AppState,
     server_http_url: &str,
     authenticated_user_id: &str,
+    canonical_server_origin: &str,
     conversation_id: &str,
     directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
     stats: &mut OfflineSyncStats,
@@ -2631,6 +2785,43 @@ fn sync_conversation_messages(
                 continue;
             }
 
+            let locator = ProfileLocator {
+                canonical_server_origin: canonical_server_origin.to_string(),
+                user_id: message.sender_id.clone(),
+                identity_key: response_identity,
+            };
+            let author_snapshot = match client
+                .db()
+                .ok_or("database not initialized")?
+                .resolve_account_snapshot(&locator)?
+            {
+                Some(snapshot) => {
+                    if snapshot.signing_key != response_signing {
+                        return Err(format!(
+                            "message {} author signing key conflicts with the origin-scoped directory",
+                            message.id
+                        ));
+                    }
+                    snapshot
+                }
+                None => AccountSnapshot {
+                    locator,
+                    signing_key: response_signing,
+                    username: directory
+                        .get(&message.sender_id)
+                        .map(|member| member.username.clone()),
+                    display_name: None,
+                    profile_version: None,
+                    profile_origin: canonical_server_origin.to_string(),
+                    source: if directory.contains_key(&message.sender_id) {
+                        AccountSnapshotSource::AuthenticatedConversationDirectory
+                    } else {
+                        AccountSnapshotSource::AuthenticatedHistory
+                    },
+                    observed_at: identity_observed_at(),
+                },
+            };
+
             let action = client.reconcile_remote_message_metadata(
                 &message.id,
                 conversation_id,
@@ -2645,6 +2836,10 @@ fn sync_conversation_messages(
                 }
                 veil_client::api::RemoteReconcileAction::Unchanged
                 | veil_client::api::RemoteReconcileAction::SelfStateOnly => {
+                    client
+                        .db()
+                        .ok_or("database not initialized")?
+                        .attach_message_author(&message.id, &author_snapshot)?;
                     stats.duplicates += 1;
                     continue;
                 }
@@ -2685,6 +2880,7 @@ fn sync_conversation_messages(
                         &message.id,
                         conversation_id,
                         &response_identity,
+                        Some(&author_snapshot),
                         sender_key_mode,
                         message_security_context.as_ref(),
                         None,
@@ -2707,6 +2903,7 @@ fn sync_conversation_messages(
                         &message.id,
                         conversation_id,
                         &response_identity,
+                        Some(&author_snapshot),
                         sender_key_mode,
                         header,
                         ciphertext,
@@ -2740,6 +2937,7 @@ fn sync_offline_state(
     state: &AppState,
     server_http_url: &str,
     authenticated_user_id: &str,
+    canonical_server_origin: &str,
 ) -> Result<OfflineSyncStats, String> {
     let mut stats = OfflineSyncStats::default();
     let mut cursor: Option<String> = None;
@@ -2782,21 +2980,24 @@ fn sync_offline_state(
                 ));
             }
             stats.conversations += 1;
-            let (directory, sender_key_refresh) =
-                match pin_and_persist_sync_conversation(state, authenticated_user_id, conversation)
-                {
-                    Ok(pinned) => pinned,
-                    Err(error) => {
-                        require_session_still_unlocked(state)?;
-                        quarantine_runtime_conversation(
-                            state,
-                            &conversation.id,
-                            matches!(conversation.conv_type, 1 | 2),
-                        )?;
-                        isolation.block(&conversation.id, "account_directory_rejected", &error);
-                        continue;
-                    }
-                };
+            let (directory, sender_key_refresh) = match pin_and_persist_sync_conversation(
+                state,
+                authenticated_user_id,
+                canonical_server_origin,
+                conversation,
+            ) {
+                Ok(pinned) => pinned,
+                Err(error) => {
+                    require_session_still_unlocked(state)?;
+                    quarantine_runtime_conversation(
+                        state,
+                        &conversation.id,
+                        matches!(conversation.conv_type, 1 | 2),
+                    )?;
+                    isolation.block(&conversation.id, "account_directory_rejected", &error);
+                    continue;
+                }
+            };
             if sender_key_refresh.is_some() {
                 // The retained SKDM FIFO barrier and every Sender-Key
                 // ciphertext are device-owned. Install the complete current
@@ -2882,6 +3083,7 @@ fn sync_offline_state(
             state,
             server_http_url,
             authenticated_user_id,
+            canonical_server_origin,
             conversation_id,
             directory,
             &mut stats,
@@ -2935,6 +3137,7 @@ fn connect_to_server(
     let requested_rest_url =
         reqwest::Url::parse(&server_http_url).map_err(|e| format!("invalid REST URL: {e}"))?;
     let requested_rest_origin = rest_origin(&requested_rest_url)?;
+    let canonical_server_origin = requested_rest_origin.canonical_server_origin();
     let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
     require_unlocked(&state)?;
     let previous_generation = state
@@ -2960,7 +3163,12 @@ fn connect_to_server(
         .authenticated_rest_origin
         .lock()
         .map_err(|e| e.to_string())? = None;
+    // The index stores plaintext in process memory and has no origin field.
+    // Erase the previous namespace before authenticating another instance.
+    state.indexer.clear().map_err(|e| e.to_string())?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    client.clear_known_user_identities();
+    client.clear_server_scoped_conversation_routing();
     client.clear_all_authorized_conversation_senders();
     client.clear_device_rosters_v1();
     let result = state.runtime.block_on(client.connect(&server_url))?;
@@ -2984,19 +3192,30 @@ fn connect_to_server(
             .map_err(|e| e.to_string())? = Some(requested_rest_binding.clone());
     }
 
-    let sync_stats = match sync_offline_state(&state, &server_http_url, &result) {
-        Ok(stats) => stats,
-        Err(error) => {
-            let mut bound = state
-                .authenticated_rest_origin
-                .lock()
-                .map_err(|e| e.to_string())?;
-            if bound.as_ref() == Some(&requested_rest_binding) {
-                *bound = None;
+    let sync_stats =
+        match sync_offline_state(&state, &server_http_url, &result, &canonical_server_origin) {
+            Ok(stats) => stats,
+            Err(error) => {
+                let mut bound = state
+                    .authenticated_rest_origin
+                    .lock()
+                    .map_err(|e| e.to_string())?;
+                if bound.as_ref() == Some(&requested_rest_binding) {
+                    *bound = None;
+                }
+                return Err(format!("authenticated offline sync failed: {error}"));
             }
-            return Err(format!("authenticated offline sync failed: {error}"));
-        }
-    };
+        };
+    if let Err(error) = rebuild_search_index_for_current_origin(&state) {
+        let _ = state.indexer.clear();
+        let _ = app.emit(
+            "veil://error",
+            serde_json::json!({
+                "code": 5001,
+                "message": format!("origin-scoped search backfill failed: {error}"),
+            }),
+        );
+    }
     {
         // Publish readiness and its UI notification in the same ordered
         // session transition as lock/unlock. Otherwise a watchdog reset could
@@ -3091,13 +3310,22 @@ fn connect_to_server(
                             message_id,
                             conversation_id,
                             sender_identity_key,
-                            sender_username,
+                            sender_username: _,
                             ciphertext,
                             header,
                             server_timestamp,
                             reply_to_id,
                             security_context,
                         } => {
+                            if !live_conversation_origin_is_current(
+                                &state_inner,
+                                &app_handle,
+                                &mut client,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             if conversation_is_quarantined_fail_closed(
                                 &state_inner,
                                 &conversation_id,
@@ -3184,14 +3412,76 @@ fn connect_to_server(
                                 );
                                 continue;
                             }
+                            let author_snapshot = match client
+                                .db()
+                                .ok_or_else(|| "database not initialized".to_string())
+                                .and_then(|db| {
+                                    db.resolve_account_by_conversation_sender(
+                                        &conversation_id,
+                                        &sender_key,
+                                    )
+                                }) {
+                                Ok(Some(snapshot)) => snapshot,
+                                Ok(None) => {
+                                    let detail = "live message author is absent from the authenticated origin-scoped directory";
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        sender_key_mode,
+                                        "live_author_directory_missing",
+                                        detail,
+                                    );
+                                    drop(client);
+                                    let _ = app_handle.emit(
+                                        "veil://error",
+                                        serde_json::json!({
+                                            "code": 4005,
+                                            "message": detail,
+                                        }),
+                                    );
+                                    continue;
+                                }
+                                Err(error) => {
+                                    let detail = format!(
+                                        "live message author directory lookup failed: {error}"
+                                    );
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        sender_key_mode,
+                                        "live_author_directory_rejected",
+                                        &detail,
+                                    );
+                                    drop(client);
+                                    let _ = app_handle.emit(
+                                        "veil://error",
+                                        serde_json::json!({
+                                            "code": 4005,
+                                            "message": detail,
+                                        }),
+                                    );
+                                    continue;
+                                }
+                            };
+                            let authoritative_sender_name = author_snapshot
+                                .display_name
+                                .as_deref()
+                                .or(author_snapshot.username.as_deref())
+                                .unwrap_or("Unknown author")
+                                .to_string();
                             let ts_ms = (server_timestamp / 1_000_000) as i64;
                             let text = match client.receive_and_persist_live_message(
                                 &message_id,
                                 &conversation_id,
                                 &sender_key,
+                                Some(&author_snapshot),
                                 sender_key_mode,
                                 security_context.as_ref(),
-                                Some(&sender_username),
+                                Some(&authoritative_sender_name),
                                 &header,
                                 &ciphertext,
                                 Some(ts_ms),
@@ -3235,6 +3525,26 @@ fn connect_to_server(
                                     continue;
                                 }
                             };
+                            let conversation_context = client.db().and_then(|db| {
+                                db.get_conversations().ok().and_then(|conversations| {
+                                    conversations
+                                        .into_iter()
+                                        .find(|conversation| conversation.id == conversation_id)
+                                })
+                            });
+                            let conversation_type = conversation_context.as_ref().map(
+                                |conversation| match conversation.conv_type {
+                                    veil_store::models::ConversationType::DM => "dm",
+                                    veil_store::models::ConversationType::Group => "group",
+                                    veil_store::models::ConversationType::Channel => "channel",
+                                },
+                            );
+                            let conversation_name = conversation_context
+                                .as_ref()
+                                .and_then(|conversation| conversation.name.as_deref());
+                            let conversation_peer_user_id = conversation_context
+                                .as_ref()
+                                .and_then(|conversation| conversation.peer_user_id.as_deref());
                             drop(client); // Release lock before emitting
 
                             let _ = app_handle.emit(
@@ -3242,8 +3552,16 @@ fn connect_to_server(
                                 serde_json::json!({
                                     "messageId": message_id,
                                     "conversationId": conversation_id,
+                                    "conversationType": conversation_type,
+                                    "conversationName": conversation_name,
+                                    "conversationPeerUserId": conversation_peer_user_id,
                                     "senderKey": hex::encode(&sender_identity_key),
-                                    "senderName": sender_username,
+                                    "senderName": authoritative_sender_name,
+                                    "senderUserId": author_snapshot.locator.user_id,
+                                    "senderSigningKey": hex::encode(author_snapshot.signing_key),
+                                    "senderProfileVersion": author_snapshot.profile_version,
+                                    "senderProfileOrigin": author_snapshot.profile_origin,
+                                    "senderOrigin": author_snapshot.locator.canonical_server_origin,
                                     "text": text,
                                     "timestamp": server_timestamp / 1_000_000,
                                     "replyToId": reply_to_id,
@@ -3337,6 +3655,15 @@ fn connect_to_server(
                             header,
                             edit_timestamp,
                         } => {
+                            if !live_conversation_origin_is_current(
+                                &state_inner,
+                                &app_handle,
+                                &mut client,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             if conversation_is_quarantined_fail_closed(
                                 &state_inner,
                                 &conversation_id,
@@ -3409,6 +3736,48 @@ fn connect_to_server(
                                 continue;
                             }
 
+                            let author_snapshot = match client
+                                .db()
+                                .ok_or_else(|| "database not initialized".to_string())
+                                .and_then(|db| {
+                                    db.resolve_account_by_conversation_sender(
+                                        &conversation_id,
+                                        &sender_key,
+                                    )
+                                }) {
+                                Ok(Some(snapshot)) => snapshot,
+                                Ok(None) => {
+                                    let detail = "live edit author is absent from the authenticated origin-scoped directory";
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        false,
+                                        "live_edit_author_directory_missing",
+                                        detail,
+                                    );
+                                    drop(client);
+                                    continue;
+                                }
+                                Err(error) => {
+                                    let detail = format!(
+                                        "live edit author directory lookup failed: {error}"
+                                    );
+                                    let _ = quarantine_live_conversation(
+                                        &state_inner,
+                                        &app_handle,
+                                        &mut client,
+                                        &conversation_id,
+                                        false,
+                                        "live_edit_author_directory_rejected",
+                                        &detail,
+                                    );
+                                    drop(client);
+                                    continue;
+                                }
+                            };
+
                             let revision_ms = match i64::try_from(edit_timestamp / 1_000_000) {
                                 Ok(timestamp) => timestamp,
                                 Err(_) => {
@@ -3429,6 +3798,26 @@ fn connect_to_server(
                             ) {
                                 Ok(veil_client::api::RemoteReconcileAction::Unchanged)
                                 | Ok(veil_client::api::RemoteReconcileAction::SelfStateOnly) => {
+                                    if let Err(error) = client
+                                        .db()
+                                        .ok_or_else(|| "database not initialized".to_string())
+                                        .and_then(|db| {
+                                            db.attach_message_author(&message_id, &author_snapshot)
+                                        })
+                                    {
+                                        let detail = format!(
+                                            "message edit author persistence rejected: {error}"
+                                        );
+                                        let _ = quarantine_live_conversation(
+                                            &state_inner,
+                                            &app_handle,
+                                            &mut client,
+                                            &conversation_id,
+                                            false,
+                                            "live_edit_author_persistence_rejected",
+                                            &detail,
+                                        );
+                                    }
                                     drop(client);
                                     continue;
                                 }
@@ -3465,6 +3854,7 @@ fn connect_to_server(
                                 &message_id,
                                 &conversation_id,
                                 &sender_key,
+                                Some(&author_snapshot),
                                 sender_key_mode,
                                 &header,
                                 &ciphertext,
@@ -3512,6 +3902,15 @@ fn connect_to_server(
                             sender_identity_key,
                             delete_timestamp,
                         } => {
+                            if !live_conversation_origin_is_current(
+                                &state_inner,
+                                &app_handle,
+                                &mut client,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             if conversation_is_quarantined_fail_closed(
                                 &state_inner,
                                 &conversation_id,
@@ -3673,6 +4072,15 @@ fn connect_to_server(
                             identity_key,
                             started,
                         } => {
+                            if !live_conversation_origin_is_current(
+                                &state_inner,
+                                &app_handle,
+                                &mut client,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             if conversation_is_quarantined_fail_closed(
                                 &state_inner,
                                 &conversation_id,
@@ -3698,6 +4106,15 @@ fn connect_to_server(
                             username,
                             add,
                         } => {
+                            if !live_conversation_origin_is_current(
+                                &state_inner,
+                                &app_handle,
+                                &mut client,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             if conversation_is_quarantined_fail_closed(
                                 &state_inner,
                                 &conversation_id,
@@ -3948,6 +4365,15 @@ fn connect_to_server(
                             route,
                         } => {
                             let conversation_id = route.conversation_id.clone();
+                            if !live_conversation_origin_is_current(
+                                &state_inner,
+                                &app_handle,
+                                &mut client,
+                                &conversation_id,
+                            ) {
+                                drop(client);
+                                continue;
+                            }
                             if conversation_is_quarantined_fail_closed(
                                 &state_inner,
                                 &conversation_id,
@@ -4022,6 +4448,7 @@ fn send_message(
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     state
         .runtime
         .block_on(client.send_message(&conversation_id, &text, reply_to_id.as_deref()))
@@ -4034,6 +4461,13 @@ fn discard_failed_outgoing_message(
 ) -> Result<(), String> {
     require_unlocked(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    let conversation_id = client
+        .db()
+        .ok_or("database not initialized")?
+        .get_message_binding(&local_message_id)?
+        .map(|binding| binding.0)
+        .ok_or("failed outgoing message is absent from encrypted local storage")?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     client.discard_failed_outgoing_message(&local_message_id)
 }
 
@@ -4048,6 +4482,7 @@ fn edit_message(
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     if client.is_channel_conversation(&conversation_id) {
         return Err(
             "editing encrypted group/channel messages is unavailable until the exact-device edit protocol is implemented"
@@ -4069,6 +4504,7 @@ fn delete_message(
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     state
         .runtime
         .block_on(client.delete_message(&message_id, &conversation_id))
@@ -4084,6 +4520,7 @@ fn send_typing(
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     state
         .runtime
         .block_on(client.send_typing(&conversation_id, started))
@@ -4102,6 +4539,7 @@ fn toggle_reaction(
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     if user_id != client.authenticated_user_id()? {
         return Err("reaction user id does not match authenticated session".to_string());
     }
@@ -4117,6 +4555,13 @@ fn get_reactions(
 ) -> Result<Vec<(String, String, String)>, String> {
     require_unlocked(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    let conversation_id = client
+        .db()
+        .ok_or("database not initialized")?
+        .get_message_binding(&message_id)?
+        .map(|binding| binding.0)
+        .ok_or("message is absent from encrypted local storage")?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     let result = client.get_local_reactions(&message_id)?;
     require_session_still_unlocked(&state)?;
     Ok(result)
@@ -4132,6 +4577,9 @@ fn create_dm(
     peer_user_id: String,
 ) -> Result<String, String> {
     require_unlocked(&state)?;
+    let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
+    require_unlocked(&state)?;
+    decode_canonical_uuid("DM peer user id", &peer_user_id)?;
     let authenticated_user_id = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
         let authenticated_user_id = client.authenticated_user_id()?;
@@ -4170,6 +4618,64 @@ fn create_dm(
             .as_str()
             .ok_or_else(|| "DM response missing peer_signing_key".to_string())?,
     )?;
+    let requested_url = reqwest::Url::parse(&server_http_url)
+        .map_err(|e| format!("invalid authenticated DM origin: {e}"))?;
+    let canonical_server_origin = require_authenticated_rest_origin(&state, &requested_url)?
+        .origin
+        .canonical_server_origin();
+    let created_at = identity_observed_at();
+    state
+        .client
+        .lock()
+        .map_err(|e| e.to_string())?
+        .db()
+        .ok_or("database not initialized")?
+        .upsert_directory_conversation(
+            &conversation_id,
+            0,
+            &canonical_server_origin,
+            None,
+            Some(&peer_user_id),
+            Some(peer_identity_key.as_slice()),
+            None,
+            &created_at,
+        )?;
+
+    // Re-read the existing signed member directory so the durable DM binding
+    // contains the peer account UUID and authenticated origin before it is
+    // published into the live ratchet map. The POST response alone carries
+    // keys but not the authoritative presentation label.
+    let members = fetch_authorized_conversation_directory(
+        &state,
+        &server_http_url,
+        &authenticated_user_id,
+        &conversation_id,
+    )?;
+    let directory = pinned_account_directory_from_json(&members)?;
+    let peer = directory
+        .get(&peer_user_id)
+        .ok_or("created DM directory is missing the requested peer")?;
+    if peer.identity_key != peer_identity_key || peer.signing_key != peer_signing_key {
+        return Err(
+            "created DM response conflicts with its authenticated member directory".to_string(),
+        );
+    }
+    state
+        .client
+        .lock()
+        .map_err(|e| e.to_string())?
+        .db()
+        .ok_or("database not initialized")?
+        .upsert_directory_conversation(
+            &conversation_id,
+            0,
+            &canonical_server_origin,
+            Some(&peer.username),
+            Some(&peer_user_id),
+            Some(peer_identity_key.as_slice()),
+            None,
+            &created_at,
+        )?;
 
     // Reopening an existing deterministic DM must never replace a healthy
     // Double Ratchet with a fresh one. Pin the directory response first; only
@@ -4177,7 +4683,7 @@ fn create_dm(
     let session_exists = {
         let mut client = state.client.lock().map_err(|e| e.to_string())?;
         client.pin_peer_signing_key(peer_identity_key, peer_signing_key)?;
-        client.remember_user_identity(&peer_user_id, peer_identity_key);
+        client.remember_user_identity(&peer_user_id, peer_identity_key)?;
         let our_identity_key = client.identity_key()?;
         client.replace_authorized_conversation_senders(
             &conversation_id,
@@ -4185,7 +4691,7 @@ fn create_dm(
         )?;
         let exists = client.has_session(&peer_identity_key);
         if exists {
-            client.bind_dm_conversation(&conversation_id, peer_identity_key);
+            client.bind_dm_conversation(&conversation_id, peer_identity_key)?;
         }
         exists
     };
@@ -4202,7 +4708,7 @@ fn create_dm(
             .client
             .lock()
             .map_err(|e| e.to_string())?
-            .bind_dm_conversation(&conversation_id, peer_identity_key);
+            .bind_dm_conversation(&conversation_id, peer_identity_key)?;
     } else if !session_exists {
         // The concurrent creator is responsible for the initial X3DH packet.
         // Cross-initiating here would install two incompatible sessions. Bind
@@ -4212,7 +4718,7 @@ fn create_dm(
             .client
             .lock()
             .map_err(|e| e.to_string())?
-            .bind_dm_conversation(&conversation_id, peer_identity_key);
+            .bind_dm_conversation(&conversation_id, peer_identity_key)?;
     }
 
     Ok(conversation_id)
@@ -4257,6 +4763,8 @@ fn create_group(
     name: String,
 ) -> Result<String, String> {
     require_live_transport_ready(&state)?;
+    let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
+    require_live_transport_ready(&state)?;
     validate_directory_text("group name", &name, 256, false)?;
     let authenticated_user_id = state
         .client
@@ -4279,6 +4787,10 @@ fn create_group(
         .ok_or("no conversation_id")?
         .to_string();
     decode_canonical_uuid("created group conversation_id", &conv_id)?;
+    let canonical_server_origin = authenticated_rest_binding(&state)?
+        .origin
+        .canonical_server_origin();
+    let created_at = identity_observed_at();
 
     let crypto_setup = (|| -> Result<(), String> {
         {
@@ -4287,7 +4799,16 @@ fn create_group(
             client
                 .db()
                 .ok_or("database not initialized")?
-                .insert_conversation(&conv_id, 1, Some(&name), None, None)?;
+                .upsert_directory_conversation(
+                    &conv_id,
+                    1,
+                    &canonical_server_origin,
+                    Some(&name),
+                    None,
+                    None,
+                    None,
+                    &created_at,
+                )?;
             client.mark_channel_conversation(&conv_id);
         }
 
@@ -4419,6 +4940,7 @@ fn pin_directory_member_keys(
     client: &mut VeilClient,
     members: &[serde_json::Value],
 ) -> Result<(), String> {
+    let mut validated = Vec::with_capacity(members.len());
     for member in members {
         let identity: [u8; 32] = hex::decode(
             member["identity_key"]
@@ -4436,6 +4958,10 @@ fn pin_directory_member_keys(
         .map_err(|e| format!("invalid member signing_key: {e}"))?
         .try_into()
         .map_err(|v: Vec<u8>| format!("member signing_key must be 32 bytes, got {}", v.len()))?;
+        client.ensure_peer_signing_key_compatible(identity, signing)?;
+        validated.push((identity, signing));
+    }
+    for (identity, signing) in validated {
         client.pin_peer_signing_key(identity, signing)?;
     }
     Ok(())
@@ -4513,28 +5039,70 @@ fn fetch_authorized_conversation_directory(
         if !identities.insert(identity) {
             return Err("conversation directory maps one identity to multiple users".to_string());
         }
-        validated.push((member_user_id.to_string(), identity, signing));
+        validated.push((
+            member_user_id.to_string(),
+            identity,
+            signing,
+            username.to_string(),
+        ));
     }
 
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_authenticated_conversation_origin(state, &client, conversation_id)?;
     let authenticated_user_id = client.authenticated_user_id()?;
     if user_id != authenticated_user_id {
         return Err("conversation directory user differs from authenticated session".into());
     }
     let our_identity = client.identity_key()?;
     let our_signing = client.signing_key()?;
-    if !validated.iter().any(|(member_user_id, identity, signing)| {
-        member_user_id == user_id && *identity == our_identity && *signing == our_signing
-    }) {
+    if !validated
+        .iter()
+        .any(|(member_user_id, identity, signing, _)| {
+            member_user_id == user_id && *identity == our_identity && *signing == our_signing
+        })
+    {
         return Err("authenticated identity is absent from conversation directory".to_string());
     }
-    for (member_user_id, identity, signing) in &validated {
-        client.remember_user_identity(member_user_id, *identity);
+    let requested_url = reqwest::Url::parse(server_http_url)
+        .map_err(|e| format!("invalid authenticated directory origin: {e}"))?;
+    let rest_binding = require_authenticated_rest_origin(state, &requested_url)?;
+    let canonical_server_origin = rest_binding.origin.canonical_server_origin();
+    let observed_at = identity_observed_at();
+    let snapshots: Vec<AccountSnapshot> = validated
+        .iter()
+        .map(
+            |(member_user_id, identity, signing, username)| AccountSnapshot {
+                locator: ProfileLocator {
+                    canonical_server_origin: canonical_server_origin.clone(),
+                    user_id: member_user_id.clone(),
+                    identity_key: *identity,
+                },
+                signing_key: *signing,
+                username: Some(username.clone()),
+                display_name: None,
+                profile_version: None,
+                profile_origin: canonical_server_origin.clone(),
+                source: AccountSnapshotSource::AuthenticatedConversationDirectory,
+                observed_at: observed_at.clone(),
+            },
+        )
+        .collect();
+    client
+        .db()
+        .ok_or("database not initialized")?
+        .upsert_identity_directory(&snapshots)?;
+    require_same_rest_binding(state, &requested_url, &rest_binding)?;
+    for (member_user_id, identity, signing, _) in &validated {
+        client.ensure_user_identity_binding_compatible(member_user_id, *identity)?;
+        client.ensure_peer_signing_key_compatible(*identity, *signing)?;
+    }
+    for (member_user_id, identity, signing, _) in &validated {
+        client.remember_user_identity(member_user_id, *identity)?;
         client.pin_peer_signing_key(*identity, *signing)?;
     }
     client.replace_authorized_conversation_senders(
         conversation_id,
-        validated.iter().map(|(_, identity, _)| *identity),
+        validated.iter().map(|(_, identity, _, _)| *identity),
     )?;
     require_session_still_unlocked(state)?;
     Ok(members)
@@ -5242,8 +5810,45 @@ fn list_server_members(
         None,
     ))?;
     let members = resp["members"].as_array().cloned().unwrap_or_default();
+    if members.is_empty() || members.len() > 100_000 {
+        return Err("server member directory count is outside client limits".to_string());
+    }
+    let directory = pinned_account_directory_from_json(&members)?;
+    let requested_url = reqwest::Url::parse(&server_http_url)
+        .map_err(|e| format!("invalid authenticated server-member origin: {e}"))?;
+    let rest_binding = require_authenticated_rest_origin(&state, &requested_url)?;
+    let canonical_server_origin = rest_binding.origin.canonical_server_origin();
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    let observed_at = identity_observed_at();
+    let snapshots: Vec<AccountSnapshot> = directory
+        .iter()
+        .map(|(member_user_id, member)| AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: canonical_server_origin.clone(),
+                user_id: member_user_id.clone(),
+                identity_key: member.identity_key,
+            },
+            signing_key: member.signing_key,
+            username: Some(member.username.clone()),
+            display_name: None,
+            profile_version: None,
+            profile_origin: canonical_server_origin.clone(),
+            source: AccountSnapshotSource::AuthenticatedConversationDirectory,
+            observed_at: observed_at.clone(),
+        })
+        .collect();
+    client
+        .db()
+        .ok_or("database not initialized")?
+        .upsert_identity_directory(&snapshots)?;
+    require_same_rest_binding(&state, &requested_url, &rest_binding)?;
+    for (member_user_id, member) in &directory {
+        client.ensure_user_identity_binding_compatible(member_user_id, member.identity_key)?;
+    }
     pin_directory_member_keys(&mut client, &members)?;
+    for (member_user_id, member) in &directory {
+        client.remember_user_identity(member_user_id, member.identity_key)?;
+    }
     require_session_still_unlocked(&state)?;
     Ok(members)
 }
@@ -5292,6 +5897,7 @@ fn list_channels(
 #[allow(clippy::too_many_arguments)] // Tauri IPC fields intentionally stay explicit.
 fn create_channel(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     user_id: String,
     server_id: String,
@@ -5300,6 +5906,9 @@ fn create_channel(
     category_id: Option<String>,
     topic: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    require_unlocked(&state)?;
+    let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
+    require_unlocked(&state)?;
     let mut body = serde_json::json!({
         "name": name,
         "channel_type": channel_type,
@@ -5310,13 +5919,87 @@ fn create_channel(
     if let Some(v) = topic {
         body["topic"] = v.into();
     }
-    state.runtime.block_on(rest_send_json(
+    let response = state.runtime.block_on(rest_send_json(
         &state,
         reqwest::Method::POST,
         rest_api_url(&server_http_url, &["v1", "servers", &server_id, "channels"])?,
         &user_id,
         Some(body),
-    ))
+    ))?;
+    // Only text channels have a backing conversation. The POST has already
+    // committed on the server, so a local persistence failure must quarantine
+    // that conversation without turning the result into a retryable create
+    // error (which could duplicate the channel).
+    if channel_type == 0 {
+        let conversation_id = response
+            .get("conversation_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if let Some(conversation_id) = conversation_id {
+            let scope_result = (|| -> Result<(), String> {
+                decode_canonical_uuid("created channel conversation_id", &conversation_id)?;
+                if response
+                    .get("server_id")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(server_id.as_str())
+                {
+                    return Err("created channel response changed its server id".to_string());
+                }
+                if response
+                    .get("channel_type")
+                    .and_then(serde_json::Value::as_i64)
+                    != Some(i64::from(channel_type))
+                {
+                    return Err("created channel response changed its channel type".to_string());
+                }
+                let canonical_server_origin = authenticated_rest_binding(&state)?
+                    .origin
+                    .canonical_server_origin();
+                let created_at = response
+                    .get("created_at")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("created channel response is missing created_at")?;
+                validate_utc_rfc3339_nano("created channel created_at", created_at)?;
+                let response_name = response
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or("created channel response is missing name")?;
+                validate_directory_text("created channel name", response_name, 256, false)?;
+                let mut client = state.client.lock().map_err(|error| error.to_string())?;
+                client
+                    .db()
+                    .ok_or("database not initialized")?
+                    .upsert_directory_conversation(
+                        &conversation_id,
+                        2,
+                        &canonical_server_origin,
+                        Some(response_name),
+                        None,
+                        None,
+                        Some(&server_id),
+                        created_at,
+                    )?;
+                client.mark_channel_conversation(&conversation_id);
+                Ok(())
+            })();
+
+            if let Err(error) = scope_result {
+                if let Ok(mut client) = state.client.lock() {
+                    client.invalidate_device_roster_v1(&conversation_id);
+                    client.mark_channel_conversation(&conversation_id);
+                }
+                if let Ok(diagnostic) = quarantine_conversation_state(
+                    &state,
+                    &conversation_id,
+                    "channel_identity_scope_pending",
+                    &error,
+                ) {
+                    emit_conversation_crypto_unavailable(&app, &diagnostic);
+                }
+            }
+        }
+    }
+    Ok(response)
 }
 
 #[tauri::command]
@@ -6023,6 +6706,7 @@ fn mark_channel_conversation(
 ) -> Result<(), String> {
     require_unlocked(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     client.mark_channel_conversation(&conversation_id);
     Ok(())
 }
@@ -6035,6 +6719,7 @@ fn hydrate_channel_sender_keys(
 ) -> Result<(), String> {
     require_unlocked(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     client
         .hydrate_channel_sender_keys(&conversation_id)
         .map(|_| ())
@@ -6047,6 +6732,7 @@ fn sender_key_distribution_status(
 ) -> Result<String, String> {
     require_unlocked(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     Ok(client
         .sender_key_distribution_status(&conversation_id)
         .to_string())
@@ -6067,6 +6753,7 @@ fn distribute_pinned_sender_key(
 ) -> Result<u32, String> {
     require_unlocked(state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_authenticated_conversation_origin(state, &client, conversation_id)?;
     client.mark_channel_conversation(conversation_id);
     let targets = client.sender_key_device_targets(conversation_id)?;
     if targets.len() > MAX_SYNC_SENDER_KEY_RECIPIENTS {
@@ -6184,6 +6871,7 @@ fn distribute_sender_key(
 fn rotate_sender_key(state: State<'_, AppState>, conversation_id: String) -> Result<(), String> {
     require_unlocked(&state)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     client.rotate_sender_key(&conversation_id)
 }
 
@@ -6197,8 +6885,9 @@ fn send_friend_request(
     target_user_id: String,
     message: Option<String>,
 ) -> Result<(), String> {
-    require_unlocked(&state)?;
+    require_live_transport_ready(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state
         .runtime
         .block_on(client.send_friend_request(&target_user_id, message.as_deref()))
@@ -6210,8 +6899,9 @@ fn respond_friend_request(
     request_id: String,
     accept: bool,
 ) -> Result<(), String> {
-    require_unlocked(&state)?;
+    require_live_transport_ready(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state
         .runtime
         .block_on(client.respond_friend_request(&request_id, accept))
@@ -6219,15 +6909,17 @@ fn respond_friend_request(
 
 #[tauri::command]
 fn remove_friend(state: State<'_, AppState>, user_id: String) -> Result<(), String> {
-    require_unlocked(&state)?;
+    require_live_transport_ready(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state.runtime.block_on(client.remove_friend(&user_id))
 }
 
 #[tauri::command]
 fn request_friend_list(state: State<'_, AppState>) -> Result<(), String> {
-    require_unlocked(&state)?;
+    require_live_transport_ready(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state.runtime.block_on(client.request_friend_list())
 }
 
@@ -6237,8 +6929,9 @@ fn send_presence(
     status: i32,
     status_text: Option<String>,
 ) -> Result<(), String> {
-    require_unlocked(&state)?;
+    require_live_transport_ready(&state)?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
     state
         .runtime
         .block_on(client.send_presence(status, status_text.as_deref()))
@@ -6251,7 +6944,7 @@ fn search_user(
     server_http_url: String,
     username: String,
 ) -> Result<serde_json::Value, String> {
-    require_unlocked(&state)?;
+    require_live_transport_ready(&state)?;
     let user_id = state
         .client
         .lock()
@@ -6260,6 +6953,7 @@ fn search_user(
     let mut url = reqwest::Url::parse(&rest_api_url(&server_http_url, &["v1", "users", "search"])?)
         .map_err(|e| format!("invalid server URL: {e}"))?;
     url.query_pairs_mut().append_pair("username", &username);
+    let rest_binding = require_authenticated_rest_origin(&state, &url)?;
 
     let result = state.runtime.block_on(rest_send_json(
         &state,
@@ -6272,19 +6966,21 @@ fn search_user(
     let peer_user_id = result["user_id"]
         .as_str()
         .ok_or_else(|| "directory response missing user_id".to_string())?;
-    let peer_identity_key: [u8; 32] = hex::decode(
+    decode_canonical_uuid("user search result user_id", peer_user_id)?;
+    let peer_identity_key = decode_lower_hex_32(
+        "user search result identity_key",
         result["identity_key"]
             .as_str()
             .ok_or_else(|| "directory response missing identity_key".to_string())?,
-    )
-    .map_err(|e| format!("invalid directory identity_key: {e}"))?
-    .try_into()
-    .map_err(|v: Vec<u8>| format!("directory identity_key must be 32 bytes, got {}", v.len()))?;
-    state
-        .client
-        .lock()
-        .map_err(|e| e.to_string())?
-        .remember_user_identity(peer_user_id, peer_identity_key);
+    )?;
+    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_live_transport_still_ready(&state)?;
+    require_same_rest_binding(&state, &url, &rest_binding)?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("authenticated user changed while resolving user search".to_string());
+    }
+    client.ensure_user_identity_binding_compatible(peer_user_id, peer_identity_key)?;
+    client.remember_user_identity(peer_user_id, peer_identity_key)?;
     require_session_still_unlocked(&state)?;
     Ok(result)
 }
@@ -6337,11 +7033,33 @@ fn search_messages(
         return Err("search conversation id is invalid".to_string());
     }
     let limit = limit.unwrap_or(50).clamp(1, 500);
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    if let Some(conversation_id) = conversation_id.as_deref() {
+        require_authenticated_conversation_origin(&state, &client, conversation_id)?;
+    }
+    let canonical_server_origin = authenticated_rest_binding(&state)?
+        .origin
+        .canonical_server_origin();
+    let allowed_conversations: std::collections::HashSet<String> = client
+        .db()
+        .ok_or("database not initialized")?
+        .get_conversations()?
+        .into_iter()
+        .filter(|conversation| {
+            conversation.server_origin.as_deref() == Some(canonical_server_origin.as_str())
+        })
+        .map(|conversation| conversation.id)
+        .collect();
+    drop(client);
     let hits = state
         .indexer
         .search(trimmed, conversation_id.as_deref(), limit)
         .map_err(|e| e.to_string())?;
-    let result = hits.into_iter().map(SearchHitDto::from).collect();
+    let result = hits
+        .into_iter()
+        .filter(|hit| allowed_conversations.contains(&hit.conversation_id))
+        .map(SearchHitDto::from)
+        .collect();
     require_session_still_unlocked(&state)?;
     Ok(result)
 }
@@ -6352,24 +7070,32 @@ fn clear_search_index(state: State<'_, AppState>) -> Result<(), String> {
     state.indexer.clear().map_err(|e| e.to_string())
 }
 
-#[tauri::command]
-fn rebuild_search_index(state: State<'_, AppState>) -> Result<usize, String> {
+fn rebuild_search_index_for_current_origin(state: &AppState) -> Result<usize, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
-    require_unlocked(&state)?;
+    require_unlocked(state)?;
+    let canonical_server_origin = authenticated_rest_binding(state)?
+        .origin
+        .canonical_server_origin();
     let client = state.client.lock().map_err(|e| e.to_string())?;
     let db = client.db().ok_or("database not initialized")?;
     state.indexer.clear().map_err(|e| e.to_string())?;
-    let convs = db.get_conversations()?;
+    let convs: Vec<_> = db
+        .get_conversations()?
+        .into_iter()
+        .filter(|conversation| {
+            conversation.server_origin.as_deref() == Some(canonical_server_origin.as_str())
+        })
+        .collect();
     let mut indexed = 0usize;
     for conv in convs {
-        if let Err(error) = require_session_still_unlocked(&state) {
+        if let Err(error) = require_session_still_unlocked(state) {
             let _ = state.indexer.clear();
             return Err(error);
         }
         let msgs = db.get_messages(&conv.id, 100_000)?;
         for m in msgs {
             if indexed.is_multiple_of(64) {
-                if let Err(error) = require_session_still_unlocked(&state) {
+                if let Err(error) = require_session_still_unlocked(state) {
                     let _ = state.indexer.clear();
                     return Err(error);
                 }
@@ -6395,15 +7121,20 @@ fn rebuild_search_index(state: State<'_, AppState>) -> Result<usize, String> {
             }
         }
     }
-    require_session_still_unlocked(&state)?;
+    require_session_still_unlocked(state)?;
     Ok(indexed)
+}
+
+#[tauri::command]
+fn rebuild_search_index(state: State<'_, AppState>) -> Result<usize, String> {
+    rebuild_search_index_for_current_origin(&state)
 }
 
 /// Rebuild the process-memory-only search index after each unlock.
 #[tauri::command]
 fn ensure_search_backfill(state: State<'_, AppState>) -> Result<usize, String> {
     require_unlocked(&state)?;
-    rebuild_search_index(state)
+    rebuild_search_index_for_current_origin(&state)
 }
 
 // ─── App ──────────────────────────────────────────────
@@ -6845,6 +7576,16 @@ mod e2ee_rest_tests {
         let other = rest_origin(&reqwest::Url::parse("https://api.example.test").unwrap()).unwrap();
         assert_eq!(bound, same);
         assert_ne!(bound, other);
+        assert_eq!(
+            bound.canonical_server_origin(),
+            "https://chat.example.test:443"
+        );
+        assert_eq!(
+            rest_origin(&reqwest::Url::parse("http://[::1]:9080").unwrap())
+                .unwrap()
+                .canonical_server_origin(),
+            "http://[::1]:9080"
+        );
     }
 
     #[test]

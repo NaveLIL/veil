@@ -13,9 +13,10 @@
 
 1. Completion gate фаз 1–4C пройден и опубликован в
    [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-2. Начать Phase 4D с origin-scoped identity directory, persisted author
-   metadata, Phaseprint и общего `UserAvatar`; network profile и avatar ingest
-   подключать только после их отдельных privacy/security gates.
+2. Продолжить Phase 4D после checkpoint 4D.1a: довести оставшиеся consumers
+   origin-scoped identity directory, затем реализовать Phaseprint и общий
+   `UserAvatar`; network profile и avatar ingest подключать только после их
+   отдельных privacy/security gates.
 3. Довести вынесенные продуктовые scopes: Phase 3B (attachment UX), Phase 4P
    (device push clients) и Phase 4E (server experience), не смешивая их с
    завершёнными protocol/runtime baselines.
@@ -34,7 +35,7 @@
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | entry gate открыт; foundation — следующий этап |
+| 4D | Identity Island & Profiles | 4D.1a закрыт: canonical mapping и local author snapshots; остальной 4D впереди |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -349,12 +350,13 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 
 ## Phase 4D — Identity Island & Profiles
 
-**Статус 2026-07-12:** entry gate открыт для foundation. Формальное решение и
-evidence опубликованы в
+**Статус 2026-07-12:** Phase 4D начата. Entry gate и формальное решение
+опубликованы в
 [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-Реализация профилей ещё не начата: сначала directory/persisted identity/
-Phaseprint, затем text profile, и только после отдельного image-security gate —
-avatar ingest.
+Первый checkpoint **4D.1a — Canonical local identity snapshots** реализован и
+проверен. Он закрывает минимальный локальный identity foundation, но не завершает
+ни 4D.1 целиком, ни Phase 4D: Phaseprint, общий `UserAvatar`, Identity Island,
+text profile, identity proof и avatar ingest ещё не реализованы.
 
 Цель — дать одному человеку единое и узнаваемое представление во всех местах
 Veil: собственный footer, друзья, DM, группы, сообщения, server members и
@@ -411,6 +413,33 @@ smoke:
 - подпись HTTP-запроса владельцем обязательна. Дополнительный client-signed
   profile manifest с monotonic revision допустим позже, но не заменяет
   авторизацию REST и требует отдельной threat-model проверки replay/rollback.
+
+### Checkpoint 4D.1a — Canonical local identity snapshots
+
+- `ProfileLocator` фиксирует `(canonical_server_origin, user_id, identity_key)`;
+  UUID пользователя не считается глобальным между self-hosted origins.
+- SQLCipher хранит origin-scoped account directory и отдельную неизменяемую
+  author snapshot для сообщения: user ID, identity/signing keys, username/
+  display name, profile version/origin, источник и время наблюдения.
+- Conversation metadata хранит server origin и отдельный DM `peer_user_id`;
+  account/friend actions больше не используют `conversation_id` как user ID.
+- Directory и author metadata принимаются только из уже существующих
+  authenticated directory/history flows. Author snapshot прикрепляется только
+  при точном совпадении identity key с `messages.sender_key` и origin с
+  conversation scope; конфликт, неизвестный live-author и cross-origin
+  collision обрабатываются fail closed.
+- После restart renderer использует сохранённое имя автора; при отсутствии
+  авторитетной snapshot показывает `Unknown author`, а не префикс ключа.
+- Схема `messages`, ciphertext, Double Ratchet, Sender Keys, ACL и rotation
+  contract не изменены. Presentation metadata нигде не участвует в crypto trust.
+
+Checkpoint не завершает полный multi-origin runtime. Conversation/ratchet/
+roster/pending/server-cache namespaces ещё не полностью origin-scoped:
+совпадающие conversation ID или peer identity на разных origins сейчас
+отвергаются, а не поддерживаются одновременно. Legacy unscoped conversation
+rows не получают активный origin по догадке и требуют отдельного authenticated
+migration/cutover. Также остаются открыты полная нормализация friend/request/
+group/server contexts и семантика `Former member`.
 
 ### 4D.1 — Canonical identity directory
 
@@ -502,8 +531,10 @@ ciphertext, имеет message ACL и retention, поэтому сервер н�
 
 ### Порядок реализации 4D
 
-1. Исправить identity mapping и persisted author metadata.
-2. Ввести origin-scoped directory, Phaseprint и общий `UserAvatar`.
+1. **Закрыто в 4D.1a:** canonical identity mapping, origin-scoped local
+   directory и persisted author metadata.
+2. Довести оставшиеся consumers origin-scoped directory, затем реализовать
+   Phaseprint и общий `UserAvatar`.
 3. Ввести единый right-island state и Identity Island на уже доступных данных.
 4. Добавить versioned signed text profile API/cache/event.
 5. Добавить server context/nickname и все profile triggers.
