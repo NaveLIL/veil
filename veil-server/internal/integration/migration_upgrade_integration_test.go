@@ -618,18 +618,71 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 019", func(t *testing.T) {
+	t.Run("020 adds bounded monotonic text profiles without changing identity keys", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_020")
+		applyMigrationsBefore(t, pool, migrations, 20)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		var userID string
+		identityKey := bytes.Repeat([]byte{0xe1}, 32)
+		signingKey := bytes.Repeat([]byte{0xe2}, 32)
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users (identity_key, signing_key, username)
+			 VALUES ($1, $2, 'profile-owner') RETURNING id::text`,
+			identityKey, signingKey,
+		).Scan(&userID); err != nil {
+			t.Fatalf("insert pre-020 user: %v", err)
+		}
+		if err := execMigration(t, pool, migrations, 20); err != nil {
+			t.Fatalf("migration 020: %v", err)
+		}
+
+		var displayName *string
+		var about string
+		var version int64
+		var storedIdentity, storedSigning []byte
+		if err := pool.QueryRow(ctx,
+			`SELECT display_name, about, profile_version, identity_key, signing_key
+			 FROM users WHERE id = $1::uuid`, userID,
+		).Scan(&displayName, &about, &version, &storedIdentity, &storedSigning); err != nil {
+			t.Fatal(err)
+		}
+		if displayName != nil || about != "" || version != 0 ||
+			!bytes.Equal(storedIdentity, identityKey) || !bytes.Equal(storedSigning, signingKey) {
+			t.Fatalf("unexpected 020 defaults or identity mutation: name=%v about=%q version=%d", displayName, about, version)
+		}
+
+		command, err := pool.Exec(ctx,
+			`UPDATE users SET display_name = 'Alice', about = 'hello',
+			 profile_version = profile_version + 1, profile_updated_at = now()
+			 WHERE id = $1::uuid AND profile_version = 0`, userID)
+		if err != nil || command.RowsAffected() != 1 {
+			t.Fatalf("first optimistic update rows=%d err=%v", command.RowsAffected(), err)
+		}
+		command, err = pool.Exec(ctx,
+			`UPDATE users SET display_name = 'rollback', profile_version = profile_version + 1
+			 WHERE id = $1::uuid AND profile_version = 0`, userID)
+		if err != nil || command.RowsAffected() != 0 {
+			t.Fatalf("stale optimistic update rows=%d err=%v", command.RowsAffected(), err)
+		}
+
+		_, err = pool.Exec(ctx, `UPDATE users SET display_name = $1 WHERE id = $2::uuid`, strings.Repeat("x", 513), userID)
+		requireMigrationError(t, err, "23514", "users_display_name_byte_limit")
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 020", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 19; number++ {
+		for number := 1; number <= 20; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 20)
+		applyMigrationsBefore(t, pool, migrations, 21)
 	})
 }
 

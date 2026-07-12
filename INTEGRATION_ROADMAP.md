@@ -644,6 +644,15 @@ checkpoint не добавлены.
 
 Первый сетевой релиз профилей не требует avatar upload:
 
+**Server checkpoint 2026-07-13:** отдельный schema/privacy/security review
+зафиксирован в
+[`docs/reviews/phase-4d-text-profile-security-review.md`](docs/reviews/phase-4d-text-profile-security-review.md).
+Миграция 020 и gateway реализуют signed origin-local GET/self PUT, bounded NFC
+plain text и атомарный `expected_version` conflict. Неизвестные поля, включая
+`avatar_url`, отклоняются; reserved `avatar_asset_id` не доступен через API.
+Этот checkpoint ещё не добавляет `ProfileUpdated`, native client/SQLCipher
+refresh, UI-редактор или avatar pipeline и поэтому не закрывает deliverable 4.
+
 - PostgreSQL: `display_name`, короткий `about`, nullable `avatar_asset_id`,
   `profile_version`, `profile_updated_at`; технический username остаётся
   безопасным fallback, а не свободным display name;

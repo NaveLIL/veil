@@ -23,6 +23,7 @@ import (
 	"github.com/AegisSec/veil-server/internal/httpmw"
 	"github.com/AegisSec/veil-server/internal/metrics"
 	"github.com/AegisSec/veil-server/internal/mls"
+	"github.com/AegisSec/veil-server/internal/profiles"
 	"github.com/AegisSec/veil-server/internal/push"
 	"github.com/AegisSec/veil-server/internal/servers"
 	"github.com/AegisSec/veil-server/internal/uploads"
@@ -107,6 +108,8 @@ func main() {
 	// Auth REST endpoints (prekeys, devices, user lookup)
 	authHandler := auth.NewHandler(authSvc, signedMw, rl)
 	authHandler.RegisterRoutes(mux)
+	profilesHandler := profiles.NewHandler(profiles.NewPostgresStore(database.Pool), signedMw, rl)
+	profilesHandler.RegisterRoutes(mux)
 
 	// Chat REST endpoints (message sync, conversations)
 	chatHandler := chat.NewHandler(chatSvc, signedMw, rl)
