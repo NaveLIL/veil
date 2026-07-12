@@ -223,6 +223,76 @@ describe("origin-scoped renderer boundary", () => {
     expect(appStore.bindingTransitioning()).toBe(false);
   });
 
+  it("drops a delayed member directory from a retired binding generation", async () => {
+    await appStore.setupEventListeners();
+    const mockedInvoke = vi.mocked(invoke);
+    const serverId = "550e8400-e29b-41d4-a716-446655440060";
+    appStore.setServerEndpoints(
+      "wss://members.example.test/ws",
+      "https://members.example.test",
+    );
+    mockedInvoke.mockImplementation(async (command: string) => {
+      if (command === "connect_to_server") {
+        return {
+          userId: USER_ID,
+          canonicalServerOrigin: "https://members.example.test:443",
+          bindingGeneration: "200",
+        } as never;
+      }
+      if (
+        command === "get_conversation_crypto_diagnostics"
+        || command === "get_conversations"
+        || command === "list_servers"
+      ) return [] as never;
+      return undefined as never;
+    });
+    await appStore.connectToServer();
+
+    const pendingMembers = deferred<unknown>();
+    const pendingReconnect = deferred<unknown>();
+    mockedInvoke.mockImplementation(async (command: string) => {
+      if (command === "list_server_members") return pendingMembers.promise as never;
+      if (command === "connect_to_server") return pendingReconnect.promise as never;
+      if (
+        command === "get_conversation_crypto_diagnostics"
+        || command === "get_conversations"
+        || command === "list_servers"
+      ) return [] as never;
+      return undefined as never;
+    });
+
+    const staleLoad = appStore.loadServerMembers(serverId);
+    expect(mockedInvoke).toHaveBeenCalledWith("list_server_members", {
+      serverHttpUrl: "https://members.example.test",
+      userId: USER_ID,
+      serverId,
+      expectedServerOrigin: "https://members.example.test:443",
+      expectedBindingGeneration: "200",
+    });
+
+    const reconnect = appStore.connectToServer();
+    expect(appStore.authenticatedServerScope()).toBeNull();
+    pendingReconnect.resolve({
+      userId: USER_ID,
+      canonicalServerOrigin: "https://members.example.test:443",
+      bindingGeneration: "201",
+    });
+    await reconnect;
+    expect(appStore.authenticatedServerScope()?.bindingGeneration).toBe("201");
+
+    pendingMembers.resolve([{
+      server_id: serverId,
+      user_id: USER_ID,
+      identity_key: "31".repeat(32),
+      signing_key: "32".repeat(32),
+      username: "retired-self",
+      role_ids: [],
+      joined_at: "2026-07-12T12:00:00Z",
+    }]);
+    await staleLoad;
+    expect(appStore.serverMembers()[serverId]).toBeUndefined();
+  });
+
   it("skips a queued endpoint after a newer origin is selected", async () => {
     await appStore.setupEventListeners();
     const mockedInvoke = vi.mocked(invoke);

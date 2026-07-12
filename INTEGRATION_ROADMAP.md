@@ -523,6 +523,19 @@ Durable self binding уже перенесён из process-only map в SQLCiphe
 сразу после authenticated WebSocket result, до публикации REST binding и
 offline sync. Повторное точное наблюдение разрешено, а замена user/identity/
 signing key на одном origin отклоняется также после file-backed restart.
+Self binding и identity directory теперь образуют симметричный инвариант:
+directory batch не может позднее заменить self user/identity/signing key или
+создать их alias, а reconnect повторно проверяет уже сохранённый каталог.
+Signing key также уникален для account locator внутри origin; одинаковый
+key на другом self-hosted origin остаётся отдельным account namespace.
+Это pre-release hard cutover: если в старой development БД уже есть
+неоднозначный same-origin signing alias, open отклоняется до restore/reseed
+из проверенного backup; migration не выбирает и не удаляет строки молча.
+Server-member directory обязан содержать точную локальную account identity до
+любой SQLCipher-записи или runtime pin; ошибка откатывает весь directory batch.
+REST response дополнительно привязан к exact origin/generation и повторно
+проверяется под transition/client lock: запоздавший ответ поколения N не
+может изменить durable/runtime/UI state после reconnect к N+1.
 `get_group_members` теперь применяет directory только под exact renderer
 origin/generation; server kick предварительно quarantine-ит origin-scoped
 channel rosters. Неиспользуемые standalone session/group-member IPC удалены.

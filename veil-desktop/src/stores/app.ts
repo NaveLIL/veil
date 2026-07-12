@@ -1752,12 +1752,14 @@ export const appStore = {
     const uid = userId();
     if (!uid) return;
     try {
+      const mutationScope = requirePublishedMutationScope();
       const fresh = await invoke<Array<any>>("list_server_members", {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         serverId,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       const mapped = fresh.map(memberFromJSON);
       setServerMembers((prev) => ({ ...prev, [serverId]: mapped }));
       // If we're viewing a channel of this server, push our sender key to the freshly

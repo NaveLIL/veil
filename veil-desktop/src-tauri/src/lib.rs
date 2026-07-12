@@ -5579,6 +5579,21 @@ fn pinned_account_directory_from_json(
     Ok(directory)
 }
 
+fn validate_pinned_directory_self(
+    directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
+    authenticated_user_id: &str,
+    identity_key: &[u8; 32],
+    signing_key: &[u8; 32],
+) -> Result<(), String> {
+    let own_member = directory
+        .get(authenticated_user_id)
+        .ok_or("authenticated user is absent from the account directory")?;
+    if own_member.identity_key != *identity_key || own_member.signing_key != *signing_key {
+        return Err("account directory returned substituted local identity keys".to_string());
+    }
+    Ok(())
+}
+
 fn fetch_authenticated_device_directory(
     state: &AppState,
     server_http_url: &str,
@@ -6308,24 +6323,47 @@ fn list_server_members(
     server_http_url: String,
     user_id: String,
     server_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let resp = state.runtime.block_on(rest_send_json(
+    let live_action_binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(&server_http_url, &["v1", "servers", &server_id, "members"])?;
+    validate_live_action_rest_origin(&live_action_binding, &request_url)?;
+    let resp = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::GET,
-        rest_api_url(&server_http_url, &["v1", "servers", &server_id, "members"])?,
+        request_url,
         &user_id,
         None,
+        &live_action_binding,
     ))?;
     let members = resp["members"].as_array().cloned().unwrap_or_default();
     if members.is_empty() || members.len() > 100_000 {
         return Err("server member directory count is outside client limits".to_string());
     }
     let directory = pinned_account_directory_from_json(&members)?;
-    let requested_url = reqwest::Url::parse(&server_http_url)
-        .map_err(|e| format!("invalid authenticated server-member origin: {e}"))?;
-    let rest_binding = require_authenticated_rest_origin(&state, &requested_url)?;
-    let canonical_server_origin = rest_binding.origin.canonical_server_origin();
+    let canonical_server_origin = live_action_binding.origin.canonical_server_origin();
+    let _session_transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("server member directory user differs from authenticated session".to_string());
+    }
+    validate_pinned_directory_self(
+        &directory,
+        &user_id,
+        &client.identity_key()?,
+        &client.signing_key()?,
+    )?;
+    for (member_user_id, member) in &directory {
+        client.ensure_user_identity_binding_compatible(member_user_id, member.identity_key)?;
+        client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
+    }
     let observed_at = identity_observed_at();
     let snapshots: Vec<AccountSnapshot> = directory
         .iter()
@@ -6348,15 +6386,12 @@ fn list_server_members(
         .db()
         .ok_or("database not initialized")?
         .upsert_identity_directory(&snapshots)?;
-    require_same_rest_binding(&state, &requested_url, &rest_binding)?;
-    for (member_user_id, member) in &directory {
-        client.ensure_user_identity_binding_compatible(member_user_id, member.identity_key)?;
-    }
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     pin_directory_member_keys(&mut client, &members)?;
     for (member_user_id, member) in &directory {
         client.remember_user_identity(member_user_id, member.identity_key)?;
     }
-    require_session_still_unlocked(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     Ok(members)
 }
 
@@ -7730,11 +7765,11 @@ mod e2ee_rest_tests {
         valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
         validate_expected_live_action_binding, validate_expected_rest_binding,
         validate_live_action_rest_origin, validate_live_message_security_context,
-        validate_next_cursor, validate_persisted_message_conversation, validate_rest_url,
-        validate_server_endpoint_pair, validate_utc_rfc3339_nano,
-        verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
-        ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
-        DEFAULT_AUTO_LOCK_SECONDS,
+        validate_next_cursor, validate_persisted_message_conversation,
+        validate_pinned_directory_self, validate_rest_url, validate_server_endpoint_pair,
+        validate_utc_rfc3339_nano, verify_device_directory_account_keys, AuthenticatedSessionScope,
+        ConversationSyncIsolation, ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding,
+        RestOrigin, DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
 
@@ -7975,6 +8010,42 @@ mod e2ee_rest_tests {
             &signing_key,
         )
         .is_err());
+    }
+
+    #[test]
+    fn authenticated_member_directory_requires_the_exact_local_account() {
+        let user_id = "550e8400-e29b-41d4-a716-446655440000";
+        let identity_key = [0x31; 32];
+        let signing_key = [0x32; 32];
+        let mut directory = std::collections::HashMap::new();
+        directory.insert(
+            user_id.to_string(),
+            PinnedDirectoryMember {
+                username: "self".to_string(),
+                identity_key,
+                signing_key,
+            },
+        );
+
+        assert!(
+            validate_pinned_directory_self(&directory, user_id, &identity_key, &signing_key,)
+                .is_ok()
+        );
+        assert!(validate_pinned_directory_self(
+            &directory,
+            "550e8400-e29b-41d4-a716-446655440009",
+            &identity_key,
+            &signing_key,
+        )
+        .is_err());
+        assert!(
+            validate_pinned_directory_self(&directory, user_id, &[0x41; 32], &signing_key,)
+                .is_err()
+        );
+        assert!(
+            validate_pinned_directory_self(&directory, user_id, &identity_key, &[0x42; 32],)
+                .is_err()
+        );
     }
 
     #[test]
