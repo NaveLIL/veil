@@ -2118,6 +2118,36 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Atomically persist the text-channel conversations from one authenticated
+    /// server directory page. A conflicting existing scope rolls back every
+    /// row from the page so renderer state can never observe a partial trust
+    /// boundary.
+    pub fn upsert_directory_channels(
+        &self,
+        canonical_server_origin: &str,
+        server_id: &str,
+        channels: &[(String, String, String)],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin channel directory transaction: {e}"))?;
+        for (conversation_id, name, created_at) in channels {
+            self.upsert_directory_conversation(
+                conversation_id,
+                2,
+                canonical_server_origin,
+                Some(name),
+                None,
+                None,
+                Some(server_id),
+                created_at,
+            )?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit channel directory transaction: {e}"))
+    }
+
     pub fn get_conversations(&self) -> Result<Vec<crate::models::Conversation>, String> {
         let mut stmt = self
             .conn
@@ -6439,6 +6469,70 @@ mod tests {
                 "2026-01-01T00:00:00Z",
             )
             .is_err());
+    }
+
+    #[test]
+    fn authenticated_channel_page_is_atomic_and_origin_scoped() {
+        let db = VeilDb::open_memory(&[0xBA; 32]).unwrap();
+        let server_id = "00000000-0000-0000-0000-0000000000d3";
+        let first = "00000000-0000-0000-0000-0000000000c4";
+        let conflicting = "00000000-0000-0000-0000-0000000000c5";
+        db.upsert_directory_conversation(
+            conflicting,
+            2,
+            ORIGIN_B,
+            Some("Existing beta channel"),
+            None,
+            None,
+            Some(server_id),
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+
+        assert!(db
+            .upsert_directory_channels(
+                ORIGIN_A,
+                server_id,
+                &[
+                    (
+                        first.to_string(),
+                        "Alpha general".to_string(),
+                        "2026-07-12T12:01:00Z".to_string(),
+                    ),
+                    (
+                        conflicting.to_string(),
+                        "Substituted channel".to_string(),
+                        "2026-07-12T12:02:00Z".to_string(),
+                    ),
+                ],
+            )
+            .is_err());
+        let conversations = db.get_conversations().unwrap();
+        assert!(!conversations
+            .iter()
+            .any(|conversation| conversation.id == first));
+        let retained = conversations
+            .iter()
+            .find(|conversation| conversation.id == conflicting)
+            .unwrap();
+        assert_eq!(retained.server_origin.as_deref(), Some(ORIGIN_B));
+        assert_eq!(retained.name.as_deref(), Some("Existing beta channel"));
+
+        db.upsert_directory_channels(
+            ORIGIN_A,
+            server_id,
+            &[(
+                first.to_string(),
+                "Alpha general".to_string(),
+                "2026-07-12T12:01:00Z".to_string(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_origin_scoped_channel_conversation_ids(ORIGIN_A, server_id)
+                .unwrap(),
+            vec![first.to_string()]
+        );
     }
 
     #[test]

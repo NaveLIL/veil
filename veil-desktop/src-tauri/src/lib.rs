@@ -6620,15 +6620,102 @@ fn list_channels(
     server_http_url: String,
     user_id: String,
     server_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let resp = state.runtime.block_on(rest_send_json(
+    decode_canonical_uuid("channel directory server id", &server_id)?;
+    let live_action_binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(&server_http_url, &["v1", "servers", &server_id, "channels"])?;
+    validate_live_action_rest_origin(&live_action_binding, &request_url)?;
+    let resp = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::GET,
-        rest_api_url(&server_http_url, &["v1", "servers", &server_id, "channels"])?,
+        request_url,
         &user_id,
         None,
+        &live_action_binding,
     ))?;
-    Ok(resp["channels"].as_array().cloned().unwrap_or_default())
+    let channels = resp
+        .get("channels")
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .ok_or("channel directory response is missing channels")?;
+    if channels.len() > 10_000 {
+        return Err("channel directory count exceeds client limits".to_string());
+    }
+
+    // Validate the complete signed page before making any local row visible.
+    // The renderer is never trusted to supply a conversation origin or bind
+    // an arbitrary conversation UUID to the selected server.
+    let mut channel_ids = std::collections::HashSet::with_capacity(channels.len());
+    let mut conversation_ids = std::collections::HashSet::new();
+    let mut text_channels = Vec::new();
+    for channel in &channels {
+        let channel_id = channel
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("channel directory entry is missing id")?;
+        decode_canonical_uuid("channel directory id", channel_id)?;
+        if !channel_ids.insert(channel_id.to_string()) {
+            return Err("channel directory repeats a channel id".to_string());
+        }
+        if channel.get("server_id").and_then(serde_json::Value::as_str) != Some(server_id.as_str())
+        {
+            return Err("channel directory entry changed its server id".to_string());
+        }
+        let channel_type = channel
+            .get("channel_type")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or("channel directory entry is missing channel_type")?;
+        if !(0..=2).contains(&channel_type) {
+            return Err("channel directory entry has an invalid type".to_string());
+        }
+        let name = channel
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("channel directory entry is missing name")?;
+        validate_directory_text("channel directory name", name, 256, false)?;
+        let created_at = channel
+            .get("created_at")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("channel directory entry is missing created_at")?;
+        validate_utc_rfc3339_nano("channel directory created_at", created_at)?;
+        let conversation_id = channel
+            .get("conversation_id")
+            .and_then(serde_json::Value::as_str);
+        if channel_type == 0 {
+            let conversation_id =
+                conversation_id.ok_or("text channel directory entry is missing conversation_id")?;
+            decode_canonical_uuid("channel directory conversation_id", conversation_id)?;
+            if !conversation_ids.insert(conversation_id.to_string()) {
+                return Err("channel directory repeats a conversation id".to_string());
+            }
+            text_channels.push((
+                conversation_id.to_string(),
+                name.to_string(),
+                created_at.to_string(),
+            ));
+        } else if conversation_id.is_some() {
+            return Err("non-text channel unexpectedly has a conversation id".to_string());
+        }
+    }
+
+    let canonical_server_origin = live_action_binding.origin.canonical_server_origin();
+    let _session_transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("channel directory user differs from authenticated session".to_string());
+    }
+    let db = client.db().ok_or("database not initialized")?;
+    db.upsert_directory_channels(&canonical_server_origin, &server_id, &text_channels)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    Ok(channels)
 }
 
 #[tauri::command]

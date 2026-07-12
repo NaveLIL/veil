@@ -1823,12 +1823,14 @@ export const appStore = {
     const uid = userId();
     if (!uid) return;
     try {
+      const mutationScope = requirePublishedMutationScope();
       const fresh = await invoke<Array<any>>("list_channels", {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         serverId,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       setChannelsByServer((prev) => ({ ...prev, [serverId]: fresh.map(channelFromJSON) }));
       // If active server but no active channel, pick first text channel
       if (activeServerId() === serverId && !activeChannelId()) {
