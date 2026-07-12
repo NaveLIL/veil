@@ -1896,6 +1896,45 @@ impl VeilDb {
             .map_err(|e| format!("collect: {e}"))
     }
 
+    /// Return only authenticated channel conversations belonging to the exact
+    /// server namespace. Originless legacy rows are deliberately excluded:
+    /// their bare server UUID cannot authorize Sender-Key roster invalidation.
+    pub fn list_origin_scoped_channel_conversation_ids(
+        &self,
+        canonical_server_origin: &str,
+        server_id: &str,
+    ) -> Result<Vec<String>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("origin-scoped channel server id", server_id)?;
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id
+                 FROM conversations
+                 WHERE conv_type = 2 AND server_origin = ?1 AND server_id = ?2
+                 ORDER BY id",
+            )
+            .map_err(|e| format!("prepare origin-scoped channel lookup: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![canonical_server_origin, server_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| format!("query origin-scoped channels: {e}"))?;
+
+        let mut conversation_ids = Vec::new();
+        for row in rows {
+            let conversation_id = row.map_err(|e| format!("read origin-scoped channel id: {e}"))?;
+            validate_canonical_uuid(
+                "persisted origin-scoped channel conversation id",
+                &conversation_id,
+            )?;
+            conversation_ids.push(conversation_id);
+        }
+        Ok(conversation_ids)
+    }
+
     // ─── CRUD: Messages ───────────────────────────────────
 
     // The parameters mirror the persisted protocol record explicitly. Keeping
@@ -6143,6 +6182,84 @@ mod tests {
                 None,
                 "2026-01-01T00:00:00Z",
             )
+            .is_err());
+    }
+
+    #[test]
+    fn origin_scoped_channel_lookup_isolates_same_server_uuid_and_excludes_originless_rows() {
+        let db = VeilDb::open_memory(&[0xB8; 32]).unwrap();
+        let server_id = "00000000-0000-0000-0000-0000000000d1";
+        let channel_a = "00000000-0000-0000-0000-0000000000c1";
+        let channel_b = "00000000-0000-0000-0000-0000000000c2";
+        let originless_channel = "00000000-0000-0000-0000-0000000000c3";
+
+        for (conversation_id, origin, name) in [
+            (channel_a, ORIGIN_A, "Alpha channel"),
+            (channel_b, ORIGIN_B, "Beta channel"),
+        ] {
+            db.upsert_directory_conversation(
+                conversation_id,
+                2,
+                origin,
+                Some(name),
+                None,
+                None,
+                Some(server_id),
+                "2026-07-12T12:00:00Z",
+            )
+            .unwrap();
+        }
+        db.insert_conversation(
+            originless_channel,
+            2,
+            Some("Originless legacy channel"),
+            None,
+            Some(server_id),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.list_origin_scoped_channel_conversation_ids(ORIGIN_A, server_id)
+                .unwrap(),
+            vec![channel_a.to_string()]
+        );
+        assert_eq!(
+            db.list_origin_scoped_channel_conversation_ids(ORIGIN_B, server_id)
+                .unwrap(),
+            vec![channel_b.to_string()]
+        );
+        assert!(!db
+            .list_origin_scoped_channel_conversation_ids(ORIGIN_A, server_id)
+            .unwrap()
+            .iter()
+            .any(|conversation_id| conversation_id == originless_channel));
+    }
+
+    #[test]
+    fn origin_scoped_channel_lookup_validates_inputs_and_persisted_ids() {
+        let db = VeilDb::open_memory(&[0xB9; 32]).unwrap();
+        let server_id = "00000000-0000-0000-0000-0000000000d2";
+
+        assert!(db
+            .list_origin_scoped_channel_conversation_ids("https://Alpha.example:443", server_id)
+            .is_err());
+        assert!(db
+            .list_origin_scoped_channel_conversation_ids(
+                ORIGIN_A,
+                "00000000-0000-0000-0000-000000000000",
+            )
+            .is_err());
+
+        db.conn
+            .execute(
+                "INSERT INTO conversations
+                    (id, conv_type, server_id, server_origin, name)
+                 VALUES ('not-a-canonical-uuid', 2, ?1, ?2, 'Corrupt channel')",
+                rusqlite::params![server_id, ORIGIN_A],
+            )
+            .unwrap();
+        assert!(db
+            .list_origin_scoped_channel_conversation_ids(ORIGIN_A, server_id)
             .is_err());
     }
 

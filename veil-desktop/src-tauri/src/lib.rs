@@ -70,7 +70,16 @@ struct AppState {
     /// Exact REST origin paired with the currently authenticated WebSocket.
     /// Every signed REST request is checked against this native binding.
     authenticated_rest_origin: Mutex<Option<RestBinding>>,
+    /// Exact native binding explicitly confirmed by the renderer after it has
+    /// published the matching UI namespace and prekeys. Renderer-initiated
+    /// live mutations are forbidden until this equals the transport binding.
+    renderer_confirmed_rest_binding: Mutex<Option<RestBinding>>,
     rest_binding_generation: AtomicU64,
+    /// A gateway may assign user UUIDs, but it may not silently remap the same
+    /// local cryptographic identity to another account on a known origin.
+    /// This process-lifetime continuity gate runs before offline sync mutates
+    /// SQLCipher or runtime ratchets.
+    authenticated_account_continuity: Mutex<AuthenticatedAccountContinuity>,
     /// Native security boundary. Sensitive commands also require an
     /// initialized client, but this flag prevents reopening the keychain/DB
     /// through IPC while the PIN screen is active.
@@ -140,6 +149,117 @@ struct RestOrigin {
 struct RestBinding {
     origin: RestOrigin,
     generation: u64,
+}
+
+#[derive(Default)]
+struct AuthenticatedAccountContinuity {
+    local_identity_key: Option<[u8; 32]>,
+    users_by_origin: std::collections::HashMap<String, String>,
+}
+
+fn bind_authenticated_account(
+    continuity: &mut AuthenticatedAccountContinuity,
+    local_identity_key: [u8; 32],
+    canonical_server_origin: &str,
+    user_id: &str,
+) -> Result<(), String> {
+    if continuity.local_identity_key != Some(local_identity_key) {
+        continuity.users_by_origin.clear();
+        continuity.local_identity_key = Some(local_identity_key);
+    }
+    if let Some(previous_user_id) = continuity.users_by_origin.get(canonical_server_origin) {
+        if previous_user_id != user_id {
+            return Err(
+                "authenticated server attempted to remap the local identity to another account"
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+    continuity
+        .users_by_origin
+        .insert(canonical_server_origin.to_string(), user_id.to_string());
+    Ok(())
+}
+
+/// Authenticated namespace published to the renderer only after the complete
+/// WS-authenticated REST backlog has passed the origin and continuity gates.
+/// The generation is serialized as text so JavaScript can never lose u64
+/// precision and accidentally treat two native bindings as the same session.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthenticatedSessionScope {
+    user_id: String,
+    canonical_server_origin: String,
+    binding_generation: String,
+}
+
+fn authenticated_event_payload<T: serde::Serialize>(
+    binding: &RestBinding,
+    event: &str,
+    payload: T,
+) -> Result<serde_json::Value, String> {
+    let mut payload = serde_json::to_value(payload)
+        .map_err(|error| format!("serialize authenticated event {event}: {error}"))?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| format!("authenticated event {event} payload must be an object"))?;
+    // Insert after serializing the event body so a future payload field can
+    // never override the native scope which authorized this exact event.
+    object.insert(
+        "serverScopeOrigin".to_string(),
+        binding.origin.canonical_server_origin().into(),
+    );
+    object.insert(
+        "serverBindingGeneration".to_string(),
+        binding.generation.to_string().into(),
+    );
+    Ok(payload)
+}
+
+fn invalidate_disconnected_binding(
+    current: &mut Option<RestBinding>,
+    disconnected: &RestBinding,
+) -> bool {
+    if current.as_ref() != Some(disconnected) {
+        return false;
+    }
+    *current = None;
+    true
+}
+
+/// App handle bound to the exact authenticated generation which produced an
+/// event. It deliberately does not look up the current binding during `emit`:
+/// a delayed old-socket event must keep its old generation tag and can never
+/// masquerade as an event from a replacement connection.
+#[derive(Clone)]
+struct AuthenticatedEventAppHandle {
+    app: AppHandle,
+    binding: RestBinding,
+}
+
+impl AuthenticatedEventAppHandle {
+    fn new(app: AppHandle, binding: RestBinding) -> Self {
+        Self { app, binding }
+    }
+
+    fn for_current(app: &AppHandle) -> Result<Self, String> {
+        let state = app.state::<AppState>();
+        Ok(Self::new(app.clone(), authenticated_rest_binding(&state)?))
+    }
+
+    fn raw_app(&self) -> &AppHandle {
+        &self.app
+    }
+}
+
+impl AuthenticatedEventAppHandle {
+    fn emit<T: serde::Serialize>(&self, event: &str, payload: T) -> Result<(), String> {
+        let payload = authenticated_event_payload(&self.binding, event, payload)?;
+        self.app
+            .emit(event, payload)
+            .map_err(|error| format!("emit authenticated event {event}: {error}"))
+    }
 }
 
 impl RestOrigin {
@@ -373,6 +493,147 @@ fn authenticated_rest_binding(state: &AppState) -> Result<RestBinding, String> {
         .ok_or_else(|| "no server origin is bound to the authenticated session".to_string())
 }
 
+fn exact_confirmed_live_action_binding(
+    authenticated: Option<&RestBinding>,
+    renderer_confirmed: Option<&RestBinding>,
+    offline_sync_ready: bool,
+    expected: Option<&RestBinding>,
+) -> Result<RestBinding, String> {
+    if !offline_sync_ready {
+        return Err("authenticated transport is not ready for renderer live actions".to_string());
+    }
+    let authenticated =
+        authenticated.ok_or("no server origin is bound to the authenticated session")?;
+    if renderer_confirmed != Some(authenticated) {
+        return Err(
+            "renderer has not confirmed the exact authenticated server binding".to_string(),
+        );
+    }
+    if expected.is_some_and(|expected| expected != authenticated) {
+        return Err("authenticated server binding changed during the live action".to_string());
+    }
+    Ok(authenticated.clone())
+}
+
+/// Capture the exact renderer-confirmed generation before acquiring the client
+/// mutex. Commands must re-check it after acquiring that mutex so a queued old
+/// action cannot mutate a replacement client session.
+fn capture_confirmed_live_action_binding(state: &AppState) -> Result<RestBinding, String> {
+    require_live_transport_ready(state)?;
+    let authenticated = state
+        .authenticated_rest_origin
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let renderer_confirmed = state
+        .renderer_confirmed_rest_binding
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    exact_confirmed_live_action_binding(
+        authenticated.as_ref(),
+        renderer_confirmed.as_ref(),
+        state.offline_sync_ready.load(Ordering::Acquire),
+        None,
+    )
+}
+
+/// Non-blocking half of the live-action gate for callers already holding
+/// `state.client`. Never call `require_unlocked` here because expiry reset also
+/// needs the client mutex.
+fn require_confirmed_live_action_binding_current(
+    state: &AppState,
+    expected: &RestBinding,
+) -> Result<(), String> {
+    require_session_still_unlocked(state)?;
+    let authenticated = state
+        .authenticated_rest_origin
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    let renderer_confirmed = state
+        .renderer_confirmed_rest_binding
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    exact_confirmed_live_action_binding(
+        authenticated.as_ref(),
+        renderer_confirmed.as_ref(),
+        state.offline_sync_ready.load(Ordering::Acquire),
+        Some(expected),
+    )
+    .map(|_| ())
+}
+
+fn validate_expected_live_action_binding(
+    binding: &RestBinding,
+    expected_server_origin: &str,
+    expected_binding_generation: &str,
+) -> Result<(), String> {
+    let expected_generation = expected_binding_generation
+        .parse::<u64>()
+        .map_err(|_| "expected binding generation is invalid".to_string())?;
+    if expected_generation == 0 || expected_generation.to_string() != expected_binding_generation {
+        return Err("expected binding generation is non-canonical".to_string());
+    }
+    if binding.origin.canonical_server_origin() != expected_server_origin
+        || binding.generation != expected_generation
+    {
+        return Err("renderer live action belongs to another server binding".to_string());
+    }
+    Ok(())
+}
+
+fn validate_live_action_rest_origin(
+    binding: &RestBinding,
+    request_url: &str,
+) -> Result<(), String> {
+    let parsed_url =
+        reqwest::Url::parse(request_url).map_err(|error| format!("invalid REST URL: {error}"))?;
+    if rest_origin(&parsed_url)? != binding.origin {
+        return Err(
+            "renderer live action REST origin differs from its authenticated binding".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_expected_rest_binding(
+    current: &RestBinding,
+    expected: Option<&RestBinding>,
+) -> Result<(), String> {
+    if expected.is_some_and(|expected| expected != current) {
+        return Err("authenticated REST binding changed before the live action".to_string());
+    }
+    Ok(())
+}
+
+/// Validate a renderer-visible scope while the caller holds
+/// `session_transition`. This is the final publication check after native
+/// backlog sync and again after renderer-side prekey publication.
+fn validate_authenticated_session_scope(
+    state: &AppState,
+    user_id: &str,
+    canonical_server_origin: &str,
+    binding_generation: u64,
+) -> Result<(), String> {
+    require_session_still_unlocked(state)?;
+    if !state.offline_sync_ready.load(Ordering::Acquire) {
+        return Err("authenticated transport is no longer ready".to_string());
+    }
+    let binding = authenticated_rest_binding(state)?;
+    if binding.generation != binding_generation
+        || binding.origin.canonical_server_origin() != canonical_server_origin
+    {
+        return Err("authenticated server scope changed before publication".to_string());
+    }
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("authenticated user changed before scope publication".to_string());
+    }
+    Ok(())
+}
+
 /// Temporary Phase 4D boundary while legacy conversation/ratchet tables still
 /// use bare UUID primary keys. A conversation from another self-hosted origin
 /// must never advance local crypto state through the active transport.
@@ -399,6 +660,32 @@ fn require_authenticated_conversation_origin(
         return Err("authenticated server origin changed while resolving conversation".to_string());
     }
     Ok(())
+}
+
+fn validate_persisted_message_conversation(
+    persisted_conversation_id: Option<&str>,
+    expected_conversation_id: &str,
+) -> Result<(), String> {
+    match persisted_conversation_id {
+        Some(persisted) if persisted == expected_conversation_id => Ok(()),
+        Some(_) => Err("message belongs to another conversation".to_string()),
+        None => Err("message is absent from encrypted local storage".to_string()),
+    }
+}
+
+fn require_persisted_message_conversation(
+    client: &VeilClient,
+    message_id: &str,
+    expected_conversation_id: &str,
+) -> Result<(), String> {
+    let binding = client
+        .db()
+        .ok_or("database not initialized")?
+        .get_message_binding(message_id)?;
+    validate_persisted_message_conversation(
+        binding.as_ref().map(|binding| binding.0.as_str()),
+        expected_conversation_id,
+    )
 }
 
 fn bounded_diagnostic_detail(detail: &str) -> String {
@@ -473,8 +760,8 @@ fn quarantine_conversation_state(
         .clone())
 }
 
-fn emit_conversation_crypto_unavailable(
-    app: &AppHandle,
+fn emit_authenticated_conversation_crypto_unavailable(
+    app: &AuthenticatedEventAppHandle,
     diagnostic: &ConversationCryptoDiagnostic,
 ) {
     let _ = app.emit("veil://conversation-crypto-unavailable", diagnostic);
@@ -496,7 +783,7 @@ fn quarantine_runtime_conversation(
 
 fn quarantine_live_conversation(
     state: &AppState,
-    app: &AppHandle,
+    app: &AuthenticatedEventAppHandle,
     client: &mut VeilClient,
     conversation_id: &str,
     sender_key_mode: bool,
@@ -508,7 +795,7 @@ fn quarantine_live_conversation(
         client.mark_channel_conversation(conversation_id);
     }
     let diagnostic = quarantine_conversation_state(state, conversation_id, code, detail)?;
-    emit_conversation_crypto_unavailable(app, &diagnostic);
+    emit_authenticated_conversation_crypto_unavailable(app, &diagnostic);
     Ok(())
 }
 
@@ -518,7 +805,7 @@ fn quarantine_live_conversation(
 /// instances.
 fn live_conversation_origin_is_current(
     state: &AppState,
-    app: &AppHandle,
+    app: &AuthenticatedEventAppHandle,
     client: &mut VeilClient,
     conversation_id: &str,
 ) -> bool {
@@ -569,6 +856,10 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
         .authenticated_rest_origin
         .lock()
         .map_err(|e| e.to_string())? = None;
+    *state
+        .renderer_confirmed_rest_binding
+        .lock()
+        .map_err(|e| e.to_string())? = None;
     state
         .unavailable_conversations
         .lock()
@@ -585,8 +876,17 @@ fn initialize_client(state: &AppState, mnemonic: &str) -> Result<String, String>
     let mut fresh = VeilClient::new();
     fresh.init_with_mnemonic(mnemonic, &db_path)?;
     fresh.set_indexer(state.indexer.clone());
-    let key = hex::encode(fresh.identity_key()?);
+    let identity_key = fresh.identity_key()?;
+    let key = hex::encode(identity_key);
     *state.client.lock().map_err(|e| e.to_string())? = fresh;
+    let mut continuity = state
+        .authenticated_account_continuity
+        .lock()
+        .map_err(|e| e.to_string())?;
+    if continuity.local_identity_key != Some(identity_key) {
+        continuity.users_by_origin.clear();
+        continuity.local_identity_key = Some(identity_key);
+    }
     state
         .unavailable_conversations
         .lock()
@@ -1325,12 +1625,13 @@ fn establish_session_for_peer(
     server_http_url: &str,
     peer_identity_key: [u8; 32],
     expected_signing_key: Option<[u8; 32]>,
+    live_action_binding: &RestBinding,
 ) -> Result<(), String> {
-    let user_id = state
-        .client
-        .lock()
-        .map_err(|e| e.to_string())?
-        .authenticated_user_id()?;
+    let user_id = {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        require_confirmed_live_action_binding_current(state, live_action_binding)?;
+        client.authenticated_user_id()?
+    };
     let value = state.runtime.block_on(rest_send_json(
         state,
         reqwest::Method::GET,
@@ -1348,6 +1649,7 @@ fn establish_session_for_peer(
         }
     }
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(state, live_action_binding)?;
     client.pin_peer_signing_key(peer_identity_key, bundle.signing_key)?;
     client.establish_session(&peer_identity_key, &bundle)
 }
@@ -1359,12 +1661,18 @@ fn establish_session(
     server_http_url: String,
     peer_identity_key: String,
 ) -> Result<(), String> {
-    require_unlocked(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
     let peer_identity_key: [u8; 32] = hex::decode(peer_identity_key.trim())
         .map_err(|e| format!("decode peer identity key: {e}"))?
         .try_into()
         .map_err(|v: Vec<u8>| format!("peer identity key must be 32 bytes, got {}", v.len()))?;
-    establish_session_for_peer(&state, &server_http_url, peer_identity_key, None)
+    establish_session_for_peer(
+        &state,
+        &server_http_url,
+        peer_identity_key,
+        None,
+        &live_action_binding,
+    )
 }
 
 // ─── Connection ───────────────────────────────────────
@@ -3009,6 +3317,7 @@ fn sync_offline_state(
                     authenticated_user_id,
                     &conversation.id,
                     &directory,
+                    None,
                 ) {
                     Ok(None) => {}
                     Ok(Some(reason)) => {
@@ -3115,6 +3424,7 @@ fn sync_offline_state(
             state,
             &conversation_id,
             SenderKeyDistributionPreparation::OfflineRefresh(sender_key_refresh),
+            None,
         ) {
             require_session_still_unlocked(state)?;
             quarantine_runtime_conversation(state, &conversation_id, true)?;
@@ -3126,12 +3436,36 @@ fn sync_offline_state(
 }
 
 #[tauri::command]
+fn confirm_authenticated_session_scope(
+    state: State<'_, AppState>,
+    user_id: String,
+    canonical_server_origin: String,
+    binding_generation: String,
+) -> Result<(), String> {
+    decode_canonical_uuid("authenticated scope user id", &user_id)?;
+    let generation = binding_generation
+        .parse::<u64>()
+        .map_err(|_| "authenticated binding generation is invalid".to_string())?;
+    if generation == 0 || generation.to_string() != binding_generation {
+        return Err("authenticated binding generation is non-canonical".to_string());
+    }
+    let _session_transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    validate_authenticated_session_scope(&state, &user_id, &canonical_server_origin, generation)?;
+    let binding = authenticated_rest_binding(&state)?;
+    *state
+        .renderer_confirmed_rest_binding
+        .lock()
+        .map_err(|error| error.to_string())? = Some(binding);
+    Ok(())
+}
+
+#[tauri::command]
 fn connect_to_server(
     state: State<'_, AppState>,
     app: AppHandle,
     server_url: String,
     server_http_url: String,
-) -> Result<String, String> {
+) -> Result<AuthenticatedSessionScope, String> {
     require_unlocked(&state)?;
     validate_server_endpoint_pair(&server_url, &server_http_url)?;
     let requested_rest_url =
@@ -3150,28 +3484,52 @@ fn connect_to_server(
         origin: requested_rest_origin,
         generation: previous_generation + 1,
     };
-    // Pauses an already-running dispatcher during reconnect as well as the
-    // first connection. It is enabled only after the complete keyset backlog
-    // has been authenticated, decrypted and persisted.
-    state.offline_sync_ready.store(false, Ordering::SeqCst);
-    state
-        .unavailable_conversations
-        .lock()
-        .map_err(|error| error.to_string())?
-        .clear();
-    *state
-        .authenticated_rest_origin
-        .lock()
-        .map_err(|e| e.to_string())? = None;
-    // The index stores plaintext in process memory and has no origin field.
-    // Erase the previous namespace before authenticating another instance.
-    state.indexer.clear().map_err(|e| e.to_string())?;
+    let requested_event_app =
+        AuthenticatedEventAppHandle::new(app.clone(), requested_rest_binding.clone());
+    // Linearize the new binding against the live poller. An old event either
+    // completes under the same session mutex or observes readiness=false; it
+    // can never be processed inside the new generation window.
+    {
+        let _session_transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+        require_session_still_unlocked(&state)?;
+        state.offline_sync_ready.store(false, Ordering::SeqCst);
+        *state
+            .renderer_confirmed_rest_binding
+            .lock()
+            .map_err(|e| e.to_string())? = None;
+        state
+            .unavailable_conversations
+            .lock()
+            .map_err(|error| error.to_string())?
+            .clear();
+        *state
+            .authenticated_rest_origin
+            .lock()
+            .map_err(|e| e.to_string())? = None;
+        // The index stores plaintext in process memory and has no origin
+        // field. Erase it before authenticating another binding.
+        state.indexer.clear().map_err(|e| e.to_string())?;
+    }
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     client.clear_known_user_identities();
     client.clear_server_scoped_conversation_routing();
     client.clear_all_authorized_conversation_senders();
     client.clear_device_rosters_v1();
     let result = state.runtime.block_on(client.connect(&server_url))?;
+    decode_canonical_uuid("authenticated user id", &result)?;
+    let local_identity_key = client.identity_key()?;
+    {
+        let mut continuity = state
+            .authenticated_account_continuity
+            .lock()
+            .map_err(|e| e.to_string())?;
+        bind_authenticated_account(
+            &mut continuity,
+            local_identity_key,
+            &canonical_server_origin,
+            &result,
+        )?;
+    }
     drop(client);
 
     // Bind REST only after successful WS authentication, serialized against a
@@ -3208,7 +3566,7 @@ fn connect_to_server(
         };
     if let Err(error) = rebuild_search_index_for_current_origin(&state) {
         let _ = state.indexer.clear();
-        let _ = app.emit(
+        let _ = requested_event_app.emit(
             "veil://error",
             serde_json::json!({
                 "code": 5001,
@@ -3244,7 +3602,7 @@ fn connect_to_server(
             .map(|diagnostic| (diagnostic.conversation_id.clone(), diagnostic))
             .collect();
         state.offline_sync_ready.store(true, Ordering::SeqCst);
-        let _ = app.emit(
+        let _ = requested_event_app.emit(
             "veil://sync-complete",
             serde_json::json!({
                 "conversations": sync_stats.conversations,
@@ -3258,7 +3616,7 @@ fn connect_to_server(
             }),
         );
         for diagnostic in &sync_stats.unavailable_conversations {
-            let _ = app.emit("veil://conversation-crypto-unavailable", diagnostic);
+            emit_authenticated_conversation_crypto_unavailable(&requested_event_app, diagnostic);
         }
     }
 
@@ -3268,9 +3626,9 @@ fn connect_to_server(
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_ok()
     {
-        let app_handle = app.clone();
+        let raw_app_handle = app.clone();
         std::thread::spawn(move || {
-            let state_inner = app_handle.state::<AppState>();
+            let state_inner = raw_app_handle.state::<AppState>();
             loop {
                 std::thread::sleep(std::time::Duration::from_millis(50));
                 if !state_inner.offline_sync_ready.load(Ordering::Acquire) {
@@ -3285,6 +3643,12 @@ fn connect_to_server(
                 {
                     continue;
                 }
+                let event_binding = match authenticated_rest_binding(&state_inner) {
+                    Ok(binding) => binding,
+                    Err(_) => continue,
+                };
+                let app_handle =
+                    AuthenticatedEventAppHandle::new(raw_app_handle.clone(), event_binding.clone());
                 let mut client = match state_inner.client.lock() {
                     Ok(c) => c,
                     Err(_) => break,
@@ -3303,6 +3667,14 @@ fn connect_to_server(
                         continue;
                     }
                 };
+
+                if !state_inner.offline_sync_ready.load(Ordering::Acquire)
+                    || authenticated_rest_binding(&state_inner).ok().as_ref()
+                        != Some(&event_binding)
+                {
+                    drop(client);
+                    continue;
+                }
 
                 if let Some(evt) = event {
                     match evt {
@@ -3570,6 +3942,7 @@ fn connect_to_server(
 
                             // Desktop notification
                             let _ = app_handle
+                                .raw_app()
                                 .notification()
                                 .builder()
                                 .title("Veil")
@@ -4010,6 +4383,32 @@ fn connect_to_server(
                         }
                         ConnectionEvent::Disconnected { reason } => {
                             drop(client);
+                            let invalidation =
+                                state_inner
+                                    .authenticated_rest_origin
+                                    .lock()
+                                    .map(|mut binding| {
+                                        invalidate_disconnected_binding(
+                                            &mut binding,
+                                            &event_binding,
+                                        )
+                                    });
+                            let confirmed_invalidation = state_inner
+                                .renderer_confirmed_rest_binding
+                                .lock()
+                                .map(|mut binding| {
+                                    invalidate_disconnected_binding(&mut binding, &event_binding)
+                                });
+                            if !matches!(invalidation, Ok(false)) || confirmed_invalidation.is_err()
+                            {
+                                // A current disconnect, or an unusable poisoned
+                                // binding mutex, must stop authenticated work.
+                                // A delayed old-generation disconnect leaves a
+                                // replacement binding and its readiness intact.
+                                state_inner
+                                    .offline_sync_ready
+                                    .store(false, Ordering::SeqCst);
+                            }
                             let _ = app_handle.emit(
                                 "veil://disconnected",
                                 serde_json::json!({ "reason": reason }),
@@ -4188,6 +4587,7 @@ fn connect_to_server(
                                 }),
                             );
                             let _ = app_handle
+                                .raw_app()
                                 .notification()
                                 .builder()
                                 .title("Veil")
@@ -4243,7 +4643,7 @@ fn connect_to_server(
                             member_info,
                             role_info,
                         } => {
-                            // Server deletion (2) invalidates cached channel
+                            // Server deletion (2) invalidates persisted channel
                             // authorization just as strongly as membership and
                             // role changes (3..=9). Metadata-only create/update
                             // events (0/1) do not require key rotation.
@@ -4253,13 +4653,25 @@ fn connect_to_server(
                                 // Membership and role changes invalidate every
                                 // affected channel roster without pausing DMs or
                                 // unrelated groups.
-                                let conversation_ids: Vec<String> = client
-                                    .db()
-                                    .and_then(|db| db.list_channels(&server_id).ok())
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    .filter_map(|channel| channel.conversation_id)
-                                    .collect();
+                                let canonical_server_origin =
+                                    event_binding.origin.canonical_server_origin();
+                                let conversation_ids = match origin_scoped_channel_conversation_ids(
+                                    &client,
+                                    &canonical_server_origin,
+                                    &server_id,
+                                ) {
+                                    Ok(conversation_ids) => conversation_ids,
+                                    Err(error) => {
+                                        drop(client);
+                                        fail_closed_channel_scope_lookup(
+                                            &state_inner,
+                                            &app_handle,
+                                            &server_id,
+                                            &error,
+                                        );
+                                        continue;
+                                    }
+                                };
                                 for conversation_id in conversation_ids {
                                     client.invalidate_device_roster_v1(&conversation_id);
                                     client.mark_channel_conversation(&conversation_id);
@@ -4275,7 +4687,10 @@ fn connect_to_server(
                             }
                             drop(client);
                             for diagnostic in &diagnostics {
-                                emit_conversation_crypto_unavailable(&app_handle, diagnostic);
+                                emit_authenticated_conversation_crypto_unavailable(
+                                    &app_handle,
+                                    diagnostic,
+                                );
                             }
                             let _ = app_handle.emit(
                                 "veil://server-event",
@@ -4315,13 +4730,25 @@ fn connect_to_server(
                             server_id,
                             channel,
                         } => {
-                            let conversation_ids: Vec<String> = client
-                                .db()
-                                .and_then(|db| db.list_channels(&server_id).ok())
-                                .unwrap_or_default()
-                                .into_iter()
-                                .filter_map(|cached| cached.conversation_id)
-                                .collect();
+                            let canonical_server_origin =
+                                event_binding.origin.canonical_server_origin();
+                            let conversation_ids = match origin_scoped_channel_conversation_ids(
+                                &client,
+                                &canonical_server_origin,
+                                &server_id,
+                            ) {
+                                Ok(conversation_ids) => conversation_ids,
+                                Err(error) => {
+                                    drop(client);
+                                    fail_closed_channel_scope_lookup(
+                                        &state_inner,
+                                        &app_handle,
+                                        &server_id,
+                                        &error,
+                                    );
+                                    continue;
+                                }
+                            };
                             let mut diagnostics = Vec::new();
                             for conversation_id in conversation_ids {
                                 client.invalidate_device_roster_v1(&conversation_id);
@@ -4337,7 +4764,10 @@ fn connect_to_server(
                             }
                             drop(client);
                             for diagnostic in &diagnostics {
-                                emit_conversation_crypto_unavailable(&app_handle, diagnostic);
+                                emit_authenticated_conversation_crypto_unavailable(
+                                    &app_handle,
+                                    diagnostic,
+                                );
                             }
                             let _ = app_handle.emit(
                                 "veil://channel-event",
@@ -4432,7 +4862,21 @@ fn connect_to_server(
         });
     }
 
-    Ok(result)
+    {
+        let _session_transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+        validate_authenticated_session_scope(
+            &state,
+            &result,
+            &canonical_server_origin,
+            requested_rest_binding.generation,
+        )?;
+    }
+
+    Ok(AuthenticatedSessionScope {
+        user_id: result,
+        canonical_server_origin,
+        binding_generation: requested_rest_binding.generation.to_string(),
+    })
 }
 
 // ─── Messaging ────────────────────────────────────────
@@ -4443,12 +4887,22 @@ fn send_message(
     conversation_id: String,
     text: String,
     reply_to_id: Option<String>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<u64, String> {
-    require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    if let Some(reply_to_id) = reply_to_id.as_deref() {
+        require_persisted_message_conversation(&client, reply_to_id, &conversation_id)?;
+    }
     state
         .runtime
         .block_on(client.send_message(&conversation_id, &text, reply_to_id.as_deref()))
@@ -4458,9 +4912,17 @@ fn send_message(
 fn discard_failed_outgoing_message(
     state: State<'_, AppState>,
     local_message_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    require_unlocked(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     let conversation_id = client
         .db()
         .ok_or("database not initialized")?
@@ -4477,12 +4939,20 @@ fn edit_message(
     message_id: String,
     conversation_id: String,
     new_text: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<u64, String> {
-    require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    require_persisted_message_conversation(&client, &message_id, &conversation_id)?;
     if client.is_channel_conversation(&conversation_id) {
         return Err(
             "editing encrypted group/channel messages is unavailable until the exact-device edit protocol is implemented"
@@ -4499,12 +4969,20 @@ fn delete_message(
     state: State<'_, AppState>,
     message_id: String,
     conversation_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<u64, String> {
-    require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    require_persisted_message_conversation(&client, &message_id, &conversation_id)?;
     state
         .runtime
         .block_on(client.delete_message(&message_id, &conversation_id))
@@ -4515,11 +4993,18 @@ fn send_typing(
     state: State<'_, AppState>,
     conversation_id: String,
     started: bool,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     state
         .runtime
@@ -4527,6 +5012,7 @@ fn send_typing(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri IPC fields intentionally stay explicit.
 fn toggle_reaction(
     state: State<'_, AppState>,
     message_id: String,
@@ -4534,12 +5020,20 @@ fn toggle_reaction(
     emoji: String,
     user_id: String,
     add: bool,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     require_conversation_crypto_available(&state, &conversation_id)?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    require_persisted_message_conversation(&client, &message_id, &conversation_id)?;
     if user_id != client.authenticated_user_id()? {
         return Err("reaction user id does not match authenticated session".to_string());
     }
@@ -4578,10 +5072,11 @@ fn create_dm(
 ) -> Result<String, String> {
     require_unlocked(&state)?;
     let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
-    require_unlocked(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
     decode_canonical_uuid("DM peer user id", &peer_user_id)?;
     let authenticated_user_id = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
         let authenticated_user_id = client.authenticated_user_id()?;
         if !our_user_id.is_empty() && our_user_id != authenticated_user_id {
             return Err("UI user id does not match the authenticated session".to_string());
@@ -4624,22 +5119,23 @@ fn create_dm(
         .origin
         .canonical_server_origin();
     let created_at = identity_observed_at();
-    state
-        .client
-        .lock()
-        .map_err(|e| e.to_string())?
-        .db()
-        .ok_or("database not initialized")?
-        .upsert_directory_conversation(
-            &conversation_id,
-            0,
-            &canonical_server_origin,
-            None,
-            Some(&peer_user_id),
-            Some(peer_identity_key.as_slice()),
-            None,
-            &created_at,
-        )?;
+    {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        client
+            .db()
+            .ok_or("database not initialized")?
+            .upsert_directory_conversation(
+                &conversation_id,
+                0,
+                &canonical_server_origin,
+                None,
+                Some(&peer_user_id),
+                Some(peer_identity_key.as_slice()),
+                None,
+                &created_at,
+            )?;
+    }
 
     // Re-read the existing signed member directory so the durable DM binding
     // contains the peer account UUID and authenticated origin before it is
@@ -4650,6 +5146,7 @@ fn create_dm(
         &server_http_url,
         &authenticated_user_id,
         &conversation_id,
+        Some(&live_action_binding),
     )?;
     let directory = pinned_account_directory_from_json(&members)?;
     let peer = directory
@@ -4660,28 +5157,30 @@ fn create_dm(
             "created DM response conflicts with its authenticated member directory".to_string(),
         );
     }
-    state
-        .client
-        .lock()
-        .map_err(|e| e.to_string())?
-        .db()
-        .ok_or("database not initialized")?
-        .upsert_directory_conversation(
-            &conversation_id,
-            0,
-            &canonical_server_origin,
-            Some(&peer.username),
-            Some(&peer_user_id),
-            Some(peer_identity_key.as_slice()),
-            None,
-            &created_at,
-        )?;
+    {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        client
+            .db()
+            .ok_or("database not initialized")?
+            .upsert_directory_conversation(
+                &conversation_id,
+                0,
+                &canonical_server_origin,
+                Some(&peer.username),
+                Some(&peer_user_id),
+                Some(peer_identity_key.as_slice()),
+                None,
+                &created_at,
+            )?;
+    }
 
     // Reopening an existing deterministic DM must never replace a healthy
     // Double Ratchet with a fresh one. Pin the directory response first; only
     // fetch/consume a new prekey bundle when no session exists locally.
     let session_exists = {
         let mut client = state.client.lock().map_err(|e| e.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
         client.pin_peer_signing_key(peer_identity_key, peer_signing_key)?;
         client.remember_user_identity(&peer_user_id, peer_identity_key)?;
         let our_identity_key = client.identity_key()?;
@@ -4703,22 +5202,19 @@ fn create_dm(
             &server_http_url,
             peer_identity_key,
             Some(peer_signing_key),
+            &live_action_binding,
         )?;
-        state
-            .client
-            .lock()
-            .map_err(|e| e.to_string())?
-            .bind_dm_conversation(&conversation_id, peer_identity_key)?;
+        let mut client = state.client.lock().map_err(|e| e.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        client.bind_dm_conversation(&conversation_id, peer_identity_key)?;
     } else if !session_exists {
         // The concurrent creator is responsible for the initial X3DH packet.
         // Cross-initiating here would install two incompatible sessions. Bind
         // the authenticated conversation and wait fail-closed for peer INITIAL;
         // send_message reports the missing session until that arrives.
-        state
-            .client
-            .lock()
-            .map_err(|e| e.to_string())?
-            .bind_dm_conversation(&conversation_id, peer_identity_key)?;
+        let mut client = state.client.lock().map_err(|e| e.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        client.bind_dm_conversation(&conversation_id, peer_identity_key)?;
     }
 
     Ok(conversation_id)
@@ -4765,12 +5261,14 @@ fn create_group(
     require_live_transport_ready(&state)?;
     let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
     require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    let event_app = AuthenticatedEventAppHandle::for_current(&app)?;
     validate_directory_text("group name", &name, 256, false)?;
-    let authenticated_user_id = state
-        .client
-        .lock()
-        .map_err(|error| error.to_string())?
-        .authenticated_user_id()?;
+    let authenticated_user_id = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        client.authenticated_user_id()?
+    };
     if user_id != authenticated_user_id {
         return Err("group creator does not match the authenticated session".to_string());
     }
@@ -4795,7 +5293,7 @@ fn create_group(
     let crypto_setup = (|| -> Result<(), String> {
         {
             let mut client = state.client.lock().map_err(|e| e.to_string())?;
-            require_live_transport_still_ready(&state)?;
+            require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
             client
                 .db()
                 .ok_or("database not initialized")?
@@ -4820,6 +5318,7 @@ fn create_group(
             &server_http_url,
             &authenticated_user_id,
             &conv_id,
+            Some(&live_action_binding),
         )?;
         let account_directory = pinned_account_directory_from_json(&members)?;
         if let Some(reason) = fetch_and_install_authenticated_device_directory(
@@ -4828,6 +5327,7 @@ fn create_group(
             &authenticated_user_id,
             &conv_id,
             &account_directory,
+            Some(&live_action_binding),
         )? {
             return Err(format!(
                 "created group is waiting for a ready exact-device roster: {reason}"
@@ -4837,6 +5337,7 @@ fn create_group(
             &state,
             &conv_id,
             SenderKeyDistributionPreparation::ReusePendingGeneration,
+            Some(&live_action_binding),
         )?;
         Ok(())
     })();
@@ -4844,8 +5345,10 @@ fn create_group(
     let (conv_id, diagnostic) = preserve_created_group_outcome(conv_id, crypto_setup);
     if let Some(diagnostic) = diagnostic {
         if let Ok(mut client) = state.client.lock() {
-            client.invalidate_device_roster_v1(&conv_id);
-            client.mark_channel_conversation(&conv_id);
+            if require_confirmed_live_action_binding_current(&state, &live_action_binding).is_ok() {
+                client.invalidate_device_roster_v1(&conv_id);
+                client.mark_channel_conversation(&conv_id);
+            }
         }
         // The server has already committed the group at this point. A poisoned
         // local diagnostic mutex must not turn that successful POST into an IPC
@@ -4853,7 +5356,7 @@ fn create_group(
         if let Ok(published) =
             quarantine_conversation_state(&state, &conv_id, &diagnostic.code, &diagnostic.detail)
         {
-            emit_conversation_crypto_unavailable(&app, &published);
+            emit_authenticated_conversation_crypto_unavailable(&event_app, &published);
         }
     }
 
@@ -4870,6 +5373,7 @@ fn add_group_member(
     group_id: String,
     target_user_id: String,
 ) -> Result<(), String> {
+    let event_app = AuthenticatedEventAppHandle::for_current(&app)?;
     state.runtime.block_on(rest_send_json(
         &state,
         reqwest::Method::POST,
@@ -4888,11 +5392,8 @@ fn add_group_member(
         "membership_refresh_required",
         "group membership changed; refresh its exact-device roster",
     )?;
-    emit_conversation_crypto_unavailable(&app, &diagnostic);
-    let _ = app.emit(
-        "veil://membership-refresh-required",
-        serde_json::json!({ "conversationId": group_id }),
-    );
+    emit_authenticated_conversation_crypto_unavailable(&event_app, &diagnostic);
+    emit_conversation_membership_refresh_required(&event_app, &group_id);
     Ok(())
 }
 
@@ -4906,6 +5407,7 @@ fn remove_group_member(
     group_id: String,
     target_user_id: String,
 ) -> Result<(), String> {
+    let event_app = AuthenticatedEventAppHandle::for_current(&app)?;
     state.runtime.block_on(rest_send_json(
         &state,
         reqwest::Method::DELETE,
@@ -4927,11 +5429,8 @@ fn remove_group_member(
         "membership_refresh_required",
         "group membership changed; refresh its exact-device roster",
     )?;
-    emit_conversation_crypto_unavailable(&app, &diagnostic);
-    let _ = app.emit(
-        "veil://membership-refresh-required",
-        serde_json::json!({ "conversationId": group_id }),
-    );
+    emit_authenticated_conversation_crypto_unavailable(&event_app, &diagnostic);
+    emit_conversation_membership_refresh_required(&event_app, &group_id);
     Ok(())
 }
 
@@ -4972,6 +5471,7 @@ fn fetch_authorized_conversation_directory(
     server_http_url: &str,
     user_id: &str,
     conversation_id: &str,
+    live_action_binding: Option<&RestBinding>,
 ) -> Result<Vec<serde_json::Value>, String> {
     decode_canonical_uuid("conversation directory request id", conversation_id)?;
     let response = state.runtime.block_on(rest_send_json(
@@ -5048,6 +5548,9 @@ fn fetch_authorized_conversation_directory(
     }
 
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    if let Some(binding) = live_action_binding {
+        require_confirmed_live_action_binding_current(state, binding)?;
+    }
     require_authenticated_conversation_origin(state, &client, conversation_id)?;
     let authenticated_user_id = client.authenticated_user_id()?;
     if user_id != authenticated_user_id {
@@ -5164,6 +5667,7 @@ fn fetch_authenticated_device_directory(
     server_http_url: &str,
     user_id: &str,
     conversation_id: &str,
+    live_action_binding: Option<&RestBinding>,
 ) -> Result<ParsedDeviceRoster, String> {
     require_unlocked(state)?;
     let response = state.runtime.block_on(rest_send_json(
@@ -5178,6 +5682,9 @@ fn fetch_authenticated_device_directory(
     ))?;
     let parsed = parse_device_directory(response, conversation_id)?;
     let client = state.client.lock().map_err(|error| error.to_string())?;
+    if let Some(binding) = live_action_binding {
+        require_confirmed_live_action_binding_current(state, binding)?;
+    }
     if client.authenticated_user_id()? != user_id {
         return Err("device directory user differs from authenticated session".to_string());
     }
@@ -5198,24 +5705,37 @@ fn fetch_authenticated_device_directory(
     Ok(parsed)
 }
 
+fn invalidate_device_roster_for_binding(
+    state: &AppState,
+    conversation_id: &str,
+    live_action_binding: Option<&RestBinding>,
+) -> Result<(), String> {
+    let mut client = state.client.lock().map_err(|error| error.to_string())?;
+    if let Some(binding) = live_action_binding {
+        require_confirmed_live_action_binding_current(state, binding)?;
+    }
+    client.invalidate_device_roster_v1(conversation_id);
+    Ok(())
+}
+
 fn fetch_and_install_authenticated_device_directory(
     state: &AppState,
     server_http_url: &str,
     user_id: &str,
     conversation_id: &str,
     account_directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
+    live_action_binding: Option<&RestBinding>,
 ) -> Result<Option<String>, String> {
     let parsed = match fetch_authenticated_device_directory(
         state,
         server_http_url,
         user_id,
         conversation_id,
+        live_action_binding,
     ) {
         Ok(parsed) => parsed,
         Err(error) => {
-            if let Ok(mut client) = state.client.lock() {
-                client.invalidate_device_roster_v1(conversation_id);
-            }
+            invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
             return Err(error);
         }
     };
@@ -5224,22 +5744,17 @@ fn fetch_and_install_authenticated_device_directory(
             .unavailable_reason
             .clone()
             .unwrap_or_else(|| "device_roster_not_ready".to_string());
-        state
-            .client
-            .lock()
-            .map_err(|lock_error| lock_error.to_string())?
-            .invalidate_device_roster_v1(conversation_id);
+        invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
         return Ok(Some(reason));
     }
     if let Err(error) = verify_device_directory_account_keys(&parsed, account_directory) {
-        state
-            .client
-            .lock()
-            .map_err(|lock_error| lock_error.to_string())?
-            .invalidate_device_roster_v1(conversation_id);
+        invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
         return Err(error);
     }
     let mut client = state.client.lock().map_err(|error| error.to_string())?;
+    if let Some(binding) = live_action_binding {
+        require_confirmed_live_action_binding_current(state, binding)?;
+    }
     if client.authenticated_user_id()? != user_id {
         client.invalidate_device_roster_v1(conversation_id);
         return Err("device directory belongs to a stale authenticated session".to_string());
@@ -5257,7 +5772,13 @@ fn get_conversation_members(
     conversation_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     require_unlocked(&state)?;
-    fetch_authorized_conversation_directory(&state, &server_http_url, &user_id, &conversation_id)
+    fetch_authorized_conversation_directory(
+        &state,
+        &server_http_url,
+        &user_id,
+        &conversation_id,
+        None,
+    )
 }
 
 #[tauri::command]
@@ -5268,8 +5789,13 @@ fn get_group_members(
     group_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
     require_unlocked(&state)?;
-    let members =
-        fetch_authorized_conversation_directory(&state, &server_http_url, &user_id, &group_id)?;
+    let members = fetch_authorized_conversation_directory(
+        &state,
+        &server_http_url,
+        &user_id,
+        &group_id,
+        None,
+    )?;
 
     // Also persist members locally
     let client = state.client.lock().map_err(|e| e.to_string())?;
@@ -5546,14 +6072,43 @@ async fn rest_send_json(
     user_id: &str,
     body: Option<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
+    rest_send_json_with_expected_binding(state, method, url, user_id, body, None).await
+}
+
+async fn rest_send_json_for_binding(
+    state: &AppState,
+    method: reqwest::Method,
+    url: String,
+    user_id: &str,
+    body: Option<serde_json::Value>,
+    expected_binding: &RestBinding,
+) -> Result<serde_json::Value, String> {
+    rest_send_json_with_expected_binding(state, method, url, user_id, body, Some(expected_binding))
+        .await
+}
+
+async fn rest_send_json_with_expected_binding(
+    state: &AppState,
+    method: reqwest::Method,
+    url: String,
+    user_id: &str,
+    body: Option<serde_json::Value>,
+    expected_binding: Option<&RestBinding>,
+) -> Result<serde_json::Value, String> {
     use base64::Engine;
     use sha2::{Digest, Sha256};
 
     require_unlocked(state)?;
     let parsed_url = reqwest::Url::parse(&url).map_err(|e| format!("invalid REST URL: {e}"))?;
     let rest_binding = require_authenticated_rest_origin(state, &parsed_url)?;
+    validate_expected_rest_binding(&rest_binding, expected_binding)?;
     let authenticated_user_id = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
+        require_session_still_unlocked(state)?;
+        require_same_rest_binding(state, &parsed_url, &rest_binding)?;
+        if let Some(expected) = expected_binding {
+            require_confirmed_live_action_binding_current(state, expected)?;
+        }
         client.authenticated_user_id()?.to_string()
     };
     if user_id != authenticated_user_id {
@@ -5586,6 +6141,11 @@ async fn rest_send_json(
     //    removed, so a missing signature would 401 every request anyway.
     let sig_b64 = {
         let client = state.client.lock().map_err(|e| e.to_string())?;
+        require_session_still_unlocked(state)?;
+        require_same_rest_binding(state, &parsed_url, &rest_binding)?;
+        if let Some(expected) = expected_binding {
+            require_confirmed_live_action_binding_current(state, expected)?;
+        }
         client
             .sign_message(canonical.as_bytes())
             .map(|sig| base64::engine::general_purpose::STANDARD.encode(sig))
@@ -5642,18 +6202,15 @@ async fn rest_send_json(
 
 fn pause_server_sender_keys(
     state: &AppState,
-    app: &AppHandle,
+    app: &AuthenticatedEventAppHandle,
+    expected_binding: &RestBinding,
     server_id: &str,
 ) -> Result<(), String> {
+    let canonical_server_origin = expected_binding.origin.canonical_server_origin();
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    let conversation_ids: Vec<String> = client
-        .db()
-        .map(|db| db.list_channels(server_id))
-        .transpose()?
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|channel| channel.conversation_id)
-        .collect();
+    require_confirmed_live_action_binding_current(state, expected_binding)?;
+    let conversation_ids =
+        origin_scoped_channel_conversation_ids(&client, &canonical_server_origin, server_id)?;
     let mut diagnostics = Vec::with_capacity(conversation_ids.len());
     for conversation_id in conversation_ids {
         client.invalidate_device_roster_v1(&conversation_id);
@@ -5671,15 +6228,84 @@ fn pause_server_sender_keys(
     }
     drop(client);
     for diagnostic in &diagnostics {
-        emit_conversation_crypto_unavailable(app, diagnostic);
+        emit_authenticated_conversation_crypto_unavailable(app, diagnostic);
     }
     Ok(())
 }
 
-fn emit_membership_refresh_required(app: &AppHandle, server_id: &str) {
+fn prepare_server_authorization_change(
+    state: &AppState,
+    app: &AppHandle,
+    request_url: &str,
+    server_id: &str,
+    expected_server_origin: &str,
+    expected_binding_generation: &str,
+) -> Result<AuthenticatedEventAppHandle, String> {
+    let live_action_binding = capture_confirmed_live_action_binding(state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        expected_server_origin,
+        expected_binding_generation,
+    )?;
+    // Validate the renderer's requested REST authority before touching local
+    // channel rosters. The second exact-generation check happens under the
+    // client mutex in `pause_server_sender_keys`, closing the queued-action
+    // race with a replacement self-hosted origin.
+    validate_live_action_rest_origin(&live_action_binding, request_url)?;
+    let event_app = AuthenticatedEventAppHandle::new(app.clone(), live_action_binding.clone());
+    if let Err(error) = pause_server_sender_keys(state, &event_app, &live_action_binding, server_id)
+    {
+        emit_server_membership_refresh_required(&event_app, server_id);
+        return Err(error);
+    }
+    Ok(event_app)
+}
+
+fn origin_scoped_channel_conversation_ids(
+    client: &VeilClient,
+    canonical_server_origin: &str,
+    server_id: &str,
+) -> Result<Vec<String>, String> {
+    client
+        .db()
+        .ok_or("database not initialized")?
+        .list_origin_scoped_channel_conversation_ids(canonical_server_origin, server_id)
+}
+
+fn fail_closed_channel_scope_lookup(
+    state: &AppState,
+    app: &AuthenticatedEventAppHandle,
+    server_id: &str,
+    error: &str,
+) {
+    state.offline_sync_ready.store(false, Ordering::SeqCst);
+    let _ = app.emit(
+        "veil://error",
+        serde_json::json!({
+            "code": 5001,
+            "message": format!("origin-scoped channel authorization lookup failed: {error}"),
+        }),
+    );
     let _ = app.emit(
         "veil://membership-refresh-required",
         serde_json::json!({ "serverId": server_id }),
+    );
+}
+
+fn emit_server_membership_refresh_required(app: &AuthenticatedEventAppHandle, server_id: &str) {
+    let _ = app.emit(
+        "veil://membership-refresh-required",
+        serde_json::json!({ "serverId": server_id }),
+    );
+}
+
+fn emit_conversation_membership_refresh_required(
+    app: &AuthenticatedEventAppHandle,
+    conversation_id: &str,
+) {
+    let _ = app.emit(
+        "veil://membership-refresh-required",
+        serde_json::json!({ "conversationId": conversation_id }),
     );
 }
 
@@ -5909,6 +6535,7 @@ fn create_channel(
     require_unlocked(&state)?;
     let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
     require_unlocked(&state)?;
+    let event_app = AuthenticatedEventAppHandle::for_current(&app)?;
     let mut body = serde_json::json!({
         "name": name,
         "channel_type": channel_type,
@@ -5994,7 +6621,7 @@ fn create_channel(
                     "channel_identity_scope_pending",
                     &error,
                 ) {
-                    emit_conversation_crypto_unavailable(&app, &diagnostic);
+                    emit_authenticated_conversation_crypto_unavailable(&event_app, &diagnostic);
                 }
             }
         }
@@ -6130,6 +6757,8 @@ fn update_role(
     name: Option<String>,
     permissions: Option<u64>,
     color: Option<i32>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
     let mut body = serde_json::Map::new();
     if let Some(v) = name {
@@ -6141,25 +6770,32 @@ fn update_role(
     if let Some(v) = color {
         body.insert("color".into(), v.into());
     }
-    if let Err(error) = pause_server_sender_keys(&state, &app, &server_id) {
-        emit_membership_refresh_required(&app, &server_id);
-        return Err(error);
-    }
-    let result = state.runtime.block_on(rest_send_json(
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "roles", &role_id],
+    )?;
+    let event_app = prepare_server_authorization_change(
+        &state,
+        &app,
+        &request_url,
+        &server_id,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let result = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::PATCH,
-        rest_api_url(
-            &server_http_url,
-            &["v1", "servers", &server_id, "roles", &role_id],
-        )?,
+        request_url,
         &user_id,
         Some(serde_json::Value::Object(body)),
+        &event_app.binding,
     ));
-    emit_membership_refresh_required(&app, &server_id);
+    emit_server_membership_refresh_required(&event_app, &server_id);
     result.map(|_| ())
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri IPC fields intentionally stay explicit.
 fn delete_role(
     state: State<'_, AppState>,
     app: AppHandle,
@@ -6167,26 +6803,35 @@ fn delete_role(
     user_id: String,
     server_id: String,
     role_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    if let Err(error) = pause_server_sender_keys(&state, &app, &server_id) {
-        emit_membership_refresh_required(&app, &server_id);
-        return Err(error);
-    }
-    let result = state.runtime.block_on(rest_send_json(
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "roles", &role_id],
+    )?;
+    let event_app = prepare_server_authorization_change(
+        &state,
+        &app,
+        &request_url,
+        &server_id,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let result = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::DELETE,
-        rest_api_url(
-            &server_http_url,
-            &["v1", "servers", &server_id, "roles", &role_id],
-        )?,
+        request_url,
         &user_id,
         None,
+        &event_app.binding,
     ));
-    emit_membership_refresh_required(&app, &server_id);
+    emit_server_membership_refresh_required(&event_app, &server_id);
     result.map(|_| ())
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri IPC fields intentionally stay explicit.
 fn assign_role(
     state: State<'_, AppState>,
     app: AppHandle,
@@ -6195,34 +6840,43 @@ fn assign_role(
     server_id: String,
     target_user_id: String,
     role_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    if let Err(error) = pause_server_sender_keys(&state, &app, &server_id) {
-        emit_membership_refresh_required(&app, &server_id);
-        return Err(error);
-    }
-    let result = state.runtime.block_on(rest_send_json(
+    let request_url = rest_api_url(
+        &server_http_url,
+        &[
+            "v1",
+            "servers",
+            &server_id,
+            "members",
+            &target_user_id,
+            "roles",
+            &role_id,
+        ],
+    )?;
+    let event_app = prepare_server_authorization_change(
+        &state,
+        &app,
+        &request_url,
+        &server_id,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let result = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::PUT,
-        rest_api_url(
-            &server_http_url,
-            &[
-                "v1",
-                "servers",
-                &server_id,
-                "members",
-                &target_user_id,
-                "roles",
-                &role_id,
-            ],
-        )?,
+        request_url,
         &user_id,
         None,
+        &event_app.binding,
     ));
-    emit_membership_refresh_required(&app, &server_id);
+    emit_server_membership_refresh_required(&event_app, &server_id);
     result.map(|_| ())
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri IPC fields intentionally stay explicit.
 fn unassign_role(
     state: State<'_, AppState>,
     app: AppHandle,
@@ -6231,30 +6885,38 @@ fn unassign_role(
     server_id: String,
     target_user_id: String,
     role_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    if let Err(error) = pause_server_sender_keys(&state, &app, &server_id) {
-        emit_membership_refresh_required(&app, &server_id);
-        return Err(error);
-    }
-    let result = state.runtime.block_on(rest_send_json(
+    let request_url = rest_api_url(
+        &server_http_url,
+        &[
+            "v1",
+            "servers",
+            &server_id,
+            "members",
+            &target_user_id,
+            "roles",
+            &role_id,
+        ],
+    )?;
+    let event_app = prepare_server_authorization_change(
+        &state,
+        &app,
+        &request_url,
+        &server_id,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let result = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::DELETE,
-        rest_api_url(
-            &server_http_url,
-            &[
-                "v1",
-                "servers",
-                &server_id,
-                "members",
-                &target_user_id,
-                "roles",
-                &role_id,
-            ],
-        )?,
+        request_url,
         &user_id,
         None,
+        &event_app.binding,
     ));
-    emit_membership_refresh_required(&app, &server_id);
+    emit_server_membership_refresh_required(&event_app, &server_id);
     result.map(|_| ())
 }
 
@@ -6378,322 +7040,8 @@ fn use_invite(
     ))
 }
 
-// ─── Server / Channel local cache (offline-first) ─────
-//
-// Source of truth is the gateway. The cache exists so the UI can render the
-// server rail and channel tree instantly on app start, before REST returns.
-// The frontend is expected to (a) call load_cached_* on mount,
-// (b) call save_cached_* with the freshly-fetched payload on successful REST,
-// (c) listen to veil://server-event / veil://channel-event and refetch.
-
-fn cached_server_from_json(
-    v: &serde_json::Value,
-    position: i32,
-) -> Option<veil_store::models::CachedServer> {
-    Some(veil_store::models::CachedServer {
-        id: v.get("id")?.as_str()?.to_string(),
-        name: v.get("name")?.as_str()?.to_string(),
-        description: v
-            .get("description")
-            .and_then(|x| x.as_str())
-            .map(String::from),
-        icon_url: v.get("icon_url").and_then(|x| x.as_str()).map(String::from),
-        owner_id: v.get("owner_id")?.as_str()?.to_string(),
-        position,
-        created_at: v
-            .get("created_at")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-    })
-}
-
-fn cached_channel_from_json(
-    server_id: &str,
-    v: &serde_json::Value,
-) -> Option<veil_store::models::CachedChannel> {
-    Some(veil_store::models::CachedChannel {
-        id: v.get("id")?.as_str()?.to_string(),
-        server_id: server_id.to_string(),
-        conversation_id: v
-            .get("conversation_id")
-            .and_then(|x| x.as_str())
-            .map(String::from),
-        name: v.get("name")?.as_str()?.to_string(),
-        channel_type: v.get("channel_type").and_then(|x| x.as_i64()).unwrap_or(0) as i16,
-        category_id: v
-            .get("category_id")
-            .and_then(|x| x.as_str())
-            .map(String::from),
-        position: v.get("position").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
-        topic: v.get("topic").and_then(|x| x.as_str()).map(String::from),
-        nsfw: v.get("nsfw").and_then(|x| x.as_bool()).unwrap_or(false),
-        slowmode_secs: v.get("slowmode_secs").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
-    })
-}
-
-fn cached_role_from_json(
-    server_id: &str,
-    v: &serde_json::Value,
-) -> Option<veil_store::models::CachedRole> {
-    Some(veil_store::models::CachedRole {
-        id: v.get("id")?.as_str()?.to_string(),
-        server_id: server_id.to_string(),
-        name: v.get("name")?.as_str()?.to_string(),
-        permissions: v.get("permissions").and_then(|x| x.as_u64()).unwrap_or(0),
-        position: v.get("position").and_then(|x| x.as_i64()).unwrap_or(0) as i32,
-        color: v.get("color").and_then(|x| x.as_i64()).map(|c| c as i32),
-        is_default: v
-            .get("is_default")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false),
-        hoist: v.get("hoist").and_then(|x| x.as_bool()).unwrap_or(false),
-        mentionable: v
-            .get("mentionable")
-            .and_then(|x| x.as_bool())
-            .unwrap_or(false),
-    })
-}
-
-fn cached_member_from_json(
-    server_id: &str,
-    v: &serde_json::Value,
-) -> Option<veil_store::models::CachedServerMember> {
-    let role_ids = v
-        .get("role_ids")
-        .and_then(|x| x.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|r| r.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    Some(veil_store::models::CachedServerMember {
-        server_id: server_id.to_string(),
-        user_id: v.get("user_id")?.as_str()?.to_string(),
-        username: v
-            .get("username")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-        nickname: v.get("nickname").and_then(|x| x.as_str()).map(String::from),
-        role_ids,
-        joined_at: v
-            .get("joined_at")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string(),
-    })
-}
-
-#[tauri::command]
-fn cache_load_servers(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
-    require_unlocked(&state)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db().ok_or("db not initialized")?;
-    let servers = db.list_servers()?;
-    let result = servers
-        .into_iter()
-        .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "name": s.name,
-                "description": s.description,
-                "icon_url": s.icon_url,
-                "owner_id": s.owner_id,
-                "position": s.position,
-                "created_at": s.created_at,
-            })
-        })
-        .collect();
-    require_session_still_unlocked(&state)?;
-    Ok(result)
-}
-
-#[tauri::command]
-fn cache_save_servers(
-    state: State<'_, AppState>,
-    servers: Vec<serde_json::Value>,
-) -> Result<(), String> {
-    require_unlocked(&state)?;
-    let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db_mut().ok_or("db not initialized")?;
-    let cached: Vec<_> = servers
-        .iter()
-        .enumerate()
-        .filter_map(|(i, v)| cached_server_from_json(v, i as i32))
-        .collect();
-    db.replace_servers(&cached)
-}
-
-#[tauri::command]
-fn cache_delete_server(state: State<'_, AppState>, server_id: String) -> Result<(), String> {
-    require_unlocked(&state)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db().ok_or("db not initialized")?;
-    db.delete_server(&server_id)
-}
-
-#[tauri::command]
-fn cache_load_channels(
-    state: State<'_, AppState>,
-    server_id: String,
-) -> Result<Vec<serde_json::Value>, String> {
-    require_unlocked(&state)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db().ok_or("db not initialized")?;
-    let chans = db.list_channels(&server_id)?;
-    let result = chans
-        .into_iter()
-        .map(|c| {
-            serde_json::json!({
-                "id": c.id,
-                "server_id": c.server_id,
-                "conversation_id": c.conversation_id,
-                "name": c.name,
-                "channel_type": c.channel_type,
-                "category_id": c.category_id,
-                "position": c.position,
-                "topic": c.topic,
-                "nsfw": c.nsfw,
-                "slowmode_secs": c.slowmode_secs,
-            })
-        })
-        .collect();
-    require_session_still_unlocked(&state)?;
-    Ok(result)
-}
-
-#[tauri::command]
-fn resolve_cached_channel_context(
-    state: State<'_, AppState>,
-    conversation_id: String,
-) -> Result<Option<serde_json::Value>, String> {
-    require_unlocked(&state)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db().ok_or("db not initialized")?;
-    let result = db
-        .find_channel_context_by_conversation(&conversation_id)?
-        .map(|(server_id, channel_id)| {
-            serde_json::json!({
-                "serverId": server_id,
-                "channelId": channel_id,
-            })
-        });
-    require_session_still_unlocked(&state)?;
-    Ok(result)
-}
-
-#[tauri::command]
-fn cache_save_channels(
-    state: State<'_, AppState>,
-    server_id: String,
-    channels: Vec<serde_json::Value>,
-) -> Result<(), String> {
-    require_unlocked(&state)?;
-    let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db_mut().ok_or("db not initialized")?;
-    let cached: Vec<_> = channels
-        .iter()
-        .filter_map(|v| cached_channel_from_json(&server_id, v))
-        .collect();
-    db.replace_channels(&server_id, &cached)
-}
-
-#[tauri::command]
-fn cache_delete_channel(state: State<'_, AppState>, channel_id: String) -> Result<(), String> {
-    require_unlocked(&state)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db().ok_or("db not initialized")?;
-    db.delete_channel(&channel_id)
-}
-
-#[tauri::command]
-fn cache_load_roles(
-    state: State<'_, AppState>,
-    server_id: String,
-) -> Result<Vec<serde_json::Value>, String> {
-    require_unlocked(&state)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db().ok_or("db not initialized")?;
-    let roles = db.list_roles(&server_id)?;
-    let result = roles
-        .into_iter()
-        .map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "server_id": r.server_id,
-                "name": r.name,
-                "permissions": r.permissions,
-                "position": r.position,
-                "color": r.color,
-                "is_default": r.is_default,
-                "hoist": r.hoist,
-                "mentionable": r.mentionable,
-            })
-        })
-        .collect();
-    require_session_still_unlocked(&state)?;
-    Ok(result)
-}
-
-#[tauri::command]
-fn cache_save_roles(
-    state: State<'_, AppState>,
-    server_id: String,
-    roles: Vec<serde_json::Value>,
-) -> Result<(), String> {
-    require_unlocked(&state)?;
-    let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db_mut().ok_or("db not initialized")?;
-    let cached: Vec<_> = roles
-        .iter()
-        .filter_map(|v| cached_role_from_json(&server_id, v))
-        .collect();
-    db.replace_roles(&server_id, &cached)
-}
-
-#[tauri::command]
-fn cache_load_server_members(
-    state: State<'_, AppState>,
-    server_id: String,
-) -> Result<Vec<serde_json::Value>, String> {
-    require_unlocked(&state)?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db().ok_or("db not initialized")?;
-    let members = db.list_server_members(&server_id)?;
-    let result = members
-        .into_iter()
-        .map(|m| {
-            serde_json::json!({
-                "server_id": m.server_id,
-                "user_id": m.user_id,
-                "username": m.username,
-                "nickname": m.nickname,
-                "role_ids": m.role_ids,
-                "joined_at": m.joined_at,
-            })
-        })
-        .collect();
-    require_session_still_unlocked(&state)?;
-    Ok(result)
-}
-
-#[tauri::command]
-fn cache_save_server_members(
-    state: State<'_, AppState>,
-    server_id: String,
-    members: Vec<serde_json::Value>,
-) -> Result<(), String> {
-    require_unlocked(&state)?;
-    let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db_mut().ok_or("db not initialized")?;
-    let cached: Vec<_> = members
-        .iter()
-        .filter_map(|v| cached_member_from_json(&server_id, v))
-        .collect();
-    db.replace_server_members(&server_id, &cached)
-}
+// The legacy server/channel cache intentionally has no renderer IPC surface:
+// its bare UUID rows cannot be used until a later origin-scoped cache schema.
 
 // ─── Sender Keys (Phase E) ────────────────────────────
 
@@ -6703,9 +7051,17 @@ fn cache_save_server_members(
 fn mark_channel_conversation(
     state: State<'_, AppState>,
     conversation_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    require_unlocked(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     client.mark_channel_conversation(&conversation_id);
     Ok(())
@@ -6716,9 +7072,17 @@ fn mark_channel_conversation(
 fn hydrate_channel_sender_keys(
     state: State<'_, AppState>,
     conversation_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    require_unlocked(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     client
         .hydrate_channel_sender_keys(&conversation_id)
@@ -6729,9 +7093,17 @@ fn hydrate_channel_sender_keys(
 fn sender_key_distribution_status(
     state: State<'_, AppState>,
     conversation_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<String, String> {
-    require_unlocked(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     Ok(client
         .sender_key_distribution_status(&conversation_id)
@@ -6750,9 +7122,16 @@ fn distribute_pinned_sender_key(
     state: &AppState,
     conversation_id: &str,
     preparation: SenderKeyDistributionPreparation,
+    live_action_binding: Option<&RestBinding>,
 ) -> Result<u32, String> {
-    require_unlocked(state)?;
+    if live_action_binding.is_none() {
+        // Native offline sync deliberately runs before renderer confirmation.
+        require_unlocked(state)?;
+    }
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    if let Some(binding) = live_action_binding {
+        require_confirmed_live_action_binding_current(state, binding)?;
+    }
     require_authenticated_conversation_origin(state, &client, conversation_id)?;
     client.mark_channel_conversation(conversation_id);
     let targets = client.sender_key_device_targets(conversation_id)?;
@@ -6785,6 +7164,12 @@ fn distribute_pinned_sender_key(
     let started = Instant::now();
     client.buffer_connection_events_during_sync();
     for target in targets {
+        if let Some(binding) = live_action_binding {
+            if let Err(error) = require_confirmed_live_action_binding_current(state, binding) {
+                client.mark_sender_key_distribution_failed(conversation_id);
+                return Err(error);
+            }
+        }
         if !seen.insert(target.device_id) {
             client.mark_sender_key_distribution_failed(conversation_id);
             return Err("validated device roster repeated an exact fanout target".to_string());
@@ -6826,8 +7211,15 @@ fn distribute_sender_key(
     server_http_url: String,
     user_id: String,
     conversation_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<u32, String> {
-    require_unlocked(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     // The renderer never chooses recipients. Fetch the signed, permission-
     // filtered directory for this exact conversation and pin it first.
     let members = fetch_authorized_conversation_directory(
@@ -6835,15 +7227,16 @@ fn distribute_sender_key(
         &server_http_url,
         &user_id,
         &conversation_id,
+        Some(&live_action_binding),
     );
     let members = match members {
         Ok(members) => members,
         Err(error) => {
-            state
-                .client
-                .lock()
-                .map_err(|lock_error| lock_error.to_string())?
-                .invalidate_device_roster_v1(&conversation_id);
+            invalidate_device_roster_for_binding(
+                &state,
+                &conversation_id,
+                Some(&live_action_binding),
+            )?;
             return Err(error);
         }
     };
@@ -6854,6 +7247,7 @@ fn distribute_sender_key(
         &user_id,
         &conversation_id,
         &account_directory,
+        Some(&live_action_binding),
     )? {
         return Err(format!(
             "conversation exact-device roster is not ready: {reason}"
@@ -6863,16 +7257,8 @@ fn distribute_sender_key(
         &state,
         &conversation_id,
         SenderKeyDistributionPreparation::ReusePendingGeneration,
+        Some(&live_action_binding),
     )
-}
-
-/// Force-rotate our outgoing sender key for a channel (e.g. on member kick).
-#[tauri::command]
-fn rotate_sender_key(state: State<'_, AppState>, conversation_id: String) -> Result<(), String> {
-    require_unlocked(&state)?;
-    let mut client = state.client.lock().map_err(|e| e.to_string())?;
-    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
-    client.rotate_sender_key(&conversation_id)
 }
 
 // ─── Phase 6: per-conversation crypto mode ───────────
@@ -6884,10 +7270,17 @@ fn send_friend_request(
     state: State<'_, AppState>,
     target_user_id: String,
     message: Option<String>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     state
         .runtime
         .block_on(client.send_friend_request(&target_user_id, message.as_deref()))
@@ -6898,28 +7291,54 @@ fn respond_friend_request(
     state: State<'_, AppState>,
     request_id: String,
     accept: bool,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     state
         .runtime
         .block_on(client.respond_friend_request(&request_id, accept))
 }
 
 #[tauri::command]
-fn remove_friend(state: State<'_, AppState>, user_id: String) -> Result<(), String> {
-    require_live_transport_ready(&state)?;
+fn remove_friend(
+    state: State<'_, AppState>,
+    user_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     state.runtime.block_on(client.remove_friend(&user_id))
 }
 
 #[tauri::command]
-fn request_friend_list(state: State<'_, AppState>) -> Result<(), String> {
-    require_live_transport_ready(&state)?;
+fn request_friend_list(
+    state: State<'_, AppState>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     state.runtime.block_on(client.request_friend_list())
 }
 
@@ -6928,10 +7347,17 @@ fn send_presence(
     state: State<'_, AppState>,
     status: i32,
     status_text: Option<String>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    require_live_transport_ready(&state)?;
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
     let client = state.client.lock().map_err(|e| e.to_string())?;
-    require_live_transport_still_ready(&state)?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     state
         .runtime
         .block_on(client.send_presence(status, status_text.as_deref()))
@@ -7178,7 +7604,11 @@ pub fn run() {
                 session_epoch: AtomicU64::new(0),
                 connect_transition: Mutex::new(()),
                 authenticated_rest_origin: Mutex::new(None),
+                renderer_confirmed_rest_binding: Mutex::new(None),
                 rest_binding_generation: AtomicU64::new(0),
+                authenticated_account_continuity: Mutex::new(
+                    AuthenticatedAccountContinuity::default(),
+                ),
                 unlocked: AtomicBool::new(!pin_configured),
                 pin_configured: AtomicBool::new(pin_configured),
                 event_poller_started: AtomicBool::new(false),
@@ -7337,6 +7767,7 @@ pub fn run() {
             upload_prekeys,
             establish_session,
             connect_to_server,
+            confirm_authenticated_session_scope,
             send_message,
             discard_failed_outgoing_message,
             edit_message,
@@ -7390,22 +7821,10 @@ pub fn run() {
             revoke_invite,
             preview_invite,
             use_invite,
-            cache_load_servers,
-            cache_save_servers,
-            cache_delete_server,
-            cache_load_channels,
-            resolve_cached_channel_context,
-            cache_save_channels,
-            cache_delete_channel,
-            cache_load_roles,
-            cache_save_roles,
-            cache_load_server_members,
-            cache_save_server_members,
             mark_channel_conversation,
             hydrate_channel_sender_keys,
             sender_key_distribution_status,
             distribute_sender_key,
-            rotate_sender_key,
         ])
         .run(tauri::generate_context!())
         .expect("error while running veil");
@@ -7414,16 +7833,32 @@ pub fn run() {
 #[cfg(test)]
 mod e2ee_rest_tests {
     use super::{
-        consume_pending_lock_event, offline_sync_url, parse_device_directory,
-        parse_message_crypto_context, parse_prekey_bundle, preserve_created_group_outcome,
-        publish_unlocked_session, resolve_auto_lock_seconds, rest_api_url, rest_authority,
-        rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
-        valid_unlock_pin, validate_live_message_security_context, validate_next_cursor,
-        validate_rest_url, validate_server_endpoint_pair, validate_utc_rfc3339_nano,
-        verify_device_directory_account_keys, ConversationSyncIsolation,
-        ParsedMessageCryptoContext, PinnedDirectoryMember, DEFAULT_AUTO_LOCK_SECONDS,
+        authenticated_event_payload, bind_authenticated_account, consume_pending_lock_event,
+        exact_confirmed_live_action_binding, invalidate_disconnected_binding, offline_sync_url,
+        parse_device_directory, parse_message_crypto_context, parse_prekey_bundle,
+        preserve_created_group_outcome, publish_unlocked_session, resolve_auto_lock_seconds,
+        rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
+        valid_auto_lock_seconds, valid_unlock_pin, validate_expected_live_action_binding,
+        validate_expected_rest_binding, validate_live_action_rest_origin,
+        validate_live_message_security_context, validate_next_cursor,
+        validate_persisted_message_conversation, validate_rest_url, validate_server_endpoint_pair,
+        validate_utc_rfc3339_nano, verify_device_directory_account_keys,
+        AuthenticatedAccountContinuity, AuthenticatedSessionScope, ConversationSyncIsolation,
+        ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
+        DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
+
+    fn authenticated_test_binding(host: &str, generation: u64) -> RestBinding {
+        RestBinding {
+            origin: RestOrigin {
+                scheme: "https".to_string(),
+                host: host.to_string(),
+                port: 443,
+            },
+            generation,
+        }
+    }
 
     #[test]
     fn prekey_bundle_requires_base64_lengths_and_requested_identity() {
@@ -7586,6 +8021,205 @@ mod e2ee_rest_tests {
                 .canonical_server_origin(),
             "http://[::1]:9080"
         );
+    }
+
+    #[test]
+    fn authenticated_scope_keeps_native_origin_and_u64_generation_exact() {
+        let scope = AuthenticatedSessionScope {
+            user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            canonical_server_origin: "https://chat.example.test:443".to_string(),
+            binding_generation: u64::MAX.to_string(),
+        };
+        assert_eq!(
+            serde_json::to_value(scope).unwrap(),
+            serde_json::json!({
+                "userId": "550e8400-e29b-41d4-a716-446655440000",
+                "canonicalServerOrigin": "https://chat.example.test:443",
+                "bindingGeneration": "18446744073709551615",
+            })
+        );
+    }
+
+    #[test]
+    fn authenticated_event_payload_uses_the_exact_captured_binding() {
+        let binding = authenticated_test_binding("chat.example.test", u64::MAX);
+        let payload = authenticated_event_payload(
+            &binding,
+            "veil://message",
+            serde_json::json!({
+                "message": "hello",
+                "serverScopeOrigin": "https://spoofed.example:443",
+                "serverBindingGeneration": "1",
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(payload["message"], "hello");
+        assert_eq!(
+            payload["serverScopeOrigin"],
+            "https://chat.example.test:443"
+        );
+        assert_eq!(payload["serverBindingGeneration"], u64::MAX.to_string());
+        assert!(authenticated_event_payload(&binding, "veil://message", "not-an-object").is_err());
+    }
+
+    #[test]
+    fn renderer_live_action_is_rejected_before_exact_confirmation() {
+        let binding = authenticated_test_binding("chat.example.test", 7);
+        assert!(exact_confirmed_live_action_binding(Some(&binding), None, true, None).is_err());
+        assert!(
+            exact_confirmed_live_action_binding(Some(&binding), Some(&binding), false, None,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn renderer_live_action_accepts_only_the_exact_confirmed_scope() {
+        let binding = authenticated_test_binding("chat.example.test", 7);
+        assert_eq!(
+            exact_confirmed_live_action_binding(
+                Some(&binding),
+                Some(&binding),
+                true,
+                Some(&binding),
+            )
+            .unwrap(),
+            binding
+        );
+        assert!(validate_expected_live_action_binding(
+            &binding,
+            "https://chat.example.test:443",
+            "7",
+        )
+        .is_ok());
+        assert!(validate_expected_live_action_binding(
+            &binding,
+            "https://chat.example.test:443",
+            "07",
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn renderer_live_action_rejects_another_rest_origin_before_local_mutation() {
+        let binding = authenticated_test_binding("alpha.example.test", 7);
+        let same_origin = reqwest::Url::parse(
+            "https://ALPHA.example.test/v1/servers/550e8400-e29b-41d4-a716-446655440000/roles",
+        )
+        .unwrap();
+        let other_origin = reqwest::Url::parse(
+            "https://beta.example.test/v1/servers/550e8400-e29b-41d4-a716-446655440000/roles",
+        )
+        .unwrap();
+
+        assert!(validate_live_action_rest_origin(&binding, same_origin.as_str()).is_ok());
+        assert!(validate_live_action_rest_origin(&binding, other_origin.as_str()).is_err());
+    }
+
+    #[test]
+    fn bound_rest_live_action_rejects_a_replacement_generation() {
+        let old_binding = authenticated_test_binding("chat.example.test", 7);
+        let replacement_binding = authenticated_test_binding("chat.example.test", 8);
+
+        assert!(validate_expected_rest_binding(&old_binding, Some(&old_binding)).is_ok());
+        assert!(validate_expected_rest_binding(&replacement_binding, Some(&old_binding)).is_err());
+    }
+
+    #[test]
+    fn queued_old_live_action_is_rejected_after_reconfirmation() {
+        let old_binding = authenticated_test_binding("chat.example.test", 7);
+        let replacement_binding = authenticated_test_binding("chat.example.test", 8);
+        assert!(exact_confirmed_live_action_binding(
+            Some(&replacement_binding),
+            Some(&replacement_binding),
+            true,
+            Some(&old_binding),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn old_disconnect_cannot_clear_a_new_renderer_confirmation() {
+        let old_binding = authenticated_test_binding("chat.example.test", 7);
+        let replacement_binding = authenticated_test_binding("chat.example.test", 8);
+        let mut renderer_confirmation = Some(replacement_binding.clone());
+        assert!(!invalidate_disconnected_binding(
+            &mut renderer_confirmation,
+            &old_binding,
+        ));
+        assert_eq!(renderer_confirmation, Some(replacement_binding));
+    }
+
+    #[test]
+    fn persisted_message_binding_rejects_cross_conversation_mutations() {
+        assert!(
+            validate_persisted_message_conversation(Some("conversation-a"), "conversation-a")
+                .is_ok()
+        );
+        assert!(
+            validate_persisted_message_conversation(Some("conversation-a"), "conversation-b")
+                .is_err()
+        );
+        assert!(validate_persisted_message_conversation(None, "conversation-a").is_err());
+    }
+
+    #[test]
+    fn old_disconnect_cannot_invalidate_a_replacement_binding() {
+        let old_binding = authenticated_test_binding("chat.example.test", 7);
+        let replacement_binding = authenticated_test_binding("chat.example.test", 8);
+        let foreign_binding = authenticated_test_binding("other.example.test", 8);
+        let mut current = Some(replacement_binding.clone());
+
+        assert!(!invalidate_disconnected_binding(&mut current, &old_binding));
+        assert_eq!(current, Some(replacement_binding.clone()));
+        assert!(!invalidate_disconnected_binding(
+            &mut current,
+            &foreign_binding
+        ));
+        assert_eq!(current, Some(replacement_binding.clone()));
+        assert!(invalidate_disconnected_binding(
+            &mut current,
+            &replacement_binding
+        ));
+        assert_eq!(current, None);
+    }
+
+    #[test]
+    fn authenticated_account_continuity_rejects_same_origin_remapping_before_sync() {
+        let mut continuity = AuthenticatedAccountContinuity::default();
+        let local_identity = [7u8; 32];
+
+        bind_authenticated_account(
+            &mut continuity,
+            local_identity,
+            "https://one.example.test:443",
+            "550e8400-e29b-41d4-a716-446655440000",
+        )
+        .unwrap();
+        bind_authenticated_account(
+            &mut continuity,
+            local_identity,
+            "https://two.example.test:443",
+            "550e8400-e29b-41d4-a716-446655440009",
+        )
+        .unwrap();
+        assert!(bind_authenticated_account(
+            &mut continuity,
+            local_identity,
+            "https://one.example.test:443",
+            "550e8400-e29b-41d4-a716-446655440009",
+        )
+        .is_err());
+
+        // Importing a genuinely different local identity starts a new account
+        // continuity namespace instead of inheriting the prior seed's map.
+        bind_authenticated_account(
+            &mut continuity,
+            [8u8; 32],
+            "https://one.example.test:443",
+            "550e8400-e29b-41d4-a716-446655440009",
+        )
+        .unwrap();
     }
 
     #[test]

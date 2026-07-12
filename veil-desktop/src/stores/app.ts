@@ -1,7 +1,7 @@
 import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { confirmDecision } from "@/lib/decisionDialog";
-import { listen } from "@tauri-apps/api/event";
+import { alertDecision, decisionDialog } from "@/lib/decisionDialog";
+import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 
 // ─── Types ───────────────────────────────────────────
 
@@ -117,6 +117,28 @@ const SERVER_ENDPOINTS_STORAGE_KEY = "veil.server-endpoints.v1";
 
 type ServerEndpoints = { ws: string; http: string };
 
+export interface AuthenticatedServerScope {
+  userId: string;
+  canonicalServerOrigin: string;
+  bindingGeneration: string;
+}
+
+export interface ServerEndpointChange {
+  originChanged: boolean;
+  transportChanged: boolean;
+}
+
+export function canonicalServerOriginFromHttpUrl(httpRaw: string): string {
+  const url = new URL(httpRaw);
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("Server origin must use http or https");
+  }
+  const bareHost = url.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  const authority = bareHost.includes(":") ? `[${bareHost}]` : bareHost;
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  return `${url.protocol}//${authority}:${port}`;
+}
+
 function normalizeServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpoints | null {
   try {
     const ws = new URL(wsRaw.trim());
@@ -165,10 +187,27 @@ function initialServerEndpoints(): ServerEndpoints {
 const initialEndpoints = initialServerEndpoints();
 const [serverUrl, setServerUrl] = createSignal(initialEndpoints.ws);
 const [serverHttpUrl, setServerHttpUrl] = createSignal(initialEndpoints.http);
+const [authenticatedServerScope, setAuthenticatedServerScope] =
+  createSignal<AuthenticatedServerScope | null>(null);
+const [pendingAuthenticatedServerScope, setPendingAuthenticatedServerScope] =
+  createSignal<AuthenticatedServerScope | null>(null);
+const [bindingTransitioning, setBindingTransitioning] = createSignal(false);
+const [originTransitioning, setOriginTransitioning] = createSignal(false);
+const [originEpoch, setOriginEpoch] = createSignal(0);
 
-function setServerEndpoints(wsRaw: string, httpRaw: string) {
+function setServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpointChange {
   const normalized = normalizeServerEndpoints(wsRaw, httpRaw);
   if (!normalized) throw new Error("Invalid or insecure server endpoint pair");
+  const transportChanged = normalized.ws !== serverUrl() || normalized.http !== serverHttpUrl();
+  const currentNamespaceOrigin = authenticatedServerScope()?.canonicalServerOrigin
+    ?? canonicalServerOriginFromHttpUrl(serverHttpUrl());
+  const originChanged = canonicalServerOriginFromHttpUrl(normalized.http)
+    !== currentNamespaceOrigin;
+  if (transportChanged) {
+    endpointSelectionEpoch += 1;
+    if (originChanged) beginOriginTransition();
+    else beginBindingTransition();
+  }
   setServerUrl(normalized.ws);
   setServerHttpUrl(normalized.http);
   try {
@@ -176,6 +215,7 @@ function setServerEndpoints(wsRaw: string, httpRaw: string) {
   } catch {
     // The active session can still use the endpoint when storage is disabled.
   }
+  return { originChanged, transportChanged };
 }
 const [servers, setServers] = createSignal<Server[]>([]);
 const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
@@ -271,10 +311,17 @@ let lastActivityTouch = 0;
 // again and would otherwise repopulate the new session with stale plaintext.
 let uiSessionEpoch = 0;
 let uiSessionActive = true;
-let connectionAttempt: Promise<string> | null = null;
+let endpointSelectionEpoch = 0;
+const publishedServerScopesByOrigin = new Map<string, AuthenticatedServerScope>();
+let connectionAttempt: {
+  endpointKey: string;
+  endpointSelectionEpoch: number;
+  promise: Promise<string>;
+} | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let reconnectAttempt = 0;
 let eventListenersInitialized = false;
+let eventListenersInitialization: Promise<void> | null = null;
 
 const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const;
 
@@ -302,7 +349,7 @@ function scheduleReconnect(expectedEpoch: number, immediate = false): void {
       setReconnecting(false);
       return;
     }
-    void appStore.connectToServer().catch((error) => {
+    void appStore.connectToServer(true).catch((error) => {
       if (!(error instanceof StaleUiSessionError)) {
         console.warn("secure reconnect failed:", error);
       }
@@ -340,7 +387,126 @@ function rethrowIfStale(error: unknown): void {
 }
 
 function acceptsSensitiveEvent(): boolean {
-  return uiSessionActive && screen() !== "locked";
+  return uiSessionActive
+    && screen() !== "locked"
+    && !originTransitioning()
+    && !bindingTransitioning();
+}
+
+type NativeScopeTag = {
+  serverScopeOrigin: string;
+  serverBindingGeneration: string;
+};
+
+function nativeScopeTag(payload: unknown): NativeScopeTag | null {
+  if (!payload || typeof payload !== "object") return null;
+  const candidate = payload as Partial<NativeScopeTag>;
+  if (
+    typeof candidate.serverScopeOrigin !== "string"
+    || typeof candidate.serverBindingGeneration !== "string"
+  ) return null;
+  return {
+    serverScopeOrigin: candidate.serverScopeOrigin,
+    serverBindingGeneration: candidate.serverBindingGeneration,
+  };
+}
+
+export function nativeEventMatchesAuthenticatedScope(
+  payload: unknown,
+  scope: AuthenticatedServerScope | null,
+): boolean {
+  if (!scope) return false;
+  const tag = nativeScopeTag(payload);
+  return tag?.serverScopeOrigin === scope.canonicalServerOrigin
+    && tag.serverBindingGeneration === scope.bindingGeneration;
+}
+
+export function validateAuthenticatedServerScope(
+  value: unknown,
+  expectedOrigin: string,
+  continuityScope: AuthenticatedServerScope | null,
+): AuthenticatedServerScope {
+  const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!value || typeof value !== "object") {
+    throw new Error("native connection returned an invalid authenticated server scope");
+  }
+  const scope = value as Partial<AuthenticatedServerScope>;
+  if (
+    scope.canonicalServerOrigin !== expectedOrigin
+    || typeof scope.userId !== "string"
+    || !canonicalUuid.test(scope.userId)
+    || typeof scope.bindingGeneration !== "string"
+    || !/^[1-9][0-9]*$/.test(scope.bindingGeneration)
+  ) {
+    throw new Error("native connection returned an invalid authenticated server scope");
+  }
+  const validated = scope as AuthenticatedServerScope;
+  if (
+    continuityScope
+    && (
+      continuityScope.canonicalServerOrigin !== validated.canonicalServerOrigin
+      || continuityScope.userId !== validated.userId
+      || BigInt(validated.bindingGeneration) <= BigInt(continuityScope.bindingGeneration)
+    )
+  ) {
+    throw new Error("native connection broke authenticated account continuity");
+  }
+  return validated;
+}
+
+function authenticatedScopesEqual(
+  left: AuthenticatedServerScope | null,
+  right: AuthenticatedServerScope | null,
+): boolean {
+  return left !== null
+    && right !== null
+    && left.userId === right.userId
+    && left.canonicalServerOrigin === right.canonicalServerOrigin
+    && left.bindingGeneration === right.bindingGeneration;
+}
+
+function requirePublishedMutationScope(): AuthenticatedServerScope {
+  const scope = authenticatedServerScope();
+  if (
+    !connected()
+    || bindingTransitioning()
+    || originTransitioning()
+    || !scope
+  ) {
+    throw new Error("authenticated server binding is not published for this action");
+  }
+  return scope;
+}
+
+function requireCurrentMutationScope(
+  sessionEpoch: number,
+  scope: AuthenticatedServerScope,
+): void {
+  requireCurrentUiSession(sessionEpoch);
+  if (!connected() || !authenticatedScopesEqual(authenticatedServerScope(), scope)) {
+    throw new StaleUiSessionError();
+  }
+}
+
+function authenticatedMutationScopeArgs(scope: AuthenticatedServerScope) {
+  return {
+    expectedServerOrigin: scope.canonicalServerOrigin,
+    expectedBindingGeneration: scope.bindingGeneration,
+  };
+}
+
+function acceptsAuthenticatedEvent(payload: unknown): boolean {
+  return uiSessionActive
+    && screen() !== "locked"
+    && !originTransitioning()
+    && !bindingTransitioning()
+    && nativeEventMatchesAuthenticatedScope(payload, authenticatedServerScope());
+}
+
+function matchesPendingOrCurrentAuthenticatedScope(payload: unknown): boolean {
+  if (!uiSessionActive || screen() === "locked") return false;
+  return nativeEventMatchesAuthenticatedScope(payload, pendingAuthenticatedServerScope())
+    || nativeEventMatchesAuthenticatedScope(payload, authenticatedServerScope());
 }
 
 function activateUiSession(expectedEpoch: number): boolean {
@@ -350,25 +516,53 @@ function activateUiSession(expectedEpoch: number): boolean {
   return true;
 }
 
-async function serializeConnectionAttempt(start: () => Promise<string>): Promise<string> {
-  if (connectionAttempt) return connectionAttempt;
+async function serializeConnectionAttempt(
+  endpointKey: string,
+  selectedEndpointEpoch: number,
+  start: () => Promise<string>,
+  forceAfterCurrent = false,
+): Promise<string> {
+  const existing = connectionAttempt;
+  if (existing) {
+    if (
+      !forceAfterCurrent
+      && existing.endpointKey === endpointKey
+      && existing.endpointSelectionEpoch === selectedEndpointEpoch
+    ) return existing.promise;
+    // Native connect transitions are serialized. Wait for an older endpoint
+    // attempt to reach its fail-closed boundary, then start the newly selected
+    // origin instead of accidentally coalescing the two requests.
+    try {
+      await existing.promise;
+    } catch {
+      // The requested endpoint still needs its own attempt.
+    }
+    return serializeConnectionAttempt(endpointKey, selectedEndpointEpoch, start, false);
+  }
 
   const attempt = start();
-  connectionAttempt = attempt;
+  connectionAttempt = { endpointKey, endpointSelectionEpoch: selectedEndpointEpoch, promise: attempt };
   try {
     return await attempt;
   } finally {
-    if (connectionAttempt === attempt) connectionAttempt = null;
+    if (connectionAttempt?.promise === attempt) connectionAttempt = null;
   }
 }
 
-function clearSensitiveUi(): void {
-  cancelReconnectTimer(true);
-  setReconnecting(false);
-  uiSessionEpoch += 1;
-  uiSessionActive = false;
-  setScreen("locked");
-  setIdentity(null);
+function selectedEndpointKey(): string {
+  return `${serverUrl()}\n${serverHttpUrl()}`;
+}
+
+function requireCurrentEndpointSelection(
+  selectedEpoch: number,
+  endpointKey: string,
+): void {
+  if (selectedEpoch !== endpointSelectionEpoch || endpointKey !== selectedEndpointKey()) {
+    throw new StaleUiSessionError();
+  }
+}
+
+function resetOriginScopedUiState(): void {
   setUserId(null);
   setConnected(false);
   setConversations([]);
@@ -398,6 +592,52 @@ function clearSensitiveUi(): void {
   setFriendDirectoryReady(false);
 }
 
+function beginBindingTransition(serverSettingsFallback: "chat" | "settings" = "chat"): void {
+  cancelReconnectTimer();
+  decisionDialog.cancelAll();
+  uiSessionEpoch += 1;
+  setAuthenticatedServerScope(null);
+  setPendingAuthenticatedServerScope(null);
+  setBindingTransitioning(true);
+  setConnected(false);
+  setUserId(null);
+  setReconnecting(true);
+  setFriends([]);
+  setFriendRequests([]);
+  setPresenceMap({});
+  setFriendDirectoryReady(false);
+  Object.values(typingTimers).forEach(clearTimeout);
+  typingTimers = {};
+  lastTypingSent = 0;
+  setTypingUsers({});
+  if (screen() === "serverSettings") setScreen(serverSettingsFallback);
+}
+
+function beginOriginTransition(): void {
+  beginBindingTransition("settings");
+  cancelReconnectTimer(true);
+  setOriginEpoch((value) => value + 1);
+  setOriginTransitioning(true);
+  resetOriginScopedUiState();
+}
+
+function clearSensitiveUi(): void {
+  cancelReconnectTimer(true);
+  decisionDialog.cancelAll();
+  setReconnecting(false);
+  uiSessionEpoch += 1;
+  uiSessionActive = false;
+  setScreen("locked");
+  setIdentity(null);
+  setAuthenticatedServerScope(null);
+  setPendingAuthenticatedServerScope(null);
+  setBindingTransitioning(false);
+  setOriginTransitioning(false);
+  publishedServerScopesByOrigin.clear();
+  setOriginEpoch((value) => value + 1);
+  resetOriginScopedUiState();
+}
+
 // ─── JSON ↔ store-type adapters (snake_case from Rust ↔ camelCase) ────
 
 function serverFromJSON(v: any): Server {
@@ -407,17 +647,6 @@ function serverFromJSON(v: any): Server {
     description: v.description ?? undefined,
     iconUrl: v.icon_url ?? undefined,
     ownerId: v.owner_id,
-  };
-}
-
-function serverToJSON(s: Server): any {
-  return {
-    id: s.id,
-    name: s.name,
-    description: s.description ?? null,
-    icon_url: s.iconUrl ?? null,
-    owner_id: s.ownerId,
-    created_at: "",
   };
 }
 
@@ -514,6 +743,11 @@ export const appStore = {
   serverUrl,
   serverHttpUrl,
   setServerEndpoints,
+  authenticatedServerScope,
+  pendingAuthenticatedServerScope,
+  bindingTransitioning,
+  originTransitioning,
+  originEpoch,
   servers,
   setServers,
   activeServerId,
@@ -581,16 +815,10 @@ export const appStore = {
     const loaded = findLoaded();
     if (loaded) return loaded;
 
-    // Search can return a channel whose server has not been opened in this
-    // renderer session. Use one read-only native lookup: replacing live
-    // channel lists with an older cache here would be a navigation race.
-    const sessionEpoch = captureUiSessionEpoch();
-    const context = await invoke<{ serverId: string; channelId: string } | null>(
-      "resolve_cached_channel_context",
-      { conversationId },
-    );
-    requireCurrentUiSession(sessionEpoch);
-    return context;
+    // Legacy server/channel cache rows have no origin column. Until the cache
+    // schema is origin-scoped, a bare conversation UUID must not navigate into
+    // a possibly colliding server on another self-hosted instance.
+    return null;
   },
 
   addMessage: (msg: Message) => {
@@ -606,74 +834,118 @@ export const appStore = {
     );
   },
 
-  /** Connect to Veil gateway and start listening for events. */
-  connectToServer: () => serializeConnectionAttempt(async () => {
-    const sessionEpoch = captureUiSessionEpoch();
-    cancelReconnectTimer();
-    // Native connect replaces the transport and pauses offline dispatch. Keep
-    // the renderer honest throughout that transition instead of showing a
-    // stale Online state while sends are intentionally unavailable.
-    setConnected(false);
-    setReconnecting(true);
-    setFriends([]);
-    setFriendRequests([]);
-    setPresenceMap({});
-    setFriendDirectoryReady(false);
-    try {
-      const uid = await invoke<string>("connect_to_server", {
-        serverUrl: serverUrl(),
-        serverHttpUrl: serverHttpUrl(),
-      });
-      requireCurrentUiSession(sessionEpoch);
-      setUserId(uid);
-      const diagnostics = await invoke<ConversationCryptoDiagnostic[]>(
-        "get_conversation_crypto_diagnostics",
+  /** Connect to Veil gateway and publish one native-authenticated namespace. */
+  connectToServer: (forceAfterCurrent = false) => {
+    if (!eventListenersInitialized) {
+      return Promise.reject(
+        new Error("authenticated transport requires the complete native event listener set"),
       );
-      requireCurrentUiSession(sessionEpoch);
-      replaceConversationCryptoDiagnostics(diagnostics);
-      // An authenticated transport without published X3DH prekeys cannot
-      // safely receive new DMs. Treat prekey publication as part of connect.
-      await invoke("upload_prekeys", { serverHttpUrl: serverHttpUrl() });
-      requireCurrentUiSession(sessionEpoch);
-      setConnected(true);
-      setReconnecting(false);
-      reconnectAttempt = 0;
-      // Native connect completes authenticated keyset backlog sync before the
-      // live event dispatcher starts. Refresh the Solid store from SQLCipher
-      // once, avoiding per-message replay/duplicate UI events.
-      await appStore.loadConversations();
-      requireCurrentUiSession(sessionEpoch);
-      const selectedConversation = activeConversationId();
-      if (selectedConversation) {
-        await appStore.loadMessages(selectedConversation);
-        requireCurrentUiSession(sessionEpoch);
-      }
-      // Request friend list and announce online after connecting
-      appStore.requestFriendList();
-      appStore.sendPresence(1); // ONLINE
-      // Load Discord-like servers (cache-first then refresh)
-      appStore.loadServers();
-      // Preload member-only identity directories so inbound group SKDMs can
-      // be verified against pinned Ed25519 keys before any group is opened.
-      await Promise.allSettled(
-        conversations()
-          .filter((conversation) => conversation.type === "group")
-          .map((conversation) => appStore.getGroupMembers(conversation.id)),
-      );
-      requireCurrentUiSession(sessionEpoch);
-      return uid;
-    } catch (e) {
-      rethrowIfStale(e);
-      console.error("connect failed:", e);
-      setConnected(false);
-      setUserId(null);
-      setReconnecting(true);
-      // Let serializeConnectionAttempt clear the rejected shared promise
-      // before the next attempt enters it.
-      setTimeout(() => scheduleReconnect(sessionEpoch), 0);
-      throw e;
     }
-  }),
+    const requestedServerUrl = serverUrl();
+    const requestedHttpUrl = serverHttpUrl();
+    const expectedOrigin = canonicalServerOriginFromHttpUrl(requestedHttpUrl);
+    const endpointKey = `${requestedServerUrl}\n${requestedHttpUrl}`;
+    const selectedEndpointEpoch = endpointSelectionEpoch;
+    return serializeConnectionAttempt(endpointKey, selectedEndpointEpoch, async () => {
+      // A queued B attempt must never start after the user has already chosen
+      // endpoint C. Check before touching renderer or native transport state.
+      requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+      const continuityScope = publishedServerScopesByOrigin.get(expectedOrigin) ?? null;
+      beginBindingTransition();
+      const sessionEpoch = captureUiSessionEpoch();
+      try {
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        const nativeScope = await invoke<unknown>("connect_to_server", {
+          serverUrl: requestedServerUrl,
+          serverHttpUrl: requestedHttpUrl,
+        });
+        requireCurrentUiSession(sessionEpoch);
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        const scope = validateAuthenticatedServerScope(
+          nativeScope,
+          expectedOrigin,
+          continuityScope,
+        );
+        setPendingAuthenticatedServerScope(scope);
+        const diagnostics = await invoke<ConversationCryptoDiagnostic[]>(
+          "get_conversation_crypto_diagnostics",
+        );
+        requireCurrentUiSession(sessionEpoch);
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        // An authenticated transport without published X3DH prekeys cannot
+        // safely receive new DMs. Treat prekey publication as part of connect.
+        await invoke("upload_prekeys", { serverHttpUrl: requestedHttpUrl });
+        requireCurrentUiSession(sessionEpoch);
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        await invoke("confirm_authenticated_session_scope", {
+          userId: scope.userId,
+          canonicalServerOrigin: scope.canonicalServerOrigin,
+          bindingGeneration: scope.bindingGeneration,
+        });
+        requireCurrentUiSession(sessionEpoch);
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        if (!authenticatedScopesEqual(pendingAuthenticatedServerScope(), scope)) {
+          throw new StaleUiSessionError();
+        }
+
+        replaceConversationCryptoDiagnostics(diagnostics);
+        setAuthenticatedServerScope(scope);
+        setPendingAuthenticatedServerScope(null);
+        publishedServerScopesByOrigin.set(scope.canonicalServerOrigin, scope);
+        setOriginTransitioning(false);
+        setUserId(scope.userId);
+        setConnected(true);
+        setReconnecting(false);
+        setBindingTransitioning(false);
+        reconnectAttempt = 0;
+
+        // Renderer hydration is generation-guarded but deliberately not part
+        // of the serialized native bind. A disconnect during hydration can now
+        // queue a real reconnect instead of coalescing with a dead attempt.
+        void (async () => {
+          try {
+            await appStore.loadConversations();
+            requireCurrentUiSession(sessionEpoch);
+            if (!authenticatedScopesEqual(authenticatedServerScope(), scope)) {
+              throw new StaleUiSessionError();
+            }
+            const selectedConversation = activeConversationId();
+            if (selectedConversation) {
+              await appStore.loadMessages(selectedConversation);
+              requireCurrentUiSession(sessionEpoch);
+            }
+            appStore.requestFriendList();
+            appStore.sendPresence(1); // ONLINE
+            void appStore.loadServers();
+            await Promise.allSettled(
+              conversations()
+                .filter((conversation) => conversation.type === "group")
+                .map((conversation) => appStore.getGroupMembers(conversation.id)),
+            );
+            requireCurrentUiSession(sessionEpoch);
+          } catch (error) {
+            if (!(error instanceof StaleUiSessionError)) {
+              console.warn("authenticated renderer hydration failed:", error);
+            }
+          }
+        })();
+        return scope.userId;
+      } catch (e) {
+        rethrowIfStale(e);
+        console.error("connect failed:", e);
+        setAuthenticatedServerScope(null);
+        setPendingAuthenticatedServerScope(null);
+        setBindingTransitioning(true);
+        setConnected(false);
+        setUserId(null);
+        setReconnecting(true);
+        // Let serializeConnectionAttempt clear the rejected shared promise
+        // before the next attempt enters it.
+        setTimeout(() => scheduleReconnect(sessionEpoch), 0);
+        throw e;
+      }
+    }, forceAfterCurrent);
+  },
 
   ensureConnected: () => {
     if (connected() || !acceptsSensitiveEvent()) return;
@@ -694,6 +966,7 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const convId = activeConversationId();
     if (!convId) return;
+    const mutationScope = requirePublishedMutationScope();
     const quarantine = conversationCryptoDiagnostics()[convId];
     if (quarantine) {
       throw new Error(
@@ -708,10 +981,16 @@ export const appStore = {
         // generation is already distributed, and creates/distributes a fresh
         // generation when rotation is required.
         await appStore.distributeSenderKey(convId);
-        requireCurrentUiSession(sessionEpoch);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
       }
-      await invoke("send_message", { conversationId: convId, text, replyToId: replyToId ?? null });
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+      await invoke("send_message", {
+        conversationId: convId,
+        text,
+        replyToId: replyToId ?? null,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       setConversations((prev) =>
         prev.map((conversation) =>
           conversation.id === convId
@@ -737,13 +1016,17 @@ export const appStore = {
 
   discardFailedMessage: async (localMessageId: string) => {
     const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
     const existing = messages().find((message) => message.id === localMessageId);
     const conversationId = existing?.conversationId;
     discardedOutgoingMessageIds.add(localMessageId);
     if (conversationId) nextMessageLoadGeneration(conversationId);
     try {
-      await invoke("discard_failed_outgoing_message", { localMessageId });
-      requireCurrentUiSession(sessionEpoch);
+      await invoke("discard_failed_outgoing_message", {
+        localMessageId,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       rejectedOutgoingMessageIds.delete(localMessageId);
       acknowledgedOutgoingMessageIds.delete(localMessageId);
       const remaining = messages().filter((message) => message.id !== localMessageId);
@@ -766,7 +1049,13 @@ export const appStore = {
     const convId = activeConversationId();
     if (!convId || messages().some((message) => message.id === messageId && (message.pending || message.failed || message.deliveryUnknown))) return;
     try {
-      await invoke("edit_message", { messageId, conversationId: convId, newText });
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("edit_message", {
+        messageId,
+        conversationId: convId,
+        newText,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
     } catch (e) {
       console.error("edit failed:", e);
     }
@@ -776,7 +1065,12 @@ export const appStore = {
     const convId = activeConversationId();
     if (!convId || messages().some((message) => message.id === messageId && (message.pending || message.failed || message.deliveryUnknown))) return;
     try {
-      await invoke("delete_message", { messageId, conversationId: convId });
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("delete_message", {
+        messageId,
+        conversationId: convId,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
     } catch (e) {
       console.error("delete failed:", e);
     }
@@ -786,10 +1080,20 @@ export const appStore = {
   sendTyping: () => {
     const convId = activeConversationId();
     if (!convId) return;
+    let mutationScope: AuthenticatedServerScope;
+    try {
+      mutationScope = requirePublishedMutationScope();
+    } catch {
+      return;
+    }
     const now = Date.now();
     if (now - lastTypingSent < 3000) return;
     lastTypingSent = now;
-    invoke("send_typing", { conversationId: convId, started: true }).catch(() => {});
+    invoke("send_typing", {
+      conversationId: convId,
+      started: true,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    }).catch(() => {});
   },
 
   /** Get display names of users currently typing in a conversation. */
@@ -819,7 +1123,15 @@ export const appStore = {
     const add = !alreadyReacted;
 
     try {
-      await invoke("toggle_reaction", { messageId, conversationId: convId, emoji, userId: uid, add });
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("toggle_reaction", {
+        messageId,
+        conversationId: convId,
+        emoji,
+        userId: uid,
+        add,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
     } catch (e) {
       console.error("reaction failed:", e);
     }
@@ -830,7 +1142,8 @@ export const appStore = {
   /** Request the full friend list from server. */
   requestFriendList: async () => {
     try {
-      await invoke("request_friend_list");
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("request_friend_list", authenticatedMutationScopeArgs(mutationScope));
     } catch (e) {
       console.error("requestFriendList failed:", e);
     }
@@ -841,6 +1154,7 @@ export const appStore = {
   sendFriendRequest: async (targetUserId: string, message?: string): Promise<string> => {
     const sessionEpoch = captureUiSessionEpoch();
     if (!connected() || !friendDirectoryReady()) return "error";
+    const mutationScope = requirePublishedMutationScope();
     // Local duplicate check — if already pending, don't even bother the server
     const existing = friendRequests().find(
       (r) => (r.outgoing && r.fromUserId === targetUserId) || (!r.outgoing && r.fromUserId === targetUserId),
@@ -850,8 +1164,12 @@ export const appStore = {
     if (alreadyFriend) return "already_friends";
 
     try {
-      await invoke("send_friend_request", { targetUserId, message: message ?? null });
-      requireCurrentUiSession(sessionEpoch);
+      await invoke("send_friend_request", {
+        targetUserId,
+        message: message ?? null,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       // Optimistically add outgoing request so it appears in Pending immediately
       setFriendRequests((prev) => [
         ...prev,
@@ -865,8 +1183,8 @@ export const appStore = {
         },
       ]);
       // Also request the real list from server (will overwrite optimistic entry)
-      await invoke("request_friend_list");
-      requireCurrentUiSession(sessionEpoch);
+      await invoke("request_friend_list", authenticatedMutationScopeArgs(mutationScope));
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       return "sent";
     } catch (e) {
       rethrowIfStale(e);
@@ -881,9 +1199,14 @@ export const appStore = {
     if (!connected() || !friendDirectoryReady()) {
       throw new Error("friend directory is not ready for this server origin");
     }
+    const mutationScope = requirePublishedMutationScope();
     try {
-      await invoke("respond_friend_request", { requestId, accept });
-      requireCurrentUiSession(sessionEpoch);
+      await invoke("respond_friend_request", {
+        requestId,
+        accept,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       // Remove from pending list optimistically
       setFriendRequests((prev) => prev.filter((r) => r.requestId !== requestId));
     } catch (e) {
@@ -899,9 +1222,13 @@ export const appStore = {
     if (!connected() || !friendDirectoryReady()) {
       throw new Error("friend directory is not ready for this server origin");
     }
+    const mutationScope = requirePublishedMutationScope();
     try {
-      await invoke("remove_friend", { userId: targetUserId });
-      requireCurrentUiSession(sessionEpoch);
+      await invoke("remove_friend", {
+        userId: targetUserId,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       setFriends((prev) => prev.filter((f) => f.userId !== targetUserId));
     } catch (e) {
       rethrowIfStale(e);
@@ -913,7 +1240,12 @@ export const appStore = {
   /** Send presence status. 1=online, 2=offline, 3=away, 4=dnd */
   sendPresence: async (status: number) => {
     try {
-      await invoke("send_presence", { status, statusText: null });
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("send_presence", {
+        status,
+        statusText: null,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
     } catch (e) {
       console.error("sendPresence failed:", e);
     }
@@ -1384,34 +1716,38 @@ export const appStore = {
     if (ch?.conversationId) {
       const convId = ch.conversationId;
       setActiveConversationId(convId);
+      let mutationScope: AuthenticatedServerScope | null = null;
+      try {
+        mutationScope = requirePublishedMutationScope();
+      } catch {
+        // The local conversation may remain readable while reconnecting, but
+        // no channel/Sender-Key mutation belongs to an unpublished binding.
+      }
       // Mark this conversation as a channel — outgoing messages will be encrypted
       // with sender keys; hydrate any persisted sender-key state from the local DB.
-      invoke("mark_channel_conversation", { conversationId: convId }).catch(() => {});
-      invoke("hydrate_channel_sender_keys", { conversationId: convId }).catch(() => {});
+      if (mutationScope) {
+        const scopeArgs = authenticatedMutationScopeArgs(mutationScope);
+        invoke("mark_channel_conversation", { conversationId: convId, ...scopeArgs }).catch(() => {});
+        invoke("hydrate_channel_sender_keys", { conversationId: convId, ...scopeArgs }).catch(() => {});
+      }
       appStore.loadMessages(convId).catch(() => {});
       // Native fetches and authorizes the current member directory. Renderer
       // cache contents are deliberately not accepted as key recipients.
-      appStore.distributeSenderKey(convId).catch((e) =>
-        console.warn("distribute_sender_key failed:", e),
-      );
+      if (mutationScope) {
+        appStore.distributeSenderKey(convId).catch((e) =>
+          console.warn("distribute_sender_key failed:", e),
+        );
+      }
     } else {
       setActiveConversationId(null);
     }
   },
 
-  /** Hydrate the server rail from local cache (instant), then refresh from REST. */
+  /** Load server rows only from the currently authenticated REST namespace. */
   loadServers: async () => {
     const sessionEpoch = captureUiSessionEpoch();
-    // 1. Cache first for instant UI
-    try {
-      const cached = await invoke<Array<any>>("cache_load_servers");
-      requireCurrentUiSession(sessionEpoch);
-      setServers(cached.map(serverFromJSON));
-    } catch (e) {
-      if (e instanceof StaleUiSessionError) return;
-      console.warn("cache_load_servers failed:", e);
-    }
-    // 2. REST refresh
+    // The v1 desktop cache has bare UUID keys and no server origin. It stays
+    // disabled until an origin-scoped schema can make collisions impossible.
     const uid = userId();
     if (!uid) return;
     try {
@@ -1421,8 +1757,6 @@ export const appStore = {
       });
       requireCurrentUiSession(sessionEpoch);
       setServers(fresh.map(serverFromJSON));
-      await invoke("cache_save_servers", { servers: fresh }).catch(() => {});
-      requireCurrentUiSession(sessionEpoch);
       // Member-only directories carry the server-pinned identity/signing-key
       // bindings needed to verify authenticated Sender Key distributions.
       await Promise.allSettled(
@@ -1437,15 +1771,6 @@ export const appStore = {
 
   loadChannels: async (serverId: string) => {
     const sessionEpoch = captureUiSessionEpoch();
-    // 1. Cache first
-    try {
-      const cached = await invoke<Array<any>>("cache_load_channels", { serverId });
-      requireCurrentUiSession(sessionEpoch);
-      setChannelsByServer((prev) => ({ ...prev, [serverId]: cached.map(channelFromJSON) }));
-    } catch (e) {
-      if (e instanceof StaleUiSessionError) return;
-    }
-    // 2. REST refresh
     const uid = userId();
     if (!uid) return;
     try {
@@ -1456,8 +1781,6 @@ export const appStore = {
       });
       requireCurrentUiSession(sessionEpoch);
       setChannelsByServer((prev) => ({ ...prev, [serverId]: fresh.map(channelFromJSON) }));
-      await invoke("cache_save_channels", { serverId, channels: fresh }).catch(() => {});
-      requireCurrentUiSession(sessionEpoch);
       // If active server but no active channel, pick first text channel
       if (activeServerId() === serverId && !activeChannelId()) {
         const firstText = fresh.find((c) => (c.channel_type ?? 0) === 0);
@@ -1471,13 +1794,6 @@ export const appStore = {
 
   loadServerMembers: async (serverId: string) => {
     const sessionEpoch = captureUiSessionEpoch();
-    try {
-      const cached = await invoke<Array<any>>("cache_load_server_members", { serverId });
-      requireCurrentUiSession(sessionEpoch);
-      setServerMembers((prev) => ({ ...prev, [serverId]: cached.map(memberFromJSON) }));
-    } catch (e) {
-      if (e instanceof StaleUiSessionError) return;
-    }
     const uid = userId();
     if (!uid) return;
     try {
@@ -1489,8 +1805,6 @@ export const appStore = {
       requireCurrentUiSession(sessionEpoch);
       const mapped = fresh.map(memberFromJSON);
       setServerMembers((prev) => ({ ...prev, [serverId]: mapped }));
-      await invoke("cache_save_server_members", { serverId, members: fresh }).catch(() => {});
-      requireCurrentUiSession(sessionEpoch);
       // If we're viewing a channel of this server, push our sender key to the freshly
       // known members. (Idempotent: noop for already-up-to-date peers, refresh on change.)
       if (activeServerId() === serverId) {
@@ -1510,6 +1824,7 @@ export const appStore = {
   /** Distribute a sender key using the native authenticated member directory. */
   distributeSenderKey: async (conversationId: string): Promise<void> => {
     const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
     const selfUserId = userId();
     if (!selfUserId) throw new Error("sender-key distribution requires an authenticated user");
     setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "checking" }));
@@ -1518,10 +1833,11 @@ export const appStore = {
         conversationId,
         serverHttpUrl: serverHttpUrl(),
         userId: selfUserId,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       let status = await appStore.refreshSenderKeyStatus(conversationId);
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
 
       // Distribution fan-out completes before every recipient ACK arrives.
       // Keep the original Send action pending for a short bounded window so a
@@ -1535,21 +1851,21 @@ export const appStore = {
           );
         }
         await new Promise<void>((resolve) => setTimeout(resolve, 250));
-        requireCurrentUiSession(sessionEpoch);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
         status = await appStore.refreshSenderKeyStatus(conversationId);
-        requireCurrentUiSession(sessionEpoch);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
       }
       if (status !== "ready") {
         throw new Error("Sender-key distribution failed; sending remains blocked");
       }
     } catch (error) {
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       try {
         // Whatever native reports after the failed distribution attempt is
         // authoritative. In particular, a final ACK may have made it ready
         // between the command error and this refresh.
         const refreshed = await appStore.refreshSenderKeyStatus(conversationId);
-        requireCurrentUiSession(sessionEpoch);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
         if (refreshed === "checking") {
           setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "error" }));
         }
@@ -1563,10 +1879,12 @@ export const appStore = {
 
   refreshSenderKeyStatus: async (conversationId: string): Promise<SenderKeyStatus> => {
     const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
     const status = await invoke<SenderKeyStatus>("sender_key_distribution_status", {
       conversationId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
-    requireCurrentUiSession(sessionEpoch);
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     const normalized: SenderKeyStatus = ["checking", "pending", "ready", "error"].includes(status)
       ? status
       : "error";
@@ -1576,13 +1894,6 @@ export const appStore = {
 
   loadServerRoles: async (serverId: string) => {
     const sessionEpoch = captureUiSessionEpoch();
-    try {
-      const cached = await invoke<Array<any>>("cache_load_roles", { serverId });
-      requireCurrentUiSession(sessionEpoch);
-      setServerRoles((prev) => ({ ...prev, [serverId]: cached.map(roleFromJSON) }));
-    } catch (e) {
-      if (e instanceof StaleUiSessionError) return;
-    }
     const uid = userId();
     if (!uid) return;
     try {
@@ -1593,8 +1904,6 @@ export const appStore = {
       });
       requireCurrentUiSession(sessionEpoch);
       setServerRoles((prev) => ({ ...prev, [serverId]: fresh.map(roleFromJSON) }));
-      await invoke("cache_save_roles", { serverId, roles: fresh }).catch(() => {});
-      requireCurrentUiSession(sessionEpoch);
     } catch (e) {
       if (e instanceof StaleUiSessionError) return;
       console.error("list_roles failed:", e);
@@ -1614,11 +1923,6 @@ export const appStore = {
       requireCurrentUiSession(sessionEpoch);
       const created = serverFromJSON(s);
       setServers((prev) => [...prev, created]);
-      // Persist the updated list
-      await invoke("cache_save_servers", {
-        servers: [...servers().map(serverToJSON)],
-      }).catch(() => {});
-      requireCurrentUiSession(sessionEpoch);
       return created;
     } catch (e) {
       rethrowIfStale(e);
@@ -1648,7 +1952,6 @@ export const appStore = {
         setActiveServerId(null);
         setActiveChannelId(null);
       }
-      await invoke("cache_delete_server", { serverId }).catch(() => {});
     } catch (e) {
       rethrowIfStale(e);
       console.error("delete_server failed:", e);
@@ -1672,7 +1975,6 @@ export const appStore = {
         setActiveServerId(null);
         setActiveChannelId(null);
       }
-      await invoke("cache_delete_server", { serverId }).catch(() => {});
     } catch (e) {
       rethrowIfStale(e);
       console.error("leave_server failed:", e);
@@ -1730,7 +2032,6 @@ export const appStore = {
         [serverId]: (prev[serverId] ?? []).filter((c) => c.id !== channelId),
       }));
       if (activeChannelId() === channelId) setActiveChannelId(null);
-      await invoke("cache_delete_channel", { channelId }).catch(() => {});
     } catch (e) {
       rethrowIfStale(e);
       console.error("delete_channel failed:", e);
@@ -1969,6 +2270,7 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("update_role", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
@@ -1977,8 +2279,9 @@ export const appStore = {
       name: patch.name ?? null,
       permissions: patch.permissions ?? null,
       color: patch.color ?? null,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
-    requireCurrentUiSession(sessionEpoch);
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerRoles((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((r) =>
@@ -1998,13 +2301,15 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("delete_role", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
       roleId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
-    requireCurrentUiSession(sessionEpoch);
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerRoles((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).filter((r) => r.id !== roleId),
@@ -2015,14 +2320,16 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("assign_role", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
       targetUserId,
       roleId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
-    requireCurrentUiSession(sessionEpoch);
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((m) =>
@@ -2037,14 +2344,16 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("unassign_role", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
       targetUserId,
       roleId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
-    requireCurrentUiSession(sessionEpoch);
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((m) =>
@@ -2097,23 +2406,29 @@ export const appStore = {
   },
 
   /** Set up Tauri event listeners for incoming server events. */
-  setupEventListeners: async () => {
+  setupEventListeners: () => {
     // App.tsx is hot-reloaded during development. Registering another copy of
     // every native listener on each remount multiplies reconnects and REST
     // refreshes, so the store owns one listener set for its lifetime.
-    if (eventListenersInitialized) return;
-    eventListenersInitialized = true;
-    await listen("veil://locked", () => {
+    if (eventListenersInitialized) return Promise.resolve();
+    if (eventListenersInitialization) return eventListenersInitialization;
+    const initialization = (async () => {
+      const registered: UnlistenFn[] = [];
+      const register = async <T>(event: string, handler: EventCallback<T>) => {
+        registered.push(await listen<T>(event, handler));
+      };
+      try {
+      await register("veil://locked", () => {
       // Native expiry already destroyed key/DB state. Clear renderer plaintext
       // synchronously before any fallible keychain or IPC operation.
       clearSensitiveUi();
       invoke("lock_app").catch((error) => console.error("native auto-lock follow-up failed:", error));
     });
 
-    await listen<{ conversations: number; messages: number; duplicates: number; unavailableHistory: number; retainedSenderKeys: number; edits: number; tombstones: number; unavailableConversations: ConversationCryptoDiagnostic[] }>(
+      await register<{ conversations: number; messages: number; duplicates: number; unavailableHistory: number; retainedSenderKeys: number; edits: number; tombstones: number; unavailableConversations: ConversationCryptoDiagnostic[] }>(
       "veil://sync-complete",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         replaceConversationCryptoDiagnostics(event.payload.unavailableConversations ?? []);
         if (event.payload.unavailableHistory > 0) {
           console.warn(
@@ -2123,15 +2438,15 @@ export const appStore = {
       },
     );
 
-    await listen<ConversationCryptoDiagnostic>(
+      await register<ConversationCryptoDiagnostic>(
       "veil://conversation-crypto-unavailable",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         upsertConversationCryptoDiagnostic(event.payload);
       },
     );
 
-    await listen<{
+      await register<{
       messageId: string;
       conversationId: string;
       conversationType?: "dm" | "group" | "channel";
@@ -2150,7 +2465,7 @@ export const appStore = {
     }>(
       "veil://message",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const d = event.payload;
         const isOwn = d.senderKey === identity();
         const senderName = isOwn ? "You" : (d.senderName?.trim() || "Unknown author");
@@ -2194,14 +2509,10 @@ export const appStore = {
       },
     );
 
-    await listen<{ reason: string }>("veil://disconnected", () => {
-      if (!acceptsSensitiveEvent()) return;
-      setConnected(false);
-      setReconnecting(true);
-      setFriends([]);
-      setFriendRequests([]);
-      setPresenceMap({});
-      setFriendDirectoryReady(false);
+      await register<{ reason: string }>("veil://disconnected", (event) => {
+      if (!matchesPendingOrCurrentAuthenticatedScope(event.payload)) return;
+      beginBindingTransition();
+      const disconnectedEpoch = captureUiSessionEpoch();
       const affectedConversations = new Set<string>();
       let disconnectedSnapshot: Message[] = [];
       setMessages((previous) => {
@@ -2216,26 +2527,25 @@ export const appStore = {
         nextMessageLoadGeneration(conversationId);
         updateConversationPreview(conversationId, disconnectedSnapshot);
       }
-      const selectedConversation = activeConversationId();
-      if (selectedConversation) {
-        void appStore.loadMessages(selectedConversation).catch(() => {});
-      }
-      scheduleReconnect(captureUiSessionEpoch());
+      // Native has already removed the matching REST binding. Keep the last
+      // SQLCipher snapshot visible, but do not issue another IPC read until a
+      // new exact scope has passed the publication gate.
+      scheduleReconnect(disconnectedEpoch);
     });
 
-    await listen("veil://membership-refresh-required", () => {
-      if (!acceptsSensitiveEvent()) return;
-      void appStore.connectToServer().catch((error) => {
+      await register("veil://membership-refresh-required", (event) => {
+      if (!acceptsAuthenticatedEvent(event.payload)) return;
+      void appStore.connectToServer(true).catch((error) => {
         if (!(error instanceof StaleUiSessionError)) {
           console.error("membership refresh reconnect failed:", error);
         }
       });
     });
 
-    await listen<{ messageId: string; localMessageId?: string | null; refSeq: number }>(
+      await register<{ messageId: string; localMessageId?: string | null; refSeq: number }>(
       "veil://message-ack",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const { messageId, localMessageId } = event.payload;
         const active = appStore.activeConversation();
         if (active?.type === "group" || active?.type === "channel") {
@@ -2286,10 +2596,10 @@ export const appStore = {
       },
     );
 
-    await listen<{ messageId: string; conversationId: string; newText: string; editTimestamp: number }>(
+      await register<{ messageId: string; conversationId: string; newText: string; editTimestamp: number }>(
       "veil://message-edited",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const d = event.payload;
         nextMessageLoadGeneration(d.conversationId);
         let editedSnapshot: Message[] = [];
@@ -2310,10 +2620,10 @@ export const appStore = {
       },
     );
 
-    await listen<{ messageId: string; conversationId: string }>(
+      await register<{ messageId: string; conversationId: string }>(
       "veil://message-deleted",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const d = event.payload;
         nextMessageLoadGeneration(d.conversationId);
         let remainingSnapshot: Message[] = [];
@@ -2331,10 +2641,10 @@ export const appStore = {
       },
     );
 
-    await listen<{ conversationId: string; identityKey: string; started: boolean }>(
+      await register<{ conversationId: string; identityKey: string; started: boolean }>(
       "veil://typing",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const eventEpoch = captureUiSessionEpoch();
         const { conversationId, identityKey, started } = event.payload;
         setTypingUsers((prev) => {
@@ -2369,8 +2679,8 @@ export const appStore = {
       },
     );
 
-    await listen<{ code: number; message: string; localMessageId?: string | null }>("veil://error", (event) => {
-      if (!acceptsSensitiveEvent()) return;
+      await register<{ code: number; message: string; localMessageId?: string | null }>("veil://error", (event) => {
+      if (!acceptsAuthenticatedEvent(event.payload)) return;
       console.error("server error:", event.payload);
       const active = appStore.activeConversation();
       if (active?.type === "group" || active?.type === "channel") {
@@ -2401,10 +2711,10 @@ export const appStore = {
       }
     });
 
-    await listen<{ messageId: string; conversationId: string; emoji: string; userId: string; username: string; add: boolean }>(
+      await register<{ messageId: string; conversationId: string; emoji: string; userId: string; username: string; add: boolean }>(
       "veil://reaction",
       (event) => {
-        if (!acceptsSensitiveEvent()) return;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const { messageId, emoji, userId: uid, username, add } = event.payload;
         setReactions((prev) => {
           const copy = { ...prev };
@@ -2426,10 +2736,10 @@ export const appStore = {
 
     // ── Friend / Presence events ──
 
-    await listen<{ identityKey: string; status: number; statusText?: string; lastSeen?: number }>(
+      await register<{ identityKey: string; status: number; statusText?: string; lastSeen?: number }>(
       "veil://presence",
       (event) => {
-        if (!acceptsSensitiveEvent() || !connected()) return;
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const { identityKey, status } = event.payload;
         setPresenceMap((prev) => ({ ...prev, [identityKey]: status }));
         // Also update friend list status
@@ -2442,10 +2752,10 @@ export const appStore = {
       },
     );
 
-    await listen<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number }>(
+      await register<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number }>(
       "veil://friend-request",
       (event) => {
-        if (!acceptsSensitiveEvent() || !connected()) return;
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const d = event.payload;
         setFriendRequests((prev) => [
           ...prev,
@@ -2461,10 +2771,10 @@ export const appStore = {
       },
     );
 
-    await listen<{ userId: string; username: string }>(
+      await register<{ userId: string; username: string }>(
       "veil://friend-accepted",
       (event) => {
-        if (!acceptsSensitiveEvent() || !connected()) return;
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const { userId: uid, username } = event.payload;
         // Add to friends list
         setFriends((prev) => {
@@ -2476,22 +2786,22 @@ export const appStore = {
       },
     );
 
-    await listen<{ userId: string }>(
+      await register<{ userId: string }>(
       "veil://friend-removed",
       (event) => {
-        if (!acceptsSensitiveEvent() || !connected()) return;
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const { userId: uid } = event.payload;
         setFriends((prev) => prev.filter((f) => f.userId !== uid));
       },
     );
 
-    await listen<{
+      await register<{
       friends: Array<{ userId: string; username: string; status: number; lastSeen?: number }>;
       pendingRequests: Array<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number; outgoing: boolean }>;
     }>(
       "veil://friend-list",
       (event) => {
-        if (!acceptsSensitiveEvent() || !connected()) return;
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const d = event.payload;
         setFriends(d.friends.map((f) => ({ userId: f.userId, username: f.username, status: f.status, lastSeen: f.lastSeen })));
         setFriendRequests(d.pendingRequests.map((r) => ({
@@ -2519,14 +2829,14 @@ export const appStore = {
     const SE_ROLE_UPDATED = 8;
     const SE_ROLE_DELETED = 9;
 
-    await listen<{
+      await register<{
       eventType: number;
       serverId: string;
       serverInfo?: { id: string; name: string; iconUrl?: string; ownerIdentityKey: string };
       memberInfo?: { identityKey: string; username: string; roleIds: string[]; reason?: string };
       roleInfo?: { id: string; name: string; permissions: number; position: number; color?: number };
     }>("veil://server-event", (event) => {
-      if (!acceptsSensitiveEvent()) return;
+      if (!acceptsAuthenticatedEvent(event.payload)) return;
       const d = event.payload;
       switch (d.eventType) {
         case SE_CREATED:
@@ -2540,7 +2850,6 @@ export const appStore = {
             setActiveServerId(null);
             setActiveChannelId(null);
           }
-          invoke("cache_delete_server", { serverId: d.serverId }).catch(() => {});
           break;
         case SE_MEMBER_JOINED:
         case SE_MEMBER_LEFT:
@@ -2562,7 +2871,7 @@ export const appStore = {
     const CE_DELETED = 2;
     const CE_REORDERED = 3;
 
-    await listen<{
+      await register<{
       eventType: number;
       serverId: string;
       channel: {
@@ -2575,7 +2884,7 @@ export const appStore = {
         topic?: string;
       };
     }>("veil://channel-event", (event) => {
-      if (!acceptsSensitiveEvent()) return;
+      if (!acceptsAuthenticatedEvent(event.payload)) return;
       const d = event.payload;
       const ch = d.channel;
       switch (d.eventType) {
@@ -2591,14 +2900,15 @@ export const appStore = {
             [d.serverId]: (prev[d.serverId] ?? []).filter((c) => c.id !== ch.id),
           }));
           if (activeChannelId() === ch.id) setActiveChannelId(null);
-          invoke("cache_delete_channel", { channelId: ch.id }).catch(() => {});
           break;
       }
     });
 
-    // Deep links are untrusted OS input. Never create conversations or claim
-    // prekeys without an explicit in-app user decision.
-    await listen<string[]>("deep-link://new-url", async (event) => {
+    // Deep links are untrusted OS input. UUID-only Add Me links predate the
+    // canonical (origin, user, identity-key) locator and are ambiguous across
+    // self-hosted instances, so they fail closed until a versioned format has
+    // its own schema/privacy/security review.
+      await register<string[]>("deep-link://new-url", async (event) => {
       if (!acceptsSensitiveEvent()) return;
       const urls = event.payload;
       for (const raw of urls) {
@@ -2607,24 +2917,36 @@ export const appStore = {
           const parts = url.pathname.replace(/^\/+/, "").split("/");
           const addUserId = url.hostname === "add" ? parts[0] : parts[0] === "add" ? parts[1] : "";
           const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-          if (
-            url.protocol === "veil:" &&
-            addUserId &&
-            canonicalUuid.test(addUserId) &&
-            await confirmDecision({
-              title: "Open encrypted conversation?",
-              message: `Veil received a link asking to start a conversation with ${addUserId}. Continue only if you expected this link.`,
-              confirmLabel: "Start conversation",
-            })
-          ) {
-            void appStore.createDm(addUserId).catch((error) => {
-              console.warn("deep-link DM creation failed:", error);
+          if (url.protocol === "veil:" && addUserId && canonicalUuid.test(addUserId)) {
+            await alertDecision({
+              title: "Legacy Add Me link blocked",
+              message: "This link contains only a user ID and cannot distinguish self-hosted Veil servers. Ask the sender for an origin-scoped link after that format is available.",
+              confirmLabel: "Close",
             });
           }
           // veil://share/{id} — future
         } catch {
           // ignore malformed
         }
+      }
+      });
+      eventListenersInitialized = true;
+    } catch (error) {
+      for (const unlisten of registered.reverse()) {
+        try {
+          unlisten();
+        } catch {
+          // Continue removing the rest of a partially installed listener set.
+        }
+      }
+      eventListenersInitialized = false;
+        throw error;
+      }
+    })();
+    eventListenersInitialization = initialization;
+    return initialization.finally(() => {
+      if (eventListenersInitialization === initialization) {
+        eventListenersInitialization = null;
       }
     });
   },

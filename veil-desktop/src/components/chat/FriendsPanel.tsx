@@ -1,5 +1,5 @@
 import { Tabs as KTabs } from "@kobalte/core/tabs";
-import { Component, For, Show, createSignal, type JSX } from "solid-js";
+import { Component, For, Show, createEffect, createSignal, type JSX } from "solid-js";
 import { appStore, type Friend, type FriendRequest } from "@/stores/app";
 import { Inbox, MessageCircle, UserMinus, Users } from "lucide-solid";
 import { toast } from "@/components/ui/toast";
@@ -49,6 +49,26 @@ const AddFriendSection: Component = () => {
   const [status, setStatus] = createSignal<"idle" | "searching" | "found" | "sent" | "error">("idle");
   const [foundUser, setFoundUser] = createSignal<{ userId: string; username: string; identityKey: string } | null>(null);
   const [errorMsg, setErrorMsg] = createSignal("");
+
+  let lastOriginEpoch = appStore.originEpoch();
+  createEffect(() => {
+    const currentOriginEpoch = appStore.originEpoch();
+    if (currentOriginEpoch === lastOriginEpoch) return;
+    lastOriginEpoch = currentOriginEpoch;
+    setUsername("");
+    setStatus("idle");
+    setFoundUser(null);
+    setErrorMsg("");
+  });
+
+  createEffect(() => {
+    if (!appStore.bindingTransitioning()) return;
+    // Keep the same-origin query text, but retire search/request results from
+    // the previous authenticated generation.
+    setStatus("idle");
+    setFoundUser(null);
+    setErrorMsg("");
+  });
 
   const search = async () => {
     const q = username().trim();
@@ -253,6 +273,14 @@ type FriendsTab = "all" | "online" | "pending" | "add";
 
 export const FriendsPanel: Component<{ onNavigate?: () => void }> = (props) => {
   const [activeTab, setActiveTab] = createSignal<FriendsTab>("all");
+
+  let lastOriginEpoch = appStore.originEpoch();
+  createEffect(() => {
+    const currentOriginEpoch = appStore.originEpoch();
+    if (currentOriginEpoch === lastOriginEpoch) return;
+    lastOriginEpoch = currentOriginEpoch;
+    setActiveTab("all");
+  });
 
   const incomingRequests = () => appStore.friendRequests().filter((r) => !r.outgoing);
   const onlineFriends = () => appStore.friends().filter((f) => f.status === 1);

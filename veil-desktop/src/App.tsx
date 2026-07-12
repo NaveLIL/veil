@@ -204,6 +204,10 @@ const App: Component = () => {
     conv()?.id,
   );
   const cryptoDiagnostic = () => cryptoGate().diagnostic;
+  const transportMutationUnavailable = () =>
+    !appStore.connected()
+    || appStore.bindingTransitioning()
+    || !appStore.authenticatedServerScope();
   const encryptionLabel = () => {
     const conversation = conv();
     if (cryptoGate().headerLabel) return cryptoGate().headerLabel!;
@@ -354,6 +358,10 @@ const App: Component = () => {
     const text = inputText().trim();
     const conversation = conv();
     if (!text || !conversation || text.length > MAX_MSG_LEN || sendBusy()) return;
+    if (transportMutationUnavailable()) {
+      setSendNotice("error");
+      return;
+    }
     const quarantine = cryptoDiagnostic();
     if (quarantine) {
       setSendNotice("security");
@@ -470,6 +478,7 @@ const App: Component = () => {
     setCreatingDm(true);
     try {
       await appStore.createDm(id);
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       setNewPeerId("");
       setShowNewDm(false);
     } catch (reason) {
@@ -477,26 +486,33 @@ const App: Component = () => {
         toast.error("Conversation not created", String(reason).replace(/^Error:\s*/, ""));
       }
     } finally {
-      setCreatingDm(false);
+      // Origin cleanup already released the old busy state. Do not let that
+      // stale completion release a newer origin's create operation.
+      if (isUiSessionEpochCurrent(sessionEpoch)) setCreatingDm(false);
     }
   };
 
   const handleNewGroup = async () => {
     const name = newGroupName().trim();
     if (!name || creatingGroup()) return;
+    const sessionEpoch = captureUiSessionEpoch();
     setCreatingGroup(true);
     setGroupCreateError("");
     try {
       const conversationId = await appStore.createGroup(name);
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       if (!conversationId) throw new Error("The server did not confirm group creation");
       setNewGroupName("");
       setShowNewGroup(false);
     } catch (reason) {
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       const message = String(reason).replace(/^Error:\s*/, "");
       setGroupCreateError(message);
       toast.error("Group not created", message);
     } finally {
-      setCreatingGroup(false);
+      // See handleNewDm: a late completion belongs only to its captured
+      // renderer session, never to a create flow on the next origin.
+      if (isUiSessionEpochCurrent(sessionEpoch)) setCreatingGroup(false);
     }
   };
 
@@ -669,6 +685,10 @@ const App: Component = () => {
     await appearanceStore.initialize();
 
     try {
+      // Install the complete listener set before any path can create a native
+      // transport. A fast connect→disconnect must never fall into a gap where
+      // renderer state can publish Online without observing the disconnect.
+      await appStore.setupEventListeners();
       const hasIdentity = await invoke<boolean>("has_stored_identity");
       if (!hasIdentity) {
         appStore.setScreen("onboarding");
@@ -688,7 +708,6 @@ const App: Component = () => {
         );
       }
     } catch { appStore.setScreen("onboarding"); }
-    await appStore.setupEventListeners();
     await appStore.loadAutoLockSetting().catch((e) =>
       console.warn("auto-lock setting load failed:", e),
     );
@@ -759,24 +778,28 @@ const App: Component = () => {
   const [showCreateChannel, setShowCreateChannel] = createSignal(false);
   const [showCreateInvite, setShowCreateInvite] = createSignal(false);
 
-  // Store state is not the only place where plaintext lives. Drafts, edit and
-  // reply references, search text and globally-mounted overlays belong to this
-  // root component and otherwise survive a screen switch. Purge them whenever
-  // the native boundary moves to the locked state.
-  createEffect(() => {
-    if (appStore.screen() !== "locked") return;
+  const resetOriginLocalState = () => {
+    // Keep the monotonic sendTokenCounter intact: an older async send must
+    // never receive the same token as work started on the next origin.
+    activeSendToken = null;
+    setDeferredSendDrafts({});
     setInputText("");
     setSendNotice("");
     setSendBusy(false);
     setSearch("");
     setNewPeerId("");
     setNewGroupName("");
+    setCreatingDm(false);
+    setCreatingGroup(false);
+    setGroupCreateError("");
+    setSidebarTab("all");
     setGroupMembers([]);
     setReplyingTo(null);
     setEditingMessage(null);
     setEditText("");
     setDeletingIds(new Set<string>());
     setMemberPanelOpen(false);
+    setIsland4Vis(false);
     setShowFriendsPanel(false);
     setShowNewDm(false);
     setShowNewGroup(false);
@@ -786,7 +809,38 @@ const App: Component = () => {
     setShowCreateChannel(false);
     setShowCreateInvite(false);
     setActiveServer("home");
+    if (inputRef) inputRef.style.height = "21px";
     toast.clear();
+  };
+
+  createEffect(() => {
+    if (!appStore.bindingTransitioning()) return;
+    // Same-origin reconnects keep drafts and navigation, but every in-flight
+    // action belongs to the retired binding generation. Release its local UI
+    // tokens immediately; late completions are already fenced by uiSessionEpoch.
+    activeSendToken = null;
+    setSendBusy(false);
+    setCreatingDm(false);
+    setCreatingGroup(false);
+    setGroupCreateError("");
+    setDeletingIds(new Set<string>());
+    setCmdkOpen(false);
+    setShowCreateServer(false);
+    setShowJoinServer(false);
+    setShowCreateChannel(false);
+    setShowCreateInvite(false);
+  });
+
+  // Store state is not the only place where plaintext lives. Drafts, edit and
+  // reply references, search text and globally-mounted overlays belong to this
+  // root component and otherwise survive lock or a self-hosted origin switch.
+  let lastClearedOriginEpoch = appStore.originEpoch();
+  createEffect(() => {
+    const currentOriginEpoch = appStore.originEpoch();
+    const locked = appStore.screen() === "locked";
+    if (!locked && currentOriginEpoch === lastClearedOriginEpoch) return;
+    lastClearedOriginEpoch = currentOriginEpoch;
+    resetOriginLocalState();
   });
   // Collapsed category IDs (per-server). Default: all expanded.
   const [collapsedCats, setCollapsedCats] = createSignal<Set<string>>(new Set());
@@ -804,6 +858,17 @@ const App: Component = () => {
     { kind: "before"; id: string } | { kind: "category"; id: string | null } | null
   >(null);
   const serverHydrationInFlight = new Set<string>();
+
+  let lastContextOriginEpoch = appStore.originEpoch();
+  createEffect(() => {
+    const currentOriginEpoch = appStore.originEpoch();
+    if (currentOriginEpoch === lastContextOriginEpoch) return;
+    lastContextOriginEpoch = currentOriginEpoch;
+    setCollapsedCats(new Set<string>());
+    setDragChannelId(null);
+    setDropTarget(null);
+    serverHydrationInFlight.clear();
+  });
 
   // Keep the local rail selection in sync with the global app store so that
   // newly-created servers / store-driven changes are reflected in the UI.
@@ -2151,9 +2216,15 @@ const App: Component = () => {
                         </div>
                         <button
                           type="button"
-                          style={S.sendBtn(!!inputText().trim() && inputText().length <= MAX_MSG_LEN && !sendBusy() && !cryptoGate().blocked)}
-                          disabled={sendBusy() || cryptoGate().blocked || !inputText().trim() || inputText().length > MAX_MSG_LEN}
-                          aria-label={cryptoGate().blocked ? "Sending blocked: secure conversation unavailable" : sendBusy() ? "Sending message" : "Send message"}
+                          style={S.sendBtn(!!inputText().trim() && inputText().length <= MAX_MSG_LEN && !sendBusy() && !cryptoGate().blocked && !transportMutationUnavailable())}
+                          disabled={sendBusy() || cryptoGate().blocked || transportMutationUnavailable() || !inputText().trim() || inputText().length > MAX_MSG_LEN}
+                          aria-label={cryptoGate().blocked
+                            ? "Sending blocked: secure conversation unavailable"
+                            : transportMutationUnavailable()
+                              ? "Sending blocked while reconnecting"
+                              : sendBusy()
+                                ? "Sending message"
+                                : "Send message"}
                           onClick={() => void handleSend()}
                         ><Send size={14} strokeWidth={2.2} /></button>
                       </div>

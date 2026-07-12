@@ -1,4 +1,4 @@
-import { Component, createSignal, Show, For, Switch, Match, onMount, onCleanup } from "solid-js";
+import { Component, createEffect, createSignal, Show, For, Switch, Match, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
@@ -11,7 +11,6 @@ import {
   AlertTriangle,
   ArrowLeft,
   Bell,
-  Check,
   Copy,
   FileText,
   ExternalLink,
@@ -82,6 +81,7 @@ export const SettingsScreen: Component = () => {
   const [httpUrl, setHttpUrl] = createSignal(appStore.serverHttpUrl());
   const [networkSaved, setNetworkSaved] = createSignal(false);
   const [networkError, setNetworkError] = createSignal("");
+  const [networkSaving, setNetworkSaving] = createSignal(false);
 
   // Auto-lock
   const autoLockMin = () => appStore.autoLockSeconds() / 60;
@@ -133,6 +133,10 @@ export const SettingsScreen: Component = () => {
     setRecoveryError("");
     setRecoveryPin("");
   };
+
+  createEffect(() => {
+    if (appStore.bindingTransitioning()) setRecoveryLoading(false);
+  });
 
   const confirmRecoveryReveal = () => {
     if (!hasPin()) {
@@ -257,7 +261,9 @@ export const SettingsScreen: Component = () => {
     }
   };
 
-  const saveNetwork = () => {
+  const saveNetwork = async () => {
+    if (networkSaving()) return;
+    setNetworkSaving(true);
     try {
       const ws = new URL(wsUrl());
       const http = new URL(httpUrl());
@@ -271,19 +277,22 @@ export const SettingsScreen: Component = () => {
       if (ws.hostname !== http.hostname) {
         throw new Error("WebSocket and API endpoints must use the same host");
       }
-      appStore.setServerEndpoints(ws.toString(), http.toString());
+      const change = appStore.setServerEndpoints(ws.toString(), http.toString());
+      if (change.transportChanged || !appStore.connected()) await appStore.connectToServer();
       setNetworkError("");
       setNetworkSaved(true);
       later(() => setNetworkSaved(false), 2000);
     } catch (e) {
       setNetworkSaved(false);
       setNetworkError(String(e));
+    } finally {
+      setNetworkSaving(false);
     }
   };
 
   const identityKey = () => appStore.identity() || "—";
   const userId = () => appStore.userId() || "—";
-  const veilLink = () => appStore.userId() ? `veil://add/${userId()}` : "Connect to a server to create your Add Me Link";
+  const addMeStatus = "Unavailable until origin-scoped profile links are supported";
 
   // ─── Styles ─────────────────────────────────────────
   const S = {
@@ -550,13 +559,13 @@ export const SettingsScreen: Component = () => {
         <div style={{ ...S.field, "border-bottom": "none" }}>
           <span style={S.fieldLabel}>Add Me Link</span>
           <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
-            <span style={{ ...S.fieldValue, color: "rgba(var(--veil-accent-rgb),0.72)" }}>{veilLink()}</span>
+            <span id="add-me-link-status" style={{ ...S.fieldValue, color: "var(--veil-text-faint)" }}>{addMeStatus}</span>
             <button
               style={S.copyBtn(copied() === "link")}
-              disabled={!appStore.userId()}
-              onClick={() => copyText(veilLink(), "link")}
+              disabled
+              aria-describedby="add-me-link-status"
             >
-              {copied() === "link" ? "\u2713 Copied" : "Copy"}
+              Copy
             </button>
           </div>
         </div>
@@ -565,15 +574,15 @@ export const SettingsScreen: Component = () => {
       <div style={S.card}>
         <div style={S.cardTitle}>Share Your Profile</div>
         <div style={S.paragraph}>
-          Share your <strong style={{ color: "rgba(var(--veil-accent-rgb),0.9)" }}>Add Me Link</strong> so someone can find your account and start an encrypted conversation. Use the Identity Key above only for out-of-band identity verification.
+          Legacy UUID-only Add Me links are disabled because identical user IDs may belong to different self-hosted servers. A versioned link will return only after it carries the server origin, user ID and identity key through a dedicated security review.
         </div>
         <div style={{ display: "flex", gap: "10px" }}>
           <button
             style={S.btnPrimary}
-            disabled={!appStore.userId()}
-            onClick={() => copyText(veilLink(), "link")}
+            disabled
+            aria-describedby="add-me-link-status"
           >
-            {copied() === "link" ? <><Check size={14} strokeWidth={2.2} /> Copied</> : <><Copy size={14} strokeWidth={2} /> Copy Add Me Link</>}
+            <Copy size={14} strokeWidth={2} /> Add Me Link unavailable
           </button>
         </div>
       </div>
@@ -1005,16 +1014,26 @@ export const SettingsScreen: Component = () => {
         </div>
 
         <div style={{ display: "flex", "align-items": "center", gap: "12px" }}>
-          <button style={S.btnPrimary} onClick={saveNetwork}>Save</button>
-          <Show when={!appStore.connected()}>
-            <button style={S.btnSecondary} onClick={() => appStore.connectToServer()}>Reconnect</button>
+          <button
+            style={S.btnPrimary}
+            onClick={() => void saveNetwork()}
+            disabled={networkSaving()}
+            aria-busy={networkSaving()}
+          >
+            {networkSaving() ? "Connecting…" : "Save"}
+          </button>
+          <Show when={!appStore.connected() && !networkSaving()}>
+            <button
+              style={S.btnSecondary}
+              onClick={() => void appStore.connectToServer(true).catch((error) => setNetworkError(String(error)))}
+            >Reconnect</button>
           </Show>
           <Show when={networkSaved()}>
-            <span style={S.successMsg}>{"\u2713"} Saved</span>
+            <span style={S.successMsg} role="status" aria-live="polite">{"\u2713"} Saved</span>
           </Show>
         </div>
         <Show when={networkError()}>
-          <div style={S.errorMsg}>{networkError()}</div>
+          <div style={S.errorMsg} role="alert">{networkError()}</div>
         </Show>
       </div>
 

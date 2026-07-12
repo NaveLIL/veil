@@ -42,4 +42,26 @@ describe("desktop interaction boundaries", () => {
     expect(store).toMatch(/conversationType\s*===\s*["']dm["']/);
     expect(store).toMatch(/conversationType\s*===\s*["']group["']/);
   });
+
+  it("fails closed for UUID-only Add Me links", () => {
+    const normalized = Object.entries(interactiveSources).map(([path, source]) => [
+      path.replaceAll("\\", "/"),
+      source,
+    ] as const);
+    const store = normalized.find(([path]) => path.endsWith("/stores/app.ts"))?.[1];
+    const settings = normalized.find(([path]) => path.endsWith("/components/chat/SettingsScreen.tsx"))?.[1];
+
+    expect(store).toContain("Legacy Add Me link blocked");
+    expect(store).not.toMatch(/createDm\s*\(\s*addUserId\s*\)/);
+    expect(settings).toContain("Unavailable until origin-scoped profile links are supported");
+  });
+
+  it("does not read or write legacy originless server caches", () => {
+    const store = Object.entries(interactiveSources)
+      .find(([path]) => path.replaceAll("\\", "/").endsWith("/stores/app.ts"))?.[1];
+
+    expect(store).toBeTypeOf("string");
+    expect(store).not.toMatch(/cache_(?:load|save|delete)_(?:servers|channels|roles|server_members|server|channel)/);
+    expect(store).not.toContain("resolve_cached_channel_context");
+  });
 });

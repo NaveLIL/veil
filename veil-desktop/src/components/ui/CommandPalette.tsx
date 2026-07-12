@@ -153,8 +153,15 @@ export const CommandPalette: Component<Props> = (props) => {
     }
   });
 
+  let lastClearedOriginEpoch = appStore.originEpoch();
   createEffect(() => {
-    if (appStore.screen() !== "locked") return;
+    const currentOriginEpoch = appStore.originEpoch();
+    if (
+      appStore.screen() !== "locked"
+      && !appStore.bindingTransitioning()
+      && currentOriginEpoch === lastClearedOriginEpoch
+    ) return;
+    lastClearedOriginEpoch = currentOriginEpoch;
     if (timer) window.clearTimeout(timer);
     setQuery("");
     setHits([]);

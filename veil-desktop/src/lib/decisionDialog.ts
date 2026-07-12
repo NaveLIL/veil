@@ -31,6 +31,12 @@ const queue: QueuedDecision[] = [];
 const [activeDecisionDialog, setActiveDecisionDialog] =
   createSignal<ActiveDecisionDialog | null>(null);
 
+const cancellationValue = (kind: DecisionDialogKind): DecisionResult => {
+  if (kind === "confirm") return false;
+  if (kind === "prompt") return null;
+  return undefined;
+};
+
 const pumpQueue = () => {
   if (activeItem || queue.length === 0) return;
   activeItem = queue.shift() ?? null;
@@ -71,17 +77,23 @@ export const decisionDialog = {
   cancel() {
     const request = activeItem?.request;
     if (!request) return;
-    this.complete(request.kind === "confirm" ? false : request.kind === "prompt" ? null : undefined);
+    this.complete(cancellationValue(request.kind));
+  },
+  cancelAll() {
+    // Detach the complete queue before resolving anything. Promise callbacks
+    // are then free to enqueue a new dialog without being consumed by this
+    // cancellation pass or by a previously scheduled pumpQueue microtask.
+    const cancelled = activeItem ? [activeItem, ...queue.splice(0)] : queue.splice(0);
+    activeItem = null;
+    setActiveDecisionDialog(null);
+    for (const item of cancelled) {
+      item.resolve(cancellationValue(item.request.kind));
+    }
   },
 };
 
 /** Test-only reset so a failed assertion cannot strand later dialog tests. */
 export const resetDecisionDialogsForTests = () => {
-  activeItem?.resolve(activeItem.request.kind === "confirm" ? false : null);
-  activeItem = null;
-  while (queue.length > 0) {
-    const item = queue.shift();
-    item?.resolve(item.request.kind === "confirm" ? false : null);
-  }
-  setActiveDecisionDialog(null);
+  decisionDialog.cancelAll();
+  nextId = 1;
 };

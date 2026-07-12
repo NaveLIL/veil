@@ -9,14 +9,21 @@
 слабую криптосхему при ошибке распределения ключей. Если защищённая отправка
 невозможна, она блокируется с понятным состоянием для пользователя.
 
+Veil ещё не выпускался, поэтому runtime backward compatibility не является
+продуктовым требованием. Устаревшие форматы, originless caches и UI-ветки нужно
+удалять либо переводить явным cutover на текущую модель, а не поддерживать
+параллельно. История миграций сохраняется только для воспроизводимой установки
+схемы и проверяемого обновления development БД; она не оправдывает live fallback
+или ослабление современных security/UX invariants.
+
 Ближайший порядок работ:
 
 1. Completion gate фаз 1–4C пройден и опубликован в
    [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-2. Продолжить Phase 4D после checkpoint 4D.1a: довести оставшиеся consumers
-   origin-scoped identity directory, затем реализовать Phaseprint и общий
-   `UserAvatar`; network profile и avatar ingest подключать только после их
-   отдельных privacy/security gates.
+2. После защитного checkpoint 4D.1b.1 выполнить pre-release 4D.1c origin
+   namespace cutover без runtime legacy fallback, довести оставшиеся consumers
+   identity directory, затем реализовать Phaseprint и общий `UserAvatar`;
+   network profile и avatar ingest подключать только после отдельных gates.
 3. Довести вынесенные продуктовые scopes: Phase 3B (attachment UX), Phase 4P
    (device push clients) и Phase 4E (server experience), не смешивая их с
    завершёнными protocol/runtime baselines.
@@ -35,7 +42,7 @@
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | 4D.1a закрыт: canonical mapping и local author snapshots; остальной 4D впереди |
+| 4D | Identity Island & Profiles | 4D.1a и защитный 4D.1b.1 закрыты; pre-release 4D.1c storage cutover следующий |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -353,10 +360,12 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 **Статус 2026-07-12:** Phase 4D начата. Entry gate и формальное решение
 опубликованы в
 [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-Первый checkpoint **4D.1a — Canonical local identity snapshots** реализован и
-проверен. Он закрывает минимальный локальный identity foundation, но не завершает
-ни 4D.1 целиком, ни Phase 4D: Phaseprint, общий `UserAvatar`, Identity Island,
-text profile, identity proof и avatar ingest ещё не реализованы.
+Checkpoint **4D.1a — Canonical local identity snapshots** и следующий защитный
+checkpoint **4D.1b.1 — Authenticated origin/binding transition fence**
+реализованы и проверены. Они закрывают минимальный локальный identity foundation
+и безопасную смену authenticated namespace, но не завершают ни 4D.1 целиком,
+ни Phase 4D: Phaseprint, общий `UserAvatar`, Identity Island, text profile,
+identity proof и avatar ingest ещё не реализованы.
 
 Цель — дать одному человеку единое и узнаваемое представление во всех местах
 Veil: собственный footer, друзья, DM, группы, сообщения, server members и
@@ -440,6 +449,66 @@ roster/pending/server-cache namespaces ещё не полностью origin-sco
 rows не получают активный origin по догадке и требуют отдельного authenticated
 migration/cutover. Также остаются открыты полная нормализация friend/request/
 group/server contexts и семантика `Former member`.
+
+### Checkpoint 4D.1b.1 — Authenticated origin/binding transition fence
+
+- Native публикует renderer не отдельный UUID, а точный authenticated scope:
+  canonical server origin, user ID и монотонную binding generation. Generation
+  передаётся строкой без потери точности JavaScript и повторно подтверждается
+  native после обязательной публикации prekeys, непосредственно перед UI.
+- Любой reconnect, включая same-origin, снимает старый scope и закрывает live
+  actions/events до подтверждения новой generation. На том же origin user ID не
+  может молча измениться, generation обязана возрасти; очередь endpoint A→B→C
+  работает latest-wins и не публикует уже отменённый B.
+- Все authenticated native events несут exact origin/generation захваченного
+  binding. Renderer принимает только точное совпадение; delayed event и старый
+  disconnect не могут мутировать replacement namespace. Matching disconnect
+  снимает readiness/binding fail closed и запускает реальный reconnect даже во
+  время renderer hydration.
+- Полный native listener set устанавливается до первого connect и откатывается
+  целиком при частичной ошибке. User-initiated message/friend/Sender-Key actions
+  разрешены только после renderer confirmation точного binding; action,
+  захвативший generation N и дождавшийся mutex уже при N+1, отклоняется до
+  local/network mutation. Изменения role authorization проходят тот же gate и
+  сверяют REST origin до локального quarantine channel rosters.
+- Cross-origin transition синхронно очищает store, component-local plaintext,
+  deferred drafts, overlays, command/friend search state и очередь decision
+  dialogs. Same-origin transition сохраняет безопасный navigation/draft state,
+  но отменяет in-flight UI operations старой generation.
+- Legacy UUID-only `veil://add/{user_id}` заблокирован: locator без origin и
+  identity key неоднозначен между self-hosted instances.
+- Originless server/channel/member/role cache удалён из renderer IPC surface.
+  До отдельной origin-scoped cache schema эти данные загружаются только свежим
+  authenticated REST; cache-first/offline server navigation намеренно выключена.
+
+Этот checkpoint не меняет schema сообщений, ciphertext, ratchets, Sender Keys,
+ACL либо rotation contract и не является завершением 4D.1. Открыты friend/
+request/group/server consumer normalization, origin-scoped server cache v2,
+`Former member`, одновременное хранение colliding namespaces и generation-bound
+проверка каждого identity-mutating REST результата.
+
+### Следующий checkpoint 4D.1c — Pre-release origin namespace cutover
+
+До Phaseprint нужен один явно описанный storage cutover. Поскольку публичного
+релиза не было, сохранять runtime-совместимость с originless development rows
+не требуется:
+
+- conversation/message/pending/roster/reaction keys переходят с bare UUID на
+  обязательный origin namespace; новые unscoped writes удаляются;
+- self account binding `(origin, user_id, identity_key, signing_key)` становится
+  durable и проверяется до offline sync также после process restart;
+- author snapshot обязательна для каждого нового incoming/outgoing message и
+  сохраняется атомарно с message row; отсутствие authoritative metadata ведёт
+  в quarantine/`Unknown author`, а не в UUID/key-prefix presentation fallback;
+- originless contacts/group members/server cache models и их production CRUD
+  удаляются либо заменяются одним typed account/context DTO;
+- development rows без доказуемого origin не «усыновляются» текущим сервером:
+  cutover их явно отвергает или удаляет после backup. Crypto payload formats,
+  Double Ratchet и Sender-Key protocol при этом не меняются.
+
+Этот блок затрагивает адресацию локального хранения сообщений, поэтому перед
+реализацией требуется отдельное объяснение schema/cutover, backup реальной
+development БД и полный restart/collision/recovery test matrix.
 
 ### 4D.1 — Canonical identity directory
 
@@ -531,15 +600,17 @@ ciphertext, имеет message ACL и retention, поэтому сервер н�
 
 ### Порядок реализации 4D
 
-1. **Закрыто в 4D.1a:** canonical identity mapping, origin-scoped local
-   directory и persisted author metadata.
-2. Довести оставшиеся consumers origin-scoped directory, затем реализовать
+1. **Закрыто в 4D.1a + 4D.1b.1:** canonical identity mapping, origin-scoped
+   local directory, persisted author metadata и authenticated origin/binding
+   transition fence.
+2. Выполнить pre-release 4D.1c storage cutover без runtime legacy fallback.
+3. Довести оставшиеся consumers origin-scoped directory, затем реализовать
    Phaseprint и общий `UserAvatar`.
-3. Ввести единый right-island state и Identity Island на уже доступных данных.
-4. Добавить versioned signed text profile API/cache/event.
-5. Добавить server context/nickname и все profile triggers.
-6. Реализовать local identity verification и identity-change flow.
-7. Только затем добавить изолированный avatar pipeline и mobile adaptation.
+4. Ввести единый right-island state и Identity Island на уже доступных данных.
+5. Добавить versioned signed text profile API/cache/event.
+6. Добавить server context/nickname и все profile triggers.
+7. Реализовать local identity verification и identity-change flow.
+8. Только затем добавить изолированный avatar pipeline и mobile adaptation.
 
 ### Критерии готовности 4D
 
