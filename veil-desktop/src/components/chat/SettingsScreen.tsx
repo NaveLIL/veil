@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
 import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
 import { appearanceStore, THEME_OPTIONS, UI_SCALE_OPTIONS } from "@/stores/appearance";
+import { promptDecision } from "@/lib/decisionDialog";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { IslandSelect } from "@/components/ui/IslandSelect";
 import { Switch as VeilSwitch } from "@/components/ui/switch";
@@ -95,6 +96,8 @@ export const SettingsScreen: Component = () => {
   const [recoveryLoading, setRecoveryLoading] = createSignal(false);
   const [recoveryError, setRecoveryError] = createSignal("");
   const [recoveryPin, setRecoveryPin] = createSignal("");
+  const [signOutBusy, setSignOutBusy] = createSignal(false);
+  const [signOutError, setSignOutError] = createSignal("");
   let recoveryHideTimer: ReturnType<typeof setTimeout> | undefined;
 
   const autoLockOptions = [
@@ -149,6 +152,29 @@ export const SettingsScreen: Component = () => {
     }
     setRecoveryConfirmed(true);
     loadRecoveryPhrase();
+  };
+
+  const signOut = async () => {
+    if (signOutBusy()) return;
+    setSignOutError("");
+    const confirmation = await promptDecision({
+      title: "Switch account",
+      message: "This removes the current identity and PIN from this device. Your server account is not deleted. The encrypted local vault stays available only when you restore this identity with its recovery phrase. Type SWITCH ACCOUNT to continue.",
+      confirmLabel: "Continue",
+      cancelLabel: "Cancel",
+      danger: true,
+      placeholder: "SWITCH ACCOUNT",
+      requiredValue: "SWITCH ACCOUNT",
+    });
+    if (confirmation !== "SWITCH ACCOUNT") return;
+    setSignOutBusy(true);
+    try {
+      await appStore.signOut();
+    } catch (error) {
+      setSignOutError(String(error));
+    } finally {
+      setSignOutBusy(false);
+    }
   };
 
   onMount(async () => {
@@ -981,6 +1007,23 @@ export const SettingsScreen: Component = () => {
             {appStore.connected() ? "Connected" : "Disconnected"}
           </span>
         </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={S.cardTitle}>Account</div>
+        <div style={S.paragraph}>
+          Switch to another Veil identity or create a new one. This signs out only this device; it does not delete the server account. Keep the current recovery phrase before continuing.
+        </div>
+        <button
+          style={S.btnDanger}
+          disabled={signOutBusy()}
+          onClick={() => void signOut()}
+        >
+          {signOutBusy() ? "Signing out…" : "Sign out and switch account"}
+        </button>
+        <Show when={signOutError()}>
+          <div style={S.errorMsg} role="alert">{signOutError()}</div>
+        </Show>
       </div>
     </>
   );

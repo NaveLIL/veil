@@ -1440,6 +1440,14 @@ export const appStore = {
     }
   },
 
+  /** Remove the active account from this device and return to onboarding. */
+  signOut: async () => {
+    await invoke("sign_out");
+    clearSensitiveUi();
+    setPinConfigured(false);
+    setScreen("onboarding");
+  },
+
   /** Start auto-lock timer using the native persisted inactivity period. */
   startAutoLock: () => {
     if (autoLockTimer) clearInterval(autoLockTimer);

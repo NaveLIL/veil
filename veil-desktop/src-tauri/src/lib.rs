@@ -870,8 +870,44 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
     state.indexer.clear().map_err(|e| e.to_string())
 }
 
+fn account_database_path(state: &AppState, mnemonic: &str) -> Result<PathBuf, String> {
+    let identity = veil_crypto::keys::IdentityKeyPair::from_mnemonic(mnemonic)?;
+    let accounts_dir = state.db_dir.join("accounts");
+    std::fs::create_dir_all(&accounts_dir).map_err(|e| format!("create account vault: {e}"))?;
+    let identity_name = hex::encode(identity.x25519_public_bytes());
+    let scoped = accounts_dir.join(format!("{identity_name}.db"));
+
+    // Pre-release builds used one global path. Move that file exactly once
+    // when opening the identity that owns it; never copy it into another
+    // account namespace.
+    let legacy = state.db_dir.join("veil.db");
+    if !scoped.exists() && legacy.exists() {
+        for source in [
+            legacy.clone(),
+            legacy.with_extension("db-wal"),
+            legacy.with_extension("db-shm"),
+        ] {
+            if !source.exists() {
+                continue;
+            }
+            let suffix = source
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("db");
+            let target = if suffix == "db" {
+                scoped.clone()
+            } else {
+                scoped.with_extension(suffix)
+            };
+            std::fs::rename(&source, &target)
+                .map_err(|e| format!("move legacy account database: {e}"))?;
+        }
+    }
+    Ok(scoped)
+}
+
 fn initialize_client(state: &AppState, mnemonic: &str) -> Result<String, String> {
-    let db_path = state.db_dir.join("veil.db");
+    let db_path = account_database_path(state, mnemonic)?;
     let mut fresh = VeilClient::new();
     fresh.init_with_mnemonic(mnemonic, &db_path)?;
     fresh.set_indexer(state.indexer.clone());
@@ -1268,6 +1304,44 @@ fn lock_app(state: State<'_, AppState>) -> Result<(), String> {
         state.lock_event_pending.store(false, Ordering::Release);
     }
     result
+}
+
+/// Remove the active account from this device without touching the server.
+/// The account-scoped SQLCipher vault remains on disk and can be reopened
+/// with its recovery phrase; only the keychain seed and app PIN are removed.
+#[tauri::command]
+fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
+    let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    require_unlocked_locked(&state)?;
+    if !keychain::has_seed(KEYCHAIN_ACCOUNT)? {
+        return Err("no stored identity is available to sign out".to_string());
+    }
+
+    // Remove the PIN policy before the seed. If keychain access fails, the
+    // operation aborts while the active account is still recoverable.
+    if keychain::has_seed(PIN_MATERIAL_ACCOUNT)? {
+        keychain::delete_seed(PIN_MATERIAL_ACCOUNT)?;
+    }
+    if keychain::has_seed(PIN_HASH_ACCOUNT)? {
+        keychain::delete_seed(PIN_HASH_ACCOUNT)?;
+    }
+    if keychain::has_seed(PIN_SALT_ACCOUNT)? {
+        keychain::delete_seed(PIN_SALT_ACCOUNT)?;
+    }
+    if keychain::has_seed(PIN_THROTTLE_ACCOUNT)? {
+        keychain::delete_seed(PIN_THROTTLE_ACCOUNT)?;
+    }
+    keychain::delete_seed(KEYCHAIN_ACCOUNT)?;
+
+    reset_sensitive_state_locked(&state)?;
+    state.pin_configured.store(false, Ordering::Release);
+    state.lock_event_pending.store(false, Ordering::Release);
+    state
+        .pin_throttle
+        .lock()
+        .map_err(|e| e.to_string())?
+        .reset();
+    Ok(())
 }
 
 #[tauri::command]
@@ -7784,6 +7858,7 @@ pub fn run() {
             clear_pin,
             reveal_recovery_phrase,
             lock_app,
+            sign_out,
             touch_activity,
             idle_seconds,
             get_auto_lock_seconds,
