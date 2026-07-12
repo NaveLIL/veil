@@ -109,8 +109,11 @@ const [connected, setConnected] = createSignal(false);
 const [reconnecting, setReconnecting] = createSignal(false);
 
 const DEFAULT_SERVER_ENDPOINTS = {
-  ws: "wss://secret.erez.pro/ws",
-  http: "https://secret.erez.pro",
+  // A packaged client must never silently target an unrelated public service.
+  // Production builds provide VITE_VEIL_{WS,HTTP}_URL explicitly; the safe
+  // fallback is the loopback gateway used by the local Compose setup.
+  ws: "ws://127.0.0.1:9080/ws",
+  http: "http://127.0.0.1:9080",
 } as const;
 const SERVER_ENDPOINTS_STORAGE_KEY = "veil.server-endpoints.v1";
 
