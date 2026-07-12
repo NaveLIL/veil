@@ -1445,8 +1445,37 @@ export const appStore = {
   signOut: async () => {
     await invoke("sign_out");
     clearSensitiveUi();
+    const clearedEpoch = captureUiSessionEpoch();
+    if (!activateUiSession(clearedEpoch)) {
+      throw new StaleUiSessionError();
+    }
     setPinConfigured(false);
     setScreen("onboarding");
+  },
+
+  /** Re-open the keychain identity and publish a fresh renderer session. */
+  resumeStoredIdentity: async (): Promise<void> => {
+    if (await appStore.hasPin()) {
+      setScreen("locked");
+      return;
+    }
+
+    const dormantEpoch = captureUiSessionEpoch();
+    const key = await invoke<string>("init_from_seed");
+    if (uiSessionActive) {
+      requireCurrentUiSession(dormantEpoch);
+    } else if (!activateUiSession(dormantEpoch)) {
+      throw new StaleUiSessionError();
+    }
+
+    setIdentity(key);
+    setScreen("chat");
+    await appStore.loadConversations();
+    await appStore.connectToServer().catch((error) => {
+      if (!(error instanceof StaleUiSessionError)) {
+        console.warn("secure connect after identity resume failed:", error);
+      }
+    });
   },
 
   /** Start auto-lock timer using the native persisted inactivity period. */

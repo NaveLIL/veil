@@ -1,10 +1,10 @@
 import { Component, createSignal, Show, For, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { appStore, StaleUiSessionError } from "@/stores/app";
-import { AlertTriangle, ArrowRightLeft, Eye, EyeOff, KeyRound, LogIn, ShieldCheck } from "lucide-solid";
+import { AlertTriangle, ArrowRightLeft, Check, Copy, Eye, EyeOff, KeyRound, LogIn, ShieldCheck } from "lucide-solid";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { Z } from "@/lib/zIndex";
-import { promptDecision } from "@/lib/decisionDialog";
+import { confirmDecision, promptDecision } from "@/lib/decisionDialog";
 
 /* ═══════════════════════════════════════════════════════
    ONBOARDING — Hebrew rain + bottom island + transitions
@@ -50,6 +50,7 @@ export const OnboardingScreen: Component = () => {
   const [rainDrops, setRainDrops] = createSignal<RainDrop[]>([]);
   const [leaving, setLeaving] = createSignal(false);
   const [entering, setEntering] = createSignal(false);
+  const [phraseCopied, setPhraseCopied] = createSignal(false);
 
   const words = () => mnemonic().split(" ").filter(Boolean);
   const existingIdentity = () => identityState() === "existing";
@@ -84,6 +85,7 @@ export const OnboardingScreen: Component = () => {
   });
 
   let taglineTimer: ReturnType<typeof setInterval>;
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
   onMount(() => {
     taglineTimer = setInterval(() => {
       setTaglineFade(false);
@@ -93,7 +95,10 @@ export const OnboardingScreen: Component = () => {
       }, 400);
     }, 4000);
   });
-  onCleanup(() => clearInterval(taglineTimer));
+  onCleanup(() => {
+    clearInterval(taglineTimer);
+    if (copiedTimer) clearTimeout(copiedTimer);
+  });
 
   const tagline = () => TAGLINES[taglineIdx()];
   const progress = () => ((taglineIdx() + 1) / TAGLINES.length) * 100;
@@ -191,19 +196,31 @@ export const OnboardingScreen: Component = () => {
     setLoading(true);
     setError("");
     try {
-      if (await appStore.hasPin()) {
-        appStore.setScreen("locked");
-        return;
-      }
-      const key = await invoke<string>("init_from_seed");
-      appStore.setIdentity(key);
-      appStore.setScreen("chat");
-      await appStore.loadConversations();
-      await appStore.connectToServer().catch((e) => console.warn("secure connect failed:", e));
+      await appStore.resumeStoredIdentity();
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const copyRecoveryPhrase = async () => {
+    if (!mnemonic().trim() || loading()) return;
+    const approved = await confirmDecision({
+      title: "Copy recovery phrase?",
+      message: "Windows Clipboard History, cloud sync, screen recorders, and other applications may retain clipboard contents after Veil closes. Copy only to paste immediately into a trusted password manager. Veil cannot guarantee deletion from clipboard history.",
+      confirmLabel: "Copy phrase",
+      cancelLabel: "Keep it off clipboard",
+      danger: true,
+    });
+    if (!approved) return;
+    try {
+      await navigator.clipboard.writeText(mnemonic());
+      setPhraseCopied(true);
+      if (copiedTimer) clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => setPhraseCopied(false), 3_000);
+    } catch {
+      setError("Windows denied clipboard access. Write the phrase down or save it directly in your password manager.");
     }
   };
 
@@ -579,8 +596,13 @@ export const OnboardingScreen: Component = () => {
               </div>
               <div class="onboarding-vault-rule" />
               <div style={{ "font-size": "11px", color: "color-mix(in srgb, var(--veil-warning) 72%, transparent)", "line-height": "1.55" }}>
-                Clipboard copy is disabled because Windows history and cloud sync may retain secrets.
+                Clipboard use is guarded because Windows history and cloud sync may retain secrets.
               </div>
+              <button class="onboarding-copy-phrase" onClick={() => void copyRecoveryPhrase()} disabled={loading()}>
+                {phraseCopied() ? <Check size={14} /> : <Copy size={14} />}
+                {phraseCopied() ? "Copied — paste it now" : "Copy with warning"}
+              </button>
+              <span class="sr-only" aria-live="polite">{phraseCopied() ? "Recovery phrase copied" : ""}</span>
             </aside>
           </div>
           <div class="onboarding-vault-actions">

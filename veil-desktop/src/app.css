@@ -1333,6 +1333,35 @@ select:focus-visible,
   background: var(--veil-contrast-06);
 }
 
+.onboarding-copy-phrase {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 34px;
+  margin-top: 2px;
+  padding: 0 10px;
+  border: 1px solid rgba(var(--veil-accent-rgb), 0.2);
+  border-radius: 9px;
+  color: color-mix(in srgb, var(--veil-accent) 78%, var(--veil-contrast-80));
+  background: rgba(var(--veil-accent-rgb), 0.08);
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+  transition: color 160ms ease, background 160ms ease, transform 160ms ease;
+}
+
+.onboarding-copy-phrase:hover:not(:disabled) {
+  color: var(--veil-contrast-90);
+  background: rgba(var(--veil-accent-rgb), 0.14);
+  transform: translateY(-1px);
+}
+
+.onboarding-copy-phrase:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
 .onboarding-phrase-visibility {
   position: absolute;
   top: 8px;
@@ -1386,6 +1415,10 @@ select:focus-visible,
 
 @media (prefers-reduced-motion: reduce) {
   .onboarding-phrase-visibility {
+    transition: none;
+  }
+
+  .onboarding-copy-phrase {
     transition: none;
   }
 }
