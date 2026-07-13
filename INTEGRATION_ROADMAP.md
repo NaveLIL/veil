@@ -1,6 +1,6 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-07-12. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-07-13. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
@@ -8,6 +8,16 @@
 используемый режим защиты. Нельзя молча откатываться на plaintext или более
 слабую криптосхему при ошибке распределения ключей. Если защищённая отправка
 невозможна, она блокируется с понятным состоянием для пользователя.
+
+Второй базовый принцип — автономность self-hosted инстанса. Уже настроенные
+desktop/mobile клиенты, gateway, хранилище и локальные сервисы обязаны сохранять
+основные функции в одной LAN при полном отсутствии WAN и внешнего control plane.
+Потеря интернета может явно отключить push, updater или внешний media relay, но
+не локальные сообщения и администрирование. Один инстанс использует один
+canonical `(scheme, host, effective port)` origin и одну валидируемую TLS server
+identity: split-horizon DNS направляет тот же hostname на LAN-адрес, не меняя
+scheme, port или certificate trust. Клиент не подменяет origin IP-адресом,
+альтернативным hostname или небезопасным HTTP.
 
 Veil ещё не выпускался, поэтому runtime backward compatibility не является
 продуктовым требованием. Устаревшие форматы, originless caches и UI-ветки нужно
@@ -20,10 +30,8 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 
 1. Completion gate фаз 1–4C пройден и опубликован в
    [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-2. Закрепить completion evidence для local-data Identity Island. Затем провести
-   отдельный schema/privacy/security review versioned text profile и локальной
-   verification/identity-change flow; network avatar ingest остаётся за своим
-   decoder/privacy gate.
+2. Completion gate Phase 4D пройден и опубликован в
+   [`docs/reviews/phase-4d-completion-gate.md`](docs/reviews/phase-4d-completion-gate.md).
 3. Довести вынесенные продуктовые scopes: Phase 3B (attachment UX), Phase 4P
    (device push clients) и Phase 4E (server experience), не смешивая их с
    завершёнными protocol/runtime baselines.
@@ -42,7 +50,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | product/security scope реализован; финальная completion-матрица выполняется |
+| 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -315,9 +323,9 @@ role/overwrite/device change инвалидирует roster proof; новое �
 подтверждением полной истории.
 
 Оставшиеся security hardening задачи не переопределяют baseline: service-
-mediated TOFU/key transparency относится к Identity/Phase 4D, глобальный
-storage budget/compaction — к Phase 8, а ручная физическая multi-device matrix —
-к Phase 4E/release gate.
+mediated TOFU/key transparency не входит в закрытую Phase 4D и требует отдельного
+pre-production protocol/security gate; глобальный storage budget/compaction — к
+Phase 8, а ручная физическая multi-device matrix — к Phase 4E/release gate.
 
 ### Безопасный baseline ближайшего релиза
 
@@ -357,33 +365,35 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 
 ## Phase 4D — Identity Island & Profiles
 
-**Статус 2026-07-13:** product и security scope Phase 4D реализован. Entry gate и
+**Статус 2026-07-13:** Phase 4D закрыта. Entry gate и
 формальное решение опубликованы в
 [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md),
-а финальный code freeze и проверочная матрица отслеживаются в
+а финальный code freeze и зелёная проверочная матрица зафиксированы в
 [`docs/reviews/phase-4d-completion-gate.md`](docs/reviews/phase-4d-completion-gate.md).
 Реализованы canonical local identity foundation с authenticated origin/binding
 fence, детерминированный Phaseprint и единый `UserAvatar`, Identity Island,
 versioned text profile/cache/editor, локальная verification/identity-change flow,
 relationship-scoped `ProfileUpdated`, identity-bearing local search DTO,
-изолированный avatar pipeline и mobile Identity sheet. Phase 4D будет объявлена
-завершённой только после зелёной full-workspace, Docker, migration и Windows
-release матрицы.
+изолированный avatar pipeline и mobile Identity sheet. Full-workspace, Docker,
+migration, visual и Windows release матрицы пройдены; остаточные риски явно
+вынесены в completion gate и не скрываются статусом фазы.
 
 Цель — дать одному человеку единое и узнаваемое представление во всех местах
 Veil: собственный footer, друзья, DM, группы, сообщения, server members и
 settings. Профиль называется **Identity Island** и продолжает язык Phase Shift,
 а не копирует banner/popover Discord.
 
-Phase 4D отслеживается как пять прямых продуктовых deliverables без вложенных
+Phase 4D отслеживалась как шесть прямых продуктовых deliverables без вложенных
 «фаз внутри фаз»:
 
 1. Identity foundation: durable origin binding, hard namespace cutover и
    удаление originless runtime legacy.
 2. Детерминированный Phaseprint и единый `UserAvatar`.
 3. Identity Island, все точки открытия, плавная навигация и переходы в DM.
-4. Versioned text profile, Identity Proof и privacy/security review.
-5. Изолированный безопасный avatar pipeline и финальный completion gate.
+4. Versioned text profile, origin-scoped search и privacy/security review.
+5. Identity Proof, локальная verification и blocking identity-change flow.
+6. Изолированный безопасный avatar pipeline, mobile adaptation и финальный
+   completion gate.
 
 Малые migration/security commits внутри deliverable являются только
 проверяемыми Git-checkpoint'ами, а не новыми уровнями roadmap.
@@ -404,9 +414,9 @@ smoke:
 | 4C | пройден | exact-device roster, multi-generation retention, receipts и atomic recovery реализованы |
 
 Незавершённые client/product куски не исчезли: Phase 3B, 4P и 4E являются
-явными владельцами. Открытый gate разрешает Phase 4D foundation, но не разрешает
-называть будущий network profile/avatar pipeline безопасным до его собственных
-критериев готовности.
+явными владельцами. Entry gate разрешал Phase 4D foundation, но требовал
+отдельных критериев готовности для network profile/avatar pipeline; эти критерии
+выполнены и зафиксированы в финальном completion gate.
 
 Отдельные обязательные prerequisites непосредственно для профилей:
 
@@ -666,8 +676,8 @@ plain text и атомарный `expected_version` conflict. Неизвестн
 `avatar_url`, отклоняются; reserved `avatar_asset_id` не доступен через API.
 Этот server-only checkpoint ещё не добавлял `ProfileUpdated`, native
 client/SQLCipher refresh, UI-редактор или avatar pipeline. Последующие
-checkpoint'ы ниже закрывают text profile/event/proof части; avatar pipeline
-остаётся отдельным незавершённым deliverable.
+checkpoint'ы ниже закрыли text profile/event/proof части и изолированный avatar
+pipeline.
 
 - PostgreSQL: `display_name`, короткий `about`, nullable `avatar_asset_id`,
   `profile_version`, `profile_updated_at`; технический username остаётся
@@ -1016,6 +1026,57 @@ Visual regression, updater, полный signed matrix и public beta ещё н�
   без содержимого сообщений, ключей и стабильных user identifiers
 - Release gate: desktop/mobile E2E, process-death/offline tests, restore drill,
   secret scan, dependency review и проверка отсутствия mock crypto
+
+### Автономный LAN и air-gapped deployment
+
+Автономность — обязательное свойство релиза, а не best-effort режим. Она не
+создаёт ещё одну вложенную фазу и проверяется тремя прямыми deliverables:
+
+Текущий development release этот gate ещё не проходит: NSIS не выбирает
+offline WebView2 mode, Compose при cold install рассчитывает на заранее
+загруженные образы или registry, а физическая WAN-off matrix не выполнена.
+Успешная работа уже установленного стенда не заменяет clean-room evidence.
+
+1. **Offline runtime:** уже установленный клиент холодно стартует и после
+   restart подключается к локальному gateway без WAN. Auth, SQLCipher history,
+   DM/groups/server channels, локальные attachments и администрирование не
+   требуют cloud control plane. Push, updater и внешний relay деградируют явно.
+2. **Offline installation:** подписанные клиентские пакеты и versioned Veil Node
+   bundle устанавливаются из локального носителя. Windows bundle включает
+   offline WebView2 installer; Linux выпускается как AppImage плюс `.deb` и
+   `.rpm`, но совместимость обещается только для проверенных distro/version/arch,
+   включая выбранные российские дистрибутивы. macOS получает заранее подписанный
+   и notarized DMG со stapled ticket и WAN-off Gatekeeper smoke; новая
+   notarization полностью без связи с Apple невозможна. Android после Phase 5
+   получает подписанный standalone APK для local/managed install наряду с AAB
+   для store distribution; iOS air-gap sideload не обещается.
+3. **Offline release factory:** target-specific reproducible runners используют
+   vendored Cargo crates, зафиксированный pnpm store/Go modules, toolchains и OS
+   SDK. Windows/MSI строится на Windows runner, macOS — на macOS runner,
+   Linux targets — на зафиксированных oldest-supported контейнерах/VM. Обещания
+   «одна машина собирает любую ОС» нет.
+
+Veil Node air-gap bundle содержит pinned multi-arch OCI images gateway,
+PostgreSQL, ntfy и будущих LiveKit/coturn, Compose/manifests, migration,
+backup/restore, checksums/signatures, локальную документацию и install/upgrade
+scripts без `pull`. Для поддерживаемых targets предоставляется либо проверенный
+offline OCI-runtime package set, либо готовый appliance/VM image; наличие
+интернета во время первичной установки не предполагается.
+
+Локальный bootstrap обязан решить DNS, TLS и время без ослабления проверок:
+split-horizon DNS сохраняет exact origin, offline CA/certificate enrollment
+требует явной fingerprint verification, а локальный time source предотвращает
+поломку timestamp-bound auth и certificate lifecycle. Запрещены auto-trust
+self-signed certificates, `--insecure`, HTTP fallback и смена identity namespace.
+
+Критерий выхода: на чистых образах каждого supported target физически отключён
+WAN; с USB/локального share разворачиваются Veil Node и клиенты, создаётся новый
+account, проходят message/file/local-call, restart, backup/restore и signed
+offline update. Updater хранит monotonic version floor и отклоняет downgrade.
+Rollback допускается только отдельным подписанным recovery manifest с явно
+разрешённой target version, schema compatibility и проверенным backup/restore
+path. Все сетевые обращения наружу либо отсутствуют, либо показываются как
+необязательная недоступная функция.
 
 ### Публичный сайт, документация и загрузки
 
