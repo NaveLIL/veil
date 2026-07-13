@@ -1979,6 +1979,7 @@ struct ParsedDeviceBinding {
     capabilities: u64,
     status: u8,
     account_signature: [u8; 64],
+    created_at: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2000,6 +2001,20 @@ struct ParsedDeviceRoster {
     unavailable_reason: Option<String>,
     member_user_ids: Vec<[u8; 16]>,
     devices: Vec<ParsedDeviceRosterEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CurrentTargetAdmissionEvidence {
+    target_device_id: [u8; 16],
+    binding_version: u64,
+    first_binding_created_at: chrono::DateTime<chrono::Utc>,
+    roster_version: u64,
+    roster_commitment: [u8; 32],
+}
+
+enum DeviceDirectoryInstallOutcome {
+    Ready(CurrentTargetAdmissionEvidence),
+    NotReady(String),
 }
 
 impl From<ParsedDeviceBinding> for DeviceBindingCandidateV1 {
@@ -3041,6 +3056,7 @@ fn parse_device_directory(
                         "device binding account_signature",
                         &binding.account_signature,
                     )?,
+                    created_at: binding.created_at,
                 };
                 (Some(parsed), binding.status, eligible, exclusion_reason)
             } else {
@@ -3100,6 +3116,117 @@ fn parse_device_directory(
         member_user_ids,
         devices,
     })
+}
+
+fn current_target_admission_evidence(
+    roster: &ParsedDeviceRoster,
+    authenticated_user_id: [u8; 16],
+    target_device_id: [u8; 16],
+) -> Result<CurrentTargetAdmissionEvidence, String> {
+    let entry = roster
+        .devices
+        .iter()
+        .find(|entry| entry.user_id == authenticated_user_id && entry.device_id == target_device_id)
+        .ok_or("current device is absent from its authenticated device directory")?;
+    let binding = entry
+        .binding
+        .as_ref()
+        .ok_or("current device has no authenticated binding")?;
+    if binding.device_id != target_device_id
+        || binding.status != 1
+        || binding.capabilities & roster.required_capabilities != roster.required_capabilities
+    {
+        return Err("current device admission evidence is not eligible".to_string());
+    }
+    let first_binding_created_at = chrono::DateTime::parse_from_rfc3339(&binding.created_at)
+        .map_err(|_| "current device binding created_at is invalid".to_string())?
+        .with_timezone(&chrono::Utc);
+    Ok(CurrentTargetAdmissionEvidence {
+        target_device_id,
+        binding_version: binding.version,
+        first_binding_created_at,
+        roster_version: roster.roster_version,
+        roster_commitment: roster.roster_commitment,
+    })
+}
+
+fn proves_future_only_sender_key_history(
+    validation: &veil_client::api::SenderKeyMessageContextInspectionV1,
+    evidence: &CurrentTargetAdmissionEvidence,
+    message_created_at: &str,
+) -> Result<bool, String> {
+    let veil_client::api::SenderKeyMessageContextInspectionV1::MissingExactRoute {
+        target_device_id,
+        message_roster_version,
+        message_roster_commitment,
+        installed_roster_version,
+        installed_roster_commitment,
+    } = validation
+    else {
+        return Ok(false);
+    };
+    if *target_device_id != evidence.target_device_id
+        || *installed_roster_version != evidence.roster_version
+        || *installed_roster_commitment != evidence.roster_commitment
+    {
+        return Err(
+            "Sender-Key admission evidence belongs to another installed roster".to_string(),
+        );
+    }
+    if evidence.binding_version != 1
+        || *message_roster_version >= evidence.roster_version
+        || *message_roster_commitment == evidence.roster_commitment
+    {
+        return Ok(false);
+    }
+    let message_created_at = chrono::DateTime::parse_from_rfc3339(message_created_at)
+        .map_err(|_| "message created_at is invalid for device admission comparison".to_string())?
+        .with_timezone(&chrono::Utc);
+    Ok(evidence.first_binding_created_at > message_created_at)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SenderKeyHistoryInspectionOutcome {
+    Verified,
+    FutureOnlyUnavailable,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconcile_sender_key_history_inspection(
+    client: &VeilClient,
+    inspection: &veil_client::api::SenderKeyMessageContextInspectionV1,
+    current_target_admission: Option<&CurrentTargetAdmissionEvidence>,
+    message_created_at: &str,
+    message_id: &str,
+    conversation_id: &str,
+    sender_identity_key: &[u8; 32],
+    metadata: &veil_client::api::RemoteMessageMetadata<'_>,
+) -> Result<SenderKeyHistoryInspectionOutcome, String> {
+    match inspection {
+        veil_client::api::SenderKeyMessageContextInspectionV1::Verified => {
+            Ok(SenderKeyHistoryInspectionOutcome::Verified)
+        }
+        veil_client::api::SenderKeyMessageContextInspectionV1::MissingExactRoute { .. } => {
+            let evidence = current_target_admission
+                .ok_or("missing Sender-Key route has no current device admission evidence")?;
+            if !proves_future_only_sender_key_history(inspection, evidence, message_created_at)? {
+                return Err(format!(
+                    "message {message_id} is missing a trusted Sender-Key route without future-only admission proof"
+                ));
+            }
+            // The server-authoritative admission order is used only for row
+            // availability. It never authenticates ciphertext, grants access,
+            // or advances the Sender-Key receive chain.
+            client.reconcile_remote_message_metadata(
+                message_id,
+                conversation_id,
+                sender_identity_key,
+                metadata,
+                veil_store::models::RemoteMessageStateKind::Unavailable,
+            )?;
+            Ok(SenderKeyHistoryInspectionOutcome::FutureOnlyUnavailable)
+        }
+    }
 }
 
 fn verify_device_directory_account_keys(
@@ -3423,6 +3550,7 @@ struct OfflineConversationSyncScope<'a> {
     canonical_server_origin: &'a str,
     conversation_id: &'a str,
     directory: &'a std::collections::HashMap<String, PinnedDirectoryMember>,
+    current_target_admission: Option<&'a CurrentTargetAdmissionEvidence>,
     event_app: &'a AuthenticatedEventAppHandle,
 }
 
@@ -3437,6 +3565,7 @@ fn sync_conversation_messages(
         canonical_server_origin,
         conversation_id,
         directory,
+        current_target_admission,
         event_app,
     } = scope;
     let mut cursor: Option<String> = None;
@@ -3601,15 +3730,6 @@ fn sync_conversation_messages(
                 };
 
             let mut client = state.client.lock().map_err(|e| e.to_string())?;
-            observe_active_history_candidate_with_signal(
-                client.db().ok_or("database not initialized")?,
-                canonical_server_origin,
-                &message.sender_id,
-                &response_identity,
-                &response_signing,
-                remote_state,
-                Some(event_app),
-            )?;
             let sender_key_mode = client.is_channel_conversation(conversation_id);
             let message_security_context =
                 client_message_security_context(crypto_context, client.device_id());
@@ -3722,7 +3842,7 @@ fn sync_conversation_messages(
                             let (_, ciphertext) = encrypted_wire
                                 .as_ref()
                                 .ok_or("active Sender-Key message has no ciphertext")?;
-                            client.validate_sender_key_message_context_v1(
+                            let validation = client.inspect_sender_key_message_context_v1(
                                 conversation_id,
                                 &response_identity,
                                 ciphertext,
@@ -3730,6 +3850,20 @@ fn sync_conversation_messages(
                                     .as_ref()
                                     .ok_or("Sender-Key message context conversion failed")?,
                             )?;
+                            if reconcile_sender_key_history_inspection(
+                                &client,
+                                &validation,
+                                current_target_admission,
+                                &message.created_at,
+                                &message.id,
+                                conversation_id,
+                                &response_identity,
+                                &metadata,
+                            )? == SenderKeyHistoryInspectionOutcome::FutureOnlyUnavailable
+                            {
+                                stats.unavailable_history += 1;
+                                continue;
+                            }
                             if !client
                                 .peer_signing_key_is_pinned(&response_identity, &response_signing)
                             {
@@ -3764,6 +3898,22 @@ fn sync_conversation_messages(
                 stats.unavailable_history += 1;
                 continue;
             }
+
+            // Identity continuity is observed only after every branch that can
+            // downgrade an active row to unavailable has returned. In
+            // particular, future-only device history has no exact route and
+            // must never seed a TOFU baseline or raise an IdentityChanged alarm.
+            // This still runs before plaintext decryption or receive-chain
+            // mutation for every usable row.
+            observe_active_history_candidate_with_signal(
+                client.db().ok_or("database not initialized")?,
+                canonical_server_origin,
+                &message.sender_id,
+                &response_identity,
+                &response_signing,
+                remote_state,
+                Some(event_app),
+            )?;
 
             let locator = ProfileLocator {
                 canonical_server_origin: canonical_server_origin.to_string(),
@@ -4008,7 +4158,7 @@ fn sync_offline_state(
                     continue;
                 }
             };
-            if sender_key_refresh.is_some() {
+            let current_target_admission = if sender_key_refresh.is_some() {
                 // The retained SKDM FIFO barrier and every Sender-Key
                 // ciphertext are device-owned. Install the complete current
                 // signed roster (including rollback/signature pins) before
@@ -4021,8 +4171,8 @@ fn sync_offline_state(
                     &directory,
                     None,
                 ) {
-                    Ok(None) => {}
-                    Ok(Some(reason)) => {
+                    Ok(DeviceDirectoryInstallOutcome::Ready(evidence)) => Some(evidence),
+                    Ok(DeviceDirectoryInstallOutcome::NotReady(reason)) => {
                         quarantine_runtime_conversation(state, &conversation.id, true)?;
                         isolation.block(&conversation.id, "device_roster_not_ready", &reason);
                         continue;
@@ -4034,8 +4184,15 @@ fn sync_offline_state(
                         continue;
                     }
                 }
-            }
-            directories.push((conversation.id.clone(), directory, sender_key_refresh));
+            } else {
+                None
+            };
+            directories.push((
+                conversation.id.clone(),
+                directory,
+                sender_key_refresh,
+                current_target_admission,
+            ));
         }
 
         match page.next_cursor {
@@ -4085,11 +4242,11 @@ fn sync_offline_state(
             .runtime
             .block_on(client.flush_sender_key_receipts_v1())?;
     }
-    directories.retain(|(conversation_id, _, _)| !isolation.is_blocked(conversation_id));
+    directories.retain(|(conversation_id, _, _, _)| !isolation.is_blocked(conversation_id));
 
     // All identities are pinned and all FK parents/groups are installed before
     // consuming any ratchet state from the ciphertext backlog.
-    for (conversation_id, directory, sender_key_refresh) in &directories {
+    for (conversation_id, directory, sender_key_refresh, current_target_admission) in &directories {
         if let Err(error) = sync_conversation_messages(
             state,
             &mut stats,
@@ -4099,6 +4256,7 @@ fn sync_offline_state(
                 canonical_server_origin,
                 conversation_id,
                 directory,
+                current_target_admission: current_target_admission.as_ref(),
                 event_app,
             },
         ) {
@@ -4113,7 +4271,7 @@ fn sync_offline_state(
             isolation.block(conversation_id, "message_history_unavailable", &error);
         }
     }
-    directories.retain(|(conversation_id, _, _)| !isolation.is_blocked(conversation_id));
+    directories.retain(|(conversation_id, _, _, _)| !isolation.is_blocked(conversation_id));
 
     // The current roster may have changed while this client was offline and
     // membership events are not durable. After all historical ciphertext has
@@ -4121,7 +4279,7 @@ fn sync_offline_state(
     // outgoing generation and distribute only to the freshly authenticated
     // directory. Sending stays blocked until every server ACK is processed by
     // the live dispatcher.
-    for (conversation_id, _, sender_key_refresh) in directories {
+    for (conversation_id, _, sender_key_refresh, _) in directories {
         let Some(sender_key_refresh) = sender_key_refresh else {
             continue;
         };
@@ -6100,14 +6258,16 @@ fn create_group(
             Some(&event_app),
         )?;
         let account_directory = pinned_account_directory_from_json(&members)?;
-        if let Some(reason) = fetch_and_install_authenticated_device_directory(
-            &state,
-            &server_http_url,
-            &authenticated_user_id,
-            &conv_id,
-            &account_directory,
-            Some(&live_action_binding),
-        )? {
+        if let DeviceDirectoryInstallOutcome::NotReady(reason) =
+            fetch_and_install_authenticated_device_directory(
+                &state,
+                &server_http_url,
+                &authenticated_user_id,
+                &conv_id,
+                &account_directory,
+                Some(&live_action_binding),
+            )?
+        {
             return Err(format!(
                 "created group is waiting for a ready exact-device roster: {reason}"
             ));
@@ -6482,7 +6642,7 @@ fn fetch_and_install_authenticated_device_directory(
     conversation_id: &str,
     account_directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
     live_action_binding: Option<&RestBinding>,
-) -> Result<Option<String>, String> {
+) -> Result<DeviceDirectoryInstallOutcome, String> {
     let parsed = match fetch_authenticated_device_directory(
         state,
         server_http_url,
@@ -6502,7 +6662,7 @@ fn fetch_and_install_authenticated_device_directory(
             .clone()
             .unwrap_or_else(|| "device_roster_not_ready".to_string());
         invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
-        return Ok(Some(reason));
+        return Ok(DeviceDirectoryInstallOutcome::NotReady(reason));
     }
     if let Err(error) = verify_device_directory_account_keys(&parsed, account_directory) {
         invalidate_device_roster_for_binding(state, conversation_id, live_action_binding)?;
@@ -6516,9 +6676,20 @@ fn fetch_and_install_authenticated_device_directory(
         client.invalidate_device_roster_v1(conversation_id);
         return Err("device directory belongs to a stale authenticated session".to_string());
     }
+    let evidence = match current_target_admission_evidence(
+        &parsed,
+        decode_canonical_uuid("authenticated user id", user_id)?,
+        client.device_id(),
+    ) {
+        Ok(evidence) => evidence,
+        Err(error) => {
+            client.invalidate_device_roster_v1(conversation_id);
+            return Err(error);
+        }
+    };
     client.install_device_roster_v1(parsed.into())?;
     require_session_still_unlocked(state)?;
-    Ok(None)
+    Ok(DeviceDirectoryInstallOutcome::Ready(evidence))
 }
 
 #[tauri::command]
@@ -8803,14 +8974,16 @@ fn distribute_sender_key(
         }
     };
     let account_directory = pinned_account_directory_from_json(&members)?;
-    if let Some(reason) = fetch_and_install_authenticated_device_directory(
-        &state,
-        &server_http_url,
-        &user_id,
-        &conversation_id,
-        &account_directory,
-        Some(&live_action_binding),
-    )? {
+    if let DeviceDirectoryInstallOutcome::NotReady(reason) =
+        fetch_and_install_authenticated_device_directory(
+            &state,
+            &server_http_url,
+            &user_id,
+            &conversation_id,
+            &account_directory,
+            Some(&live_action_binding),
+        )?
+    {
         return Err(format!(
             "conversation exact-device roster is not ready: {reason}"
         ));
@@ -9460,12 +9633,14 @@ pub fn run() {
 mod e2ee_rest_tests {
     use super::{
         authenticated_event_payload, canonical_profile_version, consume_pending_lock_event,
-        exact_confirmed_live_action_binding, invalidate_disconnected_binding, offline_sync_url,
-        parse_device_directory, parse_expected_dm_peer_identity_key, parse_message_crypto_context,
+        current_target_admission_evidence, exact_confirmed_live_action_binding,
+        invalidate_disconnected_binding, offline_sync_url, parse_device_directory,
+        parse_expected_dm_peer_identity_key, parse_message_crypto_context,
         parse_network_profile_response, parse_prekey_bundle, preserve_created_group_outcome,
-        publish_unlocked_session, require_matching_identity_fingerprint, resolve_auto_lock_seconds,
-        rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
-        valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
+        proves_future_only_sender_key_history, publish_unlocked_session,
+        require_matching_identity_fingerprint, resolve_auto_lock_seconds, rest_api_url,
+        rest_authority, rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
+        valid_unlock_pin, validate_authenticated_binding_commit,
         validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
         validate_expected_live_action_binding, validate_expected_rest_binding,
         validate_live_action_rest_origin, validate_live_message_security_context,
@@ -9473,8 +9648,8 @@ mod e2ee_rest_tests {
         validate_pinned_directory_self, validate_profile_avatar_jpeg, validate_rest_url,
         validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_hit_dto,
         verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
-        ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
-        DEFAULT_AUTO_LOCK_SECONDS,
+        CurrentTargetAdmissionEvidence, ParsedMessageCryptoContext, PinnedDirectoryMember,
+        RestBinding, RestOrigin, DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -9642,22 +9817,32 @@ mod e2ee_rest_tests {
         terminal_db
             .upsert_identity_directory(std::slice::from_ref(&original))
             .unwrap();
-        super::observe_active_history_candidate_with_signal(
-            &terminal_db,
-            origin,
-            alias_user_id,
-            &original.locator.identity_key,
-            &original.signing_key,
+        for state in [
             veil_store::models::RemoteMessageStateKind::Deleted,
-            None,
-        )
-        .unwrap();
+            veil_store::models::RemoteMessageStateKind::Expired,
+            veil_store::models::RemoteMessageStateKind::Unavailable,
+        ] {
+            super::observe_active_history_candidate_with_signal(
+                &terminal_db,
+                origin,
+                alias_user_id,
+                &original.locator.identity_key,
+                &original.signing_key,
+                state,
+                None,
+            )
+            .unwrap();
+        }
         assert_eq!(
             terminal_db
                 .local_identity_verification(&original.locator)
                 .unwrap(),
             veil_store::models::LocalIdentityVerification::NotCompared
         );
+        assert!(terminal_db
+            .identity_change_users_for_origin(origin)
+            .unwrap()
+            .is_empty());
 
         let first_seen_db = veil_store::db::VeilDb::open_memory(&[0xAB; 32]).unwrap();
         super::observe_active_history_candidate_with_signal(
@@ -10697,12 +10882,273 @@ mod e2ee_rest_tests {
         assert_eq!(parsed.devices.len(), 2);
         assert_eq!(parsed.devices[0].device_id, [0x10; 16]);
         assert_eq!(
+            parsed.devices[0].binding.as_ref().unwrap().created_at,
+            "2026-07-11T18:00:00.123456789Z"
+        );
+        let mut current_user_id = [0u8; 16];
+        current_user_id[15] = 1;
+        let evidence =
+            current_target_admission_evidence(&parsed, current_user_id, [0x10; 16]).unwrap();
+        assert_eq!(evidence.binding_version, 1);
+        assert_eq!(evidence.roster_version, 7);
+        assert_eq!(
             parsed.devices[1].binding.as_ref().unwrap().version,
             i64::MAX as u64
         );
         let candidate: veil_client::api::DeviceRosterCandidateV1 = parsed.into();
         assert_eq!(candidate.devices[0].binding.as_ref().unwrap().status, 1);
         assert_eq!(candidate.devices[1].user_id[15], 2);
+    }
+
+    #[test]
+    fn future_only_history_requires_strict_first_binding_admission_order() {
+        use veil_client::api::SenderKeyMessageContextInspectionV1;
+
+        let evidence = CurrentTargetAdmissionEvidence {
+            target_device_id: [0x10; 16],
+            binding_version: 1,
+            first_binding_created_at: chrono::DateTime::parse_from_rfc3339(
+                "2026-07-13T19:05:17.714129Z",
+            )
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+            roster_version: 2,
+            roster_commitment: [0x22; 32],
+        };
+        let missing = SenderKeyMessageContextInspectionV1::MissingExactRoute {
+            target_device_id: evidence.target_device_id,
+            message_roster_version: 1,
+            message_roster_commitment: [0x11; 32],
+            installed_roster_version: evidence.roster_version,
+            installed_roster_commitment: evidence.roster_commitment,
+        };
+
+        assert!(proves_future_only_sender_key_history(
+            &missing,
+            &evidence,
+            "2026-07-13T19:05:17.714128999Z",
+        )
+        .unwrap());
+        assert!(!proves_future_only_sender_key_history(
+            &missing,
+            &evidence,
+            "2026-07-13T19:05:17.714129Z",
+        )
+        .unwrap());
+        assert!(!proves_future_only_sender_key_history(
+            &missing,
+            &evidence,
+            "2026-07-13T19:05:17.714129001Z",
+        )
+        .unwrap());
+
+        let mut rotated_binding = evidence.clone();
+        rotated_binding.binding_version = 2;
+        assert!(!proves_future_only_sender_key_history(
+            &missing,
+            &rotated_binding,
+            "2026-07-12T20:40:16Z",
+        )
+        .unwrap());
+
+        let same_epoch = SenderKeyMessageContextInspectionV1::MissingExactRoute {
+            target_device_id: evidence.target_device_id,
+            message_roster_version: evidence.roster_version,
+            message_roster_commitment: evidence.roster_commitment,
+            installed_roster_version: evidence.roster_version,
+            installed_roster_commitment: evidence.roster_commitment,
+        };
+        assert!(!proves_future_only_sender_key_history(
+            &same_epoch,
+            &evidence,
+            "2026-07-12T20:40:16Z",
+        )
+        .unwrap());
+
+        let older_same_commitment = SenderKeyMessageContextInspectionV1::MissingExactRoute {
+            target_device_id: evidence.target_device_id,
+            message_roster_version: 1,
+            message_roster_commitment: evidence.roster_commitment,
+            installed_roster_version: evidence.roster_version,
+            installed_roster_commitment: evidence.roster_commitment,
+        };
+        assert!(!proves_future_only_sender_key_history(
+            &older_same_commitment,
+            &evidence,
+            "2026-07-12T20:40:16Z",
+        )
+        .unwrap());
+
+        let future_epoch = SenderKeyMessageContextInspectionV1::MissingExactRoute {
+            target_device_id: evidence.target_device_id,
+            message_roster_version: evidence.roster_version + 1,
+            message_roster_commitment: [0x33; 32],
+            installed_roster_version: evidence.roster_version,
+            installed_roster_commitment: evidence.roster_commitment,
+        };
+        assert!(!proves_future_only_sender_key_history(
+            &future_epoch,
+            &evidence,
+            "2026-07-12T20:40:16Z",
+        )
+        .unwrap());
+
+        for stale_install in [
+            SenderKeyMessageContextInspectionV1::MissingExactRoute {
+                target_device_id: evidence.target_device_id,
+                message_roster_version: 1,
+                message_roster_commitment: [0x11; 32],
+                installed_roster_version: evidence.roster_version - 1,
+                installed_roster_commitment: evidence.roster_commitment,
+            },
+            SenderKeyMessageContextInspectionV1::MissingExactRoute {
+                target_device_id: evidence.target_device_id,
+                message_roster_version: 1,
+                message_roster_commitment: [0x11; 32],
+                installed_roster_version: evidence.roster_version,
+                installed_roster_commitment: [0x44; 32],
+            },
+        ] {
+            assert!(proves_future_only_sender_key_history(
+                &stale_install,
+                &evidence,
+                "2026-07-12T20:40:16Z",
+            )
+            .is_err());
+        }
+
+        let stale_target = SenderKeyMessageContextInspectionV1::MissingExactRoute {
+            target_device_id: [0x99; 16],
+            message_roster_version: 1,
+            message_roster_commitment: [0x11; 32],
+            installed_roster_version: evidence.roster_version,
+            installed_roster_commitment: evidence.roster_commitment,
+        };
+        assert!(proves_future_only_sender_key_history(
+            &stale_target,
+            &evidence,
+            "2026-07-12T20:40:16Z",
+        )
+        .is_err());
+        assert!(!proves_future_only_sender_key_history(
+            &SenderKeyMessageContextInspectionV1::Verified,
+            &evidence,
+            "2026-07-12T20:40:16Z",
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn future_only_history_orchestration_reconciles_without_observing_identity() {
+        use veil_client::api::{
+            RemoteMessageMetadata, SenderKeyMessageContextInspectionV1, VeilClient,
+        };
+        use veil_store::models::{
+            AccountSnapshotSource, LocalIdentityVerification, RemoteMessageStateKind,
+        };
+
+        let temporary = tempfile::tempdir().unwrap();
+        let database_path = temporary.path().join("future-only-history.db");
+        let mut client = VeilClient::new();
+        let mnemonic = client.generate_mnemonic();
+        client
+            .init_with_mnemonic(&mnemonic, &database_path)
+            .unwrap();
+
+        let mut baseline = historical_account_snapshot(0x71, 0x72);
+        baseline.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+        client
+            .db()
+            .unwrap()
+            .upsert_identity_directory(std::slice::from_ref(&baseline))
+            .unwrap();
+        let evidence = CurrentTargetAdmissionEvidence {
+            target_device_id: [0x73; 16],
+            binding_version: 1,
+            first_binding_created_at: chrono::DateTime::parse_from_rfc3339(
+                "2026-07-13T19:05:17.714129Z",
+            )
+            .unwrap()
+            .with_timezone(&chrono::Utc),
+            roster_version: 2,
+            roster_commitment: [0x74; 32],
+        };
+        let missing = SenderKeyMessageContextInspectionV1::MissingExactRoute {
+            target_device_id: evidence.target_device_id,
+            message_roster_version: 1,
+            message_roster_commitment: [0x75; 32],
+            installed_roster_version: evidence.roster_version,
+            installed_roster_commitment: evidence.roster_commitment,
+        };
+        let metadata = RemoteMessageMetadata {
+            revision_ms: 1,
+            reactions: None,
+        };
+
+        assert_eq!(
+            super::reconcile_sender_key_history_inspection(
+                &client,
+                &missing,
+                Some(&evidence),
+                "2026-07-13T19:05:17.714128999Z",
+                "future-only-history",
+                "00000000-0000-0000-0000-000000000315",
+                &baseline.locator.identity_key,
+                &metadata,
+            )
+            .unwrap(),
+            super::SenderKeyHistoryInspectionOutcome::FutureOnlyUnavailable
+        );
+        assert!(!client
+            .db()
+            .unwrap()
+            .message_exists("future-only-history")
+            .unwrap());
+        assert_eq!(
+            client
+                .db()
+                .unwrap()
+                .get_remote_message_state("future-only-history")
+                .unwrap()
+                .unwrap()
+                .state,
+            RemoteMessageStateKind::Unavailable
+        );
+        assert_eq!(
+            client
+                .db()
+                .unwrap()
+                .local_identity_verification(&baseline.locator)
+                .unwrap(),
+            LocalIdentityVerification::NotCompared
+        );
+        assert!(client
+            .db()
+            .unwrap()
+            .identity_change_users_for_origin(&baseline.locator.canonical_server_origin)
+            .unwrap()
+            .is_empty());
+
+        assert_eq!(
+            super::reconcile_sender_key_history_inspection(
+                &client,
+                &SenderKeyMessageContextInspectionV1::Verified,
+                Some(&evidence),
+                "2026-07-13T19:05:18Z",
+                "current-route-history",
+                "00000000-0000-0000-0000-000000000315",
+                &baseline.locator.identity_key,
+                &metadata,
+            )
+            .unwrap(),
+            super::SenderKeyHistoryInspectionOutcome::Verified
+        );
+        assert!(client
+            .db()
+            .unwrap()
+            .get_remote_message_state("current-route-history")
+            .unwrap()
+            .is_none());
     }
 
     #[test]

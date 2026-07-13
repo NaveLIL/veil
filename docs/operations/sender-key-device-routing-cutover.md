@@ -140,3 +140,51 @@ membership does **not** collect rows for targets that stayed authorized; those
 targets must still be able to restore ciphertext from their authorized
 interval. Role/overwrite changes that leave a target continuously authorized
 also preserve its pending rows.
+
+## Future-only device history
+
+Restoring an account on a new installation creates a new, independently bound
+device. It must not receive Sender-Key generations published before that device
+was admitted. During offline replay, a structurally valid v5 row with no exact
+stored route therefore has two possible meanings: legitimate future-only
+history, or lost/tampered route state for a device that should have received the
+generation. Roster version ordering alone cannot distinguish them.
+
+The desktop may mark only that historical row `Unavailable` and continue to a
+fresh current-roster rotation when all of these checks hold:
+
+- the client reports a typed missing exact route; decryption itself still fails;
+- the target device and installed roster version/commitment match the directory
+  snapshot used by the same offline sync;
+- the current binding is version 1; the authentication flow commits device
+  registration before starting that binding transaction, so its `created_at`
+  is a conservative post-registration cutoff for this device;
+- the message advertises a strictly older, different roster epoch; and
+- the PostgreSQL-generated binding time is strictly later than the original
+  group/channel message `created_at` value written by the accepted message
+  insertion path; current product paths never revise that value.
+
+Every equality, rotated binding, stale snapshot, malformed timestamp, current
+or future roster, or existing conflicting route remains a conversation-level
+fail-closed error. No route is synthesized, no ciphertext is decrypted, and no
+incoming Sender-Key state advances in the unavailable-row path. A route that is
+present always takes the normal full account/device proof, signature, roster,
+and envelope verification path. Unavailable rows are reconciled before identity
+continuity observation, so their unauthenticated author fields can neither seed
+a TOFU baseline nor raise an `IdentityChanged` alarm.
+
+The cutoff depends on the server's existing roster barrier: device registration
+synchronously dirties every affected roster and an unbound device makes that
+roster NotReady. Consequently, an old-roster Sender-Key message can be accepted
+only from a transaction ordered before the committed registration, while the v1
+binding transaction starts afterwards. Timestamp equality, clock ambiguity, or
+any violation of that causal order fails closed; `created_at` is not treated as
+a general-purpose commit clock.
+
+`binding.created_at` is service-mediated availability evidence only. It is not
+covered by the account signature or roster commitment and must never influence
+crypto trust, ACLs, identity verification, or decryption. The service can
+already suppress an offline row, so this evidence does not grant it new content
+forgery power. Before Sender-Key group/channel ciphertext edits are introduced,
+replace this bounded rule with a commitment-bound per-device history floor;
+using the original message time after editable revisions would be insufficient.

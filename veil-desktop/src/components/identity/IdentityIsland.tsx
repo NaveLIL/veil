@@ -112,7 +112,10 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
   const [draftError, setDraftError] = createSignal("");
   let copyTimer: number | undefined;
   let copyEpoch = 0;
+  let avatarRemovalEpoch = 0;
   let disposed = false;
+  let changeAvatarButton: HTMLButtonElement | undefined;
+  let disposeAvatarFocusOwnership: (() => void) | undefined;
   const displayName = () => boundedIdentityText(props.profile.displayName, "Unknown account", 96);
   const technicalUsername = () => boundedIdentityText(props.profile.technicalUsername, "", 96);
   const about = () => boundedIdentityText(props.profile.about, "", 280);
@@ -193,6 +196,54 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
     if (saved) setEditingProfile(false);
   };
 
+  const removeAvatar = async (trigger: HTMLButtonElement) => {
+    if (!props.onRemoveAvatar || props.profileSaving) return;
+    disposeAvatarFocusOwnership?.();
+    disposeAvatarFocusOwnership = undefined;
+    const removalEpoch = ++avatarRemovalEpoch;
+    const startedWithFocus = document.activeElement === trigger;
+    let focusOwnershipLost = !startedWithFocus;
+    let disposeFocusOwnership: (() => void) | undefined;
+    const releaseFocusOwnership = (event: Event) => {
+      if (event.target === trigger) return;
+      focusOwnershipLost = true;
+      disposeFocusOwnership?.();
+      if (disposeAvatarFocusOwnership === disposeFocusOwnership) {
+        disposeAvatarFocusOwnership = undefined;
+      }
+    };
+    if (startedWithFocus) {
+      document.addEventListener("focusin", releaseFocusOwnership);
+      document.addEventListener("pointerdown", releaseFocusOwnership);
+      disposeFocusOwnership = () => {
+        document.removeEventListener("focusin", releaseFocusOwnership);
+        document.removeEventListener("pointerdown", releaseFocusOwnership);
+      };
+      disposeAvatarFocusOwnership = disposeFocusOwnership;
+    }
+
+    let removed = false;
+    try {
+      removed = await props.onRemoveAvatar();
+    } finally {
+      disposeFocusOwnership?.();
+      if (disposeAvatarFocusOwnership === disposeFocusOwnership) {
+        disposeAvatarFocusOwnership = undefined;
+      }
+    }
+    if (!removed || disposed || removalEpoch !== avatarRemovalEpoch || focusOwnershipLost) return;
+    queueMicrotask(() => {
+      if (
+        !disposed
+        && removalEpoch === avatarRemovalEpoch
+        && !focusOwnershipLost
+        && changeAvatarButton?.isConnected
+      ) {
+        changeAvatarButton.focus();
+      }
+    });
+  };
+
   const clearCopyTimer = () => {
     if (copyTimer === undefined) return;
     window.clearTimeout(copyTimer);
@@ -202,6 +253,9 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
   onCleanup(() => {
     disposed = true;
     copyEpoch += 1;
+    avatarRemovalEpoch += 1;
+    disposeAvatarFocusOwnership?.();
+    disposeAvatarFocusOwnership = undefined;
     clearCopyTimer();
   });
 
@@ -266,7 +320,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
     <div class="veil-identity-island-content" data-identity-island="v1">
       <section aria-labelledby="identity-person-heading" style={sectionStyle}>
         <h3 id="identity-person-heading" style={sectionTitleStyle}>Person</h3>
-        <div style={{ display: "flex", "flex-direction": "column", "align-items": "center", padding: "4px 0 2px" }}>
+        <div class="veil-identity-person-body" style={{ display: "flex", "flex-direction": "column", "align-items": "center", padding: "4px 0 2px" }}>
           <div style={{ position: "relative", "margin-bottom": "12px" }}>
             <div
               aria-hidden="true"
@@ -401,12 +455,21 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
             </Show>
           </Show>
           <Show when={proofState() === "self" && profileVersion() && props.onChangeAvatar}>
-            <div class="veil-identity-editor-actions" style={{ "margin-top": "8px" }}>
-              <button type="button" disabled={props.profileSaving} onClick={() => void props.onChangeAvatar?.()}>
+            <div class="veil-identity-editor-actions veil-identity-avatar-actions" style={{ "margin-top": "8px" }}>
+              <button
+                ref={(element) => { changeAvatarButton = element; }}
+                type="button"
+                disabled={props.profileSaving}
+                onClick={() => void props.onChangeAvatar?.()}
+              >
                 <ImagePlus size={12} /> Change avatar
               </button>
               <Show when={props.profile.avatarAssetId && props.onRemoveAvatar}>
-                <button type="button" disabled={props.profileSaving} onClick={() => void props.onRemoveAvatar?.()}>
+                <button
+                  type="button"
+                  disabled={props.profileSaving}
+                  onClick={(event) => void removeAvatar(event.currentTarget)}
+                >
                   <Trash2 size={12} /> Remove
                 </button>
               </Show>

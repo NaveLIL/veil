@@ -218,14 +218,18 @@ const GroupMemberRow: Component<{
     queueMicrotask(() => {
       if (disposed) return;
       openFrame = window.requestAnimationFrame(() => {
-        openFrame = undefined;
-        if (
-          disposed
-          || !props.shell.open
-          || !trigger?.isConnected
-          || identityProfileKey(profile()) !== expectedProfileKey
-        ) return;
-        props.onOpen(nextProfile, trigger);
+        // Let the context menu finish its own close/focus-restoration frame
+        // before the persistent island takes focus and morphs views.
+        openFrame = window.requestAnimationFrame(() => {
+          openFrame = undefined;
+          if (
+            disposed
+            || !props.shell.open
+            || !trigger?.isConnected
+            || identityProfileKey(profile()) !== expectedProfileKey
+          ) return;
+          props.onOpen(nextProfile, trigger);
+        });
       });
     });
   };
@@ -306,14 +310,18 @@ const ServerMemberRow: Component<{
     queueMicrotask(() => {
       if (disposed) return;
       openFrame = window.requestAnimationFrame(() => {
-        openFrame = undefined;
-        if (
-          disposed
-          || !props.shell.open
-          || !trigger?.isConnected
-          || identityProfileKey(profile()) !== expectedProfileKey
-        ) return;
-        props.onOpen(nextProfile, trigger);
+        // Let the context menu finish its own close/focus-restoration frame
+        // before the persistent island takes focus and morphs views.
+        openFrame = window.requestAnimationFrame(() => {
+          openFrame = undefined;
+          if (
+            disposed
+            || !props.shell.open
+            || !trigger?.isConnected
+            || identityProfileKey(profile()) !== expectedProfileKey
+          ) return;
+          props.onOpen(nextProfile, trigger);
+        });
       });
     });
   };

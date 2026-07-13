@@ -405,6 +405,10 @@ select:focus-visible,
   transition: outline-color 140ms ease, box-shadow 140ms ease;
 }
 
+.veil-message-composer-input {
+  align-self: center;
+}
+
 .veil-message-composer:focus-within {
   outline-color: var(--veil-accent);
   box-shadow: 0 0 0 2px rgba(var(--veil-accent-rgb), 0.2);
@@ -794,6 +798,14 @@ select:focus-visible,
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 7px;
+}
+
+.veil-identity-avatar-actions {
+  width: 100%;
+}
+
+.veil-identity-avatar-actions > button:only-child {
+  grid-column: 1 / -1;
 }
 
 .veil-identity-editor-actions button {

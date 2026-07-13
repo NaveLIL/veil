@@ -420,6 +420,7 @@ const Chat: Component<{ focusState: boolean }> = (props) => {
           </button>
           <button
             type="button"
+            data-testid="composer-send"
             aria-label="Send message"
             disabled={!draft().trim()}
             onClick={sendDraft}
@@ -449,10 +450,28 @@ export const AppShellFixture: Component = () => {
   const state = params.get("state") ?? "wallpaper";
   const lockScreen = state === "lock";
   const wallpaper = !lockScreen && state !== "plain";
-  const identityState = state === "identity";
+  const avatarState = state === "identity-avatar";
+  const identityState = state === "identity" || avatarState;
   const [membersOpen, setMembersOpen] = createSignal(state === "members" || identityState);
   const [rightView, setRightView] = createSignal<"members" | "identity">(identityState ? "identity" : "members");
-  const [identityProfile, setIdentityProfile] = createSignal<IdentityIslandProfile | null>(identityState ? {
+  const [identityProfile, setIdentityProfile] = createSignal<IdentityIslandProfile | null>(avatarState ? {
+    canonicalServerOrigin: FIXTURE_ORIGIN,
+    userId: CURRENT_USER_ID,
+    identityKey: "11".repeat(32),
+    signingKey: "1a".repeat(32),
+    technicalUsername: "northern-light",
+    displayName: "Northern Light",
+    contextKind: "server-member",
+    contextLabel: "Server owner",
+    contextDetail: "Server · Secure Lab",
+    profileVersion: "2",
+    avatarAssetId: null,
+    selfIdentity: {
+      canonicalServerOrigin: FIXTURE_ORIGIN,
+      userId: CURRENT_USER_ID,
+      identityKey: "11".repeat(32),
+    },
+  } : identityState ? {
     canonicalServerOrigin: FIXTURE_ORIGIN,
     userId: SABLE_USER_ID,
     identityKey: "22".repeat(32),
@@ -535,6 +554,8 @@ export const AppShellFixture: Component = () => {
               onBackToMembers={() => { setIdentityProfile(null); setRightView("members"); }}
               onClose={() => setMembersOpen(false)}
               onMessageIdentity={() => undefined}
+              onChangeIdentityAvatar={avatarState ? async () => true : undefined}
+              onRemoveIdentityAvatar={avatarState ? async () => true : undefined}
               onCreateDm={() => undefined}
               onAssignRole={() => undefined}
               onUnassignRole={() => undefined}

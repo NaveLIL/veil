@@ -238,6 +238,37 @@ pub enum MessageSecurityContextV1 {
     SenderKeyV5(SenderKeyMessageSecurityContextV1),
 }
 
+/// Result of checking whether a persisted Sender-Key v5 wire has an exact
+/// trusted route. `MissingExactRoute` is not authentication success and never
+/// authorizes decryption or receive-chain mutation. Native orchestration may
+/// use its bounded metadata only with independent device-admission evidence.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SenderKeyMessageContextInspectionV1 {
+    Verified,
+    MissingExactRoute {
+        target_device_id: [u8; 16],
+        message_roster_version: u64,
+        message_roster_commitment: [u8; 32],
+        installed_roster_version: u64,
+        installed_roster_commitment: [u8; 32],
+    },
+}
+
+enum ValidatedSenderKeyRouteForMessageV1 {
+    Verified {
+        generation: u32,
+        route: Box<IncomingSenderKeyRouteV1>,
+    },
+    MissingExactRoute {
+        target_device_id: [u8; 16],
+        message_roster_version: u64,
+        message_roster_commitment: [u8; 32],
+        installed_roster_version: u64,
+        installed_roster_commitment: [u8; 32],
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SenderKeyRouteV1 {
     pub conversation_id: String,
@@ -2286,7 +2317,7 @@ impl VeilClient {
         sender_account_identity_key: &[u8; 32],
         ciphertext: &[u8],
         security_context: &MessageSecurityContextV1,
-    ) -> Result<(u32, IncomingSenderKeyRouteV1), String> {
+    ) -> Result<ValidatedSenderKeyRouteForMessageV1, String> {
         let MessageSecurityContextV1::SenderKeyV5(context) = security_context;
         let local = self
             .device_identity
@@ -2331,9 +2362,9 @@ impl VeilClient {
                 &local.binding().device_signing_key,
                 ciphertext,
             )?;
-            return Ok((
+            return Ok(ValidatedSenderKeyRouteForMessageV1::Verified {
                 generation,
-                IncomingSenderKeyRouteV1 {
+                route: Box::new(IncomingSenderKeyRouteV1 {
                     sender_account_identity_key: local_account_identity,
                     sender_device_id: self.device_id,
                     sender_device_identity_key: local.binding().device_identity_key,
@@ -2351,23 +2382,16 @@ impl VeilClient {
                         sender_account_signature: local.binding().account_signature,
                         target_device_identity_key: Some(local.binding().device_identity_key),
                     }),
-                },
-            ));
+                }),
+            });
         }
-        let route = self
-            .db
-            .as_ref()
-            .ok_or("database is required for Sender-Key route verification")?
-            .load_incoming_sender_key_route_v1(
-                conversation_id,
-                &unverified.sender_identity_key,
-                unverified.generation,
-            )?
-            .ok_or("trusted historical Sender-Key route is unavailable")?;
-        let current_target = self
+        let current_roster = self
             .device_rosters
             .get(conversation_id)
-            .and_then(|roster| roster.eligible_devices.get(&self.device_id))
+            .ok_or("current device roster is not installed")?;
+        let current_target = current_roster
+            .eligible_devices
+            .get(&self.device_id)
             .ok_or("current device is not eligible in the installed roster")?;
         if current_target.account_identity_key != local_account_identity
             || current_target.account_signing_key != local_account_signing
@@ -2381,6 +2405,24 @@ impl VeilClient {
                 "installed target roster no longer matches local device identity".to_string(),
             );
         }
+        let route = self
+            .db
+            .as_ref()
+            .ok_or("database is required for Sender-Key route verification")?
+            .load_incoming_sender_key_route_v1(
+                conversation_id,
+                &unverified.sender_identity_key,
+                unverified.generation,
+            )?;
+        let Some(route) = route else {
+            return Ok(ValidatedSenderKeyRouteForMessageV1::MissingExactRoute {
+                target_device_id: context.target_device_id,
+                message_roster_version: context.roster_version,
+                message_roster_commitment: context.roster_commitment,
+                installed_roster_version: current_roster.version,
+                installed_roster_commitment: current_roster.commitment,
+            });
+        };
         if let Some(proof) = route.historical_sender_binding.as_ref() {
             if proof.target_device_identity_key != Some(local.binding().device_identity_key)
                 || self
@@ -2418,7 +2460,42 @@ impl VeilClient {
         if generation != unverified.generation {
             return Err("Sender-Key signed generation changed during verification".to_string());
         }
-        Ok((generation, route))
+        Ok(ValidatedSenderKeyRouteForMessageV1::Verified {
+            generation,
+            route: Box::new(route),
+        })
+    }
+
+    pub fn inspect_sender_key_message_context_v1(
+        &self,
+        conversation_id: &str,
+        sender_account_identity_key: &[u8; 32],
+        ciphertext: &[u8],
+        security_context: &MessageSecurityContextV1,
+    ) -> Result<SenderKeyMessageContextInspectionV1, String> {
+        match self.validated_sender_key_route_for_message(
+            conversation_id,
+            sender_account_identity_key,
+            ciphertext,
+            security_context,
+        )? {
+            ValidatedSenderKeyRouteForMessageV1::Verified { .. } => {
+                Ok(SenderKeyMessageContextInspectionV1::Verified)
+            }
+            ValidatedSenderKeyRouteForMessageV1::MissingExactRoute {
+                target_device_id,
+                message_roster_version,
+                message_roster_commitment,
+                installed_roster_version,
+                installed_roster_commitment,
+            } => Ok(SenderKeyMessageContextInspectionV1::MissingExactRoute {
+                target_device_id,
+                message_roster_version,
+                message_roster_commitment,
+                installed_roster_version,
+                installed_roster_commitment,
+            }),
+        }
     }
 
     pub fn validate_sender_key_message_context_v1(
@@ -2428,13 +2505,17 @@ impl VeilClient {
         ciphertext: &[u8],
         security_context: &MessageSecurityContextV1,
     ) -> Result<(), String> {
-        self.validated_sender_key_route_for_message(
+        match self.inspect_sender_key_message_context_v1(
             conversation_id,
             sender_account_identity_key,
             ciphertext,
             security_context,
-        )
-        .map(|_| ())
+        )? {
+            SenderKeyMessageContextInspectionV1::Verified => Ok(()),
+            SenderKeyMessageContextInspectionV1::MissingExactRoute { .. } => {
+                Err("trusted historical Sender-Key route is unavailable".to_string())
+            }
+        }
     }
 
     pub fn decrypt_from_with_security_context(
@@ -2558,12 +2639,21 @@ impl VeilClient {
             HEADER_SENDER_KEY => {
                 let context = security_context
                     .ok_or("Sender-Key v5 message is missing persisted device security context")?;
-                let (generation, route) = self.validated_sender_key_route_for_message(
+                let (generation, route) = match self.validated_sender_key_route_for_message(
                     conversation_id,
                     sender_identity_key,
                     ciphertext,
                     context,
-                )?;
+                )? {
+                    ValidatedSenderKeyRouteForMessageV1::Verified { generation, route } => {
+                        (generation, route)
+                    }
+                    ValidatedSenderKeyRouteForMessageV1::MissingExactRoute { .. } => {
+                        return Err(
+                            "trusted historical Sender-Key route is unavailable".to_string()
+                        );
+                    }
+                };
                 self.ensure_incoming_sender_key_loaded(
                     conversation_id,
                     &route.sender_device_identity_key,
@@ -6016,6 +6106,448 @@ mod tests {
             let _ = std::fs::remove_file(path);
             let _ = std::fs::remove_file(path.with_extension("db-wal"));
             let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        }
+    }
+
+    #[test]
+    fn missing_exact_route_is_never_an_admission_decision() {
+        let sender_user = uuid::Uuid::from_bytes([0x81; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0x82; 16]);
+        let mut sender = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_user,
+            [0x83; 16],
+            [0x84; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            recipient_user,
+            [0x85; 16],
+            [0x86; 32],
+        );
+        let conversation = "00000000-0000-0000-0000-000000000314";
+        let sender_entry = roster_entry(
+            *sender_user.as_bytes(),
+            sender.identity.as_ref().unwrap(),
+            sender.device_identity.as_ref().unwrap().binding(),
+        );
+        let recipient_entry = roster_entry(
+            *recipient_user.as_bytes(),
+            recipient.identity.as_ref().unwrap(),
+            recipient.device_identity.as_ref().unwrap().binding(),
+        );
+
+        let historical_roster =
+            candidate_with_commitment(conversation, 1, vec![sender_entry.clone()]);
+        sender.mark_channel_conversation(conversation);
+        sender
+            .install_device_roster_v1(historical_roster.clone())
+            .unwrap();
+        let (historical_ciphertext, historical_header) = sender
+            .encrypt_outgoing(conversation, "before target admission")
+            .unwrap();
+        assert_eq!(historical_header, [HEADER_SENDER_KEY]);
+
+        let current_roster =
+            candidate_with_commitment(conversation, 2, vec![sender_entry, recipient_entry]);
+        sender
+            .install_device_roster_v1(current_roster.clone())
+            .unwrap();
+        recipient.mark_channel_conversation(conversation);
+        recipient
+            .install_device_roster_v1(current_roster.clone())
+            .unwrap();
+
+        let sender_binding_version = sender.device_identity.as_ref().unwrap().binding().version;
+        let sender_device_identity_key = sender
+            .device_identity
+            .as_ref()
+            .unwrap()
+            .binding()
+            .device_identity_key;
+        let recipient_target = sender
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (fresh_key, fresh_envelope) = sender
+            .prepare_sender_key_device_envelope(&recipient_target)
+            .unwrap();
+        let fresh_route = route_for_test(&sender, &recipient_target, &fresh_key);
+        recipient
+            .process_sender_key_distribution_v1(&fresh_envelope, &fresh_route)
+            .unwrap();
+        sender.mark_sender_key_distributed(conversation).unwrap();
+        let (fresh_ciphertext, fresh_header) = sender
+            .encrypt_outgoing(conversation, "after exact-device distribution")
+            .unwrap();
+        let fresh_context =
+            MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+                roster_version: fresh_route.roster_version,
+                roster_commitment: fresh_route.roster_commitment,
+                sender_device_id: fresh_route.sender_device_id,
+                target_device_id: fresh_route.target_device_id,
+                sender_binding_version: fresh_route.sender_binding_version,
+            });
+        let historical_context =
+            MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+                roster_version: historical_roster.roster_version,
+                roster_commitment: historical_roster.roster_commitment,
+                sender_device_id: sender.device_id,
+                target_device_id: recipient.device_id,
+                sender_binding_version,
+            });
+        assert_eq!(
+            recipient
+                .inspect_sender_key_message_context_v1(
+                    conversation,
+                    &sender.identity_key().unwrap(),
+                    &historical_ciphertext,
+                    &historical_context,
+                )
+                .unwrap(),
+            SenderKeyMessageContextInspectionV1::MissingExactRoute {
+                target_device_id: recipient.device_id,
+                message_roster_version: historical_roster.roster_version,
+                message_roster_commitment: historical_roster.roster_commitment,
+                installed_roster_version: current_roster.roster_version,
+                installed_roster_commitment: current_roster.roster_commitment,
+            }
+        );
+        assert!(recipient
+            .decrypt_from_with_security_context(
+                &sender.identity_key().unwrap(),
+                conversation,
+                &historical_header,
+                &historical_ciphertext,
+                Some(&historical_context),
+            )
+            .unwrap_err()
+            .contains("historical Sender-Key route is unavailable"));
+        assert!(recipient
+            .validate_sender_key_message_context_v1(
+                conversation,
+                &sender.identity_key().unwrap(),
+                &historical_ciphertext,
+                &historical_context,
+            )
+            .unwrap_err()
+            .contains("historical Sender-Key route is unavailable"));
+
+        let incoming_before = recipient
+            .sender_keys
+            .incoming_generations(conversation, &sender_device_identity_key);
+        assert_eq!(incoming_before, vec![fresh_key.generation]);
+        let fresh_metadata_before = recipient
+            .sender_keys
+            .incoming_generation_metadata(
+                conversation,
+                &sender_device_identity_key,
+                fresh_key.generation,
+            )
+            .unwrap();
+        let ratchet_sessions_before = recipient.ratchet_sessions.len();
+        let pending_receipts_before = recipient.pending_sender_key_receipts.len();
+        let outgoing_generation_before = recipient
+            .sender_keys
+            .build_distribution(conversation)
+            .unwrap()
+            .key_id;
+        let persisted_before = recipient
+            .db()
+            .unwrap()
+            .load_incoming_sender_key_generations_for_group(conversation)
+            .unwrap();
+        assert_eq!(persisted_before.len(), 1);
+        let persisted_before = (
+            persisted_before[0].sender_identity_key,
+            persisted_before[0].generation,
+            persisted_before[0].iteration,
+            persisted_before[0].state_revision,
+            persisted_before[0].distribution_commitment,
+            Sha256::digest(persisted_before[0].key_data.as_slice()),
+        );
+        assert!(recipient
+            .receive_and_persist_message(
+                "pre-admission-message",
+                conversation,
+                &sender.identity_key().unwrap(),
+                None,
+                None,
+                true,
+                Some(&historical_context),
+                Some("Pre-admission history"),
+                &historical_header,
+                &historical_ciphertext,
+                Some(1),
+                None,
+                None,
+            )
+            .unwrap_err()
+            .contains("historical Sender-Key route is unavailable"));
+        let unavailable_metadata = RemoteMessageMetadata {
+            revision_ms: 1,
+            reactions: None,
+        };
+        assert_eq!(
+            recipient
+                .reconcile_remote_message_metadata(
+                    "pre-admission-message",
+                    conversation,
+                    &sender.identity_key().unwrap(),
+                    &unavailable_metadata,
+                    RemoteMessageStateKind::Unavailable,
+                )
+                .unwrap(),
+            RemoteReconcileAction::Unavailable
+        );
+        assert_eq!(
+            recipient
+                .sender_keys
+                .incoming_generations(conversation, &sender_device_identity_key),
+            incoming_before
+        );
+        assert_eq!(
+            recipient
+                .sender_keys
+                .incoming_generation_metadata(
+                    conversation,
+                    &sender_device_identity_key,
+                    fresh_key.generation,
+                )
+                .unwrap(),
+            fresh_metadata_before
+        );
+        assert_eq!(recipient.ratchet_sessions.len(), ratchet_sessions_before);
+        assert_eq!(
+            recipient.pending_sender_key_receipts.len(),
+            pending_receipts_before
+        );
+        assert_eq!(
+            recipient
+                .sender_keys
+                .build_distribution(conversation)
+                .unwrap()
+                .key_id,
+            outgoing_generation_before
+        );
+        let persisted_after = recipient
+            .db()
+            .unwrap()
+            .load_incoming_sender_key_generations_for_group(conversation)
+            .unwrap();
+        assert_eq!(persisted_after.len(), 1);
+        assert_eq!(
+            (
+                persisted_after[0].sender_identity_key,
+                persisted_after[0].generation,
+                persisted_after[0].iteration,
+                persisted_after[0].state_revision,
+                persisted_after[0].distribution_commitment,
+                Sha256::digest(persisted_after[0].key_data.as_slice()),
+            ),
+            persisted_before
+        );
+        assert!(!recipient
+            .db()
+            .unwrap()
+            .message_exists("pre-admission-message")
+            .unwrap());
+        assert_eq!(
+            recipient
+                .db()
+                .unwrap()
+                .get_remote_message_state("pre-admission-message")
+                .unwrap()
+                .unwrap()
+                .state,
+            RemoteMessageStateKind::Unavailable
+        );
+
+        let current_epoch_without_route =
+            MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+                roster_version: current_roster.roster_version,
+                roster_commitment: current_roster.roster_commitment,
+                sender_device_id: sender.device_id,
+                target_device_id: recipient.device_id,
+                sender_binding_version,
+            });
+        assert!(matches!(
+            recipient
+                .inspect_sender_key_message_context_v1(
+                    conversation,
+                    &sender.identity_key().unwrap(),
+                    &historical_ciphertext,
+                    &current_epoch_without_route,
+                )
+                .unwrap(),
+            SenderKeyMessageContextInspectionV1::MissingExactRoute {
+                message_roster_version: 2,
+                ..
+            }
+        ));
+        assert!(recipient
+            .inspect_sender_key_message_context_v1(
+                conversation,
+                &sender.identity_key().unwrap(),
+                &historical_ciphertext[..historical_ciphertext.len() - 1],
+                &historical_context,
+            )
+            .is_err());
+
+        assert_eq!(
+            recipient
+                .inspect_sender_key_message_context_v1(
+                    conversation,
+                    &sender.identity_key().unwrap(),
+                    &fresh_ciphertext,
+                    &fresh_context,
+                )
+                .unwrap(),
+            SenderKeyMessageContextInspectionV1::Verified
+        );
+        recipient
+            .validate_sender_key_message_context_v1(
+                conversation,
+                &sender.identity_key().unwrap(),
+                &fresh_ciphertext,
+                &fresh_context,
+            )
+            .unwrap();
+
+        let conflicting_context =
+            MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+                roster_version: fresh_route.roster_version,
+                roster_commitment: fresh_route.roster_commitment,
+                sender_device_id: [0x99; 16],
+                target_device_id: fresh_route.target_device_id,
+                sender_binding_version: fresh_route.sender_binding_version,
+            });
+        assert!(recipient
+            .inspect_sender_key_message_context_v1(
+                conversation,
+                &sender.identity_key().unwrap(),
+                &fresh_ciphertext,
+                &conflicting_context,
+            )
+            .is_err());
+
+        let mut wrong_account_identity = sender.identity_key().unwrap();
+        wrong_account_identity[0] ^= 0x80;
+        assert!(recipient
+            .inspect_sender_key_message_context_v1(
+                conversation,
+                &wrong_account_identity,
+                &fresh_ciphertext,
+                &fresh_context,
+            )
+            .is_err());
+
+        let group_len = u16::from_be_bytes([fresh_ciphertext[1], fresh_ciphertext[2]]) as usize;
+        let sender_identity_offset = 3 + group_len;
+        let inner_offset = sender_identity_offset + 32 + 4;
+        let mut mutated_sender_identity = fresh_ciphertext.clone();
+        mutated_sender_identity[sender_identity_offset] ^= 0x01;
+        let mut mutated_generation = fresh_ciphertext.clone();
+        mutated_generation[inner_offset + 1] ^= 0x01;
+        let mut mutated_signature = fresh_ciphertext.clone();
+        let signature_byte = mutated_signature
+            .last_mut()
+            .expect("signed Sender-Key message has a signature");
+        *signature_byte ^= 0x01;
+        for mutated in [
+            &mutated_sender_identity,
+            &mutated_generation,
+            &mutated_signature,
+        ] {
+            assert!(recipient
+                .validate_sender_key_message_context_v1(
+                    conversation,
+                    &sender.identity_key().unwrap(),
+                    mutated,
+                    &fresh_context,
+                )
+                .is_err());
+        }
+        let fresh_metadata = RemoteMessageMetadata {
+            revision_ms: 2,
+            reactions: None,
+        };
+        assert_eq!(
+            recipient
+                .receive_and_persist_message(
+                    "fresh-routed-message",
+                    conversation,
+                    &sender.identity_key().unwrap(),
+                    None,
+                    None,
+                    true,
+                    Some(&fresh_context),
+                    Some("Current secure channel"),
+                    &fresh_header,
+                    &fresh_ciphertext,
+                    Some(2),
+                    None,
+                    Some(&fresh_metadata),
+                )
+                .unwrap(),
+            ReceiveMessageResult::Stored {
+                plaintext: "after exact-device distribution".to_string()
+            }
+        );
+        let fresh_metadata_after = recipient
+            .sender_keys
+            .incoming_generation_metadata(
+                conversation,
+                &sender_device_identity_key,
+                fresh_key.generation,
+            )
+            .unwrap();
+        assert_eq!(
+            fresh_metadata_after.iteration,
+            fresh_metadata_before.iteration + 1
+        );
+        assert_eq!(recipient.ratchet_sessions.len(), ratchet_sessions_before);
+        assert_eq!(
+            recipient.pending_sender_key_receipts.len(),
+            pending_receipts_before
+        );
+        assert!(recipient
+            .db()
+            .unwrap()
+            .message_exists("fresh-routed-message")
+            .unwrap());
+        assert_eq!(
+            recipient
+                .db()
+                .unwrap()
+                .get_remote_message_state("fresh-routed-message")
+                .unwrap()
+                .unwrap()
+                .state,
+            RemoteMessageStateKind::Active
+        );
+        let offline_refresh = recipient.hydrate_channel_sender_keys(conversation).unwrap();
+        assert!(recipient
+            .begin_offline_sender_key_distribution(conversation, offline_refresh)
+            .unwrap());
+        assert_eq!(
+            recipient.sender_key_distribution_status(conversation),
+            "pending"
+        );
+        let distributed_generation = recipient
+            .sender_keys
+            .build_distribution(conversation)
+            .unwrap()
+            .key_id;
+        match offline_refresh {
+            OfflineSenderKeyRefresh::Required => {
+                assert_ne!(distributed_generation, outgoing_generation_before)
+            }
+            OfflineSenderKeyRefresh::AlreadyRotated => {
+                assert_eq!(distributed_generation, outgoing_generation_before)
+            }
         }
     }
 

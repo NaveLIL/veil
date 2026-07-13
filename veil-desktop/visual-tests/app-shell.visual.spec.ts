@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 async function openFixture(
   page: Page,
-  state: "wallpaper" | "members" | "identity" | "focus" | "lock",
+  state: "wallpaper" | "members" | "identity" | "identity-avatar" | "focus" | "lock",
 ) {
   await page.goto(`/visual.html?state=${state}`, { waitUntil: "networkidle" });
   await expect(page.getByTestId("app-shell")).toHaveAttribute("data-visual-state", state);
@@ -103,17 +103,20 @@ async function expectNoDocumentOverflow(page: Page) {
 async function expectComposerGeometry(page: Page) {
   const composer = page.getByTestId("composer");
   const input = page.getByTestId("composer-input");
+  const send = page.getByTestId("composer-send");
   const chat = page.getByTestId("chat-island");
-  const [composerBox, inputBox, chatBox] = await Promise.all([
+  const [composerBox, inputBox, sendBox, chatBox] = await Promise.all([
     composer.boundingBox(),
     input.boundingBox(),
+    send.boundingBox(),
     chat.boundingBox(),
   ]);
 
   expect(composerBox).not.toBeNull();
   expect(inputBox).not.toBeNull();
+  expect(sendBox).not.toBeNull();
   expect(chatBox).not.toBeNull();
-  if (!composerBox || !inputBox || !chatBox) return;
+  if (!composerBox || !inputBox || !sendBox || !chatBox) return;
 
   const composerRight = composerBox.x + composerBox.width;
   const chatRight = chatBox.x + chatBox.width;
@@ -122,16 +125,17 @@ async function expectComposerGeometry(page: Page) {
   const composerCenter = composerBox.y + composerBox.height / 2;
   const inputCenter = inputBox.y + inputBox.height / 2;
   const inputBottom = inputBox.y + inputBox.height;
+  const sendBottom = sendBox.y + sendBox.height;
 
   expect(composerBox.x - chatBox.x).toBeGreaterThanOrEqual(18);
   expect(chatRight - composerRight).toBeGreaterThanOrEqual(18);
   expect(chatBottom - composerBottom).toBeGreaterThanOrEqual(18);
   expect(chatBottom - composerBottom).toBeLessThanOrEqual(22);
-  // The active composer is flex-end aligned: a one-line textarea shares the
-  // same lower inset as the 32px action buttons, rather than their center.
-  expect(composerBottom - inputBottom).toBeGreaterThanOrEqual(11);
-  expect(composerBottom - inputBottom).toBeLessThanOrEqual(13);
-  expect(Math.abs(composerCenter - inputCenter)).toBeLessThanOrEqual(6);
+  // A one-line textarea is visually centered while the action buttons retain
+  // their lower inset for predictable multiline growth.
+  expect(Math.abs(composerCenter - inputCenter)).toBeLessThanOrEqual(1);
+  expect(composerBottom - sendBottom).toBeGreaterThanOrEqual(11);
+  expect(composerBottom - sendBottom).toBeLessThanOrEqual(13);
   expect(inputBox.y).toBeGreaterThanOrEqual(composerBox.y);
   expect(inputBottom).toBeLessThanOrEqual(composerBottom);
   expect(composerBox.height).toBeGreaterThanOrEqual(44);
@@ -212,6 +216,39 @@ test("sending with a wallpaper scrolls only the message viewport", async ({ page
     bodyTop: document.body.scrollTop,
   }));
   expect(scrollState).toEqual({ windowX: 0, windowY: 0, documentTop: 0, bodyTop: 0 });
+});
+
+test("multiline composer grows while its actions stay bottom aligned", async ({ page }) => {
+  await openFixture(page, "wallpaper");
+  const composer = page.getByTestId("composer");
+  const input = page.getByTestId("composer-input");
+  const send = page.getByTestId("composer-send");
+  const initialComposer = await composer.boundingBox();
+
+  await input.fill("First line\nSecond line\nThird line");
+  await expect.poll(async () => (await composer.boundingBox())?.height ?? 0)
+    .toBeGreaterThan(initialComposer?.height ?? 0);
+  const [composerBox, inputBox, sendBox] = await Promise.all([
+    composer.boundingBox(),
+    input.boundingBox(),
+    send.boundingBox(),
+  ]);
+
+  expect(initialComposer).not.toBeNull();
+  expect(composerBox).not.toBeNull();
+  expect(inputBox).not.toBeNull();
+  expect(sendBox).not.toBeNull();
+  if (!initialComposer || !composerBox || !inputBox || !sendBox) return;
+
+  const composerBottom = composerBox.y + composerBox.height;
+  const inputBottom = inputBox.y + inputBox.height;
+  const sendBottom = sendBox.y + sendBox.height;
+  expect(composerBox.height).toBeGreaterThan(initialComposer.height);
+  expect(inputBox.height).toBeGreaterThan(32);
+  expect(Math.abs(inputBottom - sendBottom)).toBeLessThanOrEqual(1);
+  expect(composerBottom - sendBottom).toBeGreaterThanOrEqual(11);
+  expect(composerBottom - sendBottom).toBeLessThanOrEqual(13);
+  await expectNoDocumentOverflow(page);
 });
 
 test("theme tokens preserve readable small text and accent labels", async ({ page }) => {
@@ -303,6 +340,30 @@ test("identity island keeps proof language and responsive geometry calm", async 
   }
 
   await expect(page).toHaveScreenshot("app-shell-identity.png");
+});
+
+test("a single avatar action fills its row without leaving a dead column", async ({ page }) => {
+  await openFixture(page, "identity-avatar");
+  const changeAvatar = page.getByRole("button", { name: "Change avatar" });
+  const actions = page.locator(".veil-identity-avatar-actions");
+  const personBody = page.locator(".veil-identity-person-body");
+  await expect(changeAvatar).toBeVisible();
+  await expect(actions.getByRole("button")).toHaveCount(1);
+  const [personBodyBox, actionsBox, buttonBox] = await Promise.all([
+    personBody.boundingBox(),
+    actions.boundingBox(),
+    changeAvatar.boundingBox(),
+  ]);
+  expect(personBodyBox).not.toBeNull();
+  expect(actionsBox).not.toBeNull();
+  expect(buttonBox).not.toBeNull();
+  if (personBodyBox && actionsBox && buttonBox) {
+    expect(Math.abs(personBodyBox.width - actionsBox.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(personBodyBox.x - actionsBox.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(actionsBox.width - buttonBox.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(actionsBox.x - buttonBox.x)).toBeLessThanOrEqual(1);
+  }
+  await expectNoDocumentOverflow(page);
 });
 
 test("composer focus ring follows the full composer geometry", async ({ page }) => {

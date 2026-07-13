@@ -3116,6 +3116,7 @@ const App: Component = () => {
                           placeholder={cryptoGate().composerPlaceholder ?? `Message ${c().name}...`}
                           value={inputText()}
                           disabled={sendBusy() || cryptoGate().blocked}
+                          aria-label={`Message ${c().name}`}
                           aria-describedby={cryptoDiagnostic()
                             ? "conversation-crypto-status"
                             : sendNotice()

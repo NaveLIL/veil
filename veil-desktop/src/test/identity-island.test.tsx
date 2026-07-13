@@ -271,6 +271,152 @@ describe("Identity Island", () => {
     expect(saveProfile).toHaveBeenCalledWith("New Orbit", "Updated profile", "7");
   });
 
+  it("expands the remaining avatar action and restores focus after removal", async () => {
+    const [profile, setProfile] = createSignal<IdentityIslandProfile>({
+      ...completeProfile,
+      selfIdentity: completeProfile,
+      profileVersion: "7",
+      avatarAssetId: "avatar-asset-7",
+    });
+    const removeAvatar = vi.fn(async () => {
+      setProfile({ ...profile(), avatarAssetId: null });
+      return true;
+    });
+    const user = userEvent.setup();
+    render(() => (
+      <IdentityIslandContent
+        profile={profile()}
+        canMessage={false}
+        onMessage={vi.fn()}
+        onChangeAvatar={vi.fn().mockResolvedValue(true)}
+        onRemoveAvatar={removeAvatar}
+      />
+    ));
+
+    const changeAvatar = screen.getByRole("button", { name: "Change avatar" });
+    expect(changeAvatar.closest(".veil-identity-avatar-actions")?.children).toHaveLength(2);
+
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument());
+    expect(removeAvatar).toHaveBeenCalledOnce();
+    expect(changeAvatar.closest(".veil-identity-avatar-actions")?.children).toHaveLength(1);
+    await waitFor(() => expect(changeAvatar).toHaveFocus());
+  });
+
+  it("does not steal focus after a delayed avatar removal", async () => {
+    const [profile, setProfile] = createSignal<IdentityIslandProfile>({
+      ...completeProfile,
+      selfIdentity: completeProfile,
+      profileVersion: "7",
+      avatarAssetId: "avatar-asset-7",
+    });
+    let finishRemoval: (() => void) | undefined;
+    const removeAvatar = vi.fn(() => new Promise<boolean>((resolve) => {
+      finishRemoval = () => {
+        setProfile({ ...profile(), avatarAssetId: null });
+        resolve(true);
+      };
+    }));
+    const user = userEvent.setup();
+    render(() => (
+      <div>
+        <button type="button">Outside action</button>
+        <IdentityIslandContent
+          profile={profile()}
+          canMessage={false}
+          onMessage={vi.fn()}
+          onChangeAvatar={vi.fn().mockResolvedValue(true)}
+          onRemoveAvatar={removeAvatar}
+        />
+      </div>
+    ));
+
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    const outsideAction = screen.getByRole("button", { name: "Outside action" });
+    await user.click(outsideAction);
+    expect(outsideAction).toHaveFocus();
+
+    finishRemoval?.();
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Remove" })).not.toBeInTheDocument());
+    expect(outsideAction).toHaveFocus();
+  });
+
+  it("releases avatar focus listeners as soon as focus ownership moves", async () => {
+    const addListener = vi.spyOn(document, "addEventListener");
+    const removeListener = vi.spyOn(document, "removeEventListener");
+    const removeAvatar = vi.fn(() => new Promise<boolean>(() => undefined));
+    const user = userEvent.setup();
+    render(() => (
+      <div>
+        <button type="button">Outside action</button>
+        <IdentityIslandContent
+          profile={{
+            ...completeProfile,
+            selfIdentity: completeProfile,
+            profileVersion: "7",
+            avatarAssetId: "avatar-asset-7",
+          }}
+          canMessage={false}
+          onMessage={vi.fn()}
+          onChangeAvatar={vi.fn().mockResolvedValue(true)}
+          onRemoveAvatar={removeAvatar}
+        />
+      </div>
+    ));
+
+    try {
+      await user.click(screen.getByRole("button", { name: "Remove" }));
+      const focusListener = addListener.mock.calls.find(([type]) => type === "focusin")?.[1];
+      const pointerListener = addListener.mock.calls.find(([type]) => type === "pointerdown")?.[1];
+      expect(focusListener).toBeTypeOf("function");
+      expect(pointerListener).toBeTypeOf("function");
+
+      removeListener.mockClear();
+      await user.click(screen.getByRole("button", { name: "Outside action" }));
+
+      expect(removeListener).toHaveBeenCalledWith("focusin", focusListener);
+      expect(removeListener).toHaveBeenCalledWith("pointerdown", pointerListener);
+    } finally {
+      addListener.mockRestore();
+      removeListener.mockRestore();
+    }
+  });
+
+  it("releases avatar focus listeners when removal IPC never settles and the island unmounts", async () => {
+    const addListener = vi.spyOn(document, "addEventListener");
+    const removeListener = vi.spyOn(document, "removeEventListener");
+    const removeAvatar = vi.fn(() => new Promise<boolean>(() => undefined));
+    const user = userEvent.setup();
+    const view = render(() => (
+      <IdentityIslandContent
+        profile={{
+          ...completeProfile,
+          selfIdentity: completeProfile,
+          profileVersion: "7",
+          avatarAssetId: "avatar-asset-7",
+        }}
+        canMessage={false}
+        onMessage={vi.fn()}
+        onChangeAvatar={vi.fn().mockResolvedValue(true)}
+        onRemoveAvatar={removeAvatar}
+      />
+    ));
+
+    await user.click(screen.getByRole("button", { name: "Remove" }));
+    const focusListener = addListener.mock.calls.find(([type]) => type === "focusin")?.[1];
+    const pointerListener = addListener.mock.calls.find(([type]) => type === "pointerdown")?.[1];
+    expect(focusListener).toBeTypeOf("function");
+    expect(pointerListener).toBeTypeOf("function");
+
+    view.unmount();
+
+    expect(removeListener).toHaveBeenCalledWith("focusin", focusListener);
+    expect(removeListener).toHaveBeenCalledWith("pointerdown", pointerListener);
+    addListener.mockRestore();
+    removeListener.mockRestore();
+  });
+
   it("requires a deliberate full-fingerprint comparison before local verification", async () => {
     const fingerprintHex = "51".repeat(32);
     const loaded: IdentityVerificationView = {
