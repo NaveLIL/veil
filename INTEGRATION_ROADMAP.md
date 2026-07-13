@@ -1,6 +1,6 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-07-13. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-07-14. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
@@ -32,12 +32,13 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
    [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
 2. Completion gate Phase 4D пройден и опубликован в
    [`docs/reviews/phase-4d-completion-gate.md`](docs/reviews/phase-4d-completion-gate.md).
-3. Довести вынесенные продуктовые scopes: Phase 3B (attachment UX), Phase 4P
-   (device push clients) и Phase 4E (server experience), не смешивая их с
-   завершёнными protocol/runtime baselines.
-4. На стабильном desktop/profile фундаменте начать Android foundation (5A),
+3. Выполнить Phase 4E (Veil Spaces Experience) на закрытом desktop/profile и
+   access/crypto фундаменте, не переоткрывая baselines 4A–4D.
+4. Phase 3B (attachment UX) и Phase 4P (device push clients) остаются явными
+   product scopes до beta и не прячутся внутри 4E.
+5. На стабильном desktop/profile фундаменте начать Android foundation (5A),
    после per-device модели подключить боевые сообщения Android (5B).
-5. Затем довести MLS runtime, звонки и release polish.
+6. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
 
@@ -51,12 +52,56 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
-| 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
+| 4E | Veil Spaces Experience | запланировано: Home/Circle/Space/Room IA, Veil Link, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
+
+---
+
+## Продуктовая модель Veil Spaces
+
+Veil — не набор разрозненных копий DM, Telegram-группы и Discord-сервера, а
+система защищённых личных и совместных контекстов. Форма общения меняется, но
+origin, identity, границы доступа и фактический crypto state остаются едиными и
+видимыми пользователю.
+
+Канонические продуктовые термины:
+
+| Термин | Значение в интерфейсе | Текущий технический фундамент |
+|---|---|---|
+| **Home** | личный центр: поиск людей, друзья, запросы и Direct | UI-контекст, не создаваемый контейнер |
+| **Direct** | защищённый разговор один на один | `dm`, X3DH + Double Ratchet |
+| **Circle** | небольшая приватная группа с одной непрерывной беседой | `group`, Sender Keys v5 |
+| **Space** | структурированное совместное пространство с участниками, ролями и Rooms | `server` как access/metadata container |
+| **Room** | функциональный контекст внутри Space | text Room сейчас соответствует `channel` и отдельной conversation/security domain |
+| **Veil Node** | self-hosted инфраструктура и canonical origin аккаунта | exact `(scheme, host, effective port)` origin |
+| **Veil Link** | versioned приглашение в Space | scoped capability, не browser session и не identity proof |
+
+`Home`, `Direct`, `Circle`, `Space`, `Room`, `Veil Link` и `Veil Node` являются
+продуктовым языком. Внутренние `dm/group/server/channel` в PostgreSQL, REST,
+protobuf и Rust/Go не переименовываются механически: это точные protocol/storage
+сущности, а не обязательство поддерживать старую информационную архитектуру.
+Ни один UI-термин не меняет crypto mode, ACL, roster или history policy.
+
+Один discriminated navigation state развивается до
+`home(overview | friends | requests | direct(direct_id)) | circle(circle_id) |
+space(space_id, room_id?)`:
+
+- узкий левый остров содержит Home, смешанный список Circles/Spaces и единый
+  вход создания/присоединения;
+- второй остров показывает личную навигацию и Direct в Home, плавно сворачивается
+  для Circle и показывает Rooms/управление для Space;
+- центральный остров показывает выбранный Direct, Circle либо Room;
+- правый остров сохраняет уже закрытую модель `Members ↔ Identity`;
+- mobile использует ту же информационную модель, но нативный stack/sheet flow,
+  а не буквальную копию desktop-колонок.
+
+Direct начинается из поиска человека, Friends или Identity Island и не
+считается «созданием пространства». Подключение/смена Veil Node — отдельная
+account/origin ceremony и не смешивается с меню создания Circle/Space.
 
 ---
 
@@ -205,7 +250,7 @@ Envelope: JSON с короткими именами полей, padding до р�
 **Статус access/crypto core 2026-07-12: закрыто.** REST/DB/ACL, роли, инвайты,
 участники, authoritative channel access, roster revisions и desktop-потоки
 работают. Продуктовая информационная архитектура и зрелые server/channel
-settings не выданы за готовый core: они выделены в **Phase 4E — Server
+settings не выданы за готовый core: они выделены в **Phase 4E — Veil Spaces
 Experience**.
 
 Текущий runtime:
@@ -229,13 +274,17 @@ Experience**.
 
 Phase 4E обязана закрыть:
 
-- Явно развести в UI «групповой чат» и «сервер».
-- Определить private/public channel, историю для нового участника и поведение
-  при role/access change.
-- Завершить server settings, channel settings и правдивые crypto indicators.
-- Добавить ручную desktop/mobile matrix для create/join/leave/kick, нескольких
+- Отобразить закрытый technical core одной продуктовой моделью
+  Home/Direct/Circle/Space/Room без параллельного legacy UI.
+- Определить `Space-wide` и `Restricted` Room, future-only history для нового
+  участника и поведение при role/access change. Оба режима остаются E2EE;
+  internet-public/plaintext Room в текущий baseline не входит.
+- Завершить Space/Room settings и правдивые crypto indicators.
+- Добавить ручную desktop↔desktop matrix для create/join/leave/kick, нескольких
   физических устройств и offline reconnect поверх уже существующих automated
-  exact-device/integration/race tests.
+  exact-device/integration/race tests. Desktop↔Android evidence принадлежит
+  Phase 5B/release gate и не создаёт циклическую зависимость до готового mobile
+  runtime.
 
 ---
 
@@ -409,7 +458,7 @@ smoke:
 | 2 | пройден | RAM-only поиск и rebuild из SQLCipher работают; memory budget остаётся release hardening |
 | 3 | пройден | encrypted upload core закрыт; attachment UX/2 GiB streaming — Phase 3B |
 | 4 | пройден | encrypted transport core закрыт; device `K_push` clients — Phase 4P |
-| 4A | пройден | authoritative access/roster core закрыт; product server IA/settings — Phase 4E |
+| 4A | пройден | authoritative access/roster core закрыт; Veil Spaces IA/settings — Phase 4E |
 | 4B | пройден | AppShell cleanup, scale/contrast/a11y/visual matrix и NSIS bundle зелёные |
 | 4C | пройден | exact-device roster, multi-generation retention, receipts и atomic recovery реализованы |
 
@@ -846,32 +895,215 @@ authenticated origin/generation, а открытый Identity Island refetch-и�
 
 ---
 
-## Phase 4E — Server Experience
+## Phase 4E — Veil Spaces Experience
 
-**Статус:** запланировано. Эта фаза владеет продуктовым scope, который раньше
-делал Phase 4A бесконечной, но не меняет закрытый access/crypto contract.
+**Статус:** запланировано. Фаза превращает уже закрытый access/crypto core 4A/4C
+в одну законченную продуктовую модель, но не меняет ciphertext, Double Ratchet,
+Sender Keys v5 либо rotation contract. Authoritative ACL остаётся единственным
+источником доступа; 4E лишь ужесточает invite defaults и не вводит параллельную
+permission model.
 
-- Явно развести private group и server/channel navigation, empty states и
-  creation flows.
-- Завершить server/channel settings, private/public policy, future-only history
-  UX и правдивые encrypted/rotation/quarantine indicators.
-- Провести ручную desktop↔desktop и затем desktop↔Android матрицу на нескольких
-  физических устройствах: create/join/leave/kick/role/overwrite/offline/revoke.
-- Не вводить «упрощённое шифрование» или silent plaintext fallback ради сходства
-  с Discord. Любой будущий public/plain channel — отдельный явный профиль и ADR.
+Текущий desktop является исходной точкой, а не целевой IA: `ServerRail` имеет
+раздельные create/join actions, Home одновременно показывает Friends,
+`Messages`, `DM/Group` и `All/DMs/Groups`, а Circle живёт внутри списка
+conversation. Mobile prototype буквально листает `servers → channels → chat →
+members`. При cutover эти параллельные пути удаляются, а не остаются как legacy
+вариант.
 
-Критерий выхода: пользователь без чтения документации отличает DM, group и
-server channel; permission change и device revoke доказуемо меняют exact roster;
-UI и protocol tests показывают одно и то же crypto state.
+Phase 4E отслеживается как пять прямых deliverables. Их небольшие Git-checkpoint
+commits не являются вложенными фазами.
+
+### Deliverable: product model и единая навигация
+
+- Ввести один discriminated route:
+  `home(overview | friends | requests | direct(direct_id)) | circle(circle_id) |
+  space(space_id, room_id?)`.
+  Route всегда живёт внутри точного authenticated origin/binding и не переносит
+  ID между Veil Nodes.
+- Левый остров содержит Home, смешанный прокручиваемый список Circles/Spaces,
+  быстрый поиск/переключение и одну кнопку `+`. Accessible name каждой строки
+  сообщает не только имя, но и тип `Circle`/`Space`.
+- Второй остров:
+  - Home — поиск людей/разговоров, Friends, Requests и Direct;
+  - Circle — плавно сворачивается, расширяя центральную беседу;
+  - Space — показывает доступные Rooms, категории и управление текущим Space.
+- Центральный остров показывает Direct, Circle либо выбранный Room. Правый
+  сохраняет готовый route `closed | members | identity`.
+- Морфинг/сворачивание занимает ориентировочно 180–240 ms без layout jump.
+  Перед скрытием фокус переводится в остающийся контекст, скрытый DOM становится
+  `inert`, а focus/scroll/selection/draft восстанавливаются детерминированно.
+  Reduced motion убирает перемещение без появления второй активной оболочки.
+- Kick/leave/delete, потеря роли/Room access или смена binding сначала инвалидирует
+  route/action epoch, останавливает sync/send, блокирует composer и закрывает
+  Members/Identity недоступного контекста. Потерянный Circle/Space возвращает в
+  Home; недоступный Room — в подтверждённый Space empty state либо первый свежий
+  authoritative доступный Room. Draft остаётся только origin/conversation-scoped
+  и не может быть отправлен без новой ACL/roster validation; stale completion не
+  имеет права воскресить старый route.
+
+### Deliverable: создание, поиск и вход
+
+- Единый `+` предлагает только `Create Circle`, `Create Space` и
+  `Join with Veil Link`. Старые `DM/Group`, `All/DMs/Groups`, отдельная кнопка
+  создания group и второй join-server icon удаляются после переноса сценариев.
+- Direct начинается из person search, Friends, Identity Island или найденного
+  authoritative message author. Голый user UUID и conversation ID не являются
+  account locator.
+- Create Circle включает member picker минимум с одним exact origin-scoped
+  account locator. Initial creator+selected-member roster подтверждается
+  атомарно; одночленный orphan не показывается как успешно созданный Circle.
+  `Add people` из Friends/Identity после создания повторно проверяет locator,
+  authoritative roster и Sender-Key rotation до разрешения отправки.
+- Circle остаётся одной приватной непрерывной беседой без искусственного списка
+  Rooms. Автоматического Circle → Space morph или смены crypto mode нет; будущая
+  явная конверсия требует отдельного data/history/security contract.
+- Подключение или смена Veil Node остаётся отдельным account/origin flow:
+  создание социального контекста не может молча переключить origin либо vault.
+
+### Deliverable: Space и Room experience
+
+- Space settings завершают overview, members, roles, Veil Links и
+  security/history explanation; Room settings — имя/topic, порядок, role/member
+  access и history policy. Общий полнотекстовый Space Audit Log не является
+  скрытым gate 4E; обязательны только bounded Veil Link lifecycle events без
+  raw token.
+- Существующий `PermBanMembers` получает недостающие authoritative persistence,
+  signed management API и UI для ban/unban. Это moderation enforcement внутри
+  текущей permission model, а не новый crypto trust signal.
+- Вместо двусмысленного `public/private channel` интерфейс использует:
+  - `Space-wide` — Room доступен всем текущим участникам Space и остаётся E2EE;
+  - `Restricted` — Room доступен только разрешённым ролям/участникам и тоже E2EE.
+- Text Room остаётся отдельной Sender Keys v5 security domain. UI одинаково
+  правдиво показывает `encrypted`, `rotation pending`, `quarantined` и
+  `unavailable`; future-only history не обещает старые ключи новому участнику.
+- Room type делается расширяемым, но 4E активирует только реально работающий
+  Text Room. Voice Room принадлежит Phase 7; Board/Stage, posts, comments,
+  reactions/polls и community mode не показываются как доступные функции до
+  отдельного product/schema/privacy/security review.
+- В первом 4E contract используется только deterministic Space mark с seed из
+  canonical origin + Space ID. Он декоративный, не identity proof и не trust
+  indicator; person Phaseprint не переиспользуется. Space image asset отложен
+  до отдельного same-origin ingest/privacy/image-decoder review, remote URL
+  запрещены.
+
+### Deliverable: Veil Link и invitation portal
+
+Текущий invite foundation нельзя просто переименовать: восьмисимвольный код
+имеет 48 бит энтропии, хранится и повторно листится открытым текстом,
+`veil://invite/{code}` не содержит origin, unsigned preview возвращает слишком
+широкий server DTO, а native deep-link flow не реализован. Публичный Veil Link
+получает pre-release hard cutover без поддержки старого формата:
+
+- versioned typed capability всегда содержит exact canonical origin; secret
+  имеет минимум 128 бит энтропии, хранится только как hash и показывается один
+  раз при создании. Управление/revoke выполняются по отдельному invite ID;
+- отдельный непрогнозируемый public selector также создаётся CSPRNG и имеет не
+  менее 128 бит энтропии; DB invite ID или последовательный ключ им не является.
+  Selector может открыть только минимальный allowlisted preview. Raw join secret
+  не попадает в access/error logs, analytics, third-party requests или
+  `Referer`; точное URL/wire представление фиксируется отдельным schema/API/
+  privacy/security review до реализации;
+- origin-hosted HTTPS portal целевого Veil Node показывает Space name,
+  разрешённое владельцем описание/Space mark, exact origin, срок и join policy
+  (`v1: immediate membership only after explicit native confirmation`) только
+  как text/deterministic mark. Owner UUID, member list,
+  created-at и произвольные image URL не выдаются; ответ использует `no-store`,
+  `Referrer-Policy: no-referrer`, strict CSP/text escaping и не содержит
+  third-party scripts/assets. OpenGraph metadata по умолчанию generic и не
+  раскрывает Space description;
+- invalid, expired, exhausted и revoked selector имеют одинаковый публичный
+  ответ. Preview DTO versioned/bounded, а selector в operational logs заменён
+  HMAC-ref. Preview и join получают отдельные rate limits; expiry и use count
+  обязательно bounded, unlimited/persistent link в первом contract отсутствует.
+  Используется существующий `PermCreateInvite`, новый permission bit не
+  вводится, а pre-release cutover удаляет это право из новых и уже сохранённых
+  development default-role templates/rows;
+- browser не получает account session, recovery flow, identity keys, messages
+  или IPC. Красивый полноэкранный Veil Link portal — только invitation ceremony,
+  а не crypto proof, `Verified` state или браузерный Veil client. Keyboard path,
+  visible focus, semantic headings/status, live announcement ошибок и reduced
+  motion входят в его acceptance matrix;
+- authoritative parser живёт в native Rust. HTTPS authority задаёт заявленный
+  origin; custom `veil:` payload считается недоверенным транспортом и не может
+  сам доказать origin. Locked app держит не более одного bounded pending link
+  только в native volatile memory с коротким TTL и очисткой при replacement/
+  cancel/timeout/process exit/successful consumption. Persistence возможна лишь
+  через отдельно reviewed OS-sealed storage, но не plaintext config и не
+  renderer state;
+- после unlock link никогда автоматически не выбирает account, не переключает
+  Node и не вступает в Space. При отсутствии аккаунта сначала выполняется
+  обычный create/restore/auth на exact origin; Veil Link не является enrollment
+  либо auth credential, а closed registration честно блокирует join. Отдельный
+  Node enrollment/bootstrap требует собственного review;
+- state machine фиксирована как `parse → unlock → exact-origin account →
+  create/restore/auth if allowed → signed native preview request → explicit Join
+  → atomic membership → roster quarantine → ready`;
+- native flow повторно получает свежий preview через signed native request,
+  привязанный к exact authenticated TLS origin/generation, показывает выбранную
+  local identity, join/history conditions и требует явный Join. При другом
+  origin нужен явный account/Node flow без ослабления TLS; redirects запрещены,
+  а изменение origin/account/session generation инвалидирует незавершённый flow;
+- membership публикуется только после атомарного authoritative join. Room hint
+  является лишь навигацией после отдельной ACL-проверки; link даёт только
+  обычную authoritative default membership role, не обходит Room policy и не
+  выдаёт elevated role либо прошлые ключи. Сам link не переопределяет отдельно
+  принятую history policy и не даёт доступ к Restricted Room. Отправка остаётся
+  quarantined, пока exact roster и Sender-Key distribution не готовы;
+- revoke/revoke-all, bounded lifecycle audit, authoritative ban и admission
+  throttling защищают Space от raid и rotation DoS. Ban проверяется в той же
+  транзакции, что expiry/use count/membership insert; отклонённый banned account
+  не расходует use, не меняет membership/roster и не запускает rotation. Удаление
+  или ban участника никогда не задерживается ради batching.
+
+Первый 4E contract реализует `Veil Link(type=space)` с bounded immediate join.
+Addressed Circle invite, request-to-join, Person Introduction, guest/role-bearing/
+private-Room link, unlimited link и Node bootstrap являются отдельными capability
+types/modes и не добавляются без собственного review.
+
+### Deliverable: responsive contract и completion evidence
+
+- Desktop реализует shell выше на существующих островах; новый широкий global
+  rail или пятый Identity island не добавляются.
+- Mobile contract: корневые Home и единый список Circles/Spaces; Direct находится
+  внутри Home, Circle открывается сразу в chat, Space → Rooms → Room. Members и
+  Identity являются modal bottom sheets со скрытием фона из accessibility tree,
+  initial focus и возвратом к точному trigger. Android Back закрывает sheet,
+  затем возвращает к Rooms или списку Circles/Spaces. Пустая Calls tab не
+  появляется до рабочего Phase 7 runtime.
+- Реализация mobile runtime остаётся в 5A/5B. Phase 4E фиксирует общий
+  navigation/deep-link contract и выполняет физическую desktop↔desktop matrix;
+  desktop↔Android становится evidence 5B/release gate.
+- Тесты покрывают route/focus/reduced-motion, stale completion/access
+  invalidation, long text/pseudo-locale, atomic initial Circle roster, create/
+  join/leave/kick/role/overwrite/device revoke/offline reconnect, invite
+  entropy/hash/one-time reveal, expiry/max-use race, revoke/revoke-all, rate
+  limits, ban/rejoin/unban, generic public errors/headers, volatile pending-link
+  lifetime, lock/account/origin transitions и отсутствие raw token в
+  logs/referrer.
+
+Не входят в 4E: browser messenger, новый crypto mode, Circle → Space migration,
+posts/comments/polls/community runtime, звонки, production Android messaging,
+полный product/download site и полная локализация. Эти границы не мешают их
+будущей реализации, а не дают текущей фазе снова стать бесконечной.
+
+Критерий выхода: пользователь без документации отличает Home, Direct, Circle,
+Space, Room и Veil Node; создаёт Circle/Space из одного места и проходит Veil
+Link от public preview до явного authenticated join. Permission/device changes
+совпадают с exact roster и Sender-Key состоянием, profile metadata не участвует
+в trust/ACL/rotation, silent plaintext fallback отсутствует. Component,
+protocol/security, Docker, visual/a11y, Windows native и ручная физическая
+desktop↔desktop матрицы зелёные; полный installer собирается на completion gate,
+а не после каждого малого UI-checkpoint.
 
 ---
 
 ## Phase 5 — Android
 
 **Текущее состояние:** существует качественный четырёхстраничный visual prototype
-`servers → channels/DM → chat → members` на React Navigation + PagerView.
-Island-компоненты, onboarding и локальные tokens уже есть. Это ещё не мессенджер:
-chat/server data захардкожены, сеть и SQLCipher отсутствуют, auth живёт только в
+`servers → channels/DM → chat → members` на React Navigation + PagerView и
+готовая modal Identity sheet. Это полезный визуальный фундамент, но старая
+четырёхколоночная последовательность не является целевой IA после Phase 4E.
+Chat/server data захардкожены, сеть и SQLCipher отсутствуют, auth живёт только в
 Zustand, а `VeilCrypto` в dev возвращает mock identity/signatures.
 
 Текущие обязательные исправления проекта:
@@ -902,10 +1134,15 @@ Zustand, а `VeilCrypto` в dev возвращает mock identity/signatures.
    reconnect/offline outbox и атомарные crypto+message SQLCipher transactions.
 7. Enrollment второго устройства и revoke flow как prerequisite для групп,
    server channels и MLS.
-8. Android Back закрывает dialog/sheet, затем возвращает pager на предыдущий
-   остров, и только потом покидает экран.
-9. Профилировать blur, HebrewRain и четыре смонтированных pager page на слабых
-   устройствах; respect reduced motion и battery saver.
+8. Android Back закрывает dialog/sheet, затем возвращает к Rooms/Spaces либо
+   предыдущему native route, и только потом покидает экран.
+9. Профилировать blur, HebrewRain и текущие четыре одновременно смонтированные
+   pager page на слабых устройствах; целевой route не держит невидимые тяжёлые
+   экраны без необходимости и respect reduced motion/battery saver.
+10. Перевести prototype на общий 4E navigation contract: корневые Home и единый
+    список Circles/Spaces, Direct внутри Home, Circle сразу в chat, Space →
+    Rooms → Room, Members и Identity как bottom sheets. Это меняет presentation/
+    navigation, но не даёт JS доступ к crypto state.
 
 Результат 5A: подписанный internal APK запускается на чистом устройстве,
 создаёт/восстанавливает identity, переживает restart, безопасно lock/unlock и
@@ -916,11 +1153,15 @@ Zustand, а `VeilCrypto` в dev возвращает mock identity/signatures.
 1. Сначала один честный Desktop ↔ Android DM: X3DH/Double Ratchet, history sync,
    ack/outbox, reconnect, airplane mode и process death.
 2. Реальные DM list/chat, затем private groups на Sender Keys.
-3. Servers/channels подключать только после Phase 4C и per-device roster.
+3. Circles и Space/Rooms подключать только после Phase 4E product contract,
+   Phase 4C exact-device roster и тех же fail-closed crypto indicators.
 4. Generic notification «Новое сообщение» + foreground sync. Encrypted preview
    включать только после полного `K_push` lifecycle.
-5. Затем attachments, search, settings/Appearance и server management.
-6. Device/instrumentation tests, signed AAB и закрытый beta rollout.
+5. Origin-scoped Veil Link принимает Android только через native parser,
+   unlock/account confirmation и authoritative join; browser preview не
+   передаёт Android account session.
+6. Затем attachments, search, settings/Appearance и Space management.
+7. Device/instrumentation tests, signed AAB и закрытый beta rollout.
 
 Оценка: закрытый Android DM-MVP — примерно 8–12 недель одного опытного
 разработчика. Groups/servers, push previews и attachments добавят ещё 4–8
@@ -997,7 +1238,13 @@ media path: `veil-voice`, LiveKit/coturn deployment, выдача токенов
 permissions/lifecycle и E2EE media ещё отсутствуют и обязаны пройти отдельный
 ADR/threat-model gate до включения микрофона или камеры.
 
-1:1 + групповые войс-румы. E2EE через LiveKit insertable streams, ключи деривируются из MLS exporter secret (или sender-key chain) с меткой `"livekit-call-v1"`.
+Продуктовая поверхность: Direct calls, calls внутри Circle и Voice Rooms внутри
+Space. Phase 4E резервирует расширяемый Room type/navigation contract, но не
+показывает неработающую Voice Room как доступную функцию. Реальный runtime,
+permissions и media indicators появляются только в этой фазе.
+
+E2EE через LiveKit insertable streams, ключи деривируются из MLS exporter secret
+(или sender-key chain) с меткой `"livekit-call-v1"`.
 
 SFU видит только encrypted RTP. Ротация ключей при kick — нужно успеть до следующего фрейма, иначе отрезанный участник всё ещё слышит. Цель — < 1 RTT.
 
@@ -1096,9 +1343,15 @@ path. Все сетевые обращения наружу либо отсут�
 - существующая встроенная gateway landing/download page остаётся локальной
   страницей конкретного self-hosted instance и не подменяет канонический сайт
   продукта;
-- браузерного клиента Veil не будет. Единственное узкое web-исключение — уже
-  отделённый one-time Share Viewer с собственным ограниченным threat model; он
-  никогда не становится web messenger и не получает account identity/session.
+- origin-hosted Veil Link portal из Phase 4E использует канонический сайт только
+  как download/documentation fallback. Он остаётся страницей целевого Node,
+  работает в LAN без WAN и не проксирует invite secret через центральный сайт;
+- браузерного клиента Veil не будет. Помимо статических product/docs/download
+  страниц и локальной gateway landing разрешены только два узких capability-
+  oriented web flow: one-time Share Viewer с собственным ограниченным threat
+  model и unauthenticated allowlisted Veil Link preview. Ни один из них не
+  становится web messenger и не получает account identity/session, recovery
+  flow или keys.
 
 Компрометация сайта не должна позволять выдать изменённый клиент за Veil:
 подпись приложения проверяется ОС, hashes/signing metadata дублируются в
@@ -1118,7 +1371,9 @@ GitHub release, а updater использует отдельную подпис�
   по направлению, но никогда не переводятся;
 - trust-термины имеют единый glossary: `Not compared`, `Verified on this
   device`, `Identity changed`, `Current account`, `Recovery phrase` и
-  `Phaseprint`; перевод не имеет права повышать заявленный trust state.
+  `Phaseprint`; продуктовые термины `Home`, `Direct`, `Circle`, `Space`, `Room`,
+  `Veil Link` и `Veil Node` также получают стабильные semantic keys. Перевод не
+  имеет права повышать заявленный trust state либо смешивать Space и Node.
 
 Финальная реализация:
 
@@ -1145,8 +1400,12 @@ flows, включая installer, recovery, errors, notifications, сайт и д
 ## Открытые вопросы
 
 - P2: persistent Tantivy index больше не нужен; RAM-only считается текущим решением
+- P4E+: явная Circle → Space migration и будущие Community/Board/Stage модели с
+  posts, comments, reactions и polls проектируются после закрытия 4E; они не
+  могут молча менять history, membership, crypto mode или notification privacy
 - P5: React Navigation + PagerView остаются текущей мобильной оболочкой;
-  миграция на Expo Router допустима только при конкретной пользе
+  переход на другой router допустим только при конкретной пользе для общего
+  Home/Circle/Space/Room contract
 - P5: UnifiedPush-only либо опциональный FCM wake-up с generic encrypted payload?
 - P6: per-device credential — стабильный opaque device ID; человекочитаемый
   label не входит в криптографическую identity и может меняться
