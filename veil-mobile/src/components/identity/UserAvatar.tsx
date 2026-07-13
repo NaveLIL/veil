@@ -9,10 +9,18 @@ interface UserAvatarProps extends PhaseprintIdentity {
   label?: string;
 }
 
-export const UserAvatar: React.FC<UserAvatarProps> = ({ size = 40, statusColor, label, ...identity }) => {
+export const UserAvatar: React.FC<UserAvatarProps> = ({
+  identityKey,
+  canonicalServerOrigin,
+  userId,
+  technicalUsername,
+  size = 40,
+  statusColor,
+  label,
+}) => {
   const model = useMemo(
-    () => createPhaseprintModel(identity),
-    [identity.identityKey, identity.canonicalServerOrigin, identity.userId, identity.technicalUsername],
+    () => createPhaseprintModel({ identityKey, canonicalServerOrigin, userId, technicalUsername }),
+    [identityKey, canonicalServerOrigin, userId, technicalUsername],
   );
   return (
     <View

@@ -2187,18 +2187,32 @@ fn validate_created_dm_peer_key_agreement(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct CreatedDmIdentityEvidence<'a> {
+    canonical_server_origin: &'a str,
+    peer_user_id: &'a str,
+    expected_peer_identity_key: Option<&'a [u8; 32]>,
+    directory_peer_identity_key: &'a [u8; 32],
+    directory_peer_signing_key: &'a [u8; 32],
+    response_peer_identity_key: &'a [u8; 32],
+    response_peer_signing_key: &'a [u8; 32],
+}
+
 fn persist_created_dm_identity_preflight(
     db: &veil_store::db::VeilDb,
     snapshots: &[AccountSnapshot],
     event_app: Option<&AuthenticatedEventAppHandle>,
-    canonical_server_origin: &str,
-    peer_user_id: &str,
-    expected_peer_identity_key: Option<&[u8; 32]>,
-    directory_peer_identity_key: &[u8; 32],
-    directory_peer_signing_key: &[u8; 32],
-    response_peer_identity_key: &[u8; 32],
-    response_peer_signing_key: &[u8; 32],
+    evidence: CreatedDmIdentityEvidence<'_>,
 ) -> Result<(), String> {
+    let CreatedDmIdentityEvidence {
+        canonical_server_origin,
+        peer_user_id,
+        expected_peer_identity_key,
+        directory_peer_identity_key,
+        directory_peer_signing_key,
+        response_peer_identity_key,
+        response_peer_signing_key,
+    } = evidence;
     let has_durable_peer_baseline = db
         .resolve_account_by_origin_user(canonical_server_origin, peer_user_id)?
         .is_some();
@@ -3403,16 +3417,28 @@ fn pin_and_persist_sync_conversation(
     Ok((directory, sender_key_refresh))
 }
 
+struct OfflineConversationSyncScope<'a> {
+    server_http_url: &'a str,
+    authenticated_user_id: &'a str,
+    canonical_server_origin: &'a str,
+    conversation_id: &'a str,
+    directory: &'a std::collections::HashMap<String, PinnedDirectoryMember>,
+    event_app: &'a AuthenticatedEventAppHandle,
+}
+
 fn sync_conversation_messages(
     state: &AppState,
-    server_http_url: &str,
-    authenticated_user_id: &str,
-    canonical_server_origin: &str,
-    conversation_id: &str,
-    directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
     stats: &mut OfflineSyncStats,
-    event_app: &AuthenticatedEventAppHandle,
+    scope: OfflineConversationSyncScope<'_>,
 ) -> Result<(), String> {
+    let OfflineConversationSyncScope {
+        server_http_url,
+        authenticated_user_id,
+        canonical_server_origin,
+        conversation_id,
+        directory,
+        event_app,
+    } = scope;
     let mut cursor: Option<String> = None;
     for _ in 0..OFFLINE_SYNC_MAX_PAGES {
         let url = offline_sync_url(
@@ -4066,13 +4092,15 @@ fn sync_offline_state(
     for (conversation_id, directory, sender_key_refresh) in &directories {
         if let Err(error) = sync_conversation_messages(
             state,
-            server_http_url,
-            authenticated_user_id,
-            canonical_server_origin,
-            conversation_id,
-            directory,
             &mut stats,
-            event_app,
+            OfflineConversationSyncScope {
+                server_http_url,
+                authenticated_user_id,
+                canonical_server_origin,
+                conversation_id,
+                directory,
+                event_app,
+            },
         ) {
             require_session_still_unlocked(state)?;
             // Rows accepted earlier are independently authenticated and each
@@ -5896,13 +5924,15 @@ fn create_dm(
                 db,
                 &snapshots,
                 Some(&event_app),
-                &canonical_server_origin,
-                &peer_user_id,
-                expected_peer_identity_key.as_ref(),
-                &peer.identity_key,
-                &peer.signing_key,
-                &peer_identity_key,
-                &peer_signing_key,
+                CreatedDmIdentityEvidence {
+                    canonical_server_origin: &canonical_server_origin,
+                    peer_user_id: &peer_user_id,
+                    expected_peer_identity_key: expected_peer_identity_key.as_ref(),
+                    directory_peer_identity_key: &peer.identity_key,
+                    directory_peer_signing_key: &peer.signing_key,
+                    response_peer_identity_key: &peer_identity_key,
+                    response_peer_signing_key: &peer_signing_key,
+                },
             )?;
             db.upsert_directory_conversation(
                 &conversation_id,
@@ -9799,13 +9829,15 @@ mod e2ee_rest_tests {
             &db,
             std::slice::from_ref(&changed),
             None,
-            &changed.locator.canonical_server_origin,
-            &changed.locator.user_id,
-            Some(&original.locator.identity_key),
-            &changed.locator.identity_key,
-            &changed.signing_key,
-            &changed.locator.identity_key,
-            &changed.signing_key,
+            super::CreatedDmIdentityEvidence {
+                canonical_server_origin: &changed.locator.canonical_server_origin,
+                peer_user_id: &changed.locator.user_id,
+                expected_peer_identity_key: Some(&original.locator.identity_key),
+                directory_peer_identity_key: &changed.locator.identity_key,
+                directory_peer_signing_key: &changed.signing_key,
+                response_peer_identity_key: &changed.locator.identity_key,
+                response_peer_signing_key: &changed.signing_key,
+            },
         )
         .is_err());
         assert_eq!(
@@ -9833,13 +9865,15 @@ mod e2ee_rest_tests {
             &action_db,
             std::slice::from_ref(&candidate),
             None,
-            &candidate.locator.canonical_server_origin,
-            &candidate.locator.user_id,
-            Some(&expected_identity_key),
-            &candidate.locator.identity_key,
-            &candidate.signing_key,
-            &candidate.locator.identity_key,
-            &candidate.signing_key,
+            super::CreatedDmIdentityEvidence {
+                canonical_server_origin: &candidate.locator.canonical_server_origin,
+                peer_user_id: &candidate.locator.user_id,
+                expected_peer_identity_key: Some(&expected_identity_key),
+                directory_peer_identity_key: &candidate.locator.identity_key,
+                directory_peer_signing_key: &candidate.signing_key,
+                response_peer_identity_key: &candidate.locator.identity_key,
+                response_peer_signing_key: &candidate.signing_key,
+            },
         )
         .is_err());
         assert!(action_db
@@ -9861,13 +9895,15 @@ mod e2ee_rest_tests {
             &response_db,
             std::slice::from_ref(&candidate),
             None,
-            &candidate.locator.canonical_server_origin,
-            &candidate.locator.user_id,
-            None,
-            &candidate.locator.identity_key,
-            &candidate.signing_key,
-            &[0x83; 32],
-            &[0x93; 32],
+            super::CreatedDmIdentityEvidence {
+                canonical_server_origin: &candidate.locator.canonical_server_origin,
+                peer_user_id: &candidate.locator.user_id,
+                expected_peer_identity_key: None,
+                directory_peer_identity_key: &candidate.locator.identity_key,
+                directory_peer_signing_key: &candidate.signing_key,
+                response_peer_identity_key: &[0x83; 32],
+                response_peer_signing_key: &[0x93; 32],
+            },
         )
         .is_err());
         assert!(response_db

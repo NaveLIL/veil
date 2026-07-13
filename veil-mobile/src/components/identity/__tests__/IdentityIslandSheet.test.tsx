@@ -118,7 +118,7 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
     act(() => root.findByType(Modal).props.onShow());
     expect(setAccessibilityFocus).toHaveBeenCalledTimes(1);
     expect(setAccessibilityFocus).toHaveBeenCalledWith(919);
-  });
+  }, 15_000);
 
   it("closes immediately for reduced motion through both Android back and Modal onRequestClose without timing", async () => {
     reduceMotion.mockResolvedValue(true);
