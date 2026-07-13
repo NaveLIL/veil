@@ -20,6 +20,8 @@ const validProfile = {
   username: "quiet-orbit",
   displayName: "Quiet Orbit",
   about: "Profile text",
+  avatarAssetId: null,
+  avatarJpegBase64: null,
   profileVersion: "18446744073709551615",
   profileUpdatedAt: "2026-07-13T05:00:00Z",
   observedAt: "2026-07-13T05:00:01Z",
@@ -43,6 +45,8 @@ describe("network profile renderer boundary", () => {
       { ...validProfile, identityKey: "42".repeat(32) },
       { ...validProfile, profileVersion: "01" },
       { ...validProfile, proofState: "verified" },
+      { ...validProfile, avatarAssetId: "https://cdn.example.test/avatar.jpg" },
+      { ...validProfile, avatarAssetId: null, avatarJpegBase64: "/9j/2Q==" },
     ]) {
       expect(() => validatedNetworkProfileView(
         invalid,

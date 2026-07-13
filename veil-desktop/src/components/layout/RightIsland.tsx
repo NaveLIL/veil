@@ -69,6 +69,8 @@ export interface RightIslandProps {
   onClose: () => void;
   onMessageIdentity: () => void;
   onSaveIdentityProfile?: (displayName: string | null, about: string, expectedVersion: string) => Promise<boolean>;
+  onChangeIdentityAvatar?: () => Promise<boolean>;
+  onRemoveIdentityAvatar?: () => Promise<boolean>;
   onLoadIdentityVerification?: () => Promise<IdentityVerificationView | null>;
   onConfirmIdentityVerification?: (expectedFingerprintHex: string) => Promise<boolean>;
   onCreateDm: (userId: string, technicalUsername: string, expectedIdentityKey?: string) => void;
@@ -581,6 +583,8 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
           verificationError={props.identityVerificationError}
           onMessage={props.onMessageIdentity}
           onSaveProfile={props.onSaveIdentityProfile}
+          onChangeAvatar={props.onChangeIdentityAvatar}
+          onRemoveAvatar={props.onRemoveIdentityAvatar}
           onLoadVerification={props.onLoadIdentityVerification}
           onConfirmVerification={props.onConfirmIdentityVerification}
         />

@@ -42,7 +42,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | identity/profile/proof/search foundation реализован; остаются isolated avatar и mobile/final gate |
+| 4D | Identity Island & Profiles | product scope реализован, включая isolated avatar и mobile Identity sheet; финальный gate отложен |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -363,9 +363,10 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 Реализованы canonical local identity foundation с authenticated origin/binding
 fence, детерминированный Phaseprint и единый `UserAvatar`, Identity Island,
 versioned text profile/cache/editor, локальная verification/identity-change flow,
-relationship-scoped `ProfileUpdated` и identity-bearing local search DTO. Остаются
-изолированный avatar ingest и mobile adaptation/completion evidence, поэтому
-Phase 4D ещё не завершена.
+relationship-scoped `ProfileUpdated`, identity-bearing local search DTO,
+изолированный avatar pipeline и mobile Identity sheet. По решению владельца
+финальный completion gate выполняется отдельно, поэтому Phase 4D ещё не объявлена
+завершённой.
 
 Цель — дать одному человеку единое и узнаваемое представление во всех местах
 Veil: собственный footer, друзья, DM, группы, сообщения, server members и
@@ -683,6 +684,25 @@ checkpoint'ы ниже закрывают text profile/event/proof части; a
   presence history или device secrets.
 
 ### Isolated avatar asset pipeline
+
+**Implementation checkpoint 2026-07-13:** миграция 022 и signed profile routes
+реализуют отдельный avatar store, CAS по `profile_version`, случайный asset UUID и
+24-часовой orphan grace. Сервер принимает только strict PNG/JPEG до 2 МиБ и
+4096×4096/16 MP, ограничивает параллельный decode, применяет orientation,
+center-crop 512×512 и повторно кодирует bounded JPEG без исходных metadata.
+Desktop выбирает файл нативно, подписывает точный origin/query/body, проверяет
+MIME, magic, 256-КиБ budget, digest и 512×512 до передачи base64 в renderer.
+Renderer создаёт только локальный `blob:`, использует bounded LRU и отзывает URL
+при replace/error/lock/logout/origin change; decode error возвращает Phaseprint.
+UI явно сообщает, что avatar видим серверу и не E2EE. Отдельный review:
+[`docs/reviews/phase-4d-avatar-security-review.md`](docs/reviews/phase-4d-avatar-security-review.md).
+
+**Mobile adaptation checkpoint 2026-07-13:** прототип использует единый
+identity-key-first Phaseprint в members и сообщениях; member/message action
+открывает modal bottom sheet с `Person`, `Context`, `Identity Proof`, Android back
+и accessibility modal isolation. Nickname не входит в seed, а service-mediated
+TOFU подписан `Not compared`, не `Verified`. Runtime/network integration остаётся
+владельцем Phase 5A/5B, а не скрытым хвостом Phase 4D.
 
 Существующий tus attachment pipeline переиспользовать нельзя: он принимает E2EE
 ciphertext, имеет message ACL и retention, поэтому сервер не может очистить

@@ -21,6 +21,7 @@ export interface IdentityIslandProfile extends PhaseprintIdentity {
   nickname?: string | null;
   signingKey?: string | null;
   about?: string | null;
+  avatarAssetId?: string | null;
   profileVersion?: string | number | null;
   profileUpdatedAt?: string | null;
   profileOrigin?: string | null;

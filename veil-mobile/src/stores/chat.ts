@@ -23,11 +23,23 @@ export interface Channel {
 
 export interface Member {
   id: string;
+  canonicalServerOrigin: string;
+  userId: string;
+  identityKey: string;
+  username: string;
   name: string;
+  nickname?: string;
+  about?: string;
   status: "online" | "idle" | "dnd" | "offline";
   role?: "owner" | "admin" | "member";
   color: string;
 }
+
+const origin = "https://veil.example:443";
+const member = (id: string, userId: string, identityByte: string, name: string, status: Member["status"], role: Member["role"], color: string, about?: string): Member => ({
+  id, canonicalServerOrigin: origin, userId, identityKey: identityByte.repeat(32),
+  username: name.toLowerCase(), name, status, role, color, about,
+});
 
 export interface DmConversation {
   id: DmId;
@@ -88,24 +100,24 @@ const DMS: DmConversation[] = [
 
 export const MEMBERS_BY_SERVER: Record<ServerId, Member[]> = {
   veil: [
-    { id: "u1", name: "dimon", status: "online", role: "owner", color: "#7c6bf5" },
-    { id: "u2", name: "anya", status: "online", role: "admin", color: "#ec4899" },
-    { id: "u3", name: "leo", status: "idle", role: "member", color: "#f43f5e" },
-    { id: "u4", name: "mark", status: "dnd", role: "member", color: "#10b981" },
-    { id: "u5", name: "iris", status: "offline", role: "member", color: "#fbbf24" },
-    { id: "u6", name: "noa", status: "offline", role: "member", color: "#94a3b8" },
+    member("u1", "10000000-0000-4000-8000-000000000001", "11", "dimon", "online", "owner", "#7c6bf5", "Building Veil carefully."),
+    member("u2", "10000000-0000-4000-8000-000000000002", "22", "anya", "online", "admin", "#ec4899", "Design and privacy."),
+    member("u3", "10000000-0000-4000-8000-000000000003", "33", "leo", "idle", "member", "#f43f5e"),
+    member("u4", "10000000-0000-4000-8000-000000000004", "44", "mark", "dnd", "member", "#10b981"),
+    member("u5", "10000000-0000-4000-8000-000000000005", "55", "iris", "offline", "member", "#fbbf24"),
+    member("u6", "10000000-0000-4000-8000-000000000006", "66", "noa", "offline", "member", "#94a3b8"),
   ],
   rust: [
-    { id: "r1", name: "alice", status: "online", role: "owner", color: "#d97706" },
-    { id: "r2", name: "bob", status: "online", role: "member", color: "#7c6bf5" },
-    { id: "r3", name: "carol", status: "offline", role: "member", color: "#10b981" },
+    member("r1", "20000000-0000-4000-8000-000000000001", "71", "alice", "online", "owner", "#d97706"),
+    member("r2", "20000000-0000-4000-8000-000000000002", "72", "bob", "online", "member", "#7c6bf5"),
+    member("r3", "20000000-0000-4000-8000-000000000003", "73", "carol", "offline", "member", "#10b981"),
   ],
   design: [
-    { id: "d1", name: "sasha", status: "online", role: "owner", color: "#10b981" },
-    { id: "d2", name: "yulia", status: "online", role: "member", color: "#ec4899" },
+    member("d1", "30000000-0000-4000-8000-000000000001", "81", "sasha", "online", "owner", "#10b981"),
+    member("d2", "30000000-0000-4000-8000-000000000002", "82", "yulia", "online", "member", "#ec4899"),
   ],
   music: [
-    { id: "m1", name: "dj", status: "online", role: "owner", color: "#ec4899" },
+    member("m1", "40000000-0000-4000-8000-000000000001", "91", "dj", "online", "owner", "#ec4899"),
   ],
 };
 

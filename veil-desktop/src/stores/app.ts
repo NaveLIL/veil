@@ -132,6 +132,8 @@ export interface NetworkProfileView {
   username: string;
   displayName: string | null;
   about: string;
+  avatarAssetId: string | null;
+  avatarJpegBase64: string | null;
   profileVersion: string;
   profileUpdatedAt: string;
   observedAt: string;
@@ -549,6 +551,9 @@ export function validatedNetworkProfileView(
     || (displayName !== null && (typeof displayName !== "string" || displayName.length > 512))
     || typeof profile.about !== "string"
     || profile.about.length > 2048
+    || (profile.avatarAssetId !== null && (typeof profile.avatarAssetId !== "string" || !/^[0-9a-f-]{36}$/.test(profile.avatarAssetId)))
+    || (profile.avatarJpegBase64 !== null && (typeof profile.avatarJpegBase64 !== "string" || profile.avatarJpegBase64.length > 360_000))
+    || (profile.avatarAssetId === null && profile.avatarJpegBase64 !== null)
     || typeof profile.profileVersion !== "string"
     || !/^(0|[1-9][0-9]*)$/.test(profile.profileVersion)
     || typeof profile.profileUpdatedAt !== "string"
@@ -1952,6 +1957,39 @@ export const appStore = {
       currentUserId,
       currentIdentityKey,
     );
+  },
+
+  updateProfileAvatar: async (expectedVersion: string): Promise<NetworkProfileView | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const currentUserId = userId();
+    const currentIdentityKey = identity()?.trim().toLowerCase();
+    if (!currentUserId || !currentIdentityKey || !/^[0-9a-f]{64}$/.test(currentIdentityKey)) {
+      throw new Error("avatar update has no current authenticated identity");
+    }
+    const profile = await invoke<unknown>("update_profile_avatar", {
+      serverHttpUrl: serverHttpUrl(), userId: currentUserId, expectedVersion,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    if (profile === null) return null;
+    return validatedNetworkProfileView(profile, mutationScope, currentUserId, currentIdentityKey);
+  },
+
+  removeProfileAvatar: async (expectedVersion: string): Promise<NetworkProfileView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const currentUserId = userId();
+    const currentIdentityKey = identity()?.trim().toLowerCase();
+    if (!currentUserId || !currentIdentityKey || !/^[0-9a-f]{64}$/.test(currentIdentityKey)) {
+      throw new Error("avatar removal has no current authenticated identity");
+    }
+    const profile = await invoke<unknown>("remove_profile_avatar", {
+      serverHttpUrl: serverHttpUrl(), userId: currentUserId, expectedVersion,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedNetworkProfileView(profile, mutationScope, currentUserId, currentIdentityKey);
   },
 
   loadIdentityVerification: async (

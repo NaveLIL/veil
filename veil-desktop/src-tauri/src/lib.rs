@@ -40,6 +40,12 @@ struct NetworkProfileResponse {
     username: String,
     display_name: Option<String>,
     about: String,
+    #[serde(default)]
+    avatar_asset_id: Option<String>,
+    #[serde(default)]
+    avatar_digest: Option<String>,
+    #[serde(default)]
+    avatar_content_type: Option<String>,
     profile_version: u64,
     profile_updated_at: String,
 }
@@ -53,6 +59,8 @@ struct NetworkProfileView {
     username: String,
     display_name: Option<String>,
     about: String,
+    avatar_asset_id: Option<String>,
+    avatar_jpeg_base64: Option<String>,
     profile_version: String,
     profile_updated_at: String,
     observed_at: String,
@@ -169,6 +177,8 @@ const AUTO_LOCK_ACCOUNT: &str = "veil-auto-lock-seconds";
 const DEFAULT_AUTO_LOCK_SECONDS: u64 = 5 * 60;
 static LAST_REST_TIMESTAMP_MS: AtomicI64 = AtomicI64::new(0);
 const MAX_REST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_AVATAR_INPUT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_AVATAR_RESPONSE_BYTES: usize = 256 * 1024;
 const PROJECT_REPOSITORY_URL: &str = "https://github.com/NaveLIL/veil";
 const LEGACY_MIN_PIN_LEN: usize = 4;
 const MAX_PIN_LEN: usize = 12;
@@ -2330,6 +2340,21 @@ fn parse_network_profile_response(
         validate_profile_text("network profile display name", display_name, 512, false)?;
     }
     validate_profile_text("network profile about", &profile.about, 2048, true)?;
+    match (
+        profile.avatar_asset_id.as_deref(),
+        profile.avatar_digest.as_deref(),
+        profile.avatar_content_type.as_deref(),
+    ) {
+        (None, None, None) => {}
+        (Some(asset_id), Some(digest), Some("image/jpeg")) => {
+            decode_canonical_uuid("network profile avatar id", asset_id)?;
+            let digest = decode_lower_hex_fixed::<32>("network profile avatar digest", digest)?;
+            if digest == [0u8; 32] {
+                return Err("network profile avatar digest is all zero".to_string());
+            }
+        }
+        _ => return Err("network profile avatar metadata is incomplete".to_string()),
+    }
     validate_utc_rfc3339_nano(
         "network profile updated timestamp",
         &profile.profile_updated_at,
@@ -2341,6 +2366,7 @@ fn network_profile_view(
     profile: &NetworkProfile,
     proof: LocalIdentityVerification,
     is_self: bool,
+    avatar_jpeg_base64: Option<String>,
 ) -> NetworkProfileView {
     let proof_state = if is_self {
         "current_account"
@@ -2354,6 +2380,8 @@ fn network_profile_view(
         username: profile.username.clone(),
         display_name: profile.display_name.clone(),
         about: profile.about.clone(),
+        avatar_asset_id: profile.avatar_asset_id.clone(),
+        avatar_jpeg_base64,
         profile_version: profile.profile_version.to_string(),
         profile_updated_at: profile.profile_updated_at.clone(),
         observed_at: profile.observed_at.clone(),
@@ -2367,6 +2395,139 @@ fn local_identity_verification_token(proof: LocalIdentityVerification) -> &'stat
         LocalIdentityVerification::VerifiedOnThisDevice => "verified_on_this_device",
         LocalIdentityVerification::IdentityChanged => "identity_changed",
     }
+}
+
+struct AvatarMetadata {
+    asset_id: Option<String>,
+    digest: Option<[u8; 32]>,
+    content_type: Option<String>,
+}
+
+fn avatar_metadata(response: &NetworkProfileResponse) -> Result<AvatarMetadata, String> {
+    match (
+        response.avatar_asset_id.clone(),
+        response.avatar_digest.as_deref(),
+        response.avatar_content_type.clone(),
+    ) {
+        (None, None, None) => Ok(AvatarMetadata {
+            asset_id: None,
+            digest: None,
+            content_type: None,
+        }),
+        (Some(asset_id), Some(digest), Some(content_type)) => Ok(AvatarMetadata {
+            asset_id: Some(asset_id),
+            digest: Some(decode_lower_hex_fixed::<32>(
+                "network profile avatar digest",
+                digest,
+            )?),
+            content_type: Some(content_type),
+        }),
+        _ => Err("network profile avatar metadata is incomplete".to_string()),
+    }
+}
+
+async fn fetch_profile_avatar(
+    state: &AppState,
+    server_http_url: &str,
+    user_id: &str,
+    response: &NetworkProfileResponse,
+    binding: &RestBinding,
+) -> Result<Option<String>, String> {
+    use base64::Engine;
+    use image::GenericImageView;
+    use sha2::{Digest, Sha256};
+
+    let AvatarMetadata {
+        asset_id: Some(asset_id),
+        digest: Some(expected_digest),
+        content_type: Some(_),
+    } = avatar_metadata(response)?
+    else {
+        return Ok(None);
+    };
+    let request_url = rest_api_url(server_http_url, &["v1", "profile-avatars", &asset_id])?;
+    validate_live_action_rest_origin(binding, &request_url)?;
+    let (headers, bytes) = rest_send_raw_for_binding(
+        state,
+        reqwest::Method::GET,
+        request_url,
+        user_id,
+        RawRestPayload {
+            body: Vec::new(),
+            content_type: None,
+            response_limit: MAX_AVATAR_RESPONSE_BYTES,
+        },
+        binding,
+    )
+    .await?;
+    let content_type = headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    let digest_header = headers
+        .get("X-Veil-Avatar-SHA256")
+        .and_then(|value| value.to_str().ok());
+    if content_type != Some("image/jpeg")
+        || digest_header != response.avatar_digest.as_deref()
+        || bytes.len() < 4
+        || bytes[0..2] != [0xff, 0xd8]
+        || bytes[bytes.len() - 2..] != [0xff, 0xd9]
+        || !bool::from(Sha256::digest(&bytes).as_slice().ct_eq(&expected_digest))
+    {
+        return Err("profile avatar failed native integrity validation".to_string());
+    }
+    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
+        .map_err(|_| "profile avatar failed native image validation".to_string())?;
+    if image.dimensions() != (512, 512) {
+        return Err("profile avatar dimensions are invalid".to_string());
+    }
+    Ok(Some(
+        base64::engine::general_purpose::STANDARD.encode(bytes),
+    ))
+}
+
+fn persist_self_network_profile(
+    state: &AppState,
+    user_id: String,
+    response: NetworkProfileResponse,
+    binding: &RestBinding,
+    avatar_jpeg_base64: Option<String>,
+) -> Result<NetworkProfileView, String> {
+    let metadata = avatar_metadata(&response)?;
+    let _session_transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(state, binding)?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(state, binding)?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("authenticated user changed before profile storage".to_string());
+    }
+    let profile = NetworkProfile {
+        locator: ProfileLocator {
+            canonical_server_origin: binding.origin.canonical_server_origin(),
+            user_id,
+            identity_key: client.identity_key()?,
+        },
+        username: response.username,
+        display_name: response.display_name,
+        about: response.about,
+        avatar_asset_id: metadata.asset_id,
+        avatar_digest: metadata.digest,
+        avatar_content_type: metadata.content_type,
+        profile_version: response.profile_version,
+        profile_updated_at: response.profile_updated_at,
+        observed_at: identity_observed_at(),
+    };
+    let db = client.db().ok_or("database not initialized")?;
+    db.upsert_authenticated_network_profile(&profile, client.signing_key()?)?;
+    require_confirmed_live_action_binding_current(state, binding)?;
+    Ok(network_profile_view(
+        &profile,
+        LocalIdentityVerification::NotCompared,
+        true,
+        avatar_jpeg_base64,
+    ))
 }
 
 fn validate_directory_reason(field: &str, value: &str) -> Result<(), String> {
@@ -6306,6 +6467,121 @@ async fn read_bounded_response(
     Ok((status, body))
 }
 
+async fn read_response_with_limit(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, Vec<u8>), String> {
+    let status = response.status();
+    let headers = response.headers().clone();
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(format!("HTTP response exceeds {limit} bytes"));
+    }
+    let mut body = Vec::with_capacity(
+        response
+            .content_length()
+            .unwrap_or_default()
+            .min(limit as u64) as usize,
+    );
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("read response body: {e}"))?
+    {
+        if body
+            .len()
+            .checked_add(chunk.len())
+            .is_none_or(|length| length > limit)
+        {
+            return Err(format!("HTTP response exceeds {limit} bytes"));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok((status, headers, body))
+}
+
+struct RawRestPayload {
+    body: Vec<u8>,
+    content_type: Option<&'static str>,
+    response_limit: usize,
+}
+
+async fn rest_send_raw_for_binding(
+    state: &AppState,
+    method: reqwest::Method,
+    url: String,
+    user_id: &str,
+    payload: RawRestPayload,
+    expected_binding: &RestBinding,
+) -> Result<(reqwest::header::HeaderMap, Vec<u8>), String> {
+    use base64::Engine;
+    use sha2::{Digest, Sha256};
+
+    require_unlocked(state)?;
+    let parsed_url = reqwest::Url::parse(&url).map_err(|e| format!("invalid REST URL: {e}"))?;
+    let rest_binding = require_authenticated_rest_origin(state, &parsed_url)?;
+    validate_expected_rest_binding(&rest_binding, Some(expected_binding))?;
+    let authenticated_user_id = {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        require_session_still_unlocked(state)?;
+        require_same_rest_binding(state, &parsed_url, &rest_binding)?;
+        require_confirmed_live_action_binding_current(state, expected_binding)?;
+        client.authenticated_user_id()?.to_string()
+    };
+    if user_id != authenticated_user_id {
+        return Err("REST user id does not match the authenticated WebSocket session".into());
+    }
+    let authority = rest_authority(&parsed_url, &url)?;
+    let request_target = rest_request_target(&parsed_url);
+    let ts_ms = next_rest_timestamp_ms()?;
+    let canonical = rest_canonical(
+        &method,
+        &authority,
+        &request_target,
+        ts_ms,
+        &hex::encode(Sha256::digest(&payload.body)),
+    );
+    let signature = {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        require_session_still_unlocked(state)?;
+        require_same_rest_binding(state, &parsed_url, &rest_binding)?;
+        require_confirmed_live_action_binding_current(state, expected_binding)?;
+        client
+            .sign_message(canonical.as_bytes())
+            .map(|signature| base64::engine::general_purpose::STANDARD.encode(signature))
+            .map_err(|e| format!("identity not initialized - cannot sign request: {e}"))?
+    };
+    let mut request = state
+        .http
+        .request(method, parsed_url.clone())
+        .header(reqwest::header::HOST, &authority)
+        .header("X-Veil-User", &authenticated_user_id)
+        .header("X-Veil-Timestamp", ts_ms.to_string())
+        .header("X-Veil-Signature", signature);
+    if let Some(content_type) = payload.content_type {
+        request = request.header(reqwest::header::CONTENT_TYPE, content_type);
+    }
+    if !payload.body.is_empty() {
+        request = request.body(payload.body);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|e| format!("http request failed: {e}"))?;
+    let (status, headers, bytes) =
+        read_response_with_limit(response, payload.response_limit).await?;
+    require_unlocked(state)?;
+    require_same_rest_binding(state, &parsed_url, &rest_binding)?;
+    require_confirmed_live_action_binding_current(state, expected_binding)?;
+    if !status.is_success() {
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        return Err(rest_err(&json, &format!("HTTP {}", status.as_u16())));
+    }
+    Ok((headers, bytes))
+}
+
 async fn rest_send_json(
     state: &AppState,
     method: reqwest::Method,
@@ -6650,11 +6926,25 @@ fn get_network_profile(
         &live_action_binding,
     ))?;
     let response = parse_network_profile_response(response, &target_user_id)?;
+    let avatar_jpeg_base64 = state
+        .runtime
+        .block_on(fetch_profile_avatar(
+            &state,
+            &server_http_url,
+            &user_id,
+            &response,
+            &live_action_binding,
+        ))
+        .unwrap_or(None);
+    let metadata = avatar_metadata(&response)?;
     let profile = NetworkProfile {
         locator,
         username: response.username,
         display_name: response.display_name,
         about: response.about,
+        avatar_asset_id: metadata.asset_id,
+        avatar_digest: metadata.digest,
+        avatar_content_type: metadata.content_type,
         profile_version: response.profile_version,
         profile_updated_at: response.profile_updated_at,
         observed_at: identity_observed_at(),
@@ -6685,7 +6975,12 @@ fn get_network_profile(
     }
     let proof = db.local_identity_verification(&profile.locator)?;
     require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-    Ok(network_profile_view(&profile, proof, is_self))
+    Ok(network_profile_view(
+        &profile,
+        proof,
+        is_self,
+        avatar_jpeg_base64,
+    ))
 }
 
 #[tauri::command]
@@ -6736,38 +7031,156 @@ fn update_network_profile(
         &live_action_binding,
     ))?;
     let response = parse_network_profile_response(response, &user_id)?;
+    let avatar_jpeg_base64 = state
+        .runtime
+        .block_on(fetch_profile_avatar(
+            &state,
+            &server_http_url,
+            &user_id,
+            &response,
+            &live_action_binding,
+        ))
+        .unwrap_or(None);
+    persist_self_network_profile(
+        &state,
+        user_id,
+        response,
+        &live_action_binding,
+        avatar_jpeg_base64,
+    )
+}
 
-    let _session_transition = state
-        .session_transition
-        .lock()
-        .map_err(|error| error.to_string())?;
-    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-    let client = state.client.lock().map_err(|error| error.to_string())?;
-    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-    if client.authenticated_user_id()? != user_id {
-        return Err("authenticated user changed before profile storage".to_string());
-    }
-    let profile = NetworkProfile {
-        locator: ProfileLocator {
-            canonical_server_origin: live_action_binding.origin.canonical_server_origin(),
-            user_id,
-            identity_key: client.identity_key()?,
-        },
-        username: response.username,
-        display_name: response.display_name,
-        about: response.about,
-        profile_version: response.profile_version,
-        profile_updated_at: response.profile_updated_at,
-        observed_at: identity_observed_at(),
+fn avatar_mutation_url(server_http_url: &str, expected_version: u64) -> Result<String, String> {
+    let raw = rest_api_url(server_http_url, &["v1", "users", "me", "profile", "avatar"])?;
+    let mut url =
+        reqwest::Url::parse(&raw).map_err(|error| format!("invalid avatar URL: {error}"))?;
+    url.query_pairs_mut()
+        .append_pair("expected_version", &expected_version.to_string());
+    Ok(url.to_string())
+}
+
+fn parse_avatar_mutation_response(
+    bytes: &[u8],
+    user_id: &str,
+) -> Result<NetworkProfileResponse, String> {
+    let value = serde_json::from_slice(bytes)
+        .map_err(|error| format!("invalid avatar profile response: {error}"))?;
+    parse_network_profile_response(value, user_id)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn update_profile_avatar(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    expected_version: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Option<NetworkProfileView>, String> {
+    use std::io::Read;
+
+    decode_canonical_uuid("profile avatar user id", &user_id)?;
+    let expected_version = canonical_profile_version(&expected_version)?;
+    let Some(path) = rfd::FileDialog::new()
+        .add_filter("PNG or JPEG", &["png", "jpg", "jpeg"])
+        .pick_file()
+    else {
+        return Ok(None);
     };
-    let db = client.db().ok_or("database not initialized")?;
-    db.upsert_authenticated_network_profile(&profile, client.signing_key()?)?;
-    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-    Ok(network_profile_view(
-        &profile,
-        LocalIdentityVerification::NotCompared,
-        true,
-    ))
+    let mut file = std::fs::File::open(&path)
+        .map_err(|_| "selected avatar could not be opened".to_string())?;
+    let mut bytes = Vec::new();
+    file.by_ref()
+        .take((MAX_AVATAR_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "selected avatar could not be read".to_string())?;
+    if bytes.is_empty() || bytes.len() > MAX_AVATAR_INPUT_BYTES {
+        return Err("selected avatar exceeds the 2 MiB limit".to_string());
+    }
+    let content_type = if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a])
+        && bytes.ends_with(&[
+            0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae, 0x42, 0x60, 0x82,
+        ]) {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8]) && bytes.ends_with(&[0xff, 0xd9]) {
+        "image/jpeg"
+    } else {
+        return Err("selected avatar is not a strict PNG or JPEG file".to_string());
+    };
+
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = avatar_mutation_url(&server_http_url, expected_version)?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    let (_, response_bytes) = state.runtime.block_on(rest_send_raw_for_binding(
+        &state,
+        reqwest::Method::PUT,
+        request_url,
+        &user_id,
+        RawRestPayload {
+            body: bytes,
+            content_type: Some(content_type),
+            response_limit: 64 * 1024,
+        },
+        &binding,
+    ))?;
+    let response = parse_avatar_mutation_response(&response_bytes, &user_id)?;
+    let avatar_jpeg_base64 = state
+        .runtime
+        .block_on(fetch_profile_avatar(
+            &state,
+            &server_http_url,
+            &user_id,
+            &response,
+            &binding,
+        ))
+        .map_err(|_| "uploaded avatar could not be verified after storage".to_string())?;
+    persist_self_network_profile(&state, user_id, response, &binding, avatar_jpeg_base64).map(Some)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn remove_profile_avatar(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    expected_version: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<NetworkProfileView, String> {
+    decode_canonical_uuid("profile avatar user id", &user_id)?;
+    let expected_version = canonical_profile_version(&expected_version)?;
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = avatar_mutation_url(&server_http_url, expected_version)?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    let (_, response_bytes) = state.runtime.block_on(rest_send_raw_for_binding(
+        &state,
+        reqwest::Method::DELETE,
+        request_url,
+        &user_id,
+        RawRestPayload {
+            body: Vec::new(),
+            content_type: None,
+            response_limit: 64 * 1024,
+        },
+        &binding,
+    ))?;
+    let response = parse_avatar_mutation_response(&response_bytes, &user_id)?;
+    if response.avatar_asset_id.is_some()
+        || response.avatar_digest.is_some()
+        || response.avatar_content_type.is_some()
+    {
+        return Err("server did not remove profile avatar".to_string());
+    }
+    persist_self_network_profile(&state, user_id, response, &binding, None)
 }
 
 fn exact_identity_verification_view(
@@ -8530,6 +8943,8 @@ pub fn run() {
             get_server,
             get_network_profile,
             update_network_profile,
+            update_profile_avatar,
+            remove_profile_avatar,
             get_identity_verification,
             confirm_identity_verification,
             update_server,
@@ -9579,6 +9994,17 @@ mod e2ee_rest_tests {
         let mut unknown_field = valid.clone();
         unknown_field["avatar_url"] = serde_json::json!("https://example.test/avatar.png");
         assert!(parse_network_profile_response(unknown_field, user_id).is_err());
+
+        let mut avatar = valid.clone();
+        avatar["avatar_asset_id"] = serde_json::json!("550e8400-e29b-41d4-a716-446655440000");
+        avatar["avatar_digest"] = serde_json::json!("ab".repeat(32));
+        avatar["avatar_content_type"] = serde_json::json!("image/jpeg");
+        assert!(parse_network_profile_response(avatar, user_id).is_ok());
+
+        let mut incomplete_avatar = valid.clone();
+        incomplete_avatar["avatar_asset_id"] =
+            serde_json::json!("550e8400-e29b-41d4-a716-446655440000");
+        assert!(parse_network_profile_response(incomplete_avatar, user_id).is_err());
 
         let mut bidi = valid;
         bidi["about"] = serde_json::json!("safe\u{202e}evil");

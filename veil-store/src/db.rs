@@ -281,6 +281,21 @@ fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
     if profile.about.len() > MAX_NETWORK_PROFILE_ABOUT_BYTES {
         return Err("network profile presentation text is oversized".to_string());
     }
+    match (
+        profile.avatar_asset_id.as_deref(),
+        profile.avatar_digest,
+        profile.avatar_content_type.as_deref(),
+    ) {
+        (None, None, None) => {}
+        (Some(asset_id), Some(digest), Some("image/jpeg")) => {
+            let parsed = uuid::Uuid::parse_str(asset_id)
+                .map_err(|_| "network profile avatar id is invalid".to_string())?;
+            if parsed.hyphenated().to_string() != asset_id || digest == [0u8; 32] {
+                return Err("network profile avatar metadata is invalid".to_string());
+            }
+        }
+        _ => return Err("network profile avatar metadata is incomplete".to_string()),
+    }
     for value in std::iter::once(&profile.username)
         .chain(profile.display_name.iter())
         .chain(std::iter::once(&profile.about))
@@ -1039,6 +1054,9 @@ impl VeilDb {
                           length(CAST(display_name AS BLOB)) BETWEEN 1 AND 512),
                 about TEXT NOT NULL
                     CHECK(length(CAST(about AS BLOB)) <= 2048),
+                avatar_asset_id TEXT,
+                avatar_digest BLOB CHECK(avatar_digest IS NULL OR length(avatar_digest) = 32),
+                avatar_content_type TEXT CHECK(avatar_content_type IS NULL OR avatar_content_type = 'image/jpeg'),
                 profile_version BLOB NOT NULL CHECK(length(profile_version) = 8),
                 profile_updated_at TEXT NOT NULL
                     CHECK(length(profile_updated_at) BETWEEN 1 AND 64),
@@ -1396,6 +1414,7 @@ impl VeilDb {
             .map_err(|e| format!("migrations: {e}"))?;
 
         self.ensure_conversation_identity_schema()?;
+        self.ensure_network_profile_avatar_schema()?;
         self.rebuild_interim_sender_key_tables()?;
         self.ensure_sender_key_historical_proof_schema()?;
 
@@ -1458,6 +1477,40 @@ impl VeilDb {
         }
         tx.commit()
             .map_err(|e| format!("commit conversation identity schema upgrade: {e}"))
+    }
+
+    fn ensure_network_profile_avatar_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin network profile avatar schema upgrade: {e}"))?;
+        for (name, definition) in [
+            ("avatar_asset_id", "TEXT"),
+            (
+                "avatar_digest",
+                "BLOB CHECK(avatar_digest IS NULL OR length(avatar_digest) = 32)",
+            ),
+            (
+                "avatar_content_type",
+                "TEXT CHECK(avatar_content_type IS NULL OR avatar_content_type = 'image/jpeg')",
+            ),
+        ] {
+            let present: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('network_profiles_v1') WHERE name=?1)",
+                    rusqlite::params![name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("inspect network profile {name} column: {e}"))?;
+            if !present {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE network_profiles_v1 ADD COLUMN {name} {definition};"
+                ))
+                .map_err(|e| format!("add network profile {name} column: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit network profile avatar schema upgrade: {e}"))
     }
 
     fn normalized_table_sql(&self, table: &str) -> Result<String, String> {
@@ -1960,7 +2013,8 @@ impl VeilDb {
             let existing = self
                 .conn
                 .query_row(
-                    "SELECT username, display_name, about, profile_version,
+                    "SELECT username, display_name, about, avatar_asset_id,
+                            avatar_digest, avatar_content_type, profile_version,
                             profile_updated_at
                      FROM network_profiles_v1
                      WHERE canonical_server_origin = ?1 AND user_id = ?2
@@ -1975,14 +2029,27 @@ impl VeilDb {
                             row.get::<_, String>(0)?,
                             row.get::<_, Option<String>>(1)?,
                             row.get::<_, String>(2)?,
-                            row.get::<_, Vec<u8>>(3)?,
-                            row.get::<_, String>(4)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, String>(7)?,
                         ))
                     },
                 )
                 .optional()
                 .map_err(|error| format!("load existing network profile: {error}"))?;
-            if let Some((username, display_name, about, version, updated_at)) = existing {
+            if let Some((
+                username,
+                display_name,
+                about,
+                avatar_asset_id,
+                avatar_digest,
+                avatar_content_type,
+                version,
+                updated_at,
+            )) = existing
+            {
                 let version =
                     fixed_bytes::<8>("network profile version", version).map(u64::from_be_bytes)?;
                 if profile.profile_version < version {
@@ -1992,6 +2059,9 @@ impl VeilDb {
                     && (profile.username != username
                         || profile.display_name != display_name
                         || profile.about != about
+                        || profile.avatar_asset_id != avatar_asset_id
+                        || profile.avatar_digest.map(|value| value.to_vec()) != avatar_digest
+                        || profile.avatar_content_type != avatar_content_type
                         || profile.profile_updated_at != updated_at)
                 {
                     return Err("network profile changed without a version advance".into());
@@ -2003,13 +2073,17 @@ impl VeilDb {
                 .execute(
                     "INSERT INTO network_profiles_v1
                         (canonical_server_origin, user_id, identity_key,
-                         username, display_name, about, profile_version,
+                         username, display_name, about, avatar_asset_id,
+                         avatar_digest, avatar_content_type, profile_version,
                          profile_updated_at, observed_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                      ON CONFLICT(canonical_server_origin, user_id, identity_key)
                      DO UPDATE SET username = excluded.username,
                          display_name = excluded.display_name,
                          about = excluded.about,
+                         avatar_asset_id = excluded.avatar_asset_id,
+                         avatar_digest = excluded.avatar_digest,
+                         avatar_content_type = excluded.avatar_content_type,
                          profile_version = excluded.profile_version,
                          profile_updated_at = excluded.profile_updated_at,
                          observed_at = excluded.observed_at",
@@ -2020,6 +2094,9 @@ impl VeilDb {
                         profile.username,
                         profile.display_name,
                         profile.about,
+                        profile.avatar_asset_id,
+                        profile.avatar_digest.map(|value| value.to_vec()),
+                        profile.avatar_content_type,
                         version.as_slice(),
                         profile.profile_updated_at,
                         profile.observed_at,
@@ -2076,7 +2153,8 @@ impl VeilDb {
         validate_profile_locator(locator)?;
         self.conn
             .query_row(
-                "SELECT username, display_name, about, profile_version,
+                "SELECT username, display_name, about, avatar_asset_id,
+                        avatar_digest, avatar_content_type, profile_version,
                         profile_updated_at, observed_at
                  FROM network_profiles_v1
                  WHERE canonical_server_origin = ?1 AND user_id = ?2
@@ -2091,21 +2169,39 @@ impl VeilDb {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, Vec<u8>>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, String>(5)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| format!("load network profile: {error}"))?
             .map(
-                |(username, display_name, about, version, profile_updated_at, observed_at)| {
+                |(
+                    username,
+                    display_name,
+                    about,
+                    avatar_asset_id,
+                    avatar_digest,
+                    avatar_content_type,
+                    version,
+                    profile_updated_at,
+                    observed_at,
+                )| {
                     let profile = NetworkProfile {
                         locator: locator.clone(),
                         username,
                         display_name,
                         about,
+                        avatar_asset_id,
+                        avatar_digest: avatar_digest
+                            .map(|value| fixed_bytes::<32>("network profile avatar digest", value))
+                            .transpose()?,
+                        avatar_content_type,
                         profile_version: fixed_bytes::<8>("network profile version", version)
                             .map(u64::from_be_bytes)?,
                         profile_updated_at,
@@ -5637,6 +5733,9 @@ mod tests {
             username: account.username.clone().unwrap(),
             display_name: account.display_name.clone(),
             about: "A signed origin-scoped profile.".to_string(),
+            avatar_asset_id: None,
+            avatar_digest: None,
+            avatar_content_type: None,
             profile_version: version,
             profile_updated_at: "2026-07-13T02:00:00Z".to_string(),
             observed_at: "2026-07-13T02:00:01Z".to_string(),
@@ -7557,6 +7656,9 @@ mod tests {
             .unwrap();
         let mut current = sample_network_profile(&account, 3);
         current.about = "first line\nsecond line".to_string();
+        current.avatar_asset_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        current.avatar_digest = Some([0xA5; 32]);
+        current.avatar_content_type = Some("image/jpeg".to_string());
         db.upsert_network_profile(&current).unwrap();
 
         let mut rollback = current.clone();
@@ -7566,6 +7668,15 @@ mod tests {
         let mut equivocation = current.clone();
         equivocation.about = "changed at the same revision".to_string();
         assert!(db.upsert_network_profile(&equivocation).is_err());
+
+        let mut avatar_equivocation = current.clone();
+        avatar_equivocation.avatar_digest = Some([0xA6; 32]);
+        assert!(db.upsert_network_profile(&avatar_equivocation).is_err());
+
+        let mut incomplete_avatar = current.clone();
+        incomplete_avatar.profile_version = 4;
+        incomplete_avatar.avatar_digest = None;
+        assert!(db.upsert_network_profile(&incomplete_avatar).is_err());
 
         let mut bidi = current.clone();
         bidi.profile_version = 4;

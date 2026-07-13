@@ -1,8 +1,9 @@
 import React, { useMemo } from "react";
-import { ScrollView, SectionList, StyleSheet, Text, View } from "react-native";
+import { Pressable, SectionList, StyleSheet, Text, View } from "react-native";
 import { Island } from "../ui/Island";
 import { colors, radii, spacing } from "../../lib/theme";
 import { DM_HOME_ID, MEMBERS_BY_SERVER, Member, useChatStore } from "../../stores/chat";
+import { UserAvatar } from "../identity/UserAvatar";
 
 const EMPTY_MEMBERS: Member[] = [];
 
@@ -13,7 +14,7 @@ const STATUS_COLOR: Record<Member["status"], string> = {
   offline: "#7a7a90",
 };
 
-export const MembersIsland: React.FC = () => {
+export const MembersIsland: React.FC<{ onOpenIdentity?: (member: Member) => void }> = ({ onOpenIdentity }) => {
   const serverId = useChatStore((s) => s.selectedServerId);
   const members = useMemo(
     () => MEMBERS_BY_SERVER[serverId] ?? EMPTY_MEMBERS,
@@ -63,13 +64,8 @@ export const MembersIsland: React.FC = () => {
             <Text style={styles.sectionHeader}>{section.title}</Text>
           )}
           renderItem={({ item }) => (
-            <View style={styles.row}>
-              <View style={[styles.avatar, { backgroundColor: item.color + "33", borderColor: item.color + "55" }]}>
-                <Text style={[styles.avatarText, { color: item.color }]}>
-                  {item.name.charAt(0).toUpperCase()}
-                </Text>
-                <View style={[styles.dot, { backgroundColor: STATUS_COLOR[item.status] }]} />
-              </View>
+            <Pressable accessibilityRole="button" accessibilityLabel={`View identity for ${item.name}`} onPress={() => onOpenIdentity?.(item)} style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}>
+              <UserAvatar identityKey={item.identityKey} userId={item.userId} username={item.username} size={38} statusColor={STATUS_COLOR[item.status]} />
               <View style={{ flex: 1 }}>
                 <Text style={styles.name}>{item.name}</Text>
                 {item.role && item.role !== "member" ? (
@@ -78,7 +74,7 @@ export const MembersIsland: React.FC = () => {
                   <Text style={styles.statusLabel}>{item.status}</Text>
                 )}
               </View>
-            </View>
+            </Pressable>
           )}
         />
       </Island>
@@ -106,6 +102,7 @@ const styles = StyleSheet.create({
     gap: spacing.md,
     paddingVertical: 8,
   },
+  rowPressed: { opacity: 0.72, transform: [{ scale: 0.985 }] },
   avatar: {
     width: 38,
     height: 38,

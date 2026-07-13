@@ -11,11 +11,12 @@ import {
 } from "react-native";
 import { Island } from "../ui/Island";
 import { colors, radii, spacing } from "../../lib/theme";
-import { DM_HOME_ID, useChatStore } from "../../stores/chat";
+import { DM_HOME_ID, MEMBERS_BY_SERVER, type Member, useChatStore } from "../../stores/chat";
+import { UserAvatar } from "../identity/UserAvatar";
 
 const EMPTY_MSGS: never[] = [];
 
-export const ChatIsland: React.FC = () => {
+export const ChatIsland: React.FC<{ onOpenIdentity?: (member: Member) => void }> = ({ onOpenIdentity }) => {
   const selectedServerId = useChatStore((s) => s.selectedServerId);
   const selectedChannelId = useChatStore((s) => s.selectedChannelId);
   const selectedDmId = useChatStore((s) => s.selectedDmId);
@@ -72,11 +73,22 @@ export const ChatIsland: React.FC = () => {
           ) : (
             messages.map((m) => (
               <View key={m.id} style={styles.msgRow}>
-                <View style={[styles.avatar, { backgroundColor: m.authorColor + "33", borderColor: m.authorColor + "55" }]}>
-                  <Text style={[styles.avatarText, { color: m.authorColor }]}>
-                    {m.authorName.charAt(0).toUpperCase()}
-                  </Text>
-                </View>
+                <Pressable
+                  accessibilityRole="button"
+                  accessibilityLabel={`View identity for ${m.authorName}`}
+                  disabled={!MEMBERS_BY_SERVER[selectedServerId]?.some((member) => member.id === m.authorId)}
+                  onPress={() => {
+                    const member = MEMBERS_BY_SERVER[selectedServerId]?.find((candidate) => candidate.id === m.authorId);
+                    if (member) onOpenIdentity?.(member);
+                  }}
+                >
+                  <UserAvatar
+                    identityKey={MEMBERS_BY_SERVER[selectedServerId]?.find((member) => member.id === m.authorId)?.identityKey}
+                    userId={MEMBERS_BY_SERVER[selectedServerId]?.find((member) => member.id === m.authorId)?.userId ?? m.authorId}
+                    username={m.authorName}
+                    size={36}
+                  />
+                </Pressable>
                 <View style={styles.msgBody}>
                   <View style={styles.msgHead}>
                     <Text style={[styles.author, { color: m.authorColor }]}>{m.authorName}</Text>

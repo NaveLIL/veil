@@ -24,7 +24,8 @@ export const Island: React.FC<IslandProps> = ({
   padding,
   ...rest
 }) => {
-  const supportsBlur = Platform.OS === "ios" || Platform.Version >= 31;
+  const supportsBlur = Platform.OS === "ios"
+    || (typeof Platform.Version === "number" && Platform.Version >= 31);
 
   const containerStyle: ViewStyle = {
     borderRadius: radii.xl,

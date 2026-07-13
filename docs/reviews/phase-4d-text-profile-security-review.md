@@ -135,9 +135,15 @@ treat a mutable display name as a globally unique locator. Logs and metrics may
 record only route templates and bounded error classes, never profile text or raw
 account identifiers.
 
+## Separately reviewed avatar scope
+
+Avatar upload/fetch/decoding and `avatar_asset_id` mutation are implemented
+under the independent decoder/privacy boundary documented in
+[`phase-4d-avatar-security-review.md`](phase-4d-avatar-security-review.md). They
+do not weaken or extend this text contract.
+
 ## Explicitly deferred
 
-- avatar upload/fetch/decoding and `avatar_asset_id` mutation;
 - remote image URLs or renderer network access;
 - client-signed profile manifests and rollback semantics beyond server version;
 - profile discovery outside the authenticated origin;

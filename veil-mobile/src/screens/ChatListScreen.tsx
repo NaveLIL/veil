@@ -11,10 +11,11 @@ import { GlowBlobs } from "../components/onboarding/GlowBlobs";
 import { ChannelsIsland } from "../components/layout/ChannelsIsland";
 import { ChatIsland } from "../components/layout/ChatIsland";
 import { MembersIsland } from "../components/layout/MembersIsland";
+import { IdentityIslandSheet } from "../components/identity/IdentityIslandSheet";
 import { ServerRailIsland } from "../components/layout/ServerRailIsland";
 import { TopRail, type PageMeta } from "../components/layout/TopRail";
 import { colors } from "../lib/theme";
-import { DM_HOME_ID, useChatStore } from "../stores/chat";
+import { DM_HOME_ID, type Member, useChatStore } from "../stores/chat";
 
 const PAGES_BASE: PageMeta[] = [
   { key: "servers", label: "Servers", icon: "◇" },
@@ -26,6 +27,7 @@ const PAGES_BASE: PageMeta[] = [
 export default function ChatListScreen() {
   const pagerRef = useRef<PagerView>(null);
   const [page, setPage] = useState(1);
+  const [identityProfile, setIdentityProfile] = useState<Member | null>(null);
 
   const selectedServerId = useChatStore((s) => s.selectedServerId);
   const selectedChannelId = useChatStore((s) => s.selectedChannelId);
@@ -107,12 +109,17 @@ export default function ChatListScreen() {
           <ChannelsIsland onSelect={() => goTo(2)} />
         </View>
         <View key="chat" style={styles.page}>
-          <ChatIsland />
+          <ChatIsland onOpenIdentity={setIdentityProfile} />
         </View>
         <View key="members" style={styles.page}>
-          <MembersIsland />
+          <MembersIsland onOpenIdentity={setIdentityProfile} />
         </View>
       </PagerView>
+      <IdentityIslandSheet
+        profile={identityProfile}
+        contextLabel={isDmHome ? "Direct conversation" : "Server member"}
+        onClose={() => setIdentityProfile(null)}
+      />
     </View>
   );
 }

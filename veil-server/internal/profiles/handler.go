@@ -3,9 +3,12 @@ package profiles
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
+	"mime"
 	"net/http"
+	"strconv"
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/logsafe"
@@ -42,6 +45,110 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("GET /v1/users/{userID}/profile", signed(h.getProfile))
 	mux.HandleFunc("PUT /v1/users/me/profile", signed(h.updateProfile))
+	mux.HandleFunc("PUT /v1/users/me/profile/avatar", signed(h.updateAvatar))
+	mux.HandleFunc("DELETE /v1/users/me/profile/avatar", signed(h.removeAvatar))
+	mux.HandleFunc("GET /v1/profile-avatars/{assetID}", signed(h.getAvatar))
+}
+
+func expectedAvatarVersion(r *http.Request) (int64, error) {
+	raw := r.URL.Query().Get("expected_version")
+	version, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || version < 0 || strconv.FormatInt(version, 10) != raw {
+		return 0, errors.New("invalid avatar profile version")
+	}
+	return version, nil
+}
+
+func (h *Handler) updateAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
+		publicerr.Write(w, http.StatusUnauthorized, nil)
+		return
+	}
+	expectedVersion, err := expectedAvatarVersion(r)
+	if err != nil {
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(http.StatusBadRequest, "invalid_profile_version", "invalid profile version", err))
+		return
+	}
+	contentType, _, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if err != nil {
+		publicerr.Write(w, http.StatusUnsupportedMediaType, publicerr.New(http.StatusUnsupportedMediaType, "invalid_avatar_type", "avatar must be PNG or JPEG", err))
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxAvatarInputBytes))
+	if err != nil {
+		publicerr.Write(w, http.StatusRequestEntityTooLarge, publicerr.New(http.StatusRequestEntityTooLarge, "avatar_too_large", "avatar is too large", err))
+		return
+	}
+	asset, err := normalizeAvatar(body, contentType)
+	if err != nil {
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(http.StatusBadRequest, "invalid_avatar", "avatar image is not allowed", err))
+		return
+	}
+	profile, err := h.store.UpdateAvatar(r.Context(), userID, expectedVersion, asset)
+	if !h.writeAvatarMutation(w, r, userID, profile, err) {
+		return
+	}
+}
+
+func (h *Handler) removeAvatar(w http.ResponseWriter, r *http.Request) {
+	userID, ok := authmw.VerifiedUserID(r.Context())
+	if !ok {
+		publicerr.Write(w, http.StatusUnauthorized, nil)
+		return
+	}
+	expectedVersion, err := expectedAvatarVersion(r)
+	if err != nil {
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(http.StatusBadRequest, "invalid_profile_version", "invalid profile version", err))
+		return
+	}
+	profile, err := h.store.UpdateAvatar(r.Context(), userID, expectedVersion, nil)
+	if !h.writeAvatarMutation(w, r, userID, profile, err) {
+		return
+	}
+}
+
+func (h *Handler) writeAvatarMutation(w http.ResponseWriter, r *http.Request, userID string, profile *Profile, err error) bool {
+	if errors.Is(err, ErrVersionConflict) {
+		publicerr.Write(w, http.StatusConflict, publicerr.New(http.StatusConflict, "profile_version_conflict", "profile was updated elsewhere", err))
+		return false
+	}
+	if err != nil {
+		log.Printf("update avatar error: class=%s", logsafe.ErrorClass(err))
+		publicerr.Write(w, http.StatusInternalServerError, nil)
+		return false
+	}
+	writeJSON(w, http.StatusOK, profile)
+	h.broadcastProfileUpdate(r, userID, profile)
+	return true
+}
+
+func (h *Handler) getAvatar(w http.ResponseWriter, r *http.Request) {
+	if _, ok := authmw.VerifiedUserID(r.Context()); !ok {
+		publicerr.Write(w, http.StatusUnauthorized, nil)
+		return
+	}
+	assetID := r.PathValue("assetID")
+	if _, err := uuid.Parse(assetID); err != nil {
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(http.StatusBadRequest, "invalid_avatar_id", "invalid avatar id", err))
+		return
+	}
+	asset, err := h.store.GetAvatar(r.Context(), assetID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			publicerr.Write(w, http.StatusNotFound, nil)
+			return
+		}
+		log.Printf("get avatar error: class=%s", logsafe.ErrorClass(err))
+		publicerr.Write(w, http.StatusInternalServerError, nil)
+		return
+	}
+	w.Header().Set("Content-Type", asset.ContentType)
+	w.Header().Set("Content-Length", strconv.Itoa(len(asset.Data)))
+	w.Header().Set("Cache-Control", "private, no-store")
+	w.Header().Set("X-Veil-Avatar-SHA256", fmt.Sprintf("%x", asset.SHA256))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(asset.Data)
 }
 
 func (h *Handler) getProfile(w http.ResponseWriter, r *http.Request) {
@@ -120,7 +227,11 @@ func (h *Handler) updateProfile(w http.ResponseWriter, r *http.Request) {
 	// has been written so the initiating client normally observes its own PUT
 	// result first.
 	writeJSON(w, http.StatusOK, profile)
-	if h.bcast == nil || profile.ProfileVersion <= 0 {
+	h.broadcastProfileUpdate(r, userID, profile)
+}
+
+func (h *Handler) broadcastProfileUpdate(r *http.Request, userID string, profile *Profile) {
+	if h.bcast == nil || profile == nil || profile.ProfileVersion <= 0 {
 		return
 	}
 	recipients, audienceErr := h.store.ProfileUpdateRecipients(r.Context(), userID)

@@ -1,6 +1,7 @@
 package profiles
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -34,6 +35,18 @@ type fakeStore struct {
 	updatedAbout   string
 	recipients     []string
 	recipientsErr  error
+	avatar         *AvatarAsset
+}
+
+func (s *fakeStore) UpdateAvatar(_ context.Context, userID string, version int64, asset *AvatarAsset) (*Profile, error) {
+	s.updatedUserID = userID
+	s.updatedVersion = version
+	s.avatar = asset
+	return s.profile, s.updateErr
+}
+
+func (s *fakeStore) GetAvatar(context.Context, string) (*AvatarAsset, error) {
+	return s.avatar, s.getErr
 }
 
 func (s *fakeStore) ProfileUpdateRecipients(context.Context, string) ([]string, error) {
@@ -107,6 +120,9 @@ func TestRoutesRequireVerifiedPrincipalEvenWithoutMiddleware(t *testing.T) {
 	for _, request := range []*http.Request{
 		httptest.NewRequest(http.MethodGet, "/v1/users/"+testUserID+"/profile", nil),
 		httptest.NewRequest(http.MethodPut, "/v1/users/me/profile", strings.NewReader(`{"expected_version":0,"about":""}`)),
+		httptest.NewRequest(http.MethodPut, "/v1/users/me/profile/avatar?expected_version=0", strings.NewReader("image")),
+		httptest.NewRequest(http.MethodDelete, "/v1/users/me/profile/avatar?expected_version=0", nil),
+		httptest.NewRequest(http.MethodGet, "/v1/profile-avatars/550e8400-e29b-41d4-a716-446655440000", nil),
 	} {
 		response := httptest.NewRecorder()
 		mux.ServeHTTP(response, request)
@@ -209,5 +225,38 @@ func TestGetMapsMissingAndPrivateStoreErrorsToBoundedResponses(t *testing.T) {
 		if response.Code != test.wantStatus || strings.Contains(response.Body.String(), "secret") {
 			t.Fatalf("status=%d body=%s", response.Code, response.Body.String())
 		}
+	}
+}
+
+func TestAvatarRoutesRequireSignedExactVersionAndServeOnlyNormalizedBytes(t *testing.T) {
+	assetID := "550e8400-e29b-41d4-a716-446655440000"
+	digest := strings.Repeat("ab", 32)
+	contentType := "image/jpeg"
+	store := &fakeStore{profile: &Profile{
+		UserID: testUserID, Username: "alice", ProfileVersion: 4,
+		ProfileUpdatedAt: time.Unix(1, 0).UTC(), AvatarAssetID: &assetID,
+		AvatarDigest: &digest, AvatarContentType: &contentType,
+	}}
+	mux, privateKey := newSignedMux(t, store)
+	pngBytes := encodedAvatar(t, "png", 600, 400)
+	request := requestWithPrincipal(t, privateKey, http.MethodPut,
+		"/v1/users/me/profile/avatar?expected_version=3", string(pngBytes))
+	request.Header.Set("Content-Type", "image/png")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || store.updatedVersion != 3 || store.avatar == nil {
+		t.Fatalf("status=%d version=%d avatar=%v body=%s", response.Code, store.updatedVersion, store.avatar != nil, response.Body.String())
+	}
+	if store.avatar.ContentType != "image/jpeg" || store.avatar.Width != 512 || len(store.avatar.Data) > maxAvatarOutputBytes {
+		t.Fatalf("avatar was not normalized: %#v", store.avatar)
+	}
+
+	store.avatar.ID = assetID
+	get := requestWithPrincipal(t, privateKey, http.MethodGet, "/v1/profile-avatars/"+assetID, "")
+	getResponse := httptest.NewRecorder()
+	mux.ServeHTTP(getResponse, get)
+	if getResponse.Code != http.StatusOK || getResponse.Header().Get("Content-Type") != "image/jpeg" ||
+		getResponse.Header().Get("Cache-Control") != "private, no-store" || !bytes.Equal(getResponse.Body.Bytes(), store.avatar.Data) {
+		t.Fatalf("unexpected avatar response: status=%d headers=%v bytes=%d", getResponse.Code, getResponse.Header(), getResponse.Body.Len())
 	}
 }

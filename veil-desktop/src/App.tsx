@@ -37,6 +37,7 @@ import { MessageRenderer } from "@/components/chat/MessageRenderer";
 import { FriendsPanel } from "@/components/chat/FriendsPanel";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { UserAvatar } from "@/components/identity/UserAvatar";
+import { clearAvatarRegistry, installNativeAvatar } from "@/components/identity/avatarRegistry";
 import { IdentityTrigger } from "@/components/identity/IdentityTrigger";
 import {
   canMessageIdentity,
@@ -275,6 +276,7 @@ const App: Component = () => {
     try {
       const networkProfile = await appStore.loadNetworkProfile(targetUserId, targetIdentityKey);
       if (!actionStillCurrent()) return;
+      installNativeAvatar(profile, networkProfile.avatarAssetId, networkProfile.avatarJpegBase64);
       setRightIslandRoute((current) => current.kind === "identity"
         && identityProfileKey(current.profile) === routeKey
         ? {
@@ -285,6 +287,7 @@ const App: Component = () => {
             networkDisplayName: networkProfile.displayName,
             displayName: networkProfile.displayName || networkProfile.username,
             about: networkProfile.about,
+            avatarAssetId: networkProfile.avatarAssetId,
             profileVersion: networkProfile.profileVersion,
             profileUpdatedAt: networkProfile.profileUpdatedAt,
             profileOrigin: networkProfile.canonicalServerOrigin,
@@ -324,6 +327,7 @@ const App: Component = () => {
     try {
       const networkProfile = await appStore.updateNetworkProfile(expectedVersion, displayName, about);
       if (!saveStillCurrent()) return false;
+      installNativeAvatar(route.profile, networkProfile.avatarAssetId, networkProfile.avatarJpegBase64);
       setRightIslandRoute((current) => current.kind === "identity"
         && identityProfileKey(current.profile) === routeKey
         ? {
@@ -334,6 +338,7 @@ const App: Component = () => {
             networkDisplayName: networkProfile.displayName,
             displayName: networkProfile.displayName || networkProfile.username,
             about: networkProfile.about,
+            avatarAssetId: networkProfile.avatarAssetId,
             profileVersion: networkProfile.profileVersion,
             profileUpdatedAt: networkProfile.profileUpdatedAt,
             profileOrigin: networkProfile.canonicalServerOrigin,
@@ -353,6 +358,48 @@ const App: Component = () => {
         }
       } else {
         setIdentityProfileError("Profile was not saved. Your draft remains available.");
+      }
+      return false;
+    } finally {
+      if (saveToken === identityProfileSaveToken) setIdentityProfileSaving(false);
+    }
+  };
+
+  const changeIdentityAvatar = async (remove: boolean): Promise<boolean> => {
+    const route = rightIslandRoute();
+    const version = route.kind === "identity" ? String(route.profile.profileVersion ?? "") : "";
+    if (
+      route.kind !== "identity"
+      || !isSameCanonicalIdentity(route.profile, currentIdentityLocator())
+      || !/^(0|[1-9][0-9]*)$/.test(version)
+    ) return false;
+    const routeKey = identityProfileKey(route.profile);
+    const saveToken = ++identityProfileSaveToken;
+    setIdentityProfileSaving(true);
+    setIdentityProfileError("");
+    try {
+      const networkProfile = remove
+        ? await appStore.removeProfileAvatar(version)
+        : await appStore.updateProfileAvatar(version);
+      if (!networkProfile) return false;
+      const current = rightIslandRoute();
+      if (saveToken !== identityProfileSaveToken || current.kind !== "identity" || identityProfileKey(current.profile) !== routeKey) return false;
+      installNativeAvatar(current.profile, networkProfile.avatarAssetId, networkProfile.avatarJpegBase64);
+      setRightIslandRoute({
+        ...current,
+        profile: {
+          ...current.profile,
+          avatarAssetId: networkProfile.avatarAssetId,
+          profileVersion: networkProfile.profileVersion,
+          profileUpdatedAt: networkProfile.profileUpdatedAt,
+        },
+      });
+      return true;
+    } catch (error) {
+      if (saveToken === identityProfileSaveToken) {
+        setIdentityProfileError(String(error).includes("profile was updated elsewhere")
+          ? "Profile changed elsewhere. Refresh and try again."
+          : "Avatar was not changed. Phaseprint remains active.");
       }
       return false;
     } finally {
@@ -838,6 +885,7 @@ const App: Component = () => {
       setGroupCreateError("");
       activeSendToken = null;
       setSendBusy(false);
+      clearAvatarRegistry();
     }
 
     // Keep islands hidden outside chat so re-entry always starts from hidden state.
@@ -1447,6 +1495,7 @@ const App: Component = () => {
     setActiveServer("home");
     if (inputRef) inputRef.style.height = "21px";
     toast.clear();
+    clearAvatarRegistry();
   };
 
   createEffect(() => {
@@ -3039,6 +3088,8 @@ const App: Component = () => {
               onClose={() => closeRightIsland()}
               onMessageIdentity={() => void handleIdentityMessage()}
               onSaveIdentityProfile={saveIdentityProfile}
+              onChangeIdentityAvatar={() => changeIdentityAvatar(false)}
+              onRemoveIdentityAvatar={() => changeIdentityAvatar(true)}
               onLoadIdentityVerification={loadSelectedIdentityVerification}
               onConfirmIdentityVerification={confirmSelectedIdentityVerification}
               onCreateDm={(userId, username, expectedIdentityKey) => {

@@ -1,5 +1,6 @@
 import { Show, createSignal, type Component, type JSX } from "solid-js";
 import { Phaseprint, type PhaseprintIdentity } from "@/components/identity/Phaseprint";
+import { avatarSourceForIdentity, rejectAvatarSource } from "@/components/identity/avatarRegistry";
 
 export type UserAvatarStatus = "online" | "idle" | "dnd" | "offline";
 
@@ -44,7 +45,7 @@ export const UserAvatar: Component<UserAvatarProps> = (props) => {
   const size = () => normalizedAvatarSize(props.size);
   const localImageSource = () => isAllowedLocalAvatarSource(props.localImageSrc)
     ? props.localImageSrc!.trim()
-    : null;
+    : avatarSourceForIdentity(props);
   const imageCandidateSource = () => {
     const source = localImageSource();
     return source && source !== failedImageSource() ? source : null;
@@ -105,6 +106,7 @@ export const UserAvatar: Component<UserAvatarProps> = (props) => {
               activeImageGeneration = null;
               setLoadedImageSource(null);
               setFailedImageSource(source);
+              rejectAvatarSource(source);
             };
             return (
               <img

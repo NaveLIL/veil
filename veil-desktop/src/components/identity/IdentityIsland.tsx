@@ -1,5 +1,5 @@
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, type Component, type JSX } from "solid-js";
-import { Copy, LockKeyhole, MessageCircle, Pencil, Save, ShieldQuestion, UserRound, X } from "lucide-solid";
+import { Copy, ImagePlus, LockKeyhole, MessageCircle, Pencil, Save, ShieldQuestion, Trash2, UserRound, X } from "lucide-solid";
 import { UserAvatar } from "@/components/identity/UserAvatar";
 import {
   boundedIdentityText,
@@ -24,6 +24,8 @@ interface IdentityIslandContentProps {
   verificationError?: string;
   onMessage: () => void;
   onSaveProfile?: (displayName: string | null, about: string, expectedVersion: string) => Promise<boolean>;
+  onChangeAvatar?: () => Promise<boolean>;
+  onRemoveAvatar?: () => Promise<boolean>;
   onLoadVerification?: () => Promise<IdentityVerificationView | null>;
   onConfirmVerification?: (expectedFingerprintHex: string) => Promise<boolean>;
 }
@@ -375,6 +377,21 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
               </form>
             </Show>
           </Show>
+          <Show when={proofState() === "self" && profileVersion() && props.onChangeAvatar}>
+            <div class="veil-identity-editor-actions" style={{ "margin-top": "8px" }}>
+              <button type="button" disabled={props.profileSaving} onClick={() => void props.onChangeAvatar?.()}>
+                <ImagePlus size={12} /> Change avatar
+              </button>
+              <Show when={props.profile.avatarAssetId && props.onRemoveAvatar}>
+                <button type="button" disabled={props.profileSaving} onClick={() => void props.onRemoveAvatar?.()}>
+                  <Trash2 size={12} /> Remove
+                </button>
+              </Show>
+            </div>
+            <div style={{ color: "var(--veil-warning)", "font-size": "9px", "line-height": "1.45", "margin-top": "8px", "text-align": "center" }}>
+              Profile avatars are visible to this server and are not end-to-end encrypted.
+            </div>
+          </Show>
         </div>
       </section>
 
@@ -610,6 +627,8 @@ export const IdentityIslandSheet: Component<IdentityIslandSheetProps> = (props) 
       verificationError={props.verificationError}
       onMessage={props.onMessage}
       onSaveProfile={props.onSaveProfile}
+      onChangeAvatar={props.onChangeAvatar}
+      onRemoveAvatar={props.onRemoveAvatar}
       onLoadVerification={props.onLoadVerification}
       onConfirmVerification={props.onConfirmVerification}
     />
