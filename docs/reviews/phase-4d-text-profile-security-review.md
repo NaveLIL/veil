@@ -68,6 +68,26 @@ This event is not a roster/member event. It never invokes membership refresh,
 conversation quarantine, ACL changes, Sender-Key rotation or identity proof
 changes.
 
+## Local message search identity hydration
+
+Message search remains a process-memory-only Tantivy index. The index stores
+the decrypted body, message/conversation IDs and a technical sender key needed
+for indexing; it is never persisted or treated as an identity directory.
+
+Before native code returns a search hit to the renderer, it reloads the current
+message from SQLCipher under the exact authenticated server origin and requires
+an exact match of message ID, conversation ID, sender key and plaintext. Stale,
+deleted, cross-origin or otherwise mismatched hits are omitted. Author metadata
+is emitted only from the immutable SQLCipher message-author snapshot and only
+when that snapshot's origin and identity key match the message binding.
+
+The renderer validates origin, UUID, identity/signing keys and profile origin a
+second time. A hit without a complete locator can still open its conversation
+but cannot open an Identity Island. The selected exact author is exposed as a
+separate accessible action outside the message-search listbox; `Alt+Enter`
+provides the keyboard path. Search presentation never grants trust, changes an
+ACL or triggers Sender-Key rotation.
+
 ## Text contract
 
 Version 1 accepts UTF-8 JSON strings and stores Unicode NFC. It renders only as

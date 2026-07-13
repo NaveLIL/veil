@@ -12,6 +12,16 @@ import {
 } from "solid-js";
 import { Search, MessageCircle, Users, RefreshCw } from "lucide-solid";
 import { invoke } from "@tauri-apps/api/core";
+import { IdentityTrigger } from "@/components/identity/IdentityTrigger";
+import { UserAvatar } from "@/components/identity/UserAvatar";
+import {
+  boundedIdentityText,
+  canonicalIdentityKey,
+  canonicalIdentityOrigin,
+  canonicalIdentityUserId,
+  isSameCanonicalIdentity,
+  type IdentityIslandProfile,
+} from "@/components/identity/identityProfile";
 import { Z } from "@/lib/zIndex";
 import {
   appStore,
@@ -24,15 +34,27 @@ interface Props {
   open: boolean;
   onClose: () => void;
   onNavigate: (conversationId: string) => void | Promise<void>;
+  onOpenIdentity: (profile: IdentityIslandProfile, returnFocusTo: HTMLElement | null) => void;
+}
+
+interface SearchAuthor {
+  canonicalServerOrigin: string;
+  userId: string;
+  identityKey: string;
+  signingKey: string;
+  username?: string | null;
+  displayName?: string | null;
+  profileVersion?: string | null;
+  profileOrigin: string;
 }
 
 interface SearchHit {
   id: string;
   conversationId: string;
-  sender: string;
   body: string;
   ts: number;
   score: number;
+  author?: SearchAuthor | null;
 }
 
 const portalHost = () =>
@@ -74,6 +96,7 @@ export const CommandPalette: Component<Props> = (props) => {
   const listboxId = `message-search-${createUniqueId()}`;
 
   let timer: number | undefined;
+  let identityOpenTimer: number | undefined;
   let inputRef: HTMLInputElement | undefined;
   let previouslyFocused: HTMLElement | null = null;
   let wasOpen = false;
@@ -174,6 +197,7 @@ export const CommandPalette: Component<Props> = (props) => {
 
   onCleanup(() => {
     if (timer) window.clearTimeout(timer);
+    if (identityOpenTimer) window.clearTimeout(identityOpenTimer);
     if (wasOpen) restoreFocus();
   });
 
@@ -187,6 +211,72 @@ export const CommandPalette: Component<Props> = (props) => {
     await props.onNavigate(h.conversationId);
     props.onClose();
   };
+
+  const identityProfileForHit = (
+    h: SearchHit,
+    conversationTitle: string,
+  ): IdentityIslandProfile | null => {
+    const author = h.author;
+    const canonicalServerOrigin = canonicalIdentityOrigin(author?.canonicalServerOrigin);
+    const userId = canonicalIdentityUserId(author?.userId);
+    const identityKey = canonicalIdentityKey(author?.identityKey);
+    const signingKey = canonicalIdentityKey(author?.signingKey);
+    const profileOrigin = canonicalIdentityOrigin(author?.profileOrigin);
+    if (
+      !author
+      || !canonicalServerOrigin
+      || !userId
+      || !identityKey
+      || !signingKey
+      || profileOrigin !== canonicalServerOrigin
+    ) return null;
+    const selfIdentity = {
+      canonicalServerOrigin: appStore.authenticatedServerScope()?.canonicalServerOrigin,
+      userId: appStore.userId(),
+      identityKey: appStore.identity(),
+    };
+    const profile: IdentityIslandProfile = {
+      canonicalServerOrigin,
+      userId,
+      identityKey,
+      signingKey,
+      technicalUsername: author.username,
+      displayName: boundedIdentityText(author.displayName, author.username || "Unknown author"),
+      networkDisplayName: author.displayName,
+      profileVersion: author.profileVersion,
+      profileOrigin,
+      contextKind: "message-author",
+      contextLabel: "Message author",
+      contextDetail: `Search result · ${boundedIdentityText(conversationTitle, "Conversation")}`,
+      selfIdentity,
+    };
+    return {
+      ...profile,
+      contextLabel: isSameCanonicalIdentity(profile, selfIdentity)
+        ? "Your message"
+        : profile.contextLabel,
+    };
+  };
+
+  const openHitIdentity = (profile: IdentityIslandProfile) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const returnFocusTo = previouslyFocused;
+    props.onClose();
+    if (identityOpenTimer) window.clearTimeout(identityOpenTimer);
+    identityOpenTimer = window.setTimeout(() => {
+      identityOpenTimer = undefined;
+      if (isUiSessionEpochCurrent(sessionEpoch)) {
+        props.onOpenIdentity(profile, returnFocusTo);
+      }
+    }, 0);
+  };
+
+  const activeIdentityProfile = createMemo(() => {
+    const hit = hits()[active()];
+    if (!hit) return null;
+    const conversation = conversationsById().get(hit.conversationId);
+    return identityProfileForHit(hit, conversation?.name || hit.conversationId.slice(0, 8));
+  });
 
   const rebuild = async () => {
     if (rebuilding()) return;
@@ -227,6 +317,12 @@ export const CommandPalette: Component<Props> = (props) => {
     } else if (e.key === "End" && hits().length > 0) {
       e.preventDefault();
       focusOption(hits().length - 1);
+    } else if (e.key === "Enter" && e.altKey) {
+      const profile = activeIdentityProfile();
+      if (profile) {
+        e.preventDefault();
+        openHitIdentity(profile);
+      }
     } else if (e.key === "Enter") {
       const h = hits()[active()];
       if (h) {
@@ -350,37 +446,46 @@ export const CommandPalette: Component<Props> = (props) => {
                     const title = () => conv()?.name || h.conversationId.slice(0, 8);
                     return (
                       <div
-                        id={`${listboxId}-option-${i()}`}
-                        role="option"
-                        aria-selected={active() === i()}
+                        role="none"
                         onMouseEnter={() => setActive(i())}
-                        onMouseDown={(event) => event.preventDefault()}
-                        onClick={() => void openHit(h)}
                         style={{
-                          display: "block", width: "100%", "text-align": "left",
-                          padding: "10px 18px", border: "none",
+                          display: "flex", width: "100%", "align-items": "stretch",
                           background: active() === i() ? "color-mix(in srgb, var(--veil-accent) 16%, transparent)" : "transparent",
-                          color: "var(--veil-text)", cursor: "pointer",
                           "border-bottom": "1px solid var(--veil-border-soft)",
                           transition: "background 0.1s",
                         }}
                       >
-                        <div style={{
-                          display: "flex", "align-items": "center", gap: "8px",
-                          "font-size": "12px", color: "var(--veil-text-muted)", "margin-bottom": "4px",
-                        }}>
-                          {convIcon(conv())}
-                          <span style={{ color: "var(--veil-text)", "font-weight": "500" }}>{title()}</span>
-                          <span style={{ "margin-left": "auto", "font-size": "11px" }}>
-                            {new Date(h.ts).toLocaleString()}
-                          </span>
-                        </div>
-                        <div style={{
-                          "font-size": "13px", "line-height": "1.45",
-                          "white-space": "pre-wrap", "word-break": "break-word",
-                        }}>
-                          {highlight(h.body, query())}
-                        </div>
+                        <button
+                          type="button"
+                          id={`${listboxId}-option-${i()}`}
+                          role="option"
+                          tabIndex={-1}
+                          aria-selected={active() === i()}
+                          onMouseDown={(event) => event.preventDefault()}
+                          onClick={() => void openHit(h)}
+                          style={{
+                            flex: "1", "min-width": "0", "text-align": "left",
+                            padding: "10px 18px", border: "none", background: "transparent",
+                            color: "var(--veil-text)", cursor: "pointer", "font-family": "inherit",
+                          }}
+                        >
+                          <div style={{
+                            display: "flex", "align-items": "center", gap: "8px",
+                            "font-size": "12px", color: "var(--veil-text-muted)", "margin-bottom": "4px",
+                          }}>
+                            {convIcon(conv())}
+                            <span style={{ color: "var(--veil-text)", "font-weight": "500" }}>{title()}</span>
+                            <span style={{ "margin-left": "auto", "font-size": "11px" }}>
+                              {new Date(h.ts).toLocaleString()}
+                            </span>
+                          </div>
+                          <div style={{
+                            "font-size": "13px", "line-height": "1.45",
+                            "white-space": "pre-wrap", "word-break": "break-word",
+                          }}>
+                            {highlight(h.body, query())}
+                          </div>
+                        </button>
                       </div>
                     );
                   }}
@@ -456,6 +561,32 @@ export const CommandPalette: Component<Props> = (props) => {
               <span><kbd style={{ color: "var(--veil-text-muted)" }}>↑</kbd> <kbd style={{ color: "var(--veil-text-muted)" }}>↓</kbd> Navigate</span>
               <span><kbd style={{ color: "var(--veil-text-muted)" }}>↵</kbd> Open</span>
               <span><kbd style={{ color: "var(--veil-text-muted)" }}>Esc</kbd> Close</span>
+              <Show when={activeIdentityProfile()} keyed>
+                {(profile) => (
+                  <IdentityTrigger
+                    label={`View identity for ${profile.displayName}`}
+                    onOpen={() => openHitIdentity(profile)}
+                    style={{
+                      display: "inline-flex", "align-items": "center", gap: "5px",
+                      "max-width": "170px", padding: "2px 7px 2px 3px",
+                      "border-radius": "999px",
+                      background: "color-mix(in srgb, var(--veil-accent) 12%, transparent)",
+                      color: "var(--veil-text)",
+                    }}
+                  >
+                    <UserAvatar
+                      size={20}
+                      canonicalServerOrigin={profile.canonicalServerOrigin}
+                      userId={profile.userId}
+                      identityKey={profile.identityKey}
+                      technicalUsername={profile.technicalUsername}
+                    />
+                    <span style={{ overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                      {profile.displayName}
+                    </span>
+                  </IdentityTrigger>
+                )}
+              </Show>
               <button
                 type="button"
                 onClick={rebuild}

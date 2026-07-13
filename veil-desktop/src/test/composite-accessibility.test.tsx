@@ -166,17 +166,23 @@ describe("composite widget accessibility", () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command !== "search_messages") return 0;
       return [
-        { id: "m1", conversationId: "c1", sender: "alice", body: "first cipher result", ts: 1, score: 2 },
-        { id: "m2", conversationId: "c2", sender: "bob", body: "second cipher result", ts: 2, score: 1 },
+        { id: "m1", conversationId: "c1", body: "first cipher result", ts: 1, score: 2 },
+        { id: "m2", conversationId: "c2", body: "second cipher result", ts: 2, score: 1 },
       ];
     });
     const navigate = vi.fn(async () => undefined);
+    const openIdentity = vi.fn();
     const Harness = () => {
       const [open, setOpen] = createSignal(false);
       return (
         <>
           <button type="button" onClick={() => setOpen(true)}>Open search</button>
-          <CommandPalette open={open()} onClose={() => setOpen(false)} onNavigate={navigate} />
+          <CommandPalette
+            open={open()}
+            onClose={() => setOpen(false)}
+            onNavigate={navigate}
+            onOpenIdentity={openIdentity}
+          />
           <div id="island-portal" />
         </>
       );
@@ -203,6 +209,67 @@ describe("composite widget accessibility", () => {
 
     await waitFor(() => expect(navigate).toHaveBeenCalledWith("c2"));
     await waitFor(() => expect(launcher).toHaveFocus());
+  });
+
+  it("opens only an exact origin-scoped author identity from message search", async () => {
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command !== "search_messages") return 0;
+      return [{
+        id: "m1",
+        conversationId: "c1",
+        body: "exact cipher result",
+        ts: 1,
+        score: 2,
+        author: {
+          canonicalServerOrigin: "https://chat.example.test:443",
+          userId: "550e8400-e29b-41d4-a716-446655440000",
+          identityKey: "31".repeat(32),
+          signingKey: "32".repeat(32),
+          username: "alice",
+          displayName: "Alice",
+          profileVersion: "18446744073709551615",
+          profileOrigin: "https://chat.example.test:443",
+        },
+      }];
+    });
+    const navigate = vi.fn(async () => undefined);
+    const openIdentity = vi.fn();
+    const Harness = () => {
+      const [open, setOpen] = createSignal(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>Open identity search</button>
+          <CommandPalette
+            open={open()}
+            onClose={() => setOpen(false)}
+            onNavigate={navigate}
+            onOpenIdentity={openIdentity}
+          />
+          <div id="island-portal" />
+        </>
+      );
+    };
+    render(() => <Harness />);
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Open identity search" }));
+    const combobox = screen.getByRole("combobox", { name: "Search messages" });
+    fireEvent.input(combobox, { target: { value: "cipher" } });
+    const identityButton = await screen.findByRole("button", { name: "View identity for Alice" });
+    const accessibility = await axe.run(document.body, axeOptions);
+    expect(accessibility.violations).toEqual([]);
+
+    await user.click(identityButton);
+    await waitFor(() => expect(openIdentity).toHaveBeenCalledOnce());
+    expect(navigate).not.toHaveBeenCalled();
+    expect(openIdentity.mock.calls[0][0]).toMatchObject({
+      canonicalServerOrigin: "https://chat.example.test:443",
+      userId: "550e8400-e29b-41d4-a716-446655440000",
+      identityKey: "31".repeat(32),
+      signingKey: "32".repeat(32),
+      profileVersion: "18446744073709551615",
+      contextKind: "message-author",
+    });
   });
 
   it("has no structural axe violations in the open emoji picker", async () => {

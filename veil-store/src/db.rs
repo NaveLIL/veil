@@ -3217,6 +3217,72 @@ impl VeilDb {
         Ok(messages)
     }
 
+    /// Load one current message row for a RAM search-index hit.
+    ///
+    /// The index is deliberately not an identity authority. Callers must
+    /// hydrate author metadata from this origin-scoped SQLCipher row and may
+    /// only expose it after matching the indexed message/conversation/sender.
+    pub fn get_message_for_search(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        canonical_server_origin: &str,
+    ) -> Result<Option<crate::models::Message>, String> {
+        if message_id.is_empty() || conversation_id.is_empty() {
+            return Err("search message and conversation ids must not be empty".to_string());
+        }
+        validate_canonical_server_origin(canonical_server_origin)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                        m.msg_type, m.reply_to_id, m.is_outgoing, m.status,
+                        m.expires_at, m.server_timestamp, m.created_at,
+                        a.canonical_server_origin, a.user_id, a.identity_key,
+                        a.signing_key, a.username, a.display_name,
+                        a.profile_version, a.profile_origin, a.source, a.observed_at
+                 FROM messages AS m
+                 JOIN conversations AS c ON c.id = m.conversation_id
+                 LEFT JOIN message_author_snapshots_v1 AS a ON a.message_id = m.id
+                 WHERE m.id = ?1 AND m.conversation_id = ?2
+                   AND c.server_origin = ?3",
+                rusqlite::params![message_id, conversation_id, canonical_server_origin],
+                |row| {
+                    Ok((
+                        Message {
+                            id: row.get(0)?,
+                            conversation_id: row.get(1)?,
+                            sender_key: row.get(2)?,
+                            plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                            msg_type: row.get(4)?,
+                            reply_to_id: row.get(5)?,
+                            is_outgoing: row.get::<_, u8>(6)? != 0,
+                            status: match row.get::<_, u8>(7)? {
+                                1 => crate::models::MessageStatus::Sent,
+                                2 => crate::models::MessageStatus::Delivered,
+                                3 => crate::models::MessageStatus::Read,
+                                4 => crate::models::MessageStatus::Failed,
+                                5 => crate::models::MessageStatus::Unknown,
+                                _ => crate::models::MessageStatus::Sending,
+                            },
+                            expires_at: row.get(8)?,
+                            server_timestamp: row.get(9)?,
+                            created_at: row.get(10)?,
+                            author: None,
+                        },
+                        raw_account_snapshot_from_row(row, 11)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load message for search: {error}"))?;
+        row.map(|(mut message, author)| {
+            message.author = author.map(RawAccountSnapshot::decode).transpose()?;
+            Ok(message)
+        })
+        .transpose()
+    }
+
     /// Update the plaintext of an existing message (edit).
     pub fn update_message_text(&self, message_id: &str, new_text: &str) -> Result<(), String> {
         let updated = self
@@ -7845,6 +7911,63 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn search_hydration_is_exact_message_conversation_and_origin_scoped() {
+        let db = VeilDb::open_memory(&[0xBA; 32]).unwrap();
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x83,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(9),
+        );
+        db.upsert_directory_conversation(
+            "search-author-conversation",
+            1,
+            ORIGIN_A,
+            Some("Search group"),
+            None,
+            None,
+            None,
+            "2026-07-13T12:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "search-author-message",
+            "search-author-conversation",
+            &author.locator.identity_key,
+            "origin scoped search",
+            false,
+            Some(42),
+            None,
+        )
+        .unwrap();
+        db.attach_message_author("search-author-message", &author)
+            .unwrap();
+
+        let loaded = db
+            .get_message_for_search(
+                "search-author-message",
+                "search-author-conversation",
+                ORIGIN_A,
+            )
+            .unwrap()
+            .expect("exact search row must resolve");
+        assert_eq!(loaded.author, Some(author));
+        assert!(db
+            .get_message_for_search("search-author-message", "different-conversation", ORIGIN_A,)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_message_for_search(
+                "search-author-message",
+                "search-author-conversation",
+                ORIGIN_B,
+            )
+            .unwrap()
+            .is_none());
     }
 
     #[test]

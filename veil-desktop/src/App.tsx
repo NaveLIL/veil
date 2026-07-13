@@ -3084,7 +3084,12 @@ const App: Component = () => {
       <ToastViewport />
       <DecisionDialogHost />
       {/* Phase 2: Cmd/Ctrl+K command palette (Tantivy local search). */}
-      <CommandPalette open={cmdkOpen()} onClose={() => setCmdkOpen(false)} onNavigate={openSearchResult} />
+      <CommandPalette
+        open={cmdkOpen()}
+        onClose={() => setCmdkOpen(false)}
+        onNavigate={openSearchResult}
+        onOpenIdentity={(profile, returnFocusTo) => openIdentityIsland(profile, returnFocusTo)}
+      />
     </div>
   );
 };

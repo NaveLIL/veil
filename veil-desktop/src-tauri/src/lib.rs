@@ -16,7 +16,7 @@ use veil_client::connection::ConnectionEvent;
 use veil_search::{Indexer, SearchHit};
 use veil_store::keychain;
 use veil_store::models::{
-    AccountSnapshot, AccountSnapshotSource, LocalIdentityVerification, NetworkProfile,
+    AccountSnapshot, AccountSnapshotSource, LocalIdentityVerification, Message, NetworkProfile,
     ProfileLocator,
 };
 use zeroize::{Zeroize, Zeroizing};
@@ -8090,28 +8090,68 @@ fn search_user(
 
 // ─── Local search ─────────────────────────────────────
 
-#[derive(serde::Serialize)]
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchAuthorDto {
+    canonical_server_origin: String,
+    user_id: String,
+    identity_key: String,
+    signing_key: String,
+    username: Option<String>,
+    display_name: Option<String>,
+    profile_version: Option<String>,
+    profile_origin: String,
+}
+
+#[derive(Debug, serde::Serialize)]
 struct SearchHitDto {
     id: String,
     #[serde(rename = "conversationId")]
     conversation_id: String,
-    sender: String,
     body: String,
     ts: i64,
     score: f32,
+    author: Option<SearchAuthorDto>,
 }
 
-impl From<SearchHit> for SearchHitDto {
-    fn from(h: SearchHit) -> Self {
-        Self {
-            id: h.id,
-            conversation_id: h.conversation_id,
-            sender: h.sender,
-            body: h.body,
-            ts: h.ts,
-            score: h.score,
-        }
+fn validated_search_hit_dto(
+    hit: SearchHit,
+    stored: Message,
+    canonical_server_origin: &str,
+) -> Option<SearchHitDto> {
+    if stored.id != hit.id
+        || stored.conversation_id != hit.conversation_id
+        || stored.plaintext != hit.body
+        || stored.sender_key.len() != 32
+        || hex::encode(&stored.sender_key) != hit.sender
+    {
+        return None;
     }
+    let author = stored.author.and_then(|author| {
+        if author.locator.canonical_server_origin != canonical_server_origin
+            || author.locator.identity_key.as_slice() != stored.sender_key.as_slice()
+        {
+            return None;
+        }
+        Some(SearchAuthorDto {
+            canonical_server_origin: author.locator.canonical_server_origin,
+            user_id: author.locator.user_id,
+            identity_key: hex::encode(author.locator.identity_key),
+            signing_key: hex::encode(author.signing_key),
+            username: author.username,
+            display_name: author.display_name,
+            profile_version: author.profile_version.map(|version| version.to_string()),
+            profile_origin: author.profile_origin,
+        })
+    });
+    Some(SearchHitDto {
+        id: hit.id,
+        conversation_id: hit.conversation_id,
+        body: hit.body,
+        ts: hit.ts,
+        score: hit.score,
+        author,
+    })
 }
 
 #[tauri::command]
@@ -8140,9 +8180,8 @@ fn search_messages(
     if let Some(conversation_id) = conversation_id.as_deref() {
         require_authenticated_conversation_origin(&state, &client, conversation_id)?;
     }
-    let canonical_server_origin = authenticated_rest_binding(&state)?
-        .origin
-        .canonical_server_origin();
+    let search_binding = authenticated_rest_binding(&state)?;
+    let canonical_server_origin = search_binding.origin.canonical_server_origin();
     let allowed_conversations: std::collections::HashSet<String> = client
         .db()
         .ok_or("database not initialized")?
@@ -8158,11 +8197,29 @@ fn search_messages(
         .indexer
         .search(trimmed, conversation_id.as_deref(), limit)
         .map_err(|e| e.to_string())?;
-    let result = hits
-        .into_iter()
-        .filter(|hit| allowed_conversations.contains(&hit.conversation_id))
-        .map(SearchHitDto::from)
-        .collect();
+    if authenticated_rest_binding(&state)? != search_binding {
+        return Err("authenticated server binding changed during local search".to_string());
+    }
+    let client = state.client.lock().map_err(|e| e.to_string())?;
+    let db = client.db().ok_or("database not initialized")?;
+    let mut result = Vec::with_capacity(hits.len());
+    for hit in hits {
+        if !allowed_conversations.contains(&hit.conversation_id) {
+            continue;
+        }
+        let Some(stored) =
+            db.get_message_for_search(&hit.id, &hit.conversation_id, &canonical_server_origin)?
+        else {
+            continue;
+        };
+        if let Some(hit) = validated_search_hit_dto(hit, stored, &canonical_server_origin) {
+            result.push(hit);
+        }
+    }
+    drop(client);
+    if authenticated_rest_binding(&state)? != search_binding {
+        return Err("authenticated server binding changed during local search".to_string());
+    }
     require_session_still_unlocked(&state)?;
     Ok(result)
 }
@@ -8520,11 +8577,15 @@ mod e2ee_rest_tests {
         validate_live_action_rest_origin, validate_live_message_security_context,
         validate_next_cursor, validate_persisted_message_conversation,
         validate_pinned_directory_self, validate_rest_url, validate_server_endpoint_pair,
-        validate_utc_rfc3339_nano, verify_device_directory_account_keys, AuthenticatedSessionScope,
-        ConversationSyncIsolation, ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding,
-        RestOrigin, DEFAULT_AUTO_LOCK_SECONDS,
+        validate_utc_rfc3339_nano, validated_search_hit_dto, verify_device_directory_account_keys,
+        AuthenticatedSessionScope, ConversationSyncIsolation, ParsedMessageCryptoContext,
+        PinnedDirectoryMember, RestBinding, RestOrigin, DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
+    use veil_search::SearchHit;
+    use veil_store::models::{
+        AccountSnapshot, AccountSnapshotSource, Message, MessageStatus, ProfileLocator,
+    };
 
     fn authenticated_test_binding(host: &str, generation: u64) -> RestBinding {
         RestBinding {
@@ -8833,6 +8894,66 @@ mod e2ee_rest_tests {
                 "bindingGeneration": "18446744073709551615",
             })
         );
+    }
+
+    #[test]
+    fn local_search_identity_requires_the_exact_sqlcipher_message_binding() {
+        let origin = "https://chat.example.test:443";
+        let identity_key = [0x31; 32];
+        let author = AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: origin.to_string(),
+                user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                identity_key,
+            },
+            signing_key: [0x32; 32],
+            username: Some("alice".to_string()),
+            display_name: Some("Alice".to_string()),
+            profile_version: Some(u64::MAX),
+            profile_origin: origin.to_string(),
+            source: AccountSnapshotSource::AuthenticatedHistory,
+            observed_at: "2026-07-13T12:00:00Z".to_string(),
+        };
+        let stored = Message {
+            id: "message-1".to_string(),
+            conversation_id: "conversation-1".to_string(),
+            sender_key: identity_key.to_vec(),
+            plaintext: "exact search text".to_string(),
+            msg_type: 0,
+            reply_to_id: None,
+            is_outgoing: false,
+            status: MessageStatus::Sent,
+            expires_at: None,
+            server_timestamp: Some(7),
+            created_at: "2026-07-13T12:00:00Z".to_string(),
+            author: Some(author),
+        };
+        let hit = SearchHit {
+            id: stored.id.clone(),
+            conversation_id: stored.conversation_id.clone(),
+            sender: hex::encode(identity_key),
+            body: stored.plaintext.clone(),
+            ts: 7,
+            score: 1.0,
+        };
+
+        let dto = validated_search_hit_dto(hit.clone(), stored.clone(), origin)
+            .expect("exact search binding must resolve");
+        let author = dto.author.expect("author locator must be present");
+        assert_eq!(author.canonical_server_origin, origin);
+        assert_eq!(author.identity_key, hex::encode(identity_key));
+        assert_eq!(
+            author.profile_version.as_deref(),
+            Some("18446744073709551615")
+        );
+
+        let mut stale_sender = hit.clone();
+        stale_sender.sender = hex::encode([0x41; 32]);
+        assert!(validated_search_hit_dto(stale_sender, stored.clone(), origin).is_none());
+
+        let mut stale_body = hit;
+        stale_body.body = "stale index plaintext".to_string();
+        assert!(validated_search_hit_dto(stale_body, stored, origin).is_none());
     }
 
     #[test]

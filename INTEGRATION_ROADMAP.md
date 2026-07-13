@@ -42,7 +42,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | identity/profile/proof foundation и live invalidation реализованы; остаются search DTO, isolated avatar и mobile/final gate |
+| 4D | Identity Island & Profiles | identity/profile/proof/search foundation реализован; остаются isolated avatar и mobile/final gate |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -362,8 +362,8 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
 Реализованы canonical local identity foundation с authenticated origin/binding
 fence, детерминированный Phaseprint и единый `UserAvatar`, Identity Island,
-versioned text profile/cache/editor, локальная verification/identity-change flow
-и relationship-scoped `ProfileUpdated`. Остаются identity-bearing search DTO,
+versioned text profile/cache/editor, локальная verification/identity-change flow,
+relationship-scoped `ProfileUpdated` и identity-bearing local search DTO. Остаются
 изолированный avatar ingest и mobile adaptation/completion evidence, поэтому
 Phase 4D ещё не завершена.
 
@@ -634,12 +634,22 @@ launch smoke, MSI и NSIS. NSIS SHA-256:
 Installer всё ещё не подписан, как и зафиксировано в residual risks.
 
 Outgoing friend request не использует перегруженный self `fromUserId`: он
-открывает только ограниченный username/origin view без proof/DM action. Текущий
-global Command Palette остаётся message search и не открывает identity по строке
-`sender`, потому что его hit DTO не содержит origin/user/key. Friend/request DTO
-без полного locator честно используют partial view и не объявляются verified.
+открывает только ограниченный username/origin view без proof/DM action. Global
+Command Palette остаётся локальным message search: author action появляется
+только после точной origin/message/conversation/sender/plaintext сверки RAM-hit
+с авторитетным SQLCipher message-author snapshot. Голая строка `sender` больше
+не выходит в renderer DTO и никогда не используется как account locator.
+Friend/request DTO без полного locator честно используют partial view и не
+объявляются verified.
 Новый network profile API, network avatar fetch и crypto/storage protocol этим
 checkpoint не добавлены.
+
+Completion evidence identity-bearing search checkpoint (2026-07-13): workspace
+`cargo fmt`, `clippy -D warnings` и all-targets tests; Go unit/vet и свежий
+Docker integration suite; frontend 80/80 tests, production build и visual/a11y
+matrix 20 passed / 4 expected skips. Windows native desktop test binary собран и
+выполнен из ASCII target; release/NSIS намеренно не пересобирался, поскольку
+package/config/runtime entrypoint этим checkpoint не менялись.
 
 ### Versioned text profile
 
@@ -776,9 +786,9 @@ authenticated origin/generation, а открытый Identity Island refetch-и�
 3. **Закрыто:** единый right-island route,
    responsive Identity Island, server context и безопасные profile triggers на
    уже доступных locator-bearing данных.
-4. **В работе:** versioned signed text profile API/cache/editor и отдельный
-   relationship-scoped `ProfileUpdated` event закрыты; остаётся нормализация
-   identity-bearing search DTO.
+4. **Закрыто:** versioned signed text profile API/cache/editor, отдельный
+   relationship-scoped `ProfileUpdated` event и identity-bearing local search
+   DTO с точной SQLCipher hydration.
 5. **Закрыто:** local identity verification и blocking identity-change flow.
 6. Только затем добавить изолированный avatar pipeline и mobile adaptation.
 
