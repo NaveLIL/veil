@@ -28,23 +28,21 @@ describe("origin-local App cleanup", () => {
       "setDeferredSendDrafts({})",
       'setInputText("")',
       'setSearch("")',
-      'setNewPeerId("")',
       'setNewGroupName("")',
       "setGroupMembers([])",
       "setReplyingTo(null)",
       "setEditingMessage(null)",
       'setEditText("")',
-      "setCreatingDm(false)",
       "setCreatingGroup(false)",
       'setGroupCreateError("")',
       "setSendBusy(false)",
       "setDeletingIds(new Set<string>())",
       "closeRightIsland(true)",
       "setShowFriendsPanel(false)",
-      "setShowNewDm(false)",
       "setShowNewGroup(false)",
       "setShowCreateServer(false)",
       "setShowJoinServer(false)",
+      "setShowSpaceCreateMenu(false)",
       "setShowCreateChannel(false)",
       "setShowCreateInvite(false)",
       "toast.clear()",
@@ -72,11 +70,6 @@ describe("origin-local App cleanup", () => {
   });
 
   it("prevents old create completions from releasing or repopulating new-origin state", () => {
-    const dmFlow = section("const handleNewDm = async () => {", "const handleNewGroup = async () => {");
-    expect(dmFlow).toContain(
-      "if (isUiSessionEpochCurrent(sessionEpoch)) setCreatingDm(false)",
-    );
-
     const groupFlow = section("const handleNewGroup = async () => {", "const restoreFailedDraft");
     expect(groupFlow).toContain("const sessionEpoch = captureUiSessionEpoch()");
     expect(groupFlow).toContain("if (!isUiSessionEpochCurrent(sessionEpoch)) return");
@@ -93,7 +86,6 @@ describe("origin-local App cleanup", () => {
     );
     expect(bindingCleanup).toContain("activeSendToken = null");
     expect(bindingCleanup).toContain("setSendBusy(false)");
-    expect(bindingCleanup).toContain("setCreatingDm(false)");
     expect(bindingCleanup).toContain("setCreatingGroup(false)");
     expect(bindingCleanup).toContain("setDeletingIds(new Set<string>())");
     expect(bindingCleanup).toContain("closeRightIsland(true)");

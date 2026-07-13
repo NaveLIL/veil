@@ -35,7 +35,7 @@ export const CreateServerDialog: Component<Props> = (props) => {
         appStore.selectServer(created.id);
         reset();
         props.onClose();
-      } else setError("Failed to create server");
+      } else setError("Failed to create Space");
     } catch (e) {
       if (isUiSessionEpochCurrent(sessionEpoch)) setError(String(e));
     } finally {
@@ -53,17 +53,17 @@ export const CreateServerDialog: Component<Props> = (props) => {
     <IslandDialog
       open={props.open}
       onClose={close}
-      title="Create Server"
+      title="Create Space"
       icon={<Plus size={15} />}
       accent="var(--veil-success)"
       closeDisabled={loading()}
     >
       <div style={ds.fieldGroup}>
         <div>
-          <label style={ds.label}>Server name</label>
+          <label style={ds.label}>Space name</label>
           <input
             style={ds.input(!!error())}
-            placeholder="My Awesome Server"
+            placeholder="My Space"
             value={name()}
             onInput={(e) => { setName(e.currentTarget.value); setError(""); }}
             onKeyDown={onKey}
@@ -81,7 +81,7 @@ export const CreateServerDialog: Component<Props> = (props) => {
           onClick={handleCreate}
           disabled={!enabled()}
         >
-          <Show when={loading()} fallback={<>Create Server <ArrowRight size={14} /></>}>
+          <Show when={loading()} fallback={<>Create Space <ArrowRight size={14} /></>}>
             <Loader2 size={14} class="animate-spin" /> Creating…
           </Show>
         </button>

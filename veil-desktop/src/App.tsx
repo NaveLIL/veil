@@ -21,6 +21,7 @@ import { CreateChannelDialog } from "@/components/server/CreateChannelDialog";
 import { CreateInviteDialog } from "@/components/server/CreateInviteDialog";
 import { RightIsland } from "@/components/layout/RightIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
+import { SpaceCreateMenu } from "@/components/spaces/SpaceCreateMenu";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 import { conversationCryptoUiState } from "@/security/conversationCrypto";
 
@@ -58,7 +59,7 @@ import { CommandPalette, useCommandPaletteHotkey } from "@/components/ui/Command
 import { DecisionDialogHost } from "@/components/ui/DecisionDialogHost";
 import { confirmDecision, promptDecision } from "@/lib/decisionDialog";
 import {
-  MessageCircle, Users, UserPlus, UserMinus, Settings, Lock,
+  Users, UserPlus, UserMinus, Settings, Lock,
   ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
   Volume2, MessageSquare, Eye, Shield, Send,
 } from "lucide-solid";
@@ -194,14 +195,10 @@ const App: Component = () => {
   const [sendBusy, setSendBusy] = createSignal(false);
   const [sendNotice, setSendNotice] = createSignal<"" | "security" | "error">("");
   const [search, setSearch] = createSignal("");
-  const [showNewDm, setShowNewDm] = createSignal(false);
   const [showNewGroup, setShowNewGroup] = createSignal(false);
-  const [creatingDm, setCreatingDm] = createSignal(false);
   const [creatingGroup, setCreatingGroup] = createSignal(false);
   const [groupCreateError, setGroupCreateError] = createSignal("");
-  const [newPeerId, setNewPeerId] = createSignal("");
   const [newGroupName, setNewGroupName] = createSignal("");
-  const [sidebarTab, setSidebarTab] = createSignal<"all" | "dm" | "group">("all");
   const [rightIslandRoute, setRightIslandRoute] = createSignal<RightIslandRoute>({ kind: "closed" });
   const [identityMessageBusy, setIdentityMessageBusy] = createSignal(false);
   const [identityProfileLoading, setIdentityProfileLoading] = createSignal(false);
@@ -877,13 +874,31 @@ const App: Component = () => {
 
   const filtered = () => {
     const q = search().toLowerCase();
-    const tab = sidebarTab();
-    let list = appStore.conversations();
-    if (tab === "dm") list = list.filter((c) => c.type === "dm");
-    else if (tab === "group") list = list.filter((c) => c.type === "group");
+    const list = appStore.conversations().filter((conversation) => conversation.type === "dm");
     if (!q) return list;
     return list.filter((c) => c.name.toLowerCase().includes(q));
   };
+
+  const circles = () => appStore.conversations().filter(
+    (conversation) => conversation.type === "group",
+  );
+
+  const activeCircle = () => {
+    if (appStore.activeServerId()) return null;
+    const conversationId = appStore.activeConversationId();
+    if (!conversationId) return null;
+    return circles().find((circle) => circle.id === conversationId) ?? null;
+  };
+
+  const railRoute = () => {
+    const spaceId = appStore.activeServerId();
+    if (spaceId) return { kind: "space" as const, spaceId };
+    const circle = activeCircle();
+    if (circle) return { kind: "circle" as const, circleId: circle.id };
+    return { kind: "home" as const };
+  };
+
+  const circleContextOpen = () => railRoute().kind === "circle";
 
   createEffect(() => {
     const notice = appStore.identityChangeNotice();
@@ -1023,7 +1038,6 @@ const App: Component = () => {
       setEditingMessage(null);
       setEditText("");
       setSearch("");
-      setNewPeerId("");
       setNewGroupName("");
       setGroupCreateError("");
       activeSendToken = null;
@@ -1171,28 +1185,6 @@ const App: Component = () => {
     }, 350);
   };
 
-  const handleNewDm = async () => {
-    const id = newPeerId().trim();
-    if (!id || creatingDm()) return;
-    const sessionEpoch = captureUiSessionEpoch();
-    setCreatingDm(true);
-    try {
-      const conversationId = await appStore.createDm(id);
-      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
-      setNewPeerId("");
-      setShowNewDm(false);
-      openConversation(conversationId);
-    } catch (reason) {
-      if (isUiSessionEpochCurrent(sessionEpoch)) {
-        toast.error("Conversation not created", String(reason).replace(/^Error:\s*/, ""));
-      }
-    } finally {
-      // Origin cleanup already released the old busy state. Do not let that
-      // stale completion release a newer origin's create operation.
-      if (isUiSessionEpochCurrent(sessionEpoch)) setCreatingDm(false);
-    }
-  };
-
   const handleNewGroup = async () => {
     const name = newGroupName().trim();
     if (!name || creatingGroup()) return;
@@ -1212,8 +1204,8 @@ const App: Component = () => {
       setGroupCreateError(message);
       toast.error("Group not created", message);
     } finally {
-      // See handleNewDm: a late completion belongs only to its captured
-      // renderer session, never to a create flow on the next origin.
+      // A late completion belongs only to its captured renderer session,
+      // never to a create flow on the next origin.
       if (isUiSessionEpochCurrent(sessionEpoch)) setCreatingGroup(false);
     }
   };
@@ -1262,19 +1254,9 @@ const App: Component = () => {
     !!(msg.pending || msg.failed || msg.deliveryUnknown);
 
   const closeHomeTransientUi = () => {
-    setShowNewDm(false);
     setShowNewGroup(false);
-    setNewPeerId("");
     setNewGroupName("");
     setGroupCreateError("");
-  };
-
-  const clearIncompatibleConversation = (tab: "all" | "dm" | "group") => {
-    if (tab === "all") return;
-    const active = appStore.conversations().find(
-      (conversation) => conversation.id === appStore.activeConversationId(),
-    );
-    if (active && active.type !== tab) appStore.setActiveConversationId(null);
   };
 
   const openFriends = () => {
@@ -1283,65 +1265,11 @@ const App: Component = () => {
     appStore.setActiveConversationId(null);
   };
 
-  const toggleNewDm = () => {
-    const next = !showNewDm();
-    setShowFriendsPanel(false);
-    setSidebarTab("dm");
-    clearIncompatibleConversation("dm");
-    setShowNewGroup(false);
-    setNewGroupName("");
-    setShowNewDm(next);
-  };
-
-  const toggleNewGroup = () => {
-    const next = !showNewGroup();
-    setShowFriendsPanel(false);
-    setSidebarTab("group");
-    clearIncompatibleConversation("group");
-    setShowNewDm(false);
-    setNewPeerId("");
-    setGroupCreateError("");
-    setShowNewGroup(next);
-    if (next) requestAnimationFrame(() => newGroupInputRef?.focus());
-  };
-
-  const changeSidebarTab = (tab: "all" | "dm" | "group") => {
-    setSidebarTab(tab);
-    clearIncompatibleConversation(tab);
-    setShowFriendsPanel(false);
-    if (tab !== "dm") {
-      setShowNewDm(false);
-      setNewPeerId("");
-    }
-    if (tab !== "group") {
-      setShowNewGroup(false);
-      setNewGroupName("");
-      setGroupCreateError("");
-    }
-  };
-
-  const handleSidebarTabKeyDown = (
-    event: KeyboardEvent,
-    current: "all" | "dm" | "group",
-  ) => {
-    const tabs = ["all", "dm", "group"] as const;
-    let nextIndex = tabs.indexOf(current);
-    if (event.key === "ArrowRight") nextIndex = (nextIndex + 1) % tabs.length;
-    else if (event.key === "ArrowLeft") nextIndex = (nextIndex + tabs.length - 1) % tabs.length;
-    else if (event.key === "Home") nextIndex = 0;
-    else if (event.key === "End") nextIndex = tabs.length - 1;
-    else return;
-    event.preventDefault();
-    const next = tabs[nextIndex];
-    changeSidebarTab(next);
-    requestAnimationFrame(() => document.getElementById(`messages-tab-${next}`)?.focus());
-  };
 
   const openConversation = (id: string) => {
     const alreadyActive = appStore.activeConversationId() === id;
     closeHomeTransientUi();
     setShowFriendsPanel(false);
-    setActiveServer("home");
     appStore.selectConversation(id);
     if (alreadyActive && rightIslandRoute().kind !== "closed") closeRightIsland();
     const selected = appStore.conversations().find((conversation) => conversation.id === id);
@@ -1356,7 +1284,6 @@ const App: Component = () => {
     const alreadyActive = appStore.activeConversationId() === id;
     closeHomeTransientUi();
     setShowFriendsPanel(false);
-    setActiveServer("home");
     if (!appStore.selectRetainedLocalDm(id)) return false;
     if (alreadyActive && rightIslandRoute().kind !== "closed") closeRightIsland();
     return true;
@@ -1479,7 +1406,6 @@ const App: Component = () => {
   const selectServerContext = (serverId: string | null, autoSelect = true) => {
     closeHomeTransientUi();
     setShowFriendsPanel(false);
-    setActiveServer(serverId ?? "home");
     appStore.selectServer(serverId, autoSelect);
   };
 
@@ -1600,9 +1526,9 @@ const App: Component = () => {
     sendBtn: (hasText: boolean) => ({ width: "32px", height: "32px", "border-radius": "8px", border: "none", background: hasText ? "var(--veil-accent)" : "transparent", color: hasText ? "var(--veil-on-accent)" : "var(--veil-text-faint)", cursor: hasText ? "pointer" : "default", display: "flex", "align-items": "center", "justify-content": "center", "font-size": "14px", transition: "background 0.2s" }),
   };
 
-  const [activeServer, setActiveServer] = createSignal("home");
   const [showCreateServer, setShowCreateServer] = createSignal(false);
   const [showJoinServer, setShowJoinServer] = createSignal(false);
+  const [showSpaceCreateMenu, setShowSpaceCreateMenu] = createSignal(false);
   const [showCreateChannel, setShowCreateChannel] = createSignal(false);
   const [showCreateInvite, setShowCreateInvite] = createSignal(false);
 
@@ -1615,12 +1541,9 @@ const App: Component = () => {
     setSendNotice("");
     setSendBusy(false);
     setSearch("");
-    setNewPeerId("");
     setNewGroupName("");
-    setCreatingDm(false);
     setCreatingGroup(false);
     setGroupCreateError("");
-    setSidebarTab("all");
     setGroupMembers([]);
     setReplyingTo(null);
     setEditingMessage(null);
@@ -1628,14 +1551,13 @@ const App: Component = () => {
     setDeletingIds(new Set<string>());
     closeRightIsland(true);
     setShowFriendsPanel(false);
-    setShowNewDm(false);
     setShowNewGroup(false);
     setCmdkOpen(false);
     setShowCreateServer(false);
     setShowJoinServer(false);
+    setShowSpaceCreateMenu(false);
     setShowCreateChannel(false);
     setShowCreateInvite(false);
-    setActiveServer("home");
     if (inputRef) inputRef.style.height = "21px";
     toast.clear();
     clearAvatarRegistry();
@@ -1648,13 +1570,13 @@ const App: Component = () => {
     // tokens immediately; late completions are already fenced by uiSessionEpoch.
     activeSendToken = null;
     setSendBusy(false);
-    setCreatingDm(false);
     setCreatingGroup(false);
     setGroupCreateError("");
     setDeletingIds(new Set<string>());
     setCmdkOpen(false);
     setShowCreateServer(false);
     setShowJoinServer(false);
+    setShowSpaceCreateMenu(false);
     setShowCreateChannel(false);
     setShowCreateInvite(false);
     closeRightIsland(true);
@@ -1697,13 +1619,6 @@ const App: Component = () => {
     setDragChannelId(null);
     setDropTarget(null);
     serverHydrationInFlight.clear();
-  });
-
-  // Keep the local rail selection in sync with the global app store so that
-  // newly-created servers / store-driven changes are reflected in the UI.
-  createEffect(() => {
-    const id = appStore.activeServerId();
-    setActiveServer(id ?? "home");
   });
 
   // When a server becomes active, ensure channels + members are loaded so the
@@ -1767,19 +1682,31 @@ const App: Component = () => {
 
             {/* ISLAND 1 — Server Rail */}
             <ServerRail
-              activeServerId={activeServer()}
-              servers={appStore.servers()}
+              activeRoute={railRoute()}
+              circles={circles()}
+              spaces={appStore.servers()}
               visible={island1Vis()}
-              onSelectServer={(serverId) => selectServerContext(serverId)}
-              onOpenServerSettings={(serverId) => appStore.openServerSettings?.(serverId)}
-              onCreateServer={() => setShowCreateServer(true)}
-              onJoinServer={() => setShowJoinServer(true)}
+              onSelectHome={() => selectServerContext(null)}
+              onSelectCircle={openConversation}
+              onSelectSpace={(spaceId) => selectServerContext(spaceId)}
+              onOpenSpaceSettings={(spaceId) => appStore.openServerSettings?.(spaceId)}
+              onOpenCreate={() => setShowSpaceCreateMenu(true)}
             />
             {/* ISLAND 2 — Sidebar */}
             <aside
               class="veil-sidebar-island"
               aria-label={appStore.activeServerId() ? "Server channels" : "Conversations"}
-              style={{ ...S.island("256px"), ...S.islandAnim(island2Vis(), 0) }}
+              aria-hidden={circleContextOpen() ? "true" : undefined}
+              inert={circleContextOpen()}
+              style={{
+                ...S.island("256px"),
+                ...S.islandAnim(island2Vis(), 0),
+                width: circleContextOpen() ? "0" : "256px",
+                opacity: circleContextOpen() ? "0" : (island2Vis() ? "1" : "0"),
+                transform: circleContextOpen() ? "translateX(-12px) scale(0.98)" : (island2Vis() ? "translateX(0) scale(1)" : "translateY(16px) scale(0.97)"),
+                "pointer-events": circleContextOpen() ? "none" : "auto",
+                transition: "width 220ms ease, opacity 180ms ease, transform 220ms ease",
+              }}
             >
               {/* ── Server context: channels list ───────────────── */}
               <Show when={appStore.activeServerId()}>
@@ -2226,22 +2153,40 @@ const App: Component = () => {
               {/* ── Home context: friends + DMs + groups ─────────── */}
               <Show when={!appStore.activeServerId()}>
               <>
-              {/* Friends button — Discord-style */}
+              <div style={{ padding: "17px 18px 13px", "border-bottom": "1px solid var(--veil-contrast-04)", "flex-shrink": "0" }}>
+                <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", gap: "10px" }}>
+                  <div>
+                    <div style={{ color: "var(--veil-text-strong)", "font-size": "15px", "font-weight": "720" }}>Home</div>
+                    <div style={{ color: "var(--veil-text-faint)", "font-size": "10px", "margin-top": "2px" }}>Your private center</div>
+                  </div>
+                  <button
+                    type="button"
+                    aria-label="Search Veil"
+                    title="Search · Ctrl+K"
+                    onClick={() => setCmdkOpen(true)}
+                    style={{ width: "30px", height: "30px", "border-radius": "8px", border: "1px solid var(--veil-border-soft)", background: "var(--veil-control)", color: "var(--veil-text-muted)", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
+                  >
+                    <span aria-hidden="true" style={{ "font-size": "15px" }}>⌕</span>
+                  </button>
+                </div>
+              </div>
+
               <button
+                type="button"
                 style={{
                   display: "flex", "align-items": "center", gap: "10px",
-                  width: "100%", padding: "12px 20px", border: "none",
-                  background: showFriendsPanel() ? "rgba(var(--veil-accent-rgb),0.1)" : "transparent",
+                  width: "calc(100% - 24px)", margin: "12px 12px 4px", padding: "10px 12px", border: "none",
+                  "border-radius": "9px",
+                  background: showFriendsPanel() ? "rgba(var(--veil-accent-rgb),0.12)" : "transparent",
                   color: showFriendsPanel() ? "var(--veil-accent)" : "var(--veil-text-muted)",
                   cursor: "pointer", "font-size": "13px", "font-weight": "600",
-                  "border-bottom": "1px solid var(--veil-contrast-04)",
-                  transition: "background 0.15s, color 0.15s",
+                  transition: "background 180ms ease, color 180ms ease",
                   "flex-shrink": "0",
                 }}
                 onClick={openFriends}
               >
-                <Users size={18} strokeWidth={1.8} />
-                Friends
+                <Users size={17} strokeWidth={1.8} aria-hidden="true" />
+                Friends & requests
                 <Show when={appStore.friendRequests().filter(r => !r.outgoing).length > 0}>
                   <span style={{ "min-width": "18px", height: "18px", "border-radius": "9px", background: "var(--veil-accent)", display: "inline-flex", "align-items": "center", "justify-content": "center", "font-size": "10px", color: "var(--veil-on-accent)", "font-weight": "700", padding: "0 5px", "margin-left": "auto" }}>
                     {appStore.friendRequests().filter(r => !r.outgoing).length}
@@ -2249,144 +2194,59 @@ const App: Component = () => {
                 </Show>
               </button>
 
-              <div style={S.sidebarHeader}>
-                <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", "margin-bottom": "12px" }}>
-                  <span style={{ "font-size": "15px", "font-weight": "700", color: "var(--veil-text-strong)" }}>Messages</span>
-                  <div style={{ display: "flex", gap: "4px" }}>
-                    <button
-                      type="button"
-                      aria-label="Start a direct message"
-                      style={{ height: "28px", padding: "0 8px", display: "inline-flex", "align-items": "center", gap: "4px", "border-radius": "7px", background: showNewDm() ? "rgba(var(--veil-accent-rgb),0.16)" : "var(--veil-contrast-04)", border: "none", color: showNewDm() ? "var(--veil-accent)" : "var(--veil-text-muted)", cursor: "pointer", "font-size": "10px", "font-weight": "650" }}
-                      onClick={toggleNewDm}
-                      title="New DM"
-                    ><MessageCircle size={12} strokeWidth={2} /> DM</button>
-                    <button
-                      type="button"
-                      aria-label="Create an encrypted group"
-                      style={{ height: "28px", padding: "0 8px", display: "inline-flex", "align-items": "center", gap: "4px", "border-radius": "7px", background: showNewGroup() ? "rgba(var(--veil-accent-rgb),0.16)" : "var(--veil-contrast-04)", border: "none", color: showNewGroup() ? "var(--veil-accent)" : "var(--veil-text-muted)", cursor: "pointer", "font-size": "10px", "font-weight": "650" }}
-                      onClick={toggleNewGroup}
-                      title="New Group"
-                    ><UserPlus size={12} strokeWidth={2} /> Group</button>
-                  </div>
-                </div>
-
-                {/* Tabs: All / DM / Groups */}
-                <div role="tablist" aria-label="Conversation filters" style={{ display: "flex", gap: "2px", "margin-bottom": "10px", background: "var(--veil-window)", "border-radius": "8px", padding: "3px" }}>
-                  <For each={[{ key: "all" as const, label: "All" }, { key: "dm" as const, label: "DMs" }, { key: "group" as const, label: "Groups" }]}>
-                    {(t) => (
-                      <button
-                        type="button"
-                        role="tab"
-                        id={`messages-tab-${t.key}`}
-                        aria-controls="messages-tab-panel"
-                        aria-selected={sidebarTab() === t.key}
-                        tabIndex={sidebarTab() === t.key ? 0 : -1}
-                        style={{
-                          flex: "1", padding: "5px 0", "border-radius": "6px", border: "none",
-                          background: sidebarTab() === t.key ? "rgba(var(--veil-accent-rgb),0.15)" : "transparent",
-                          color: sidebarTab() === t.key ? "var(--veil-accent)" : "var(--veil-text-faint)",
-                          "font-size": "11px", "font-weight": "600", cursor: "pointer",
-                          transition: "background 0.15s, color 0.15s",
-                        }}
-                        onClick={() => changeSidebarTab(t.key)}
-                        onKeyDown={(event) => handleSidebarTabKeyDown(event, t.key)}
-                      >{t.label}</button>
-                    )}
-                  </For>
-                </div>
-
-                <Show when={sidebarTab() === "group" && !showNewGroup()}>
-                  <button
-                    type="button"
-                    onClick={toggleNewGroup}
-                    style={{
-                      width: "100%", height: "34px", "margin-bottom": "10px",
-                      display: "flex", "align-items": "center", "justify-content": "center", gap: "7px",
-                      "border-radius": "8px", border: "1px solid rgba(var(--veil-accent-rgb),0.22)",
-                      background: "rgba(var(--veil-accent-rgb),0.08)", color: "var(--veil-accent)",
-                      cursor: "pointer", "font-size": "11px", "font-weight": "650",
-                    }}
-                  ><UserPlus size={13} strokeWidth={2} /> Create encrypted group</button>
-                </Show>
-
-                <Show when={showNewDm()}>
-                  <div style={{ display: "flex", gap: "8px", "margin-bottom": "10px" }}>
+              <Show when={showNewGroup()}>
+                <div style={{ margin: "8px 12px 5px", padding: "12px", "border-radius": "10px", background: "rgba(var(--veil-accent-rgb),0.07)", border: "1px solid rgba(var(--veil-accent-rgb),0.18)" }}>
+                  <div style={{ color: "var(--veil-text-strong)", "font-size": "12px", "font-weight": "650", "margin-bottom": "8px" }}>Create Circle</div>
+                  <div style={{ display: "flex", gap: "7px" }}>
                     <input
-                      style={{ ...S.searchBox, flex: "1" }}
-                      placeholder="User ID..."
-                      value={newPeerId()}
-                      disabled={creatingDm()}
-                      onInput={(e) => setNewPeerId(e.currentTarget.value)}
-                      onKeyDown={(e) => e.key === "Enter" && handleNewDm()}
+                      ref={newGroupInputRef}
+                      aria-label="Circle name"
+                      style={{ ...S.searchBox, flex: "1", "min-width": "0" }}
+                      placeholder="Circle name"
+                      value={newGroupName()}
+                      disabled={creatingGroup()}
+                      onInput={(event) => { setNewGroupName(event.currentTarget.value); setGroupCreateError(""); }}
+                      onKeyDown={(event) => event.key === "Enter" && void handleNewGroup()}
                     />
                     <button
                       type="button"
-                      disabled={creatingDm() || !newPeerId().trim()}
-                      style={{ height: "34px", padding: "0 12px", "border-radius": "8px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", "font-size": "12px", "font-weight": "600", cursor: creatingDm() ? "wait" : "pointer", opacity: creatingDm() || !newPeerId().trim() ? "0.55" : "1" }}
-                      onClick={handleNewDm}
-                    >{creatingDm() ? "Creating..." : "Go"}</button>
+                      aria-label="Create Circle"
+                      disabled={creatingGroup() || !newGroupName().trim()}
+                      style={{ width: "36px", height: "34px", "border-radius": "8px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", cursor: creatingGroup() ? "wait" : "pointer", opacity: creatingGroup() || !newGroupName().trim() ? "0.5" : "1" }}
+                      onClick={() => void handleNewGroup()}
+                    >→</button>
                   </div>
-                </Show>
+                  <Show when={groupCreateError()}>
+                    <div role="alert" style={{ "margin-top": "7px", color: "var(--veil-danger)", "font-size": "10px", "line-height": "1.35" }}>{groupCreateError()}</div>
+                  </Show>
+                </div>
+              </Show>
 
-                <Show when={showNewGroup()}>
-                  <div style={{ "margin-bottom": "10px" }}>
-                    <div style={{ display: "flex", gap: "8px" }}>
-                      <input
-                        ref={newGroupInputRef}
-                        aria-label="Encrypted group name"
-                        style={{ ...S.searchBox, flex: "1" }}
-                        placeholder="Encrypted group name..."
-                        value={newGroupName()}
-                        disabled={creatingGroup()}
-                        onInput={(e) => { setNewGroupName(e.currentTarget.value); setGroupCreateError(""); }}
-                        onKeyDown={(e) => e.key === "Enter" && void handleNewGroup()}
-                      />
-                      <button
-                        type="button"
-                        disabled={creatingGroup() || !newGroupName().trim()}
-                        style={{ height: "34px", padding: "0 12px", "border-radius": "8px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", "font-size": "12px", "font-weight": "600", cursor: creatingGroup() ? "wait" : "pointer", opacity: creatingGroup() || !newGroupName().trim() ? "0.55" : "1" }}
-                        onClick={() => void handleNewGroup()}
-                      >{creatingGroup() ? "Creating…" : "Create"}</button>
-                    </div>
-                    <Show when={groupCreateError()}>
-                      <div role="alert" style={{ "margin-top": "7px", color: "var(--veil-danger)", "font-size": "10px", "line-height": "1.35" }}>
-                        {groupCreateError()}
-                      </div>
-                    </Show>
-                  </div>
-                </Show>
-
+              <div style={S.sidebarHeader}>
+                <div style={{ color: "var(--veil-text-faint)", "font-size": "10px", "font-weight": "700", "letter-spacing": "0.08em", "margin-bottom": "9px" }}>DIRECT</div>
                 <input
+                  aria-label="Filter Direct conversations"
                   style={S.searchBox}
-                  placeholder="Search conversations..."
+                  placeholder="Find a conversation…"
                   value={search()}
-                  onInput={(e) => setSearch(e.currentTarget.value)}
+                  onInput={(event) => setSearch(event.currentTarget.value)}
                 />
               </div>
 
               <div
-                id="messages-tab-panel"
-                role="tabpanel"
-                aria-labelledby={`messages-tab-${sidebarTab()}`}
+                aria-label="Direct conversations"
                 style={S.contactList}
               >
                 <Show
                   when={filtered().length > 0}
                   fallback={
                     <div style={{ "text-align": "center", "padding-top": "40px", color: "var(--veil-text-faint)" }}>
-                      <p style={{ "font-size": "13px" }}>No conversations</p>
-                      <div style={{ display: "flex", gap: "8px", "justify-content": "center", "margin-top": "8px" }}>
-                        <button
-                          type="button"
-                          style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
-                          onClick={toggleNewDm}
-                        >New DM {"\u2192"}</button>
-                        <button
-                          type="button"
-                          style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
-                          onClick={toggleNewGroup}
-                        >New Group {"\u2192"}</button>
-                      </div>
+                      <p style={{ "font-size": "13px", margin: "0 0 6px" }}>No Direct conversations</p>
+                      <button
+                        type="button"
+                        style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
+                        onClick={openFriends}
+                      >Find a person {"\u2192"}</button>
                     </div>
                   }
                 >
@@ -2586,17 +2446,17 @@ const App: Component = () => {
                   <div style={{ width: "56px", height: "56px", "border-radius": "16px", background: "rgba(var(--veil-accent-rgb),0.08)", display: "flex", "align-items": "center", "justify-content": "center", "margin-bottom": "16px" }}>
                     <VeilMark size={24} style={{ color: "var(--veil-accent)" }} />
                   </div>
-                  <div style={{ "font-size": "16px", "font-weight": "500", color: "var(--veil-text-muted)", "margin-bottom": "6px" }}>Veil Messenger</div>
-                  <div style={{ "font-size": "13px", color: "var(--veil-text-faint)" }}>Select a conversation or start a new one</div>
+                  <div style={{ "font-size": "16px", "font-weight": "500", color: "var(--veil-text-muted)", "margin-bottom": "6px" }}>Your Veil Home</div>
+                  <div style={{ "font-size": "13px", color: "var(--veil-text-faint)" }}>Choose a Direct, Circle or Space</div>
                   <div style={{ display: "flex", gap: "12px", "margin-top": "20px" }}>
                     <button
                       style={{ padding: "8px 16px", "border-radius": "8px", background: "rgba(var(--veil-accent-rgb),0.1)", border: "none", color: "var(--veil-accent)", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
-                      onClick={toggleNewDm}
-                    >New DM</button>
+                      onClick={openFriends}
+                    >Find people</button>
                     <button
                       style={{ padding: "8px 16px", "border-radius": "8px", background: "rgba(var(--veil-accent-rgb),0.1)", border: "none", color: "var(--veil-accent)", "font-size": "12px", "font-weight": "600", cursor: "pointer" }}
-                      onClick={toggleNewGroup}
-                    >New Group</button>
+                      onClick={() => setShowSpaceCreateMenu(true)}
+                    >Create or join</button>
                   </div>
                   <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "16px", display: "inline-flex", "align-items": "center", gap: "5px" }}><Lock size={11} strokeWidth={2} /> End-to-end encrypted</div>
                 </div>
@@ -3264,7 +3124,20 @@ const App: Component = () => {
         </Match>
       </Switch>
 
-      {/* Server creation / join dialogs (mounted globally so they overlay the chat) */}
+      <SpaceCreateMenu
+        open={showSpaceCreateMenu()}
+        onClose={() => setShowSpaceCreateMenu(false)}
+        onCreateCircle={() => {
+          selectServerContext(null);
+          setShowNewGroup(true);
+          requestAnimationFrame(() => newGroupInputRef?.focus());
+        }}
+        onCreateSpace={() => setShowCreateServer(true)}
+        onJoinSpace={() => setShowJoinServer(true)}
+        joinAvailable={false}
+      />
+
+      {/* Protocol names remain server/channel internally; product language is Space/Room. */}
       <CreateServerDialog open={showCreateServer()} onClose={() => setShowCreateServer(false)} />
       <JoinServerDialog open={showJoinServer()} onClose={() => setShowJoinServer(false)} />
       <Show when={appStore.activeServerId()}>

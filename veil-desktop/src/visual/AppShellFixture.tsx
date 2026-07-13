@@ -522,13 +522,15 @@ export const AppShellFixture: Component = () => {
         fallback={(
           <div class="veil-app-body" data-testid="app-body" style={bodyStyle}>
             <ServerRail
-              activeServerId="secure-lab"
-              servers={servers}
+              activeRoute={{ kind: "space", spaceId: "secure-lab" }}
+              circles={[]}
+              spaces={servers}
               visible={true}
-              onSelectServer={() => undefined}
-              onOpenServerSettings={() => undefined}
-              onCreateServer={() => undefined}
-              onJoinServer={() => undefined}
+              onSelectHome={() => undefined}
+              onSelectCircle={() => undefined}
+              onSelectSpace={() => undefined}
+              onOpenSpaceSettings={() => undefined}
+              onOpenCreate={() => undefined}
             />
             <Sidebar membersOpen={membersOpen()} onToggleMembers={toggleMembers} />
             <Chat focusState={state === "focus"} />

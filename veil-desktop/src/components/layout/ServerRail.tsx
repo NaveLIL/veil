@@ -1,16 +1,25 @@
 import type { Component } from "solid-js";
 import { For } from "solid-js";
-import { Globe, MessageCircle } from "lucide-solid";
-import type { Server } from "@/stores/app";
+import { MessageCircle, Plus, Users } from "lucide-solid";
+import type { Conversation, Server } from "@/stores/app";
+
+type CircleSummary = Pick<Conversation, "id" | "name" | "unreadCount">;
+
+export type RailRoute =
+  | { kind: "home" }
+  | { kind: "circle"; circleId: string }
+  | { kind: "space"; spaceId: string };
 
 export interface ServerRailProps {
-  activeServerId: string;
-  servers: readonly Server[];
+  activeRoute: RailRoute;
+  circles: readonly CircleSummary[];
+  spaces: readonly Server[];
   visible: boolean;
-  onSelectServer: (serverId: string | null) => void;
-  onOpenServerSettings: (serverId: string) => void;
-  onCreateServer: () => void;
-  onJoinServer: () => void;
+  onSelectHome: () => void;
+  onSelectCircle: (circleId: string) => void;
+  onSelectSpace: (spaceId: string) => void;
+  onOpenSpaceSettings: (spaceId: string) => void;
+  onOpenCreate: () => void;
 }
 
 const islandStyle = {
@@ -30,14 +39,16 @@ const railStyle = {
   padding: "14px 0",
   gap: "8px",
   height: "100%",
+  "min-height": "0",
 };
 
 const railButtonStyle = (active: boolean) => ({
   width: "42px",
   height: "42px",
+  "flex-shrink": "0",
   "border-radius": active ? "14px" : "21px",
   background: active ? "var(--veil-accent)" : "var(--veil-surface-raised)",
-  color: active ? "var(--veil-text-strong)" : "var(--veil-text-muted)",
+  color: active ? "var(--veil-on-accent)" : "var(--veil-text-muted)",
   border: "none",
   cursor: "pointer",
   display: "flex",
@@ -45,8 +56,16 @@ const railButtonStyle = (active: boolean) => ({
   "justify-content": "center",
   "font-size": "12px",
   "font-weight": "700",
-  transition: "border-radius 0.2s, background 0.2s",
+  transition: "border-radius 200ms ease, background 200ms ease, color 200ms ease, transform 200ms ease",
 });
+
+const separator = (
+  <div
+    role="separator"
+    aria-orientation="horizontal"
+    style={{ width: "28px", height: "2px", background: "var(--veil-border)", "border-radius": "1px", "flex-shrink": "0" }}
+  />
+);
 
 export const ServerRail: Component<ServerRailProps> = (props) => (
   <div
@@ -56,67 +75,88 @@ export const ServerRail: Component<ServerRailProps> = (props) => (
       ...islandStyle,
       opacity: props.visible ? "1" : "0",
       transform: props.visible ? "translateY(0) scale(1)" : "translateY(16px) scale(0.97)",
-      transition: "opacity 0.5s ease 0ms, transform 0.5s ease 0ms",
+      transition: "opacity 500ms ease, transform 500ms ease",
     }}
   >
-    <nav style={railStyle} aria-label="Servers">
+    <nav style={railStyle} aria-label="Veil spaces">
       <button
         type="button"
-        style={railButtonStyle(props.activeServerId === "home")}
-        aria-label="Home — direct messages and groups"
-        aria-current={props.activeServerId === "home" ? "page" : undefined}
+        style={railButtonStyle(props.activeRoute.kind === "home")}
+        aria-label="Home — friends and Direct"
+        aria-current={props.activeRoute.kind === "home" ? "page" : undefined}
         title="Home"
-        onClick={() => props.onSelectServer(null)}
+        onClick={props.onSelectHome}
       >
         <MessageCircle size={20} strokeWidth={1.8} aria-hidden="true" />
       </button>
 
+      {separator}
+
       <div
-        role="separator"
-        aria-orientation="horizontal"
-        style={{ width: "28px", height: "2px", background: "var(--veil-border)", "border-radius": "1px" }}
-      />
-
-      <For each={props.servers}>
-        {(server) => {
-          const active = () => props.activeServerId === server.id;
-          return (
-            <button
-              type="button"
-              style={railButtonStyle(active())}
-              aria-label={server.name}
-              aria-current={active() ? "page" : undefined}
-              onClick={() => props.onSelectServer(server.id)}
-              onContextMenu={(event) => {
-                event.preventDefault();
-                props.onOpenServerSettings(server.id);
-              }}
-              title={server.name}
-            >
-              <span aria-hidden="true">{server.name.charAt(0).toUpperCase()}</span>
-            </button>
-          );
+        aria-label="Circles and Spaces"
+        style={{
+          display: "flex",
+          "flex-direction": "column",
+          "align-items": "center",
+          gap: "8px",
+          width: "100%",
+          flex: "1",
+          "min-height": "0",
+          "overflow-y": "auto",
+          "scrollbar-width": "none",
         }}
-      </For>
+      >
+        <For each={props.circles}>
+          {(circle) => {
+            const active = () => props.activeRoute.kind === "circle" && props.activeRoute.circleId === circle.id;
+            return (
+              <button
+                type="button"
+                style={railButtonStyle(active())}
+                aria-label={`Circle: ${circle.name}`}
+                aria-current={active() ? "page" : undefined}
+                onClick={() => props.onSelectCircle(circle.id)}
+                title={`${circle.name} · Circle`}
+              >
+                <Users size={18} strokeWidth={1.8} aria-hidden="true" />
+              </button>
+            );
+          }}
+        </For>
+
+        <For each={props.spaces}>
+          {(space) => {
+            const active = () => props.activeRoute.kind === "space" && props.activeRoute.spaceId === space.id;
+            return (
+              <button
+                type="button"
+                style={railButtonStyle(active())}
+                aria-label={`Space: ${space.name}`}
+                aria-current={active() ? "page" : undefined}
+                onClick={() => props.onSelectSpace(space.id)}
+                onContextMenu={(event) => {
+                  event.preventDefault();
+                  props.onOpenSpaceSettings(space.id);
+                }}
+                title={`${space.name} · Space`}
+              >
+                <span aria-hidden="true">{space.name.charAt(0).toUpperCase()}</span>
+              </button>
+            );
+          }}
+        </For>
+      </div>
+
+      {separator}
 
       <button
         type="button"
-        style={{ ...railButtonStyle(false), color: "var(--veil-success)", "font-size": "20px", "font-weight": "600" }}
-        onClick={props.onCreateServer}
-        aria-label="Create a server"
-        title="Create a server"
+        style={{ ...railButtonStyle(false), color: "var(--veil-success)" }}
+        onClick={props.onOpenCreate}
+        aria-label="Create or join a Veil space"
+        title="Create or join"
       >
-        <span aria-hidden="true">+</span>
-      </button>
-
-      <button
-        type="button"
-        style={{ ...railButtonStyle(false), color: "var(--veil-accent)", "font-size": "15px" }}
-        onClick={props.onJoinServer}
-        aria-label="Join a server with an invite"
-        title="Join a server with an invite"
-      >
-        <Globe size={18} strokeWidth={1.8} aria-hidden="true" />
+        <Plus size={20} strokeWidth={1.9} aria-hidden="true" />
       </button>
     </nav>
   </div>

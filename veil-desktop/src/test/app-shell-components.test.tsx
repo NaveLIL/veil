@@ -4,6 +4,7 @@ import { createSignal } from "solid-js";
 import { describe, expect, it, vi } from "vitest";
 import { RightIsland } from "@/components/layout/RightIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
+import { SpaceCreateMenu } from "@/components/spaces/SpaceCreateMenu";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 import type { GroupMember, Role, Server, ServerMember } from "@/stores/app";
 import {
@@ -46,13 +47,14 @@ describe("active AppShell components", () => {
     expect(screen.getByRole("banner", { name: "Application window" })).toHaveAttribute("data-tauri-drag-region");
   });
 
-  it("keeps server navigation and creation actions on the active rail", async () => {
+  it("keeps Home, Circles, Spaces and one creation entry on the active rail", async () => {
     const user = userEvent.setup();
-    const selectServer = vi.fn();
+    const selectHome = vi.fn();
+    const selectCircle = vi.fn();
+    const selectSpace = vi.fn();
     const openSettings = vi.fn();
-    const createServer = vi.fn();
-    const joinServer = vi.fn();
-    const servers: Server[] = [{
+    const openCreate = vi.fn();
+    const spaces: Server[] = [{
       id: "server-1",
       name: "Private Room",
       ownerId: "owner-1",
@@ -60,30 +62,58 @@ describe("active AppShell components", () => {
 
     const { container } = render(() => (
       <ServerRail
-        activeServerId="server-1"
-        servers={servers}
+        activeRoute={{ kind: "space", spaceId: "server-1" }}
+        circles={[{ id: "circle-1", name: "Night Shift", unreadCount: 0 }]}
+        spaces={spaces}
         visible
-        onSelectServer={selectServer}
-        onOpenServerSettings={openSettings}
-        onCreateServer={createServer}
-        onJoinServer={joinServer}
+        onSelectHome={selectHome}
+        onSelectCircle={selectCircle}
+        onSelectSpace={selectSpace}
+        onOpenSpaceSettings={openSettings}
+        onOpenCreate={openCreate}
       />
     ));
 
-    expect(screen.getByRole("navigation", { name: "Servers" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Private Room" })).toHaveAttribute("aria-current", "page");
+    expect(screen.getByRole("navigation", { name: "Veil spaces" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Space: Private Room" })).toHaveAttribute("aria-current", "page");
     expect(container.querySelector(".veil-server-rail-island")).toHaveStyle({ opacity: "1" });
 
-    await user.click(screen.getByRole("button", { name: "Home — direct messages and groups" }));
-    expect(selectServer).toHaveBeenCalledWith(null);
-    await user.click(screen.getByRole("button", { name: "Private Room" }));
-    expect(selectServer).toHaveBeenCalledWith("server-1");
-    fireEvent.contextMenu(screen.getByRole("button", { name: "Private Room" }));
+    await user.click(screen.getByRole("button", { name: "Home — friends and Direct" }));
+    expect(selectHome).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole("button", { name: "Circle: Night Shift" }));
+    expect(selectCircle).toHaveBeenCalledWith("circle-1");
+    await user.click(screen.getByRole("button", { name: "Space: Private Room" }));
+    expect(selectSpace).toHaveBeenCalledWith("server-1");
+    fireEvent.contextMenu(screen.getByRole("button", { name: "Space: Private Room" }));
     expect(openSettings).toHaveBeenCalledWith("server-1");
-    await user.click(screen.getByRole("button", { name: "Create a server" }));
-    await user.click(screen.getByRole("button", { name: "Join a server with an invite" }));
-    expect(createServer).toHaveBeenCalledOnce();
-    expect(joinServer).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole("button", { name: "Create or join a Veil space" }));
+    expect(openCreate).toHaveBeenCalledOnce();
+  });
+
+  it("keeps legacy invite entry fail-closed during the Veil Link cutover", async () => {
+    const user = userEvent.setup();
+    const createCircle = vi.fn();
+    const createSpace = vi.fn();
+    const joinSpace = vi.fn();
+    const close = vi.fn();
+
+    render(() => (
+      <SpaceCreateMenu
+        open
+        onClose={close}
+        onCreateCircle={createCircle}
+        onCreateSpace={createSpace}
+        onJoinSpace={joinSpace}
+        joinAvailable={false}
+      />
+    ));
+
+    expect(screen.getByRole("button", { name: "Open Veil Link" })).toBeDisabled();
+    expect(screen.getByText(/secure Veil Link cutover/i)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Create Circle" }));
+    expect(close).toHaveBeenCalledOnce();
+    expect(createCircle).toHaveBeenCalledOnce();
+    expect(joinSpace).not.toHaveBeenCalled();
   });
 
   it("renders the extracted members island in group and server contexts", async () => {
