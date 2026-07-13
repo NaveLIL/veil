@@ -19,8 +19,11 @@ export interface IdentityIslandProfile extends PhaseprintIdentity {
   displayName: string;
   nickname?: string | null;
   signingKey?: string | null;
-  profileVersion?: number | null;
+  about?: string | null;
+  profileVersion?: string | number | null;
+  profileUpdatedAt?: string | null;
   profileOrigin?: string | null;
+  localProofState?: "not_compared" | "verified_on_this_device" | "identity_changed" | "current_account";
   contextKind: IdentityContextKind;
   contextLabel: string;
   contextDetail?: string | null;
@@ -31,7 +34,12 @@ export interface IdentityIslandProfile extends PhaseprintIdentity {
   selfIdentity?: PhaseprintIdentity | null;
 }
 
-export type IdentityProofState = "self" | "not-compared" | "unavailable";
+export type IdentityProofState =
+  | "self"
+  | "not-compared"
+  | "verified-on-device"
+  | "identity-changed"
+  | "unavailable";
 
 const USER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const IDENTITY_KEY_RE = /^[0-9a-f]{64}$/i;
@@ -121,9 +129,10 @@ export function identityProofState(profile: IdentityIslandProfile): IdentityProo
     && !!canonicalIdentityUserId(profile.userId)
     && !!canonicalIdentityKey(profile.identityKey);
   if (!hasCompleteLocator) return "unavailable";
-  return profile.selfIdentity && isSameCanonicalIdentity(profile, profile.selfIdentity)
-    ? "self"
-    : "not-compared";
+  if (profile.selfIdentity && isSameCanonicalIdentity(profile, profile.selfIdentity)) return "self";
+  if (profile.localProofState === "verified_on_this_device") return "verified-on-device";
+  if (profile.localProofState === "identity_changed") return "identity-changed";
+  return "not-compared";
 }
 
 export function canMessageIdentity(

@@ -106,6 +106,47 @@ describe("Identity Island", () => {
     expect(message).toHaveBeenCalledOnce();
   });
 
+  it("shows bounded network profile text and truthful device-local proof states", () => {
+    const [profile, setProfile] = createSignal<IdentityIslandProfile>({
+      ...completeProfile,
+      about: "Quietly building secure things.",
+      profileVersion: "18446744073709551615",
+      localProofState: "verified_on_this_device",
+    });
+    render(() => (
+      <IdentityIslandContent
+        profile={profile()}
+        canMessage={false}
+        profileLoading={false}
+        onMessage={vi.fn()}
+      />
+    ));
+
+    expect(screen.getByText("Quietly building secure things.")).toBeInTheDocument();
+    expect(screen.getByText("Verified on this device")).toBeInTheDocument();
+    expect(screen.getByText("18446744073709551615")).toBeInTheDocument();
+    expect(identityProofState(profile())).toBe("verified-on-device");
+
+    setProfile({ ...profile(), localProofState: "identity_changed" });
+    expect(screen.getByText("Identity changed")).toBeInTheDocument();
+    expect(screen.getByText(/blocking identity change/)).toBeInTheDocument();
+    expect(identityProofState(profile())).toBe("identity-changed");
+  });
+
+  it("keeps retained identity visible while live profile refresh fails", () => {
+    render(() => (
+      <IdentityIslandContent
+        profile={completeProfile}
+        canMessage={false}
+        profileError="Live profile unavailable. Retained identity data is still shown."
+        onMessage={vi.fn()}
+      />
+    ));
+
+    expect(screen.getByText("Quiet Orbit")).toBeInTheDocument();
+    expect(screen.getByText(/Live profile unavailable/).closest('[role="status"]')).toBeInTheDocument();
+  });
+
   it("keeps incomplete account coordinates read-only and rejects insecure origins", () => {
     const incomplete: IdentityIslandProfile = {
       canonicalServerOrigin: ORIGIN,

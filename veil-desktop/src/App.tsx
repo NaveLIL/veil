@@ -198,6 +198,8 @@ const App: Component = () => {
   const [sidebarTab, setSidebarTab] = createSignal<"all" | "dm" | "group">("all");
   const [rightIslandRoute, setRightIslandRoute] = createSignal<RightIslandRoute>({ kind: "closed" });
   const [identityMessageBusy, setIdentityMessageBusy] = createSignal(false);
+  const [identityProfileLoading, setIdentityProfileLoading] = createSignal(false);
+  const [identityProfileError, setIdentityProfileError] = createSignal("");
   const [windowMaximized, setWindowMaximized] = createSignal(false);
   const [groupMembers, setGroupMembers] = createSignal<GroupMember[]>([]);
   const [replyingTo, setReplyingTo] = createSignal<Message | null>(null);
@@ -224,6 +226,7 @@ const App: Component = () => {
   let rightIslandTransitionEpoch = 0;
   let rightIslandAnimationFrame: number | undefined;
   let identityDmActionToken = 0;
+  let identityProfileActionToken = 0;
 
   const memberPanelOpen = () => rightIslandRoute().kind === "members" && island4Vis();
   const rightIslandOpen = () => rightIslandRoute().kind !== "closed" && island4Vis();
@@ -236,6 +239,60 @@ const App: Component = () => {
     return route.kind === "identity" && route.backToMembers;
   };
 
+  const refreshIdentityProfile = async (profile: IdentityIslandProfile) => {
+    const targetOrigin = canonicalIdentityOrigin(profile.canonicalServerOrigin);
+    const targetUserId = canonicalIdentityUserId(profile.userId);
+    const targetIdentityKey = canonicalIdentityKey(profile.identityKey);
+    const scope = appStore.authenticatedServerScope();
+    if (
+      !targetOrigin
+      || !targetUserId
+      || !targetIdentityKey
+      || !scope
+      || targetOrigin !== canonicalIdentityOrigin(scope.canonicalServerOrigin)
+      || !appStore.connected()
+      || appStore.bindingTransitioning()
+      || appStore.originTransitioning()
+    ) return;
+
+    const routeKey = identityProfileKey(profile);
+    const actionToken = ++identityProfileActionToken;
+    setIdentityProfileLoading(true);
+    setIdentityProfileError("");
+    const actionStillCurrent = () => {
+      const route = rightIslandRoute();
+      return actionToken === identityProfileActionToken
+        && route.kind === "identity"
+        && identityProfileKey(route.profile) === routeKey;
+    };
+    try {
+      const networkProfile = await appStore.loadNetworkProfile(targetUserId, targetIdentityKey);
+      if (!actionStillCurrent()) return;
+      setRightIslandRoute((current) => current.kind === "identity"
+        && identityProfileKey(current.profile) === routeKey
+        ? {
+          ...current,
+          profile: {
+            ...current.profile,
+            technicalUsername: networkProfile.username,
+            displayName: networkProfile.displayName || networkProfile.username,
+            about: networkProfile.about,
+            profileVersion: networkProfile.profileVersion,
+            profileUpdatedAt: networkProfile.profileUpdatedAt,
+            profileOrigin: networkProfile.canonicalServerOrigin,
+            localProofState: networkProfile.proofState,
+          },
+        }
+        : current);
+    } catch {
+      if (actionStillCurrent()) {
+        setIdentityProfileError("Live profile unavailable. Retained identity data is still shown.");
+      }
+    } finally {
+      if (actionToken === identityProfileActionToken) setIdentityProfileLoading(false);
+    }
+  };
+
   const cancelRightIslandAnimationFrame = () => {
     if (rightIslandAnimationFrame === undefined) return;
     cancelAnimationFrame(rightIslandAnimationFrame);
@@ -246,9 +303,12 @@ const App: Component = () => {
     const wasClosed = rightIslandRoute().kind === "closed" || !island4Vis();
     rightIslandTransitionEpoch += 1;
     identityDmActionToken += 1;
+    identityProfileActionToken += 1;
     cancelRightIslandAnimationFrame();
     setRightIslandRoute(route);
     setIdentityMessageBusy(false);
+    setIdentityProfileLoading(false);
+    setIdentityProfileError("");
     if (!wasClosed) {
       setIsland4Vis(true);
       return;
@@ -287,6 +347,7 @@ const App: Component = () => {
         ?? (current.kind === "members" || current.kind === "identity" ? current.opener : null)
         ?? focusedElement,
     });
+    void refreshIdentityProfile(profile);
   };
 
   const backToMembersIsland = () => {
@@ -302,8 +363,11 @@ const App: Component = () => {
     const activeAtClose = document.activeElement;
     const epoch = ++rightIslandTransitionEpoch;
     identityDmActionToken += 1;
+    identityProfileActionToken += 1;
     cancelRightIslandAnimationFrame();
     setIdentityMessageBusy(false);
+    setIdentityProfileLoading(false);
+    setIdentityProfileError("");
     setIsland4Vis(false);
     const finish = () => {
       if (epoch !== rightIslandTransitionEpoch) return;
@@ -2766,6 +2830,8 @@ const App: Component = () => {
               identityBackToMembers={identityBackToMembers()}
               identityCanMessage={selectedIdentityCanMessage()}
               identityMessageBusy={identityMessageBusy()}
+              identityProfileLoading={identityProfileLoading()}
+              identityProfileError={identityProfileError()}
               serverId={appStore.activeServerId()}
               contextName={appStore.activeServerId()
                 ? appStore.servers().find((server) => server.id === appStore.activeServerId())?.name

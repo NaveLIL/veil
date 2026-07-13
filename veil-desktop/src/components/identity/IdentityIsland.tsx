@@ -15,6 +15,8 @@ interface IdentityIslandContentProps {
   profile: IdentityIslandProfile;
   canMessage: boolean;
   messageBusy?: boolean;
+  profileLoading?: boolean;
+  profileError?: string;
   onMessage: () => void;
 }
 
@@ -95,6 +97,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
   let disposed = false;
   const displayName = () => boundedIdentityText(props.profile.displayName, "Unknown account", 96);
   const technicalUsername = () => boundedIdentityText(props.profile.technicalUsername, "", 96);
+  const about = () => boundedIdentityText(props.profile.about, "", 280);
   const contextLabel = () => boundedIdentityText(props.profile.contextLabel, "Unknown context", 96);
   const contextDetail = () => boundedIdentityText(props.profile.contextDetail, "", 160);
   const nickname = () => boundedIdentityText(props.profile.nickname, "", 96);
@@ -104,6 +107,11 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
   const identityKey = () => canonicalIdentityKey(props.profile.identityKey);
   const signingKey = () => canonicalIdentityKey(props.profile.signingKey);
   const proofState = () => identityProofState(props.profile);
+  const profileVersion = () => {
+    const value = props.profile.profileVersion;
+    if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
+    return typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) ? value : null;
+  };
   const joinedAt = () => formatJoinedAt(props.profile.joinedAt);
   const visibleRoles = createMemo(() => (props.profile.roles ?? []).slice(0, 3).map((role) => ({
     name: boundedIdentityText(role.name, "Unnamed role", 64),
@@ -154,6 +162,8 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
 
   const proofLabel = () => {
     if (proofState() === "self") return "Current account";
+    if (proofState() === "verified-on-device") return "Verified on this device";
+    if (proofState() === "identity-changed") return "Identity changed";
     if (proofState() === "not-compared") return "Not compared";
     return "Identity unavailable";
   };
@@ -164,6 +174,12 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
     }
     if (proofState() === "not-compared") {
       return "This key was observed through the authenticated server (service-mediated TOFU). It has not been verified on this device.";
+    }
+    if (proofState() === "verified-on-device") {
+      return "You previously compared this exact origin, account, and identity key on this device.";
+    }
+    if (proofState() === "identity-changed") {
+      return "The observed identity key differs from the key previously compared on this device. Treat this as a blocking identity change.";
     }
     return "This context does not contain a complete origin, account ID, and identity key. Veil will not infer or label it as verified.";
   };
@@ -223,6 +239,21 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
           >
             {proofState() === "self" ? "You" : formatOrigin(origin())}
           </div>
+          <Show when={about()}>
+            {(value) => (
+              <div style={{ color: "var(--veil-text-muted)", "font-size": "11px", "line-height": "1.5", "text-align": "center", "white-space": "pre-wrap", "margin-top": "11px" }}>
+                {value()}
+              </div>
+            )}
+          </Show>
+          <Show when={props.profileLoading}>
+            <div role="status" class="veil-identity-profile-status">Refreshing profile…</div>
+          </Show>
+          <Show when={!props.profileLoading && props.profileError}>
+            <div role="status" class="veil-identity-profile-status veil-identity-profile-status-error">
+              {props.profileError}
+            </div>
+          </Show>
         </div>
       </section>
 
@@ -278,10 +309,14 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
               display: "flex",
               "align-items": "center",
               "justify-content": "center",
-              background: proofState() === "not-compared"
-                ? "var(--veil-warning-surface)"
-                : "rgba(var(--veil-accent-rgb),0.1)",
-              color: proofState() === "not-compared" ? "var(--veil-warning)" : "var(--veil-accent)",
+              background: proofState() === "identity-changed"
+                ? "var(--veil-danger-surface)"
+                : proofState() === "not-compared"
+                  ? "var(--veil-warning-surface)"
+                  : "rgba(var(--veil-accent-rgb),0.1)",
+              color: proofState() === "identity-changed"
+                ? "var(--veil-danger)"
+                : proofState() === "not-compared" ? "var(--veil-warning)" : "var(--veil-accent)",
               "flex-shrink": "0",
             }}
           >
@@ -310,8 +345,8 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
           <Show when={shortKey(signingKey())}>
             {(value) => <DetailRow label="Observed signing key" value={value()} mono />}
           </Show>
-          <Show when={Number.isSafeInteger(props.profile.profileVersion) && (props.profile.profileVersion ?? 0) >= 0}>
-            <DetailRow label="Profile revision" value={String(props.profile.profileVersion)} mono />
+          <Show when={profileVersion()}>
+            {(value) => <DetailRow label="Profile revision" value={value()} mono />}
           </Show>
           <Show when={profileOrigin()}>
             {(value) => <DetailRow label="Profile metadata origin" value={formatOrigin(value())} mono />}
@@ -399,6 +434,8 @@ export const IdentityIslandSheet: Component<IdentityIslandSheetProps> = (props) 
       profile={props.profile}
       canMessage={props.canMessage}
       messageBusy={props.messageBusy}
+      profileLoading={props.profileLoading}
+      profileError={props.profileError}
       onMessage={props.onMessage}
     />
   </IslandSheet>

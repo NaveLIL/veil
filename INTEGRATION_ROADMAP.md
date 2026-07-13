@@ -713,6 +713,15 @@ session и существующего immutable self-binding. Directory + profil
 ожидания. Profile event, renderer editor и интерактивный proof flow ещё не
 подключены, поэтому deliverable не закрыт.
 
+**Renderer profile checkpoint 2026-07-13:** Identity Island неблокирующе
+обновляет точный locator через native profile API и сохраняет локальную карточку
+видимой при offline/error. Late completion применяется только к всё ещё открытому
+exact profile route в той же опубликованной server binding. Renderer повторно
+проверяет origin/user/key/schema, хранит `profile_version` строкой без потери
+точности JavaScript и показывает `about`, revision, `Verified on this device` и
+blocking `Identity changed` без переименования TOFU в Verified. Editor, event и
+действие физического сравнения остаются следующими checkpoint'ами.
+
 - Native API возвращает стабильный fingerprint в hex + визуальном/emoji формате.
 - SQLCipher хранит verification по server origin, account и наблюдаемой identity,
   а не только по mutable имени.

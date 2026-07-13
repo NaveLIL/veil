@@ -127,6 +127,21 @@ describe("origin-local App cleanup", () => {
       .toBeLessThan(identityDmFlow.indexOf("appStore.createDm("));
   });
 
+  it("applies live profiles only to the exact still-open identity route", () => {
+    const refreshFlow = section(
+      "const refreshIdentityProfile = async",
+      "const cancelRightIslandAnimationFrame =",
+    );
+    expect(refreshFlow).toContain("canonicalIdentityOrigin(profile.canonicalServerOrigin)");
+    expect(refreshFlow).toContain("canonicalIdentityUserId(profile.userId)");
+    expect(refreshFlow).toContain("canonicalIdentityKey(profile.identityKey)");
+    expect(refreshFlow).toContain("targetOrigin !== canonicalIdentityOrigin(scope.canonicalServerOrigin)");
+    expect(refreshFlow).toContain("const actionToken = ++identityProfileActionToken");
+    expect(refreshFlow).toContain("actionToken === identityProfileActionToken");
+    expect(refreshFlow).toContain("identityProfileKey(route.profile) === routeKey");
+    expect(refreshFlow).toContain("Retained identity data is still shown");
+  });
+
   it("installs native event listeners before the first transport connect", () => {
     const boot = section("onMount(async () => {", "let stopWindowResizeListener");
     expect(boot.indexOf("await appStore.setupEventListeners()"))

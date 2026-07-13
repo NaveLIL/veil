@@ -708,6 +708,18 @@ select:focus-visible,
   line-height: 1.4;
 }
 
+.veil-identity-profile-status {
+  margin-top: 10px;
+  color: var(--veil-text-faint);
+  font-size: 9px;
+  line-height: 1.4;
+  text-align: center;
+}
+
+.veil-identity-profile-status-error {
+  color: var(--veil-warning);
+}
+
 .veil-identity-copy-button {
   min-height: 27px;
   padding: 5px 8px;

@@ -125,6 +125,19 @@ export interface AuthenticatedServerScope {
   bindingGeneration: string;
 }
 
+export interface NetworkProfileView {
+  canonicalServerOrigin: string;
+  userId: string;
+  identityKey: string;
+  username: string;
+  displayName: string | null;
+  about: string;
+  profileVersion: string;
+  profileUpdatedAt: string;
+  observedAt: string;
+  proofState: "not_compared" | "verified_on_this_device" | "identity_changed" | "current_account";
+}
+
 export interface ServerEndpointChange {
   originChanged: boolean;
   transportChanged: boolean;
@@ -496,6 +509,46 @@ function authenticatedMutationScopeArgs(scope: AuthenticatedServerScope) {
     expectedServerOrigin: scope.canonicalServerOrigin,
     expectedBindingGeneration: scope.bindingGeneration,
   };
+}
+
+export function validatedNetworkProfileView(
+  value: unknown,
+  scope: AuthenticatedServerScope,
+  expectedUserId: string,
+  expectedIdentityKey: string,
+): NetworkProfileView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("native profile response is invalid");
+  }
+  const profile = value as Record<string, unknown>;
+  const displayName = profile.displayName;
+  const proofState = profile.proofState;
+  if (
+    profile.canonicalServerOrigin !== scope.canonicalServerOrigin
+    || profile.userId !== expectedUserId
+    || profile.identityKey !== expectedIdentityKey
+    || typeof profile.username !== "string"
+    || profile.username.length === 0
+    || profile.username.length > 256
+    || (displayName !== null && (typeof displayName !== "string" || displayName.length > 512))
+    || typeof profile.about !== "string"
+    || profile.about.length > 2048
+    || typeof profile.profileVersion !== "string"
+    || !/^(0|[1-9][0-9]*)$/.test(profile.profileVersion)
+    || typeof profile.profileUpdatedAt !== "string"
+    || profile.profileUpdatedAt.length > 64
+    || typeof profile.observedAt !== "string"
+    || profile.observedAt.length > 64
+    || ![
+      "not_compared",
+      "verified_on_this_device",
+      "identity_changed",
+      "current_account",
+    ].includes(String(proofState))
+  ) {
+    throw new Error("native profile response changed its authenticated locator or schema");
+  }
+  return profile as unknown as NetworkProfileView;
 }
 
 function acceptsAuthenticatedEvent(payload: unknown): boolean {
@@ -1790,6 +1843,32 @@ export const appStore = {
     } else {
       setActiveConversationId(null);
     }
+  },
+
+  loadNetworkProfile: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+  ): Promise<NetworkProfileView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const requesterUserId = userId();
+    if (!requesterUserId || requesterUserId !== mutationScope.userId) {
+      throw new Error("profile request has no current authenticated account");
+    }
+    const profile = await invoke<unknown>("get_network_profile", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: requesterUserId,
+      targetUserId,
+      expectedIdentityKey,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedNetworkProfileView(
+      profile,
+      mutationScope,
+      targetUserId,
+      expectedIdentityKey,
+    );
   },
 
   /** Load server rows only from the currently authenticated REST namespace. */

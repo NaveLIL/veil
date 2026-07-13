@@ -49,6 +49,8 @@ export interface RightIslandProps {
   identityBackToMembers: boolean;
   identityCanMessage: boolean;
   identityMessageBusy: boolean;
+  identityProfileLoading?: boolean;
+  identityProfileError?: string;
   serverId: string | null;
   contextName?: string;
   canonicalServerOrigin?: string;
@@ -554,6 +556,8 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
           profile={profile()}
           canMessage={props.identityCanMessage}
           messageBusy={props.identityMessageBusy}
+          profileLoading={props.identityProfileLoading}
+          profileError={props.identityProfileError}
           onMessage={props.onMessageIdentity}
         />
       )}
