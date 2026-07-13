@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 
+	"github.com/AegisSec/veil-server/internal/cryptokey"
 	"github.com/AegisSec/veil-server/internal/db"
 )
 
@@ -40,6 +41,9 @@ func validateDeviceBindingInput(binding *DeviceBindingInput, requireSignature bo
 		binding.Version == 0 || binding.Version > math.MaxInt64 ||
 		binding.Capabilities > math.MaxInt64 ||
 		(requireSignature && len(binding.AccountSignature) != ed25519.SignatureSize) {
+		return ErrBadDeviceBinding
+	}
+	if !cryptokey.ValidEd25519PublicKey(binding.DeviceSigningKey) {
 		return ErrBadDeviceBinding
 	}
 	if binding.Status != db.DeviceBindingActive && binding.Status != db.DeviceBindingExcluded &&

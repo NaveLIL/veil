@@ -19,22 +19,34 @@ import (
 )
 
 type Handler struct {
-	store Store
-	mw    *authmw.Middleware
-	rl    *authmw.RateLimit
-	bcast Broadcaster
+	store           Store
+	mw              *authmw.Middleware
+	rl              *authmw.RateLimit
+	mutationRL      *authmw.RateLimit
+	avatarAdmission chan struct{}
+	bcast           Broadcaster
 }
 
 type Broadcaster interface {
 	BroadcastToUsers(userIDs []string, env *pb.Envelope)
 }
 
-func NewHandler(store Store, mw *authmw.Middleware, rl *authmw.RateLimit, bcast Broadcaster) *Handler {
-	return &Handler{store: store, mw: mw, rl: rl, bcast: bcast}
+func NewHandler(store Store, mw *authmw.Middleware, rl, mutationRL *authmw.RateLimit, bcast Broadcaster) *Handler {
+	return &Handler{
+		store:           store,
+		mw:              mw,
+		rl:              rl,
+		mutationRL:      mutationRL,
+		avatarAdmission: make(chan struct{}, 4),
+		bcast:           bcast,
+	}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
-	signed := func(f http.HandlerFunc) http.HandlerFunc {
+	signed := func(f http.HandlerFunc, mutation bool) http.HandlerFunc {
+		if mutation && h.mutationRL != nil {
+			f = h.mutationRL.Wrap(f)
+		}
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
 		}
@@ -43,11 +55,29 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		}
 		return f
 	}
-	mux.HandleFunc("GET /v1/users/{userID}/profile", signed(h.getProfile))
-	mux.HandleFunc("PUT /v1/users/me/profile", signed(h.updateProfile))
-	mux.HandleFunc("PUT /v1/users/me/profile/avatar", signed(h.updateAvatar))
-	mux.HandleFunc("DELETE /v1/users/me/profile/avatar", signed(h.removeAvatar))
-	mux.HandleFunc("GET /v1/profile-avatars/{assetID}", signed(h.getAvatar))
+	mux.HandleFunc("GET /v1/users/{userID}/profile", signed(h.getProfile, false))
+	mux.HandleFunc("PUT /v1/users/me/profile", signed(h.updateProfile, true))
+	mux.HandleFunc("PUT /v1/users/me/profile/avatar", signed(h.admitAvatarUpload(h.updateAvatar), true))
+	mux.HandleFunc("DELETE /v1/users/me/profile/avatar", signed(h.removeAvatar, true))
+	mux.HandleFunc("GET /v1/profile-avatars/{assetID}", signed(h.getAvatar, false))
+}
+
+func (h *Handler) admitAvatarUpload(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case h.avatarAdmission <- struct{}{}:
+			defer func() { <-h.avatarAdmission }()
+			next(w, r)
+		default:
+			w.Header().Set("Retry-After", "1")
+			publicerr.Write(w, http.StatusTooManyRequests, publicerr.New(
+				http.StatusTooManyRequests,
+				"avatar_upload_busy",
+				"avatar upload capacity is busy",
+				nil,
+			))
+		}
+	}
 }
 
 func expectedAvatarVersion(r *http.Request) (int64, error) {
@@ -80,7 +110,7 @@ func (h *Handler) updateAvatar(w http.ResponseWriter, r *http.Request) {
 		publicerr.Write(w, http.StatusRequestEntityTooLarge, publicerr.New(http.StatusRequestEntityTooLarge, "avatar_too_large", "avatar is too large", err))
 		return
 	}
-	asset, err := normalizeAvatar(body, contentType)
+	asset, err := normalizeAvatar(r.Context(), body, contentType)
 	if err != nil {
 		publicerr.Write(w, http.StatusBadRequest, publicerr.New(http.StatusBadRequest, "invalid_avatar", "avatar image is not allowed", err))
 		return
@@ -113,6 +143,16 @@ func (h *Handler) writeAvatarMutation(w http.ResponseWriter, r *http.Request, us
 		publicerr.Write(w, http.StatusConflict, publicerr.New(http.StatusConflict, "profile_version_conflict", "profile was updated elsewhere", err))
 		return false
 	}
+	if errors.Is(err, ErrAvatarUploadQuota) {
+		w.Header().Set("Retry-After", "3600")
+		publicerr.Write(w, http.StatusTooManyRequests, publicerr.New(
+			http.StatusTooManyRequests,
+			"avatar_upload_quota",
+			"avatar upload quota exceeded",
+			err,
+		))
+		return false
+	}
 	if err != nil {
 		log.Printf("update avatar error: class=%s", logsafe.ErrorClass(err))
 		publicerr.Write(w, http.StatusInternalServerError, nil)
@@ -129,8 +169,8 @@ func (h *Handler) getAvatar(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	assetID := r.PathValue("assetID")
-	if _, err := uuid.Parse(assetID); err != nil {
-		publicerr.Write(w, http.StatusBadRequest, publicerr.New(http.StatusBadRequest, "invalid_avatar_id", "invalid avatar id", err))
+	if !canonicalUUID(assetID) {
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(http.StatusBadRequest, "invalid_avatar_id", "invalid avatar id", nil))
 		return
 	}
 	asset, err := h.store.GetAvatar(r.Context(), assetID)
@@ -157,9 +197,9 @@ func (h *Handler) getProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	userID := r.PathValue("userID")
-	if _, err := uuid.Parse(userID); err != nil {
+	if !canonicalUUID(userID) {
 		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
-			http.StatusBadRequest, "invalid_user_id", "invalid user id", err,
+			http.StatusBadRequest, "invalid_user_id", "invalid user id", nil,
 		))
 		return
 	}
@@ -174,6 +214,11 @@ func (h *Handler) getProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, profile)
+}
+
+func canonicalUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil && parsed.String() == value
 }
 
 type updateProfileRequest struct {

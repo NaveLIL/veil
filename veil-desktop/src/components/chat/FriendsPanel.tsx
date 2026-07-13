@@ -147,6 +147,7 @@ const AddFriendSection: Component<Pick<FriendsPanelProps, "onOpenIdentity">> = (
       <div style={{ display: "flex", gap: "8px" }}>
         <input
           style={{ ...S.searchBox, flex: "1" }}
+          aria-label="Find a friend by username"
           placeholder="Enter username..."
           value={username()}
           onInput={(e) => { setUsername(e.currentTarget.value); setStatus("idle"); }}

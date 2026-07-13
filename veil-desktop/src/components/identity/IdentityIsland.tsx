@@ -47,7 +47,7 @@ const sectionStyle: JSX.CSSProperties = {
 const sectionTitleStyle: JSX.CSSProperties = {
   margin: "0 0 10px",
   color: "var(--veil-text-faint)",
-  "font-size": "9px",
+  "font-size": "10px",
   "font-weight": "700",
   "letter-spacing": "0.12em",
   "text-transform": "uppercase",
@@ -84,7 +84,7 @@ function formatFingerprint(value: string): string {
 
 const DetailRow: Component<{ label: string; value: string; mono?: boolean }> = (props) => (
   <div style={{ display: "grid", gap: "3px" }}>
-    <dt style={{ color: "var(--veil-text-faint)", "font-size": "9px", "font-weight": "600" }}>
+    <dt style={{ color: "var(--veil-text-faint)", "font-size": "10px", "font-weight": "600" }}>
       {props.label}
     </dt>
     <dd
@@ -136,6 +136,8 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
       && value.canonicalServerOrigin === origin()
       && value.userId === userId()
       && value.identityKey === identityKey()
+      && (!signingKey() || value.signingKey === signingKey())
+      && value.fingerprintVersion === "account_v2"
       ? value
       : null;
   };
@@ -159,7 +161,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
   const validateProfileDraft = (): string | null => {
     const name = draftDisplayName().normalize("NFC");
     const bio = draftAbout().normalize("NFC");
-    const unsafe = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+    const unsafe = /[\u00ad\u034f\u061c\u180e\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u206f\ufeff]/u;
     if (new TextEncoder().encode(name).length > 512 || /\p{Cc}/u.test(name) || unsafe.test(name)) {
       return "Display name is too long or contains unsafe controls.";
     }
@@ -249,15 +251,15 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
       return "This is the identity currently active on this device. Veil does not offer self-verification.";
     }
     if (proofState() === "not-compared") {
-      return "This key was observed through the authenticated server (service-mediated TOFU). It has not been verified on this device.";
+      return "This origin-scoped account locator has not been compared. Preparing a comparison loads the exact pinned encryption and signing keys when available; service-mediated TOFU is not verification.";
     }
     if (proofState() === "verified-on-device") {
-      return "You previously compared this exact origin, account, and identity key on this device.";
+      return "You previously compared this exact server origin, account ID, encryption identity key, and signing key on this device.";
     }
     if (proofState() === "identity-changed") {
-      return "The observed identity key differs from the key previously compared on this device. Treat this as a blocking identity change.";
+      return "The authenticated server presented a different encryption or signing key than the origin-scoped account previously pinned or compared on this device. Treat this as a blocking identity change.";
     }
-    return "This context does not contain a complete origin, account ID, and identity key. Veil will not infer or label it as verified.";
+    return "This context does not contain a complete origin, account ID, encryption identity key, and signing key. Veil will not infer or label it as verified.";
   };
 
   return (
@@ -299,14 +301,22 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
             {displayName()}
           </div>
           <Show when={technicalUsername() && technicalUsername() !== displayName()}>
-            <div style={{ color: "var(--veil-text-faint)", "font-size": "11px", "margin-top": "3px" }}>
+            <div style={{
+              color: "var(--veil-text-faint)",
+              "font-size": "11px",
+              "margin-top": "3px",
+              "max-width": "100%",
+              overflow: "hidden",
+              "text-overflow": "ellipsis",
+              "white-space": "nowrap",
+            }}>
               @{technicalUsername()}
             </div>
           </Show>
           <div
             style={{
               color: "var(--veil-accent)",
-              "font-size": "9px",
+              "font-size": "10px",
               "font-weight": "700",
               "letter-spacing": "0.08em",
               "text-transform": "uppercase",
@@ -317,7 +327,17 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
           </div>
           <Show when={about()}>
             {(value) => (
-              <div style={{ color: "var(--veil-text-muted)", "font-size": "11px", "line-height": "1.5", "text-align": "center", "white-space": "pre-wrap", "margin-top": "11px" }}>
+              <div style={{
+                color: "var(--veil-text-muted)",
+                "font-size": "11px",
+                "line-height": "1.5",
+                "text-align": "center",
+                "white-space": "pre-wrap",
+                "overflow-wrap": "anywhere",
+                "word-break": "break-word",
+                "max-width": "100%",
+                "margin-top": "11px",
+              }}>
                 {value()}
               </div>
             )}
@@ -345,6 +365,9 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
               )}
             >
               <form class="veil-identity-profile-editor" onSubmit={(event) => { event.preventDefault(); void saveProfileDraft(); }}>
+                <div class="veil-identity-profile-disclosure" role="note">
+                  Display name and About are visible to this server and are not end-to-end encrypted.
+                </div>
                 <label>
                   <span>Display name</span>
                   <input
@@ -388,7 +411,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
                 </button>
               </Show>
             </div>
-            <div style={{ color: "var(--veil-warning)", "font-size": "9px", "line-height": "1.45", "margin-top": "8px", "text-align": "center" }}>
+            <div style={{ color: "var(--veil-warning)", "font-size": "10px", "line-height": "1.45", "margin-top": "8px", "text-align": "center" }}>
               Profile avatars are visible to this server and are not end-to-end encrypted.
             </div>
           </Show>
@@ -430,7 +453,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
             Additional contextual roles are not shown in this profile summary.
           </div>
         </Show>
-        <div style={{ color: "var(--veil-text-faint)", "font-size": "9px", "line-height": "1.45", "margin-top": "10px" }}>
+        <div style={{ color: "var(--veil-text-faint)", "font-size": "10px", "line-height": "1.45", "margin-top": "10px" }}>
           Nicknames, roles, and presence are context only. They never affect trust, access, or encryption keys.
         </div>
       </section>
@@ -473,7 +496,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
         </div>
 
         <dl style={{ margin: "12px 0 0", display: "grid", gap: "9px" }}>
-          <DetailRow label="Server origin" value={formatOrigin(origin())} mono />
+          <DetailRow label="Server origin" value={origin() ?? "Origin unavailable"} mono />
           <Show when={userId()}>
             {(value) => <DetailRow label="Account ID" value={value()} mono />}
           </Show>
@@ -487,7 +510,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
             {(value) => <DetailRow label="Profile revision" value={value()} mono />}
           </Show>
           <Show when={profileOrigin()}>
-            {(value) => <DetailRow label="Profile metadata origin" value={formatOrigin(value())} mono />}
+            {(value) => <DetailRow label="Profile metadata origin" value={value()} mono />}
           </Show>
         </dl>
 
@@ -536,6 +559,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
                   </div>
                   <code class="veil-identity-fingerprint-hex">{formatFingerprint(value().fingerprintHex)}</code>
                   <div class="veil-identity-verification-guidance">
+                    Account fingerprint v2 binds this server origin, both account IDs, both X25519 encryption identities, and both Ed25519 signing identities.{" "}
                     Compare the entire fingerprint in person or over a separate trusted channel.
                     Phaseprint and profile text are not identity proof.
                   </div>
@@ -543,7 +567,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
                     <button type="button" onClick={() => void copyValue("fingerprint", value().fingerprintHex)}>
                       <Copy size={11} /> {copied() === "fingerprint" ? "Copied" : "Copy fingerprint"}
                     </button>
-                    <Show when={proofState() !== "verified-on-device" && props.onConfirmVerification}>
+                    <Show when={proofState() !== "verified-on-device" && proofState() !== "identity-changed" && props.onConfirmVerification}>
                       <button
                         type="button"
                         disabled={props.verificationBusy}
@@ -593,7 +617,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
               <MessageCircle size={14} strokeWidth={2} /> Message
             </Show>
           </button>
-          <div style={{ color: "var(--veil-text-faint)", "font-size": "9px", "line-height": "1.45", "text-align": "center" }}>
+          <div style={{ color: "var(--veil-text-faint)", "font-size": "10px", "line-height": "1.45", "text-align": "center" }}>
             {props.canMessage
               ? "An exact local DM opens without a network request; creating a new one still requires current server authority."
               : "Messaging requires an exact account ID on the currently authenticated server."}

@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -66,5 +67,22 @@ func TestProfileUpdateAudienceIsRelationshipScoped(t *testing.T) {
 	}
 	if got[stranger.ID] || len(got) != 4 {
 		t.Fatalf("unrelated account leaked into audience: stranger=%s recipients=%v", stranger.ID, recipients)
+	}
+
+	if _, err := h.DB.Pool.Exec(ctx, `
+		WITH created AS (
+			INSERT INTO users(identity_key, signing_key, username)
+			SELECT digest('profile-audience-identity-' || g::text, 'sha256'),
+			       digest('profile-audience-signing-' || g::text, 'sha256'),
+			       'profile-audience-bulk-' || g::text
+			FROM generate_series(1, 4100) g
+			RETURNING id
+		)
+		INSERT INTO server_members(server_id, user_id)
+		SELECT $1::uuid, id FROM created`, server.ID); err != nil {
+		t.Fatalf("seed oversized profile audience: %v", err)
+	}
+	if _, err := profiles.NewPostgresStore(h.DB.Pool).ProfileUpdateRecipients(ctx, owner.ID); !errors.Is(err, profiles.ErrProfileAudienceTooLarge) {
+		t.Fatalf("oversized audience error=%v, want bounded refusal", err)
 	}
 }

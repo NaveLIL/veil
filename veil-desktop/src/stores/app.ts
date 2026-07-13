@@ -2,6 +2,11 @@ import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { alertDecision, decisionDialog } from "@/lib/decisionDialog";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  validatedLiveMessage,
+  validatedStoredMessages,
+  type MessageAuthorContextWire,
+} from "@/lib/identityIpcBoundary";
 
 // ─── Types ───────────────────────────────────────────
 
@@ -78,9 +83,10 @@ export interface Message {
   senderUserId?: string;
   senderKey: string;
   senderSigningKey?: string;
-  senderProfileVersion?: number;
+  senderProfileVersion?: string;
   senderProfileOrigin?: string;
   senderOrigin?: string;
+  senderAuthorContext?: MessageAuthorContextWire;
   text: string;
   timestamp: number;
   isOwn: boolean;
@@ -144,8 +150,17 @@ export interface IdentityVerificationView {
   canonicalServerOrigin: string;
   userId: string;
   identityKey: string;
+  signingKey: string;
+  fingerprintVersion: "account_v2";
   fingerprintHex: string;
   fingerprintEmoji: string;
+  proofState: "not_compared" | "verified_on_this_device" | "identity_changed";
+}
+
+export interface CachedIdentityProofView {
+  canonicalServerOrigin: string;
+  userId: string;
+  identityKey: string;
   proofState: "not_compared" | "verified_on_this_device" | "identity_changed";
 }
 
@@ -153,6 +168,11 @@ export interface ProfileUpdateNotice {
   canonicalServerOrigin: string;
   userId: string;
   profileVersion: string;
+}
+
+export interface IdentityChangeNotice {
+  canonicalServerOrigin: string;
+  userId: string;
 }
 
 export interface ServerEndpointChange {
@@ -224,6 +244,7 @@ const [authenticatedServerScope, setAuthenticatedServerScope] =
 const [pendingAuthenticatedServerScope, setPendingAuthenticatedServerScope] =
   createSignal<AuthenticatedServerScope | null>(null);
 const [profileUpdateNotice, setProfileUpdateNotice] = createSignal<ProfileUpdateNotice | null>(null);
+const [identityChangeNotice, setIdentityChangeNotice] = createSignal<IdentityChangeNotice | null>(null);
 const [bindingTransitioning, setBindingTransitioning] = createSignal(false);
 const [originTransitioning, setOriginTransitioning] = createSignal(false);
 const [originEpoch, setOriginEpoch] = createSignal(0);
@@ -529,9 +550,16 @@ function authenticatedMutationScopeArgs(scope: AuthenticatedServerScope) {
   };
 }
 
+const UNSAFE_PROFILE_CHARACTER = /[\u00ad\u034f\u061c\u180e\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u206f\ufeff]/u;
+
+function hasUnsafeProfileText(value: string, allowLineFeed: boolean): boolean {
+  return UNSAFE_PROFILE_CHARACTER.test(value)
+    || /\p{Cc}/u.test(allowLineFeed ? value.replaceAll("\n", "") : value);
+}
+
 export function validatedNetworkProfileView(
   value: unknown,
-  scope: AuthenticatedServerScope,
+  scope: Pick<AuthenticatedServerScope, "canonicalServerOrigin">,
   expectedUserId: string,
   expectedIdentityKey: string,
 ): NetworkProfileView {
@@ -541,6 +569,12 @@ export function validatedNetworkProfileView(
   const profile = value as Record<string, unknown>;
   const displayName = profile.displayName;
   const proofState = profile.proofState;
+  const unsafeUsername = typeof profile.username === "string"
+    && hasUnsafeProfileText(profile.username, false);
+  const unsafeDisplayName = typeof displayName === "string"
+    && hasUnsafeProfileText(displayName, false);
+  const unsafeAbout = typeof profile.about === "string"
+    && hasUnsafeProfileText(profile.about, true);
   if (
     profile.canonicalServerOrigin !== scope.canonicalServerOrigin
     || profile.userId !== expectedUserId
@@ -548,14 +582,19 @@ export function validatedNetworkProfileView(
     || typeof profile.username !== "string"
     || profile.username.length === 0
     || profile.username.length > 256
+    || unsafeUsername
     || (displayName !== null && (typeof displayName !== "string" || displayName.length > 512))
+    || unsafeDisplayName
     || typeof profile.about !== "string"
     || profile.about.length > 2048
+    || unsafeAbout
     || (profile.avatarAssetId !== null && (typeof profile.avatarAssetId !== "string" || !/^[0-9a-f-]{36}$/.test(profile.avatarAssetId)))
     || (profile.avatarJpegBase64 !== null && (typeof profile.avatarJpegBase64 !== "string" || profile.avatarJpegBase64.length > 360_000))
     || (profile.avatarAssetId === null && profile.avatarJpegBase64 !== null)
     || typeof profile.profileVersion !== "string"
     || !/^(0|[1-9][0-9]*)$/.test(profile.profileVersion)
+    || profile.profileVersion.length > 19
+    || BigInt(profile.profileVersion) > 9223372036854775807n
     || typeof profile.profileUpdatedAt !== "string"
     || profile.profileUpdatedAt.length > 64
     || typeof profile.observedAt !== "string"
@@ -574,7 +613,7 @@ export function validatedNetworkProfileView(
 
 export function validatedIdentityVerificationView(
   value: unknown,
-  scope: AuthenticatedServerScope,
+  scope: Pick<AuthenticatedServerScope, "canonicalServerOrigin">,
   expectedUserId: string,
   expectedIdentityKey: string,
 ): IdentityVerificationView {
@@ -586,6 +625,10 @@ export function validatedIdentityVerificationView(
     verification.canonicalServerOrigin !== scope.canonicalServerOrigin
     || verification.userId !== expectedUserId
     || verification.identityKey !== expectedIdentityKey
+    || typeof verification.signingKey !== "string"
+    || !/^[0-9a-f]{64}$/.test(verification.signingKey)
+    || /^0{64}$/.test(verification.signingKey)
+    || verification.fingerprintVersion !== "account_v2"
     || typeof verification.fingerprintHex !== "string"
     || !/^[0-9a-f]{64}$/.test(verification.fingerprintHex)
     || typeof verification.fingerprintEmoji !== "string"
@@ -600,6 +643,34 @@ export function validatedIdentityVerificationView(
     throw new Error("native identity verification response changed its locator or schema");
   }
   return verification as unknown as IdentityVerificationView;
+}
+
+export function validatedCachedIdentityProofView(
+  value: unknown,
+  expectedServerOrigin: string,
+  expectedUserId: string,
+  expectedIdentityKey: string,
+): CachedIdentityProofView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("native cached identity proof response is invalid");
+  }
+  const proof = value as Record<string, unknown>;
+  if (
+    proof.canonicalServerOrigin !== expectedServerOrigin
+    || proof.userId !== expectedUserId
+    || proof.identityKey !== expectedIdentityKey
+    || ![
+      "not_compared",
+      "verified_on_this_device",
+      "identity_changed",
+    ].includes(String(proof.proofState))
+    || "fingerprintHex" in proof
+    || "fingerprintEmoji" in proof
+    || "signingKey" in proof
+  ) {
+    throw new Error("native cached identity proof changed its locator or schema");
+  }
+  return proof as unknown as CachedIdentityProofView;
 }
 
 function acceptsAuthenticatedEvent(payload: unknown): boolean {
@@ -698,6 +769,7 @@ function resetOriginScopedUiState(): void {
   setPresenceMap({});
   setFriendDirectoryReady(false);
   setProfileUpdateNotice(null);
+  setIdentityChangeNotice(null);
 }
 
 function beginBindingTransition(serverSettingsFallback: "chat" | "settings" = "chat"): void {
@@ -707,6 +779,7 @@ function beginBindingTransition(serverSettingsFallback: "chat" | "settings" = "c
   setAuthenticatedServerScope(null);
   setPendingAuthenticatedServerScope(null);
   setProfileUpdateNotice(null);
+  setIdentityChangeNotice(null);
   setBindingTransitioning(true);
   setConnected(false);
   setUserId(null);
@@ -855,6 +928,7 @@ export const appStore = {
   authenticatedServerScope,
   pendingAuthenticatedServerScope,
   profileUpdateNotice,
+  identityChangeNotice,
   bindingTransitioning,
   originTransitioning,
   originEpoch,
@@ -1665,32 +1739,24 @@ export const appStore = {
   /** Load persisted messages for a conversation. */
   loadMessages: async (conversationId: string) => {
     const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = authenticatedServerScope();
+    if (!expectedScope) return;
     const generation = nextMessageLoadGeneration(conversationId);
     try {
-      const msgs = await invoke<Array<{
-        id: string;
-        conversationId: string;
-        senderName?: string;
-        senderUserId?: string;
-        senderKey: string;
-        senderSigningKey?: string;
-        senderProfileVersion?: number;
-        senderProfileOrigin?: string;
-        senderOrigin?: string;
-        text: string;
-        isOwn: boolean;
-        pending: boolean;
-        failed: boolean;
-        deliveryUnknown: boolean;
-        timestamp: number;
-        createdAt: string;
-        replyToId?: string;
-      }>>(
+      const response = await invoke<unknown>(
         "get_messages",
         { conversationId },
       );
       requireCurrentUiSession(sessionEpoch);
+      if (!authenticatedScopesEqual(authenticatedServerScope(), expectedScope)) {
+        throw new StaleUiSessionError();
+      }
       if (messageLoadGenerations.get(conversationId) !== generation) return;
+      const msgs = validatedStoredMessages(
+        response,
+        conversationId,
+        expectedScope.canonicalServerOrigin,
+      );
       const loaded: Message[] = msgs
         .filter((message) => !discardedOutgoingMessageIds.has(message.id))
         .map(m => {
@@ -1706,6 +1772,7 @@ export const appStore = {
             senderProfileVersion: m.senderProfileVersion,
             senderProfileOrigin: m.senderProfileOrigin,
             senderOrigin: m.senderOrigin,
+            senderAuthorContext: m.senderAuthorContext,
             text: m.text,
             timestamp: m.timestamp || new Date(m.createdAt).getTime(),
             isOwn: m.isOwn,
@@ -1920,6 +1987,85 @@ export const appStore = {
     return validatedNetworkProfileView(
       profile,
       mutationScope,
+      targetUserId,
+      expectedIdentityKey,
+    );
+  },
+
+  loadCachedNetworkProfile: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+    expectedServerOrigin: string,
+  ): Promise<NetworkProfileView | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const requesterUserId = userId();
+    const requesterIdentityKey = identity()?.trim().toLowerCase();
+    const parsedOrigin = new URL(expectedServerOrigin);
+    if (
+      !requesterUserId
+      || !requesterIdentityKey
+      || !/^[0-9a-f]{64}$/.test(requesterIdentityKey)
+      || !/^[0-9a-f]{64}$/.test(expectedIdentityKey)
+      || parsedOrigin.pathname !== "/"
+      || parsedOrigin.search
+      || parsedOrigin.hash
+      || canonicalServerOriginFromHttpUrl(expectedServerOrigin) !== expectedServerOrigin
+    ) {
+      throw new Error("cached profile request has no exact authenticated locator");
+    }
+    const profile = await invoke<unknown>("get_cached_network_profile", {
+      userId: requesterUserId,
+      targetUserId,
+      expectedIdentityKey,
+      expectedServerOrigin,
+    });
+    requireCurrentUiSession(sessionEpoch);
+    if (
+      userId() !== requesterUserId
+      || identity()?.trim().toLowerCase() !== requesterIdentityKey
+    ) {
+      throw new StaleUiSessionError();
+    }
+    if (profile === null) return null;
+    return validatedNetworkProfileView(
+      profile,
+      { canonicalServerOrigin: expectedServerOrigin },
+      targetUserId,
+      expectedIdentityKey,
+    );
+  },
+
+  loadCachedIdentityVerification: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+    expectedServerOrigin: string,
+  ): Promise<CachedIdentityProofView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const currentIdentityKey = identity()?.trim().toLowerCase();
+    const parsedOrigin = new URL(expectedServerOrigin);
+    if (
+      !currentIdentityKey
+      || !/^[0-9a-f]{64}$/.test(currentIdentityKey)
+      || !/^[0-9a-f]{64}$/.test(expectedIdentityKey)
+      || parsedOrigin.pathname !== "/"
+      || parsedOrigin.search
+      || parsedOrigin.hash
+      || canonicalServerOriginFromHttpUrl(expectedServerOrigin) !== expectedServerOrigin
+    ) {
+      throw new Error("cached identity proof request has no exact unlocked locator");
+    }
+    const verification = await invoke<unknown>("get_cached_identity_verification", {
+      targetUserId,
+      expectedIdentityKey,
+      expectedServerOrigin,
+    });
+    requireCurrentUiSession(sessionEpoch);
+    if (identity()?.trim().toLowerCase() !== currentIdentityKey) {
+      throw new StaleUiSessionError();
+    }
+    return validatedCachedIdentityProofView(
+      verification,
+      expectedServerOrigin,
       targetUserId,
       expectedIdentityKey,
     );
@@ -2767,27 +2913,19 @@ export const appStore = {
       },
     );
 
-      await register<{
-      messageId: string;
-      conversationId: string;
-      conversationType?: "dm" | "group" | "channel";
-      conversationName?: string;
-      conversationPeerUserId?: string;
-      senderKey: string;
-      senderName?: string;
-      senderUserId?: string;
-      senderSigningKey?: string;
-      senderProfileVersion?: number;
-      senderProfileOrigin?: string;
-      senderOrigin?: string;
-      text: string;
-      timestamp: number;
-      replyToId?: string;
-    }>(
+      await register<unknown>(
       "veil://message",
       (event) => {
         if (!acceptsAuthenticatedEvent(event.payload)) return;
-        const d = event.payload;
+        const scope = authenticatedServerScope();
+        if (!scope) return;
+        let d;
+        try {
+          d = validatedLiveMessage(event.payload, scope.canonicalServerOrigin);
+        } catch (error) {
+          console.error("native live message failed its renderer schema boundary", error);
+          return;
+        }
         const isOwn = d.senderKey === identity();
         const senderName = isOwn ? "You" : (d.senderName?.trim() || "Unknown author");
         nextMessageLoadGeneration(d.conversationId);
@@ -2801,6 +2939,7 @@ export const appStore = {
           senderProfileVersion: d.senderProfileVersion,
           senderProfileOrigin: d.senderProfileOrigin,
           senderOrigin: d.senderOrigin,
+          senderAuthorContext: d.senderAuthorContext,
           text: d.text,
           timestamp: d.timestamp,
           isOwn,
@@ -3136,6 +3275,21 @@ export const appStore = {
           canonicalServerOrigin: scope.canonicalServerOrigin,
           userId: updatedUserId,
           profileVersion,
+        });
+      },
+      );
+
+      await register<{ userId: string }>(
+      "veil://identity-changed",
+      (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        const scope = authenticatedServerScope();
+        const changedUserId = event.payload.userId;
+        const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+        if (!scope || typeof changedUserId !== "string" || !canonicalUuid.test(changedUserId)) return;
+        setIdentityChangeNotice({
+          canonicalServerOrigin: scope.canonicalServerOrigin,
+          userId: changedUserId,
         });
       },
     );

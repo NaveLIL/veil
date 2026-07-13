@@ -14,7 +14,7 @@ const STATUS_COLOR: Record<Member["status"], string> = {
   offline: "#7a7a90",
 };
 
-export const MembersIsland: React.FC<{ onOpenIdentity?: (member: Member) => void }> = ({ onOpenIdentity }) => {
+export const MembersIsland: React.FC<{ onOpenIdentity?: (member: Member, triggerHandle: string | number) => void }> = ({ onOpenIdentity }) => {
   const serverId = useChatStore((s) => s.selectedServerId);
   const members = useMemo(
     () => MEMBERS_BY_SERVER[serverId] ?? EMPTY_MEMBERS,
@@ -64,8 +64,8 @@ export const MembersIsland: React.FC<{ onOpenIdentity?: (member: Member) => void
             <Text style={styles.sectionHeader}>{section.title}</Text>
           )}
           renderItem={({ item }) => (
-            <Pressable accessibilityRole="button" accessibilityLabel={`View identity for ${item.name}`} onPress={() => onOpenIdentity?.(item)} style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}>
-              <UserAvatar identityKey={item.identityKey} userId={item.userId} username={item.username} size={38} statusColor={STATUS_COLOR[item.status]} />
+            <Pressable accessibilityRole="button" accessibilityLabel={`View identity for ${item.name}`} onPress={(event) => onOpenIdentity?.(item, event.nativeEvent.target)} style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}>
+              <UserAvatar identityKey={item.identityKey} canonicalServerOrigin={item.canonicalServerOrigin} userId={item.userId} technicalUsername={item.username} size={38} statusColor={STATUS_COLOR[item.status]} />
               <View style={{ flex: 1 }}>
                 <Text style={styles.name}>{item.name}</Text>
                 {item.role && item.role !== "member" ? (

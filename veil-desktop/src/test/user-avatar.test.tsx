@@ -1,15 +1,13 @@
 import { fireEvent, render, screen } from "@solidjs/testing-library";
 import { createSignal } from "solid-js";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   createPhaseprintModel,
   resolvePhaseprintSeed,
 } from "@/components/identity/Phaseprint";
-import {
-  isAllowedLocalAvatarSource,
-  UserAvatar,
-} from "@/components/identity/UserAvatar";
+import { UserAvatar } from "@/components/identity/UserAvatar";
 import { phaseprintIdentityForFriendRequest } from "@/components/identity/avatarIdentity";
+import { clearAvatarRegistry, installNativeAvatar } from "@/components/identity/avatarRegistry";
 
 const ORIGIN_A = "https://alpha.example.test:443";
 const ORIGIN_B = "https://beta.example.test:443";
@@ -145,6 +143,17 @@ describe("Phaseprint v1", () => {
 });
 
 describe("UserAvatar", () => {
+  let nextAvatarUrl = 0;
+  beforeEach(() => {
+    nextAvatarUrl = 0;
+    vi.spyOn(URL, "createObjectURL").mockImplementation(() => `blob:https://veil.local/avatar-${++nextAvatarUrl}`);
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+  });
+  afterEach(() => {
+    clearAvatarRegistry();
+    vi.restoreAllMocks();
+  });
+
   it("is decorative by default and labelled only when used standalone", () => {
     const { container } = render(() => (
       <>
@@ -184,15 +193,17 @@ describe("UserAvatar", () => {
     expect(container.innerHTML).not.toContain("505ea8c981828b4817ea1321992c7936");
   });
 
-  it("rejects remote and data image sources without creating an image element", () => {
-    expect(isAllowedLocalAvatarSource("https://cdn.example.test/avatar.png")).toBe(false);
-    expect(isAllowedLocalAvatarSource("data:image/png;base64,AAAA")).toBe(false);
-    expect(isAllowedLocalAvatarSource("blob:https://veil.local/avatar-1")).toBe(true);
-
+  it("never renders an avatar registered for a different exact identity", () => {
+    installNativeAvatar({
+      identityKey: IDENTITY_KEY,
+      canonicalServerOrigin: ORIGIN_A,
+      userId: USER_ID,
+    }, "550e8400-e29b-41d4-a716-446655440001", "/9j/2Q==");
     const { container } = render(() => (
       <UserAvatar
-        identityKey={IDENTITY_KEY}
-        localImageSrc="https://cdn.example.test/avatar.png"
+        identityKey={"42".repeat(32)}
+        canonicalServerOrigin={ORIGIN_A}
+        userId={USER_ID}
       />
     ));
     expect(container.querySelector("img")).not.toBeInTheDocument();
@@ -200,10 +211,16 @@ describe("UserAvatar", () => {
   });
 
   it("keeps Phaseprint visible until a local blob decodes and restores it on failure", () => {
+    installNativeAvatar({
+      identityKey: IDENTITY_KEY,
+      canonicalServerOrigin: ORIGIN_A,
+      userId: USER_ID,
+    }, "550e8400-e29b-41d4-a716-446655440001", "/9j/2Q==");
     const { container } = render(() => (
       <UserAvatar
         identityKey={IDENTITY_KEY}
-        localImageSrc="blob:https://veil.local/avatar-1"
+        canonicalServerOrigin={ORIGIN_A}
+        userId={USER_ID}
       />
     ));
     const avatar = container.querySelector("[data-user-avatar]")!;
@@ -224,16 +241,21 @@ describe("UserAvatar", () => {
   });
 
   it("resets image readiness for a replacement blob and falls back on abort", () => {
-    const [source, setSource] = createSignal("blob:https://veil.local/avatar-1");
+    const avatarIdentity = {
+      identityKey: IDENTITY_KEY,
+      canonicalServerOrigin: ORIGIN_A,
+      userId: USER_ID,
+    };
+    installNativeAvatar(avatarIdentity, "550e8400-e29b-41d4-a716-446655440001", "/9j/2Q==");
     const { container } = render(() => (
-      <UserAvatar identityKey={IDENTITY_KEY} localImageSrc={source()} />
+      <UserAvatar {...avatarIdentity} />
     ));
     const avatar = container.querySelector("[data-user-avatar]")!;
     const firstImage = container.querySelector("img")!;
     fireEvent.load(firstImage);
     expect(avatar).toHaveAttribute("data-avatar-source", "local-image");
 
-    setSource("blob:https://veil.local/avatar-2");
+    installNativeAvatar(avatarIdentity, "550e8400-e29b-41d4-a716-446655440002", "/9j/2Q==");
     const replacementImage = container.querySelector("img")!;
     expect(replacementImage).toHaveAttribute("src", "blob:https://veil.local/avatar-2");
     expect(replacementImage).toHaveStyle({ opacity: "0" });
@@ -250,13 +272,14 @@ describe("UserAvatar", () => {
     expect(container.querySelector("img")).not.toBeInTheDocument();
     expect(avatar).toHaveAttribute("data-avatar-source", "phaseprint");
 
-    setSource("blob:https://veil.local/avatar-1");
+    installNativeAvatar(avatarIdentity, "550e8400-e29b-41d4-a716-446655440003", "/9j/2Q==");
     const remountedFirstSource = container.querySelector("img")!;
-    fireEvent.load(firstImage);
+    expect(remountedFirstSource).toHaveAttribute("src", "blob:https://veil.local/avatar-3");
+    fireEvent.load(replacementImage);
     expect(avatar).toHaveAttribute("data-avatar-source", "phaseprint");
     fireEvent.load(remountedFirstSource);
     expect(avatar).toHaveAttribute("data-avatar-source", "local-image");
-    fireEvent.error(firstImage);
+    fireEvent.error(replacementImage);
     expect(avatar).toHaveAttribute("data-avatar-source", "local-image");
   });
 });

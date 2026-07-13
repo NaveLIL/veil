@@ -38,10 +38,14 @@ func main() {
 		log.Fatalf("database connection failed: %v", err)
 	}
 	defer database.Close()
+	if err := database.ValidateCryptographicPublicKeys(ctx); err != nil {
+		log.Fatalf("database cryptographic-key preflight failed: %v", err)
+	}
 	log.Println("database connected")
 
 	authSvc := auth.NewService(database, cfg)
 	signedMw := authmw.New(authSvc.SigningKeyLookup())
+	defer signedMw.Close()
 	rl := authmw.NewRateLimit(240, time.Minute)
 	defer rl.Close()
 	preAuthRL := authmw.NewRateLimit(600, time.Minute)

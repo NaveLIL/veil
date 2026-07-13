@@ -55,6 +55,7 @@ export interface RightIslandProps {
   identityVerification?: IdentityVerificationView | null;
   identityVerificationBusy?: boolean;
   identityVerificationError?: string;
+  returnFocusTo?: HTMLElement | null;
   serverId: string | null;
   contextName?: string;
   canonicalServerOrigin?: string;
@@ -108,7 +109,7 @@ const MemberIdentityButton: Component<MemberIdentityButtonProps> = (props) => (
     <div style={{ flex: "1", "min-width": "0" }}>
       <div class="veil-member-identity-name">{props.displayName}</div>
       <Show when={props.badgeText}>
-        <div style={{ "font-size": "9px", color: props.badgeColor ?? "var(--veil-accent)", "font-weight": "600" }}>
+        <div style={{ "font-size": "10px", color: props.badgeColor ?? "var(--veil-accent)", "font-weight": "600" }}>
           {props.badgeText}
         </div>
       </Show>
@@ -207,11 +208,26 @@ const GroupMemberRow: Component<{
   let rowRoot: HTMLDivElement | undefined;
   let registeredTrigger: HTMLButtonElement | null = null;
   let registeredProfile: IdentityIslandProfile | null = null;
+  let disposed = false;
+  let openFrame: number | undefined;
   const rowTrigger = () => rowRoot?.querySelector<HTMLButtonElement>("[data-identity-trigger='v1']") ?? null;
   const openFromMenu = () => {
     const trigger = rowTrigger();
     const nextProfile = profile();
-    queueMicrotask(() => props.onOpen(nextProfile, trigger ?? undefined));
+    const expectedProfileKey = identityProfileKey(nextProfile);
+    queueMicrotask(() => {
+      if (disposed) return;
+      openFrame = window.requestAnimationFrame(() => {
+        openFrame = undefined;
+        if (
+          disposed
+          || !props.shell.open
+          || !trigger?.isConnected
+          || identityProfileKey(profile()) !== expectedProfileKey
+        ) return;
+        props.onOpen(nextProfile, trigger);
+      });
+    });
   };
 
   onMount(() => {
@@ -220,6 +236,8 @@ const GroupMemberRow: Component<{
     props.onRegisterTrigger(registeredProfile, registeredTrigger);
   });
   onCleanup(() => {
+    disposed = true;
+    if (openFrame !== undefined) window.cancelAnimationFrame(openFrame);
     if (registeredProfile) props.onRegisterTrigger(registeredProfile, null, registeredTrigger);
   });
 
@@ -278,11 +296,26 @@ const ServerMemberRow: Component<{
   let rowRoot: HTMLDivElement | undefined;
   let registeredTrigger: HTMLButtonElement | null = null;
   let registeredProfile: IdentityIslandProfile | null = null;
+  let disposed = false;
+  let openFrame: number | undefined;
   const rowTrigger = () => rowRoot?.querySelector<HTMLButtonElement>("[data-identity-trigger='v1']") ?? null;
   const openFromMenu = () => {
     const trigger = rowTrigger();
     const nextProfile = profile();
-    queueMicrotask(() => props.onOpen(nextProfile, trigger ?? undefined));
+    const expectedProfileKey = identityProfileKey(nextProfile);
+    queueMicrotask(() => {
+      if (disposed) return;
+      openFrame = window.requestAnimationFrame(() => {
+        openFrame = undefined;
+        if (
+          disposed
+          || !props.shell.open
+          || !trigger?.isConnected
+          || identityProfileKey(profile()) !== expectedProfileKey
+        ) return;
+        props.onOpen(nextProfile, trigger);
+      });
+    });
   };
 
   onMount(() => {
@@ -291,6 +324,8 @@ const ServerMemberRow: Component<{
     props.onRegisterTrigger(registeredProfile, registeredTrigger);
   });
   onCleanup(() => {
+    disposed = true;
+    if (openFrame !== undefined) window.cancelAnimationFrame(openFrame);
     if (registeredProfile) props.onRegisterTrigger(registeredProfile, null, registeredTrigger);
   });
 
@@ -397,6 +432,7 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
   let wideBackButton: HTMLButtonElement | undefined;
   let wideIdentityCloseButton: HTMLButtonElement | undefined;
   let wideMembersCloseButton: HTMLButtonElement | undefined;
+  let wideIslandElement: HTMLElement | undefined;
   let previousView = props.view;
   let previousOpen = false;
   let previousNarrow = false;
@@ -427,6 +463,7 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
   const openMemberIdentity = (profile: IdentityIslandProfile, trigger?: HTMLButtonElement) => {
     lastMemberProfileKey = identityProfileKey(profile);
     if (trigger) lastMemberTrigger = trigger;
+    handoffWideFocusBeforeViewChange(true);
     props.onOpenIdentity(profile);
   };
 
@@ -447,13 +484,43 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
       || target.getAttribute("aria-disabled") === "true"
     ) return false;
     target.focus({ preventScroll: true });
-    return true;
+    return document.activeElement === target;
   };
 
   const focusLastMember = () => {
     const mapped = lastMemberProfileKey ? memberTriggers.get(lastMemberProfileKey) : undefined;
     if (focusElement(lastMemberTrigger)) return;
-    if (focusElement(mapped)) lastMemberTrigger = mapped ?? null;
+    if (focusElement(mapped)) {
+      lastMemberTrigger = mapped ?? null;
+      return;
+    }
+    if (!narrow()) focusElement(wideMembersCloseButton);
+  };
+
+  const handoffWideFocusBeforeViewChange = (force = false) => {
+    if (!props.open || narrow() || !wideIslandElement) return;
+    const active = document.activeElement;
+    if (
+      force
+      || (active instanceof Node && wideIslandElement.contains(active))
+      || !(active instanceof HTMLElement)
+      || !active.isConnected
+    ) {
+      focusElement(wideIslandElement);
+    }
+  };
+
+  const requestBackToMembers = () => {
+    handoffWideFocusBeforeViewChange(true);
+    props.onBackToMembers();
+  };
+
+  const requestClose = () => {
+    if (!narrow() && !focusElement(props.returnFocusTo)) {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && wideIslandElement?.contains(active)) active.blur();
+    }
+    props.onClose();
   };
 
   const focusWideIdentityHeader = () => {
@@ -486,6 +553,7 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
     const enteredWide = open && !isNarrow && (!previousOpen || previousNarrow);
 
     if (open && !isNarrow && (enteredWide || viewChanged)) {
+      if (viewChanged) handoffWideFocusBeforeViewChange();
       if (view === "identity") scheduleFocus(focusWideIdentityHeader);
       else if (viewChanged) scheduleFocus(() => {
         if (props.open && !narrow() && props.view === "members") focusLastMember();
@@ -600,7 +668,7 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
           type="button"
           class="veil-right-island-header-button"
           aria-label="Back to Members"
-          onClick={props.onBackToMembers}
+          onClick={requestBackToMembers}
         >
           <ArrowLeft size={15} strokeWidth={1.9} />
         </button>
@@ -614,7 +682,7 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
         type="button"
         class="veil-right-island-header-button"
         aria-label={`Close ${headerProps.title}`}
-        onClick={props.onClose}
+        onClick={requestClose}
       >
         <X size={14} strokeWidth={1.9} />
       </button>
@@ -632,12 +700,14 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
     ) return;
     event.preventDefault();
     event.stopPropagation();
-    props.onClose();
+    requestClose();
   };
 
   return (
     <>
       <aside
+        ref={wideIslandElement}
+        tabIndex={-1}
         class="veil-members-island-wrapper veil-right-island-wrapper"
         classList={{ "is-open": wideOpen() }}
         aria-label={props.view === "identity" ? "Identity" : "Conversation members"}
@@ -687,7 +757,7 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
           title={props.view === "identity" ? "Identity" : `Members — ${memberCount()}`}
           side="right"
           size="min(360px, calc(100vw - 24px))"
-          onBack={props.view === "identity" && props.identityBackToMembers ? props.onBackToMembers : undefined}
+          onBack={props.view === "identity" && props.identityBackToMembers ? requestBackToMembers : undefined}
           backLabel="Back to Members"
           bodyPadding="0"
         >

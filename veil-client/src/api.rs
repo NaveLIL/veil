@@ -4,7 +4,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
-use veil_crypto::fingerprint;
 use veil_crypto::kdf;
 use veil_crypto::keys::{generate_mnemonic, validate_mnemonic, IdentityKeyPair};
 use veil_crypto::ratchet::{MessageHeader, RatchetSession};
@@ -16,7 +15,7 @@ use veil_store::db::{
     IncomingSenderKeyRouteV1, LocalPreKey, PendingSenderKeyDeviceEnvelopeV1, VeilDb,
 };
 use veil_store::models::{
-    AccountSnapshot, ConversationType, RemoteMessageStateKind, RemoteReaction,
+    AccountSnapshot, ConversationType, MessageAuthorContext, RemoteMessageStateKind, RemoteReaction,
 };
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -1204,12 +1203,6 @@ impl VeilClient {
     pub fn sign_message(&self, message: &[u8]) -> Result<[u8; 64], String> {
         let id = self.identity.as_ref().ok_or("not initialized")?;
         Ok(veil_crypto::signature::sign(id, message))
-    }
-
-    /// Generate a fingerprint for contact verification.
-    pub fn fingerprint(&self, peer_key: &[u8; 32]) -> Result<(String, String), String> {
-        let our_key = self.identity_key()?;
-        Ok(fingerprint::generate(&our_key, peer_key))
     }
 
     // ─── Connection ──────────────────────────────────
@@ -3689,6 +3682,7 @@ impl VeilClient {
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
         author_snapshot: Option<&AccountSnapshot>,
+        author_context: Option<MessageAuthorContext>,
         sender_key_mode: bool,
         security_context: Option<&MessageSecurityContextV1>,
         fallback_conversation_name: Option<&str>,
@@ -3704,6 +3698,7 @@ impl VeilClient {
             conversation_id,
             sender_identity_key,
             author_snapshot,
+            author_context,
             sender_key_mode,
             security_context,
             fallback_conversation_name,
@@ -3725,6 +3720,7 @@ impl VeilClient {
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
         author_snapshot: Option<&AccountSnapshot>,
+        author_context: Option<MessageAuthorContext>,
         sender_key_mode: bool,
         security_context: Option<&MessageSecurityContextV1>,
         fallback_conversation_name: Option<&str>,
@@ -3739,6 +3735,11 @@ impl VeilClient {
         }
         if header.is_empty() || ciphertext.is_empty() {
             return Err("inbound E2E header and ciphertext must not be empty".to_string());
+        }
+        if author_snapshot.is_some() != author_context.is_some() {
+            return Err(
+                "inbound author snapshot and observation context must be paired".to_string(),
+            );
         }
         if !sender_key_mode && !self.trusted_signing_keys.contains_key(sender_identity_key) {
             return Err("inbound sender identity is not pinned to a signing key".to_string());
@@ -3777,11 +3778,17 @@ impl VeilClient {
                 .ok_or("database not initialized")?
                 .message_exists(message_id)?
             {
-                if let Some(author_snapshot) = author_snapshot {
+                if let (Some(author_snapshot), Some(author_context)) =
+                    (author_snapshot, author_context)
+                {
                     self.db
                         .as_ref()
                         .ok_or("database not initialized")?
-                        .attach_message_author(message_id, author_snapshot)?;
+                        .attach_message_author_with_context(
+                            message_id,
+                            author_snapshot,
+                            author_context,
+                        )?;
                 }
                 return Ok(ReceiveMessageResult::Duplicate);
             }
@@ -3829,11 +3836,16 @@ impl VeilClient {
                     server_timestamp,
                     reply_to_id,
                 )?;
-            if let Some(author_snapshot) = author_snapshot {
+            if let (Some(author_snapshot), Some(author_context)) = (author_snapshot, author_context)
+            {
                 self.db
                     .as_ref()
                     .ok_or("database not initialized")?
-                    .attach_message_author(message_id, author_snapshot)?;
+                    .attach_message_author_with_context(
+                        message_id,
+                        author_snapshot,
+                        author_context,
+                    )?;
             }
             if let Some(metadata) = remote_metadata {
                 let db = self.db.as_ref().ok_or("database not initialized")?;
@@ -4084,6 +4096,7 @@ impl VeilClient {
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
         author_snapshot: Option<&AccountSnapshot>,
+        author_context: Option<MessageAuthorContext>,
         sender_key_mode: bool,
         header: &[u8],
         ciphertext: &[u8],
@@ -4095,6 +4108,7 @@ impl VeilClient {
             conversation_id,
             sender_identity_key,
             author_snapshot,
+            author_context,
             sender_key_mode,
             header,
             ciphertext,
@@ -4109,6 +4123,7 @@ impl VeilClient {
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
         author_snapshot: Option<&AccountSnapshot>,
+        author_context: Option<MessageAuthorContext>,
         sender_key_mode: bool,
         header: &[u8],
         ciphertext: &[u8],
@@ -4119,6 +4134,9 @@ impl VeilClient {
                 "encrypted group/channel edits are disabled until an exact device edit protocol exists"
                     .to_string(),
             );
+        }
+        if author_snapshot.is_some() != author_context.is_some() {
+            return Err("edit author snapshot and observation context must be paired".to_string());
         }
         if !self.trusted_signing_keys.contains_key(sender_identity_key) {
             return Err("edit sender identity is not pinned to a signing key".to_string());
@@ -4166,8 +4184,9 @@ impl VeilClient {
                 sender_identity_key,
                 &plaintext,
             )?;
-            if let Some(author_snapshot) = author_snapshot {
-                db.attach_message_author(message_id, author_snapshot)?;
+            if let (Some(author_snapshot), Some(author_context)) = (author_snapshot, author_context)
+            {
+                db.attach_message_author_with_context(message_id, author_snapshot, author_context)?;
             }
             if let Some(metadata) = remote_metadata {
                 db.record_remote_message_state(
@@ -6322,6 +6341,7 @@ mod tests {
                     "dm-restart",
                     &bob_key,
                     None,
+                    None,
                     false,
                     None,
                     Some("Bob"),
@@ -6426,6 +6446,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 None,
+                None,
                 false,
                 None,
                 Some("Alice"),
@@ -6450,6 +6471,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 Some(&wrong_origin_author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
                 false,
                 None,
                 Some("Alice"),
@@ -6479,6 +6501,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 Some(&author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
                 false,
                 None,
                 Some("Alice"),
@@ -6510,6 +6533,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 Some(&author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
                 false,
                 None,
                 Some("Alice"),
@@ -6567,6 +6591,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 Some(&author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
                 false,
                 &edit_header,
                 &edit_ciphertext,
@@ -6591,6 +6616,7 @@ mod tests {
                 "dm-atomic",
                 &alice_key,
                 Some(&author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
                 false,
                 &edit_header,
                 &edit_ciphertext,

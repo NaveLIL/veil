@@ -137,6 +137,19 @@ export function identityProofState(profile: IdentityIslandProfile): IdentityProo
   return "not-compared";
 }
 
+export function mergeIdentityProofState(
+  profile: IdentityIslandProfile,
+  next: IdentityIslandProfile["localProofState"],
+): IdentityIslandProfile {
+  // Identity-change observations are durable and never auto-cleared by the
+  // native store. Mirror that monotonicity in renderer state so an older async
+  // profile/proof response cannot visually downgrade an active quarantine.
+  if (profile.localProofState === "identity_changed" && next !== "identity_changed") {
+    return profile;
+  }
+  return { ...profile, localProofState: next };
+}
+
 export function canMessageIdentity(
   profile: IdentityIslandProfile,
   currentCanonicalOrigin: string | null | undefined,
@@ -152,6 +165,14 @@ export function canMessageIdentity(
     && targetUserId !== selfUserId;
 }
 
+export function messageAuthorContextLabel(
+  context: string | null | undefined,
+  isSelf: boolean,
+): "Your message" | "Former member" | "Message author" {
+  if (isSelf) return "Your message";
+  return context === "former_member_at_observation" ? "Former member" : "Message author";
+}
+
 export function identityProfileKey(profile: IdentityIslandProfile): string {
   return [
     canonicalIdentityOrigin(profile.canonicalServerOrigin) ?? "origin-unavailable",
@@ -159,4 +180,37 @@ export function identityProfileKey(profile: IdentityIslandProfile): string {
     canonicalIdentityKey(profile.identityKey) ?? "key-unavailable",
     profile.contextKind,
   ].join("\0");
+}
+
+export function identityProfileMatchesAuthenticatedOrigin(
+  profile: IdentityIslandProfile,
+  authenticatedOrigin: string | null | undefined,
+): boolean {
+  const profileOrigin = canonicalIdentityOrigin(profile.canonicalServerOrigin);
+  const scopeOrigin = canonicalIdentityOrigin(authenticatedOrigin);
+  return !!profileOrigin && profileOrigin === scopeOrigin;
+}
+
+export function identityVerificationMatchesProfile(
+  verification: {
+    canonicalServerOrigin: string | null | undefined;
+    userId: string | null | undefined;
+    identityKey: string | null | undefined;
+    signingKey: string | null | undefined;
+  },
+  profile: IdentityIslandProfile,
+): boolean {
+  const verificationOrigin = canonicalIdentityOrigin(verification.canonicalServerOrigin);
+  const verificationUserId = canonicalIdentityUserId(verification.userId);
+  const verificationIdentityKey = canonicalIdentityKey(verification.identityKey);
+  const verificationSigningKey = canonicalIdentityKey(verification.signingKey);
+  const profileSigningKey = canonicalIdentityKey(profile.signingKey);
+  return !!verificationOrigin
+    && !!verificationUserId
+    && !!verificationIdentityKey
+    && !!verificationSigningKey
+    && verificationOrigin === canonicalIdentityOrigin(profile.canonicalServerOrigin)
+    && verificationUserId === canonicalIdentityUserId(profile.userId)
+    && verificationIdentityKey === canonicalIdentityKey(profile.identityKey)
+    && (!profileSigningKey || verificationSigningKey === profileSigningKey);
 }

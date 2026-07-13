@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -36,6 +37,13 @@ type fakeStore struct {
 	recipients     []string
 	recipientsErr  error
 	avatar         *AvatarAsset
+}
+
+type countingReader struct{ reads int }
+
+func (r *countingReader) Read([]byte) (int, error) {
+	r.reads++
+	return 0, io.EOF
 }
 
 func (s *fakeStore) UpdateAvatar(_ context.Context, userID string, version int64, asset *AvatarAsset) (*Profile, error) {
@@ -106,14 +114,14 @@ func newSignedMux(t *testing.T, store Store, broadcasters ...Broadcaster) (*http
 	if len(broadcasters) > 0 {
 		broadcaster = broadcasters[0]
 	}
-	handler := NewHandler(store, middleware, nil, broadcaster)
+	handler := NewHandler(store, middleware, nil, nil, broadcaster)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 	return mux, privateKey
 }
 
 func TestRoutesRequireVerifiedPrincipalEvenWithoutMiddleware(t *testing.T) {
-	handler := NewHandler(&fakeStore{}, nil, nil, nil)
+	handler := NewHandler(&fakeStore{}, nil, nil, nil, nil)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 
@@ -129,6 +137,27 @@ func TestRoutesRequireVerifiedPrincipalEvenWithoutMiddleware(t *testing.T) {
 		if response.Code != http.StatusUnauthorized {
 			t.Fatalf("%s %s status=%d, want 401", request.Method, request.URL.Path, response.Code)
 		}
+	}
+}
+
+func TestAvatarAdmissionRejectsBeforeDownstreamBodyReads(t *testing.T) {
+	handler := NewHandler(&fakeStore{}, nil, nil, nil, nil)
+	for range cap(handler.avatarAdmission) {
+		handler.avatarAdmission <- struct{}{}
+	}
+	defer func() {
+		for range cap(handler.avatarAdmission) {
+			<-handler.avatarAdmission
+		}
+	}()
+	reader := &countingReader{}
+	request := httptest.NewRequest(http.MethodPut, "/v1/users/me/profile/avatar?expected_version=0", reader)
+	response := httptest.NewRecorder()
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || reader.reads != 0 {
+		t.Fatalf("status=%d body reads=%d, want 429 before body read", response.Code, reader.reads)
 	}
 }
 
@@ -173,6 +202,46 @@ func TestUpdateAudienceFailureDoesNotRewriteCommittedSuccess(t *testing.T) {
 		`{"expected_version":1,"about":"safe"}`))
 	if response.Code != http.StatusOK || len(broadcaster.calls) != 0 {
 		t.Fatalf("status=%d broadcasts=%d body=%s", response.Code, len(broadcaster.calls), response.Body.String())
+	}
+}
+
+func TestProfileMutationLimiterRunsAfterVerifiedPrincipal(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	middleware := authmw.New(authmw.LookupFunc(func(context.Context, string) (ed25519.PublicKey, error) {
+		return publicKey, nil
+	}))
+	t.Cleanup(middleware.Close)
+	mutationLimiter := authmw.NewRateLimit(1, time.Hour)
+	t.Cleanup(mutationLimiter.Close)
+	store := &fakeStore{profile: &Profile{
+		UserID: testUserID, Username: "alice", ProfileVersion: 1,
+		ProfileUpdatedAt: time.Unix(1, 0).UTC(),
+	}}
+	handler := NewHandler(store, middleware, nil, mutationLimiter, nil)
+	mux := http.NewServeMux()
+	handler.RegisterRoutes(mux)
+
+	first := httptest.NewRecorder()
+	mux.ServeHTTP(first, requestWithPrincipal(t, privateKey, http.MethodPut,
+		"/v1/users/me/profile", `{"expected_version":0,"about":"first"}`))
+	if first.Code != http.StatusOK {
+		t.Fatalf("first mutation status=%d body=%s", first.Code, first.Body.String())
+	}
+	second := httptest.NewRecorder()
+	mux.ServeHTTP(second, requestWithPrincipal(t, privateKey, http.MethodPut,
+		"/v1/users/me/profile", `{"expected_version":0,"about":"second"}`))
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second mutation status=%d body=%s", second.Code, second.Body.String())
+	}
+
+	read := httptest.NewRecorder()
+	mux.ServeHTTP(read, requestWithPrincipal(t, privateKey, http.MethodGet,
+		"/v1/users/"+testUserID+"/profile", ""))
+	if read.Code != http.StatusOK {
+		t.Fatalf("read was incorrectly charged to mutation limiter: status=%d body=%s", read.Code, read.Body.String())
 	}
 }
 
@@ -258,5 +327,20 @@ func TestAvatarRoutesRequireSignedExactVersionAndServeOnlyNormalizedBytes(t *tes
 	if getResponse.Code != http.StatusOK || getResponse.Header().Get("Content-Type") != "image/jpeg" ||
 		getResponse.Header().Get("Cache-Control") != "private, no-store" || !bytes.Equal(getResponse.Body.Bytes(), store.avatar.Data) {
 		t.Fatalf("unexpected avatar response: status=%d headers=%v bytes=%d", getResponse.Code, getResponse.Header(), getResponse.Body.Len())
+	}
+}
+
+func TestAvatarUploadQuotaReturnsBoundedRetryableError(t *testing.T) {
+	store := &fakeStore{updateErr: ErrAvatarUploadQuota}
+	mux, privateKey := newSignedMux(t, store)
+	pngBytes := encodedAvatar(t, "png", 8, 8)
+	request := requestWithPrincipal(t, privateKey, http.MethodPut,
+		"/v1/users/me/profile/avatar?expected_version=3", string(pngBytes))
+	request.Header.Set("Content-Type", "image/png")
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, request)
+	if response.Code != http.StatusTooManyRequests || response.Header().Get("Retry-After") == "" ||
+		!strings.Contains(response.Body.String(), "avatar_upload_quota") {
+		t.Fatalf("unexpected quota response: status=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
 	}
 }

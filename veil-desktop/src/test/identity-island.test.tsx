@@ -8,9 +8,13 @@ import {
   canMessageIdentity,
   canonicalIdentityOrigin,
   identityAllowsKeylessDmResolution,
+  identityProfileMatchesAuthenticatedOrigin,
   identityProofState,
+  identityVerificationMatchesProfile,
   IDENTITY_ROLE_PRESENTATION_BUDGET,
   isSameCanonicalIdentity,
+  messageAuthorContextLabel,
+  mergeIdentityProofState,
   type IdentityIslandProfile,
 } from "@/components/identity/identityProfile";
 import { RightIsland, type RightIslandView } from "@/components/layout/RightIsland";
@@ -91,6 +95,7 @@ describe("Identity Island", () => {
     expect(screen.getByRole("heading", { name: "Identity Proof" })).toBeInTheDocument();
     expect(screen.getByText("Not compared")).toBeInTheDocument();
     expect(screen.getByText(/service-mediated TOFU/)).toBeInTheDocument();
+    expect(screen.getByText(ORIGIN)).toBeInTheDocument();
     expect(screen.queryByText(/^Verified$/i)).not.toBeInTheDocument();
     expect(identityProofState(profile())).toBe("not-compared");
     expect(canMessageIdentity(profile(), ORIGIN, SELF_ID)).toBe(true);
@@ -106,11 +111,43 @@ describe("Identity Island", () => {
     expect(message).toHaveBeenCalledOnce();
   });
 
+  it("keeps exact origin schemes visible and contains hostile bounded profile text", () => {
+    const longUsername = "u".repeat(96);
+    const longAbout = "a".repeat(280);
+    render(() => (
+      <IdentityIslandContent
+        profile={{
+          ...completeProfile,
+          canonicalServerOrigin: "http://127.0.0.1:443",
+          technicalUsername: longUsername,
+          displayName: "Local account",
+          about: longAbout,
+        }}
+        canMessage={false}
+        onMessage={vi.fn()}
+      />
+    ));
+
+    expect(screen.getByText("http://127.0.0.1:443")).toBeInTheDocument();
+    const username = screen.getByText(`@${longUsername}`);
+    expect(username).toHaveStyle({
+      maxWidth: "100%",
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      whiteSpace: "nowrap",
+    });
+    expect(screen.getByText(longAbout)).toHaveStyle({
+      overflowWrap: "anywhere",
+      wordBreak: "break-word",
+      maxWidth: "100%",
+    });
+  });
+
   it("shows bounded network profile text and truthful device-local proof states", () => {
     const [profile, setProfile] = createSignal<IdentityIslandProfile>({
       ...completeProfile,
       about: "Quietly building secure things.",
-      profileVersion: "18446744073709551615",
+      profileVersion: "9223372036854775807",
       localProofState: "verified_on_this_device",
     });
     render(() => (
@@ -124,13 +161,58 @@ describe("Identity Island", () => {
 
     expect(screen.getByText("Quietly building secure things.")).toBeInTheDocument();
     expect(screen.getByText("Verified on this device")).toBeInTheDocument();
-    expect(screen.getByText("18446744073709551615")).toBeInTheDocument();
+    expect(screen.getByText("9223372036854775807")).toBeInTheDocument();
     expect(identityProofState(profile())).toBe("verified-on-device");
 
     setProfile({ ...profile(), localProofState: "identity_changed" });
     expect(screen.getByText("Identity changed")).toBeInTheDocument();
     expect(screen.getByText(/blocking identity change/)).toBeInTheDocument();
     expect(identityProofState(profile())).toBe("identity-changed");
+  });
+
+  it("never lets a stale async proof downgrade an identity-change quarantine", () => {
+    const quarantined = mergeIdentityProofState(completeProfile, "identity_changed");
+    const staleVerified = mergeIdentityProofState(quarantined, "verified_on_this_device");
+    const staleNotCompared = mergeIdentityProofState(staleVerified, "not_compared");
+
+    expect(staleVerified).toBe(quarantined);
+    expect(staleNotCompared).toBe(quarantined);
+    expect(identityProofState(staleNotCompared)).toBe("identity-changed");
+  });
+
+  it("labels immutable historical author snapshots as former members", () => {
+    expect(messageAuthorContextLabel("former_member_at_observation", false)).toBe("Former member");
+    expect(messageAuthorContextLabel("directory_member_at_observation", false)).toBe("Message author");
+    expect(messageAuthorContextLabel("former_member_at_observation", true)).toBe("Your message");
+    expect(messageAuthorContextLabel("untrusted_value", false)).toBe("Message author");
+  });
+
+  it("never applies proof from another self-hosted origin with the same UUID and key", () => {
+    const sameLocatorOtherOrigin = {
+      canonicalServerOrigin: "https://other.example.test:443",
+      userId: completeProfile.userId,
+      identityKey: completeProfile.identityKey,
+      signingKey: completeProfile.signingKey,
+    };
+
+    expect(identityProfileMatchesAuthenticatedOrigin(completeProfile, ORIGIN)).toBe(true);
+    expect(identityProfileMatchesAuthenticatedOrigin(
+      completeProfile,
+      sameLocatorOtherOrigin.canonicalServerOrigin,
+    )).toBe(false);
+    expect(identityVerificationMatchesProfile(sameLocatorOtherOrigin, completeProfile)).toBe(false);
+    expect(identityVerificationMatchesProfile({
+      canonicalServerOrigin: ORIGIN,
+      userId: completeProfile.userId,
+      identityKey: completeProfile.identityKey,
+      signingKey: completeProfile.signingKey,
+    }, completeProfile)).toBe(true);
+    expect(identityVerificationMatchesProfile({
+      canonicalServerOrigin: ORIGIN,
+      userId: completeProfile.userId,
+      identityKey: completeProfile.identityKey,
+      signingKey: "99".repeat(32),
+    }, completeProfile)).toBe(false);
   });
 
   it("keeps retained identity visible while live profile refresh fails", () => {
@@ -166,6 +248,7 @@ describe("Identity Island", () => {
     ));
 
     await user.click(screen.getByRole("button", { name: "Edit profile" }));
+    expect(screen.getByRole("note")).toHaveTextContent(/visible to this server.*not end-to-end encrypted/i);
     const displayName = screen.getByLabelText("Display name");
     const about = screen.getByLabelText("About");
     await user.clear(displayName);
@@ -174,6 +257,11 @@ describe("Identity Island", () => {
     fireEvent.input(about, { target: { value: "safe\u202eevil" } });
     await user.click(screen.getByRole("button", { name: "Save profile" }));
 
+    expect(screen.getByRole("alert")).toHaveTextContent("unsafe controls");
+    expect(saveProfile).not.toHaveBeenCalled();
+
+    fireEvent.input(about, { target: { value: "safe\u200bhidden" } });
+    await user.click(screen.getByRole("button", { name: "Save profile" }));
     expect(screen.getByRole("alert")).toHaveTextContent("unsafe controls");
     expect(saveProfile).not.toHaveBeenCalled();
 
@@ -189,6 +277,8 @@ describe("Identity Island", () => {
       canonicalServerOrigin: ORIGIN,
       userId: USER_ID,
       identityKey: IDENTITY_KEY,
+      signingKey: "42".repeat(32),
+      fingerprintVersion: "account_v2",
       fingerprintHex,
       fingerprintEmoji: "🔒".repeat(32),
       proofState: "not_compared",
@@ -214,11 +304,40 @@ describe("Identity Island", () => {
     expect(screen.queryByText(/Compare the entire fingerprint/)).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Compare identity" }));
     expect(load).toHaveBeenCalledOnce();
+    expect(screen.getByText(/Account fingerprint v2 binds this server origin/)).toBeInTheDocument();
     expect(screen.getByText(/Compare the entire fingerprint/)).toBeInTheDocument();
     expect(screen.getByText(/5151 5151 5151/)).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "I compared this exact fingerprint" }));
     expect(confirm).toHaveBeenCalledWith(fingerprintHex);
+  });
+
+  it("keeps a quarantined identity change blocking and non-dismissible", () => {
+    const confirm = vi.fn();
+    const changed: IdentityVerificationView = {
+      canonicalServerOrigin: ORIGIN,
+      userId: USER_ID,
+      identityKey: IDENTITY_KEY,
+      signingKey: "42".repeat(32),
+      fingerprintVersion: "account_v2",
+      fingerprintHex: "61".repeat(32),
+      fingerprintEmoji: "⚠️".repeat(16),
+      proofState: "identity_changed",
+    };
+    render(() => (
+      <IdentityIslandContent
+        profile={{ ...completeProfile, localProofState: "identity_changed" }}
+        canMessage={false}
+        verification={changed}
+        onMessage={vi.fn()}
+        onConfirmVerification={confirm}
+      />
+    ));
+
+    expect(screen.getByText("Identity changed")).toBeInTheDocument();
+    expect(screen.getByText(/different encryption or signing key/i)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "I compared this exact fingerprint" })).not.toBeInTheDocument();
+    expect(confirm).not.toHaveBeenCalled();
   });
 
   it("keeps incomplete account coordinates read-only and rejects insecure origins", () => {
@@ -270,6 +389,8 @@ describe("Identity Island", () => {
   it("morphs one wide island Members to Identity and restores the exact context-menu trigger", async () => {
     const [view, setView] = createSignal<RightIslandView>("members");
     const [profile, setProfile] = createSignal<IdentityIslandProfile | null>(null);
+    let focusDuringIdentityHandoff: Element | null = null;
+    let focusDuringMembersHandoff: Element | null = null;
     const noop = vi.fn();
     const { container } = render(() => (
       <RightIsland
@@ -288,8 +409,15 @@ describe("Identity Island", () => {
         serverMembers={[]}
         serverRoles={[]}
         groupMembers={[member, secondMember]}
-        onOpenIdentity={(next) => { setProfile(next); setView("identity"); }}
-        onBackToMembers={() => setView("members")}
+        onOpenIdentity={(next) => {
+          focusDuringIdentityHandoff = document.activeElement;
+          setProfile(next);
+          setView("identity");
+        }}
+        onBackToMembers={() => {
+          focusDuringMembersHandoff = document.activeElement;
+          setView("members");
+        }}
         onClose={noop}
         onMessageIdentity={noop}
         onCreateDm={noop}
@@ -305,12 +433,14 @@ describe("Identity Island", () => {
     fireEvent.contextMenu(memberTrigger);
     await userEvent.setup().click(await screen.findByRole("menuitem", { name: "View Identity" }));
 
+    await waitFor(() => expect(focusDuringIdentityHandoff).toBe(island));
     expect(screen.getByRole("complementary", { name: "Identity" })).toBe(island);
     expect(screen.getByText("Not compared")).toBeInTheDocument();
     const back = screen.getByRole("button", { name: "Back to Members" });
     await waitFor(() => expect(back).toHaveFocus());
     await userEvent.setup().click(back);
 
+    expect(focusDuringMembersHandoff).toBe(island);
     expect(screen.getByRole("complementary", { name: "Conversation members" })).toBe(island);
     const restoredTrigger = screen.getByRole("button", { name: "View identity for quiet-comet" });
     expect(restoredTrigger).toBe(memberTrigger);
@@ -318,18 +448,19 @@ describe("Identity Island", () => {
     expect(container.querySelectorAll("[data-user-avatar]")).toHaveLength(2);
   });
 
-  it("focuses Close for a standalone wide Identity view and closes it with unhandled Escape", async () => {
-    const [open, setOpen] = createSignal(true);
-    const close = vi.fn(() => setOpen(false));
+  it("falls back to the Members header when the selected member disappears", async () => {
+    const [view, setView] = createSignal<RightIslandView>("members");
+    const [members, setMembers] = createSignal<readonly GroupMember[]>([member]);
+    const [profile, setProfile] = createSignal<IdentityIslandProfile | null>(null);
     const noop = vi.fn();
     render(() => (
       <RightIsland
-        present={open()}
-        open={open()}
+        present
+        open
         visible
-        view="identity"
-        identityProfile={completeProfile}
-        identityBackToMembers={false}
+        view={view()}
+        identityProfile={profile()}
+        identityBackToMembers={view() === "identity"}
         identityCanMessage={false}
         identityMessageBusy={false}
         serverId={null}
@@ -337,10 +468,10 @@ describe("Identity Island", () => {
         currentUserId={SELF_ID}
         serverMembers={[]}
         serverRoles={[]}
-        groupMembers={[]}
-        onOpenIdentity={noop}
-        onBackToMembers={noop}
-        onClose={close}
+        groupMembers={members()}
+        onOpenIdentity={(next) => { setProfile(next); setView("identity"); }}
+        onBackToMembers={() => setView("members")}
+        onClose={noop}
         onMessageIdentity={noop}
         onCreateDm={noop}
         onAssignRole={noop}
@@ -348,6 +479,56 @@ describe("Identity Island", () => {
         onKickMember={noop}
         onInviteMember={noop}
       />
+    ));
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "View identity for quiet-orbit" }));
+    const back = screen.getByRole("button", { name: "Back to Members" });
+    await waitFor(() => expect(back).toHaveFocus());
+    setMembers([]);
+    expect(screen.queryByRole("button", { name: "View identity for quiet-orbit" })).not.toBeInTheDocument();
+
+    await userEvent.setup().click(back);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Close Members — 0" })).toHaveFocus());
+  });
+
+  it("focuses Close for a standalone wide Identity view and closes it with unhandled Escape", async () => {
+    const [open, setOpen] = createSignal(true);
+    const [returnTarget, setReturnTarget] = createSignal<HTMLButtonElement | null>(null);
+    const close = vi.fn(() => {
+      expect(returnTarget()).toHaveFocus();
+      setOpen(false);
+    });
+    const noop = vi.fn();
+    render(() => (
+      <>
+        <button ref={setReturnTarget} type="button">Return to chat</button>
+        <RightIsland
+          present={open()}
+          open={open()}
+          visible
+          view="identity"
+          identityProfile={completeProfile}
+          identityBackToMembers={false}
+          identityCanMessage={false}
+          identityMessageBusy={false}
+          returnFocusTo={returnTarget()}
+          serverId={null}
+          canonicalServerOrigin={ORIGIN}
+          currentUserId={SELF_ID}
+          serverMembers={[]}
+          serverRoles={[]}
+          groupMembers={[]}
+          onOpenIdentity={noop}
+          onBackToMembers={noop}
+          onClose={close}
+          onMessageIdentity={noop}
+          onCreateDm={noop}
+          onAssignRole={noop}
+          onUnassignRole={noop}
+          onKickMember={noop}
+          onInviteMember={noop}
+        />
+      </>
     ));
 
     const island = screen.getByRole("complementary", { name: "Identity" });
@@ -361,6 +542,59 @@ describe("Identity Island", () => {
 
     fireEvent.keyDown(island, { key: "Escape" });
     expect(close).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Return to chat" })).toHaveFocus();
+  });
+
+  it("blurs the wide island when a connected inert return target rejects focus", async () => {
+    const [open, setOpen] = createSignal(true);
+    const [returnTarget, setReturnTarget] = createSignal<HTMLButtonElement | null>(null);
+    let activeDuringClose: Element | null = null;
+    const noop = vi.fn();
+    render(() => (
+      <>
+        <div inert><button ref={setReturnTarget} type="button">Inert member trigger</button></div>
+        <RightIsland
+          present={open()}
+          open={open()}
+          visible
+          view="identity"
+          identityProfile={completeProfile}
+          identityBackToMembers={false}
+          identityCanMessage={false}
+          identityMessageBusy={false}
+          returnFocusTo={returnTarget()}
+          serverId={null}
+          canonicalServerOrigin={ORIGIN}
+          currentUserId={SELF_ID}
+          serverMembers={[]}
+          serverRoles={[]}
+          groupMembers={[]}
+          onOpenIdentity={noop}
+          onBackToMembers={noop}
+          onClose={() => {
+            activeDuringClose = document.activeElement;
+            setOpen(false);
+          }}
+          onMessageIdentity={noop}
+          onCreateDm={noop}
+          onAssignRole={noop}
+          onUnassignRole={noop}
+          onKickMember={noop}
+          onInviteMember={noop}
+        />
+      </>
+    ));
+
+    const island = screen.getByRole("complementary", { name: "Identity" });
+    const closeButton = screen.getByRole("button", { name: "Close Identity" });
+    await waitFor(() => expect(closeButton).toHaveFocus());
+    const blockedTarget = returnTarget()!;
+    vi.spyOn(blockedTarget, "focus").mockImplementation(() => undefined);
+
+    fireEvent.keyDown(island, { key: "Escape" });
+    expect(blockedTarget.focus).toHaveBeenCalledOnce();
+    expect(activeDuringClose).toBe(document.body);
+    expect(blockedTarget).not.toHaveFocus();
   });
 
   it("retains bounded member rows for the non-interactive exit animation", async () => {

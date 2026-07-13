@@ -4,6 +4,7 @@ import {
   captureUiSessionEpoch,
   isUiSessionEpochCurrent,
   type Channel,
+  type IdentityVerificationView,
   type Role,
   type ServerMember,
 } from "@/stores/app";
@@ -19,8 +20,11 @@ import {
   canonicalIdentityKey,
   canonicalIdentityOrigin,
   canonicalIdentityUserId,
+  identityProfileMatchesAuthenticatedOrigin,
   identityProfileKey,
+  identityVerificationMatchesProfile,
   IDENTITY_ROLE_PRESENTATION_BUDGET,
+  mergeIdentityProofState,
   type IdentityIslandProfile,
 } from "@/components/identity/identityProfile";
 import {
@@ -112,8 +116,12 @@ export const ServerSettingsScreen: Component = () => {
   const [copied, setCopied] = createSignal("");
   const [selectedIdentity, setSelectedIdentity] = createSignal<IdentityIslandProfile | null>(null);
   const [identityMessageBusy, setIdentityMessageBusy] = createSignal(false);
+  const [identityVerification, setIdentityVerification] = createSignal<IdentityVerificationView | null>(null);
+  const [identityVerificationBusy, setIdentityVerificationBusy] = createSignal(false);
+  const [identityVerificationError, setIdentityVerificationError] = createSignal("");
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let identityMessageActionToken = 0;
+  let identityProofActionToken = 0;
   let closing = false;
   const later = (callback: () => void, delayMs: number) => {
     const timer = setTimeout(() => {
@@ -176,11 +184,20 @@ export const ServerSettingsScreen: Component = () => {
   };
   const closeSelectedIdentity = () => {
     invalidateIdentityMessageAction();
+    identityProofActionToken += 1;
+    setIdentityVerification(null);
+    setIdentityVerificationBusy(false);
+    setIdentityVerificationError("");
     setSelectedIdentity(null);
   };
   const openSelectedIdentity = (profile: IdentityIslandProfile) => {
     invalidateIdentityMessageAction();
+    identityProofActionToken += 1;
+    setIdentityVerification(null);
+    setIdentityVerificationBusy(false);
+    setIdentityVerificationError("");
     setSelectedIdentity(profile);
+    void hydrateSelectedIdentityProof(profile);
   };
 
   // ─── Lifecycle ─────────────────────────────────────
@@ -190,6 +207,7 @@ export const ServerSettingsScreen: Component = () => {
   });
   onCleanup(() => {
     identityMessageActionToken += 1;
+    identityProofActionToken += 1;
     timers.forEach(clearTimeout);
     timers.clear();
     document.removeEventListener("keydown", handleKey);
@@ -1051,6 +1069,174 @@ export const ServerSettingsScreen: Component = () => {
       && canonicalIdentityKey(identityKey) === current.identityKey;
   };
 
+  const hydrateSelectedIdentityProof = async (profile: IdentityIslandProfile) => {
+    const targetOrigin = canonicalIdentityOrigin(profile.canonicalServerOrigin);
+    const targetUserId = canonicalIdentityUserId(profile.userId);
+    const targetIdentityKey = canonicalIdentityKey(profile.identityKey);
+    if (!targetOrigin || !targetUserId || !targetIdentityKey) return;
+    const routeKey = identityProfileKey(profile);
+    const actionToken = ++identityProofActionToken;
+    const sessionEpoch = captureUiSessionEpoch();
+    setIdentityVerificationBusy(true);
+    setIdentityVerificationError("");
+    try {
+      const verification = await appStore.loadCachedIdentityVerification(
+        targetUserId,
+        targetIdentityKey,
+        targetOrigin,
+      );
+      const current = selectedIdentity();
+      if (
+        actionToken !== identityProofActionToken
+        || !isUiSessionEpochCurrent(sessionEpoch)
+        || !current
+        || identityProfileKey(current) !== routeKey
+      ) return;
+      setSelectedIdentity(mergeIdentityProofState(current, verification.proofState));
+    } catch {
+      // Missing self/origin binding cannot upgrade trust. The member directory
+      // snapshot stays visible and the proof remains fail-closed.
+    } finally {
+      if (actionToken === identityProofActionToken) setIdentityVerificationBusy(false);
+    }
+  };
+
+  const loadSelectedIdentityVerification = async (): Promise<IdentityVerificationView | null> => {
+    const profile = selectedIdentity();
+    const scope = appStore.authenticatedServerScope();
+    const targetUserId = canonicalIdentityUserId(profile?.userId);
+    const targetIdentityKey = canonicalIdentityKey(profile?.identityKey);
+    if (
+      !profile
+      || !scope
+      || !targetUserId
+      || !targetIdentityKey
+      || !appStore.connected()
+      || appStore.bindingTransitioning()
+      || appStore.originTransitioning()
+      || !identityProfileMatchesAuthenticatedOrigin(profile, scope.canonicalServerOrigin)
+      || isExactCurrentIdentity(profile.canonicalServerOrigin, targetUserId, targetIdentityKey)
+    ) return null;
+    const routeKey = identityProfileKey(profile);
+    const actionToken = ++identityProofActionToken;
+    const sessionEpoch = captureUiSessionEpoch();
+    setIdentityVerificationBusy(true);
+    setIdentityVerificationError("");
+    try {
+      const verification = await appStore.loadIdentityVerification(targetUserId, targetIdentityKey);
+      const current = selectedIdentity();
+      if (
+        actionToken !== identityProofActionToken
+        || !isUiSessionEpochCurrent(sessionEpoch)
+        || !current
+        || identityProfileKey(current) !== routeKey
+        || !identityVerificationMatchesProfile(verification, current)
+      ) return null;
+      setIdentityVerification(verification);
+      setSelectedIdentity(mergeIdentityProofState(
+        { ...current, signingKey: verification.signingKey },
+        verification.proofState,
+      ));
+      return verification;
+    } catch {
+      if (actionToken === identityProofActionToken) {
+        setIdentityVerificationError("Fingerprint unavailable for this exact identity.");
+      }
+      return null;
+    } finally {
+      if (actionToken === identityProofActionToken) setIdentityVerificationBusy(false);
+    }
+  };
+
+  const confirmSelectedIdentityVerification = async (
+    expectedFingerprintHex: string,
+  ): Promise<boolean> => {
+    const profile = selectedIdentity();
+    const displayed = identityVerification();
+    const scope = appStore.authenticatedServerScope();
+    const targetUserId = canonicalIdentityUserId(profile?.userId);
+    const targetIdentityKey = canonicalIdentityKey(profile?.identityKey);
+    if (
+      !profile
+      || !displayed
+      || !scope
+      || !targetUserId
+      || !targetIdentityKey
+      || !appStore.connected()
+      || appStore.bindingTransitioning()
+      || appStore.originTransitioning()
+      || !identityProfileMatchesAuthenticatedOrigin(profile, scope.canonicalServerOrigin)
+      || !identityVerificationMatchesProfile(displayed, profile)
+      || displayed.fingerprintHex !== expectedFingerprintHex
+    ) return false;
+    const routeKey = identityProfileKey(profile);
+    const actionToken = ++identityProofActionToken;
+    const sessionEpoch = captureUiSessionEpoch();
+    setIdentityVerificationBusy(true);
+    setIdentityVerificationError("");
+    try {
+      const verified = await appStore.confirmIdentityVerification(
+        targetUserId,
+        targetIdentityKey,
+        expectedFingerprintHex,
+      );
+      const current = selectedIdentity();
+      if (
+        actionToken !== identityProofActionToken
+        || !isUiSessionEpochCurrent(sessionEpoch)
+        || !current
+        || identityProfileKey(current) !== routeKey
+        || !identityVerificationMatchesProfile(verified, current)
+      ) return false;
+      setIdentityVerification(verified);
+      setSelectedIdentity(mergeIdentityProofState(
+        { ...current, signingKey: verified.signingKey },
+        verified.proofState,
+      ));
+      return verified.proofState === "verified_on_this_device";
+    } catch {
+      if (actionToken === identityProofActionToken) {
+        setIdentityVerificationError("Identity was not marked as verified. Compare again before retrying.");
+      }
+      return false;
+    } finally {
+      if (actionToken === identityProofActionToken) setIdentityVerificationBusy(false);
+    }
+  };
+
+  createEffect(() => {
+    const notice = appStore.identityChangeNotice();
+    const profile = selectedIdentity();
+    if (
+      !notice
+      || !profile
+      || canonicalIdentityOrigin(profile.canonicalServerOrigin) !== notice.canonicalServerOrigin
+      || canonicalIdentityUserId(profile.userId) !== notice.userId
+    ) return;
+    identityProofActionToken += 1;
+    setIdentityVerification(null);
+    setIdentityVerificationBusy(false);
+    setIdentityVerificationError("");
+    setSelectedIdentity(mergeIdentityProofState(profile, "identity_changed"));
+    void hydrateSelectedIdentityProof(profile);
+  });
+
+  let lastIdentityProofBindingGeneration: string | null = null;
+  createEffect(() => {
+    const scope = appStore.authenticatedServerScope();
+    const transitioning = appStore.bindingTransitioning();
+    if (!scope || transitioning || scope.bindingGeneration === lastIdentityProofBindingGeneration) {
+      return;
+    }
+    lastIdentityProofBindingGeneration = scope.bindingGeneration;
+    const profile = selectedIdentity();
+    if (
+      profile
+      && canonicalIdentityOrigin(profile.canonicalServerOrigin)
+        === canonicalIdentityOrigin(scope.canonicalServerOrigin)
+    ) void hydrateSelectedIdentityProof(profile);
+  });
+
   const selectedIdentityDmState = createMemo(() => {
     const profile = selectedIdentity();
     const targetOrigin = canonicalIdentityOrigin(profile?.canonicalServerOrigin);
@@ -1663,7 +1849,12 @@ export const ServerSettingsScreen: Component = () => {
         }}
         canMessage={selectedIdentityCanMessage()}
         messageBusy={identityMessageBusy()}
+        verification={identityVerification()}
+        verificationBusy={identityVerificationBusy()}
+        verificationError={identityVerificationError()}
         onMessage={() => void messageSelectedIdentity()}
+        onLoadVerification={loadSelectedIdentityVerification}
+        onConfirmVerification={confirmSelectedIdentityVerification}
         onClose={closeSelectedIdentity}
       />
     </>

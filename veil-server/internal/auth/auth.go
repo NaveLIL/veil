@@ -19,6 +19,7 @@ import (
 	"golang.org/x/crypto/curve25519"
 
 	"github.com/AegisSec/veil-server/internal/config"
+	"github.com/AegisSec/veil-server/internal/cryptokey"
 	"github.com/AegisSec/veil-server/internal/db"
 	"github.com/AegisSec/veil-server/internal/logsafe"
 )
@@ -30,6 +31,7 @@ var (
 	ErrSigningKeyMismatch = errors.New("signing key does not match registered identity")
 	ErrBadIdentityProof   = errors.New("invalid X25519 identity proof")
 	ErrBadKeyLength       = errors.New("key must be exactly 32 bytes")
+	ErrBadSigningKey      = errors.New("invalid Ed25519 signing public key")
 	ErrBadDeviceID        = errors.New("device_id must be exactly 16 bytes")
 	ErrBadDeviceName      = errors.New("device_name must be 1..128 UTF-8 bytes without control characters")
 	ErrTooManyAttempts    = errors.New("too many auth attempts")
@@ -128,6 +130,9 @@ func (s *Service) VerifyResponseV1(ctx context.Context, connID string, identityK
 	}
 	if len(signingKey) != ed25519.PublicKeySize {
 		return nil, ErrBadKeyLength
+	}
+	if !cryptokey.ValidEd25519PublicKey(signingKey) {
+		return nil, ErrBadSigningKey
 	}
 	if len(deviceID) != 16 {
 		return nil, ErrBadDeviceID

@@ -20,9 +20,14 @@ import {
   canonicalIdentityOrigin,
   canonicalIdentityUserId,
   isSameCanonicalIdentity,
+  messageAuthorContextLabel,
   type IdentityIslandProfile,
 } from "@/components/identity/identityProfile";
 import { Z } from "@/lib/zIndex";
+import {
+  validatedSearchHits,
+  type SearchHitDto as SearchHit,
+} from "@/lib/identityIpcBoundary";
 import {
   appStore,
   captureUiSessionEpoch,
@@ -35,26 +40,6 @@ interface Props {
   onClose: () => void;
   onNavigate: (conversationId: string) => void | Promise<void>;
   onOpenIdentity: (profile: IdentityIslandProfile, returnFocusTo: HTMLElement | null) => void;
-}
-
-interface SearchAuthor {
-  canonicalServerOrigin: string;
-  userId: string;
-  identityKey: string;
-  signingKey: string;
-  username?: string | null;
-  displayName?: string | null;
-  profileVersion?: string | null;
-  profileOrigin: string;
-}
-
-interface SearchHit {
-  id: string;
-  conversationId: string;
-  body: string;
-  ts: number;
-  score: number;
-  author?: SearchAuthor | null;
 }
 
 const portalHost = () =>
@@ -144,13 +129,26 @@ export const CommandPalette: Component<Props> = (props) => {
       return;
     }
     const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = appStore.authenticatedServerScope();
+    if (!expectedScope) {
+      setHits([]);
+      setLoading(false);
+      return;
+    }
     setLoading(true);
     try {
-      const res = await invoke<SearchHit[]>("search_messages", {
+      const response = await invoke<unknown>("search_messages", {
         query: q, conversationId: null, limit: 30,
       });
       if (!isUiSessionEpochCurrent(sessionEpoch)) return;
-      setHits(res);
+      const currentScope = appStore.authenticatedServerScope();
+      if (
+        !currentScope
+        || currentScope.canonicalServerOrigin !== expectedScope.canonicalServerOrigin
+        || currentScope.userId !== expectedScope.userId
+        || currentScope.bindingGeneration !== expectedScope.bindingGeneration
+      ) return;
+      setHits(validatedSearchHits(response, expectedScope.canonicalServerOrigin));
       setActive(0);
     } catch (err) {
       if (!isUiSessionEpochCurrent(sessionEpoch)) return;
@@ -252,9 +250,10 @@ export const CommandPalette: Component<Props> = (props) => {
     };
     return {
       ...profile,
-      contextLabel: isSameCanonicalIdentity(profile, selfIdentity)
-        ? "Your message"
-        : profile.contextLabel,
+      contextLabel: messageAuthorContextLabel(
+        author.context,
+        isSameCanonicalIdentity(profile, selfIdentity),
+      ),
     };
   };
 

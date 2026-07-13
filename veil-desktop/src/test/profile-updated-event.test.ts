@@ -40,7 +40,9 @@ describe("profile update event boundary", () => {
     await appStore.connectToServer();
 
     const deliver = eventState.listeners.get("veil://profile-updated");
+    const deliverIdentityChange = eventState.listeners.get("veil://identity-changed");
     expect(deliver).toBeTypeOf("function");
+    expect(deliverIdentityChange).toBeTypeOf("function");
     deliver?.({ payload: {
       serverScopeOrigin: "https://profile.example.test:443",
       serverBindingGeneration: "40",
@@ -74,8 +76,34 @@ describe("profile update event boundary", () => {
       } });
     }
     expect(appStore.profileUpdateNotice()?.profileVersion).toBe("9223372036854775807");
+    expect(appStore.identityChangeNotice()).toBeNull();
+
+    deliverIdentityChange?.({ payload: {
+      serverScopeOrigin: "https://profile.example.test:443",
+      serverBindingGeneration: "40",
+      userId: PEER_ID,
+    } });
+    expect(appStore.identityChangeNotice()).toBeNull();
+
+    deliverIdentityChange?.({ payload: {
+      serverScopeOrigin: "https://profile.example.test:443",
+      serverBindingGeneration: "41",
+      userId: PEER_ID,
+    } });
+    expect(appStore.identityChangeNotice()).toEqual({
+      canonicalServerOrigin: "https://profile.example.test:443",
+      userId: PEER_ID,
+    });
+
+    deliverIdentityChange?.({ payload: {
+      serverScopeOrigin: "https://profile.example.test:443",
+      serverBindingGeneration: "41",
+      userId: PEER_ID.toUpperCase(),
+    } });
+    expect(appStore.identityChangeNotice()?.userId).toBe(PEER_ID);
 
     appStore.setServerEndpoints("wss://profile.example.test/other", "https://profile.example.test");
     expect(appStore.profileUpdateNotice()).toBeNull();
+    expect(appStore.identityChangeNotice()).toBeNull();
   });
 });

@@ -38,6 +38,7 @@ import (
 	"github.com/AegisSec/veil-server/internal/chat"
 	"github.com/AegisSec/veil-server/internal/config"
 	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/AegisSec/veil-server/internal/profiles"
 	"github.com/AegisSec/veil-server/internal/servers"
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 
@@ -136,6 +137,7 @@ func New(t *testing.T) *Harness {
 	auth.NewHandler(authSvc, mw, nil).RegisterRoutes(mux)
 	chat.NewHandler(chatSvc, mw, nil).RegisterRoutes(mux)
 	servers.NewHandler(serversSvc, mw, nil).RegisterRoutes(mux)
+	profiles.NewHandler(profiles.NewPostgresStore(database.Pool), mw, nil, nil, nil).RegisterRoutes(mux)
 
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -214,6 +216,21 @@ func (h *Harness) Do(u *User, method, path string, body any) (int, []byte, map[s
 			raw = b2
 		}
 	}
+	contentType := ""
+	if raw != nil {
+		contentType = "application/json"
+	}
+	return h.doSignedRaw(u, method, path, raw, contentType)
+}
+
+// DoRaw issues a signed request with an exact binary body and media type.
+func (h *Harness) DoRaw(u *User, method, path string, raw []byte, contentType string) (int, []byte, map[string]any) {
+	h.t.Helper()
+	return h.doSignedRaw(u, method, path, raw, contentType)
+}
+
+func (h *Harness) doSignedRaw(u *User, method, path string, raw []byte, contentType string) (int, []byte, map[string]any) {
+	h.t.Helper()
 	req, err := http.NewRequest(method, h.Server.URL+path, bytes.NewReader(raw))
 	if err != nil {
 		h.t.Fatalf("new request: %v", err)
@@ -231,8 +248,8 @@ func (h *Harness) Do(u *User, method, path string, body any) (int, []byte, map[s
 	req.Header.Set("X-Veil-User", u.ID)
 	req.Header.Set("X-Veil-Timestamp", strconv.FormatInt(tsMs, 10))
 	req.Header.Set("X-Veil-Signature", base64.StdEncoding.EncodeToString(sig))
-	if raw != nil {
-		req.Header.Set("Content-Type", "application/json")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

@@ -1,6 +1,6 @@
 use crate::models::{
-    AccountSnapshot, AccountSnapshotSource, LocalIdentityVerification, Message, NetworkProfile,
-    ProfileLocator,
+    AccountSnapshot, AccountSnapshotSource, HistoricalAccountContinuity, LocalIdentityVerification,
+    Message, MessageAuthorContext, NetworkProfile, ProfileLocator,
 };
 use rusqlite::{Connection, OptionalExtension, Row};
 use std::path::Path;
@@ -262,8 +262,25 @@ fn is_directional_control(value: char) -> bool {
     )
 }
 
+fn is_unsafe_profile_invisible(value: char) -> bool {
+    matches!(
+        value,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{180e}'
+            | '\u{200b}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{2060}'
+            | '\u{feff}'
+    )
+}
+
 fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
     validate_profile_locator(&profile.locator)?;
+    if profile.profile_version > i64::MAX as u64 {
+        return Err("network profile version exceeds the server contract".to_string());
+    }
     validate_bounded_text(
         "network profile username",
         &profile.username,
@@ -300,8 +317,10 @@ fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
         .chain(profile.display_name.iter())
         .chain(std::iter::once(&profile.about))
     {
-        if value.chars().any(is_directional_control) {
-            return Err("network profile contains directional controls".to_string());
+        if value.chars().any(|character| {
+            is_directional_control(character) || is_unsafe_profile_invisible(character)
+        }) {
+            return Err("network profile contains unsafe invisible characters".to_string());
         }
     }
     if profile
@@ -325,11 +344,8 @@ fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
     )
 }
 
-fn validate_account_snapshot(snapshot: &AccountSnapshot) -> Result<(), String> {
+fn validate_account_snapshot_envelope(snapshot: &AccountSnapshot) -> Result<(), String> {
     validate_profile_locator(&snapshot.locator)?;
-    if snapshot.signing_key == [0u8; 32] {
-        return Err("account signing key must not be all zero".to_string());
-    }
     validate_optional_presentation("account username", snapshot.username.as_deref())?;
     validate_optional_presentation("account display name", snapshot.display_name.as_deref())?;
     if snapshot.profile_origin.len() > MAX_PROFILE_ORIGIN_BYTES {
@@ -345,6 +361,14 @@ fn validate_account_snapshot(snapshot: &AccountSnapshot) -> Result<(), String> {
         MAX_OBSERVED_AT_BYTES,
         false,
     )
+}
+
+fn validate_account_snapshot(snapshot: &AccountSnapshot) -> Result<(), String> {
+    validate_account_snapshot_envelope(snapshot)?;
+    if !veil_crypto::public_key::valid_ed25519_public_key(&snapshot.signing_key) {
+        return Err("account signing key is not a valid prime-order Ed25519 key".to_string());
+    }
+    Ok(())
 }
 
 fn load_account_by_origin_user(
@@ -434,29 +458,40 @@ fn load_authenticated_self_binding(
     conn: &Connection,
     canonical_server_origin: &str,
 ) -> Result<Option<AuthenticatedSelfBinding>, String> {
-    conn.query_row(
-        "SELECT user_id, identity_key, signing_key
+    let binding = conn
+        .query_row(
+            "SELECT user_id, identity_key, signing_key
          FROM authenticated_self_bindings_v1
          WHERE canonical_server_origin = ?1",
-        rusqlite::params![canonical_server_origin],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        },
-    )
-    .optional()
-    .map_err(|error| format!("load authenticated self binding: {error}"))?
-    .map(|(user_id, identity_key, signing_key)| {
-        Ok(AuthenticatedSelfBinding {
-            user_id,
-            identity_key: fixed_bytes::<32>("authenticated self identity key", identity_key)?,
-            signing_key: fixed_bytes::<32>("authenticated self signing key", signing_key)?,
+            rusqlite::params![canonical_server_origin],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("load authenticated self binding: {error}"))?
+        .map(|(user_id, identity_key, signing_key)| {
+            Ok::<AuthenticatedSelfBinding, String>(AuthenticatedSelfBinding {
+                user_id,
+                identity_key: fixed_bytes::<32>("authenticated self identity key", identity_key)?,
+                signing_key: fixed_bytes::<32>("authenticated self signing key", signing_key)?,
+            })
         })
-    })
-    .transpose()
+        .transpose()?;
+    if let Some(binding) = binding.as_ref() {
+        validate_canonical_uuid("authenticated self user id", &binding.user_id)?;
+        if binding.identity_key == [0u8; 32]
+            || binding.identity_key == binding.signing_key
+            || !veil_crypto::public_key::valid_ed25519_public_key(&binding.signing_key)
+        {
+            return Err("persisted authenticated self binding has invalid keys".to_string());
+        }
+    }
+    Ok(binding)
 }
 
 fn ensure_self_binding_directory_compatible(
@@ -572,6 +607,93 @@ fn merge_account_presentation(
     }
 
     Ok(incoming.clone())
+}
+
+fn account_snapshot_continuity_conflict_users(
+    conn: &Connection,
+    incoming: &AccountSnapshot,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut users = std::collections::BTreeSet::new();
+    let origin = &incoming.locator.canonical_server_origin;
+    if let Some(existing) = load_account_by_origin_user(conn, origin, &incoming.locator.user_id)? {
+        if existing.locator.identity_key != incoming.locator.identity_key
+            || existing.signing_key != incoming.signing_key
+        {
+            users.insert(existing.locator.user_id);
+        }
+    }
+    if let Some(existing) =
+        load_account_by_origin_identity(conn, origin, &incoming.locator.identity_key)?
+    {
+        if existing.locator.user_id != incoming.locator.user_id
+            || existing.signing_key != incoming.signing_key
+        {
+            users.insert(existing.locator.user_id);
+        }
+    }
+    if let Some(existing) = load_account_by_origin_signing(conn, origin, &incoming.signing_key)? {
+        if existing.locator.user_id != incoming.locator.user_id
+            || existing.locator.identity_key != incoming.locator.identity_key
+        {
+            users.insert(existing.locator.user_id);
+        }
+    }
+    if let Some(binding) = load_authenticated_self_binding(conn, origin)? {
+        let overlaps_self = incoming.locator.user_id == binding.user_id
+            || incoming.locator.identity_key == binding.identity_key
+            || incoming.signing_key == binding.signing_key;
+        let exact_self = incoming.locator.user_id == binding.user_id
+            && incoming.locator.identity_key == binding.identity_key
+            && incoming.signing_key == binding.signing_key;
+        if overlaps_self && !exact_self {
+            users.insert(binding.user_id);
+        }
+    }
+    Ok(users)
+}
+
+fn record_identity_change_observation_for(
+    conn: &Connection,
+    alarm_user_id: &str,
+    incoming: &AccountSnapshot,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO identity_change_observations_v1
+            (canonical_server_origin, user_id, observed_identity_key,
+             observed_signing_key, source, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(canonical_server_origin, user_id)
+         DO UPDATE SET observed_identity_key = excluded.observed_identity_key,
+                       observed_signing_key = excluded.observed_signing_key,
+                       source = excluded.source,
+                       observed_at = excluded.observed_at",
+        rusqlite::params![
+            incoming.locator.canonical_server_origin,
+            alarm_user_id,
+            incoming.locator.identity_key.as_slice(),
+            incoming.signing_key.as_slice(),
+            incoming.source.as_u8(),
+            incoming.observed_at,
+        ],
+    )
+    .map_err(|error| format!("record blocking identity change observation: {error}"))?;
+    Ok(())
+}
+
+fn has_identity_change_observation(
+    conn: &Connection,
+    canonical_server_origin: &str,
+    user_id: &str,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM identity_change_observations_v1
+             WHERE canonical_server_origin = ?1 AND user_id = ?2
+         )",
+        rusqlite::params![canonical_server_origin, user_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("load blocking identity change observation: {error}"))
 }
 
 fn merge_account_snapshot(
@@ -1068,16 +1190,42 @@ impl VeilDb {
                     ON DELETE CASCADE
             );
 
-            -- Explicit physical/out-of-band comparison made on this device.
-            -- No foreign key is intentional: the verified old key must remain
-            -- available to diagnose a later identity change.
-            CREATE TABLE IF NOT EXISTS local_identity_verifications_v1 (
+            -- X25519-only v1 comparisons did not authenticate the independent
+            -- Ed25519 account key. Pre-release cutover deliberately discards
+            -- them instead of silently upgrading a weaker proof.
+            DROP TABLE IF EXISTS local_identity_verifications_v1;
+
+            -- Explicit physical/out-of-band account comparison made on this
+            -- device. No foreign key is intentional: the verified old tuple
+            -- must remain available to diagnose a later key change.
+            CREATE TABLE IF NOT EXISTS local_account_verifications_v2 (
                 canonical_server_origin TEXT NOT NULL
                     CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
                 user_id TEXT NOT NULL CHECK(length(user_id) = 36),
                 verified_identity_key BLOB NOT NULL
                     CHECK(length(verified_identity_key) = 32),
+                verified_signing_key BLOB NOT NULL
+                    CHECK(length(verified_signing_key) = 32),
                 verified_at TEXT NOT NULL CHECK(length(verified_at) BETWEEN 1 AND 64),
+                PRIMARY KEY (canonical_server_origin, user_id)
+            );
+
+            -- An authenticated directory may present a different key for an
+            -- already pinned origin/user. The candidate is never promoted to
+            -- the account directory or crypto routing state, but the durable
+            -- observation makes the blocking Identity changed state reachable
+            -- after restart. There is intentionally no FK: the alarm must
+            -- survive cleanup of presentation/cache rows.
+            CREATE TABLE IF NOT EXISTS identity_change_observations_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                observed_identity_key BLOB NOT NULL
+                    CHECK(length(observed_identity_key) = 32),
+                observed_signing_key BLOB NOT NULL
+                    CHECK(length(observed_signing_key) = 32),
+                source INTEGER NOT NULL CHECK(source IN (1, 2)),
+                observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
                 PRIMARY KEY (canonical_server_origin, user_id)
             );
 
@@ -1113,6 +1261,7 @@ impl VeilDb {
                 profile_version BLOB CHECK(profile_version IS NULL OR length(profile_version) = 8),
                 profile_origin TEXT NOT NULL CHECK(length(profile_origin) BETWEEN 1 AND 512),
                 source INTEGER NOT NULL CHECK(source IN (1, 2)),
+                author_context INTEGER CHECK(author_context IN (1, 2)),
                 observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
                 FOREIGN KEY (canonical_server_origin, user_id, identity_key)
                     REFERENCES identity_directory_v1
@@ -1415,6 +1564,7 @@ impl VeilDb {
 
         self.ensure_conversation_identity_schema()?;
         self.ensure_network_profile_avatar_schema()?;
+        self.ensure_message_author_context_schema()?;
         self.rebuild_interim_sender_key_tables()?;
         self.ensure_sender_key_historical_proof_schema()?;
 
@@ -1511,6 +1661,34 @@ impl VeilDb {
         }
         tx.commit()
             .map_err(|e| format!("commit network profile avatar schema upgrade: {e}"))
+    }
+
+    fn ensure_message_author_context_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin message author context schema upgrade: {e}"))?;
+        let present: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('message_author_snapshots_v1')
+                    WHERE name = 'author_context'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect message author context column: {e}"))?;
+        if !present {
+            // Existing development rows remain unknown rather than inferring
+            // membership from the presentation-authority `source` column.
+            tx.execute_batch(
+                "ALTER TABLE message_author_snapshots_v1
+                 ADD COLUMN author_context INTEGER CHECK(author_context IN (1, 2));",
+            )
+            .map_err(|e| format!("add message author context column: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit message author context schema upgrade: {e}"))
     }
 
     fn normalized_table_sql(&self, table: &str) -> Result<String, String> {
@@ -1903,8 +2081,10 @@ impl VeilDb {
     ) -> Result<(), String> {
         validate_canonical_server_origin(canonical_server_origin)?;
         validate_canonical_uuid("authenticated self user id", user_id)?;
-        if identity_key == &[0u8; 32] || signing_key == &[0u8; 32] {
-            return Err("authenticated self keys must not be all zero".to_string());
+        if identity_key == &[0u8; 32]
+            || !veil_crypto::public_key::valid_ed25519_public_key(signing_key)
+        {
+            return Err("authenticated self keys are not valid account public keys".to_string());
         }
         if identity_key == signing_key {
             return Err(
@@ -1968,8 +2148,48 @@ impl VeilDb {
     /// equal-version equivocation rolls the whole batch back.
     pub fn upsert_identity_directory(&self, snapshots: &[AccountSnapshot]) -> Result<(), String> {
         for snapshot in snapshots {
+            // Validate every untrusted presentation/scope field before using
+            // it in a continuity query. The Ed25519 subgroup check deliberately
+            // follows conflict classification: malformed presented key bytes
+            // may be retained as incident evidence for an existing baseline,
+            // but are never admitted into the directory.
+            validate_account_snapshot_envelope(snapshot)?;
+        }
+
+        // A continuity conflict is security evidence, not a candidate update.
+        // Persist only the alarm in its own atomic savepoint, then reject the
+        // entire directory batch before any presentation or routing state can
+        // change. A matching future response cannot silently clear this alarm;
+        // accepting a replacement requires a separately reviewed rotation flow.
+        let mut identity_changes =
+            std::collections::BTreeMap::<(String, String), &AccountSnapshot>::new();
+        for snapshot in snapshots {
+            for alarm_user_id in account_snapshot_continuity_conflict_users(&self.conn, snapshot)? {
+                identity_changes.insert(
+                    (
+                        snapshot.locator.canonical_server_origin.clone(),
+                        alarm_user_id,
+                    ),
+                    snapshot,
+                );
+            }
+        }
+        if !identity_changes.is_empty() {
+            run_savepoint(&self.conn, "veil_identity_change_observations", || {
+                for ((_, alarm_user_id), snapshot) in &identity_changes {
+                    record_identity_change_observation_for(&self.conn, alarm_user_id, snapshot)?;
+                }
+                Ok(())
+            })?;
+            return Err(
+                "account identity changed; directory batch rejected and quarantined".to_string(),
+            );
+        }
+
+        for snapshot in snapshots {
             validate_account_snapshot(snapshot)?;
         }
+
         run_savepoint(&self.conn, "veil_identity_directory_batch", || {
             let mut self_bindings =
                 std::collections::HashMap::<String, Option<AuthenticatedSelfBinding>>::new();
@@ -2000,6 +2220,115 @@ impl VeilDb {
     ) -> Result<Option<AccountSnapshot>, String> {
         validate_profile_locator(locator)?;
         load_exact_account(&self.conn, locator)
+    }
+
+    /// Resolve the single immutable account currently pinned for an exact
+    /// `(origin, user_id)` namespace. This deliberately does not accept an
+    /// identity-key candidate, so callers can distinguish a missing durable
+    /// baseline from an exact match while preflighting continuity changes.
+    pub fn resolve_account_by_origin_user(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+    ) -> Result<Option<AccountSnapshot>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("account directory user id", user_id)?;
+        load_account_by_origin_user(&self.conn, canonical_server_origin, user_id)
+    }
+
+    /// Compare one author tuple from an authenticated active-history row with
+    /// every overlapping durable origin-scoped account/self baseline before
+    /// any device proof, decryption, or process-local pin is touched. A
+    /// mismatch becomes durable incident evidence owned by the baseline user,
+    /// while a first observation remains service-mediated TOFU and is
+    /// deliberately not promoted here.
+    pub fn observe_historical_account_candidate(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        identity_key: &[u8; 32],
+        signing_key: &[u8; 32],
+        observed_at: &str,
+    ) -> Result<HistoricalAccountContinuity, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("historical account candidate user id", user_id)?;
+        validate_bounded_text(
+            "historical account candidate observation timestamp",
+            observed_at,
+            MAX_OBSERVED_AT_BYTES,
+            false,
+        )?;
+        let candidate = AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: canonical_server_origin.to_string(),
+                user_id: user_id.to_string(),
+                identity_key: *identity_key,
+            },
+            signing_key: *signing_key,
+            username: None,
+            display_name: None,
+            profile_version: None,
+            profile_origin: canonical_server_origin.to_string(),
+            source: AccountSnapshotSource::AuthenticatedHistory,
+            observed_at: observed_at.to_string(),
+        };
+        let conflict_users = account_snapshot_continuity_conflict_users(&self.conn, &candidate)?;
+        if !conflict_users.is_empty() {
+            run_savepoint(&self.conn, "veil_historical_identity_observation", || {
+                for alarm_user_id in &conflict_users {
+                    record_identity_change_observation_for(&self.conn, alarm_user_id, &candidate)?;
+                }
+                Ok(())
+            })?;
+            return Ok(HistoricalAccountContinuity::IdentityChanged(
+                conflict_users.into_iter().collect(),
+            ));
+        }
+
+        if load_account_by_origin_user(&self.conn, canonical_server_origin, user_id)?.is_some() {
+            return Ok(HistoricalAccountContinuity::Compatible);
+        }
+        if let Some(binding) = load_authenticated_self_binding(&self.conn, canonical_server_origin)?
+        {
+            if binding.user_id == user_id
+                && binding.identity_key == *identity_key
+                && binding.signing_key == *signing_key
+            {
+                return Ok(HistoricalAccountContinuity::Compatible);
+            }
+        }
+        Ok(HistoricalAccountContinuity::NoBaseline)
+    }
+
+    /// List durable continuity alarms for one authenticated origin so the
+    /// renderer signal can name the baseline account rather than an attacker-
+    /// supplied alias UUID. The rows remain authoritative in SQLCipher even
+    /// when event delivery is unavailable.
+    pub fn identity_change_users_for_origin(
+        &self,
+        canonical_server_origin: &str,
+    ) -> Result<Vec<String>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT user_id
+                 FROM identity_change_observations_v1
+                 WHERE canonical_server_origin = ?1
+                 ORDER BY user_id",
+            )
+            .map_err(|error| format!("prepare identity-change users: {error}"))?;
+        let users = statement
+            .query_map(rusqlite::params![canonical_server_origin], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("query identity-change users: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("collect identity-change users: {error}"))?;
+        for user_id in &users {
+            validate_canonical_uuid("identity-change observation user id", user_id)?;
+        }
+        Ok(users)
     }
 
     /// Store one signed network profile against an exact pinned account.
@@ -2214,8 +2543,80 @@ impl VeilDb {
             .transpose()
     }
 
-    /// Record an explicit comparison of one exact identity on this device.
-    pub fn mark_identity_verified(
+    /// Load a cached profile only when the currently unlocked account is
+    /// durably bound to the same origin. This is the offline/restart read path;
+    /// it never upgrades trust and cannot cross an origin, account or key.
+    pub fn load_network_profile_for_authenticated_account(
+        &self,
+        canonical_server_origin: &str,
+        current_user_id: &str,
+        current_identity_key: &[u8; 32],
+        current_signing_key: &[u8; 32],
+        locator: &ProfileLocator,
+    ) -> Result<Option<NetworkProfile>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("authenticated profile cache user", current_user_id)?;
+        validate_profile_locator(locator)?;
+        if locator.canonical_server_origin != canonical_server_origin {
+            return Err("cached profile locator crosses the authenticated origin".to_string());
+        }
+        let binding = validated_self_binding_for_origin(&self.conn, canonical_server_origin)?
+            .ok_or("cached profile origin has no authenticated self binding")?;
+        if binding.user_id != current_user_id
+            || binding.identity_key != *current_identity_key
+            || binding.signing_key != *current_signing_key
+        {
+            return Err(
+                "cached profile requester differs from the authenticated binding".to_string(),
+            );
+        }
+        self.load_network_profile(locator)
+    }
+
+    /// Load device-local proof for an exact peer while offline, scoped by the
+    /// currently unlocked cryptographic identity and the durable self binding
+    /// for the peer's origin. No renderer-supplied account UUID is trusted.
+    pub fn local_identity_verification_for_unlocked_account(
+        &self,
+        current_identity_key: &[u8; 32],
+        current_signing_key: &[u8; 32],
+        locator: &ProfileLocator,
+    ) -> Result<LocalIdentityVerification, String> {
+        validate_profile_locator(locator)?;
+        let binding =
+            validated_self_binding_for_origin(&self.conn, &locator.canonical_server_origin)?
+                .ok_or("identity proof origin has no authenticated self binding")?;
+        if binding.identity_key != *current_identity_key
+            || binding.signing_key != *current_signing_key
+        {
+            return Err("identity proof requester differs from the unlocked account".to_string());
+        }
+        if binding.user_id == locator.user_id && binding.identity_key == locator.identity_key {
+            return Err("the current account cannot verify itself".to_string());
+        }
+        let proof = self.local_identity_verification(locator)?;
+        if proof == LocalIdentityVerification::IdentityChanged {
+            return Ok(proof);
+        }
+        match load_account_by_origin_user(
+            &self.conn,
+            &locator.canonical_server_origin,
+            &locator.user_id,
+        )? {
+            Some(pinned) if pinned.locator.identity_key != locator.identity_key => {
+                return Ok(LocalIdentityVerification::IdentityChanged);
+            }
+            Some(_) => {}
+            None => {
+                return Err("identity proof target has no exact pinned account entry".to_string());
+            }
+        }
+        Ok(proof)
+    }
+
+    /// Record an explicit account-v2 comparison of one exact identity on this
+    /// device, binding both its X25519 and Ed25519 account keys.
+    pub fn mark_account_verified_v2(
         &self,
         locator: &ProfileLocator,
         verified_at: &str,
@@ -2227,32 +2628,44 @@ impl VeilDb {
             MAX_OBSERVED_AT_BYTES,
             false,
         )?;
-        if load_exact_account(&self.conn, locator)?.is_none() {
-            return Err("cannot verify an identity absent from the pinned directory".into());
+        let account = load_exact_account(&self.conn, locator)?
+            .ok_or("cannot verify an identity absent from the pinned directory")?;
+        if has_identity_change_observation(
+            &self.conn,
+            &locator.canonical_server_origin,
+            &locator.user_id,
+        )? {
+            return Err(
+                "cannot verify an identity while a blocking identity change is pending".into(),
+            );
         }
-        if load_authenticated_self_binding(&self.conn, &locator.canonical_server_origin)?
-            .is_some_and(|binding| {
-                binding.user_id == locator.user_id && binding.identity_key == locator.identity_key
-            })
+        let self_binding =
+            validated_self_binding_for_origin(&self.conn, &locator.canonical_server_origin)?
+                .ok_or("cannot verify an identity without an authenticated self binding")?;
+        if self_binding.user_id == locator.user_id
+            && self_binding.identity_key == locator.identity_key
         {
             return Err("the current account cannot verify itself".into());
         }
         self.conn
             .execute(
-                "INSERT INTO local_identity_verifications_v1
-                    (canonical_server_origin, user_id, verified_identity_key, verified_at)
-                 VALUES (?1, ?2, ?3, ?4)
+                "INSERT INTO local_account_verifications_v2
+                    (canonical_server_origin, user_id, verified_identity_key,
+                     verified_signing_key, verified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT(canonical_server_origin, user_id)
                  DO UPDATE SET verified_identity_key = excluded.verified_identity_key,
+                               verified_signing_key = excluded.verified_signing_key,
                                verified_at = excluded.verified_at",
                 rusqlite::params![
                     locator.canonical_server_origin,
                     locator.user_id,
                     locator.identity_key.as_slice(),
+                    account.signing_key.as_slice(),
                     verified_at,
                 ],
             )
-            .map_err(|error| format!("store local identity verification: {error}"))?;
+            .map_err(|error| format!("store local account-v2 verification: {error}"))?;
         Ok(())
     }
 
@@ -2262,26 +2675,49 @@ impl VeilDb {
         locator: &ProfileLocator,
     ) -> Result<LocalIdentityVerification, String> {
         validate_profile_locator(locator)?;
-        let verified_key = self
+        if has_identity_change_observation(
+            &self.conn,
+            &locator.canonical_server_origin,
+            &locator.user_id,
+        )? {
+            return Ok(LocalIdentityVerification::IdentityChanged);
+        }
+        let verified_keys = self
             .conn
             .query_row(
-                "SELECT verified_identity_key
-                 FROM local_identity_verifications_v1
+                "SELECT verified_identity_key, verified_signing_key
+                 FROM local_account_verifications_v2
                  WHERE canonical_server_origin = ?1 AND user_id = ?2",
                 rusqlite::params![locator.canonical_server_origin, locator.user_id],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
             )
             .optional()
-            .map_err(|error| format!("load local identity verification: {error}"))?;
-        match verified_key {
+            .map_err(|error| format!("load local account-v2 verification: {error}"))?;
+        match verified_keys {
             None => Ok(LocalIdentityVerification::NotCompared),
-            Some(value) => {
-                let value = fixed_bytes::<32>("verified identity key", value)?;
-                if value == locator.identity_key {
-                    Ok(LocalIdentityVerification::VerifiedOnThisDevice)
-                } else {
-                    Ok(LocalIdentityVerification::IdentityChanged)
+            Some((identity, signing)) => {
+                let identity = fixed_bytes::<32>("verified identity key", identity)?;
+                let signing = fixed_bytes::<32>("verified signing key", signing)?;
+                if identity != locator.identity_key {
+                    return Ok(LocalIdentityVerification::IdentityChanged);
                 }
+                let Some(current) = load_account_by_origin_user(
+                    &self.conn,
+                    &locator.canonical_server_origin,
+                    &locator.user_id,
+                )?
+                else {
+                    return Ok(LocalIdentityVerification::IdentityChanged);
+                };
+                if current.locator.identity_key != identity || current.signing_key != signing {
+                    return Ok(LocalIdentityVerification::IdentityChanged);
+                }
+                if validated_self_binding_for_origin(&self.conn, &locator.canonical_server_origin)?
+                    .is_none()
+                {
+                    return Ok(LocalIdentityVerification::IdentityChanged);
+                }
+                Ok(LocalIdentityVerification::VerifiedOnThisDevice)
             }
         }
     }
@@ -2320,6 +2756,24 @@ impl VeilDb {
         &self,
         message_id: &str,
         snapshot: &AccountSnapshot,
+    ) -> Result<(), String> {
+        self.attach_message_author_with_context(
+            message_id,
+            snapshot,
+            MessageAuthorContext::from_snapshot_source(snapshot.source),
+        )
+    }
+
+    /// Attach author metadata with an explicit immutable membership context.
+    /// Callers which resolve presentation fields through a stronger cached
+    /// directory snapshot must still pass the context of the current
+    /// authenticated observation rather than deriving membership from that
+    /// merged presentation authority.
+    pub fn attach_message_author_with_context(
+        &self,
+        message_id: &str,
+        snapshot: &AccountSnapshot,
+        author_context: MessageAuthorContext,
     ) -> Result<(), String> {
         if message_id.is_empty() {
             return Err("message id must not be empty".to_string());
@@ -2365,8 +2819,8 @@ impl VeilDb {
                     "INSERT INTO message_author_snapshots_v1
                         (message_id, canonical_server_origin, user_id,
                          identity_key, signing_key, username, display_name,
-                         profile_version, profile_origin, source, observed_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                         profile_version, profile_origin, source, author_context, observed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                     rusqlite::params![
                         message_id,
                         &effective.locator.canonical_server_origin,
@@ -2378,6 +2832,7 @@ impl VeilDb {
                         profile_version.as_ref().map(<[u8; 8]>::as_slice),
                         &effective.profile_origin,
                         effective.source.as_u8(),
+                        author_context.as_u8(),
                         &effective.observed_at,
                     ],
                 )
@@ -3256,7 +3711,8 @@ impl VeilDb {
                         m.effective_timestamp, m.local_order,
                         a.canonical_server_origin, a.user_id, a.identity_key,
                         a.signing_key, a.username, a.display_name,
-                        a.profile_version, a.profile_origin, a.source, a.observed_at
+                        a.profile_version, a.profile_origin, a.source, a.observed_at,
+                        a.author_context
                  FROM (
                    SELECT id, conversation_id, sender_key, plaintext, msg_type, reply_to_id,
                           is_outgoing, status, expires_at, server_timestamp, created_at,
@@ -3298,16 +3754,25 @@ impl VeilDb {
                         server_timestamp: row.get(9)?,
                         created_at: row.get(10)?,
                         author: None,
+                        author_context: None,
                     },
                     raw_account_snapshot_from_row(row, 13)?,
+                    row.get::<_, Option<u8>>(23)?,
                 ))
             })
             .map_err(|e| format!("query: {e}"))?;
 
         let mut messages = Vec::new();
         for row in rows {
-            let (mut message, author) = row.map_err(|e| format!("collect message: {e}"))?;
+            let (mut message, author, author_context) =
+                row.map_err(|e| format!("collect message: {e}"))?;
             message.author = author.map(RawAccountSnapshot::decode).transpose()?;
+            message.author_context = author_context
+                .map(|value| {
+                    MessageAuthorContext::from_u8(value)
+                        .ok_or_else(|| "invalid persisted message author context".to_string())
+                })
+                .transpose()?;
             messages.push(message);
         }
         Ok(messages)
@@ -3336,7 +3801,8 @@ impl VeilDb {
                         m.expires_at, m.server_timestamp, m.created_at,
                         a.canonical_server_origin, a.user_id, a.identity_key,
                         a.signing_key, a.username, a.display_name,
-                        a.profile_version, a.profile_origin, a.source, a.observed_at
+                        a.profile_version, a.profile_origin, a.source, a.observed_at,
+                        a.author_context
                  FROM messages AS m
                  JOIN conversations AS c ON c.id = m.conversation_id
                  LEFT JOIN message_author_snapshots_v1 AS a ON a.message_id = m.id
@@ -3365,15 +3831,23 @@ impl VeilDb {
                             server_timestamp: row.get(9)?,
                             created_at: row.get(10)?,
                             author: None,
+                            author_context: None,
                         },
                         raw_account_snapshot_from_row(row, 11)?,
+                        row.get::<_, Option<u8>>(21)?,
                     ))
                 },
             )
             .optional()
             .map_err(|error| format!("load message for search: {error}"))?;
-        row.map(|(mut message, author)| {
+        row.map(|(mut message, author, author_context)| {
             message.author = author.map(RawAccountSnapshot::decode).transpose()?;
+            message.author_context = author_context
+                .map(|value| {
+                    MessageAuthorContext::from_u8(value)
+                        .ok_or_else(|| "invalid persisted message author context".to_string())
+                })
+                .transpose()?;
             Ok(message)
         })
         .transpose()
@@ -5698,11 +6172,18 @@ impl VeilDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
 
     const ORIGIN_A: &str = "https://alpha.example:443";
     const ORIGIN_B: &str = "https://beta.example:443";
     const USER_A: &str = "00000000-0000-0000-0000-0000000000a1";
     const USER_B: &str = "00000000-0000-0000-0000-0000000000b2";
+
+    fn test_signing_key(seed: u8) -> [u8; 32] {
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    }
 
     fn sample_account(
         canonical_server_origin: &str,
@@ -5717,7 +6198,7 @@ mod tests {
                 user_id: user_id.to_string(),
                 identity_key: [seed; 32],
             },
-            signing_key: [seed.wrapping_add(1); 32],
+            signing_key: test_signing_key(seed.wrapping_add(1)),
             username: Some(format!("user-{seed}")),
             display_name: Some(format!("User {seed}")),
             profile_version,
@@ -7180,7 +7661,7 @@ mod tests {
     fn authenticated_self_binding_is_origin_scoped_and_immutable() {
         let db = VeilDb::open_memory(&[0xA1; 32]).unwrap();
         let identity_key = [0x11; 32];
-        let signing_key = [0x12; 32];
+        let signing_key = test_signing_key(0x12);
 
         db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
             .unwrap();
@@ -7214,7 +7695,7 @@ mod tests {
         ));
         let db_key = [0xA2; 32];
         let identity_key = [0x21; 32];
-        let signing_key = [0x22; 32];
+        let signing_key = test_signing_key(0x22);
         {
             let db = VeilDb::open(&path, &db_key).unwrap();
             db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
@@ -7303,7 +7784,7 @@ mod tests {
         );
         let mut substituted_self = self_account.clone();
         substituted_self.locator.identity_key = [0x38; 32];
-        substituted_self.signing_key = [0x39; 32];
+        substituted_self.signing_key = test_signing_key(0x39);
         assert!(db
             .upsert_identity_directory(&[unrelated.clone(), substituted_self])
             .is_err());
@@ -7331,6 +7812,14 @@ mod tests {
         );
         signing_alias.signing_key = self_account.signing_key;
         assert!(db.upsert_identity_directory(&[signing_alias]).is_err());
+        assert_eq!(
+            db.identity_change_users_for_origin(ORIGIN_A).unwrap(),
+            vec![USER_A.to_string()]
+        );
+        assert!(db
+            .resolve_account_by_origin_user(ORIGIN_A, USER_B)
+            .unwrap()
+            .is_none());
 
         db.upsert_identity_directory(&[unrelated.clone(), self_account.clone()])
             .unwrap();
@@ -7362,11 +7851,11 @@ mod tests {
     fn authenticated_self_reconnect_revalidates_the_persisted_directory() {
         let db = VeilDb::open_memory(&[0xA5; 32]).unwrap();
         let identity_key = [0x41; 32];
-        let signing_key = [0x42; 32];
+        let signing_key = test_signing_key(0x42);
         db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
             .unwrap();
         let poisoned_identity_key = [0x43u8; 32];
-        let poisoned_signing_key = [0x44u8; 32];
+        let poisoned_signing_key = test_signing_key(0x44);
 
         db.conn
             .execute(
@@ -7412,7 +7901,7 @@ mod tests {
         );
         let mut substituted = original.clone();
         substituted.locator.identity_key = [0x33; 32];
-        substituted.signing_key = [0x34; 32];
+        substituted.signing_key = test_signing_key(0x34);
         assert!(db
             .upsert_identity_directory(&[unrelated.clone(), substituted])
             .is_err());
@@ -7424,9 +7913,13 @@ mod tests {
             db.resolve_account_snapshot(&original.locator).unwrap(),
             Some(original.clone())
         );
+        assert_eq!(
+            db.local_identity_verification(&original.locator).unwrap(),
+            LocalIdentityVerification::IdentityChanged
+        );
 
         let mut signing_substitution = original.clone();
-        signing_substitution.signing_key = [0x35; 32];
+        signing_substitution.signing_key = test_signing_key(0x35);
         assert!(db
             .upsert_identity_directory(&[signing_substitution])
             .is_err());
@@ -7470,6 +7963,10 @@ mod tests {
             .resolve_account_snapshot(&signing_alias.locator)
             .unwrap()
             .is_none());
+        assert!(db
+            .identity_change_users_for_origin(ORIGIN_A)
+            .unwrap()
+            .is_empty());
 
         db.upsert_identity_directory(std::slice::from_ref(&original))
             .unwrap();
@@ -7478,6 +7975,10 @@ mod tests {
         assert!(db
             .upsert_identity_directory(std::slice::from_ref(&signing_alias))
             .is_err());
+        assert_eq!(
+            db.identity_change_users_for_origin(ORIGIN_A).unwrap(),
+            vec![USER_A.to_string()]
+        );
 
         let mut cross_origin = signing_alias;
         cross_origin.locator.canonical_server_origin = ORIGIN_B.to_string();
@@ -7526,6 +8027,109 @@ mod tests {
                 reopened
                     .resolve_account_snapshot(&original.locator)
                     .unwrap(),
+                Some(original.clone())
+            );
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened.identity_change_users_for_origin(ORIGIN_A).unwrap(),
+                vec![USER_A.to_string()]
+            );
+            assert_eq!(
+                reopened
+                    .local_identity_verification(&original.locator)
+                    .unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn historical_account_candidate_alarm_is_durable_and_never_promotes_the_candidate() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-historical-account-candidate-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xBA; 32];
+        let original = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x45,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.upsert_identity_directory(std::slice::from_ref(&original))
+                .unwrap();
+            assert_eq!(
+                db.observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_A,
+                    &original.locator.identity_key,
+                    &original.signing_key,
+                    "2026-07-13T12:10:00Z",
+                )
+                .unwrap(),
+                HistoricalAccountContinuity::Compatible
+            );
+            let mut unpinned_weak_signing = [0u8; 32];
+            unpinned_weak_signing[0] = 1;
+            assert_eq!(
+                db.observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_B,
+                    &[0x46; 32],
+                    &unpinned_weak_signing,
+                    "2026-07-13T12:11:00Z",
+                )
+                .unwrap(),
+                HistoricalAccountContinuity::NoBaseline
+            );
+            assert!(db
+                .identity_change_users_for_origin(ORIGIN_A)
+                .unwrap()
+                .is_empty());
+
+            let mut weak_changed_signing = [0u8; 32];
+            weak_changed_signing[0] = 1;
+            assert_eq!(
+                db.observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_A,
+                    &original.locator.identity_key,
+                    &weak_changed_signing,
+                    "2026-07-13T12:12:00Z",
+                )
+                .unwrap(),
+                HistoricalAccountContinuity::IdentityChanged(vec![USER_A.to_string()])
+            );
+            assert_eq!(
+                db.resolve_account_snapshot(&original.locator).unwrap(),
+                Some(original.clone())
+            );
+            assert_eq!(
+                db.local_identity_verification(&original.locator).unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened
+                    .local_identity_verification(&original.locator)
+                    .unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+            assert_eq!(
+                reopened
+                    .resolve_account_snapshot(&original.locator)
+                    .unwrap(),
                 Some(original)
             );
         }
@@ -7533,6 +8137,110 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn historical_account_candidate_alarms_cross_user_and_self_alias_owners() {
+        let original = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x47,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+
+        let identity_alias_db = VeilDb::open_memory(&[0xBB; 32]).unwrap();
+        identity_alias_db
+            .upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        assert_eq!(
+            identity_alias_db
+                .observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_B,
+                    &original.locator.identity_key,
+                    &original.signing_key,
+                    "2026-07-13T12:13:00Z",
+                )
+                .unwrap(),
+            HistoricalAccountContinuity::IdentityChanged(vec![USER_A.to_string()])
+        );
+        assert!(identity_alias_db
+            .resolve_account_by_origin_user(ORIGIN_A, USER_B)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            identity_alias_db
+                .identity_change_users_for_origin(ORIGIN_A)
+                .unwrap(),
+            vec![USER_A.to_string()]
+        );
+
+        let signing_alias_db = VeilDb::open_memory(&[0xBC; 32]).unwrap();
+        signing_alias_db
+            .upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        let signing_alias_identity = [0x49; 32];
+        assert_eq!(
+            signing_alias_db
+                .observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_B,
+                    &signing_alias_identity,
+                    &original.signing_key,
+                    "2026-07-13T12:14:00Z",
+                )
+                .unwrap(),
+            HistoricalAccountContinuity::IdentityChanged(vec![USER_A.to_string()])
+        );
+        assert!(signing_alias_db
+            .resolve_account_by_origin_user(ORIGIN_A, USER_B)
+            .unwrap()
+            .is_none());
+
+        let self_alias_db = VeilDb::open_memory(&[0xBD; 32]).unwrap();
+        self_alias_db
+            .bind_authenticated_self(
+                ORIGIN_A,
+                USER_A,
+                &original.locator.identity_key,
+                &original.signing_key,
+            )
+            .unwrap();
+        assert_eq!(
+            self_alias_db
+                .observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_A,
+                    &original.locator.identity_key,
+                    &original.signing_key,
+                    "2026-07-13T12:15:00Z",
+                )
+                .unwrap(),
+            HistoricalAccountContinuity::Compatible
+        );
+        assert_eq!(
+            self_alias_db
+                .observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_B,
+                    &original.locator.identity_key,
+                    &original.signing_key,
+                    "2026-07-13T12:16:00Z",
+                )
+                .unwrap(),
+            HistoricalAccountContinuity::IdentityChanged(vec![USER_A.to_string()])
+        );
+        assert!(self_alias_db
+            .resolve_account_by_origin_user(ORIGIN_A, USER_B)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            self_alias_db
+                .identity_change_users_for_origin(ORIGIN_A)
+                .unwrap(),
+            vec![USER_A.to_string()]
+        );
     }
 
     #[test]
@@ -7682,6 +8390,15 @@ mod tests {
         bidi.profile_version = 4;
         bidi.about = "safe\u{202e}evil".to_string();
         assert!(db.upsert_network_profile(&bidi).is_err());
+        for unsafe_character in [
+            '\u{00ad}', '\u{034f}', '\u{180e}', '\u{200b}', '\u{2028}', '\u{2029}', '\u{2060}',
+            '\u{feff}',
+        ] {
+            let mut spoofing = current.clone();
+            spoofing.profile_version = 4;
+            spoofing.display_name = Some(format!("safe{unsafe_character}hidden"));
+            assert!(db.upsert_network_profile(&spoofing).is_err());
+        }
         assert_eq!(
             db.load_network_profile(&account.locator).unwrap(),
             Some(current)
@@ -7728,7 +8445,7 @@ mod tests {
             account.signing_key
         );
 
-        let conflicting_signing_key = [0x59; 32];
+        let conflicting_signing_key = test_signing_key(0x59);
         let mut advanced = profile.clone();
         advanced.profile_version = 2;
         advanced.display_name = Some("Must roll back".to_string());
@@ -7742,12 +8459,82 @@ mod tests {
     }
 
     #[test]
-    fn local_verification_is_device_local_and_detects_identity_change_after_restart() {
+    fn authenticated_profile_cache_survives_restart_and_rejects_cross_origin_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-network-profile-cache-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xC7; 32];
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x61,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(2),
+        );
+        let mut profile = sample_network_profile(&account, 2);
+        profile.display_name = Some("Restart cache".to_string());
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self(
+                ORIGIN_A,
+                USER_A,
+                &account.locator.identity_key,
+                &account.signing_key,
+            )
+            .unwrap();
+            db.upsert_authenticated_network_profile(&profile, account.signing_key)
+                .unwrap();
+        }
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                db.load_network_profile_for_authenticated_account(
+                    ORIGIN_A,
+                    USER_A,
+                    &account.locator.identity_key,
+                    &account.signing_key,
+                    &account.locator,
+                )
+                .unwrap(),
+                Some(profile.clone())
+            );
+            assert!(db
+                .load_network_profile_for_authenticated_account(
+                    ORIGIN_B,
+                    USER_A,
+                    &account.locator.identity_key,
+                    &account.signing_key,
+                    &account.locator,
+                )
+                .is_err());
+            assert!(db
+                .load_network_profile_for_authenticated_account(
+                    ORIGIN_A,
+                    USER_A,
+                    &[0x62; 32],
+                    &account.signing_key,
+                    &account.locator,
+                )
+                .is_err());
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_verification_v2_detects_signing_change_after_restart() {
         let path = std::env::temp_dir().join(format!(
             "veil-local-identity-verification-{}.db",
             uuid::Uuid::new_v4()
         ));
         let db_key = [0xC3; 32];
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x53,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
         let account = sample_account(
             ORIGIN_A,
             USER_A,
@@ -7755,32 +8542,70 @@ mod tests {
             AccountSnapshotSource::AuthenticatedConversationDirectory,
             None,
         );
+        let mut changed_account = account.clone();
+        changed_account.signing_key = test_signing_key(0x56);
+        changed_account.source = AccountSnapshotSource::AuthenticatedHistory;
+        changed_account.observed_at = "2026-07-13T02:11:00Z".to_string();
         {
             let db = VeilDb::open(&path, &db_key).unwrap();
-            db.upsert_identity_directory(std::slice::from_ref(&account))
+            db.bind_authenticated_self(
+                ORIGIN_A,
+                USER_B,
+                &self_account.locator.identity_key,
+                &self_account.signing_key,
+            )
+            .unwrap();
+            db.upsert_identity_directory(&[self_account.clone(), account.clone()])
                 .unwrap();
             assert_eq!(
                 db.local_identity_verification(&account.locator).unwrap(),
                 LocalIdentityVerification::NotCompared
             );
-            db.mark_identity_verified(&account.locator, "2026-07-13T02:10:00Z")
+            db.mark_account_verified_v2(&account.locator, "2026-07-13T02:10:00Z")
                 .unwrap();
+            assert_eq!(
+                db.local_identity_verification(&account.locator).unwrap(),
+                LocalIdentityVerification::VerifiedOnThisDevice
+            );
+            assert!(db
+                .upsert_identity_directory(std::slice::from_ref(&changed_account))
+                .is_err());
         }
         {
             let db = VeilDb::open(&path, &db_key).unwrap();
             assert_eq!(
                 db.local_identity_verification(&account.locator).unwrap(),
-                LocalIdentityVerification::VerifiedOnThisDevice
-            );
-            let mut changed = account.locator.clone();
-            changed.identity_key = [0x55; 32];
-            assert_eq!(
-                db.local_identity_verification(&changed).unwrap(),
                 LocalIdentityVerification::IdentityChanged
             );
+            assert_eq!(
+                db.local_identity_verification_for_unlocked_account(
+                    &self_account.locator.identity_key,
+                    &self_account.signing_key,
+                    &account.locator,
+                )
+                .unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+            assert_eq!(
+                db.local_identity_verification(&changed_account.locator)
+                    .unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+            assert_eq!(
+                db.resolve_account_snapshot(&account.locator).unwrap(),
+                Some(account.clone())
+            );
+            assert_eq!(
+                db.resolve_account_snapshot(&changed_account.locator)
+                    .unwrap(),
+                Some(account.clone())
+            );
+            assert!(db
+                .mark_account_verified_v2(&account.locator, "2026-07-13T02:12:00Z")
+                .is_err());
             let other_origin = ProfileLocator {
                 canonical_server_origin: ORIGIN_B.to_string(),
-                ..changed
+                ..changed_account.locator.clone()
             };
             assert_eq!(
                 db.local_identity_verification(&other_origin).unwrap(),
@@ -7791,6 +8616,93 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn offline_proof_reports_durable_origin_user_key_mismatch_without_seeding_it() {
+        let db = VeilDb::open_memory(&[0xC4; 32]).unwrap();
+        let self_a = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x63,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let mut self_b = self_a.clone();
+        self_b.locator.canonical_server_origin = ORIGIN_B.to_string();
+        self_b.profile_origin = ORIGIN_B.to_string();
+        let peer_a = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x64,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_B,
+            &self_a.locator.identity_key,
+            &self_a.signing_key,
+        )
+        .unwrap();
+        db.bind_authenticated_self(
+            ORIGIN_B,
+            USER_B,
+            &self_b.locator.identity_key,
+            &self_b.signing_key,
+        )
+        .unwrap();
+        db.upsert_identity_directory(&[self_a.clone(), self_b, peer_a.clone()])
+            .unwrap();
+
+        assert_eq!(
+            db.local_identity_verification_for_unlocked_account(
+                &self_a.locator.identity_key,
+                &self_a.signing_key,
+                &peer_a.locator,
+            )
+            .unwrap(),
+            LocalIdentityVerification::NotCompared
+        );
+        let changed_a = ProfileLocator {
+            identity_key: [0x65; 32],
+            ..peer_a.locator.clone()
+        };
+        assert_eq!(
+            db.local_identity_verification_for_unlocked_account(
+                &self_a.locator.identity_key,
+                &self_a.signing_key,
+                &changed_a,
+            )
+            .unwrap(),
+            LocalIdentityVerification::IdentityChanged
+        );
+        assert!(db.resolve_account_snapshot(&changed_a).unwrap().is_none());
+
+        let unknown = ProfileLocator {
+            user_id: "550e8400-e29b-41d4-a716-446655440099".to_string(),
+            identity_key: [0x66; 32],
+            ..peer_a.locator.clone()
+        };
+        assert!(db
+            .local_identity_verification_for_unlocked_account(
+                &self_a.locator.identity_key,
+                &self_a.signing_key,
+                &unknown,
+            )
+            .is_err());
+
+        let cross_origin = ProfileLocator {
+            canonical_server_origin: ORIGIN_B.to_string(),
+            ..changed_a
+        };
+        assert!(db
+            .local_identity_verification_for_unlocked_account(
+                &self_a.locator.identity_key,
+                &self_a.signing_key,
+                &cross_origin,
+            )
+            .is_err());
     }
 
     #[test]
@@ -7813,12 +8725,99 @@ mod tests {
         db.upsert_identity_directory(std::slice::from_ref(&account))
             .unwrap();
         assert!(db
-            .mark_identity_verified(&account.locator, "2026-07-13T02:20:00Z")
+            .mark_account_verified_v2(&account.locator, "2026-07-13T02:20:00Z")
             .is_err());
         assert_eq!(
             db.local_identity_verification(&account.locator).unwrap(),
             LocalIdentityVerification::NotCompared
         );
+    }
+
+    #[test]
+    fn account_v2_verification_binds_signing_key_and_never_upgrades_v1() {
+        let db = VeilDb::open_memory(&[0xC5; 32]).unwrap();
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x73,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let peer = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x74,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_B,
+            &self_account.locator.identity_key,
+            &self_account.signing_key,
+        )
+        .unwrap();
+        db.upsert_identity_directory(&[self_account, peer.clone()])
+            .unwrap();
+
+        db.conn
+            .execute_batch(
+                "CREATE TABLE local_identity_verifications_v1 (
+                    canonical_server_origin TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    verified_identity_key BLOB NOT NULL,
+                    verified_at TEXT NOT NULL,
+                    PRIMARY KEY (canonical_server_origin, user_id)
+                 );",
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO local_identity_verifications_v1
+                    (canonical_server_origin, user_id, verified_identity_key, verified_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    ORIGIN_A,
+                    USER_A,
+                    peer.locator.identity_key.as_slice(),
+                    "2026-07-13T02:30:00Z",
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            db.local_identity_verification(&peer.locator).unwrap(),
+            LocalIdentityVerification::NotCompared
+        );
+
+        db.mark_account_verified_v2(&peer.locator, "2026-07-13T02:31:00Z")
+            .unwrap();
+        assert_eq!(
+            db.local_identity_verification(&peer.locator).unwrap(),
+            LocalIdentityVerification::VerifiedOnThisDevice
+        );
+        let mut presentation_only = peer.clone();
+        presentation_only.display_name = Some("Renamed presentation".to_string());
+        presentation_only.observed_at = "2026-07-13T02:32:00Z".to_string();
+        db.upsert_identity_directory(std::slice::from_ref(&presentation_only))
+            .unwrap();
+        assert_eq!(
+            db.local_identity_verification(&peer.locator).unwrap(),
+            LocalIdentityVerification::VerifiedOnThisDevice
+        );
+
+        let mut signing_change = peer.clone();
+        signing_change.signing_key = test_signing_key(0x76);
+        signing_change.observed_at = "2026-07-13T02:33:00Z".to_string();
+        assert!(db
+            .upsert_identity_directory(std::slice::from_ref(&signing_change))
+            .is_err());
+        assert_eq!(
+            db.local_identity_verification(&peer.locator).unwrap(),
+            LocalIdentityVerification::IdentityChanged
+        );
+        assert!(db
+            .mark_account_verified_v2(&peer.locator, "2026-07-13T02:34:00Z")
+            .is_err());
     }
 
     #[test]
@@ -7892,6 +8891,27 @@ mod tests {
         );
         zero_signing.signing_key = [0; 32];
         assert!(db.upsert_identity_directory(&[zero_signing]).is_err());
+
+        let mut low_order_signing = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x64,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        low_order_signing.signing_key = [0; 32];
+        low_order_signing.signing_key[0] = 1;
+        assert!(db
+            .upsert_identity_directory(std::slice::from_ref(&low_order_signing))
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(
+                ORIGIN_A,
+                USER_A,
+                &low_order_signing.locator.identity_key,
+                &low_order_signing.signing_key,
+            )
+            .is_err());
 
         let mut cross_origin = sample_account(
             ORIGIN_A,
@@ -7972,6 +8992,99 @@ mod tests {
     }
 
     #[test]
+    fn message_author_context_is_separate_from_authority_and_immutable_per_message() {
+        let db = VeilDb::open_memory(&[0xBC; 32]).unwrap();
+        let directory_author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x75,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(4),
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&directory_author))
+            .unwrap();
+        db.upsert_directory_conversation(
+            "author-context-conversation",
+            1,
+            ORIGIN_A,
+            Some("Context group"),
+            None,
+            None,
+            None,
+            "2026-07-13T13:00:00Z",
+        )
+        .unwrap();
+
+        db.insert_message(
+            "former-author-message",
+            "author-context-conversation",
+            &directory_author.locator.identity_key,
+            "restored history",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        db.attach_message_author_with_context(
+            "former-author-message",
+            &directory_author,
+            MessageAuthorContext::FormerMemberAtObservation,
+        )
+        .unwrap();
+
+        let former = db
+            .get_messages("author-context-conversation", 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            former.author.as_ref().map(|author| author.source),
+            Some(AccountSnapshotSource::AuthenticatedConversationDirectory),
+            "presentation authority must not be downgraded by history",
+        );
+        assert_eq!(
+            former.author_context,
+            Some(MessageAuthorContext::FormerMemberAtObservation),
+        );
+
+        // A later directory replay cannot rewrite the immutable provenance of
+        // an already-committed historical message.
+        db.attach_message_author_with_context(
+            "former-author-message",
+            &directory_author,
+            MessageAuthorContext::DirectoryMemberAtObservation,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_messages("author-context-conversation", 10).unwrap()[0].author_context,
+            Some(MessageAuthorContext::FormerMemberAtObservation),
+        );
+
+        // A new message observed after the account is present again receives
+        // the current-directory context without rewriting the older message.
+        db.insert_message(
+            "rejoined-author-message",
+            "author-context-conversation",
+            &directory_author.locator.identity_key,
+            "after rejoin",
+            false,
+            Some(2),
+            None,
+        )
+        .unwrap();
+        db.attach_message_author("rejoined-author-message", &directory_author)
+            .unwrap();
+        let messages = db.get_messages("author-context-conversation", 10).unwrap();
+        assert_eq!(
+            messages[0].author_context,
+            Some(MessageAuthorContext::FormerMemberAtObservation)
+        );
+        assert_eq!(
+            messages[1].author_context,
+            Some(MessageAuthorContext::DirectoryMemberAtObservation)
+        );
+    }
+
+    #[test]
     fn author_snapshot_survives_a_file_backed_sqlcipher_restart() {
         let path =
             std::env::temp_dir().join(format!("veil-author-snapshot-{}.db", uuid::Uuid::new_v4()));
@@ -8018,6 +9131,10 @@ mod tests {
                 .unwrap()
                 .remove(0);
             assert_eq!(message.author, Some(author));
+            assert_eq!(
+                message.author_context,
+                Some(MessageAuthorContext::DirectoryMemberAtObservation)
+            );
         }
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
@@ -8067,6 +9184,10 @@ mod tests {
             .unwrap()
             .expect("exact search row must resolve");
         assert_eq!(loaded.author, Some(author));
+        assert_eq!(
+            loaded.author_context,
+            Some(MessageAuthorContext::DirectoryMemberAtObservation)
+        );
         assert!(db
             .get_message_for_search("search-author-message", "different-conversation", ORIGIN_A,)
             .unwrap()
@@ -8125,6 +9246,10 @@ mod tests {
         assert_eq!(
             db.get_messages("author-ack-conversation", 10).unwrap()[0].author,
             Some(author)
+        );
+        assert_eq!(
+            db.get_messages("author-ack-conversation", 10).unwrap()[0].author_context,
+            Some(MessageAuthorContext::DirectoryMemberAtObservation)
         );
     }
 

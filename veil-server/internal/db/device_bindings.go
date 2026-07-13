@@ -8,6 +8,7 @@ import (
 	"math"
 	"time"
 
+	"github.com/AegisSec/veil-server/internal/cryptokey"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -59,6 +60,9 @@ func validateDeviceBindingForStore(binding *DeviceBinding) error {
 		binding.Version > math.MaxInt64 || binding.Capabilities > math.MaxInt64 ||
 		len(binding.AccountSignature) != 64 || len(binding.Commitment) != 32 {
 		return errors.New("invalid device binding")
+	}
+	if !cryptokey.ValidEd25519PublicKey(binding.DeviceSigningKey) {
+		return errors.New("invalid device signing public key")
 	}
 	if binding.Status != DeviceBindingActive && binding.Status != DeviceBindingExcluded &&
 		binding.Status != DeviceBindingRevoked {

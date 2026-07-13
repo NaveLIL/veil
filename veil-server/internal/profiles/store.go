@@ -3,6 +3,7 @@ package profiles
 import (
 	"context"
 	"errors"
+	"sort"
 	"time"
 
 	"github.com/google/uuid"
@@ -10,7 +11,18 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-var ErrVersionConflict = errors.New("profile version conflict")
+var (
+	ErrVersionConflict         = errors.New("profile version conflict")
+	ErrAvatarUploadQuota       = errors.New("avatar upload quota exceeded")
+	ErrProfileAudienceTooLarge = errors.New("profile update audience exceeds fanout budget")
+)
+
+const (
+	maxAvatarUploadsPerWindow       = 12
+	maxProfileUpdateRecipients      = 4096
+	maxRetainedOrphanAvatarAssets   = 4096
+	avatarOrphanBudgetAdvisoryKeyID = int64(0x5645494c41564154) // "VEILAVAT"
+)
 
 type Profile struct {
 	UserID            string    `json:"user_id"`
@@ -111,11 +123,21 @@ func (s *PostgresStore) UpdateAvatar(ctx context.Context, userID string, expecte
 	defer func() { _ = tx.Rollback(ctx) }()
 	var oldID *string
 	var currentVersion int64
-	if err = tx.QueryRow(ctx, `SELECT avatar_asset_id::text, profile_version FROM users WHERE id=$1::uuid FOR UPDATE`, userID).Scan(&oldID, &currentVersion); err != nil {
+	var resetUploadWindow bool
+	var uploadCount int
+	if err = tx.QueryRow(ctx, `SELECT avatar_asset_id::text, profile_version,
+		COALESCE(avatar_upload_window_started_at <= now() - interval '24 hours', true),
+		avatar_upload_count
+		FROM users WHERE id=$1::uuid FOR UPDATE`, userID).Scan(
+		&oldID, &currentVersion, &resetUploadWindow, &uploadCount,
+	); err != nil {
 		return nil, err
 	}
 	if currentVersion != expectedVersion {
 		return nil, ErrVersionConflict
+	}
+	if asset != nil && !resetUploadWindow && uploadCount >= maxAvatarUploadsPerWindow {
+		return nil, ErrAvatarUploadQuota
 	}
 	var nextID *string
 	if asset != nil {
@@ -128,12 +150,37 @@ func (s *PostgresStore) UpdateAvatar(ctx context.Context, userID string, expecte
 		}
 		nextID = &asset.ID
 	}
-	if _, err = tx.Exec(ctx, `UPDATE users SET avatar_asset_id=$1::uuid,
-		profile_version=profile_version+1, profile_updated_at=now() WHERE id=$2::uuid`, nextID, userID); err != nil {
+	if asset != nil {
+		if _, err = tx.Exec(ctx, `UPDATE users SET avatar_asset_id=$1::uuid,
+			profile_version=profile_version+1, profile_updated_at=now(),
+			avatar_upload_window_started_at=CASE WHEN $3 THEN now() ELSE avatar_upload_window_started_at END,
+			avatar_upload_count=CASE WHEN $3 THEN 1 ELSE avatar_upload_count+1 END
+			WHERE id=$2::uuid`, nextID, userID, resetUploadWindow); err != nil {
+			return nil, err
+		}
+	} else if _, err = tx.Exec(ctx, `UPDATE users SET avatar_asset_id=NULL,
+		profile_version=profile_version+1, profile_updated_at=now() WHERE id=$1::uuid`, userID); err != nil {
 		return nil, err
 	}
 	if oldID != nil {
 		if _, err = tx.Exec(ctx, `UPDATE profile_avatar_assets SET orphaned_at=now() WHERE id=$1::uuid AND owner_id=$2::uuid`, *oldID, userID); err != nil {
+			return nil, err
+		}
+		// Serialize the global orphan budget across gateway replicas. Current
+		// avatars are never budget-evicted; only detached presentation bytes may
+		// lose part of their *maximum* 24-hour grace under storage pressure.
+		if _, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, avatarOrphanBudgetAdvisoryKeyID); err != nil {
+			return nil, err
+		}
+		if _, err = tx.Exec(ctx, `DELETE FROM profile_avatar_assets doomed
+			WHERE doomed.id IN (
+				SELECT candidate.id FROM profile_avatar_assets candidate
+				WHERE candidate.orphaned_at IS NOT NULL
+				  AND NOT EXISTS (SELECT 1 FROM users u WHERE u.avatar_asset_id=candidate.id)
+				ORDER BY candidate.orphaned_at DESC, candidate.id DESC
+				OFFSET $1
+				LIMIT 128
+			)`, maxRetainedOrphanAvatarAssets); err != nil {
 			return nil, err
 		}
 	}
@@ -144,7 +191,6 @@ func (s *PostgresStore) UpdateAvatar(ctx context.Context, userID string, expecte
 	if err = tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	_, _ = s.pool.Exec(ctx, `DELETE FROM profile_avatar_assets WHERE orphaned_at < now() - interval '24 hours'`)
 	return &profile, nil
 }
 
@@ -166,36 +212,65 @@ func (s *PostgresStore) GetAvatar(ctx context.Context, assetID string) (*AvatarA
 // presentation update into instance-wide UUID/activity disclosure.
 func (s *PostgresStore) ProfileUpdateRecipients(ctx context.Context, userID string) ([]string, error) {
 	rows, err := s.pool.Query(ctx, `
-		WITH related(user_id) AS (
-			SELECT $1::uuid
-			UNION
-			SELECT CASE WHEN user_id_1 = $1::uuid THEN user_id_2 ELSE user_id_1 END
-			FROM friendships
-			WHERE user_id_1 = $1::uuid OR user_id_2 = $1::uuid
-			UNION
-			SELECT peer.user_id
-			FROM conversation_members mine
-			JOIN conversation_members peer ON peer.conversation_id = mine.conversation_id
-			WHERE mine.user_id = $1::uuid
-			UNION
-			SELECT peer.user_id
-			FROM server_members mine
-			JOIN server_members peer ON peer.server_id = mine.server_id
-			WHERE mine.user_id = $1::uuid
-		)
-		SELECT user_id::text FROM related ORDER BY user_id`, userID)
+		SELECT source, user_id::text FROM (
+			SELECT 0 AS source, $1::uuid AS user_id
+			UNION ALL
+			SELECT * FROM (
+				SELECT 1 AS source,
+					CASE WHEN user_id_1 = $1::uuid THEN user_id_2 ELSE user_id_1 END AS user_id
+				FROM friendships
+				WHERE user_id_1 = $1::uuid OR user_id_2 = $1::uuid
+				LIMIT $2
+			) friends
+			UNION ALL
+			SELECT * FROM (
+				SELECT 2 AS source, peer.user_id
+				FROM conversation_members mine
+				JOIN conversation_members peer ON peer.conversation_id = mine.conversation_id
+				WHERE mine.user_id = $1::uuid
+				LIMIT $2
+			) conversations
+			UNION ALL
+			SELECT * FROM (
+				SELECT 3 AS source, peer.user_id
+				FROM server_members mine
+				JOIN server_members peer ON peer.server_id = mine.server_id
+				WHERE mine.user_id = $1::uuid
+				LIMIT $2
+			) servers
+		) bounded_related`, userID, maxProfileUpdateRecipients+1)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	recipients := make([]string, 0)
+	branchCounts := [4]int{}
+	unique := make(map[string]struct{}, maxProfileUpdateRecipients)
 	for rows.Next() {
+		var source int
 		var recipient string
-		if err := rows.Scan(&recipient); err != nil {
+		if err := rows.Scan(&source, &recipient); err != nil {
 			return nil, err
 		}
+		if source < 0 || source >= len(branchCounts) {
+			return nil, ErrProfileAudienceTooLarge
+		}
+		branchCounts[source]++
+		if source != 0 && branchCounts[source] > maxProfileUpdateRecipients {
+			return nil, ErrProfileAudienceTooLarge
+		}
+		unique[recipient] = struct{}{}
+		if len(unique) > maxProfileUpdateRecipients {
+			return nil, ErrProfileAudienceTooLarge
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	recipients := make([]string, 0, len(unique))
+	for recipient := range unique {
 		recipients = append(recipients, recipient)
 	}
-	return recipients, rows.Err()
+	sort.Strings(recipients)
+	return recipients, nil
 }

@@ -1,6 +1,7 @@
 package auth_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -23,6 +24,15 @@ func x25519KeyPair(t *testing.T) ([]byte, []byte) {
 		t.Fatal(err)
 	}
 	return private, public
+}
+
+func signingPublicKey(t *testing.T) ed25519.PublicKey {
+	t.Helper()
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return publicKey
 }
 
 func signWSChallenge(t *testing.T, serverPublic, identityPrivate []byte, signingPrivate ed25519.PrivateKey) []byte {
@@ -88,7 +98,7 @@ func TestRemoveChallenge(t *testing.T) {
 
 	// Now VerifyResponse should return ErrChallengeUnknown
 	_, err := svc.VerifyResponse(context.Background(), "conn-1",
-		make([]byte, 32), make([]byte, 32), make([]byte, 64), make([]byte, 16), "test")
+		make([]byte, 32), signingPublicKey(t), make([]byte, 64), make([]byte, 16), "test")
 	if err != auth.ErrChallengeUnknown {
 		t.Fatalf("expected ErrChallengeUnknown, got %v", err)
 	}
@@ -98,7 +108,7 @@ func TestVerifyResponse_UnknownChallenge(t *testing.T) {
 	svc := newTestService()
 
 	_, err := svc.VerifyResponse(context.Background(), "nonexistent",
-		make([]byte, 32), make([]byte, 32), make([]byte, 64), make([]byte, 16), "test")
+		make([]byte, 32), signingPublicKey(t), make([]byte, 64), make([]byte, 16), "test")
 	if err != auth.ErrChallengeUnknown {
 		t.Fatalf("expected ErrChallengeUnknown, got %v", err)
 	}
@@ -122,7 +132,7 @@ func TestVerifyResponse_BadDeviceID(t *testing.T) {
 
 	// device_id too short
 	_, err := svc.VerifyResponse(context.Background(), "conn-1",
-		make([]byte, 32), make([]byte, 32), make([]byte, 64), make([]byte, 8), "")
+		make([]byte, 32), signingPublicKey(t), make([]byte, 64), make([]byte, 8), "")
 	if err != auth.ErrBadDeviceID {
 		t.Fatalf("expected ErrBadDeviceID, got %v", err)
 	}
@@ -157,6 +167,24 @@ func TestVerifyResponse_RejectsLowOrderIdentityKey(t *testing.T) {
 		make([]byte, 32), pub, make([]byte, ed25519.SignatureSize), make([]byte, 16), "test")
 	if err != auth.ErrBadIdentityProof {
 		t.Fatalf("expected ErrBadIdentityProof, got %v", err)
+	}
+}
+
+func TestVerifyResponseRejectsWeakEd25519SigningKeyBeforeRegistration(t *testing.T) {
+	svc := newTestService()
+	svc.CreateChallenge("weak-signing-key")
+
+	_, err := svc.VerifyResponse(
+		context.Background(),
+		"weak-signing-key",
+		bytes.Repeat([]byte{1}, 32),
+		make([]byte, ed25519.PublicKeySize),
+		make([]byte, ed25519.SignatureSize),
+		make([]byte, 16),
+		"test",
+	)
+	if err != auth.ErrBadSigningKey {
+		t.Fatalf("weak signing key error = %v, want ErrBadSigningKey", err)
 	}
 }
 

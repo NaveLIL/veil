@@ -51,11 +51,28 @@ func normalizeField(value string, allowLF bool, maxGraphemes, maxBytes int) (str
 		if r == '\n' && allowLF {
 			continue
 		}
-		if unicode.IsControl(r) || isDirectionalControl(r) {
+		if unicode.IsControl(r) || isDirectionalControl(r) || isUnsafeInvisible(r) {
 			return "", ErrInvalidProfileText
 		}
 	}
 	return value, nil
+}
+
+func isUnsafeInvisible(r rune) bool {
+	if unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) {
+		return true
+	}
+	switch r {
+	case '\u00ad', // soft hyphen
+		'\u034f', // combining grapheme joiner
+		'\u180e', // Mongolian vowel separator (deprecated invisible)
+		'\u200b', // zero-width space
+		'\u2060', // word joiner
+		'\ufeff': // zero-width no-break space / BOM
+		return true
+	default:
+		return false
+	}
 }
 
 func isDirectionalControl(r rune) bool {

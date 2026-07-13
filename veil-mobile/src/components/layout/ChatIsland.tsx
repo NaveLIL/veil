@@ -11,12 +11,12 @@ import {
 } from "react-native";
 import { Island } from "../ui/Island";
 import { colors, radii, spacing } from "../../lib/theme";
-import { DM_HOME_ID, MEMBERS_BY_SERVER, type Member, useChatStore } from "../../stores/chat";
+import { DM_HOME_ID, type Member, useChatStore } from "../../stores/chat";
 import { UserAvatar } from "../identity/UserAvatar";
 
 const EMPTY_MSGS: never[] = [];
 
-export const ChatIsland: React.FC<{ onOpenIdentity?: (member: Member) => void }> = ({ onOpenIdentity }) => {
+export const ChatIsland: React.FC<{ onOpenIdentity?: (member: Member, triggerHandle: string | number) => void }> = ({ onOpenIdentity }) => {
   const selectedServerId = useChatStore((s) => s.selectedServerId);
   const selectedChannelId = useChatStore((s) => s.selectedChannelId);
   const selectedDmId = useChatStore((s) => s.selectedDmId);
@@ -75,23 +75,20 @@ export const ChatIsland: React.FC<{ onOpenIdentity?: (member: Member) => void }>
               <View key={m.id} style={styles.msgRow}>
                 <Pressable
                   accessibilityRole="button"
-                  accessibilityLabel={`View identity for ${m.authorName}`}
-                  disabled={!MEMBERS_BY_SERVER[selectedServerId]?.some((member) => member.id === m.authorId)}
-                  onPress={() => {
-                    const member = MEMBERS_BY_SERVER[selectedServerId]?.find((candidate) => candidate.id === m.authorId);
-                    if (member) onOpenIdentity?.(member);
-                  }}
+                  accessibilityLabel={`View identity for ${m.author.name}`}
+                  onPress={(event) => onOpenIdentity?.(m.author, event.nativeEvent.target)}
                 >
                   <UserAvatar
-                    identityKey={MEMBERS_BY_SERVER[selectedServerId]?.find((member) => member.id === m.authorId)?.identityKey}
-                    userId={MEMBERS_BY_SERVER[selectedServerId]?.find((member) => member.id === m.authorId)?.userId ?? m.authorId}
-                    username={m.authorName}
+                    identityKey={m.author.identityKey}
+                    canonicalServerOrigin={m.author.canonicalServerOrigin}
+                    userId={m.author.userId}
+                    technicalUsername={m.author.username}
                     size={36}
                   />
                 </Pressable>
                 <View style={styles.msgBody}>
                   <View style={styles.msgHead}>
-                    <Text style={[styles.author, { color: m.authorColor }]}>{m.authorName}</Text>
+                    <Text style={[styles.author, { color: m.author.color }]}>{m.author.name}</Text>
                     <Text style={styles.ts}>{m.ts}</Text>
                   </View>
                   <Text style={styles.text}>{m.text}</Text>
@@ -149,15 +146,6 @@ const styles = StyleSheet.create({
   emptyHint: { color: colors.textLo, fontSize: 12, marginTop: 4 },
 
   msgRow: { flexDirection: "row", gap: spacing.sm },
-  avatar: {
-    width: 36,
-    height: 36,
-    borderRadius: radii.pill,
-    alignItems: "center",
-    justifyContent: "center",
-    borderWidth: 1,
-  },
-  avatarText: { fontSize: 14, fontWeight: "700" },
   msgBody: { flex: 1, minWidth: 0 },
   msgHead: { flexDirection: "row", alignItems: "baseline", gap: spacing.sm },
   author: { fontSize: 13, fontWeight: "700" },

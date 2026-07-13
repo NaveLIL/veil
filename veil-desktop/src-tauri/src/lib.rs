@@ -16,8 +16,8 @@ use veil_client::connection::ConnectionEvent;
 use veil_search::{Indexer, SearchHit};
 use veil_store::keychain;
 use veil_store::models::{
-    AccountSnapshot, AccountSnapshotSource, LocalIdentityVerification, Message, NetworkProfile,
-    ProfileLocator,
+    AccountSnapshot, AccountSnapshotSource, HistoricalAccountContinuity, LocalIdentityVerification,
+    Message, MessageAuthorContext, NetworkProfile, ProfileLocator,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -73,8 +73,19 @@ struct IdentityVerificationView {
     canonical_server_origin: String,
     user_id: String,
     identity_key: String,
+    signing_key: String,
+    fingerprint_version: &'static str,
     fingerprint_hex: String,
     fingerprint_emoji: String,
+    proof_state: String,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedIdentityProofView {
+    canonical_server_origin: String,
+    user_id: String,
+    identity_key: String,
     proof_state: String,
 }
 
@@ -313,6 +324,117 @@ fn identity_observed_at() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+fn persist_identity_directory_with_signal(
+    db: &veil_store::db::VeilDb,
+    snapshots: &[AccountSnapshot],
+    event_app: Option<&AuthenticatedEventAppHandle>,
+) -> Result<(), String> {
+    let Err(error) = db.upsert_identity_directory(snapshots) else {
+        return Ok(());
+    };
+
+    // The directory candidate has already been rejected and the durable alarm
+    // committed by VeilDb. Notify only for exact users whose local proof now
+    // reports IdentityChanged, and keep the original fail-closed error even if
+    // renderer event delivery itself is unavailable.
+    if let Some(event_app) = event_app {
+        let event_origin = event_app.binding.origin.canonical_server_origin();
+        if let Ok(users) = db.identity_change_users_for_origin(&event_origin) {
+            for user_id in users {
+                let _ = event_app.emit(
+                    "veil://identity-changed",
+                    serde_json::json!({ "userId": user_id }),
+                );
+            }
+        }
+    }
+    Err(error)
+}
+
+fn persist_authenticated_history_preflight(
+    db: &veil_store::db::VeilDb,
+    snapshot: &AccountSnapshot,
+    sender_is_usable: bool,
+    remote_state: veil_store::models::RemoteMessageStateKind,
+    event_app: Option<&AuthenticatedEventAppHandle>,
+) -> Result<(), String> {
+    if snapshot.source != AccountSnapshotSource::AuthenticatedHistory
+        || !sender_is_usable
+        || remote_state != veil_store::models::RemoteMessageStateKind::Active
+    {
+        return Ok(());
+    }
+
+    // A former member is outside the current directory. Only an active wire
+    // row that passed its retained account/device proof may contribute an
+    // authoritative historical identity. Tombstones and unavailable rows
+    // deliberately carry no such authority.
+    persist_identity_directory_with_signal(db, std::slice::from_ref(snapshot), event_app)
+}
+
+fn observe_active_history_candidate_with_signal(
+    db: &veil_store::db::VeilDb,
+    canonical_server_origin: &str,
+    user_id: &str,
+    identity_key: &[u8; 32],
+    signing_key: &[u8; 32],
+    remote_state: veil_store::models::RemoteMessageStateKind,
+    event_app: Option<&AuthenticatedEventAppHandle>,
+) -> Result<(), String> {
+    if remote_state != veil_store::models::RemoteMessageStateKind::Active {
+        return Ok(());
+    }
+    match db.observe_historical_account_candidate(
+        canonical_server_origin,
+        user_id,
+        identity_key,
+        signing_key,
+        &identity_observed_at(),
+    )? {
+        HistoricalAccountContinuity::NoBaseline | HistoricalAccountContinuity::Compatible => Ok(()),
+        HistoricalAccountContinuity::IdentityChanged(alarm_user_ids) => {
+            if let Some(event_app) = event_app {
+                for alarm_user_id in alarm_user_ids {
+                    let _ = event_app.emit(
+                        "veil://identity-changed",
+                        serde_json::json!({ "userId": alarm_user_id }),
+                    );
+                }
+            }
+            Err("active history presented account keys that differ from the durable origin-scoped baseline".to_string())
+        }
+    }
+}
+
+fn require_historical_candidate_runtime_continuity(
+    client: &VeilClient,
+    db: &veil_store::db::VeilDb,
+    canonical_server_origin: &str,
+    user_id: &str,
+    candidate_identity_key: [u8; 32],
+    sender_is_usable: bool,
+    remote_state: veil_store::models::RemoteMessageStateKind,
+) -> Result<(), String> {
+    if !sender_is_usable || remote_state != veil_store::models::RemoteMessageStateKind::Active {
+        return Ok(());
+    }
+    let Some(runtime_identity_key) = client.known_user_identity(user_id) else {
+        return Ok(());
+    };
+    if runtime_identity_key == candidate_identity_key {
+        return Ok(());
+    }
+    if db
+        .resolve_account_by_origin_user(canonical_server_origin, user_id)?
+        .is_some()
+    {
+        // The SQLCipher directory owns continuity. Let its atomic preflight
+        // record a durable IdentityChanged alarm for the conflicting candidate.
+        return Ok(());
+    }
+    Err("historical sender conflicts with a process-only identity pin and has no durable continuity baseline".to_string())
+}
+
 // ─── Identity ─────────────────────────────────────────
 
 #[tauri::command]
@@ -369,22 +491,6 @@ fn get_identity_key(state: State<'_, AppState>) -> Result<String, String> {
     let key = client.identity_key()?;
     require_session_still_unlocked(&state)?;
     Ok(hex::encode(key))
-}
-
-#[tauri::command]
-fn fingerprint_peer(
-    state: State<'_, AppState>,
-    peer_identity_key: String,
-) -> Result<String, String> {
-    require_unlocked(&state)?;
-    let peer: [u8; 32] = hex::decode(peer_identity_key.trim())
-        .map_err(|_| "peer identity key must be 32-byte hex")?
-        .try_into()
-        .map_err(|_| "peer identity key must be 32-byte hex")?;
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let (_, hex_fingerprint) = client.fingerprint(&peer)?;
-    require_session_still_unlocked(&state)?;
-    Ok(hex_fingerprint)
 }
 
 #[tauri::command]
@@ -1584,9 +1690,10 @@ fn get_messages(
                 "senderName": author_name,
                 "senderUserId": m.author.as_ref().map(|author| &author.locator.user_id),
                 "senderSigningKey": m.author.as_ref().map(|author| hex::encode(author.signing_key)),
-                "senderProfileVersion": m.author.as_ref().and_then(|author| author.profile_version),
+                "senderProfileVersion": m.author.as_ref().and_then(|author| author.profile_version.map(|version| version.to_string())),
                 "senderProfileOrigin": m.author.as_ref().map(|author| &author.profile_origin),
                 "senderOrigin": m.author.as_ref().map(|author| &author.locator.canonical_server_origin),
+                "senderAuthorContext": m.author_context.map(MessageAuthorContext::wire_label),
                 "text": m.plaintext,
                 "isOwn": m.is_outgoing,
                 "pending": m.is_outgoing && m.status == veil_store::models::MessageStatus::Sending,
@@ -1942,6 +2049,17 @@ struct PinnedDirectoryMember {
     signing_key: [u8; 32],
 }
 
+fn observed_message_author_context(
+    directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
+    sender_user_id: &str,
+) -> MessageAuthorContext {
+    if directory.contains_key(sender_user_id) {
+        MessageAuthorContext::DirectoryMemberAtObservation
+    } else {
+        MessageAuthorContext::FormerMemberAtObservation
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SyncMessagePage {
@@ -2053,14 +2171,78 @@ fn validate_expected_dm_peer_identity_key(
     Ok(())
 }
 
-fn validate_created_dm_account_directory<'a>(
+fn validate_created_dm_peer_key_agreement(
+    directory_peer_identity_key: &[u8; 32],
+    directory_peer_signing_key: &[u8; 32],
+    response_peer_identity_key: &[u8; 32],
+    response_peer_signing_key: &[u8; 32],
+) -> Result<(), String> {
+    if directory_peer_identity_key != response_peer_identity_key
+        || directory_peer_signing_key != response_peer_signing_key
+    {
+        return Err(
+            "created DM response conflicts with its authenticated member directory".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn persist_created_dm_identity_preflight(
+    db: &veil_store::db::VeilDb,
+    snapshots: &[AccountSnapshot],
+    event_app: Option<&AuthenticatedEventAppHandle>,
+    canonical_server_origin: &str,
+    peer_user_id: &str,
+    expected_peer_identity_key: Option<&[u8; 32]>,
+    directory_peer_identity_key: &[u8; 32],
+    directory_peer_signing_key: &[u8; 32],
+    response_peer_identity_key: &[u8; 32],
+    response_peer_signing_key: &[u8; 32],
+) -> Result<(), String> {
+    let has_durable_peer_baseline = db
+        .resolve_account_by_origin_user(canonical_server_origin, peer_user_id)?
+        .is_some();
+    if !has_durable_peer_baseline {
+        // A first-seen server candidate must not become durable after it has
+        // contradicted either the creation response or the identity selected
+        // by the user action.
+        validate_created_dm_peer_key_agreement(
+            directory_peer_identity_key,
+            directory_peer_signing_key,
+            response_peer_identity_key,
+            response_peer_signing_key,
+        )?;
+        validate_expected_dm_peer_identity_key(
+            expected_peer_identity_key,
+            response_peer_identity_key,
+        )?;
+    }
+
+    // Once continuity exists, the complete authenticated directory gets the
+    // first opportunity to record a durable key-change alarm. Either failure
+    // still happens before conversation/runtime publication.
+    persist_identity_directory_with_signal(db, snapshots, event_app)?;
+    if has_durable_peer_baseline {
+        validate_created_dm_peer_key_agreement(
+            directory_peer_identity_key,
+            directory_peer_signing_key,
+            response_peer_identity_key,
+            response_peer_signing_key,
+        )?;
+        validate_expected_dm_peer_identity_key(
+            expected_peer_identity_key,
+            response_peer_identity_key,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_created_dm_account_directory_membership<'a>(
     directory: &'a std::collections::HashMap<String, PinnedDirectoryMember>,
     authenticated_user_id: &str,
     local_identity_key: &[u8; 32],
     local_signing_key: &[u8; 32],
     peer_user_id: &str,
-    peer_identity_key: &[u8; 32],
-    peer_signing_key: &[u8; 32],
 ) -> Result<&'a PinnedDirectoryMember, String> {
     if peer_user_id == authenticated_user_id {
         return Err("DM peer must differ from the authenticated account".to_string());
@@ -2077,11 +2259,32 @@ fn validate_created_dm_account_directory<'a>(
     let peer = directory
         .get(peer_user_id)
         .ok_or("created DM directory is missing the requested peer")?;
-    if peer.identity_key != *peer_identity_key || peer.signing_key != *peer_signing_key {
-        return Err(
-            "created DM response conflicts with its authenticated member directory".to_string(),
-        );
-    }
+    Ok(peer)
+}
+
+#[cfg(test)]
+fn validate_created_dm_account_directory<'a>(
+    directory: &'a std::collections::HashMap<String, PinnedDirectoryMember>,
+    authenticated_user_id: &str,
+    local_identity_key: &[u8; 32],
+    local_signing_key: &[u8; 32],
+    peer_user_id: &str,
+    peer_identity_key: &[u8; 32],
+    peer_signing_key: &[u8; 32],
+) -> Result<&'a PinnedDirectoryMember, String> {
+    let peer = validate_created_dm_account_directory_membership(
+        directory,
+        authenticated_user_id,
+        local_identity_key,
+        local_signing_key,
+        peer_user_id,
+    )?;
+    validate_created_dm_peer_key_agreement(
+        &peer.identity_key,
+        &peer.signing_key,
+        peer_identity_key,
+        peer_signing_key,
+    )?;
     Ok(peer)
 }
 
@@ -2291,6 +2494,23 @@ fn contains_bidi_override(value: &str) -> bool {
                 | '\u{200f}'
                 | '\u{202a}'..='\u{202e}'
                 | '\u{2066}'..='\u{2069}'
+                | '\u{206a}'..='\u{206f}'
+        )
+    })
+}
+
+fn contains_unsafe_profile_invisible(value: &str) -> bool {
+    value.chars().any(|character| {
+        matches!(
+            character,
+            '\u{00ad}'
+                | '\u{034f}'
+                | '\u{180e}'
+                | '\u{200b}'
+                | '\u{2028}'
+                | '\u{2029}'
+                | '\u{2060}'
+                | '\u{feff}'
         )
     })
 }
@@ -2303,6 +2523,7 @@ fn validate_profile_text(
 ) -> Result<(), String> {
     if value.len() > max_bytes
         || contains_bidi_override(value)
+        || contains_unsafe_profile_invisible(value)
         || value
             .chars()
             .any(|character| character.is_control() && !(allow_line_feed && character == '\n'))
@@ -2316,7 +2537,7 @@ fn canonical_profile_version(value: &str) -> Result<u64, String> {
     let parsed = value
         .parse::<u64>()
         .map_err(|_| "profile version is invalid".to_string())?;
-    if parsed.to_string() != value {
+    if parsed.to_string() != value || parsed > i64::MAX as u64 {
         return Err("profile version is non-canonical".to_string());
     }
     Ok(parsed)
@@ -2359,6 +2580,9 @@ fn parse_network_profile_response(
         "network profile updated timestamp",
         &profile.profile_updated_at,
     )?;
+    if profile.profile_version > i64::MAX as u64 {
+        return Err("network profile version exceeds the server contract".to_string());
+    }
     Ok(profile)
 }
 
@@ -2403,6 +2627,25 @@ struct AvatarMetadata {
     content_type: Option<String>,
 }
 
+fn validate_profile_avatar_jpeg(bytes: &[u8]) -> Result<(), String> {
+    use image::GenericImageView;
+    use std::io::Cursor;
+
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(512);
+    limits.max_image_height = Some(512);
+    limits.max_alloc = Some(8 * 1024 * 1024);
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), image::ImageFormat::Jpeg);
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|_| "profile avatar failed native image validation".to_string())?;
+    if decoded.dimensions() != (512, 512) {
+        return Err("profile avatar dimensions are invalid".to_string());
+    }
+    Ok(())
+}
+
 fn avatar_metadata(response: &NetworkProfileResponse) -> Result<AvatarMetadata, String> {
     match (
         response.avatar_asset_id.clone(),
@@ -2434,7 +2677,6 @@ async fn fetch_profile_avatar(
     binding: &RestBinding,
 ) -> Result<Option<String>, String> {
     use base64::Engine;
-    use image::GenericImageView;
     use sha2::{Digest, Sha256};
 
     let AvatarMetadata {
@@ -2475,11 +2717,7 @@ async fn fetch_profile_avatar(
     {
         return Err("profile avatar failed native integrity validation".to_string());
     }
-    let image = image::load_from_memory_with_format(&bytes, image::ImageFormat::Jpeg)
-        .map_err(|_| "profile avatar failed native image validation".to_string())?;
-    if image.dimensions() != (512, 512) {
-        return Err("profile avatar dimensions are invalid".to_string());
-    }
+    validate_profile_avatar_jpeg(&bytes)?;
     Ok(Some(
         base64::engine::general_purpose::STANDARD.encode(bytes),
     ))
@@ -2982,6 +3220,7 @@ fn pin_and_persist_sync_conversation(
     authenticated_user_id: &str,
     canonical_server_origin: &str,
     conversation: &SyncConversation,
+    event_app: &AuthenticatedEventAppHandle,
 ) -> Result<
     (
         std::collections::HashMap<String, PinnedDirectoryMember>,
@@ -3123,7 +3362,7 @@ fn pin_and_persist_sync_conversation(
                 observed_at: observed_at.clone(),
             })
             .collect();
-        db.upsert_identity_directory(&snapshots)?;
+        persist_identity_directory_with_signal(db, &snapshots, Some(event_app))?;
         db.upsert_directory_conversation(
             &conversation.id,
             conversation.conv_type,
@@ -3172,6 +3411,7 @@ fn sync_conversation_messages(
     conversation_id: &str,
     directory: &std::collections::HashMap<String, PinnedDirectoryMember>,
     stats: &mut OfflineSyncStats,
+    event_app: &AuthenticatedEventAppHandle,
 ) -> Result<(), String> {
     let mut cursor: Option<String> = None;
     for _ in 0..OFFLINE_SYNC_MAX_PAGES {
@@ -3335,6 +3575,15 @@ fn sync_conversation_messages(
                 };
 
             let mut client = state.client.lock().map_err(|e| e.to_string())?;
+            observe_active_history_candidate_with_signal(
+                client.db().ok_or("database not initialized")?,
+                canonical_server_origin,
+                &message.sender_id,
+                &response_identity,
+                &response_signing,
+                remote_state,
+                Some(event_app),
+            )?;
             let sender_key_mode = client.is_channel_conversation(conversation_id);
             let message_security_context =
                 client_message_security_context(crypto_context, client.device_id());
@@ -3372,15 +3621,12 @@ fn sync_conversation_messages(
                 if !client.peer_signing_key_is_pinned(&response_identity, &response_signing) {
                     sender_is_usable = false;
                 }
-                if client
-                    .known_user_identity(&message.sender_id)
-                    .is_some_and(|known| known != response_identity)
-                {
-                    return Err(format!(
-                        "message {} former sender conflicts with a known user identity",
-                        message.id
-                    ));
-                }
+                // Do not reject a warm process-local user mapping here. When
+                // the retained proof is usable, the origin-scoped SQLCipher
+                // preflight below must see the candidate first so a conflict
+                // becomes a durable IdentityChanged alarm. Without a usable
+                // proof, sender_is_usable remains false and no candidate is
+                // persisted or decrypted.
             }
 
             match (sender_key_mode, crypto_context) {
@@ -3498,6 +3744,7 @@ fn sync_conversation_messages(
                 user_id: message.sender_id.clone(),
                 identity_key: response_identity,
             };
+            let author_context = observed_message_author_context(directory, &message.sender_id);
             let author_snapshot = match client
                 .db()
                 .ok_or("database not initialized")?
@@ -3512,22 +3759,43 @@ fn sync_conversation_messages(
                     }
                     snapshot
                 }
-                None => AccountSnapshot {
-                    locator,
-                    signing_key: response_signing,
-                    username: directory
-                        .get(&message.sender_id)
-                        .map(|member| member.username.clone()),
-                    display_name: None,
-                    profile_version: None,
-                    profile_origin: canonical_server_origin.to_string(),
-                    source: if directory.contains_key(&message.sender_id) {
-                        AccountSnapshotSource::AuthenticatedConversationDirectory
-                    } else {
-                        AccountSnapshotSource::AuthenticatedHistory
-                    },
-                    observed_at: identity_observed_at(),
-                },
+                None => {
+                    if !directory.contains_key(&message.sender_id) {
+                        require_historical_candidate_runtime_continuity(
+                            &client,
+                            client.db().ok_or("database not initialized")?,
+                            canonical_server_origin,
+                            &message.sender_id,
+                            response_identity,
+                            sender_is_usable,
+                            remote_state,
+                        )?;
+                    }
+                    let snapshot = AccountSnapshot {
+                        locator,
+                        signing_key: response_signing,
+                        username: directory
+                            .get(&message.sender_id)
+                            .map(|member| member.username.clone()),
+                        display_name: None,
+                        profile_version: None,
+                        profile_origin: canonical_server_origin.to_string(),
+                        source: if directory.contains_key(&message.sender_id) {
+                            AccountSnapshotSource::AuthenticatedConversationDirectory
+                        } else {
+                            AccountSnapshotSource::AuthenticatedHistory
+                        },
+                        observed_at: identity_observed_at(),
+                    };
+                    persist_authenticated_history_preflight(
+                        client.db().ok_or("database not initialized")?,
+                        &snapshot,
+                        sender_is_usable,
+                        remote_state,
+                        Some(event_app),
+                    )?;
+                    snapshot
+                }
             };
 
             let action = client.reconcile_remote_message_metadata(
@@ -3547,7 +3815,11 @@ fn sync_conversation_messages(
                     client
                         .db()
                         .ok_or("database not initialized")?
-                        .attach_message_author(&message.id, &author_snapshot)?;
+                        .attach_message_author_with_context(
+                            &message.id,
+                            &author_snapshot,
+                            author_context,
+                        )?;
                     stats.duplicates += 1;
                     continue;
                 }
@@ -3589,6 +3861,7 @@ fn sync_conversation_messages(
                         conversation_id,
                         &response_identity,
                         Some(&author_snapshot),
+                        Some(author_context),
                         sender_key_mode,
                         message_security_context.as_ref(),
                         None,
@@ -3612,6 +3885,7 @@ fn sync_conversation_messages(
                         conversation_id,
                         &response_identity,
                         Some(&author_snapshot),
+                        Some(author_context),
                         sender_key_mode,
                         header,
                         ciphertext,
@@ -3646,6 +3920,7 @@ fn sync_offline_state(
     server_http_url: &str,
     authenticated_user_id: &str,
     canonical_server_origin: &str,
+    event_app: &AuthenticatedEventAppHandle,
 ) -> Result<OfflineSyncStats, String> {
     let mut stats = OfflineSyncStats::default();
     let mut cursor: Option<String> = None;
@@ -3693,6 +3968,7 @@ fn sync_offline_state(
                 authenticated_user_id,
                 canonical_server_origin,
                 conversation,
+                event_app,
             ) {
                 Ok(pinned) => pinned,
                 Err(error) => {
@@ -3796,6 +4072,7 @@ fn sync_offline_state(
             conversation_id,
             directory,
             &mut stats,
+            event_app,
         ) {
             require_session_still_unlocked(state)?;
             // Rows accepted earlier are independently authenticated and each
@@ -3956,20 +4233,25 @@ fn connect_to_server(
             .map_err(|e| e.to_string())? = Some(requested_rest_binding.clone());
     }
 
-    let sync_stats =
-        match sync_offline_state(&state, &server_http_url, &result, &canonical_server_origin) {
-            Ok(stats) => stats,
-            Err(error) => {
-                let mut bound = state
-                    .authenticated_rest_origin
-                    .lock()
-                    .map_err(|e| e.to_string())?;
-                if bound.as_ref() == Some(&requested_rest_binding) {
-                    *bound = None;
-                }
-                return Err(format!("authenticated offline sync failed: {error}"));
+    let sync_stats = match sync_offline_state(
+        &state,
+        &server_http_url,
+        &result,
+        &canonical_server_origin,
+        &requested_event_app,
+    ) {
+        Ok(stats) => stats,
+        Err(error) => {
+            let mut bound = state
+                .authenticated_rest_origin
+                .lock()
+                .map_err(|e| e.to_string())?;
+            if bound.as_ref() == Some(&requested_rest_binding) {
+                *bound = None;
             }
-        };
+            return Err(format!("authenticated offline sync failed: {error}"));
+        }
+    };
     if let Err(error) = rebuild_search_index_for_current_origin(&state) {
         let _ = state.indexer.clear();
         let _ = requested_event_app.emit(
@@ -4257,6 +4539,7 @@ fn connect_to_server(
                                 &conversation_id,
                                 &sender_key,
                                 Some(&author_snapshot),
+                                Some(MessageAuthorContext::DirectoryMemberAtObservation),
                                 sender_key_mode,
                                 security_context.as_ref(),
                                 Some(&authoritative_sender_name),
@@ -4337,9 +4620,10 @@ fn connect_to_server(
                                     "senderName": authoritative_sender_name,
                                     "senderUserId": author_snapshot.locator.user_id,
                                     "senderSigningKey": hex::encode(author_snapshot.signing_key),
-                                    "senderProfileVersion": author_snapshot.profile_version,
+                                    "senderProfileVersion": author_snapshot.profile_version.map(|version| version.to_string()),
                                     "senderProfileOrigin": author_snapshot.profile_origin,
                                     "senderOrigin": author_snapshot.locator.canonical_server_origin,
+                                    "senderAuthorContext": MessageAuthorContext::DirectoryMemberAtObservation.wire_label(),
                                     "text": text,
                                     "timestamp": server_timestamp / 1_000_000,
                                     "replyToId": reply_to_id,
@@ -4581,7 +4865,11 @@ fn connect_to_server(
                                         .db()
                                         .ok_or_else(|| "database not initialized".to_string())
                                         .and_then(|db| {
-                                            db.attach_message_author(&message_id, &author_snapshot)
+                                            db.attach_message_author_with_context(
+                                                &message_id,
+                                                &author_snapshot,
+                                                MessageAuthorContext::DirectoryMemberAtObservation,
+                                            )
                                         })
                                     {
                                         let detail = format!(
@@ -4634,6 +4922,7 @@ fn connect_to_server(
                                 &conversation_id,
                                 &sender_key,
                                 Some(&author_snapshot),
+                                Some(MessageAuthorContext::DirectoryMemberAtObservation),
                                 sender_key_mode,
                                 &header,
                                 &ciphertext,
@@ -5489,6 +5778,7 @@ fn get_reactions(
 #[tauri::command]
 fn create_dm(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     our_user_id: String,
     peer_user_id: String,
@@ -5497,6 +5787,7 @@ fn create_dm(
     require_unlocked(&state)?;
     let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
     let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    let event_app = AuthenticatedEventAppHandle::new(app, live_action_binding.clone());
     decode_canonical_uuid("DM peer user id", &peer_user_id)?;
     // Reject malformed renderer input before the POST can create a server-side
     // conversation. The decoded value remains process-local and is compared
@@ -5540,10 +5831,6 @@ fn create_dm(
             .as_str()
             .ok_or_else(|| "DM response missing peer_identity_key".to_string())?,
     )?;
-    validate_expected_dm_peer_identity_key(
-        expected_peer_identity_key.as_ref(),
-        &peer_identity_key,
-    )?;
     let peer_signing_key = decode_b64_array::<32>(
         "peer_signing_key",
         body["peer_signing_key"]
@@ -5576,19 +5863,13 @@ fn create_dm(
         if client.authenticated_user_id()? != authenticated_user_id {
             return Err("created DM directory user differs from authenticated session".to_string());
         }
-        let peer = validate_created_dm_account_directory(
+        let peer = validate_created_dm_account_directory_membership(
             &directory,
             &authenticated_user_id,
             &client.identity_key()?,
             &client.signing_key()?,
             &peer_user_id,
-            &peer_identity_key,
-            &peer_signing_key,
         )?;
-        for (member_user_id, member) in &directory {
-            client.ensure_user_identity_binding_compatible(member_user_id, member.identity_key)?;
-            client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
-        }
         let snapshots: Vec<AccountSnapshot> = directory
             .iter()
             .map(|(member_user_id, member)| AccountSnapshot {
@@ -5611,7 +5892,18 @@ fn create_dm(
             // Persist the validated identity snapshots first. A durable
             // continuity conflict therefore fails before the conversation can
             // become addressable by its bare UUID.
-            db.upsert_identity_directory(&snapshots)?;
+            persist_created_dm_identity_preflight(
+                db,
+                &snapshots,
+                Some(&event_app),
+                &canonical_server_origin,
+                &peer_user_id,
+                expected_peer_identity_key.as_ref(),
+                &peer.identity_key,
+                &peer.signing_key,
+                &peer_identity_key,
+                &peer_signing_key,
+            )?;
             db.upsert_directory_conversation(
                 &conversation_id,
                 0,
@@ -5624,6 +5916,10 @@ fn create_dm(
             )?;
         }
         require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        for (member_user_id, member) in &directory {
+            client.ensure_user_identity_binding_compatible(member_user_id, member.identity_key)?;
+            client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
+        }
         for (member_user_id, member) in &directory {
             client.remember_user_identity(member_user_id, member.identity_key)?;
             client.pin_peer_signing_key(member.identity_key, member.signing_key)?;
@@ -5771,6 +6067,7 @@ fn create_group(
             &authenticated_user_id,
             &conv_id,
             Some(&live_action_binding),
+            Some(&event_app),
         )?;
         let account_directory = pinned_account_directory_from_json(&members)?;
         if let Some(reason) = fetch_and_install_authenticated_device_directory(
@@ -5900,6 +6197,7 @@ fn fetch_authorized_conversation_directory(
     user_id: &str,
     conversation_id: &str,
     live_action_binding: Option<&RestBinding>,
+    event_app: Option<&AuthenticatedEventAppHandle>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let members = fetch_conversation_directory_members(
         state,
@@ -5999,10 +6297,11 @@ fn fetch_authorized_conversation_directory(
             },
         )
         .collect();
-    client
-        .db()
-        .ok_or("database not initialized")?
-        .upsert_identity_directory(&snapshots)?;
+    persist_identity_directory_with_signal(
+        client.db().ok_or("database not initialized")?,
+        &snapshots,
+        event_app,
+    )?;
     require_same_rest_binding(state, &requested_url, &rest_binding)?;
     for (member_user_id, identity, signing, _) in &validated {
         client.ensure_user_identity_binding_compatible(member_user_id, *identity)?;
@@ -6195,6 +6494,7 @@ fn fetch_and_install_authenticated_device_directory(
 #[tauri::command]
 fn get_group_members(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     user_id: String,
     group_id: String,
@@ -6206,12 +6506,14 @@ fn get_group_members(
         &expected_server_origin,
         &expected_binding_generation,
     )?;
+    let event_app = AuthenticatedEventAppHandle::new(app, live_action_binding.clone());
     fetch_authorized_conversation_directory(
         &state,
         &server_http_url,
         &user_id,
         &group_id,
         Some(&live_action_binding),
+        Some(&event_app),
     )
 }
 
@@ -6256,6 +6558,22 @@ fn rest_origin(url: &reqwest::Url) -> Result<RestOrigin, String> {
             .port_or_known_default()
             .ok_or_else(|| "REST URL has no effective port".to_string())?,
     })
+}
+
+fn parse_canonical_server_origin(value: &str) -> Result<String, String> {
+    if value.is_empty() || value.len() > 512 {
+        return Err("server origin is empty or oversized".to_string());
+    }
+    let parsed = reqwest::Url::parse(value)
+        .map_err(|error| format!("invalid canonical server origin: {error}"))?;
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("server origin must not contain a path, query, or fragment".to_string());
+    }
+    let canonical = rest_origin(&parsed)?.canonical_server_origin();
+    if canonical != value {
+        return Err("server origin is not canonical".to_string());
+    }
+    Ok(canonical)
 }
 
 fn require_authenticated_rest_origin(
@@ -6866,6 +7184,103 @@ fn get_server(
 
 #[tauri::command]
 #[allow(clippy::too_many_arguments)] // Security scope fields stay explicit at the IPC boundary.
+fn get_cached_network_profile(
+    state: State<'_, AppState>,
+    user_id: String,
+    target_user_id: String,
+    expected_identity_key: String,
+    expected_server_origin: String,
+) -> Result<Option<NetworkProfileView>, String> {
+    decode_canonical_uuid("cached profile requester user id", &user_id)?;
+    decode_canonical_uuid("cached profile target user id", &target_user_id)?;
+    let identity_key = decode_lower_hex_fixed::<32>(
+        "cached profile expected identity key",
+        &expected_identity_key,
+    )?;
+    let canonical_server_origin = parse_canonical_server_origin(&expected_server_origin)?;
+    let locator = ProfileLocator {
+        canonical_server_origin: canonical_server_origin.clone(),
+        user_id: target_user_id.clone(),
+        identity_key,
+    };
+
+    let _session_transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("cached profile requester differs from the unlocked account".to_string());
+    }
+    let current_identity_key = client.identity_key()?;
+    let current_signing_key = client.signing_key()?;
+    if target_user_id == user_id && identity_key != current_identity_key {
+        return Err("cached self profile identity differs from the unlocked account".to_string());
+    }
+    let db = client.db().ok_or("database not initialized")?;
+    let Some(profile) = db.load_network_profile_for_authenticated_account(
+        &canonical_server_origin,
+        &user_id,
+        &current_identity_key,
+        &current_signing_key,
+        &locator,
+    )?
+    else {
+        return Ok(None);
+    };
+    let proof = db.local_identity_verification(&locator)?;
+    Ok(Some(network_profile_view(
+        &profile,
+        proof,
+        target_user_id == user_id,
+        None,
+    )))
+}
+
+#[tauri::command]
+fn get_cached_identity_verification(
+    state: State<'_, AppState>,
+    target_user_id: String,
+    expected_identity_key: String,
+    expected_server_origin: String,
+) -> Result<CachedIdentityProofView, String> {
+    require_unlocked(&state)?;
+    decode_canonical_uuid("cached verification target user id", &target_user_id)?;
+    let identity_key = decode_lower_hex_fixed::<32>(
+        "cached verification expected identity key",
+        &expected_identity_key,
+    )?;
+    let canonical_server_origin = parse_canonical_server_origin(&expected_server_origin)?;
+    let locator = ProfileLocator {
+        canonical_server_origin: canonical_server_origin.clone(),
+        user_id: target_user_id.clone(),
+        identity_key,
+    };
+
+    let _session_transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    require_session_still_unlocked(&state)?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    let current_identity_key = client.identity_key()?;
+    let current_signing_key = client.signing_key()?;
+    let db = client.db().ok_or("database not initialized")?;
+    let proof = db.local_identity_verification_for_unlocked_account(
+        &current_identity_key,
+        &current_signing_key,
+        &locator,
+    )?;
+    Ok(CachedIdentityProofView {
+        canonical_server_origin,
+        user_id: target_user_id,
+        identity_key: expected_identity_key,
+        proof_state: local_identity_verification_token(proof).to_string(),
+    })
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Security scope fields stay explicit at the IPC boundary.
 fn get_network_profile(
     state: State<'_, AppState>,
     server_http_url: String,
@@ -7138,7 +7553,11 @@ fn update_profile_avatar(
             &response,
             &binding,
         ))
-        .map_err(|_| "uploaded avatar could not be verified after storage".to_string())?;
+        // The signed mutation response is authoritative even when the
+        // optional image fetch fails. Persist its advanced profile version
+        // and fall back to Phaseprint rather than reporting a false failed
+        // mutation and leaving the next CAS update stale.
+        .unwrap_or(None);
     persist_self_network_profile(&state, user_id, response, &binding, avatar_jpeg_base64).map(Some)
 }
 
@@ -7189,7 +7608,8 @@ fn exact_identity_verification_view(
     target_user_id: &str,
     identity_key: [u8; 32],
 ) -> Result<IdentityVerificationView, String> {
-    if client.authenticated_user_id()? == target_user_id {
+    let authenticated_user_id = client.authenticated_user_id()?;
+    if authenticated_user_id == target_user_id {
         return Err("the current account cannot verify itself".to_string());
     }
     let locator = ProfileLocator {
@@ -7198,15 +7618,31 @@ fn exact_identity_verification_view(
         identity_key,
     };
     let db = client.db().ok_or("database not initialized")?;
-    if db.resolve_account_snapshot(&locator)?.is_none() {
-        return Err("identity verification target has no exact pinned account entry".to_string());
-    }
-    let (fingerprint_emoji, fingerprint_hex) = client.fingerprint(&identity_key)?;
+    let peer = db
+        .resolve_account_snapshot(&locator)?
+        .ok_or("identity verification target has no exact pinned account entry")?;
+    let our_identity_key = client.identity_key()?;
+    let our_signing_key = client.signing_key()?;
+    let (fingerprint_emoji, fingerprint_hex) = veil_crypto::fingerprint::generate_account_v2(
+        canonical_server_origin,
+        veil_crypto::fingerprint::AccountFingerprintTuple {
+            user_id: &authenticated_user_id,
+            identity_key: &our_identity_key,
+            signing_key: &our_signing_key,
+        },
+        veil_crypto::fingerprint::AccountFingerprintTuple {
+            user_id: target_user_id,
+            identity_key: &peer.locator.identity_key,
+            signing_key: &peer.signing_key,
+        },
+    );
     let proof = db.local_identity_verification(&locator)?;
     Ok(IdentityVerificationView {
         canonical_server_origin: canonical_server_origin.to_string(),
         user_id: target_user_id.to_string(),
         identity_key: hex::encode(identity_key),
+        signing_key: hex::encode(peer.signing_key),
+        fingerprint_version: "account_v2",
         fingerprint_hex,
         fingerprint_emoji,
         proof_state: local_identity_verification_token(proof).to_string(),
@@ -7313,7 +7749,7 @@ fn confirm_identity_verification(
     client
         .db()
         .ok_or("database not initialized")?
-        .mark_identity_verified(&locator, &identity_observed_at())?;
+        .mark_account_verified_v2(&locator, &identity_observed_at())?;
     view.proof_state = local_identity_verification_token(
         client
             .db()
@@ -7392,6 +7828,7 @@ fn leave_server(
 #[tauri::command]
 fn list_server_members(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     user_id: String,
     server_id: String,
@@ -7403,6 +7840,7 @@ fn list_server_members(
         &expected_server_origin,
         &expected_binding_generation,
     )?;
+    let event_app = AuthenticatedEventAppHandle::new(app, live_action_binding.clone());
     let request_url = rest_api_url(&server_http_url, &["v1", "servers", &server_id, "members"])?;
     validate_live_action_rest_origin(&live_action_binding, &request_url)?;
     let resp = state.runtime.block_on(rest_send_json_for_binding(
@@ -7432,10 +7870,6 @@ fn list_server_members(
         &client.identity_key()?,
         &client.signing_key()?,
     )?;
-    for (member_user_id, member) in &directory {
-        client.ensure_user_identity_binding_compatible(member_user_id, member.identity_key)?;
-        client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
-    }
     let observed_at = identity_observed_at();
     let snapshots: Vec<AccountSnapshot> = directory
         .iter()
@@ -7454,11 +7888,16 @@ fn list_server_members(
             observed_at: observed_at.clone(),
         })
         .collect();
-    client
-        .db()
-        .ok_or("database not initialized")?
-        .upsert_identity_directory(&snapshots)?;
+    persist_identity_directory_with_signal(
+        client.db().ok_or("database not initialized")?,
+        &snapshots,
+        Some(&event_app),
+    )?;
     require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    for (member_user_id, member) in &directory {
+        client.ensure_user_identity_binding_compatible(member_user_id, member.identity_key)?;
+        client.ensure_peer_signing_key_compatible(member.identity_key, member.signing_key)?;
+    }
     pin_directory_member_keys(&mut client, &members)?;
     for (member_user_id, member) in &directory {
         client.remember_user_identity(member_user_id, member.identity_key)?;
@@ -8298,6 +8737,7 @@ fn distribute_pinned_sender_key(
 #[tauri::command]
 fn distribute_sender_key(
     state: State<'_, AppState>,
+    app: AppHandle,
     server_http_url: String,
     user_id: String,
     conversation_id: String,
@@ -8310,6 +8750,7 @@ fn distribute_sender_key(
         &expected_server_origin,
         &expected_binding_generation,
     )?;
+    let event_app = AuthenticatedEventAppHandle::new(app, live_action_binding.clone());
     // The renderer never chooses recipients. Fetch the signed, permission-
     // filtered directory for this exact conversation and pin it first.
     let members = fetch_authorized_conversation_directory(
@@ -8318,6 +8759,7 @@ fn distribute_sender_key(
         &user_id,
         &conversation_id,
         Some(&live_action_binding),
+        Some(&event_app),
     );
     let members = match members {
         Ok(members) => members,
@@ -8489,14 +8931,17 @@ fn search_user(
             .as_str()
             .ok_or_else(|| "directory response missing identity_key".to_string())?,
     )?;
-    let mut client = state.client.lock().map_err(|e| e.to_string())?;
+    let client = state.client.lock().map_err(|e| e.to_string())?;
     require_live_transport_still_ready(&state)?;
     require_same_rest_binding(&state, &url, &rest_binding)?;
     if client.authenticated_user_id()? != user_id {
         return Err("authenticated user changed while resolving user search".to_string());
     }
+    // Search is authenticated discovery, not a complete identity-directory
+    // observation: the response has no signing key. It may be used as the
+    // action-bound expected peer key for Create DM, but must never publish a
+    // process-local continuity pin on its own.
     client.ensure_user_identity_binding_compatible(peer_user_id, peer_identity_key)?;
-    client.remember_user_identity(peer_user_id, peer_identity_key)?;
     require_session_still_unlocked(&state)?;
     Ok(result)
 }
@@ -8514,6 +8959,7 @@ struct SearchAuthorDto {
     display_name: Option<String>,
     profile_version: Option<String>,
     profile_origin: String,
+    context: Option<&'static str>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -8540,6 +8986,7 @@ fn validated_search_hit_dto(
     {
         return None;
     }
+    let author_context = stored.author_context.map(MessageAuthorContext::wire_label);
     let author = stored.author.and_then(|author| {
         if author.locator.canonical_server_origin != canonical_server_origin
             || author.locator.identity_key.as_slice() != stored.sender_key.as_slice()
@@ -8555,6 +9002,7 @@ fn validated_search_hit_dto(
             display_name: author.display_name,
             profile_version: author.profile_version.map(|version| version.to_string()),
             profile_origin: author.profile_origin,
+            context: author_context,
         })
     });
     Some(SearchHitDto {
@@ -8890,7 +9338,6 @@ pub fn run() {
             validate_mnemonic_cmd,
             init_identity,
             get_identity_key,
-            fingerprint_peer,
             store_seed,
             has_stored_identity,
             open_project_repository,
@@ -8941,6 +9388,8 @@ pub fn run() {
             create_server,
             list_servers,
             get_server,
+            get_cached_network_profile,
+            get_cached_identity_verification,
             get_network_profile,
             update_network_profile,
             update_profile_avatar,
@@ -8991,15 +9440,18 @@ mod e2ee_rest_tests {
         validate_expected_live_action_binding, validate_expected_rest_binding,
         validate_live_action_rest_origin, validate_live_message_security_context,
         validate_next_cursor, validate_persisted_message_conversation,
-        validate_pinned_directory_self, validate_rest_url, validate_server_endpoint_pair,
-        validate_utc_rfc3339_nano, validated_search_hit_dto, verify_device_directory_account_keys,
-        AuthenticatedSessionScope, ConversationSyncIsolation, ParsedMessageCryptoContext,
-        PinnedDirectoryMember, RestBinding, RestOrigin, DEFAULT_AUTO_LOCK_SECONDS,
+        validate_pinned_directory_self, validate_profile_avatar_jpeg, validate_rest_url,
+        validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_hit_dto,
+        verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
+        ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
+        DEFAULT_AUTO_LOCK_SECONDS,
     };
     use base64::Engine;
+    use ed25519_dalek::SigningKey;
     use veil_search::SearchHit;
     use veil_store::models::{
-        AccountSnapshot, AccountSnapshotSource, Message, MessageStatus, ProfileLocator,
+        AccountSnapshot, AccountSnapshotSource, Message, MessageAuthorContext, MessageStatus,
+        ProfileLocator,
     };
 
     fn authenticated_test_binding(host: &str, generation: u64) -> RestBinding {
@@ -9011,6 +9463,421 @@ mod e2ee_rest_tests {
             },
             generation,
         }
+    }
+
+    fn test_signing_key(seed: u8) -> [u8; 32] {
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    fn historical_account_snapshot(identity_key: u8, signing_key: u8) -> AccountSnapshot {
+        AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: "https://chat.example.test:443".to_string(),
+                user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+                identity_key: [identity_key; 32],
+            },
+            signing_key: test_signing_key(signing_key),
+            username: Some("former-member".to_string()),
+            display_name: None,
+            profile_version: None,
+            profile_origin: "https://chat.example.test:443".to_string(),
+            source: AccountSnapshotSource::AuthenticatedHistory,
+            observed_at: "2026-07-13T12:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn terminal_or_unusable_history_never_seeds_identity_or_alarm() {
+        let db = veil_store::db::VeilDb::open_memory(&[0xA1; 32]).unwrap();
+        let mut original = historical_account_snapshot(0x21, 0x31);
+        original.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+        db.upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        let candidate = historical_account_snapshot(0x22, 0x32);
+
+        for state in [
+            veil_store::models::RemoteMessageStateKind::Deleted,
+            veil_store::models::RemoteMessageStateKind::Expired,
+            veil_store::models::RemoteMessageStateKind::Unavailable,
+        ] {
+            super::persist_authenticated_history_preflight(&db, &candidate, false, state, None)
+                .unwrap();
+        }
+        super::persist_authenticated_history_preflight(
+            &db,
+            &candidate,
+            false,
+            veil_store::models::RemoteMessageStateKind::Active,
+            None,
+        )
+        .unwrap();
+
+        assert!(db
+            .resolve_account_snapshot(&candidate.locator)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.local_identity_verification(&original.locator).unwrap(),
+            veil_store::models::LocalIdentityVerification::NotCompared
+        );
+
+        assert!(super::persist_authenticated_history_preflight(
+            &db,
+            &candidate,
+            true,
+            veil_store::models::RemoteMessageStateKind::Active,
+            None,
+        )
+        .is_err());
+        assert_eq!(
+            db.local_identity_verification(&original.locator).unwrap(),
+            veil_store::models::LocalIdentityVerification::IdentityChanged
+        );
+        assert_eq!(
+            db.resolve_account_snapshot(&original.locator).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn active_history_key_change_is_alarmed_before_crypto_while_terminal_rows_are_ignored() {
+        let origin = "https://chat.example.test:443";
+        let db = veil_store::db::VeilDb::open_memory(&[0xA9; 32]).unwrap();
+        let mut original = historical_account_snapshot(0x27, 0x37);
+        original.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+        db.upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+
+        super::observe_active_history_candidate_with_signal(
+            &db,
+            origin,
+            &original.locator.user_id,
+            &original.locator.identity_key,
+            &original.signing_key,
+            veil_store::models::RemoteMessageStateKind::Active,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.local_identity_verification(&original.locator).unwrap(),
+            veil_store::models::LocalIdentityVerification::NotCompared
+        );
+        let changed_signing = test_signing_key(0x38);
+        assert!(super::observe_active_history_candidate_with_signal(
+            &db,
+            origin,
+            &original.locator.user_id,
+            &original.locator.identity_key,
+            &changed_signing,
+            veil_store::models::RemoteMessageStateKind::Active,
+            None,
+        )
+        .is_err());
+        assert_eq!(
+            db.local_identity_verification(&original.locator).unwrap(),
+            veil_store::models::LocalIdentityVerification::IdentityChanged
+        );
+        assert_eq!(
+            db.resolve_account_snapshot(&original.locator).unwrap(),
+            Some(original.clone())
+        );
+
+        let alias_db = veil_store::db::VeilDb::open_memory(&[0xAC; 32]).unwrap();
+        alias_db
+            .upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        let alias_user_id = "550e8400-e29b-41d4-a716-446655440002";
+        assert!(super::observe_active_history_candidate_with_signal(
+            &alias_db,
+            origin,
+            alias_user_id,
+            &original.locator.identity_key,
+            &original.signing_key,
+            veil_store::models::RemoteMessageStateKind::Active,
+            None,
+        )
+        .is_err());
+        assert_eq!(
+            alias_db.identity_change_users_for_origin(origin).unwrap(),
+            vec![original.locator.user_id.clone()]
+        );
+        assert!(alias_db
+            .resolve_account_by_origin_user(origin, alias_user_id)
+            .unwrap()
+            .is_none());
+
+        let terminal_db = veil_store::db::VeilDb::open_memory(&[0xAA; 32]).unwrap();
+        terminal_db
+            .upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        super::observe_active_history_candidate_with_signal(
+            &terminal_db,
+            origin,
+            alias_user_id,
+            &original.locator.identity_key,
+            &original.signing_key,
+            veil_store::models::RemoteMessageStateKind::Deleted,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            terminal_db
+                .local_identity_verification(&original.locator)
+                .unwrap(),
+            veil_store::models::LocalIdentityVerification::NotCompared
+        );
+
+        let first_seen_db = veil_store::db::VeilDb::open_memory(&[0xAB; 32]).unwrap();
+        super::observe_active_history_candidate_with_signal(
+            &first_seen_db,
+            origin,
+            &original.locator.user_id,
+            &original.locator.identity_key,
+            &original.signing_key,
+            veil_store::models::RemoteMessageStateKind::Active,
+            None,
+        )
+        .unwrap();
+        assert!(first_seen_db
+            .identity_change_users_for_origin(origin)
+            .unwrap()
+            .is_empty());
+        assert!(first_seen_db
+            .resolve_account_snapshot(&original.locator)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn native_history_context_ignores_stronger_cached_presentation_source() {
+        let db = veil_store::db::VeilDb::open_memory(&[0xA8; 32]).unwrap();
+        let mut cached = historical_account_snapshot(0x25, 0x35);
+        cached.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+        db.upsert_identity_directory(std::slice::from_ref(&cached))
+            .unwrap();
+        db.upsert_directory_conversation(
+            "native-former-context",
+            1,
+            &cached.locator.canonical_server_origin,
+            Some("History"),
+            None,
+            None,
+            None,
+            "2026-07-13T12:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "native-former-message",
+            "native-former-context",
+            &cached.locator.identity_key,
+            "history",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        let empty_directory = std::collections::HashMap::new();
+        let former_context =
+            super::observed_message_author_context(&empty_directory, &cached.locator.user_id);
+        let resolved = db
+            .resolve_account_snapshot(&cached.locator)
+            .unwrap()
+            .expect("cached directory presentation remains available");
+        db.attach_message_author_with_context("native-former-message", &resolved, former_context)
+            .unwrap();
+        let persisted = db.get_messages("native-former-context", 10).unwrap();
+        assert_eq!(
+            persisted[0].author.as_ref().map(|author| author.source),
+            Some(AccountSnapshotSource::AuthenticatedConversationDirectory)
+        );
+        assert_eq!(
+            persisted[0].author_context,
+            Some(MessageAuthorContext::FormerMemberAtObservation)
+        );
+
+        let current_directory = std::collections::HashMap::from([(
+            cached.locator.user_id.clone(),
+            PinnedDirectoryMember {
+                username: "former-member".to_string(),
+                identity_key: cached.locator.identity_key,
+                signing_key: cached.signing_key,
+            },
+        )]);
+        assert_eq!(
+            super::observed_message_author_context(&current_directory, &cached.locator.user_id,),
+            MessageAuthorContext::DirectoryMemberAtObservation
+        );
+    }
+
+    #[test]
+    fn process_only_search_pin_cannot_replace_historical_continuity() {
+        let db = veil_store::db::VeilDb::open_memory(&[0xA2; 32]).unwrap();
+        let mut client = veil_client::api::VeilClient::new();
+        let original = historical_account_snapshot(0x41, 0x51);
+        let candidate = historical_account_snapshot(0x42, 0x52);
+        client
+            .remember_user_identity(&original.locator.user_id, original.locator.identity_key)
+            .unwrap();
+
+        for state in [
+            veil_store::models::RemoteMessageStateKind::Deleted,
+            veil_store::models::RemoteMessageStateKind::Expired,
+            veil_store::models::RemoteMessageStateKind::Unavailable,
+        ] {
+            super::require_historical_candidate_runtime_continuity(
+                &client,
+                &db,
+                &candidate.locator.canonical_server_origin,
+                &candidate.locator.user_id,
+                candidate.locator.identity_key,
+                false,
+                state,
+            )
+            .unwrap();
+        }
+
+        assert!(super::require_historical_candidate_runtime_continuity(
+            &client,
+            &db,
+            &candidate.locator.canonical_server_origin,
+            &candidate.locator.user_id,
+            candidate.locator.identity_key,
+            true,
+            veil_store::models::RemoteMessageStateKind::Active,
+        )
+        .is_err());
+        assert!(db
+            .resolve_account_by_origin_user(
+                &candidate.locator.canonical_server_origin,
+                &candidate.locator.user_id,
+            )
+            .unwrap()
+            .is_none());
+
+        let mut durable = original.clone();
+        durable.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+        db.upsert_identity_directory(std::slice::from_ref(&durable))
+            .unwrap();
+        super::require_historical_candidate_runtime_continuity(
+            &client,
+            &db,
+            &candidate.locator.canonical_server_origin,
+            &candidate.locator.user_id,
+            candidate.locator.identity_key,
+            true,
+            veil_store::models::RemoteMessageStateKind::Active,
+        )
+        .unwrap();
+        assert!(super::persist_authenticated_history_preflight(
+            &db,
+            &candidate,
+            true,
+            veil_store::models::RemoteMessageStateKind::Active,
+            None,
+        )
+        .is_err());
+        assert_eq!(
+            db.local_identity_verification(&durable.locator).unwrap(),
+            veil_store::models::LocalIdentityVerification::IdentityChanged
+        );
+    }
+
+    #[test]
+    fn dm_action_key_mismatch_records_quarantine_before_local_publication() {
+        let db = veil_store::db::VeilDb::open_memory(&[0xA3; 32]).unwrap();
+        let mut original = historical_account_snapshot(0x61, 0x71);
+        original.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+        db.upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        let mut changed = historical_account_snapshot(0x62, 0x72);
+        changed.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+
+        assert!(super::persist_created_dm_identity_preflight(
+            &db,
+            std::slice::from_ref(&changed),
+            None,
+            &changed.locator.canonical_server_origin,
+            &changed.locator.user_id,
+            Some(&original.locator.identity_key),
+            &changed.locator.identity_key,
+            &changed.signing_key,
+            &changed.locator.identity_key,
+            &changed.signing_key,
+        )
+        .is_err());
+        assert_eq!(
+            db.local_identity_verification(&original.locator).unwrap(),
+            veil_store::models::LocalIdentityVerification::IdentityChanged
+        );
+        assert_eq!(
+            db.resolve_account_snapshot(&original.locator).unwrap(),
+            Some(original)
+        );
+        assert!(db
+            .resolve_account_snapshot(&changed.locator)
+            .unwrap()
+            .is_none());
+        assert!(db.get_conversations().unwrap().is_empty());
+    }
+
+    #[test]
+    fn first_seen_dm_mismatch_never_seeds_server_candidate() {
+        let candidate = historical_account_snapshot(0x82, 0x92);
+        let expected_identity_key = [0x81; 32];
+
+        let action_db = veil_store::db::VeilDb::open_memory(&[0xA4; 32]).unwrap();
+        assert!(super::persist_created_dm_identity_preflight(
+            &action_db,
+            std::slice::from_ref(&candidate),
+            None,
+            &candidate.locator.canonical_server_origin,
+            &candidate.locator.user_id,
+            Some(&expected_identity_key),
+            &candidate.locator.identity_key,
+            &candidate.signing_key,
+            &candidate.locator.identity_key,
+            &candidate.signing_key,
+        )
+        .is_err());
+        assert!(action_db
+            .resolve_account_by_origin_user(
+                &candidate.locator.canonical_server_origin,
+                &candidate.locator.user_id,
+            )
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            action_db
+                .local_identity_verification(&candidate.locator)
+                .unwrap(),
+            veil_store::models::LocalIdentityVerification::NotCompared
+        );
+
+        let response_db = veil_store::db::VeilDb::open_memory(&[0xA5; 32]).unwrap();
+        assert!(super::persist_created_dm_identity_preflight(
+            &response_db,
+            std::slice::from_ref(&candidate),
+            None,
+            &candidate.locator.canonical_server_origin,
+            &candidate.locator.user_id,
+            None,
+            &candidate.locator.identity_key,
+            &candidate.signing_key,
+            &[0x83; 32],
+            &[0x93; 32],
+        )
+        .is_err());
+        assert!(response_db
+            .resolve_account_by_origin_user(
+                &candidate.locator.canonical_server_origin,
+                &candidate.locator.user_id,
+            )
+            .unwrap()
+            .is_none());
+        assert!(response_db.get_conversations().unwrap().is_empty());
     }
 
     #[test]
@@ -9321,7 +10188,7 @@ mod e2ee_rest_tests {
                 user_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
                 identity_key,
             },
-            signing_key: [0x32; 32],
+            signing_key: test_signing_key(0x32),
             username: Some("alice".to_string()),
             display_name: Some("Alice".to_string()),
             profile_version: Some(u64::MAX),
@@ -9342,6 +10209,7 @@ mod e2ee_rest_tests {
             server_timestamp: Some(7),
             created_at: "2026-07-13T12:00:00Z".to_string(),
             author: Some(author),
+            author_context: Some(MessageAuthorContext::FormerMemberAtObservation),
         };
         let hit = SearchHit {
             id: stored.id.clone(),
@@ -9357,6 +10225,7 @@ mod e2ee_rest_tests {
         let author = dto.author.expect("author locator must be present");
         assert_eq!(author.canonical_server_origin, origin);
         assert_eq!(author.identity_key, hex::encode(identity_key));
+        assert_eq!(author.context, Some("former_member_at_observation"));
         assert_eq!(
             author.profile_version.as_deref(),
             Some("18446744073709551615")
@@ -10009,13 +10878,58 @@ mod e2ee_rest_tests {
         let mut bidi = valid;
         bidi["about"] = serde_json::json!("safe\u{202e}evil");
         assert!(parse_network_profile_response(bidi, user_id).is_err());
+
+        for unsafe_character in [
+            '\u{00ad}', '\u{034f}', '\u{180e}', '\u{200b}', '\u{2028}', '\u{2029}', '\u{2060}',
+            '\u{feff}',
+        ] {
+            let mut spoofing = serde_json::json!({
+                "user_id": user_id,
+                "username": "alice",
+                "display_name": "Alice",
+                "about": "safe",
+                "profile_version": 7,
+                "profile_updated_at": "2026-07-13T08:00:00Z"
+            });
+            spoofing["display_name"] = serde_json::json!(format!("safe{unsafe_character}hidden"));
+            assert!(parse_network_profile_response(spoofing, user_id).is_err());
+        }
+
+        let oversized_version = serde_json::json!({
+            "user_id": user_id,
+            "username": "alice",
+            "display_name": null,
+            "about": "",
+            "profile_version": (i64::MAX as u64) + 1,
+            "profile_updated_at": "2026-07-13T08:00:00Z"
+        });
+        assert!(parse_network_profile_response(oversized_version, user_id).is_err());
+    }
+
+    #[test]
+    fn profile_avatar_dimensions_are_limited_before_decode_allocation() {
+        let pixels = vec![0x44; 512 * 512 * 3];
+        let mut jpeg = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 80)
+            .encode(&pixels, 512, 512, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        validate_profile_avatar_jpeg(&jpeg).unwrap();
+
+        let mut patched = jpeg;
+        let sof = patched
+            .windows(2)
+            .position(|window| window == [0xff, 0xc0] || window == [0xff, 0xc2])
+            .expect("test JPEG has a SOF marker");
+        patched[sof + 5..sof + 7].copy_from_slice(&u16::MAX.to_be_bytes());
+        patched[sof + 7..sof + 9].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(validate_profile_avatar_jpeg(&patched).is_err());
     }
 
     #[test]
     fn profile_version_from_renderer_is_canonical() {
         assert_eq!(canonical_profile_version("0").unwrap(), 0);
         assert_eq!(canonical_profile_version("42").unwrap(), 42);
-        for invalid in ["", "00", "01", "+1", "-1", " 1"] {
+        for invalid in ["", "00", "01", "+1", "-1", " 1", "9223372036854775808"] {
             assert!(canonical_profile_version(invalid).is_err());
         }
     }

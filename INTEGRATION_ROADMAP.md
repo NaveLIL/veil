@@ -42,7 +42,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | product scope реализован, включая isolated avatar и mobile Identity sheet; финальный gate отложен |
+| 4D | Identity Island & Profiles | product/security scope реализован; финальная completion-матрица выполняется |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -357,16 +357,18 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 
 ## Phase 4D — Identity Island & Profiles
 
-**Статус 2026-07-13:** Phase 4D в активной реализации. Entry gate и формальное решение
-опубликованы в
-[`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
+**Статус 2026-07-13:** product и security scope Phase 4D реализован. Entry gate и
+формальное решение опубликованы в
+[`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md),
+а финальный code freeze и проверочная матрица отслеживаются в
+[`docs/reviews/phase-4d-completion-gate.md`](docs/reviews/phase-4d-completion-gate.md).
 Реализованы canonical local identity foundation с authenticated origin/binding
 fence, детерминированный Phaseprint и единый `UserAvatar`, Identity Island,
 versioned text profile/cache/editor, локальная verification/identity-change flow,
 relationship-scoped `ProfileUpdated`, identity-bearing local search DTO,
-изолированный avatar pipeline и mobile Identity sheet. По решению владельца
-финальный completion gate выполняется отдельно, поэтому Phase 4D ещё не объявлена
-завершённой.
+изолированный avatar pipeline и mobile Identity sheet. Phase 4D будет объявлена
+завершённой только после зелёной full-workspace, Docker, migration и Windows
+release матрицы.
 
 Цель — дать одному человеку единое и узнаваемое представление во всех местах
 Veil: собственный footer, друзья, DM, группы, сообщения, server members и
@@ -456,13 +458,12 @@ smoke:
 - Схема `messages`, ciphertext, Double Ratchet, Sender Keys, ACL и rotation
   contract не изменены. Presentation metadata нигде не участвует в crypto trust.
 
-Checkpoint не завершает полный multi-origin runtime. Conversation/ratchet/
-roster/pending/server-cache namespaces ещё не полностью origin-scoped:
-совпадающие conversation ID или peer identity на разных origins сейчас
-отвергаются, а не поддерживаются одновременно. Legacy unscoped conversation
-rows не получают активный origin по догадке и требуют отдельного authenticated
-migration/cutover. Также остаются открыты полная нормализация friend/request/
-group/server contexts и семантика `Former member`.
+Pre-release namespace cutover завершён для conversation/message/pending/roster/
+reaction state: одинаковые bare UUID на разных origins адресуются разными
+canonical namespaces, а originless development rows не получают активный origin
+по догадке. Friend/request/group/server consumers используют typed locator-bearing
+snapshots. Исторический автор сохраняется с авторитетным контекстом и после выхода
+из roster показывается как `Former member`, без присвоения текущих ролей/presence.
 
 ### Реализовано в Identity foundation: authenticated transition fence
 
@@ -495,11 +496,11 @@ group/server contexts и семантика `Former member`.
   До отдельной origin-scoped cache schema эти данные загружаются только свежим
   authenticated REST; cache-first/offline server navigation намеренно выключена.
 
-Этот checkpoint не меняет schema сообщений, ciphertext, ratchets, Sender Keys,
-ACL либо rotation contract и не является завершением 4D.1. Открыты friend/
-request/group/server consumer normalization, origin-scoped server cache v2,
-`Former member`, одновременное хранение colliding namespaces и generation-bound
-проверка каждого identity-mutating REST результата.
+Этот cutover не меняет ciphertext, ratchets, Sender Keys, ACL либо rotation
+contract. Consumer normalization, colliding origin namespaces, `Former member`
+и generation-bound проверка identity-mutating REST результатов закрыты.
+Originless server cache не возвращён: server/channel/member/role presentation
+загружается свежим authenticated REST до отдельной origin-scoped cache schema.
 
 ### Identity foundation: pre-release origin namespace cutover
 
@@ -543,9 +544,10 @@ channel rosters. Неиспользуемые standalone session/group-member IP
 Перед изменением схемы сохранена совпадающая по SHA-256 копия development DB,
 WAL и SHM в локальной игнорируемой `backups/`.
 
-Этот блок затрагивает адресацию локального хранения сообщений, поэтому перед
-реализацией требуется отдельное объяснение schema/cutover, backup реальной
-development БД и полный restart/collision/recovery test matrix.
+Этот блок затронул адресацию локального хранения сообщений. До cutover были
+зафиксированы отдельное schema/crypto explanation, backup development БД и
+restart/collision/recovery test matrix; ciphertext и криптографический протокол
+не изменялись.
 
 ### Identity foundation: canonical identity directory
 
@@ -590,10 +592,10 @@ origin показывается нейтральный anonymous print, а не 
 message authors, friend/search/request rows, group/server members и server settings.
 Group/channel/server entity icons остаются отдельными от person avatar. Nickname
 не передаётся в seed, а keyed member row не remount-ит Phaseprint при его
-смене. Remote/data image URL отклоняются; будущий native-validated
-`blob:` должен успешно decode-нуться над уже отрисованным Phaseprint;
-error/abort не даёт broken-image flash. Сам image pipeline и сетевые аватары
-на этом checkpoint не реализованы.
+смене. Remote/data/network image URL отклоняются. Native загружает только
+same-origin avatar asset, проверяет и нормализует PNG/JPEG с удалением metadata,
+а renderer получает локальный `blob:` URL, который decode-ится над уже
+отрисованным Phaseprint; error/abort не даёт broken-image flash.
 Закрытый Members island не mount-ит row/SVG DOM, а открытый Members,
 Server Settings и активная вкладка friends/requests имеют явный presentation
 budget в 256 rows с честным truncation status до pagination/virtualization.
@@ -810,7 +812,7 @@ authenticated origin/generation, а открытый Identity Island refetch-и�
    relationship-scoped `ProfileUpdated` event и identity-bearing local search
    DTO с точной SQLCipher hydration.
 5. **Закрыто:** local identity verification и blocking identity-change flow.
-6. Только затем добавить изолированный avatar pipeline и mobile adaptation.
+6. **Закрыто:** изолированный avatar pipeline и mobile adaptation.
 
 ### Критерии готовности 4D
 

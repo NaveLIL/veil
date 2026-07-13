@@ -71,6 +71,9 @@ func main() {
 		log.Fatalf("database connection failed: %v", err)
 	}
 	defer database.Close()
+	if err := database.ValidateCryptographicPublicKeys(ctx); err != nil {
+		log.Fatalf("database cryptographic-key preflight failed: %v", err)
+	}
 	log.Println("database connected")
 
 	// Initialize services
@@ -98,8 +101,11 @@ func main() {
 	// all share the same DB). The legacy unsigned bypass was removed in W3 —
 	// every REST call must carry the X-Veil-{User,Timestamp,Signature} triplet.
 	signedMw := authmw.New(serversSvc.SigningKeyLookup())
+	defer signedMw.Close()
 	rl := authmw.NewRateLimit(240, time.Minute) // 4 req/sec sustained, burst 240
 	defer rl.Close()
+	profileMutationRL := authmw.NewRateLimit(12, time.Minute)
+	defer profileMutationRL.Close()
 	// Bound unauthenticated key lookup + Ed25519 verification before the
 	// verified-principal limiter inside each REST route.
 	preAuthRL := authmw.NewRateLimit(600, time.Minute)
@@ -108,8 +114,12 @@ func main() {
 	// Auth REST endpoints (prekeys, devices, user lookup)
 	authHandler := auth.NewHandler(authSvc, signedMw, rl)
 	authHandler.RegisterRoutes(mux)
-	profilesHandler := profiles.NewHandler(profiles.NewPostgresStore(database.Pool), signedMw, rl, hub)
+	profileStore := profiles.NewPostgresStore(database.Pool)
+	profilesHandler := profiles.NewHandler(profileStore, signedMw, rl, profileMutationRL, hub)
 	profilesHandler.RegisterRoutes(mux)
+	avatarJanitorCtx, avatarJanitorCancel := context.WithCancel(context.Background())
+	defer avatarJanitorCancel()
+	go profiles.RunAvatarJanitor(avatarJanitorCtx, profileStore, slog.Default())
 
 	// Chat REST endpoints (message sync, conversations)
 	chatHandler := chat.NewHandler(chatSvc, signedMw, rl)

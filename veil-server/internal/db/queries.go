@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/AegisSec/veil-server/internal/cryptokey"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -74,6 +75,9 @@ func (db *DB) FindUserByIdentityKey(ctx context.Context, identityKey []byte) (*U
 
 // CreateUser registers a new user with their public keys.
 func (db *DB) CreateUser(ctx context.Context, identityKey, signingKey []byte, username string) (*User, error) {
+	if len(identityKey) != 32 || !cryptokey.ValidEd25519PublicKey(signingKey) {
+		return nil, errors.New("invalid account cryptographic public keys")
+	}
 	var u User
 	err := db.Pool.QueryRow(ctx,
 		`INSERT INTO users (identity_key, signing_key, username)

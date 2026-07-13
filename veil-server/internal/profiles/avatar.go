@@ -2,8 +2,11 @@ package profiles
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
+	"hash/crc32"
 	"image"
 	"image/color"
 	"image/draw"
@@ -24,10 +27,10 @@ const (
 
 var (
 	ErrInvalidAvatar  = errors.New("invalid avatar image")
-	avatarDecodeSlots = make(chan struct{}, 2)
+	avatarDecodeSlots = make(chan struct{}, 1)
 )
 
-func normalizeAvatar(input []byte, declaredType string) (*AvatarAsset, error) {
+func normalizeAvatar(ctx context.Context, input []byte, declaredType string) (*AvatarAsset, error) {
 	if len(input) == 0 || len(input) > maxAvatarInputBytes {
 		return nil, ErrInvalidAvatar
 	}
@@ -42,13 +45,34 @@ func normalizeAvatar(input []byte, declaredType string) (*AvatarAsset, error) {
 		return nil, ErrInvalidAvatar
 	}
 
-	avatarDecodeSlots <- struct{}{}
+	select {
+	case avatarDecodeSlots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	defer func() { <-avatarDecodeSlots }()
 	decoded, err := imaging.Decode(bytes.NewReader(input), imaging.AutoOrientation(true))
 	if err != nil {
 		return nil, ErrInvalidAvatar
 	}
-	resized := imaging.Fill(decoded, avatarOutputSize, avatarOutputSize, imaging.Center, imaging.Lanczos)
+	// Crop in source coordinates before resizing. imaging.Fill resizes first;
+	// for a valid 4096x1 input that would create a multi-gigabyte intermediate.
+	// Source-first square cropping keeps every allocation bounded by the already
+	// validated 16 MP input and the fixed 512x512 output.
+	bounds := decoded.Bounds()
+	side := min(bounds.Dx(), bounds.Dy())
+	left := bounds.Min.X + (bounds.Dx()-side)/2
+	top := bounds.Min.Y + (bounds.Dy()-side)/2
+	cropBounds := image.Rect(left, top, left+side, top+side)
+	var cropped image.Image
+	if subImage, ok := decoded.(interface {
+		SubImage(image.Rectangle) image.Image
+	}); ok {
+		cropped = subImage.SubImage(cropBounds)
+	} else {
+		cropped = imaging.Crop(decoded, cropBounds)
+	}
+	resized := imaging.Resize(cropped, avatarOutputSize, avatarOutputSize, imaging.Lanczos)
 	flattened := image.NewRGBA(image.Rect(0, 0, avatarOutputSize, avatarOutputSize))
 	draw.Draw(flattened, flattened.Bounds(), &image.Uniform{C: color.RGBA{R: 18, G: 38, B: 55, A: 255}}, image.Point{}, draw.Src)
 	draw.Draw(flattened, flattened.Bounds(), resized, resized.Bounds().Min, draw.Over)
@@ -81,18 +105,127 @@ func strictAvatarFormat(input []byte, declaredType string) (string, bool) {
 	declaredType = strings.ToLower(strings.TrimSpace(declaredType))
 	switch declaredType {
 	case "image/png":
-		pngSignature := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
-		iend := []byte{0x00, 0x00, 0x00, 0x00, 'I', 'E', 'N', 'D', 0xae, 0x42, 0x60, 0x82}
-		if !bytes.HasPrefix(input, pngSignature) || !bytes.HasSuffix(input, iend) || bytes.Contains(input, []byte("acTL")) {
+		if !strictPNG(input) {
 			return "", false
 		}
 		return "png", true
 	case "image/jpeg":
-		if len(input) < 4 || input[0] != 0xff || input[1] != 0xd8 || input[len(input)-2] != 0xff || input[len(input)-1] != 0xd9 {
+		if !strictJPEG(input) {
 			return "", false
 		}
 		return "jpeg", true
 	default:
 		return "", false
 	}
+}
+
+func strictPNG(input []byte) bool {
+	signature := []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}
+	if !bytes.HasPrefix(input, signature) {
+		return false
+	}
+	offset := len(signature)
+	seenIHDR := false
+	for offset < len(input) {
+		if len(input)-offset < 12 {
+			return false
+		}
+		length := uint64(binary.BigEndian.Uint32(input[offset : offset+4]))
+		if length > uint64(len(input)-offset-12) {
+			return false
+		}
+		chunkEnd := offset + 12 + int(length)
+		chunkType := input[offset+4 : offset+8]
+		chunkDataEnd := offset + 8 + int(length)
+		storedCRC := binary.BigEndian.Uint32(input[chunkDataEnd:chunkEnd])
+		if crc32.ChecksumIEEE(input[offset+4:chunkDataEnd]) != storedCRC {
+			return false
+		}
+		name := string(chunkType)
+		if !seenIHDR {
+			if name != "IHDR" || length != 13 {
+				return false
+			}
+			seenIHDR = true
+		} else if name == "IHDR" {
+			return false
+		}
+		if name == "acTL" || name == "fcTL" || name == "fdAT" {
+			return false
+		}
+		if name == "IEND" {
+			return length == 0 && chunkEnd == len(input)
+		}
+		offset = chunkEnd
+	}
+	return false
+}
+
+func strictJPEG(input []byte) bool {
+	if len(input) < 4 || input[0] != 0xff || input[1] != 0xd8 {
+		return false
+	}
+	offset := 2
+	inScan := false
+	for offset < len(input) {
+		var marker byte
+		if inScan {
+			for {
+				if offset >= len(input) {
+					return false
+				}
+				if input[offset] != 0xff {
+					offset++
+					continue
+				}
+				for offset < len(input) && input[offset] == 0xff {
+					offset++
+				}
+				if offset >= len(input) {
+					return false
+				}
+				marker = input[offset]
+				offset++
+				if marker == 0x00 || (marker >= 0xd0 && marker <= 0xd7) {
+					continue
+				}
+				break
+			}
+			inScan = false
+		} else {
+			if input[offset] != 0xff {
+				return false
+			}
+			for offset < len(input) && input[offset] == 0xff {
+				offset++
+			}
+			if offset >= len(input) {
+				return false
+			}
+			marker = input[offset]
+			offset++
+		}
+
+		if marker == 0xd9 {
+			return offset == len(input)
+		}
+		if marker == 0xd8 || marker == 0x00 || (marker >= 0xd0 && marker <= 0xd7) {
+			return false
+		}
+		if marker == 0x01 { // TEM is the only standalone non-entropy marker.
+			continue
+		}
+		if len(input)-offset < 2 {
+			return false
+		}
+		segmentLength := int(binary.BigEndian.Uint16(input[offset : offset+2]))
+		if segmentLength < 2 || segmentLength > len(input)-offset {
+			return false
+		}
+		offset += segmentLength
+		if marker == 0xda {
+			inScan = true
+		}
+	}
+	return false
 }

@@ -671,18 +671,68 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		requireMigrationError(t, err, "23514", "users_display_name_byte_limit")
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 020", func(t *testing.T) {
+	t.Run("022 adds owner-bound bounded avatar storage without changing account keys", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_022")
+		applyMigrationsBefore(t, pool, migrations, 22)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var ownerID, otherID string
+		for _, fixture := range []struct {
+			username string
+			marker   byte
+			result   *string
+		}{
+			{username: "avatar-owner", marker: 0xf1, result: &ownerID},
+			{username: "avatar-other", marker: 0xf3, result: &otherID},
+		} {
+			if err := pool.QueryRow(ctx,
+				`INSERT INTO users(identity_key, signing_key, username)
+				 VALUES ($1,$2,$3) RETURNING id::text`,
+				bytes.Repeat([]byte{fixture.marker}, 32),
+				bytes.Repeat([]byte{fixture.marker + 1}, 32), fixture.username,
+			).Scan(fixture.result); err != nil {
+				t.Fatalf("insert avatar fixture: %v", err)
+			}
+		}
+		if err := execMigration(t, pool, migrations, 22); err != nil {
+			t.Fatalf("migration 022: %v", err)
+		}
+		var assetID string
+		if err := pool.QueryRow(ctx, `INSERT INTO profile_avatar_assets
+			(owner_id, id, content_type, sha256, width, height, data)
+			VALUES ($1::uuid, gen_random_uuid(), 'image/jpeg', $2, 512, 512, '\xffd8ffd9')
+			RETURNING id::text`, ownerID, bytes.Repeat([]byte{0xa5}, 32)).Scan(&assetID); err != nil {
+			t.Fatalf("insert avatar asset: %v", err)
+		}
+		if _, err := pool.Exec(ctx, `UPDATE users SET avatar_asset_id=$1::uuid WHERE id=$2::uuid`, assetID, ownerID); err != nil {
+			t.Fatalf("bind owned avatar: %v", err)
+		}
+		_, err := pool.Exec(ctx, `UPDATE users SET avatar_asset_id=$1::uuid WHERE id=$2::uuid`, assetID, otherID)
+		requireMigrationError(t, err, "23514", "profile avatar owner mismatch")
+		_, err = pool.Exec(ctx, `UPDATE profile_avatar_assets SET owner_id=$1::uuid WHERE id=$2::uuid`, otherID, assetID)
+		requireMigrationError(t, err, "23514", "profile avatar owner is immutable")
+		var indexes int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM pg_indexes
+			WHERE schemaname=current_schema() AND indexname IN
+			('profile_avatar_assets_orphaned_idx','profile_avatar_assets_owner_idx','users_avatar_asset_idx')`).Scan(&indexes); err != nil || indexes != 3 {
+			t.Fatalf("avatar retention/FK indexes=%d err=%v, want 3", indexes, err)
+		}
+		_, err = pool.Exec(ctx, `UPDATE users SET avatar_upload_window_started_at=now(), avatar_upload_count=13 WHERE id=$1::uuid`, ownerID)
+		requireMigrationError(t, err, "23514", "users_avatar_upload_quota_state")
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 022", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 20; number++ {
+		for number := 1; number <= 22; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 21)
+		applyMigrationsBefore(t, pool, migrations, 23)
 	})
 }
 

@@ -69,12 +69,18 @@ importers:
       '@types/react':
         specifier: ~19.1.0
         version: 19.1.17
+      '@types/react-test-renderer':
+        specifier: 19.0.0
+        version: 19.0.0
       jest:
         specifier: ^29
         version: 29.7.0(@types/node@25.6.0)
       jest-expo:
         specifier: ~53.0.0
         version: 53.0.14(@babel/core@7.29.0)(expo@53.0.27(@babel/core@7.29.0)(react-native@0.79.2(@babel/core@7.29.0)(@types/react@19.1.17)(react@19.0.0))(react@19.0.0))(jest@29.7.0(@types/node@25.6.0))(react-native@0.79.2(@babel/core@7.29.0)(@types/react@19.1.17)(react@19.0.0))(react@19.0.0)
+      react-test-renderer:
+        specifier: 19.0.0
+        version: 19.0.0(react@19.0.0)
       typescript:
         specifier: ~5.8.0
         version: 5.8.3
@@ -940,6 +946,9 @@ packages:
 
   '@types/node@25.6.0':
     resolution: {integrity: sha512-+qIYRKdNYJwY3vRCZMdJbPLJAtGjQBudzZzdzwQYkEPQd+PJGixUL5QfvCLDaULoLv+RhT3LDkwEfKaAkgSmNQ==}
+
+  '@types/react-test-renderer@19.0.0':
+    resolution: {integrity: sha512-qDVnNybqFm2eZKJ4jD34EvRd6VHD67KjgnWaEMM0Id9L22EpWe3nOSVKHWL1XWRCxUWe3lhXwlEeCKD1BlJCQA==}
 
   '@types/react@19.1.17':
     resolution: {integrity: sha512-Qec1E3mhALmaspIrhWt9jkQMNdw6bReVu64mjvhbhq2NFPftLPVr+l1SZgmw/66WwBNpDh7ao5AT6gF5v41PFA==}
@@ -4747,6 +4756,10 @@ snapshots:
   '@types/node@25.6.0':
     dependencies:
       undici-types: 7.19.2
+
+  '@types/react-test-renderer@19.0.0':
+    dependencies:
+      '@types/react': 19.1.17
 
   '@types/react@19.1.17':
     dependencies:

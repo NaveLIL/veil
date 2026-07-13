@@ -39,7 +39,14 @@ function publish(): void {
 export function avatarSourceForIdentity(identity: PhaseprintIdentity): string | null {
   revision();
   const key = locatorKey(identity);
-  return key ? entries.get(key)?.source ?? null : null;
+  if (!key) return null;
+  const entry = entries.get(key);
+  if (!entry) return null;
+  // Map iteration order is the eviction order. Refresh it on every successful
+  // read so the documented budget is true LRU rather than insertion FIFO.
+  entries.delete(key);
+  entries.set(key, entry);
+  return entry.source;
 }
 
 export function installNativeAvatar(

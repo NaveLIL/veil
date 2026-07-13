@@ -6,10 +6,6 @@ export type UserAvatarStatus = "online" | "idle" | "dnd" | "offline";
 
 export interface UserAvatarProps extends PhaseprintIdentity {
   size?: number;
-  // Dormant hook for a future native-validated avatar registry. A `blob:`
-  // scheme check is only defense in depth; callers must never pass arbitrary
-  // web content or treat it as proof of MIME/content provenance.
-  localImageSrc?: string | null;
   status?: UserAvatarStatus;
   label?: string;
   title?: string;
@@ -24,16 +20,6 @@ const STATUS_COLORS: Record<UserAvatarStatus, string> = {
   offline: "var(--veil-text-faint)",
 };
 
-export function isAllowedLocalAvatarSource(source: string | null | undefined): boolean {
-  const candidate = source?.trim();
-  if (!candidate) return false;
-  try {
-    return new URL(candidate).protocol === "blob:";
-  } catch {
-    return false;
-  }
-}
-
 function normalizedAvatarSize(value: number | undefined): number {
   if (!Number.isFinite(value)) return 36;
   return Math.min(160, Math.max(20, Math.round(value ?? 36)));
@@ -43,9 +29,7 @@ export const UserAvatar: Component<UserAvatarProps> = (props) => {
   const [loadedImageSource, setLoadedImageSource] = createSignal<string | null>(null);
   const [failedImageSource, setFailedImageSource] = createSignal<string | null>(null);
   const size = () => normalizedAvatarSize(props.size);
-  const localImageSource = () => isAllowedLocalAvatarSource(props.localImageSrc)
-    ? props.localImageSrc!.trim()
-    : avatarSourceForIdentity(props);
+  const localImageSource = () => avatarSourceForIdentity(props);
   const imageCandidateSource = () => {
     const source = localImageSource();
     return source && source !== failedImageSource() ? source : null;

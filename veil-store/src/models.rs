@@ -48,6 +48,50 @@ impl AccountSnapshotSource {
     }
 }
 
+/// Membership context captured for one immutable message-author observation.
+///
+/// This is deliberately separate from `AccountSnapshotSource`: source ranks
+/// presentation authority, while this value records whether the author was
+/// present in the authenticated conversation directory when the message was
+/// first committed. It is presentation-only and never participates in crypto,
+/// ACL, or Sender-Key decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum MessageAuthorContext {
+    DirectoryMemberAtObservation = 1,
+    FormerMemberAtObservation = 2,
+}
+
+impl MessageAuthorContext {
+    pub const fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn from_u8(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::DirectoryMemberAtObservation),
+            2 => Some(Self::FormerMemberAtObservation),
+            _ => None,
+        }
+    }
+
+    pub const fn from_snapshot_source(source: AccountSnapshotSource) -> Self {
+        match source {
+            AccountSnapshotSource::AuthenticatedConversationDirectory => {
+                Self::DirectoryMemberAtObservation
+            }
+            AccountSnapshotSource::AuthenticatedHistory => Self::FormerMemberAtObservation,
+        }
+    }
+
+    pub const fn wire_label(self) -> &'static str {
+        match self {
+            Self::DirectoryMemberAtObservation => "directory_member_at_observation",
+            Self::FormerMemberAtObservation => "former_member_at_observation",
+        }
+    }
+}
+
 /// Origin-scoped account metadata retained inside SQLCipher.
 ///
 /// Presentation fields never participate in crypto trust, ACL decisions, or
@@ -91,6 +135,17 @@ pub enum LocalIdentityVerification {
     IdentityChanged,
 }
 
+/// Result of comparing authenticated active-history author metadata with the
+/// durable origin/user account baseline. This comparison records incidents
+/// only; it never promotes the candidate into the identity directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HistoricalAccountContinuity {
+    NoBaseline,
+    Compatible,
+    /// Durable baseline owners whose identity continuity was violated.
+    IdentityChanged(Vec<String>),
+}
+
 /// Message delivery status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
@@ -132,6 +187,7 @@ pub struct Message {
     pub server_timestamp: Option<i64>,
     pub created_at: String,
     pub author: Option<AccountSnapshot>,
+    pub author_context: Option<MessageAuthorContext>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

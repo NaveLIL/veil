@@ -45,8 +45,12 @@ import {
   canonicalIdentityOrigin,
   canonicalIdentityUserId,
   identityAllowsKeylessDmResolution,
+  identityProfileMatchesAuthenticatedOrigin,
   identityProfileKey,
+  identityVerificationMatchesProfile,
   isSameCanonicalIdentity,
+  messageAuthorContextLabel,
+  mergeIdentityProofState,
   type IdentityIslandProfile,
 } from "@/components/identity/identityProfile";
 import { toast, ToastViewport } from "@/components/ui/toast";
@@ -246,6 +250,10 @@ const App: Component = () => {
     const route = rightIslandRoute();
     return route.kind === "identity" && route.backToMembers;
   };
+  const rightIslandReturnFocusTarget = () => {
+    const route = rightIslandRoute();
+    return route.kind === "closed" ? null : route.opener;
+  };
 
   const refreshIdentityProfile = async (profile: IdentityIslandProfile) => {
     const targetOrigin = canonicalIdentityOrigin(profile.canonicalServerOrigin);
@@ -281,7 +289,7 @@ const App: Component = () => {
         && identityProfileKey(current.profile) === routeKey
         ? {
           ...current,
-          profile: {
+          profile: mergeIdentityProofState({
             ...current.profile,
             technicalUsername: networkProfile.username,
             networkDisplayName: networkProfile.displayName,
@@ -291,8 +299,7 @@ const App: Component = () => {
             profileVersion: networkProfile.profileVersion,
             profileUpdatedAt: networkProfile.profileUpdatedAt,
             profileOrigin: networkProfile.canonicalServerOrigin,
-            localProofState: networkProfile.proofState,
-          },
+          }, networkProfile.proofState),
         }
         : current);
     } catch {
@@ -301,6 +308,67 @@ const App: Component = () => {
       }
     } finally {
       if (actionToken === identityProfileActionToken) setIdentityProfileLoading(false);
+    }
+  };
+
+  const hydrateCachedIdentityProfile = async (profile: IdentityIslandProfile) => {
+    const targetOrigin = canonicalIdentityOrigin(profile.canonicalServerOrigin);
+    const targetUserId = canonicalIdentityUserId(profile.userId);
+    const targetIdentityKey = canonicalIdentityKey(profile.identityKey);
+    if (!targetOrigin || !targetUserId || !targetIdentityKey) return;
+    const routeKey = identityProfileKey(profile);
+    try {
+      const cached = await appStore.loadCachedNetworkProfile(
+        targetUserId,
+        targetIdentityKey,
+        targetOrigin,
+      );
+      if (!cached) return;
+      setRightIslandRoute((current) => current.kind === "identity"
+        && identityProfileKey(current.profile) === routeKey
+        ? {
+          ...current,
+          profile: mergeIdentityProofState({
+            ...current.profile,
+            technicalUsername: cached.username,
+            networkDisplayName: cached.displayName,
+            displayName: cached.displayName || cached.username,
+            about: cached.about,
+            avatarAssetId: cached.avatarAssetId,
+            profileVersion: cached.profileVersion,
+            profileUpdatedAt: cached.profileUpdatedAt,
+            profileOrigin: cached.canonicalServerOrigin,
+          }, cached.proofState),
+        }
+        : current);
+    } catch {
+      // Cache absence or a stale session leaves the durable route snapshot in
+      // place. The live refresh below remains authoritative when available.
+    }
+  };
+
+  const hydrateLocalIdentityProof = async (profile: IdentityIslandProfile) => {
+    const targetOrigin = canonicalIdentityOrigin(profile.canonicalServerOrigin);
+    const targetUserId = canonicalIdentityUserId(profile.userId);
+    const targetIdentityKey = canonicalIdentityKey(profile.identityKey);
+    if (!targetOrigin || !targetUserId || !targetIdentityKey) return;
+    const routeKey = identityProfileKey(profile);
+    try {
+      const verification = await appStore.loadCachedIdentityVerification(
+        targetUserId,
+        targetIdentityKey,
+        targetOrigin,
+      );
+      setRightIslandRoute((current) => current.kind === "identity"
+        && identityProfileKey(current.profile) === routeKey
+        ? {
+          ...current,
+          profile: mergeIdentityProofState(current.profile, verification.proofState),
+        }
+        : current);
+    } catch {
+      // Missing origin/self binding or a stale unlocked session cannot upgrade
+      // trust. Profile/cache hydration remains independent and fail-closed.
     }
   };
 
@@ -332,7 +400,7 @@ const App: Component = () => {
         && identityProfileKey(current.profile) === routeKey
         ? {
           ...current,
-          profile: {
+          profile: mergeIdentityProofState({
             ...current.profile,
             technicalUsername: networkProfile.username,
             networkDisplayName: networkProfile.displayName,
@@ -342,8 +410,7 @@ const App: Component = () => {
             profileVersion: networkProfile.profileVersion,
             profileUpdatedAt: networkProfile.profileUpdatedAt,
             profileOrigin: networkProfile.canonicalServerOrigin,
-            localProofState: networkProfile.proofState,
-          },
+          }, networkProfile.proofState),
         }
         : current);
       return true;
@@ -409,9 +476,17 @@ const App: Component = () => {
 
   const loadSelectedIdentityVerification = async (): Promise<IdentityVerificationView | null> => {
     const route = rightIslandRoute();
+    const scope = appStore.authenticatedServerScope();
     if (route.kind !== "identity" || isSameCanonicalIdentity(route.profile, currentIdentityLocator())) {
       return null;
     }
+    if (
+      !scope
+      || !appStore.connected()
+      || appStore.bindingTransitioning()
+      || appStore.originTransitioning()
+      || !identityProfileMatchesAuthenticatedOrigin(route.profile, scope.canonicalServerOrigin)
+    ) return null;
     const targetUserId = canonicalIdentityUserId(route.profile.userId);
     const targetIdentityKey = canonicalIdentityKey(route.profile.identityKey);
     if (!targetUserId || !targetIdentityKey) return null;
@@ -426,11 +501,15 @@ const App: Component = () => {
         actionToken !== identityVerificationActionToken
         || current.kind !== "identity"
         || identityProfileKey(current.profile) !== routeKey
+        || !identityVerificationMatchesProfile(verification, current.profile)
       ) return null;
       setIdentityVerification(verification);
       setRightIslandRoute({
         ...current,
-        profile: { ...current.profile, localProofState: verification.proofState },
+        profile: mergeIdentityProofState(
+          { ...current.profile, signingKey: verification.signingKey },
+          verification.proofState,
+        ),
       });
       return verification;
     } catch {
@@ -446,14 +525,19 @@ const App: Component = () => {
   const confirmSelectedIdentityVerification = async (expectedFingerprintHex: string): Promise<boolean> => {
     const route = rightIslandRoute();
     const displayed = identityVerification();
+    const scope = appStore.authenticatedServerScope();
     if (route.kind !== "identity" || !displayed) return false;
     const targetUserId = canonicalIdentityUserId(route.profile.userId);
     const targetIdentityKey = canonicalIdentityKey(route.profile.identityKey);
     if (
       !targetUserId
       || !targetIdentityKey
-      || displayed.userId !== targetUserId
-      || displayed.identityKey !== targetIdentityKey
+      || !scope
+      || !appStore.connected()
+      || appStore.bindingTransitioning()
+      || appStore.originTransitioning()
+      || !identityProfileMatchesAuthenticatedOrigin(route.profile, scope.canonicalServerOrigin)
+      || !identityVerificationMatchesProfile(displayed, route.profile)
       || displayed.fingerprintHex !== expectedFingerprintHex
     ) return false;
     const routeKey = identityProfileKey(route.profile);
@@ -471,11 +555,15 @@ const App: Component = () => {
         actionToken !== identityVerificationActionToken
         || current.kind !== "identity"
         || identityProfileKey(current.profile) !== routeKey
+        || !identityVerificationMatchesProfile(verified, current.profile)
       ) return false;
       setIdentityVerification(verified);
       setRightIslandRoute({
         ...current,
-        profile: { ...current.profile, localProofState: verified.proofState },
+        profile: mergeIdentityProofState(
+          { ...current.profile, signingKey: verified.signingKey },
+          verified.proofState,
+        ),
       });
       return verified.proofState === "verified_on_this_device";
     } catch {
@@ -548,7 +636,14 @@ const App: Component = () => {
         ?? (current.kind === "members" || current.kind === "identity" ? current.opener : null)
         ?? focusedElement,
     });
-    void refreshIdentityProfile(profile);
+    void (async () => {
+      await hydrateLocalIdentityProof(profile);
+      await hydrateCachedIdentityProfile(profile);
+      const route = rightIslandRoute();
+      if (route.kind === "identity" && identityProfileKey(route.profile) === identityProfileKey(profile)) {
+        await refreshIdentityProfile(route.profile);
+      }
+    })();
   };
 
   const backToMembersIsland = () => {
@@ -575,6 +670,15 @@ const App: Component = () => {
     setIdentityVerification(null);
     setIdentityVerificationBusy(false);
     setIdentityVerificationError("");
+    const validOpener = opener?.isConnected
+      && !opener.hasAttribute("disabled")
+      && opener.getAttribute("aria-disabled") !== "true";
+    if (validOpener) opener.focus({ preventScroll: true });
+    const focusTransferred = validOpener && document.activeElement === opener;
+    if (!focusTransferred && (
+      activeAtClose instanceof HTMLElement
+      && activeAtClose.closest(".veil-right-island-wrapper")
+    )) activeAtClose.blur();
     setIsland4Vis(false);
     const finish = () => {
       if (epoch !== rightIslandTransitionEpoch) return;
@@ -689,7 +793,7 @@ const App: Component = () => {
     const isSelf = isSameCanonicalIdentity(profile, currentIdentityLocator());
     return {
       ...profile,
-      contextLabel: isSelf ? "Your message" : profile.contextLabel,
+      contextLabel: messageAuthorContextLabel(message.senderAuthorContext, isSelf),
       selfIdentity: currentIdentityLocator(),
     };
   };
@@ -780,6 +884,45 @@ const App: Component = () => {
     if (!q) return list;
     return list.filter((c) => c.name.toLowerCase().includes(q));
   };
+
+  createEffect(() => {
+    const notice = appStore.identityChangeNotice();
+    if (!notice || appStore.screen() !== "chat") return;
+    const route = untrack(rightIslandRoute);
+    if (
+      route.kind !== "identity"
+      || canonicalIdentityOrigin(route.profile.canonicalServerOrigin) !== notice.canonicalServerOrigin
+      || canonicalIdentityUserId(route.profile.userId) !== notice.userId
+    ) return;
+    identityProfileActionToken += 1;
+    identityVerificationActionToken += 1;
+    setIdentityProfileLoading(false);
+    setIdentityVerification(null);
+    setIdentityVerificationBusy(false);
+    setIdentityVerificationError("");
+    setRightIslandRoute((current) => current.kind === "identity"
+      && canonicalIdentityOrigin(current.profile.canonicalServerOrigin) === notice.canonicalServerOrigin
+      && canonicalIdentityUserId(current.profile.userId) === notice.userId
+      ? { ...current, profile: mergeIdentityProofState(current.profile, "identity_changed") }
+      : current);
+    untrack(() => void hydrateLocalIdentityProof(route.profile));
+  });
+
+  let lastIdentityProofBindingGeneration: string | null = null;
+  createEffect(() => {
+    const scope = appStore.authenticatedServerScope();
+    const transitioning = appStore.bindingTransitioning();
+    if (!scope || transitioning || appStore.screen() !== "chat") return;
+    if (scope.bindingGeneration === lastIdentityProofBindingGeneration) return;
+    lastIdentityProofBindingGeneration = scope.bindingGeneration;
+    const route = untrack(rightIslandRoute);
+    if (
+      route.kind !== "identity"
+      || canonicalIdentityOrigin(route.profile.canonicalServerOrigin)
+        !== canonicalIdentityOrigin(scope.canonicalServerOrigin)
+    ) return;
+    untrack(() => void hydrateLocalIdentityProof(route.profile));
+  });
 
   createEffect(() => {
     const notice = appStore.profileUpdateNotice();
@@ -3068,6 +3211,7 @@ const App: Component = () => {
               identityVerification={identityVerification()}
               identityVerificationBusy={identityVerificationBusy()}
               identityVerificationError={identityVerificationError()}
+              returnFocusTo={rightIslandReturnFocusTarget()}
               serverId={appStore.activeServerId()}
               contextName={appStore.activeServerId()
                 ? appStore.servers().find((server) => server.id === appStore.activeServerId())?.name

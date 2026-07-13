@@ -744,6 +744,16 @@ select:focus-visible,
   text-align: left;
 }
 
+.veil-identity-profile-disclosure {
+  border: 1px solid rgba(245, 185, 66, 0.22);
+  border-radius: 8px;
+  padding: 8px 9px;
+  color: var(--veil-warning);
+  background: rgba(245, 185, 66, 0.07);
+  font-size: 9px;
+  line-height: 1.45;
+}
+
 .veil-identity-profile-editor label {
   display: grid;
   gap: 5px;

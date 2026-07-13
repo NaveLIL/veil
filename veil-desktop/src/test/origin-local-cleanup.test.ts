@@ -111,6 +111,13 @@ describe("origin-local App cleanup", () => {
     expect(routeLifecycle).toContain('if (untrack(rightIslandRoute).kind !== "closed")');
     expect(routeLifecycle).toContain("setIsland4Vis(false)");
     expect(routeLifecycle).toContain("prefers-reduced-motion: reduce");
+    const closeFlow = section(
+      "const closeRightIsland =",
+      "const conv = () => appStore.activeConversation();",
+    );
+    expect(closeFlow).toContain("activeAtClose.blur()");
+    expect(closeFlow.indexOf("opener.focus({ preventScroll: true })"))
+      .toBeLessThan(closeFlow.indexOf("setIsland4Vis(false)"));
 
     const identityDmFlow = section(
       "const handleIdentityMessage = async () => {",
@@ -167,6 +174,19 @@ describe("origin-local App cleanup", () => {
     expect(refreshEffect).toContain("refreshIdentityProfile(route.profile)");
   });
 
+  it("makes an authenticated identity-change notice monotonic across async responses", () => {
+    const quarantineEffect = section(
+      "const notice = appStore.identityChangeNotice()",
+      "const notice = appStore.profileUpdateNotice()",
+    );
+    expect(quarantineEffect).toContain("identityProfileActionToken += 1");
+    expect(quarantineEffect).toContain("identityVerificationActionToken += 1");
+    expect(quarantineEffect).toContain('mergeIdentityProofState(current.profile, "identity_changed")');
+    expect(quarantineEffect).toContain("hydrateLocalIdentityProof(route.profile)");
+    expect(quarantineEffect).toContain("lastIdentityProofBindingGeneration");
+    expect(quarantineEffect).toContain("scope.bindingGeneration === lastIdentityProofBindingGeneration");
+  });
+
   it("binds physical verification to the exact displayed fingerprint and route", () => {
     const verificationFlow = section(
       "const loadSelectedIdentityVerification = async",
@@ -175,6 +195,11 @@ describe("origin-local App cleanup", () => {
     expect(verificationFlow).toContain("isSameCanonicalIdentity(route.profile, currentIdentityLocator())");
     expect(verificationFlow).toContain("const actionToken = ++identityVerificationActionToken");
     expect(verificationFlow).toContain("identityProfileKey(current.profile) !== routeKey");
+    expect(verificationFlow).toContain("identityProfileMatchesAuthenticatedOrigin(route.profile, scope.canonicalServerOrigin)");
+    expect(verificationFlow).toContain("identityVerificationMatchesProfile(verification, current.profile)");
+    expect(verificationFlow).toContain("identityVerificationMatchesProfile(displayed, route.profile)");
+    expect(verificationFlow).toContain("appStore.bindingTransitioning()");
+    expect(verificationFlow).toContain("appStore.originTransitioning()");
     expect(verificationFlow).toContain("displayed.fingerprintHex !== expectedFingerprintHex");
     expect(verificationFlow).toContain("appStore.confirmIdentityVerification(");
     expect(verificationFlow).toContain('verified.proofState === "verified_on_this_device"');

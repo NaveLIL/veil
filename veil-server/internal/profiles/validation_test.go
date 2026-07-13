@@ -43,6 +43,10 @@ func TestNormalizeProfileTextRejectsBoundsControlsAndBidi(t *testing.T) {
 		{name: "display newline", displayName: "line\nbreak"},
 		{name: "about tab", displayName: "ok", about: "tab\tvalue"},
 		{name: "bidi override", displayName: "safe\u202eevil"},
+		{name: "line separator", displayName: "line\u2028break"},
+		{name: "paragraph separator", displayName: "ok", about: "line\u2029break"},
+		{name: "zero-width space", displayName: "safe\u200bhidden"},
+		{name: "byte-order mark", displayName: "ok", about: "safe\ufeffhidden"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

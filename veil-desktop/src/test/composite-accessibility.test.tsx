@@ -26,6 +26,11 @@ const axeOptions = {
 describe("composite widget accessibility", () => {
   beforeEach(() => {
     invokeMock.mockReset();
+    vi.spyOn(appStore, "authenticatedServerScope").mockReturnValue({
+      canonicalServerOrigin: "https://chat.example.test:443",
+      userId: "550e8400-e29b-41d4-a716-446655440001",
+      bindingGeneration: "1",
+    });
   });
 
   afterEach(() => {
@@ -83,6 +88,12 @@ describe("composite widget accessibility", () => {
     await user.keyboard("{End}");
     expect(screen.getByRole("tab", { name: "Add" })).toHaveAttribute("aria-selected", "true");
     expect(screen.getByRole("tabpanel", { name: "Add" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "Find a friend by username" })).toBeInTheDocument();
+    const accessibility = await axe.run(document.body, {
+      ...axeOptions,
+      rules: { ...axeOptions.rules, region: { enabled: false } },
+    });
+    expect(accessibility.violations).toEqual([]);
   });
 
   it("bounds remote friend and request rows to the active presentation window", async () => {
@@ -227,7 +238,7 @@ describe("composite widget accessibility", () => {
           signingKey: "32".repeat(32),
           username: "alice",
           displayName: "Alice",
-          profileVersion: "18446744073709551615",
+          profileVersion: "9223372036854775807",
           profileOrigin: "https://chat.example.test:443",
         },
       }];
@@ -267,7 +278,7 @@ describe("composite widget accessibility", () => {
       userId: "550e8400-e29b-41d4-a716-446655440000",
       identityKey: "31".repeat(32),
       signingKey: "32".repeat(32),
-      profileVersion: "18446744073709551615",
+      profileVersion: "9223372036854775807",
       contextKind: "message-author",
     });
   });

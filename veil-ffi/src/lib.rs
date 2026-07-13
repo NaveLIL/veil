@@ -242,13 +242,36 @@ pub fn ed25519_verify(
 }
 
 #[uniffi::export]
-pub fn generate_fingerprint(
-    key_a: Vec<u8>,
-    key_b: Vec<u8>,
+#[allow(clippy::too_many_arguments)]
+pub fn generate_account_fingerprint_v2(
+    canonical_server_origin: String,
+    user_id_a: String,
+    identity_key_a: Vec<u8>,
+    signing_key_a: Vec<u8>,
+    user_id_b: String,
+    identity_key_b: Vec<u8>,
+    signing_key_b: Vec<u8>,
 ) -> Result<FingerprintResult, VeilError> {
-    let a = to_32(&key_a)?;
-    let b = to_32(&key_b)?;
-    let (emoji, hex) = fingerprint::generate(&a, &b);
+    let origin = require_canonical_server_origin(&canonical_server_origin)?;
+    let user_a = require_canonical_user_id("first account user ID", &user_id_a)?;
+    let user_b = require_canonical_user_id("second account user ID", &user_id_b)?;
+    let (identity_a, signing_a) =
+        require_account_key_pair("first account", &identity_key_a, &signing_key_a)?;
+    let (identity_b, signing_b) =
+        require_account_key_pair("second account", &identity_key_b, &signing_key_b)?;
+    let (emoji, hex) = fingerprint::generate_account_v2(
+        &origin,
+        fingerprint::AccountFingerprintTuple {
+            user_id: &user_a,
+            identity_key: &identity_a,
+            signing_key: &signing_a,
+        },
+        fingerprint::AccountFingerprintTuple {
+            user_id: &user_b,
+            identity_key: &identity_b,
+            signing_key: &signing_b,
+        },
+    );
     Ok(FingerprintResult { emoji, hex })
 }
 
@@ -352,6 +375,106 @@ fn to_64(data: &[u8]) -> Result<[u8; 64], VeilError> {
         msg: format!("expected 64 bytes, got {}", data.len()),
     })
 }
+
+fn require_canonical_user_id(label: &str, value: &str) -> Result<String, VeilError> {
+    let parsed = uuid::Uuid::parse_str(value).map_err(|_| VeilError::InvalidInput {
+        msg: format!("{label} must be a canonical lowercase UUID"),
+    })?;
+    let canonical = parsed.hyphenated().to_string();
+    if parsed.is_nil() || canonical != value {
+        return Err(VeilError::InvalidInput {
+            msg: format!("{label} must be a non-nil canonical lowercase UUID"),
+        });
+    }
+    Ok(canonical)
+}
+
+fn require_account_key_pair(
+    label: &str,
+    identity_key: &[u8],
+    signing_key: &[u8],
+) -> Result<([u8; 32], [u8; 32]), VeilError> {
+    let identity_key = to_32(identity_key)?;
+    let signing_key = to_32(signing_key)?;
+    if identity_key == [0u8; 32]
+        || !veil_crypto::public_key::valid_ed25519_public_key(&signing_key)
+        || identity_key == signing_key
+    {
+        return Err(VeilError::InvalidInput {
+            msg: format!(
+                "{label} keys must contain a non-zero X25519 key and a valid, type-distinct Ed25519 key"
+            ),
+        });
+    }
+    Ok((identity_key, signing_key))
+}
+
+fn require_canonical_server_origin(value: &str) -> Result<String, VeilError> {
+    if value.is_empty() || value.len() > 512 {
+        return Err(VeilError::InvalidInput {
+            msg: "server origin is empty or oversized".to_string(),
+        });
+    }
+    let parsed = url::Url::parse(value).map_err(|error| VeilError::InvalidInput {
+        msg: format!("invalid canonical server origin: {error}"),
+    })?;
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.path() != "/"
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(VeilError::InvalidInput {
+            msg: "server origin must not contain credentials, path, query, or fragment".to_string(),
+        });
+    }
+    match parsed.scheme() {
+        "https" => {}
+        "http" => match parsed.host_str() {
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]") => {}
+            _ => {
+                return Err(VeilError::InvalidInput {
+                    msg: "insecure http:// is allowed only for localhost/loopback".to_string(),
+                });
+            }
+        },
+        _ => {
+            return Err(VeilError::InvalidInput {
+                msg: "server origin must use https:// or loopback http://".to_string(),
+            });
+        }
+    }
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| VeilError::InvalidInput {
+            msg: "server origin is missing a host".to_string(),
+        })?
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host
+    };
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| VeilError::InvalidInput {
+            msg: "server origin has no effective port".to_string(),
+        })?;
+    let canonical = format!(
+        "{}://{}:{}",
+        parsed.scheme().to_ascii_lowercase(),
+        authority,
+        port
+    );
+    if canonical != value {
+        return Err(VeilError::InvalidInput {
+            msg: "server origin is not canonical".to_string(),
+        });
+    }
+    Ok(canonical)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -387,11 +510,101 @@ mod tests {
     }
 
     #[test]
-    fn test_fingerprint() {
-        let a = vec![1u8; 32];
-        let b = vec![2u8; 32];
-        let fp = generate_fingerprint(a, b).unwrap();
-        assert!(!fp.emoji.is_empty());
-        assert!(!fp.hex.is_empty());
+    fn test_account_fingerprint_v2() {
+        let account_a = VeilIdentity::generate();
+        let account_b = VeilIdentity::generate();
+        let identity_a = account_a.identity_key();
+        let signing_a = account_a.signing_key();
+        let identity_b = account_b.identity_key();
+        let signing_b = account_b.signing_key();
+        let fp_ab = generate_account_fingerprint_v2(
+            "https://chat.example.test:443".to_string(),
+            "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            identity_a.clone(),
+            signing_a.clone(),
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+            identity_b.clone(),
+            signing_b.clone(),
+        )
+        .unwrap();
+        let fp_ba = generate_account_fingerprint_v2(
+            "https://chat.example.test:443".to_string(),
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+            identity_b,
+            signing_b,
+            "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            identity_a,
+            signing_a,
+        )
+        .unwrap();
+        assert!(!fp_ab.emoji.is_empty());
+        assert_eq!(fp_ab.hex.len(), 64);
+        assert_eq!(fp_ab.hex, fp_ba.hex);
+    }
+
+    #[test]
+    fn account_fingerprint_v2_rejects_ambiguous_scope() {
+        let account_a = VeilIdentity::generate();
+        let account_b = VeilIdentity::generate();
+        let identity_a = account_a.identity_key();
+        let signing_a = account_a.signing_key();
+        let identity_b = account_b.identity_key();
+        let signing_b = account_b.signing_key();
+        assert!(generate_account_fingerprint_v2(
+            "https://chat.example.test".to_string(),
+            "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            identity_a.clone(),
+            signing_a.clone(),
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+            identity_b.clone(),
+            signing_b.clone(),
+        )
+        .is_err());
+        assert!(generate_account_fingerprint_v2(
+            "https://chat.example.test:443".to_string(),
+            "550E8400-E29B-41D4-A716-446655440001".to_string(),
+            identity_a.clone(),
+            signing_a.clone(),
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+            identity_b.clone(),
+            signing_b.clone(),
+        )
+        .is_err());
+        assert!(generate_account_fingerprint_v2(
+            "https://chat.example.test:443".to_string(),
+            "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            vec![0u8; 32],
+            signing_a,
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+            identity_b,
+            signing_b,
+        )
+        .is_err());
+        assert!(generate_account_fingerprint_v2(
+            "https://chat.example.test:443".to_string(),
+            "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            vec![7u8; 32],
+            vec![7u8; 32],
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+            vec![3u8; 32],
+            vec![4u8; 32],
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn account_fingerprint_v2_accepts_canonical_ipv6_loopback_origin() {
+        let account_a = VeilIdentity::generate();
+        let account_b = VeilIdentity::generate();
+        assert!(generate_account_fingerprint_v2(
+            "http://[::1]:80".to_string(),
+            "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            account_a.identity_key(),
+            account_a.signing_key(),
+            "550e8400-e29b-41d4-a716-446655440002".to_string(),
+            account_b.identity_key(),
+            account_b.signing_key(),
+        )
+        .is_ok());
     }
 }

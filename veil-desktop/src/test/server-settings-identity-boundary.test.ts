@@ -82,6 +82,31 @@ describe("server-settings Identity Island boundary", () => {
     );
   });
 
+  it("uses the same durable proof and quarantine boundary inside settings", () => {
+    const proofFlow = section(
+      "const hydrateSelectedIdentityProof = async",
+      "const selectedIdentityDmState = createMemo",
+    );
+
+    expect(proofFlow).toContain("appStore.loadCachedIdentityVerification(");
+    expect(proofFlow).toContain("appStore.loadIdentityVerification(");
+    expect(proofFlow).toContain("appStore.confirmIdentityVerification(");
+    expect(proofFlow).toContain("const sessionEpoch = captureUiSessionEpoch()");
+    expect(proofFlow).toContain("isUiSessionEpochCurrent(sessionEpoch)");
+    expect(proofFlow).toContain("identityProfileKey(current) !== routeKey");
+    expect(proofFlow).toContain("identityProfileMatchesAuthenticatedOrigin(profile, scope.canonicalServerOrigin)");
+    expect(proofFlow).toContain("identityVerificationMatchesProfile(verification, current)");
+    expect(proofFlow).toContain("identityVerificationMatchesProfile(displayed, profile)");
+    expect(proofFlow).toContain("appStore.bindingTransitioning()");
+    expect(proofFlow).toContain("appStore.originTransitioning()");
+    expect(proofFlow).toContain("const notice = appStore.identityChangeNotice()");
+    expect(proofFlow).toContain('mergeIdentityProofState(profile, "identity_changed")');
+    expect(proofFlow).toContain("scope.bindingGeneration === lastIdentityProofBindingGeneration");
+    expect(source).toContain("verification={identityVerification()}");
+    expect(source).toContain("onLoadVerification={loadSelectedIdentityVerification}");
+    expect(source).toContain("onConfirmVerification={confirmSelectedIdentityVerification}");
+  });
+
   it("bounds identity role presentation without truncating authorization state", () => {
     expect(source).toContain("boundedIdentityRoles(source)");
     expect(source).toContain("new Set(boundedIdentityRoles(m.roleIds))");

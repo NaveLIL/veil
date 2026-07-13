@@ -99,10 +99,11 @@ func TestDeviceBindingV1DeterministicVector(t *testing.T) {
 }
 
 func TestDeviceBindingV1RejectsAmbiguousFields(t *testing.T) {
+	deviceSigningPrivate := ed25519.NewKeyFromSeed(bytes.Repeat([]byte{3}, ed25519.SeedSize))
 	valid := &DeviceBindingInput{
 		DeviceKey:         bytes.Repeat([]byte{1}, 16),
 		DeviceIdentityKey: bytes.Repeat([]byte{2}, 32),
-		DeviceSigningKey:  bytes.Repeat([]byte{3}, 32),
+		DeviceSigningKey:  deviceSigningPrivate.Public().(ed25519.PublicKey),
 		Version:           1,
 		Capabilities:      db.RequiredChannelCapabilities,
 		Status:            db.DeviceBindingActive,
@@ -119,6 +120,7 @@ func TestDeviceBindingV1RejectsAmbiguousFields(t *testing.T) {
 		"short device id":     func(value *DeviceBindingInput) { value.DeviceKey = value.DeviceKey[:15] },
 		"short X25519 key":    func(value *DeviceBindingInput) { value.DeviceIdentityKey = value.DeviceIdentityKey[:31] },
 		"short Ed25519 key":   func(value *DeviceBindingInput) { value.DeviceSigningKey = value.DeviceSigningKey[:31] },
+		"weak Ed25519 key":    func(value *DeviceBindingInput) { value.DeviceSigningKey = make([]byte, 32) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			copyValue := *valid
