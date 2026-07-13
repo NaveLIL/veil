@@ -17,6 +17,7 @@ export interface IdentityContextRole {
 
 export interface IdentityIslandProfile extends PhaseprintIdentity {
   displayName: string;
+  networkDisplayName?: string | null;
   nickname?: string | null;
   signingKey?: string | null;
   about?: string | null;

@@ -50,6 +50,7 @@ export interface RightIslandProps {
   identityCanMessage: boolean;
   identityMessageBusy: boolean;
   identityProfileLoading?: boolean;
+  identityProfileSaving?: boolean;
   identityProfileError?: string;
   serverId: string | null;
   contextName?: string;
@@ -64,6 +65,7 @@ export interface RightIslandProps {
   onBackToMembers: () => void;
   onClose: () => void;
   onMessageIdentity: () => void;
+  onSaveIdentityProfile?: (displayName: string | null, about: string, expectedVersion: string) => Promise<boolean>;
   onCreateDm: (userId: string, technicalUsername: string, expectedIdentityKey?: string) => void;
   onAssignRole: (serverId: string, userId: string, roleId: string) => void;
   onUnassignRole: (serverId: string, userId: string, roleId: string) => void;
@@ -557,8 +559,10 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
           canMessage={props.identityCanMessage}
           messageBusy={props.identityMessageBusy}
           profileLoading={props.identityProfileLoading}
+          profileSaving={props.identityProfileSaving}
           profileError={props.identityProfileError}
           onMessage={props.onMessageIdentity}
+          onSaveProfile={props.onSaveIdentityProfile}
         />
       )}
     </Show>

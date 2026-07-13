@@ -1,5 +1,5 @@
-import { For, Show, createMemo, createSignal, onCleanup, type Component, type JSX } from "solid-js";
-import { Copy, LockKeyhole, MessageCircle, ShieldQuestion, UserRound } from "lucide-solid";
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, type Component, type JSX } from "solid-js";
+import { Copy, LockKeyhole, MessageCircle, Pencil, Save, ShieldQuestion, UserRound, X } from "lucide-solid";
 import { UserAvatar } from "@/components/identity/UserAvatar";
 import {
   boundedIdentityText,
@@ -16,8 +16,10 @@ interface IdentityIslandContentProps {
   canMessage: boolean;
   messageBusy?: boolean;
   profileLoading?: boolean;
+  profileSaving?: boolean;
   profileError?: string;
   onMessage: () => void;
+  onSaveProfile?: (displayName: string | null, about: string, expectedVersion: string) => Promise<boolean>;
 }
 
 interface IdentityIslandSheetProps extends IdentityIslandContentProps {
@@ -92,6 +94,10 @@ const DetailRow: Component<{ label: string; value: string; mono?: boolean }> = (
 export const IdentityIslandContent: Component<IdentityIslandContentProps> = (props) => {
   const [copied, setCopied] = createSignal<"user" | "identity" | "signing" | null>(null);
   const [copyStatus, setCopyStatus] = createSignal("");
+  const [editingProfile, setEditingProfile] = createSignal(false);
+  const [draftDisplayName, setDraftDisplayName] = createSignal("");
+  const [draftAbout, setDraftAbout] = createSignal("");
+  const [draftError, setDraftError] = createSignal("");
   let copyTimer: number | undefined;
   let copyEpoch = 0;
   let disposed = false;
@@ -118,6 +124,51 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
     color: safeRoleColor(role.color),
   })));
   const rolesTruncated = () => !!props.profile.rolesTruncated || (props.profile.roles?.length ?? 0) > 3;
+
+  createEffect(() => {
+    props.profile.profileVersion;
+    props.profile.networkDisplayName;
+    props.profile.about;
+    if (editingProfile() || props.profileSaving) return;
+    setDraftDisplayName(props.profile.networkDisplayName ?? "");
+    setDraftAbout(props.profile.about ?? "");
+    setDraftError("");
+  });
+
+  const validateProfileDraft = (): string | null => {
+    const name = draftDisplayName().normalize("NFC");
+    const bio = draftAbout().normalize("NFC");
+    const unsafe = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/u;
+    if (new TextEncoder().encode(name).length > 512 || /\p{Cc}/u.test(name) || unsafe.test(name)) {
+      return "Display name is too long or contains unsafe controls.";
+    }
+    if (
+      new TextEncoder().encode(bio).length > 2048
+      || /[\u0000-\u0009\u000b-\u001f\u007f-\u009f]/u.test(bio)
+      || unsafe.test(bio)
+    ) {
+      return "About text is too long or contains unsafe controls.";
+    }
+    return null;
+  };
+
+  const saveProfileDraft = async () => {
+    const version = profileVersion();
+    if (!version || !props.onSaveProfile || props.profileSaving) return;
+    const validationError = validateProfileDraft();
+    if (validationError) {
+      setDraftError(validationError);
+      return;
+    }
+    setDraftError("");
+    const normalizedName = draftDisplayName().trim().normalize("NFC");
+    const saved = await props.onSaveProfile(
+      normalizedName ? normalizedName : null,
+      draftAbout().trim().normalize("NFC"),
+      version,
+    );
+    if (saved) setEditingProfile(false);
+  };
 
   const clearCopyTimer = () => {
     if (copyTimer === undefined) return;
@@ -253,6 +304,53 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
             <div role="status" class="veil-identity-profile-status veil-identity-profile-status-error">
               {props.profileError}
             </div>
+          </Show>
+          <Show when={proofState() === "self" && profileVersion() && props.onSaveProfile}>
+            <Show
+              when={editingProfile()}
+              fallback={(
+                <button
+                  type="button"
+                  class="veil-identity-edit-button"
+                  disabled={props.profileLoading || props.profileSaving}
+                  onClick={() => setEditingProfile(true)}
+                >
+                  <Pencil size={12} /> Edit profile
+                </button>
+              )}
+            >
+              <form class="veil-identity-profile-editor" onSubmit={(event) => { event.preventDefault(); void saveProfileDraft(); }}>
+                <label>
+                  <span>Display name</span>
+                  <input
+                    value={draftDisplayName()}
+                    onInput={(event) => setDraftDisplayName(event.currentTarget.value)}
+                    autocomplete="off"
+                    disabled={props.profileSaving}
+                  />
+                </label>
+                <label>
+                  <span>About</span>
+                  <textarea
+                    rows={4}
+                    value={draftAbout()}
+                    onInput={(event) => setDraftAbout(event.currentTarget.value)}
+                    disabled={props.profileSaving}
+                  />
+                </label>
+                <Show when={draftError()}>
+                  <div role="alert" class="veil-identity-editor-error">{draftError()}</div>
+                </Show>
+                <div class="veil-identity-editor-actions">
+                  <button type="button" disabled={props.profileSaving} onClick={() => setEditingProfile(false)}>
+                    <X size={12} /> Cancel
+                  </button>
+                  <button type="submit" disabled={props.profileSaving}>
+                    <Save size={12} /> {props.profileSaving ? "Saving…" : "Save profile"}
+                  </button>
+                </div>
+              </form>
+            </Show>
           </Show>
         </div>
       </section>
@@ -435,8 +533,10 @@ export const IdentityIslandSheet: Component<IdentityIslandSheetProps> = (props) 
       canMessage={props.canMessage}
       messageBusy={props.messageBusy}
       profileLoading={props.profileLoading}
+      profileSaving={props.profileSaving}
       profileError={props.profileError}
       onMessage={props.onMessage}
+      onSaveProfile={props.onSaveProfile}
     />
   </IslandSheet>
 );

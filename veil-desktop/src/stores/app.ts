@@ -1871,6 +1871,40 @@ export const appStore = {
     );
   },
 
+  updateNetworkProfile: async (
+    expectedVersion: string,
+    displayName: string | null,
+    about: string,
+  ): Promise<NetworkProfileView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const currentUserId = userId();
+    const currentIdentityKey = identity()?.trim().toLowerCase();
+    if (
+      !currentUserId
+      || currentUserId !== mutationScope.userId
+      || !currentIdentityKey
+      || !/^[0-9a-f]{64}$/.test(currentIdentityKey)
+    ) {
+      throw new Error("profile update has no current authenticated identity");
+    }
+    const profile = await invoke<unknown>("update_network_profile", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: currentUserId,
+      expectedVersion,
+      displayName,
+      about,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedNetworkProfileView(
+      profile,
+      mutationScope,
+      currentUserId,
+      currentIdentityKey,
+    );
+  },
+
   /** Load server rows only from the currently authenticated REST namespace. */
   loadServers: async () => {
     const sessionEpoch = captureUiSessionEpoch();

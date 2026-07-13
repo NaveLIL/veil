@@ -720,7 +720,15 @@ exact profile route в той же опубликованной server binding. 
 проверяет origin/user/key/schema, хранит `profile_version` строкой без потери
 точности JavaScript и показывает `about`, revision, `Verified on this device` и
 blocking `Identity changed` без переименования TOFU в Verified. Editor, event и
-действие физического сравнения остаются следующими checkpoint'ами.
+действие физического сравнения на этом checkpoint ещё не подключены.
+
+**Self editor checkpoint 2026-07-13:** exact self profile редактируется прямо в
+Identity Island через native self-only PUT. Renderer проверяет bounded text до
+IPC, передаёт canonical string revision, не применяет optimistic presentation и
+публикует результат только для всё ещё открытого exact route. При CAS 409
+актуальная версия загружается заново, черновик не заменяет подтверждённый профиль
+молча, а пользователь получает явное предложение review/retry. Peer profile
+остаётся read-only; editor не меняет trust, ACL, Sender Keys или Phaseprint seed.
 
 - Native API возвращает стабильный fingerprint в hex + визуальном/emoji формате.
 - SQLCipher хранит verification по server origin, account и наблюдаемой identity,

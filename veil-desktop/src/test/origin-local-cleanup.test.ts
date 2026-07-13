@@ -142,6 +142,20 @@ describe("origin-local App cleanup", () => {
     expect(refreshFlow).toContain("Retained identity data is still shown");
   });
 
+  it("keeps profile writes self-only and refreshes an explicit CAS conflict", () => {
+    const saveFlow = section(
+      "const saveIdentityProfile = async",
+      "const cancelRightIslandAnimationFrame =",
+    );
+    expect(saveFlow).toContain("isSameCanonicalIdentity(route.profile, currentIdentityLocator())");
+    expect(saveFlow).toContain("const saveToken = ++identityProfileSaveToken");
+    expect(saveFlow).toContain("identityProfileKey(current.profile) === routeKey");
+    expect(saveFlow).toContain("appStore.updateNetworkProfile(expectedVersion, displayName, about)");
+    expect(saveFlow).toContain('includes("profile was updated elsewhere")');
+    expect(saveFlow).toContain("await refreshIdentityProfile(current.profile)");
+    expect(saveFlow).toContain("review before saving again");
+  });
+
   it("installs native event listeners before the first transport connect", () => {
     const boot = section("onMount(async () => {", "let stopWindowResizeListener");
     expect(boot.indexOf("await appStore.setupEventListeners()"))

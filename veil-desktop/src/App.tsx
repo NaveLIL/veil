@@ -199,6 +199,7 @@ const App: Component = () => {
   const [rightIslandRoute, setRightIslandRoute] = createSignal<RightIslandRoute>({ kind: "closed" });
   const [identityMessageBusy, setIdentityMessageBusy] = createSignal(false);
   const [identityProfileLoading, setIdentityProfileLoading] = createSignal(false);
+  const [identityProfileSaving, setIdentityProfileSaving] = createSignal(false);
   const [identityProfileError, setIdentityProfileError] = createSignal("");
   const [windowMaximized, setWindowMaximized] = createSignal(false);
   const [groupMembers, setGroupMembers] = createSignal<GroupMember[]>([]);
@@ -227,6 +228,7 @@ const App: Component = () => {
   let rightIslandAnimationFrame: number | undefined;
   let identityDmActionToken = 0;
   let identityProfileActionToken = 0;
+  let identityProfileSaveToken = 0;
 
   const memberPanelOpen = () => rightIslandRoute().kind === "members" && island4Vis();
   const rightIslandOpen = () => rightIslandRoute().kind !== "closed" && island4Vis();
@@ -275,6 +277,7 @@ const App: Component = () => {
           profile: {
             ...current.profile,
             technicalUsername: networkProfile.username,
+            networkDisplayName: networkProfile.displayName,
             displayName: networkProfile.displayName || networkProfile.username,
             about: networkProfile.about,
             profileVersion: networkProfile.profileVersion,
@@ -293,6 +296,65 @@ const App: Component = () => {
     }
   };
 
+  const saveIdentityProfile = async (
+    displayName: string | null,
+    about: string,
+    expectedVersion: string,
+  ): Promise<boolean> => {
+    const route = rightIslandRoute();
+    if (route.kind !== "identity" || !isSameCanonicalIdentity(route.profile, currentIdentityLocator())) {
+      setIdentityProfileError("Only the current authenticated account can edit this profile.");
+      return false;
+    }
+    const routeKey = identityProfileKey(route.profile);
+    const saveToken = ++identityProfileSaveToken;
+    setIdentityProfileSaving(true);
+    setIdentityProfileError("");
+    const saveStillCurrent = () => {
+      const current = rightIslandRoute();
+      return saveToken === identityProfileSaveToken
+        && current.kind === "identity"
+        && identityProfileKey(current.profile) === routeKey;
+    };
+    try {
+      const networkProfile = await appStore.updateNetworkProfile(expectedVersion, displayName, about);
+      if (!saveStillCurrent()) return false;
+      setRightIslandRoute((current) => current.kind === "identity"
+        && identityProfileKey(current.profile) === routeKey
+        ? {
+          ...current,
+          profile: {
+            ...current.profile,
+            technicalUsername: networkProfile.username,
+            networkDisplayName: networkProfile.displayName,
+            displayName: networkProfile.displayName || networkProfile.username,
+            about: networkProfile.about,
+            profileVersion: networkProfile.profileVersion,
+            profileUpdatedAt: networkProfile.profileUpdatedAt,
+            profileOrigin: networkProfile.canonicalServerOrigin,
+            localProofState: networkProfile.proofState,
+          },
+        }
+        : current);
+      return true;
+    } catch (error) {
+      if (!saveStillCurrent()) return false;
+      if (String(error).includes("profile was updated elsewhere")) {
+        const current = rightIslandRoute();
+        if (current.kind === "identity") await refreshIdentityProfile(current.profile);
+        const refreshed = rightIslandRoute();
+        if (refreshed.kind === "identity" && identityProfileKey(refreshed.profile) === routeKey) {
+          setIdentityProfileError("Profile changed elsewhere. Latest version loaded; review before saving again.");
+        }
+      } else {
+        setIdentityProfileError("Profile was not saved. Your draft remains available.");
+      }
+      return false;
+    } finally {
+      if (saveToken === identityProfileSaveToken) setIdentityProfileSaving(false);
+    }
+  };
+
   const cancelRightIslandAnimationFrame = () => {
     if (rightIslandAnimationFrame === undefined) return;
     cancelAnimationFrame(rightIslandAnimationFrame);
@@ -304,10 +366,12 @@ const App: Component = () => {
     rightIslandTransitionEpoch += 1;
     identityDmActionToken += 1;
     identityProfileActionToken += 1;
+    identityProfileSaveToken += 1;
     cancelRightIslandAnimationFrame();
     setRightIslandRoute(route);
     setIdentityMessageBusy(false);
     setIdentityProfileLoading(false);
+    setIdentityProfileSaving(false);
     setIdentityProfileError("");
     if (!wasClosed) {
       setIsland4Vis(true);
@@ -364,9 +428,11 @@ const App: Component = () => {
     const epoch = ++rightIslandTransitionEpoch;
     identityDmActionToken += 1;
     identityProfileActionToken += 1;
+    identityProfileSaveToken += 1;
     cancelRightIslandAnimationFrame();
     setIdentityMessageBusy(false);
     setIdentityProfileLoading(false);
+    setIdentityProfileSaving(false);
     setIdentityProfileError("");
     setIsland4Vis(false);
     const finish = () => {
@@ -2831,6 +2897,7 @@ const App: Component = () => {
               identityCanMessage={selectedIdentityCanMessage()}
               identityMessageBusy={identityMessageBusy()}
               identityProfileLoading={identityProfileLoading()}
+              identityProfileSaving={identityProfileSaving()}
               identityProfileError={identityProfileError()}
               serverId={appStore.activeServerId()}
               contextName={appStore.activeServerId()
@@ -2851,6 +2918,7 @@ const App: Component = () => {
               onBackToMembers={backToMembersIsland}
               onClose={() => closeRightIsland()}
               onMessageIdentity={() => void handleIdentityMessage()}
+              onSaveIdentityProfile={saveIdentityProfile}
               onCreateDm={(userId, username, expectedIdentityKey) => {
                 void handleRightIslandCreateDm(userId, username, expectedIdentityKey);
               }}

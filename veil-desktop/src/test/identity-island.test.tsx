@@ -147,6 +147,42 @@ describe("Identity Island", () => {
     expect(screen.getByText(/Live profile unavailable/).closest('[role="status"]')).toBeInTheDocument();
   });
 
+  it("edits only the current account and keeps unsafe drafts local", async () => {
+    const saveProfile = vi.fn().mockResolvedValue(true);
+    const user = userEvent.setup();
+    render(() => (
+      <IdentityIslandContent
+        profile={{
+          ...completeProfile,
+          selfIdentity: completeProfile,
+          networkDisplayName: "Quiet Orbit",
+          about: "Original",
+          profileVersion: "7",
+        }}
+        canMessage={false}
+        onMessage={vi.fn()}
+        onSaveProfile={saveProfile}
+      />
+    ));
+
+    await user.click(screen.getByRole("button", { name: "Edit profile" }));
+    const displayName = screen.getByLabelText("Display name");
+    const about = screen.getByLabelText("About");
+    await user.clear(displayName);
+    await user.type(displayName, "New Orbit");
+    await user.clear(about);
+    fireEvent.input(about, { target: { value: "safe\u202eevil" } });
+    await user.click(screen.getByRole("button", { name: "Save profile" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent("unsafe controls");
+    expect(saveProfile).not.toHaveBeenCalled();
+
+    await user.clear(about);
+    await user.type(about, "Updated profile");
+    await user.click(screen.getByRole("button", { name: "Save profile" }));
+    expect(saveProfile).toHaveBeenCalledWith("New Orbit", "Updated profile", "7");
+  });
+
   it("keeps incomplete account coordinates read-only and rejects insecure origins", () => {
     const incomplete: IdentityIslandProfile = {
       canonicalServerOrigin: ORIGIN,

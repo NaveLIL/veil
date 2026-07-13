@@ -720,6 +720,99 @@ select:focus-visible,
   color: var(--veil-warning);
 }
 
+.veil-identity-edit-button {
+  margin-top: 12px;
+  min-height: 30px;
+  padding: 6px 10px;
+  border: 1px solid var(--veil-border-soft);
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--veil-text-muted);
+  background: var(--veil-contrast-03);
+  font-size: 10px;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.veil-identity-profile-editor {
+  width: 100%;
+  display: grid;
+  gap: 10px;
+  margin-top: 13px;
+  text-align: left;
+}
+
+.veil-identity-profile-editor label {
+  display: grid;
+  gap: 5px;
+  color: var(--veil-text-faint);
+  font-size: 9px;
+  font-weight: 650;
+}
+
+.veil-identity-profile-editor input,
+.veil-identity-profile-editor textarea {
+  width: 100%;
+  border: 1px solid var(--veil-border-soft);
+  border-radius: 8px;
+  padding: 8px 9px;
+  color: var(--veil-text-strong);
+  background: var(--veil-contrast-02);
+  font: inherit;
+  font-size: 11px;
+  line-height: 1.45;
+  outline: none;
+  resize: vertical;
+  transition: border-color 140ms ease, box-shadow 140ms ease;
+}
+
+.veil-identity-profile-editor input:focus-visible,
+.veil-identity-profile-editor textarea:focus-visible {
+  border-color: var(--veil-accent);
+  box-shadow: 0 0 0 3px rgba(var(--veil-accent-rgb),0.12);
+}
+
+.veil-identity-editor-error {
+  color: var(--veil-danger);
+  font-size: 9px;
+  line-height: 1.4;
+}
+
+.veil-identity-editor-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 7px;
+}
+
+.veil-identity-editor-actions button {
+  min-height: 31px;
+  border: 1px solid var(--veil-border-soft);
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  color: var(--veil-text-muted);
+  background: var(--veil-contrast-03);
+  font-size: 9px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.veil-identity-editor-actions button[type="submit"] {
+  border-color: transparent;
+  color: var(--veil-on-accent);
+  background: var(--veil-accent);
+}
+
+.veil-identity-profile-editor :disabled,
+.veil-identity-edit-button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .veil-identity-copy-button {
   min-height: 27px;
   padding: 5px 8px;
