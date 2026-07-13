@@ -14,7 +14,7 @@ import {
   ContextMenuSubTrigger,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
-import type { GroupMember, Role, ServerMember } from "@/stores/app";
+import type { GroupMember, IdentityVerificationView, Role, ServerMember } from "@/stores/app";
 import { UserAvatar } from "@/components/identity/UserAvatar";
 import { IdentityTrigger } from "@/components/identity/IdentityTrigger";
 import {
@@ -52,6 +52,9 @@ export interface RightIslandProps {
   identityProfileLoading?: boolean;
   identityProfileSaving?: boolean;
   identityProfileError?: string;
+  identityVerification?: IdentityVerificationView | null;
+  identityVerificationBusy?: boolean;
+  identityVerificationError?: string;
   serverId: string | null;
   contextName?: string;
   canonicalServerOrigin?: string;
@@ -66,6 +69,8 @@ export interface RightIslandProps {
   onClose: () => void;
   onMessageIdentity: () => void;
   onSaveIdentityProfile?: (displayName: string | null, about: string, expectedVersion: string) => Promise<boolean>;
+  onLoadIdentityVerification?: () => Promise<IdentityVerificationView | null>;
+  onConfirmIdentityVerification?: (expectedFingerprintHex: string) => Promise<boolean>;
   onCreateDm: (userId: string, technicalUsername: string, expectedIdentityKey?: string) => void;
   onAssignRole: (serverId: string, userId: string, roleId: string) => void;
   onUnassignRole: (serverId: string, userId: string, roleId: string) => void;
@@ -457,7 +462,17 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
 
   const scheduleFocus = (callback: () => void) => {
     queueMicrotask(() => {
-      window.requestAnimationFrame(() => callback());
+      window.requestAnimationFrame(() => {
+        callback();
+        window.requestAnimationFrame(() => {
+          const active = document.activeElement;
+          if (
+            active === document.body
+            || !(active instanceof HTMLElement)
+            || !active.isConnected
+          ) callback();
+        });
+      });
     });
   };
 
@@ -561,8 +576,13 @@ export const RightIsland: Component<RightIslandProps> = (props) => {
           profileLoading={props.identityProfileLoading}
           profileSaving={props.identityProfileSaving}
           profileError={props.identityProfileError}
+          verification={props.identityVerification}
+          verificationBusy={props.identityVerificationBusy}
+          verificationError={props.identityVerificationError}
           onMessage={props.onMessageIdentity}
           onSaveProfile={props.onSaveIdentityProfile}
+          onLoadVerification={props.onLoadIdentityVerification}
+          onConfirmVerification={props.onConfirmIdentityVerification}
         />
       )}
     </Show>

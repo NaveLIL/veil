@@ -14,7 +14,7 @@ import {
   type IdentityIslandProfile,
 } from "@/components/identity/identityProfile";
 import { RightIsland, type RightIslandView } from "@/components/layout/RightIsland";
-import type { GroupMember } from "@/stores/app";
+import type { GroupMember, IdentityVerificationView } from "@/stores/app";
 
 const ORIGIN = "https://identity.example.test:443";
 const USER_ID = "550e8400-e29b-41d4-a716-446655440010";
@@ -181,6 +181,44 @@ describe("Identity Island", () => {
     await user.type(about, "Updated profile");
     await user.click(screen.getByRole("button", { name: "Save profile" }));
     expect(saveProfile).toHaveBeenCalledWith("New Orbit", "Updated profile", "7");
+  });
+
+  it("requires a deliberate full-fingerprint comparison before local verification", async () => {
+    const fingerprintHex = "51".repeat(32);
+    const loaded: IdentityVerificationView = {
+      canonicalServerOrigin: ORIGIN,
+      userId: USER_ID,
+      identityKey: IDENTITY_KEY,
+      fingerprintHex,
+      fingerprintEmoji: "🔒".repeat(32),
+      proofState: "not_compared",
+    };
+    const [verification, setVerification] = createSignal<IdentityVerificationView | null>(null);
+    const load = vi.fn(async () => {
+      setVerification(loaded);
+      return loaded;
+    });
+    const confirm = vi.fn().mockResolvedValue(true);
+    const user = userEvent.setup();
+    render(() => (
+      <IdentityIslandContent
+        profile={completeProfile}
+        canMessage={false}
+        verification={verification()}
+        onMessage={vi.fn()}
+        onLoadVerification={load}
+        onConfirmVerification={confirm}
+      />
+    ));
+
+    expect(screen.queryByText(/Compare the entire fingerprint/)).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Compare identity" }));
+    expect(load).toHaveBeenCalledOnce();
+    expect(screen.getByText(/Compare the entire fingerprint/)).toBeInTheDocument();
+    expect(screen.getByText(/5151 5151 5151/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "I compared this exact fingerprint" }));
+    expect(confirm).toHaveBeenCalledWith(fingerprintHex);
   });
 
   it("keeps incomplete account coordinates read-only and rejects insecure origins", () => {

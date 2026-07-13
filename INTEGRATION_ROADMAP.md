@@ -730,6 +730,17 @@ IPC, передаёт canonical string revision, не применяет optimis
 молча, а пользователь получает явное предложение review/retry. Peer profile
 остаётся read-only; editor не меняет trust, ACL, Sender Keys или Phaseprint seed.
 
+**Local proof checkpoint 2026-07-13:** Identity Island показывает полный
+симметричный hex+emoji fingerprint только для уже закреплённого exact peer
+locator. Пользователь отдельно открывает сравнение и явно подтверждает, что
+сверил весь fingerprint по независимому доверенному каналу. Native повторно
+вычисляет fingerprint из текущей identity, constant-time сравнивает его с
+показанным значением и лишь затем записывает device-local verification в
+SQLCipher. Self и отсутствующий directory locator отклоняются; late route,
+origin, binding или session completion не публикуется. Phaseprint/profile text
+явно не называются proof, а identity change остаётся blocking состоянием до
+нового физического сравнения.
+
 - Native API возвращает стабильный fingerprint в hex + визуальном/emoji формате.
 - SQLCipher хранит verification по server origin, account и наблюдаемой identity,
   а не только по mutable имени.
@@ -750,9 +761,9 @@ IPC, передаёт canonical string revision, не применяет optimis
 3. **Закрыто:** единый right-island route,
    responsive Identity Island, server context и безопасные profile triggers на
    уже доступных locator-bearing данных.
-4. Добавить versioned signed text profile API/cache/event после отдельного
-   schema/privacy/security review и нормализовать identity-bearing search DTO.
-5. Реализовать local identity verification и identity-change flow.
+4. **В работе:** versioned signed text profile API/cache/editor закрыты; остаются
+   `ProfileUpdated` event и нормализация identity-bearing search DTO.
+5. **Закрыто:** local identity verification и blocking identity-change flow.
 6. Только затем добавить изолированный avatar pipeline и mobile adaptation.
 
 ### Критерии готовности 4D

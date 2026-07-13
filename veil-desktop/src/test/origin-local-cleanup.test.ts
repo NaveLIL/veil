@@ -156,6 +156,19 @@ describe("origin-local App cleanup", () => {
     expect(saveFlow).toContain("review before saving again");
   });
 
+  it("binds physical verification to the exact displayed fingerprint and route", () => {
+    const verificationFlow = section(
+      "const loadSelectedIdentityVerification = async",
+      "const cancelRightIslandAnimationFrame =",
+    );
+    expect(verificationFlow).toContain("isSameCanonicalIdentity(route.profile, currentIdentityLocator())");
+    expect(verificationFlow).toContain("const actionToken = ++identityVerificationActionToken");
+    expect(verificationFlow).toContain("identityProfileKey(current.profile) !== routeKey");
+    expect(verificationFlow).toContain("displayed.fingerprintHex !== expectedFingerprintHex");
+    expect(verificationFlow).toContain("appStore.confirmIdentityVerification(");
+    expect(verificationFlow).toContain('verified.proofState === "verified_on_this_device"');
+  });
+
   it("installs native event listeners before the first transport connect", () => {
     const boot = section("onMount(async () => {", "let stopWindowResizeListener");
     expect(boot.indexOf("await appStore.setupEventListeners()"))

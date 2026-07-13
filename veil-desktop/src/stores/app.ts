@@ -138,6 +138,15 @@ export interface NetworkProfileView {
   proofState: "not_compared" | "verified_on_this_device" | "identity_changed" | "current_account";
 }
 
+export interface IdentityVerificationView {
+  canonicalServerOrigin: string;
+  userId: string;
+  identityKey: string;
+  fingerprintHex: string;
+  fingerprintEmoji: string;
+  proofState: "not_compared" | "verified_on_this_device" | "identity_changed";
+}
+
 export interface ServerEndpointChange {
   originChanged: boolean;
   transportChanged: boolean;
@@ -549,6 +558,36 @@ export function validatedNetworkProfileView(
     throw new Error("native profile response changed its authenticated locator or schema");
   }
   return profile as unknown as NetworkProfileView;
+}
+
+export function validatedIdentityVerificationView(
+  value: unknown,
+  scope: AuthenticatedServerScope,
+  expectedUserId: string,
+  expectedIdentityKey: string,
+): IdentityVerificationView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("native identity verification response is invalid");
+  }
+  const verification = value as Record<string, unknown>;
+  if (
+    verification.canonicalServerOrigin !== scope.canonicalServerOrigin
+    || verification.userId !== expectedUserId
+    || verification.identityKey !== expectedIdentityKey
+    || typeof verification.fingerprintHex !== "string"
+    || !/^[0-9a-f]{64}$/.test(verification.fingerprintHex)
+    || typeof verification.fingerprintEmoji !== "string"
+    || verification.fingerprintEmoji.length === 0
+    || verification.fingerprintEmoji.length > 256
+    || ![
+      "not_compared",
+      "verified_on_this_device",
+      "identity_changed",
+    ].includes(String(verification.proofState))
+  ) {
+    throw new Error("native identity verification response changed its locator or schema");
+  }
+  return verification as unknown as IdentityVerificationView;
 }
 
 function acceptsAuthenticatedEvent(payload: unknown): boolean {
@@ -1902,6 +1941,58 @@ export const appStore = {
       mutationScope,
       currentUserId,
       currentIdentityKey,
+    );
+  },
+
+  loadIdentityVerification: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+  ): Promise<IdentityVerificationView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const requesterUserId = userId();
+    if (!requesterUserId || requesterUserId !== mutationScope.userId) {
+      throw new Error("identity verification has no current authenticated account");
+    }
+    const verification = await invoke<unknown>("get_identity_verification", {
+      userId: requesterUserId,
+      targetUserId,
+      expectedIdentityKey,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedIdentityVerificationView(
+      verification,
+      mutationScope,
+      targetUserId,
+      expectedIdentityKey,
+    );
+  },
+
+  confirmIdentityVerification: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+    expectedFingerprintHex: string,
+  ): Promise<IdentityVerificationView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const requesterUserId = userId();
+    if (!requesterUserId || requesterUserId !== mutationScope.userId) {
+      throw new Error("identity verification has no current authenticated account");
+    }
+    const verification = await invoke<unknown>("confirm_identity_verification", {
+      userId: requesterUserId,
+      targetUserId,
+      expectedIdentityKey,
+      expectedFingerprintHex,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedIdentityVerificationView(
+      verification,
+      mutationScope,
+      targetUserId,
+      expectedIdentityKey,
     );
   },
 

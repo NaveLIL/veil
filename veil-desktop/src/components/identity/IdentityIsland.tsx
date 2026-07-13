@@ -10,6 +10,7 @@ import {
   type IdentityIslandProfile,
 } from "@/components/identity/identityProfile";
 import { IslandSheet } from "@/components/ui/IslandSheet";
+import type { IdentityVerificationView } from "@/stores/app";
 
 interface IdentityIslandContentProps {
   profile: IdentityIslandProfile;
@@ -18,8 +19,13 @@ interface IdentityIslandContentProps {
   profileLoading?: boolean;
   profileSaving?: boolean;
   profileError?: string;
+  verification?: IdentityVerificationView | null;
+  verificationBusy?: boolean;
+  verificationError?: string;
   onMessage: () => void;
   onSaveProfile?: (displayName: string | null, about: string, expectedVersion: string) => Promise<boolean>;
+  onLoadVerification?: () => Promise<IdentityVerificationView | null>;
+  onConfirmVerification?: (expectedFingerprintHex: string) => Promise<boolean>;
 }
 
 interface IdentityIslandSheetProps extends IdentityIslandContentProps {
@@ -70,6 +76,10 @@ function shortKey(value: string | null): string | null {
   return value ? `${value.slice(0, 8)}…${value.slice(-8)}` : null;
 }
 
+function formatFingerprint(value: string): string {
+  return value.match(/.{1,4}/g)?.join(" ") ?? value;
+}
+
 const DetailRow: Component<{ label: string; value: string; mono?: boolean }> = (props) => (
   <div style={{ display: "grid", gap: "3px" }}>
     <dt style={{ color: "var(--veil-text-faint)", "font-size": "9px", "font-weight": "600" }}>
@@ -92,7 +102,7 @@ const DetailRow: Component<{ label: string; value: string; mono?: boolean }> = (
 );
 
 export const IdentityIslandContent: Component<IdentityIslandContentProps> = (props) => {
-  const [copied, setCopied] = createSignal<"user" | "identity" | "signing" | null>(null);
+  const [copied, setCopied] = createSignal<"user" | "identity" | "signing" | "fingerprint" | null>(null);
   const [copyStatus, setCopyStatus] = createSignal("");
   const [editingProfile, setEditingProfile] = createSignal(false);
   const [draftDisplayName, setDraftDisplayName] = createSignal("");
@@ -117,6 +127,15 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
     const value = props.profile.profileVersion;
     if (typeof value === "number") return Number.isSafeInteger(value) && value >= 0 ? String(value) : null;
     return typeof value === "string" && /^(0|[1-9][0-9]{0,19})$/.test(value) ? value : null;
+  };
+  const verification = () => {
+    const value = props.verification;
+    return value
+      && value.canonicalServerOrigin === origin()
+      && value.userId === userId()
+      && value.identityKey === identityKey()
+      ? value
+      : null;
   };
   const joinedAt = () => formatJoinedAt(props.profile.joinedAt);
   const visibleRoles = createMemo(() => (props.profile.roles ?? []).slice(0, 3).map((role) => ({
@@ -182,7 +201,7 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
     clearCopyTimer();
   });
 
-  const copyValue = async (kind: "user" | "identity" | "signing", value: string) => {
+  const copyValue = async (kind: "user" | "identity" | "signing" | "fingerprint", value: string) => {
     const epoch = ++copyEpoch;
     clearCopyTimer();
     setCopied(null);
@@ -191,7 +210,11 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
       await navigator.clipboard.writeText(value);
       if (disposed || epoch !== copyEpoch) return;
       setCopied(kind);
-      const label = kind === "user" ? "Account ID" : kind === "identity" ? "Identity key" : "Signing key";
+      const label = kind === "user"
+        ? "Account ID"
+        : kind === "identity"
+          ? "Identity key"
+          : kind === "signing" ? "Signing key" : "Fingerprint";
       setCopyStatus(`${label} copied.`);
       copyTimer = window.setTimeout(() => {
         if (disposed || epoch !== copyEpoch) return;
@@ -474,6 +497,53 @@ export const IdentityIslandContent: Component<IdentityIslandContentProps> = (pro
             )}
           </Show>
         </div>
+        <Show when={proofState() !== "self" && proofState() !== "unavailable" && props.onLoadVerification}>
+          <div class="veil-identity-verification-panel">
+            <Show
+              when={verification()}
+              fallback={(
+                <button
+                  type="button"
+                  class="veil-identity-compare-button"
+                  disabled={props.verificationBusy}
+                  onClick={() => void props.onLoadVerification?.()}
+                >
+                  <ShieldQuestion size={13} /> {props.verificationBusy ? "Preparing…" : "Compare identity"}
+                </button>
+              )}
+            >
+              {(value) => (
+                <>
+                  <div class="veil-identity-fingerprint-emoji" aria-label="Visual identity fingerprint">
+                    {value().fingerprintEmoji}
+                  </div>
+                  <code class="veil-identity-fingerprint-hex">{formatFingerprint(value().fingerprintHex)}</code>
+                  <div class="veil-identity-verification-guidance">
+                    Compare the entire fingerprint in person or over a separate trusted channel.
+                    Phaseprint and profile text are not identity proof.
+                  </div>
+                  <div class="veil-identity-verification-actions">
+                    <button type="button" onClick={() => void copyValue("fingerprint", value().fingerprintHex)}>
+                      <Copy size={11} /> {copied() === "fingerprint" ? "Copied" : "Copy fingerprint"}
+                    </button>
+                    <Show when={proofState() !== "verified-on-device" && props.onConfirmVerification}>
+                      <button
+                        type="button"
+                        disabled={props.verificationBusy}
+                        onClick={() => void props.onConfirmVerification?.(value().fingerprintHex)}
+                      >
+                        <LockKeyhole size={11} /> {props.verificationBusy ? "Confirming…" : "I compared this exact fingerprint"}
+                      </button>
+                    </Show>
+                  </div>
+                </>
+              )}
+            </Show>
+            <Show when={props.verificationError}>
+              <div role="alert" class="veil-identity-editor-error">{props.verificationError}</div>
+            </Show>
+          </div>
+        </Show>
         <div
           role="status"
           aria-live="polite"
@@ -535,8 +605,13 @@ export const IdentityIslandSheet: Component<IdentityIslandSheetProps> = (props) 
       profileLoading={props.profileLoading}
       profileSaving={props.profileSaving}
       profileError={props.profileError}
+      verification={props.verification}
+      verificationBusy={props.verificationBusy}
+      verificationError={props.verificationError}
       onMessage={props.onMessage}
       onSaveProfile={props.onSaveProfile}
+      onLoadVerification={props.onLoadVerification}
+      onConfirmVerification={props.onConfirmVerification}
     />
   </IslandSheet>
 );

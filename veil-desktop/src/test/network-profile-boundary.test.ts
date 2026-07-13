@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  validatedIdentityVerificationView,
   validatedNetworkProfileView,
   type AuthenticatedServerScope,
 } from "@/stores/app";
@@ -44,6 +45,36 @@ describe("network profile renderer boundary", () => {
       { ...validProfile, proofState: "verified" },
     ]) {
       expect(() => validatedNetworkProfileView(
+        invalid,
+        scope,
+        targetUserId,
+        identityKey,
+      )).toThrow();
+    }
+  });
+
+  it("rejects fingerprint proof state or locator substitution at the renderer boundary", () => {
+    const validVerification = {
+      canonicalServerOrigin: scope.canonicalServerOrigin,
+      userId: targetUserId,
+      identityKey,
+      fingerprintHex: "51".repeat(32),
+      fingerprintEmoji: "🔒".repeat(32),
+      proofState: "not_compared",
+    };
+    expect(validatedIdentityVerificationView(
+      validVerification,
+      scope,
+      targetUserId,
+      identityKey,
+    ).fingerprintHex).toBe("51".repeat(32));
+    for (const invalid of [
+      { ...validVerification, userId: scope.userId },
+      { ...validVerification, identityKey: "42".repeat(32) },
+      { ...validVerification, fingerprintHex: "51".repeat(31) },
+      { ...validVerification, proofState: "verified" },
+    ]) {
+      expect(() => validatedIdentityVerificationView(
         invalid,
         scope,
         targetUserId,

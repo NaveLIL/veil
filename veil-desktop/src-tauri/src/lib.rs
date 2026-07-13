@@ -59,6 +59,17 @@ struct NetworkProfileView {
     proof_state: String,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct IdentityVerificationView {
+    canonical_server_origin: String,
+    user_id: String,
+    identity_key: String,
+    fingerprint_hex: String,
+    fingerprint_emoji: String,
+    proof_state: String,
+}
+
 #[derive(Default)]
 struct ConversationSyncIsolation {
     blocked: std::collections::BTreeMap<String, ConversationCryptoDiagnostic>,
@@ -2334,11 +2345,7 @@ fn network_profile_view(
     let proof_state = if is_self {
         "current_account"
     } else {
-        match proof {
-            LocalIdentityVerification::NotCompared => "not_compared",
-            LocalIdentityVerification::VerifiedOnThisDevice => "verified_on_this_device",
-            LocalIdentityVerification::IdentityChanged => "identity_changed",
-        }
+        local_identity_verification_token(proof)
     };
     NetworkProfileView {
         canonical_server_origin: profile.locator.canonical_server_origin.clone(),
@@ -2351,6 +2358,14 @@ fn network_profile_view(
         profile_updated_at: profile.profile_updated_at.clone(),
         observed_at: profile.observed_at.clone(),
         proof_state: proof_state.to_string(),
+    }
+}
+
+fn local_identity_verification_token(proof: LocalIdentityVerification) -> &'static str {
+    match proof {
+        LocalIdentityVerification::NotCompared => "not_compared",
+        LocalIdentityVerification::VerifiedOnThisDevice => "verified_on_this_device",
+        LocalIdentityVerification::IdentityChanged => "identity_changed",
     }
 }
 
@@ -6738,6 +6753,148 @@ fn update_network_profile(
     ))
 }
 
+fn exact_identity_verification_view(
+    client: &VeilClient,
+    canonical_server_origin: &str,
+    target_user_id: &str,
+    identity_key: [u8; 32],
+) -> Result<IdentityVerificationView, String> {
+    if client.authenticated_user_id()? == target_user_id {
+        return Err("the current account cannot verify itself".to_string());
+    }
+    let locator = ProfileLocator {
+        canonical_server_origin: canonical_server_origin.to_string(),
+        user_id: target_user_id.to_string(),
+        identity_key,
+    };
+    let db = client.db().ok_or("database not initialized")?;
+    if db.resolve_account_snapshot(&locator)?.is_none() {
+        return Err("identity verification target has no exact pinned account entry".to_string());
+    }
+    let (fingerprint_emoji, fingerprint_hex) = client.fingerprint(&identity_key)?;
+    let proof = db.local_identity_verification(&locator)?;
+    Ok(IdentityVerificationView {
+        canonical_server_origin: canonical_server_origin.to_string(),
+        user_id: target_user_id.to_string(),
+        identity_key: hex::encode(identity_key),
+        fingerprint_hex,
+        fingerprint_emoji,
+        proof_state: local_identity_verification_token(proof).to_string(),
+    })
+}
+
+fn require_matching_identity_fingerprint(
+    expected: &[u8; 32],
+    actual_hex: &str,
+) -> Result<(), String> {
+    let actual = decode_lower_hex_fixed::<32>("computed identity fingerprint", actual_hex)?;
+    if expected.ct_eq(&actual).unwrap_u8() != 1 {
+        return Err("displayed identity fingerprint is stale or mismatched".to_string());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_identity_verification(
+    state: State<'_, AppState>,
+    user_id: String,
+    target_user_id: String,
+    expected_identity_key: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<IdentityVerificationView, String> {
+    decode_canonical_uuid("verification requester user id", &user_id)?;
+    decode_canonical_uuid("verification target user id", &target_user_id)?;
+    let identity_key =
+        decode_lower_hex_fixed::<32>("verification expected identity key", &expected_identity_key)?;
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let canonical_server_origin = binding.origin.canonical_server_origin();
+    let _session_transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &binding)?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &binding)?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("verification requester differs from authenticated session".to_string());
+    }
+    let view = exact_identity_verification_view(
+        &client,
+        &canonical_server_origin,
+        &target_user_id,
+        identity_key,
+    )?;
+    require_confirmed_live_action_binding_current(&state, &binding)?;
+    Ok(view)
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Exact comparison inputs stay explicit at the IPC boundary.
+fn confirm_identity_verification(
+    state: State<'_, AppState>,
+    user_id: String,
+    target_user_id: String,
+    expected_identity_key: String,
+    expected_fingerprint_hex: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<IdentityVerificationView, String> {
+    decode_canonical_uuid("verification requester user id", &user_id)?;
+    decode_canonical_uuid("verification target user id", &target_user_id)?;
+    let identity_key =
+        decode_lower_hex_fixed::<32>("verification expected identity key", &expected_identity_key)?;
+    let expected_fingerprint = decode_lower_hex_fixed::<32>(
+        "verification expected fingerprint",
+        &expected_fingerprint_hex,
+    )?;
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let canonical_server_origin = binding.origin.canonical_server_origin();
+    let _session_transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &binding)?;
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &binding)?;
+    if client.authenticated_user_id()? != user_id {
+        return Err("verification requester differs from authenticated session".to_string());
+    }
+    let mut view = exact_identity_verification_view(
+        &client,
+        &canonical_server_origin,
+        &target_user_id,
+        identity_key,
+    )?;
+    require_matching_identity_fingerprint(&expected_fingerprint, &view.fingerprint_hex)?;
+    let locator = ProfileLocator {
+        canonical_server_origin,
+        user_id: target_user_id,
+        identity_key,
+    };
+    client
+        .db()
+        .ok_or("database not initialized")?
+        .mark_identity_verified(&locator, &identity_observed_at())?;
+    view.proof_state = local_identity_verification_token(
+        client
+            .db()
+            .ok_or("database not initialized")?
+            .local_identity_verification(&locator)?,
+    )
+    .to_string();
+    require_confirmed_live_action_binding_current(&state, &binding)?;
+    Ok(view)
+}
+
 #[tauri::command]
 fn update_server(
     state: State<'_, AppState>,
@@ -8299,6 +8456,8 @@ pub fn run() {
             get_server,
             get_network_profile,
             update_network_profile,
+            get_identity_verification,
+            confirm_identity_verification,
             update_server,
             delete_server,
             leave_server,
@@ -8336,9 +8495,9 @@ mod e2ee_rest_tests {
         exact_confirmed_live_action_binding, invalidate_disconnected_binding, offline_sync_url,
         parse_device_directory, parse_expected_dm_peer_identity_key, parse_message_crypto_context,
         parse_network_profile_response, parse_prekey_bundle, preserve_created_group_outcome,
-        publish_unlocked_session, resolve_auto_lock_seconds, rest_api_url, rest_authority,
-        rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
-        valid_unlock_pin, validate_authenticated_binding_commit,
+        publish_unlocked_session, require_matching_identity_fingerprint, resolve_auto_lock_seconds,
+        rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
+        valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
         validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
         validate_expected_live_action_binding, validate_expected_rest_binding,
         validate_live_action_rest_origin, validate_live_message_security_context,
@@ -9295,5 +9454,16 @@ mod e2ee_rest_tests {
         for invalid in ["", "00", "01", "+1", "-1", " 1"] {
             assert!(canonical_profile_version(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn identity_verification_confirms_the_exact_displayed_fingerprint() {
+        let expected = [0x41; 32];
+        require_matching_identity_fingerprint(&expected, &hex::encode(expected)).unwrap();
+        assert!(
+            require_matching_identity_fingerprint(&expected, &hex::encode([0x42; 32])).is_err()
+        );
+        assert!(require_matching_identity_fingerprint(&expected, &"41".repeat(31)).is_err());
+        assert!(require_matching_identity_fingerprint(&expected, &"AA".repeat(32)).is_err());
     }
 }

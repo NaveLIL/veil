@@ -7,6 +7,7 @@ import {
   isUiSessionEpochCurrent,
   type Conversation,
   type GroupMember,
+  type IdentityVerificationView,
   type Message,
 } from "@/stores/app";
 import { appearanceStore } from "@/stores/appearance";
@@ -201,6 +202,9 @@ const App: Component = () => {
   const [identityProfileLoading, setIdentityProfileLoading] = createSignal(false);
   const [identityProfileSaving, setIdentityProfileSaving] = createSignal(false);
   const [identityProfileError, setIdentityProfileError] = createSignal("");
+  const [identityVerification, setIdentityVerification] = createSignal<IdentityVerificationView | null>(null);
+  const [identityVerificationBusy, setIdentityVerificationBusy] = createSignal(false);
+  const [identityVerificationError, setIdentityVerificationError] = createSignal("");
   const [windowMaximized, setWindowMaximized] = createSignal(false);
   const [groupMembers, setGroupMembers] = createSignal<GroupMember[]>([]);
   const [replyingTo, setReplyingTo] = createSignal<Message | null>(null);
@@ -229,6 +233,7 @@ const App: Component = () => {
   let identityDmActionToken = 0;
   let identityProfileActionToken = 0;
   let identityProfileSaveToken = 0;
+  let identityVerificationActionToken = 0;
 
   const memberPanelOpen = () => rightIslandRoute().kind === "members" && island4Vis();
   const rightIslandOpen = () => rightIslandRoute().kind !== "closed" && island4Vis();
@@ -355,6 +360,87 @@ const App: Component = () => {
     }
   };
 
+  const loadSelectedIdentityVerification = async (): Promise<IdentityVerificationView | null> => {
+    const route = rightIslandRoute();
+    if (route.kind !== "identity" || isSameCanonicalIdentity(route.profile, currentIdentityLocator())) {
+      return null;
+    }
+    const targetUserId = canonicalIdentityUserId(route.profile.userId);
+    const targetIdentityKey = canonicalIdentityKey(route.profile.identityKey);
+    if (!targetUserId || !targetIdentityKey) return null;
+    const routeKey = identityProfileKey(route.profile);
+    const actionToken = ++identityVerificationActionToken;
+    setIdentityVerificationBusy(true);
+    setIdentityVerificationError("");
+    try {
+      const verification = await appStore.loadIdentityVerification(targetUserId, targetIdentityKey);
+      const current = rightIslandRoute();
+      if (
+        actionToken !== identityVerificationActionToken
+        || current.kind !== "identity"
+        || identityProfileKey(current.profile) !== routeKey
+      ) return null;
+      setIdentityVerification(verification);
+      setRightIslandRoute({
+        ...current,
+        profile: { ...current.profile, localProofState: verification.proofState },
+      });
+      return verification;
+    } catch {
+      if (actionToken === identityVerificationActionToken) {
+        setIdentityVerificationError("Fingerprint unavailable for this exact identity.");
+      }
+      return null;
+    } finally {
+      if (actionToken === identityVerificationActionToken) setIdentityVerificationBusy(false);
+    }
+  };
+
+  const confirmSelectedIdentityVerification = async (expectedFingerprintHex: string): Promise<boolean> => {
+    const route = rightIslandRoute();
+    const displayed = identityVerification();
+    if (route.kind !== "identity" || !displayed) return false;
+    const targetUserId = canonicalIdentityUserId(route.profile.userId);
+    const targetIdentityKey = canonicalIdentityKey(route.profile.identityKey);
+    if (
+      !targetUserId
+      || !targetIdentityKey
+      || displayed.userId !== targetUserId
+      || displayed.identityKey !== targetIdentityKey
+      || displayed.fingerprintHex !== expectedFingerprintHex
+    ) return false;
+    const routeKey = identityProfileKey(route.profile);
+    const actionToken = ++identityVerificationActionToken;
+    setIdentityVerificationBusy(true);
+    setIdentityVerificationError("");
+    try {
+      const verified = await appStore.confirmIdentityVerification(
+        targetUserId,
+        targetIdentityKey,
+        expectedFingerprintHex,
+      );
+      const current = rightIslandRoute();
+      if (
+        actionToken !== identityVerificationActionToken
+        || current.kind !== "identity"
+        || identityProfileKey(current.profile) !== routeKey
+      ) return false;
+      setIdentityVerification(verified);
+      setRightIslandRoute({
+        ...current,
+        profile: { ...current.profile, localProofState: verified.proofState },
+      });
+      return verified.proofState === "verified_on_this_device";
+    } catch {
+      if (actionToken === identityVerificationActionToken) {
+        setIdentityVerificationError("Identity was not marked as verified. Compare again before retrying.");
+      }
+      return false;
+    } finally {
+      if (actionToken === identityVerificationActionToken) setIdentityVerificationBusy(false);
+    }
+  };
+
   const cancelRightIslandAnimationFrame = () => {
     if (rightIslandAnimationFrame === undefined) return;
     cancelAnimationFrame(rightIslandAnimationFrame);
@@ -367,12 +453,16 @@ const App: Component = () => {
     identityDmActionToken += 1;
     identityProfileActionToken += 1;
     identityProfileSaveToken += 1;
+    identityVerificationActionToken += 1;
     cancelRightIslandAnimationFrame();
     setRightIslandRoute(route);
     setIdentityMessageBusy(false);
     setIdentityProfileLoading(false);
     setIdentityProfileSaving(false);
     setIdentityProfileError("");
+    setIdentityVerification(null);
+    setIdentityVerificationBusy(false);
+    setIdentityVerificationError("");
     if (!wasClosed) {
       setIsland4Vis(true);
       return;
@@ -429,11 +519,15 @@ const App: Component = () => {
     identityDmActionToken += 1;
     identityProfileActionToken += 1;
     identityProfileSaveToken += 1;
+    identityVerificationActionToken += 1;
     cancelRightIslandAnimationFrame();
     setIdentityMessageBusy(false);
     setIdentityProfileLoading(false);
     setIdentityProfileSaving(false);
     setIdentityProfileError("");
+    setIdentityVerification(null);
+    setIdentityVerificationBusy(false);
+    setIdentityVerificationError("");
     setIsland4Vis(false);
     const finish = () => {
       if (epoch !== rightIslandTransitionEpoch) return;
@@ -2899,6 +2993,9 @@ const App: Component = () => {
               identityProfileLoading={identityProfileLoading()}
               identityProfileSaving={identityProfileSaving()}
               identityProfileError={identityProfileError()}
+              identityVerification={identityVerification()}
+              identityVerificationBusy={identityVerificationBusy()}
+              identityVerificationError={identityVerificationError()}
               serverId={appStore.activeServerId()}
               contextName={appStore.activeServerId()
                 ? appStore.servers().find((server) => server.id === appStore.activeServerId())?.name
@@ -2919,6 +3016,8 @@ const App: Component = () => {
               onClose={() => closeRightIsland()}
               onMessageIdentity={() => void handleIdentityMessage()}
               onSaveIdentityProfile={saveIdentityProfile}
+              onLoadIdentityVerification={loadSelectedIdentityVerification}
+              onConfirmIdentityVerification={confirmSelectedIdentityVerification}
               onCreateDm={(userId, username, expectedIdentityKey) => {
                 void handleRightIslandCreateDm(userId, username, expectedIdentityKey);
               }}
