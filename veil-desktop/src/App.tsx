@@ -735,6 +735,29 @@ const App: Component = () => {
   };
 
   createEffect(() => {
+    const notice = appStore.profileUpdateNotice();
+    if (!notice || appStore.screen() !== "chat") return;
+    const route = untrack(rightIslandRoute);
+    if (
+      route.kind !== "identity"
+      || canonicalIdentityOrigin(route.profile.canonicalServerOrigin) !== notice.canonicalServerOrigin
+      || canonicalIdentityUserId(route.profile.userId) !== notice.userId
+    ) return;
+    const currentVersion = route.profile.profileVersion;
+    const currentVersionText = typeof currentVersion === "string"
+      ? currentVersion
+      : typeof currentVersion === "number" && Number.isSafeInteger(currentVersion) && currentVersion >= 0
+        ? currentVersion.toString()
+        : null;
+    if (
+      currentVersionText
+      && /^(0|[1-9][0-9]*)$/.test(currentVersionText)
+      && BigInt(currentVersionText) >= BigInt(notice.profileVersion)
+    ) return;
+    untrack(() => void refreshIdentityProfile(route.profile));
+  });
+
+  createEffect(() => {
     const conversationId = conv()?.id;
     msgs();
 

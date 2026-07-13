@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/AegisSec/veil-server/internal/authmw"
+	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -31,6 +32,25 @@ type fakeStore struct {
 	updatedVersion int64
 	updatedName    *string
 	updatedAbout   string
+	recipients     []string
+	recipientsErr  error
+}
+
+func (s *fakeStore) ProfileUpdateRecipients(context.Context, string) ([]string, error) {
+	return s.recipients, s.recipientsErr
+}
+
+type broadcastCall struct {
+	recipients []string
+	envelope   *pb.Envelope
+}
+
+type fakeBroadcaster struct {
+	calls []broadcastCall
+}
+
+func (b *fakeBroadcaster) BroadcastToUsers(recipients []string, envelope *pb.Envelope) {
+	b.calls = append(b.calls, broadcastCall{recipients: append([]string(nil), recipients...), envelope: envelope})
 }
 
 func (s *fakeStore) GetProfile(context.Context, string) (*Profile, error) {
@@ -59,7 +79,7 @@ func requestWithPrincipal(t *testing.T, privateKey ed25519.PrivateKey, method, t
 	return request
 }
 
-func newSignedMux(t *testing.T, store Store) (*http.ServeMux, ed25519.PrivateKey) {
+func newSignedMux(t *testing.T, store Store, broadcasters ...Broadcaster) (*http.ServeMux, ed25519.PrivateKey) {
 	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -69,14 +89,18 @@ func newSignedMux(t *testing.T, store Store) (*http.ServeMux, ed25519.PrivateKey
 		return publicKey, nil
 	}))
 	t.Cleanup(middleware.Close)
-	handler := NewHandler(store, middleware, nil)
+	var broadcaster Broadcaster
+	if len(broadcasters) > 0 {
+		broadcaster = broadcasters[0]
+	}
+	handler := NewHandler(store, middleware, nil, broadcaster)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 	return mux, privateKey
 }
 
 func TestRoutesRequireVerifiedPrincipalEvenWithoutMiddleware(t *testing.T) {
-	handler := NewHandler(&fakeStore{}, nil, nil)
+	handler := NewHandler(&fakeStore{}, nil, nil, nil)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 
@@ -96,8 +120,9 @@ func TestUpdateUsesVerifiedPrincipalAndNormalizesText(t *testing.T) {
 	store := &fakeStore{profile: &Profile{
 		UserID: testUserID, Username: "alice", About: "Café", ProfileVersion: 8,
 		ProfileUpdatedAt: time.Unix(1, 0).UTC(),
-	}}
-	mux, privateKey := newSignedMux(t, store)
+	}, recipients: []string{testUserID, "550e8400-e29b-41d4-a716-446655440000"}}
+	broadcaster := &fakeBroadcaster{}
+	mux, privateKey := newSignedMux(t, store, broadcaster)
 
 	response := httptest.NewRecorder()
 	mux.ServeHTTP(response, requestWithPrincipal(t, privateKey, http.MethodPut, "/v1/users/me/profile",
@@ -107,6 +132,31 @@ func TestUpdateUsesVerifiedPrincipalAndNormalizesText(t *testing.T) {
 	}
 	if store.updatedUserID != testUserID || store.updatedVersion != 7 || store.updatedName == nil || *store.updatedName != "Alice" || store.updatedAbout != "Café" {
 		t.Fatalf("unexpected update: %#v", store)
+	}
+	if len(broadcaster.calls) != 1 {
+		t.Fatalf("broadcast calls=%d, want 1", len(broadcaster.calls))
+	}
+	call := broadcaster.calls[0]
+	if len(call.recipients) != 2 || call.envelope.GetProfileUpdated().GetUserId() != testUserID || call.envelope.GetProfileUpdated().GetProfileVersion() != 8 {
+		t.Fatalf("unexpected profile event: recipients=%v envelope=%v", call.recipients, call.envelope)
+	}
+}
+
+func TestUpdateAudienceFailureDoesNotRewriteCommittedSuccess(t *testing.T) {
+	store := &fakeStore{
+		profile: &Profile{
+			UserID: testUserID, Username: "alice", ProfileVersion: 2,
+			ProfileUpdatedAt: time.Unix(1, 0).UTC(),
+		},
+		recipientsErr: errors.New("private relationship query detail"),
+	}
+	broadcaster := &fakeBroadcaster{}
+	mux, privateKey := newSignedMux(t, store, broadcaster)
+	response := httptest.NewRecorder()
+	mux.ServeHTTP(response, requestWithPrincipal(t, privateKey, http.MethodPut, "/v1/users/me/profile",
+		`{"expected_version":1,"about":"safe"}`))
+	if response.Code != http.StatusOK || len(broadcaster.calls) != 0 {
+		t.Fatalf("status=%d broadcasts=%d body=%s", response.Code, len(broadcaster.calls), response.Body.String())
 	}
 }
 

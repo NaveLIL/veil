@@ -4881,6 +4881,23 @@ fn connect_to_server(
                             }),
                         );
                         }
+                        ConnectionEvent::ProfileUpdated {
+                            user_id,
+                            profile_version,
+                        } => {
+                            // Presentation metadata must stay completely
+                            // separate from roster invalidation and Sender-Key
+                            // rotation. The renderer refetches the signed REST
+                            // profile for this exact authenticated origin.
+                            drop(client);
+                            let _ = app_handle.emit(
+                                "veil://profile-updated",
+                                serde_json::json!({
+                                    "userId": user_id,
+                                    "profileVersion": profile_version.to_string(),
+                                }),
+                            );
+                        }
                         ConnectionEvent::ServerEvent {
                             event_type,
                             server_id,

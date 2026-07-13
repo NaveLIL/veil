@@ -11,6 +11,7 @@ import "veil/v1/server.proto";
 import "veil/v1/media.proto";
 import "veil/v1/voice.proto";
 import "veil/v1/friends.proto";
+import "veil/v1/profile.proto";
 
 // Envelope — корневое сообщение для всех WebSocket фреймов.
 // Клиент и сервер обмениваются исключительно Envelope.
@@ -62,6 +63,9 @@ message Envelope {
     // Servers & Channels
     ServerEvent server_event = 50;
     ChannelEvent channel_event = 51;
+
+    // Presentation-only profile invalidation; never a roster/crypto event.
+    ProfileUpdated profile_updated = 52;
 
     // Shares
     ShareCreate share_create = 60;

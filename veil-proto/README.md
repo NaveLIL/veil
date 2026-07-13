@@ -17,6 +17,7 @@ veil/v1/
 ├── presence.proto   # Online status, typing indicators
 ├── share.proto      # Secure share links
 ├── server.proto     # Servers, channels, roles, multi-device sync
+├── profile.proto    # Presentation-only profile invalidation
 ├── media.proto      # File upload/download
 └── voice.proto      # Voice/video (LiveKit tokens)
 ```

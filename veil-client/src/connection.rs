@@ -12,6 +12,7 @@ use tokio_tungstenite::{
     tungstenite::{protocol::WebSocketConfig, Message as WsMessage},
 };
 use tracing::{info, warn};
+use uuid::Uuid;
 use zeroize::Zeroize;
 
 use veil_crypto::signature;
@@ -237,6 +238,12 @@ pub enum ConnectionEvent {
     FriendListReceived {
         friends: Vec<FriendInfo>,
         pending_requests: Vec<FriendRequestInfo>,
+    },
+    /// Presentation-only hint that an origin-scoped profile should be
+    /// refetched through the signed REST surface.
+    ProfileUpdated {
+        user_id: String,
+        profile_version: u64,
     },
     /// A server-level event (created/updated/deleted, member join/leave/kick/ban, role CRUD).
     ServerEvent {
@@ -1121,6 +1128,19 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
                     .collect(),
             }
         }
+        Some(proto::envelope::Payload::ProfileUpdated(update)) => {
+            let parsed_user_id = Uuid::parse_str(&update.user_id).ok()?;
+            if parsed_user_id.to_string() != update.user_id
+                || update.profile_version == 0
+                || update.profile_version > i64::MAX as u64
+            {
+                return None;
+            }
+            ConnectionEvent::ProfileUpdated {
+                user_id: update.user_id,
+                profile_version: update.profile_version,
+            }
+        }
         Some(proto::envelope::Payload::ServerEvent(se)) => ConnectionEvent::ServerEvent {
             event_type: se.event_type,
             server_id: se.server_id,
@@ -1232,6 +1252,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn profile_update_requires_a_canonical_user_and_bounded_positive_version() {
+        let user_id = "5a636f65-3ab4-48b9-84b8-f4996ab73c88";
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::ProfileUpdated(
+                    proto::ProfileUpdated {
+                        user_id: user_id.to_string(),
+                        profile_version: i64::MAX as u64,
+                    },
+                )),
+                ..Default::default()
+            }),
+            Some(ConnectionEvent::ProfileUpdated {
+                user_id: accepted_user_id,
+                profile_version,
+            }) if accepted_user_id == user_id && profile_version == i64::MAX as u64
+        ));
+
+        for update in [
+            proto::ProfileUpdated {
+                user_id: user_id.to_uppercase(),
+                profile_version: 1,
+            },
+            proto::ProfileUpdated {
+                user_id: user_id.to_string(),
+                profile_version: 0,
+            },
+            proto::ProfileUpdated {
+                user_id: user_id.to_string(),
+                profile_version: i64::MAX as u64 + 1,
+            },
+        ] {
+            assert!(connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::ProfileUpdated(update)),
+                ..Default::default()
+            })
+            .is_none());
+        }
     }
 
     #[test]

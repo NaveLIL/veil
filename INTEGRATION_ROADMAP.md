@@ -42,7 +42,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
-| 4D | Identity Island & Profiles | foundation, Phaseprint/UserAvatar и local-data Identity Island реализованы; дальше text profile/proof/avatar boundary |
+| 4D | Identity Island & Profiles | identity/profile/proof foundation и live invalidation реализованы; остаются search DTO, isolated avatar и mobile/final gate |
 | 4E | Server Experience | запланировано: group/server IA, settings и manual device matrix |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
@@ -357,14 +357,15 @@ storage budget/compaction — к Phase 8, а ручная физическая m
 
 ## Phase 4D — Identity Island & Profiles
 
-**Статус 2026-07-12:** Phase 4D в активной реализации. Entry gate и формальное решение
+**Статус 2026-07-13:** Phase 4D в активной реализации. Entry gate и формальное решение
 опубликованы в
 [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
-Реализованы и проверены три прямых deliverable: canonical local identity
-foundation с authenticated origin/binding fence, детерминированный Phaseprint с
-единым `UserAvatar`, а также Identity Island на уже доступных локальных данных.
-Network text profile, локально сохраняемая verification/identity-change flow и
-изолированный avatar ingest ещё не реализованы, поэтому Phase 4D не завершена.
+Реализованы canonical local identity foundation с authenticated origin/binding
+fence, детерминированный Phaseprint и единый `UserAvatar`, Identity Island,
+versioned text profile/cache/editor, локальная verification/identity-change flow
+и relationship-scoped `ProfileUpdated`. Остаются identity-bearing search DTO,
+изолированный avatar ingest и mobile adaptation/completion evidence, поэтому
+Phase 4D ещё не завершена.
 
 Цель — дать одному человеку единое и узнаваемое представление во всех местах
 Veil: собственный footer, друзья, DM, группы, сообщения, server members и
@@ -650,8 +651,10 @@ checkpoint не добавлены.
 Миграция 020 и gateway реализуют signed origin-local GET/self PUT, bounded NFC
 plain text и атомарный `expected_version` conflict. Неизвестные поля, включая
 `avatar_url`, отклоняются; reserved `avatar_asset_id` не доступен через API.
-Этот checkpoint ещё не добавляет `ProfileUpdated`, native client/SQLCipher
-refresh, UI-редактор или avatar pipeline и поэтому не закрывает deliverable 4.
+Этот server-only checkpoint ещё не добавлял `ProfileUpdated`, native
+client/SQLCipher refresh, UI-редактор или avatar pipeline. Последующие
+checkpoint'ы ниже закрывают text profile/event/proof части; avatar pipeline
+остаётся отдельным незавершённым deliverable.
 
 - PostgreSQL: `display_name`, короткий `about`, nullable `avatar_asset_id`,
   `profile_version`, `profile_updated_at`; технический username остаётся
@@ -741,6 +744,18 @@ origin, binding или session completion не публикуется. Phaseprin
 явно не называются proof, а identity change остаётся blocking состоянием до
 нового физического сравнения.
 
+**Profile event checkpoint 2026-07-13:** успешный CAS update публикует отдельный
+presentation-only `ProfileUpdated { user_id, profile_version }` только самому
+аккаунту и уже связанным пользователям на том же origin (friend/shared
+conversation/shared server). Event не содержит profile text/keys, не использует
+offline push и не является roster/member событием. Миграция 021 добавляет
+обратные membership indexes для bounded audience lookup без full-table scan.
+Native принимает только
+canonical UUID и bounded positive revision, привязывает renderer event к точной
+authenticated origin/generation, а открытый Identity Island refetch-ит профиль
+только при совпадении origin/user и более новой версии. Ни membership refresh,
+ни conversation quarantine, ни ACL/Sender-Key rotation этот путь не вызывает.
+
 - Native API возвращает стабильный fingerprint в hex + визуальном/emoji формате.
 - SQLCipher хранит verification по server origin, account и наблюдаемой identity,
   а не только по mutable имени.
@@ -761,8 +776,9 @@ origin, binding или session completion не публикуется. Phaseprin
 3. **Закрыто:** единый right-island route,
    responsive Identity Island, server context и безопасные profile triggers на
    уже доступных locator-bearing данных.
-4. **В работе:** versioned signed text profile API/cache/editor закрыты; остаются
-   `ProfileUpdated` event и нормализация identity-bearing search DTO.
+4. **В работе:** versioned signed text profile API/cache/editor и отдельный
+   relationship-scoped `ProfileUpdated` event закрыты; остаётся нормализация
+   identity-bearing search DTO.
 5. **Закрыто:** local identity verification и blocking identity-change flow.
 6. Только затем добавить изолированный avatar pipeline и mobile adaptation.
 

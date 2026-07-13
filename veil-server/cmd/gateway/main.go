@@ -108,7 +108,7 @@ func main() {
 	// Auth REST endpoints (prekeys, devices, user lookup)
 	authHandler := auth.NewHandler(authSvc, signedMw, rl)
 	authHandler.RegisterRoutes(mux)
-	profilesHandler := profiles.NewHandler(profiles.NewPostgresStore(database.Pool), signedMw, rl)
+	profilesHandler := profiles.NewHandler(profiles.NewPostgresStore(database.Pool), signedMw, rl, hub)
 	profilesHandler.RegisterRoutes(mux)
 
 	// Chat REST endpoints (message sync, conversations)

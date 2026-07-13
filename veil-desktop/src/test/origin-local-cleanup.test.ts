@@ -156,6 +156,17 @@ describe("origin-local App cleanup", () => {
     expect(saveFlow).toContain("review before saving again");
   });
 
+  it("refreshes only the open exact profile after a newer origin-scoped event", () => {
+    const refreshEffect = section(
+      "const notice = appStore.profileUpdateNotice()",
+      "createEffect(() => {\n    const conversationId",
+    );
+    expect(refreshEffect).toContain("canonicalIdentityOrigin(route.profile.canonicalServerOrigin) !== notice.canonicalServerOrigin");
+    expect(refreshEffect).toContain("canonicalIdentityUserId(route.profile.userId) !== notice.userId");
+    expect(refreshEffect).toContain("BigInt(currentVersionText) >= BigInt(notice.profileVersion)");
+    expect(refreshEffect).toContain("refreshIdentityProfile(route.profile)");
+  });
+
   it("binds physical verification to the exact displayed fingerprint and route", () => {
     const verificationFlow = section(
       "const loadSelectedIdentityVerification = async",

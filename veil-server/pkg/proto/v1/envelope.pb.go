@@ -60,6 +60,7 @@ type Envelope struct {
 	//	*Envelope_FriendListResponse
 	//	*Envelope_ServerEvent
 	//	*Envelope_ChannelEvent
+	//	*Envelope_ProfileUpdated
 	//	*Envelope_ShareCreate
 	//	*Envelope_ShareCreated
 	//	*Envelope_MediaUploadRequest
@@ -386,6 +387,15 @@ func (x *Envelope) GetChannelEvent() *ChannelEvent {
 	return nil
 }
 
+func (x *Envelope) GetProfileUpdated() *ProfileUpdated {
+	if x != nil {
+		if x, ok := x.Payload.(*Envelope_ProfileUpdated); ok {
+			return x.ProfileUpdated
+		}
+	}
+	return nil
+}
+
 func (x *Envelope) GetShareCreate() *ShareCreate {
 	if x != nil {
 		if x, ok := x.Payload.(*Envelope_ShareCreate); ok {
@@ -593,6 +603,11 @@ type Envelope_ChannelEvent struct {
 	ChannelEvent *ChannelEvent `protobuf:"bytes,51,opt,name=channel_event,json=channelEvent,proto3,oneof"`
 }
 
+type Envelope_ProfileUpdated struct {
+	// Presentation-only profile invalidation; never a roster/crypto event.
+	ProfileUpdated *ProfileUpdated `protobuf:"bytes,52,opt,name=profile_updated,json=profileUpdated,proto3,oneof"`
+}
+
 type Envelope_ShareCreate struct {
 	// Shares
 	ShareCreate *ShareCreate `protobuf:"bytes,60,opt,name=share_create,json=shareCreate,proto3,oneof"`
@@ -692,6 +707,8 @@ func (*Envelope_ServerEvent) isEnvelope_Payload() {}
 
 func (*Envelope_ChannelEvent) isEnvelope_Payload() {}
 
+func (*Envelope_ProfileUpdated) isEnvelope_Payload() {}
+
 func (*Envelope_ShareCreate) isEnvelope_Payload() {}
 
 func (*Envelope_ShareCreated) isEnvelope_Payload() {}
@@ -774,7 +791,7 @@ var File_veil_v1_envelope_proto protoreflect.FileDescriptor
 
 const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\n" +
-	"\x16veil/v1/envelope.proto\x12\aveil.v1\x1a\x12veil/v1/auth.proto\x1a\x12veil/v1/chat.proto\x1a\x16veil/v1/presence.proto\x1a\x13veil/v1/share.proto\x1a\x14veil/v1/server.proto\x1a\x13veil/v1/media.proto\x1a\x13veil/v1/voice.proto\x1a\x15veil/v1/friends.proto\"\x85\x14\n" +
+	"\x16veil/v1/envelope.proto\x12\aveil.v1\x1a\x12veil/v1/auth.proto\x1a\x12veil/v1/chat.proto\x1a\x16veil/v1/presence.proto\x1a\x13veil/v1/share.proto\x1a\x14veil/v1/server.proto\x1a\x13veil/v1/media.proto\x1a\x13veil/v1/voice.proto\x1a\x15veil/v1/friends.proto\x1a\x15veil/v1/profile.proto\"\xc9\x14\n" +
 	"\bEnvelope\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\x04R\ttimestamp\x12?\n" +
@@ -809,7 +826,8 @@ const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\x13friend_list_request\x180 \x01(\v2\x1a.veil.v1.FriendListRequestH\x00R\x11friendListRequest\x12O\n" +
 	"\x14friend_list_response\x181 \x01(\v2\x1b.veil.v1.FriendListResponseH\x00R\x12friendListResponse\x129\n" +
 	"\fserver_event\x182 \x01(\v2\x14.veil.v1.ServerEventH\x00R\vserverEvent\x12<\n" +
-	"\rchannel_event\x183 \x01(\v2\x15.veil.v1.ChannelEventH\x00R\fchannelEvent\x129\n" +
+	"\rchannel_event\x183 \x01(\v2\x15.veil.v1.ChannelEventH\x00R\fchannelEvent\x12B\n" +
+	"\x0fprofile_updated\x184 \x01(\v2\x17.veil.v1.ProfileUpdatedH\x00R\x0eprofileUpdated\x129\n" +
 	"\fshare_create\x18< \x01(\v2\x14.veil.v1.ShareCreateH\x00R\vshareCreate\x12<\n" +
 	"\rshare_created\x18= \x01(\v2\x15.veil.v1.ShareCreatedH\x00R\fshareCreated\x12O\n" +
 	"\x14media_upload_request\x18F \x01(\v2\x1b.veil.v1.MediaUploadRequestH\x00R\x12mediaUploadRequest\x12C\n" +
@@ -874,14 +892,15 @@ var file_veil_v1_envelope_proto_goTypes = []any{
 	(*FriendListResponse)(nil),    // 28: veil.v1.FriendListResponse
 	(*ServerEvent)(nil),           // 29: veil.v1.ServerEvent
 	(*ChannelEvent)(nil),          // 30: veil.v1.ChannelEvent
-	(*ShareCreate)(nil),           // 31: veil.v1.ShareCreate
-	(*ShareCreated)(nil),          // 32: veil.v1.ShareCreated
-	(*MediaUploadRequest)(nil),    // 33: veil.v1.MediaUploadRequest
-	(*MediaUploadUrl)(nil),        // 34: veil.v1.MediaUploadUrl
-	(*VoiceTokenRequest)(nil),     // 35: veil.v1.VoiceTokenRequest
-	(*VoiceToken)(nil),            // 36: veil.v1.VoiceToken
-	(*SyncRequest)(nil),           // 37: veil.v1.SyncRequest
-	(*SyncBatch)(nil),             // 38: veil.v1.SyncBatch
+	(*ProfileUpdated)(nil),        // 31: veil.v1.ProfileUpdated
+	(*ShareCreate)(nil),           // 32: veil.v1.ShareCreate
+	(*ShareCreated)(nil),          // 33: veil.v1.ShareCreated
+	(*MediaUploadRequest)(nil),    // 34: veil.v1.MediaUploadRequest
+	(*MediaUploadUrl)(nil),        // 35: veil.v1.MediaUploadUrl
+	(*VoiceTokenRequest)(nil),     // 36: veil.v1.VoiceTokenRequest
+	(*VoiceToken)(nil),            // 37: veil.v1.VoiceToken
+	(*SyncRequest)(nil),           // 38: veil.v1.SyncRequest
+	(*SyncBatch)(nil),             // 39: veil.v1.SyncBatch
 }
 var file_veil_v1_envelope_proto_depIdxs = []int32{
 	2,  // 0: veil.v1.Envelope.auth_challenge:type_name -> veil.v1.AuthChallenge
@@ -913,20 +932,21 @@ var file_veil_v1_envelope_proto_depIdxs = []int32{
 	28, // 26: veil.v1.Envelope.friend_list_response:type_name -> veil.v1.FriendListResponse
 	29, // 27: veil.v1.Envelope.server_event:type_name -> veil.v1.ServerEvent
 	30, // 28: veil.v1.Envelope.channel_event:type_name -> veil.v1.ChannelEvent
-	31, // 29: veil.v1.Envelope.share_create:type_name -> veil.v1.ShareCreate
-	32, // 30: veil.v1.Envelope.share_created:type_name -> veil.v1.ShareCreated
-	33, // 31: veil.v1.Envelope.media_upload_request:type_name -> veil.v1.MediaUploadRequest
-	34, // 32: veil.v1.Envelope.media_upload_url:type_name -> veil.v1.MediaUploadUrl
-	35, // 33: veil.v1.Envelope.voice_token_request:type_name -> veil.v1.VoiceTokenRequest
-	36, // 34: veil.v1.Envelope.voice_token:type_name -> veil.v1.VoiceToken
-	37, // 35: veil.v1.Envelope.sync_request:type_name -> veil.v1.SyncRequest
-	38, // 36: veil.v1.Envelope.sync_batch:type_name -> veil.v1.SyncBatch
-	1,  // 37: veil.v1.Envelope.error:type_name -> veil.v1.Error
-	38, // [38:38] is the sub-list for method output_type
-	38, // [38:38] is the sub-list for method input_type
-	38, // [38:38] is the sub-list for extension type_name
-	38, // [38:38] is the sub-list for extension extendee
-	0,  // [0:38] is the sub-list for field type_name
+	31, // 29: veil.v1.Envelope.profile_updated:type_name -> veil.v1.ProfileUpdated
+	32, // 30: veil.v1.Envelope.share_create:type_name -> veil.v1.ShareCreate
+	33, // 31: veil.v1.Envelope.share_created:type_name -> veil.v1.ShareCreated
+	34, // 32: veil.v1.Envelope.media_upload_request:type_name -> veil.v1.MediaUploadRequest
+	35, // 33: veil.v1.Envelope.media_upload_url:type_name -> veil.v1.MediaUploadUrl
+	36, // 34: veil.v1.Envelope.voice_token_request:type_name -> veil.v1.VoiceTokenRequest
+	37, // 35: veil.v1.Envelope.voice_token:type_name -> veil.v1.VoiceToken
+	38, // 36: veil.v1.Envelope.sync_request:type_name -> veil.v1.SyncRequest
+	39, // 37: veil.v1.Envelope.sync_batch:type_name -> veil.v1.SyncBatch
+	1,  // 38: veil.v1.Envelope.error:type_name -> veil.v1.Error
+	39, // [39:39] is the sub-list for method output_type
+	39, // [39:39] is the sub-list for method input_type
+	39, // [39:39] is the sub-list for extension type_name
+	39, // [39:39] is the sub-list for extension extendee
+	0,  // [0:39] is the sub-list for field type_name
 }
 
 func init() { file_veil_v1_envelope_proto_init() }
@@ -942,6 +962,7 @@ func file_veil_v1_envelope_proto_init() {
 	file_veil_v1_media_proto_init()
 	file_veil_v1_voice_proto_init()
 	file_veil_v1_friends_proto_init()
+	file_veil_v1_profile_proto_init()
 	file_veil_v1_envelope_proto_msgTypes[0].OneofWrappers = []any{
 		(*Envelope_AuthChallenge)(nil),
 		(*Envelope_AuthResponse)(nil),
@@ -972,6 +993,7 @@ func file_veil_v1_envelope_proto_init() {
 		(*Envelope_FriendListResponse)(nil),
 		(*Envelope_ServerEvent)(nil),
 		(*Envelope_ChannelEvent)(nil),
+		(*Envelope_ProfileUpdated)(nil),
 		(*Envelope_ShareCreate)(nil),
 		(*Envelope_ShareCreated)(nil),
 		(*Envelope_MediaUploadRequest)(nil),

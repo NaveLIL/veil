@@ -2,9 +2,10 @@
 
 Date: 2026-07-13
 
-Status: approved for the text-only server checkpoint described below. This
-review does not approve avatar upload, remote image URLs, profile-based trust,
-or changes to the message/cryptographic protocols.
+Status: approved for the text-only server checkpoint and the presentation-only
+`ProfileUpdated` invalidation contract described below. This review does not
+approve avatar upload, remote image URLs, profile-based trust, or changes to the
+message/cryptographic protocols.
 
 ## Scope
 
@@ -37,9 +38,35 @@ a different account.
 - Existing signed-request replay protection and verified-principal rate limits
   are mandatory outer middleware. No unsigned compatibility route exists.
 
-`ProfileUpdated` fanout is deliberately excluded from this first checkpoint.
-It must be added as a presentation-only event in the next checkpoint and must
-not reuse roster/member events or trigger Sender-Key rotation.
+## Profile update invalidation
+
+`ProfileUpdated { user_id, profile_version }` is an additive protobuf event.
+It contains no display name, about text, identity/signing key, relationship,
+presence or device data. The signed REST response remains authoritative; the
+event only tells a client to refetch the exact origin-scoped profile.
+
+- Fanout is limited to the updated account and accounts which already have a
+  durable relationship with it on that origin: accepted friends, a shared
+  conversation or a shared server. It is never broadcast instance-wide and is
+  not forwarded through offline push.
+- PostgreSQL computes the indexed, deduplicated relationship union after the
+  committed CAS update. A fanout/audience failure is logged only as a bounded
+  error class and cannot rewrite the already committed REST success into a
+  misleading client error.
+- The native client accepts only a canonical UUID and a positive revision no
+  larger than PostgreSQL `BIGINT`, tags the renderer event with the exact
+  authenticated origin and binding generation, and exposes the revision as a
+  decimal string so JavaScript cannot lose precision.
+- The renderer ignores retired origins/generations and only refreshes an open
+  profile whose origin and user ID match. The existing exact identity key is
+  still required by native profile loading before SQLCipher publication.
+- Missing events are harmless: reconnect or reopening the Identity Island uses
+  signed REST and the monotonic SQLCipher cache rules. The event is not a
+  durable synchronization or authorization channel.
+
+This event is not a roster/member event. It never invokes membership refresh,
+conversation quarantine, ACL changes, Sender-Key rotation or identity proof
+changes.
 
 ## Text contract
 

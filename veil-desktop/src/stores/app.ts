@@ -147,6 +147,12 @@ export interface IdentityVerificationView {
   proofState: "not_compared" | "verified_on_this_device" | "identity_changed";
 }
 
+export interface ProfileUpdateNotice {
+  canonicalServerOrigin: string;
+  userId: string;
+  profileVersion: string;
+}
+
 export interface ServerEndpointChange {
   originChanged: boolean;
   transportChanged: boolean;
@@ -215,6 +221,7 @@ const [authenticatedServerScope, setAuthenticatedServerScope] =
   createSignal<AuthenticatedServerScope | null>(null);
 const [pendingAuthenticatedServerScope, setPendingAuthenticatedServerScope] =
   createSignal<AuthenticatedServerScope | null>(null);
+const [profileUpdateNotice, setProfileUpdateNotice] = createSignal<ProfileUpdateNotice | null>(null);
 const [bindingTransitioning, setBindingTransitioning] = createSignal(false);
 const [originTransitioning, setOriginTransitioning] = createSignal(false);
 const [originEpoch, setOriginEpoch] = createSignal(0);
@@ -685,6 +692,7 @@ function resetOriginScopedUiState(): void {
   setFriendRequests([]);
   setPresenceMap({});
   setFriendDirectoryReady(false);
+  setProfileUpdateNotice(null);
 }
 
 function beginBindingTransition(serverSettingsFallback: "chat" | "settings" = "chat"): void {
@@ -693,6 +701,7 @@ function beginBindingTransition(serverSettingsFallback: "chat" | "settings" = "c
   uiSessionEpoch += 1;
   setAuthenticatedServerScope(null);
   setPendingAuthenticatedServerScope(null);
+  setProfileUpdateNotice(null);
   setBindingTransitioning(true);
   setConnected(false);
   setUserId(null);
@@ -840,6 +849,7 @@ export const appStore = {
   setServerEndpoints,
   authenticatedServerScope,
   pendingAuthenticatedServerScope,
+  profileUpdateNotice,
   bindingTransitioning,
   originTransitioning,
   originEpoch,
@@ -3065,6 +3075,30 @@ export const appStore = {
         if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const { userId: uid } = event.payload;
         setFriends((prev) => prev.filter((f) => f.userId !== uid));
+      },
+    );
+
+      await register<{ userId: string; profileVersion: string }>(
+      "veil://profile-updated",
+      (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        const scope = authenticatedServerScope();
+        if (!scope) return;
+        const { userId: updatedUserId, profileVersion } = event.payload;
+        const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+        if (
+          typeof updatedUserId !== "string"
+          || typeof profileVersion !== "string"
+          || !canonicalUuid.test(updatedUserId)
+          || !/^[1-9][0-9]*$/.test(profileVersion)
+          || profileVersion.length > 19
+          || BigInt(profileVersion) > 9223372036854775807n
+        ) return;
+        setProfileUpdateNotice({
+          canonicalServerOrigin: scope.canonicalServerOrigin,
+          userId: updatedUserId,
+          profileVersion,
+        });
       },
     );
 

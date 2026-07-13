@@ -23,6 +23,7 @@ type Profile struct {
 type Store interface {
 	GetProfile(ctx context.Context, userID string) (*Profile, error)
 	UpdateProfile(ctx context.Context, userID string, expectedVersion int64, displayName *string, about string) (*Profile, error)
+	ProfileUpdateRecipients(ctx context.Context, userID string) ([]string, error)
 }
 
 type PostgresStore struct {
@@ -72,4 +73,43 @@ func (s *PostgresStore) UpdateProfile(
 		return nil, err
 	}
 	return &profile, nil
+}
+
+// ProfileUpdateRecipients returns only accounts which already have a durable
+// relationship with the profile owner on this instance. This avoids turning a
+// presentation update into instance-wide UUID/activity disclosure.
+func (s *PostgresStore) ProfileUpdateRecipients(ctx context.Context, userID string) ([]string, error) {
+	rows, err := s.pool.Query(ctx, `
+		WITH related(user_id) AS (
+			SELECT $1::uuid
+			UNION
+			SELECT CASE WHEN user_id_1 = $1::uuid THEN user_id_2 ELSE user_id_1 END
+			FROM friendships
+			WHERE user_id_1 = $1::uuid OR user_id_2 = $1::uuid
+			UNION
+			SELECT peer.user_id
+			FROM conversation_members mine
+			JOIN conversation_members peer ON peer.conversation_id = mine.conversation_id
+			WHERE mine.user_id = $1::uuid
+			UNION
+			SELECT peer.user_id
+			FROM server_members mine
+			JOIN server_members peer ON peer.server_id = mine.server_id
+			WHERE mine.user_id = $1::uuid
+		)
+		SELECT user_id::text FROM related ORDER BY user_id`, userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	recipients := make([]string, 0)
+	for rows.Next() {
+		var recipient string
+		if err := rows.Scan(&recipient); err != nil {
+			return nil, err
+		}
+		recipients = append(recipients, recipient)
+	}
+	return recipients, rows.Err()
 }

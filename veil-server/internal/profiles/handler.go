@@ -10,6 +10,7 @@ import (
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/logsafe"
 	"github.com/AegisSec/veil-server/internal/publicerr"
+	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
@@ -18,10 +19,15 @@ type Handler struct {
 	store Store
 	mw    *authmw.Middleware
 	rl    *authmw.RateLimit
+	bcast Broadcaster
 }
 
-func NewHandler(store Store, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
-	return &Handler{store: store, mw: mw, rl: rl}
+type Broadcaster interface {
+	BroadcastToUsers(userIDs []string, env *pb.Envelope)
+}
+
+func NewHandler(store Store, mw *authmw.Middleware, rl *authmw.RateLimit, bcast Broadcaster) *Handler {
+	return &Handler{store: store, mw: mw, rl: rl, bcast: bcast}
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -109,7 +115,27 @@ func (h *Handler) updateProfile(w http.ResponseWriter, r *http.Request) {
 		publicerr.Write(w, http.StatusInternalServerError, nil)
 		return
 	}
+	// The REST response stays authoritative. Fanout is a best-effort, bounded
+	// invalidation hint and is deliberately sent only after the response body
+	// has been written so the initiating client normally observes its own PUT
+	// result first.
 	writeJSON(w, http.StatusOK, profile)
+	if h.bcast == nil || profile.ProfileVersion <= 0 {
+		return
+	}
+	recipients, audienceErr := h.store.ProfileUpdateRecipients(r.Context(), userID)
+	if audienceErr != nil {
+		log.Printf("profile update audience error: class=%s", logsafe.ErrorClass(audienceErr))
+		return
+	}
+	h.bcast.BroadcastToUsers(recipients, &pb.Envelope{
+		Payload: &pb.Envelope_ProfileUpdated{
+			ProfileUpdated: &pb.ProfileUpdated{
+				UserId:         profile.UserID,
+				ProfileVersion: uint64(profile.ProfileVersion),
+			},
+		},
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
