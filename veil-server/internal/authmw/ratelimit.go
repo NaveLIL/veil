@@ -5,7 +5,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/httpmw"
+	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
 )
 
 // RateLimit is a per-user (or per-IP) token-bucket limiter for REST

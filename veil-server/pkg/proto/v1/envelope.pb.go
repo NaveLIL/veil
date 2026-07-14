@@ -845,7 +845,7 @@ const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x1c\n" +
 	"\aref_seq\x18\x03 \x01(\x04H\x00R\x06refSeq\x88\x01\x01B\n" +
 	"\n" +
-	"\b_ref_seqB.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\b_ref_seqB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_envelope_proto_rawDescOnce sync.Once

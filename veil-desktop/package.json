@@ -2,10 +2,20 @@
   "name": "veil-desktop",
   "private": true,
   "version": "0.1.0",
+  "author": "NaveLIL",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://veil.erez.pro",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NaveLIL/veil.git",
+    "directory": "veil-desktop"
+  },
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
+    "build:bundle": "pnpm licenses:desktop && pnpm build",
+    "licenses:desktop": "node ../scripts/generate-third-party-notices.mjs --component desktop --output src-tauri/resources/THIRD_PARTY_NOTICES.txt",
     "preview": "vite preview",
     "test": "vitest",
     "test:run": "vitest run",

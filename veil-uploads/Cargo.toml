@@ -2,9 +2,12 @@
 name = "veil-uploads"
 version = "0.1.0"
 edition = "2021"
-authors = ["NaveLIL <warthunder.bizon@proton.me>"]
+authors.workspace = true
 description = "Resumable encrypted uploads for Veil messenger (tus.io client + chunked AEAD streaming)"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [dependencies]
 veil-crypto = { path = "../veil-crypto" }

@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -14,19 +17,19 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/chat"
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/gateway"
-	"github.com/AegisSec/veil-server/internal/httpmw"
-	"github.com/AegisSec/veil-server/internal/metrics"
-	"github.com/AegisSec/veil-server/internal/mls"
-	"github.com/AegisSec/veil-server/internal/profiles"
-	"github.com/AegisSec/veil-server/internal/push"
-	"github.com/AegisSec/veil-server/internal/servers"
-	"github.com/AegisSec/veil-server/internal/uploads"
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/chat"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/gateway"
+	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
+	"github.com/NaveLIL/veil/veil-server/internal/metrics"
+	"github.com/NaveLIL/veil/veil-server/internal/mls"
+	"github.com/NaveLIL/veil/veil-server/internal/profiles"
+	"github.com/NaveLIL/veil/veil-server/internal/push"
+	"github.com/NaveLIL/veil/veil-server/internal/servers"
+	"github.com/NaveLIL/veil/veil-server/internal/uploads"
 )
 
 //go:embed web/index.html
@@ -50,6 +53,84 @@ var robotsTxt []byte
 //go:embed web/sitemap.xml
 var sitemapXML []byte
 
+const projectRepositoryURL = "https://github.com/NaveLIL/veil"
+
+// buildCommit is replaced with the exact source commit by the release image
+// workflow. Local development builds deliberately fall back to the repository
+// root instead of constructing a misleading source URL.
+var buildCommit = "development"
+
+type sourceMetadata struct {
+	License    string `json:"license"`
+	Copyright  string `json:"copyright"`
+	Revision   string `json:"revision,omitempty"`
+	ArchiveURL string `json:"archive_url,omitempty"`
+	BrowseURL  string `json:"browse_url"`
+}
+
+func canonicalCommit(commit string) (string, bool) {
+	commit = strings.ToLower(strings.TrimSpace(commit))
+	if len(commit) != 40 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(commit); err != nil {
+		return "", false
+	}
+	return commit, true
+}
+
+func validatedSourceURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawQuery != "" {
+		return "", errors.New("must be an absolute durable HTTPS URL without credentials, query, or fragment")
+	}
+	return parsed.String(), nil
+}
+
+func sourceMetadataForBuild(commit, overrideRevision, overrideArchive, overrideBrowse string) (sourceMetadata, error) {
+	metadata := sourceMetadata{
+		License:   "AGPL-3.0-or-later",
+		Copyright: "Copyright (C) 2026 NaveLIL",
+	}
+
+	overrideRevision = strings.TrimSpace(overrideRevision)
+	overrideArchive = strings.TrimSpace(overrideArchive)
+	overrideBrowse = strings.TrimSpace(overrideBrowse)
+	hasOverride := overrideRevision != "" || overrideArchive != "" || overrideBrowse != ""
+	if hasOverride {
+		if overrideRevision == "" || overrideArchive == "" || overrideBrowse == "" {
+			return sourceMetadata{}, errors.New("VEIL_SOURCE_REVISION, VEIL_SOURCE_ARCHIVE_URL, and VEIL_SOURCE_BROWSE_URL must be set together")
+		}
+		revision, ok := canonicalCommit(overrideRevision)
+		if !ok {
+			return sourceMetadata{}, errors.New("VEIL_SOURCE_REVISION must be a full 40-character Git commit")
+		}
+		archiveURL, err := validatedSourceURL(overrideArchive)
+		if err != nil {
+			return sourceMetadata{}, fmt.Errorf("VEIL_SOURCE_ARCHIVE_URL %w", err)
+		}
+		browseURL, err := validatedSourceURL(overrideBrowse)
+		if err != nil {
+			return sourceMetadata{}, fmt.Errorf("VEIL_SOURCE_BROWSE_URL %w", err)
+		}
+		metadata.Revision = revision
+		metadata.ArchiveURL = archiveURL
+		metadata.BrowseURL = browseURL
+		return metadata, nil
+	}
+
+	revision, ok := canonicalCommit(commit)
+	if !ok {
+		metadata.BrowseURL = projectRepositoryURL
+		return metadata, nil
+	}
+	metadata.Revision = revision
+	metadata.ArchiveURL = projectRepositoryURL + "/archive/" + revision + ".tar.gz"
+	metadata.BrowseURL = projectRepositoryURL + "/tree/" + revision
+	return metadata, nil
+}
+
 func main() {
 	// Switch to structured JSON logging via slog (consumed by httpmw.AccessLog).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
@@ -61,6 +142,20 @@ func main() {
 	if err := httpmw.ConfigureClientIPFromEnv(); err != nil {
 		log.Fatalf("proxy configuration error: %v", err)
 	}
+	sourceInfo, err := sourceMetadataForBuild(
+		buildCommit,
+		os.Getenv("VEIL_SOURCE_REVISION"),
+		os.Getenv("VEIL_SOURCE_ARCHIVE_URL"),
+		os.Getenv("VEIL_SOURCE_BROWSE_URL"),
+	)
+	if err != nil {
+		log.Fatalf("source metadata configuration error: %v", err)
+	}
+	sourceInfoJSON, err := json.Marshal(sourceInfo)
+	if err != nil {
+		log.Fatalf("source metadata encoding error: %v", err)
+	}
+	sourceInfoJSON = append(sourceInfoJSON, '\n')
 
 	// Connect to PostgreSQL
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -197,6 +292,7 @@ func main() {
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Link", "</source>; rel=\"source\"")
 		w.Write(landingHTML)
 	})
 
@@ -206,6 +302,7 @@ func main() {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "public, max-age=3600")
 			w.Header().Set("X-Robots-Tag", "noindex")
+			w.Header().Set("Link", "</source>; rel=\"source\"")
 			w.Write(body)
 		}
 	}
@@ -213,6 +310,23 @@ func main() {
 	mux.HandleFunc("GET /privacy/", staticHTML(privacyHTML))
 	mux.HandleFunc("GET /terms", staticHTML(termsHTML))
 	mux.HandleFunc("GET /terms/", staticHTML(termsHTML))
+	mux.HandleFunc("GET /source", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		target := sourceInfo.ArchiveURL
+		if target == "" {
+			target = sourceInfo.BrowseURL
+		}
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("GET /source/browse", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, r, sourceInfo.BrowseURL, http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("GET /.well-known/veil-source.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Write(sourceInfoJSON)
+	})
 
 	mux.HandleFunc("GET /legal.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")

@@ -9,8 +9,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/logsafe"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 )
 

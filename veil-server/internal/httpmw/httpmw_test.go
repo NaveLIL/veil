@@ -10,7 +10,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/AegisSec/veil-server/internal/httpmw"
+	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
 	"github.com/prometheus/client_golang/prometheus"
 )
 

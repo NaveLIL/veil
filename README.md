@@ -1,5 +1,16 @@
 # Veil
 
+<img src="assets/brand/phase-shift-mark.svg" width="88" alt="Veil Phase Shift logo">
+
+[Русский](README.md) · [English](README.en.md)
+
+[![Rust CI](https://github.com/NaveLIL/veil/actions/workflows/rust.yml/badge.svg)](https://github.com/NaveLIL/veil/actions/workflows/rust.yml)
+[![Go CI](https://github.com/NaveLIL/veil/actions/workflows/go.yml/badge.svg)](https://github.com/NaveLIL/veil/actions/workflows/go.yml)
+[![Desktop UI CI](https://github.com/NaveLIL/veil/actions/workflows/desktop-ui.yml/badge.svg)](https://github.com/NaveLIL/veil/actions/workflows/desktop-ui.yml)
+[![Mobile CI](https://github.com/NaveLIL/veil/actions/workflows/mobile.yml/badge.svg)](https://github.com/NaveLIL/veil/actions/workflows/mobile.yml)
+[![Security Audit](https://github.com/NaveLIL/veil/actions/workflows/security.yml/badge.svg)](https://github.com/NaveLIL/veil/actions/workflows/security.yml)
+[![License: AGPL-3.0-or-later](https://img.shields.io/badge/license-AGPL--3.0--or--later-663399.svg)](LICENSE)
+
 Veil — native-first система защищённых личных и совместных пространств. Один
 origin-scoped account и одна понятная модель доверия используются в Home,
 Direct, Circle и структурированных Space/Room. Проект ещё не выпускался и
@@ -165,9 +176,10 @@ docker compose --profile proxy up -d --build
 ## Публичные релизы
 
 Старые Linux-ветки и вручную собранные `Veil_0.1.0_*` не являются источником
-релиза. Linux и Windows всегда собираются из одного tag на актуальном
-`master`; если Linux build или общий quality gate падает, новый релиз не
-публикуется и сайт не предлагает устаревший файл.
+релиза. Linux-сборки и включённые для конкретного релиза Windows-сборки
+создаются из одного tag на актуальном `master`; если обязательный Linux build
+или общий quality gate падает, новый релиз не публикуется и сайт не предлагает
+устаревший файл.
 
 Tag вида `vMAJOR.MINOR.PATCH` запускает GitHub release workflow. Он проверяет
 совпадение версии, собирает поддерживаемые desktop targets, создаёт стабильные
@@ -200,6 +212,7 @@ Pop-Location
 Release bundle собирается отдельно:
 
 ```powershell
+cargo install cargo-about --version 0.9.1 --locked --features cli
 $env:CARGO_TARGET_DIR = 'D:\veil-release-target'
 Push-Location veil-desktop
 pnpm install --frozen-lockfile
@@ -237,6 +250,26 @@ Integration tests требуют готового Docker environment. Полны
 включает migrations, native smoke и platform-specific checks в объёме риска
 изменения.
 
+## Документация и участие
+
+- [Документация](docs/README.md) и [текущая архитектура](docs/architecture.md)
+- [Как внести вклад](CONTRIBUTING.md) и [правила сообщества](CODE_OF_CONDUCT.md)
+- [Политика безопасности](SECURITY.md) и [каналы поддержки](SUPPORT.md)
+- [История лицензирования (EN)](LICENSING.md), [уведомление](NOTICE) и
+  [политика товарных знаков](TRADEMARKS.md)
+
 ## License
 
-MIT
+Copyright © 2026 NaveLIL.
+
+Исходный код, документация и остальные оригинальные материалы Veil
+распространяются по лицензии
+[GNU Affero General Public License v3.0 or later](LICENSE)
+(`AGPL-3.0-or-later`). При изменении сетевой версии Veil предоставьте её
+пользователям доступ к соответствующему исходному коду на условиях лицензии.
+
+Названия **Veil** и логотип **Phase Shift** не предоставляются как товарные
+знаки и не должны использоваться так, будто сторонний форк является официальным.
+Подробности — в [TRADEMARKS.md](TRADEMARKS.md). Сторонние зависимости сохраняют
+собственные лицензии; воспроизводимый реестр и тексты уведомлений описаны в
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

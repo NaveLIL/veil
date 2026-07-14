@@ -1,4 +1,4 @@
-module github.com/AegisSec/veil-server
+module github.com/NaveLIL/veil/veil-server
 
 go 1.26.0
 

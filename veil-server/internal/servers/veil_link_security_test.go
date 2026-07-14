@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
 )
 
 func TestVeilLinkTokenValidationIsCanonicalAndFixedWidth(t *testing.T) {

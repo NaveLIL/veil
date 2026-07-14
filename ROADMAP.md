@@ -19,18 +19,19 @@
 | W8 — Sender-Key rotation | exact-device rotation, retention, durable receipts and scoped quarantine implemented; transparency/manual-device UX remain |
 | W9 — raw user IDs in logs | closed; HMAC refs, bounded error classes and safe tusd logging are enforced |
 | W10 — WS message rate limit | closed; abuse alerting/auto-disconnect remain optional follow-ups |
-| W11 — profile/avatar privacy boundary | planned in Phase 4D; server-visible profile metadata and a separate sanitized avatar pipeline are required |
+| W11 — profile/avatar privacy boundary | closed in Phase 4D; presentation metadata is server-visible and avatars use a separate sanitized pipeline |
 | W12 — internal errors in client responses | closed; fail-closed `publicerr` HTTP/WS/tusd boundary plus AST regression |
 
 The sections below are retained as an engineering journal. Statements such as
 “chat/servers have zero tests”, “allowUnsigned=true” or “Origin defaults to *”
 describe the old audit state and are superseded by the table above.
 
-Phase 4D and its entry gate are defined in
-[`INTEGRATION_ROADMAP.md`](INTEGRATION_ROADMAP.md). Public display names, about
-text and avatars are instance-scoped server-visible metadata, not cryptographic
-identity and not E2EE message content. Avatar images must not reuse the opaque
-E2EE attachment pipeline or arbitrary remote URLs.
+Phase 4D and its passed completion gate are defined in
+[`INTEGRATION_ROADMAP.md`](INTEGRATION_ROADMAP.md) and
+[`docs/reviews/phase-4d-completion-gate.md`](docs/reviews/phase-4d-completion-gate.md).
+Public display names, about text and avatars are instance-scoped server-visible
+metadata, not cryptographic identity and not E2EE message content. Avatar
+images use a separate sanitized pipeline and never reuse arbitrary remote URLs.
 
 ## Recently shipped
 

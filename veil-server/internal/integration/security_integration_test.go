@@ -16,12 +16,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/chat"
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/servers"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
+	"github.com/NaveLIL/veil/veil-server/internal/chat"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/servers"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -49,7 +49,7 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 	mallory := h.CreateUser("security-mallory")
 
 	t.Run("websocket auth registers only with a valid X25519 proof", func(t *testing.T) {
-		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3}
+		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3, AllowRegistration: true}
 		svc := auth.NewService(h.DB, cfg)
 		serverPublic, err := svc.CreateChallenge("valid-registration")
 		if err != nil {
@@ -76,6 +76,34 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 		if !result.IsNew {
 			t.Fatal("valid registration was not marked new")
+		}
+	})
+
+	t.Run("websocket auth keeps first-time registration closed by default", func(t *testing.T) {
+		cfg := &config.Config{AuthChallengeTTL: 5 * time.Second, AuthMaxAttempts: 3}
+		svc := auth.NewService(h.DB, cfg)
+		serverPublic, err := svc.CreateChallenge("closed-registration")
+		if err != nil {
+			t.Fatal(err)
+		}
+		identityPublic, identityPrivate := randomX25519KeyPair(t)
+		signingPublic, signingPrivate, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		shared, err := curve25519.X25519(identityPrivate, serverPublic[:])
+		if err != nil {
+			t.Fatal(err)
+		}
+		message, err := auth.WSAuthSigningMessage(serverPublic[:], shared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = svc.VerifyResponse(context.Background(), "closed-registration",
+			identityPublic, signingPublic, ed25519.Sign(signingPrivate, message),
+			randomBytes(t, 16), "closed-device")
+		if !errors.Is(err, auth.ErrRegistrationClosed) {
+			t.Fatalf("closed registration error = %v, want ErrRegistrationClosed", err)
 		}
 	})
 

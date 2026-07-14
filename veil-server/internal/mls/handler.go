@@ -7,8 +7,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/publicerr"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/publicerr"
 	"github.com/jackc/pgx/v5"
 )
 

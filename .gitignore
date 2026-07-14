@@ -28,9 +28,16 @@ backups/
 *.p12
 *.pfx
 *.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
 
 # Build artifacts
 *.wasm
+veil-desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt
+veil-server/THIRD_PARTY_NOTICES.txt
 
 # Coverage
 coverage/

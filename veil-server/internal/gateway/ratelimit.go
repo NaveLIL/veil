@@ -19,7 +19,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/metrics"
+	"github.com/NaveLIL/veil/veil-server/internal/metrics"
 )
 
 // wsBucketLimits is the table of per-kind capacity / refill-window pairs.

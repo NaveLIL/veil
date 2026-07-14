@@ -4,9 +4,9 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/db"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
 
 func TestDeviceBindingFromProtoRejectsUnknownStatusBeforeNarrowing(t *testing.T) {

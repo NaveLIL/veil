@@ -1,9 +1,9 @@
+Contact: https://github.com/NaveLIL/veil/security/advisories/new
 Contact: mailto:security@erez.pro
 Expires: 2027-04-24T00:00:00.000Z
 Preferred-Languages: ru, en
 Canonical: https://veil.erez.pro/.well-known/security.txt
-Policy: https://veil.erez.pro/terms
-Acknowledgments: https://veil.erez.pro/
+Policy: https://github.com/NaveLIL/veil/blob/master/SECURITY.md
 
 # Veil — open-source E2EE messenger.
 # Сообщайте об уязвимостях по адресу security@erez.pro.

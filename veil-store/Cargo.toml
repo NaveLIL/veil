@@ -2,7 +2,11 @@
 name = "veil-store"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 description = "Encrypted local storage for Veil messenger — SQLCipher + OS Keychain"
 
 [dependencies]

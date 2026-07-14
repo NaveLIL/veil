@@ -18,10 +18,10 @@ import (
 	"github.com/jackc/pgx/v5"
 	"golang.org/x/crypto/curve25519"
 
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/cryptokey"
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/logsafe"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
 )
 
 var (
@@ -35,6 +35,7 @@ var (
 	ErrBadDeviceID        = errors.New("device_id must be exactly 16 bytes")
 	ErrBadDeviceName      = errors.New("device_name must be 1..128 UTF-8 bytes without control characters")
 	ErrTooManyAttempts    = errors.New("too many auth attempts")
+	ErrRegistrationClosed = errors.New("registration is closed")
 )
 
 const wsAuthDomainV2 = "veil-ws-auth-v2\x00"
@@ -188,6 +189,9 @@ func (s *Service) VerifyResponseV1(ctx context.Context, connID string, identityK
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("find user: %w", err)
+		}
+		if !s.cfg.AllowRegistration {
+			return nil, ErrRegistrationClosed
 		}
 		// User doesn't exist — register
 		username := fmt.Sprintf("user_%x", identityKey[:4])

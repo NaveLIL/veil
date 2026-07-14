@@ -8,9 +8,9 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/db"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
 
 // Broadcaster delivers WebSocket envelopes to a set of users.

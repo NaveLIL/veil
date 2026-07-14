@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/logsafe"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
 )
 
 const (

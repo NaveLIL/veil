@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 // Store is the narrow DB surface this package needs. Defining it here

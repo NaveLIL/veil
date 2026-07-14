@@ -1612,7 +1612,7 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x11MESSAGE_TYPE_FILE\x10\x02\x12\x1b\n" +
 	"\x17MESSAGE_TYPE_VOICE_NOTE\x10\x03\x12\x1a\n" +
 	"\x16MESSAGE_TYPE_VIEW_ONCE\x10\x04\x12\x17\n" +
-	"\x13MESSAGE_TYPE_SYSTEM\x10\x05B.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\x13MESSAGE_TYPE_SYSTEM\x10\x05B2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_chat_proto_rawDescOnce sync.Once

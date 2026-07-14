@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 type directoryBindingJSON struct {

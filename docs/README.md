@@ -1,0 +1,76 @@
+# Документация Veil
+
+Этот каталог содержит архитектурные решения, эксплуатационные инструкции и
+evidence для completion gates. Veil остаётся pre-release проектом без
+независимого криптографического аудита и стабильных compatibility guarantees.
+
+## Начать отсюда
+
+- [Краткая архитектура](architecture.md) — компоненты, trust boundaries и
+  основные потоки данных.
+- [Русская entry page](../README.md) — состояние продукта, локальный запуск и
+  release process.
+- [English entry page](../README.en.md) — compact project overview.
+- [Участие в разработке](../CONTRIBUTING.md) — workflow, проверки и
+  лицензионные условия вклада.
+- [Security Policy](../SECURITY.md) — приватное сообщение об уязвимостях.
+- [Поддержка](../SUPPORT.md) — выбор канала и безопасная диагностика.
+
+## Architecture Decision Records
+
+- [ADR-0001: Authenticated Sender Keys v5 for server channels](adr/0001-authenticated-sender-keys-v5-for-server-channels.md)
+
+ADR фиксирует принятое решение и причины. Изменение такого решения должно
+добавлять новый ADR, а не незаметно переписывать исторический документ.
+
+## Operations
+
+- [Cryptographic identity rotation](operations/cryptographic-identity-rotation.md)
+- [Sender-Key device-routing cutover](operations/sender-key-device-routing-cutover.md)
+- [Production deployment](../deploy/README.md)
+
+Операционные инструкции не заменяют backup, rollback и smoke gate конкретного
+развёртывания. Секреты и production-значения не должны попадать в документацию.
+
+## Reviews и completion gates
+
+- [Phase 1–4C completion gate](reviews/phase-1-4c-completion-gate.md)
+- [Phase 2 search product gate](reviews/phase-2-search-product-gate.md)
+- [Phase 3B attachment security review](reviews/phase-3b-attachment-security-review.md)
+- [Phase 4D avatar security review](reviews/phase-4d-avatar-security-review.md)
+- [Phase 4D completion gate](reviews/phase-4d-completion-gate.md)
+- [Phase 4D text profile security review](reviews/phase-4d-text-profile-security-review.md)
+- [Phase 4E completion gate](reviews/phase-4e-completion-gate.md)
+- [Phase 4E Veil Link schema/security review](reviews/phase-4e-veil-link-schema-security-review.md)
+- [Phase 4P device push client review](reviews/phase-4p-device-push-client-review.md)
+
+Эти документы являются внутренними инженерными review и evidence, а не
+заключением независимого внешнего аудитора.
+
+## Источники статуса
+
+[INTEGRATION_ROADMAP.md](../INTEGRATION_ROADMAP.md) содержит текущие phase
+gates и остающиеся release evidence. [VEIL_DESIGN.md](../VEIL_DESIGN.md)
+содержит более широкий дизайн-контекст; наличие идеи там не означает, что она
+реализована. [ROADMAP.md](../ROADMAP.md) следует читать вместе с актуальными
+completion gates и кодом.
+
+При конфликте утверждений проверяйте в таком порядке:
+
+1. код, миграции и автоматические тесты текущего commit;
+2. соответствующий completion gate или ADR;
+3. INTEGRATION_ROADMAP;
+4. обзорные и исторические документы.
+
+## Правила документации
+
+- отделяйте implemented, experimental, planned и unsupported;
+- указывайте точный commit или версию для release/operations evidence;
+- не называйте внутреннее review внешним аудитом;
+- используйте синтетические данные и никогда не публикуйте секреты;
+- обновляйте документацию в том же PR, где меняется observable contract;
+- относительные ссылки должны работать из GitHub checkout.
+
+Оригинальные материалы документации распространяются по
+[AGPL-3.0-or-later](../LICENSE); сторонние материалы сохраняют собственные
+notices.

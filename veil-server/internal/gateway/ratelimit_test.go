@@ -6,7 +6,7 @@ import (
 
 	dto "github.com/prometheus/client_model/go"
 
-	"github.com/AegisSec/veil-server/internal/metrics"
+	"github.com/NaveLIL/veil/veil-server/internal/metrics"
 )
 
 // rejectedCount returns the current value of veil_ws_messages_rejected_total

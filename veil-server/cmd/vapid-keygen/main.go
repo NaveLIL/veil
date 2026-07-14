@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 
-	"github.com/AegisSec/veil-server/internal/push"
+	"github.com/NaveLIL/veil/veil-server/internal/push"
 )
 
 func main() {

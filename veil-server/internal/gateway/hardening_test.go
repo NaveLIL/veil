@@ -9,7 +9,7 @@ import (
 
 	"github.com/gorilla/websocket"
 
-	"github.com/AegisSec/veil-server/internal/gateway"
+	"github.com/NaveLIL/veil/veil-server/internal/gateway"
 )
 
 func wsURL(s *httptest.Server) string {

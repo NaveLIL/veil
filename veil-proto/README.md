@@ -32,11 +32,19 @@ prost_build::compile_protos(&["path/to/veil/v1/envelope.proto"], &["path/to/"])?
 
 ### Go
 ```bash
-protoc --go_out=. --go_opt=paths=source_relative veil/v1/*.proto
+# Run from the monorepo root. protoc-gen-go v1.36.11 is the reviewed version.
+protoc --proto_path=veil-proto \
+  --go_out=. \
+  --go_opt=module=github.com/NaveLIL/veil \
+  veil-proto/veil/v1/*.proto
 ```
+
+This writes the checked-in bindings to `veil-server/pkg/proto/v1`. Review both
+the `.proto` source and regenerated Go diff in the same change.
 
 ## Versioning
 
-- `v1` — current stable version
+- `v1` — current Preview wire namespace; compatibility may still change before
+  the first stable release
 - Breaking changes → `v2` (new directory)
 - Additive changes (new fields, new oneof variants) are backwards compatible

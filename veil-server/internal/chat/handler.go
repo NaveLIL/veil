@@ -15,10 +15,10 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/logsafe"
-	"github.com/AegisSec/veil-server/internal/publicerr"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
+	"github.com/NaveLIL/veil/veil-server/internal/publicerr"
 	"github.com/google/uuid"
 )
 

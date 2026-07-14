@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 // Regression test for account takeover via a public X25519 identity key.

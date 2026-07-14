@@ -8,8 +8,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/AegisSec/veil-server/internal/publicerr"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/publicerr"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
 
 const transportSecretCanary = "constraint sender_keys_owner_target_key C:\\veil\\secrets.db 199a866e-8591-4546-9edb-00381bfeb55b https://token.example/private"

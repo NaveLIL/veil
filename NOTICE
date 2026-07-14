@@ -1,0 +1,16 @@
+Veil
+Copyright (C) 2026 NaveLIL
+
+Unless a file or directory states otherwise, the original Veil material in
+this repository is licensed under the GNU Affero General Public License,
+version 3 or (at your option) any later version (AGPL-3.0-or-later). See
+LICENSE for the complete license text.
+
+Third-party components and generated files remain subject to their own
+licenses and copyright notices. Nothing in the Veil license changes those
+terms. See THIRD_PARTY_NOTICES.md for the reproducible notice process; binary
+distributions include the generated inventory and upstream license texts.
+
+The software license does not grant permission to use the Veil name or the
+Phase Shift logo in a way that implies endorsement or official status. See
+TRADEMARKS.md.

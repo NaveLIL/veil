@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/httpmw"
+	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
 )
 
 func TestRateLimit_AllowsBurstUpToCapacity(t *testing.T) {

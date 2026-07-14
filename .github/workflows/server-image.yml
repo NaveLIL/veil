@@ -70,12 +70,16 @@ jobs:
           tags: |
             type=raw,value=sha-${{ steps.source.outputs.sha }}
             type=raw,value=latest,enable=${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_branch == github.event.repository.default_branch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ steps.source.outputs.sha }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
 
       - name: Build and publish
         id: build
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
-          context: veil-server
+          context: .
           file: veil-server/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
@@ -83,6 +87,8 @@ jobs:
           labels: ${{ steps.metadata.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          build-args: |
+            VEIL_BUILD_COMMIT=${{ steps.source.outputs.sha }}
           provenance: mode=max
           sbom: true
 

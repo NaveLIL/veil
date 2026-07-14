@@ -294,6 +294,10 @@ const MAX_REST_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_AVATAR_INPUT_BYTES: usize = 2 * 1024 * 1024;
 const MAX_AVATAR_RESPONSE_BYTES: usize = 256 * 1024;
 const PROJECT_REPOSITORY_URL: &str = "https://github.com/NaveLIL/veil";
+const PROJECT_SOURCE_URL: &str = match option_env!("VEIL_PROJECT_SOURCE_URL") {
+    Some(url) => url,
+    None => PROJECT_REPOSITORY_URL,
+};
 const LEGACY_MIN_PIN_LEN: usize = 4;
 const MAX_PIN_LEN: usize = 12;
 
@@ -698,7 +702,7 @@ fn open_project_repository() -> Result<(), String> {
 
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         std::process::Command::new("rundll32.exe")
-            .args(["url.dll,FileProtocolHandler", PROJECT_REPOSITORY_URL])
+            .args(["url.dll,FileProtocolHandler", PROJECT_SOURCE_URL])
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("open project repository: {e}"))?;
@@ -708,7 +712,7 @@ fn open_project_repository() -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         std::process::Command::new("open")
-            .arg(PROJECT_REPOSITORY_URL)
+            .arg(PROJECT_SOURCE_URL)
             .spawn()
             .map_err(|e| format!("open project repository: {e}"))?;
         return Ok(());
@@ -717,7 +721,7 @@ fn open_project_repository() -> Result<(), String> {
     #[cfg(target_os = "linux")]
     {
         std::process::Command::new("xdg-open")
-            .arg(PROJECT_REPOSITORY_URL)
+            .arg(PROJECT_SOURCE_URL)
             .spawn()
             .map_err(|e| format!("open project repository: {e}"))?;
         return Ok(());

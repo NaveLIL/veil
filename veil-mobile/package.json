@@ -2,6 +2,14 @@
   "name": "veil-mobile",
   "version": "0.1.0",
   "private": true,
+  "author": "NaveLIL",
+  "license": "AGPL-3.0-or-later",
+  "homepage": "https://veil.erez.pro",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NaveLIL/veil.git",
+    "directory": "veil-mobile"
+  },
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
@@ -46,5 +54,22 @@
     "transformIgnorePatterns": [
       "node_modules[\\\\/](?!(?:\\.pnpm[\\\\/](?:(?:jest-)?react-native@|@react-native\\+|expo[^@]*@|@expo(?:nent)?\\+|react-navigation@|@react-navigation\\+|react-native-svg@)|(?:jest-)?react-native(?:[\\\\/]|$)|@react-native(?:[\\\\/]|$)|expo[^\\\\/]*(?:[\\\\/]|$)|@expo(?:nent)?(?:[\\\\/]|$)|react-navigation(?:[\\\\/]|$)|@react-navigation(?:[\\\\/]|$)|react-native-svg(?:[\\\\/]|$)))"
     ]
+  },
+  "pnpm": {
+    "overrides": {
+      "shell-quote@>=1.1.0 <=1.8.3": "1.8.4",
+      "form-data@>=4.0.0 <4.0.6": "4.0.6",
+      "@expo/cli>undici": "6.27.0",
+      "ws@>=8.0.0 <8.21.0": "8.21.0",
+      "ws@>=7.0.0 <7.5.11": "7.5.11",
+      "ws@>=6.0.0 <6.2.4": "6.2.4",
+      "postcss@>=8.0.0 <8.5.10": "8.5.10",
+      "tar@>=7.0.0 <=7.5.15": "7.5.16",
+      "js-yaml@<3.15.0": "3.15.0",
+      "js-yaml@>=4.0.0 <=4.1.1": "4.2.0",
+      "@tootallnate/once@<2.0.1": "2.0.1",
+      "@babel/core@>=7.0.0 <=7.29.0": "7.29.6",
+      "xcode>uuid": "11.1.1"
+    }
   }
 }

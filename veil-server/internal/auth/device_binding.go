@@ -7,8 +7,8 @@ import (
 	"errors"
 	"math"
 
-	"github.com/AegisSec/veil-server/internal/cryptokey"
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 const (

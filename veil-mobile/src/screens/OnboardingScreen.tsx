@@ -3,6 +3,7 @@ import {
   Animated,
   Easing,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -280,6 +281,15 @@ const WelcomeStep: React.FC<{
         />
       </View>
     </Island>
+
+    <Pressable
+      accessibilityRole="link"
+      accessibilityLabel="Open Veil source code and license"
+      onPress={() => void Linking.openURL("https://github.com/NaveLIL/veil")}
+      style={styles.licenseLink}
+    >
+      <Text style={styles.licenseText}>© 2026 NaveLIL · AGPL-3.0-or-later · no warranty · Source &amp; License</Text>
+    </Pressable>
   </View>
 );
 
@@ -510,6 +520,16 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   welcomeIsland: { gap: spacing.xl },
+  licenseLink: {
+    alignSelf: "center",
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  licenseText: {
+    color: colors.textLo,
+    fontSize: 10,
+    textAlign: "center",
+  },
   divider: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: colors.border,

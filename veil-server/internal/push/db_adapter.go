@@ -3,7 +3,7 @@ package push
 import (
 	"context"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 // dbStore adapts *db.DB to the push.Store interface so the push

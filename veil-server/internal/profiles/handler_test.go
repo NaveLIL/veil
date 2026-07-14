@@ -17,8 +17,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 	"github.com/jackc/pgx/v5"
 )
 

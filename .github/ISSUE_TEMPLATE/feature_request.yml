@@ -1,0 +1,97 @@
+name: "Feature request / Предложить изменение"
+description: "Предложение для продукта, протокола, документации или эксплуатации"
+title: "[Feature]: "
+labels:
+  - "enhancement"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Veil находится в pre-release разработке. Предложение может потребовать protocol,
+        schema, privacy и security review и не означает обещания реализации.
+        Для уязвимостей используйте приватный канал из SECURITY.md.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: "Предварительная проверка / Preflight"
+      options:
+        - label: "Я проверил открытые Issues и roadmap-документы."
+          required: true
+        - label: "Это предложение, а не нераскрытая уязвимость."
+          required: true
+        - label: "Форма не содержит секретов или реальных пользовательских данных."
+          required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: "Область / Area"
+      options:
+        - "Desktop product"
+        - "Veil Node / self-hosting"
+        - "Mobile"
+        - "Protocol / cryptography"
+        - "Storage / search / uploads"
+        - "Website / release engineering"
+        - "Documentation / community"
+        - "Other"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Проблема / Problem"
+      description: "Какую пользовательскую или операторскую проблему нужно решить? Не начинайте только с UI."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "Предлагаемое решение / Proposed solution"
+      description: "Опишите observable behavior, ограничения и критерии готовности."
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "Альтернативы / Alternatives"
+      description: "Какие варианты или обходные пути рассмотрены?"
+
+  - type: textarea
+    id: security
+    attributes:
+      label: "Security и privacy impact"
+      description: "Ключи, metadata, identity/origin, ACL, abuse, logs, storage, threat model."
+      placeholder: "None, because... / Влияет на..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: "Compatibility, schema и migration"
+      description: "Изменения wire/storage форматов, rollout, rollback и поведение старых Preview."
+      placeholder: "Not applicable, because... / Потребуется..."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: contribution
+    attributes:
+      label: "Готовность помочь / Contribution"
+      options:
+        - "Могу подготовить PR после согласования"
+        - "Могу помочь с тестированием или документацией"
+        - "Сейчас предлагаю только идею"
+    validations:
+      required: true
+
+  - type: textarea
+    id: context
+    attributes:
+      label: "Дополнительный контекст / Additional context"
+      description: "Ссылки, макеты на синтетических данных или связанные ADR/Issues."

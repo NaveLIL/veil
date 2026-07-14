@@ -808,7 +808,7 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\x1cDEVICE_BINDING_STATUS_ACTIVE\x10\x01\x12\"\n" +
 	"\x1eDEVICE_BINDING_STATUS_EXCLUDED\x10\x02\x12!\n" +
 	"\x1dDEVICE_BINDING_STATUS_REVOKED\x10\x03\x12(\n" +
-	"$DEVICE_BINDING_STATUS_LEGACY_UNBOUND\x10\x04B.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"$DEVICE_BINDING_STATUS_LEGACY_UNBOUND\x10\x04B2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_auth_proto_rawDescOnce sync.Once

@@ -29,8 +29,10 @@ services:
 
   gateway:
     build:
-      context: ./veil-server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: veil-server/Dockerfile
+      args:
+        VEIL_BUILD_COMMIT: "${VEIL_BUILD_COMMIT:-development}"
     restart: unless-stopped
     ports:
       - "127.0.0.1:9080:8080"
@@ -40,6 +42,10 @@ services:
       VEIL_WS_ORIGINS:           "${VEIL_WS_ORIGINS:?set VEIL_WS_ORIGINS in .env}"
       VEIL_CORS_ORIGINS:         "${VEIL_CORS_ORIGINS:-}"
       VEIL_WS_MAX_CONNS_PER_IP:  "${VEIL_WS_MAX_CONNS_PER_IP:-64}"
+      VEIL_ALLOW_REGISTRATION:    "${VEIL_ALLOW_REGISTRATION:-true}"
+      VEIL_SOURCE_REVISION:      "${VEIL_SOURCE_REVISION:-}"
+      VEIL_SOURCE_ARCHIVE_URL:   "${VEIL_SOURCE_ARCHIVE_URL:-}"
+      VEIL_SOURCE_BROWSE_URL:    "${VEIL_SOURCE_BROWSE_URL:-}"
       # Compose traffic may arrive through the bundled Caddy proxy. Outside
       # this topology the application default remains false/fail-closed.
       VEIL_TRUST_PROXY_HEADERS:  "${VEIL_TRUST_PROXY_HEADERS:-true}"

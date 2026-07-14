@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/AegisSec/veil-server/internal/httpmw"
+	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
 )
 
 func makeSenderKeyEnvelopeV3(group string, generation uint32, identity []byte, signingKey ed25519.PrivateKey, recipient []byte) []byte {

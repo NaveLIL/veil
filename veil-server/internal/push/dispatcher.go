@@ -19,8 +19,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/logsafe"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 	webpush "github.com/ergochat/webpush-go/v2"
 )
 

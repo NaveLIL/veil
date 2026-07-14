@@ -137,7 +137,7 @@ const file_veil_v1_voice_proto_rawDesc = "" +
 	"\x05token\x18\x01 \x01(\tR\x05token\x12\x1d\n" +
 	"\n" +
 	"server_url\x18\x02 \x01(\tR\tserverUrl\x12\x1b\n" +
-	"\troom_name\x18\x03 \x01(\tR\broomNameB.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\troom_name\x18\x03 \x01(\tR\broomNameB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_voice_proto_rawDescOnce sync.Once

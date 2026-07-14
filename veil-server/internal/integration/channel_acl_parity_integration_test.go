@@ -6,7 +6,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 // TestChannelReadSQLParity locks the deferred target-pruning predicate to the

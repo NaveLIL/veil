@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/profiles"
+	"github.com/NaveLIL/veil/veil-server/internal/profiles"
 )
 
 func TestSignedProfileAndAvatarLifecycle(t *testing.T) {

@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/logsafe"
-	"github.com/AegisSec/veil-server/internal/metrics"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
+	"github.com/NaveLIL/veil/veil-server/internal/metrics"
 )
 
 // AccessLog wraps an http.Handler and emits one structured log line per

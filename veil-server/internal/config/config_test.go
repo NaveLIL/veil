@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
 )
 
 func TestLoadRequiresDatabaseURL(t *testing.T) {
@@ -21,6 +21,7 @@ func TestLoadDefaultsWithExplicitDevOptIn(t *testing.T) {
 	t.Setenv("VEIL_ALLOW_INSECURE_DEV_DATABASE", "1")
 	t.Setenv("AUTH_CHALLENGE_TTL", "")
 	t.Setenv("AUTH_MAX_ATTEMPTS", "")
+	t.Setenv("VEIL_ALLOW_REGISTRATION", "")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -36,6 +37,9 @@ func TestLoadDefaultsWithExplicitDevOptIn(t *testing.T) {
 	if cfg.AuthMaxAttempts != 3 {
 		t.Errorf("default AuthMaxAttempts = %d, want 3", cfg.AuthMaxAttempts)
 	}
+	if cfg.AllowRegistration {
+		t.Error("default AllowRegistration = true, want fail-closed false")
+	}
 	if cfg.MaxMessageSize != 64*1024 {
 		t.Errorf("default MaxMessageSize = %d, want %d", cfg.MaxMessageSize, 64*1024)
 	}
@@ -50,6 +54,7 @@ func TestLoadFromEnv(t *testing.T) {
 	t.Setenv("PORT", "9090")
 	t.Setenv("AUTH_CHALLENGE_TTL", "1m")
 	t.Setenv("AUTH_MAX_ATTEMPTS", "5")
+	t.Setenv("VEIL_ALLOW_REGISTRATION", "true")
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -64,6 +69,17 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if cfg.AuthMaxAttempts != 5 {
 		t.Errorf("AuthMaxAttempts = %d, want 5", cfg.AuthMaxAttempts)
+	}
+	if !cfg.AllowRegistration {
+		t.Error("AllowRegistration = false, want true")
+	}
+}
+
+func TestLoadRejectsMalformedRegistrationFlag(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgresql://app:secret@db.internal:5432/veil_prod?sslmode=require")
+	t.Setenv("VEIL_ALLOW_REGISTRATION", "sometimes")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load accepted malformed VEIL_ALLOW_REGISTRATION")
 	}
 }
 

@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://127.0.0.1:1420",
     "beforeDevCommand": "pnpm dev",
-    "beforeBuildCommand": "pnpm build"
+    "beforeBuildCommand": "pnpm build:bundle"
   },
   "app": {
     "withGlobalTauri": false,
@@ -39,6 +39,10 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "copyright": "Copyright © 2026 NaveLIL",
+    "license": "AGPL-3.0-or-later",
+    "licenseFile": "../../LICENSE",
+    "resources": ["resources/*"],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

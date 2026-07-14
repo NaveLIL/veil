@@ -1299,6 +1299,10 @@ export const SettingsScreen: Component = () => {
           <span style={S.fieldLabel}>Transport</span>
           <span style={{ ...S.fieldValue, "font-family": "inherit" }}>WSS (TLS) + Protobuf</span>
         </div>
+        <div style={S.field}>
+          <span style={S.fieldLabel}>License</span>
+          <span style={{ ...S.fieldValue, "font-family": "inherit" }}>GNU AGPL v3.0 or later</span>
+        </div>
         <div style={{ ...S.field, "border-bottom": "none" }}>
           <span style={S.fieldLabel}>Framework</span>
           <span style={{ ...S.fieldValue, "font-family": "inherit" }}>Tauri v2 + SolidJS + Rust</span>
@@ -1307,9 +1311,13 @@ export const SettingsScreen: Component = () => {
 
       <div style={S.card}>
         <div style={S.cardTitle}>Links</div>
+        <div style={{ ...S.paragraph, "margin-bottom": "12px" }}>
+          Copyright © 2026 NaveLIL. Veil is free software under AGPL-3.0-or-later and comes without warranty.
+          The source link is pinned to this build in official releases and includes the complete license terms.
+        </div>
         <div style={{ display: "flex", gap: "10px", "flex-wrap": "wrap" }}>
           <button type="button" style={S.btnSecondary} onClick={() => void openRepository()}>
-            <ExternalLink size={14} strokeWidth={2} /> Open GitHub Repository
+            <ExternalLink size={14} strokeWidth={2} /> Open Source &amp; License
           </button>
         </div>
         <Show when={repositoryError()}>

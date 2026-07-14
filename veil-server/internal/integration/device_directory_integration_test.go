@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"golang.org/x/crypto/curve25519"
 )
 

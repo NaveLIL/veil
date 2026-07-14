@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 // TestPermissionSensitiveReadsFailAfterCommittedRevoke guards against the

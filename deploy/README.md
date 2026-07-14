@@ -38,6 +38,12 @@ tag. Set `VEIL_RELEASE_ID` to the matching Git tag or Git commit SHA and change
 it for every rollout. This makes Compose recreate the completed migration job
 when a release changes.
 
+Keep `VEIL_ALLOW_REGISTRATION=false` while the managed Node is in closed
+Preview. This setting blocks creation of first-time accounts but does not lock
+out identities already registered on that Node. Opening registration is an
+explicit operator decision and must be coordinated with the site's published
+privacy and support information.
+
 Make the GHCR package public, or authenticate Docker once with a dedicated
 token that has only `read:packages`. Do not store that token in `deploy/.env`:
 
@@ -112,6 +118,20 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
+Before publishing the managed-service privacy notice, verify that the host's
+existing Nginx logrotate policy covers `/var/log/nginx/veil.erez.pro.*.log`
+with `daily` and `rotate 14` (the Debian/Ubuntu Nginx package normally uses one
+global rule for `/var/log/nginx/*.log`):
+
+```sh
+sudo sed -n '1,120p' /etc/logrotate.d/nginx
+sudo logrotate --debug /etc/logrotate.d/nginx
+```
+
+Do not install a second rule for the same files: logrotate rejects duplicate
+log entries. If the host policy differs, change it deliberately and update the
+privacy notice before accepting accounts.
+
 In `/etc/nginx/stream.d/sni_routing.conf`, add the Veil destination to the
 existing `map $ssl_preread_server_name $backend` block:
 
@@ -185,6 +205,19 @@ An application image rollback cannot undo these database changes.
 The checked-out SQL files and `VEIL_GATEWAY_IMAGE` must represent the same
 release. Force removal of an old completed migration container, then start the
 stack. Gateway startup is gated on a successful one-shot migration:
+
+The gateway runs as the fixed unprivileged UID/GID `10001:10001`. Fresh named
+volumes receive the correct ownership automatically. If `veil_uploadsdata` was
+created by an older root-running image, repair it once before the rollout:
+
+```sh
+docker compose -f deploy/compose.prod.yml --env-file deploy/.env run --rm \
+  --no-deps --user 0 --cap-add CHOWN --entrypoint sh gateway \
+  -c 'chown -R 10001:10001 /var/veil/uploads'
+```
+
+`CHOWN` is restored only for this one-shot repair; the normal gateway keeps
+`cap_drop: [ALL]`. Do not make the uploads volume world-writable as a shortcut.
 
 ```sh
 docker compose -f deploy/compose.prod.yml --env-file deploy/.env rm -sf migrate

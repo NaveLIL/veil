@@ -9,11 +9,11 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/httpmw"
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
 )
 
 func main() {

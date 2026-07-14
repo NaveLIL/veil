@@ -1,0 +1,108 @@
+name: "Bug report / Сообщить об ошибке"
+description: "Воспроизводимая проблема в текущем Veil Preview, без чувствительных данных"
+title: "[Bug]: "
+labels:
+  - "bug"
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Veil находится в pre-release разработке и ещё не проходил независимый security-аудит.
+        Не публикуйте уязвимости, recovery phrase, ключи, токены, реальные сообщения или production-данные.
+        Уязвимость сообщите приватно по SECURITY.md через security@erez.pro.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: "Предварительная проверка / Preflight"
+      options:
+        - label: "Я проверил открытые Issues и не нашёл такого же сообщения."
+          required: true
+        - label: "Это обычная ошибка, а не нераскрытая уязвимость."
+          required: true
+        - label: "В форме нет секретов, персональных данных или приватного содержимого."
+          required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: "Компонент / Component"
+      options:
+        - "Desktop client"
+        - "Veil Node / Go server"
+        - "Mobile foundation"
+        - "Protocol / cryptography"
+        - "Storage / search / uploads"
+        - "Website / releases / deployment"
+        - "Documentation"
+        - "Other"
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: "Версия и commit / Version and commit"
+      description: "Укажите Preview-версию и полный или короткий Git SHA."
+      placeholder: "v0.1.0-preview, abcdef0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: "Окружение / Environment"
+      description: "ОС, архитектура, способ установки, self-hosted Node и релевантные версии инструментов."
+      placeholder: "Windows 11 x64; official Preview installer; Node at a synthetic test origin"
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: "Шаги воспроизведения / Reproduction"
+      description: "Минимальная последовательность на тестовых данных."
+      placeholder: |
+        1. Запустить...
+        2. Открыть...
+        3. Выполнить...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "Ожидаемое поведение / Expected behavior"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: "Фактическое поведение / Actual behavior"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "Очищенные логи / Sanitized logs"
+      description: "Оставьте пустым, если нельзя безопасно очистить. Не прикладывайте полный дамп."
+      render: "shell"
+
+  - type: dropdown
+    id: regression
+    attributes:
+      label: "Регрессия / Regression"
+      options:
+        - "Unknown / Неизвестно"
+        - "Yes / Да"
+        - "No / Нет"
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: "Дополнительный контекст / Additional context"
+      description: "Ссылки, безопасные скриншоты с тестовыми данными или возможная причина."

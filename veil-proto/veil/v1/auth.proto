@@ -1,7 +1,7 @@
 syntax = "proto3";
 package veil.v1;
 
-option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+option go_package = "github.com/NaveLIL/veil/veil-server/pkg/proto/v1";
 
 // Сервер отправляет challenge при подключении
 message AuthChallenge {

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 	webpush "github.com/ergochat/webpush-go/v2"
 )
 

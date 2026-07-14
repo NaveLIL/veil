@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
 	"golang.org/x/crypto/curve25519"
 )
 

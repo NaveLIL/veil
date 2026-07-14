@@ -9,8 +9,8 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/publicerr"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/publicerr"
 )
 
 type deviceBindingRequest struct {

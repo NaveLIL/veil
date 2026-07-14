@@ -5,6 +5,7 @@ on:
     branches: [master, main]
     paths:
       - "veil-desktop/src/**"
+      - "veil-desktop/index.html"
       - "veil-desktop/package.json"
       - "veil-desktop/pnpm-lock.yaml"
       - "veil-desktop/tsconfig.json"
@@ -19,6 +20,7 @@ on:
     branches: [master, main]
     paths:
       - "veil-desktop/src/**"
+      - "veil-desktop/index.html"
       - "veil-desktop/package.json"
       - "veil-desktop/pnpm-lock.yaml"
       - "veil-desktop/tsconfig.json"

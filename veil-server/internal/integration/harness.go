@@ -33,14 +33,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/chat"
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/profiles"
-	"github.com/AegisSec/veil-server/internal/servers"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/chat"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/profiles"
+	"github.com/NaveLIL/veil/veil-server/internal/servers"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
@@ -121,6 +121,7 @@ func New(t *testing.T) *Harness {
 		AuthChallengeTTL:      30 * time.Second,
 		AuthMaxAttempts:       3,
 		PreKeyLowWarning:      10,
+		AllowRegistration:     true,
 		MaxMessageSize:        64 * 1024,
 		MessageBatchLimit:     100,
 		MaxConversationFanout: 16,

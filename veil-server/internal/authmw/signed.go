@@ -31,7 +31,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/cryptokey"
+	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
 	"github.com/google/uuid"
 )
 

@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/AegisSec/veil-server/internal/cryptokey"
+	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
 )
 
 // ValidateCryptographicPublicKeys is a fail-closed startup preflight for rows

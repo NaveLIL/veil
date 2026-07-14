@@ -65,3 +65,67 @@ func TestParseCORSOriginsValidatesExactOrigins(t *testing.T) {
 		t.Fatal("origin containing a path must be rejected")
 	}
 }
+
+func TestSourceMetadataUsesOnlyCanonicalCommit(t *testing.T) {
+	const commit = "ABCDEF0123456789ABCDEF0123456789ABCDEF01"
+	metadata, err := sourceMetadataForBuild(commit, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const revision = "abcdef0123456789abcdef0123456789abcdef01"
+	if metadata.Revision != revision ||
+		metadata.ArchiveURL != projectRepositoryURL+"/archive/"+revision+".tar.gz" ||
+		metadata.BrowseURL != projectRepositoryURL+"/tree/"+revision {
+		t.Fatalf("unexpected source metadata: %#v", metadata)
+	}
+
+	for _, invalid := range []string{
+		"development",
+		"abcdef0123456789abcdef0123456789abcdef0g",
+		"abcdef0123456789abcdef0123456789abcdef01/../../issues",
+	} {
+		metadata, err := sourceMetadataForBuild(invalid, "", "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if metadata.Revision != "" || metadata.ArchiveURL != "" || metadata.BrowseURL != projectRepositoryURL {
+			t.Fatalf("sourceMetadataForBuild(%q) = %#v, want repository fallback", invalid, metadata)
+		}
+	}
+}
+
+func TestSourceMetadataOverrideIsCompleteAndHTTPS(t *testing.T) {
+	const revision = "abcdef0123456789abcdef0123456789abcdef01"
+	metadata, err := sourceMetadataForBuild(
+		"development",
+		revision,
+		"https://code.example/veil/source.tar.gz",
+		"https://code.example/veil/tree/"+revision,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Revision != revision || metadata.ArchiveURL != "https://code.example/veil/source.tar.gz" {
+		t.Fatalf("unexpected override metadata: %#v", metadata)
+	}
+
+	invalid := []struct {
+		name     string
+		revision string
+		archive  string
+		browse   string
+	}{
+		{name: "partial", revision: revision},
+		{name: "short revision", revision: "abc", archive: "https://code.example/source.tar.gz", browse: "https://code.example/tree"},
+		{name: "non https", revision: revision, archive: "http://code.example/source.tar.gz", browse: "https://code.example/tree"},
+		{name: "credentialed", revision: revision, archive: "https://user@code.example/source.tar.gz", browse: "https://code.example/tree"},
+		{name: "ephemeral query", revision: revision, archive: "https://code.example/source.tar.gz?token=x", browse: "https://code.example/tree"},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := sourceMetadataForBuild("development", tc.revision, tc.archive, tc.browse); err == nil {
+				t.Fatal("expected invalid source metadata to fail")
+			}
+		})
+	}
+}

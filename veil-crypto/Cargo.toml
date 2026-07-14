@@ -2,9 +2,12 @@
 name = "veil-crypto"
 version = "0.1.0"
 edition = "2021"
-authors = ["NaveLIL <warthunder.bizon@proton.me>"]
+authors.workspace = true
 description = "Cryptographic core for Veil messenger — X25519, Ed25519, XChaCha20-Poly1305, Double Ratchet, X3DH"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [dependencies]
 # Key exchange

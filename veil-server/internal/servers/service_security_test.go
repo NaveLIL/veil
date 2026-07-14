@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 func TestRoleManagerCannotGrantPermissionsOutsideOwnSet(t *testing.T) {

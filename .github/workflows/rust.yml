@@ -13,6 +13,7 @@ on:
       - "veil-ffi/**"
       - "veil-desktop/src-tauri/**"
       - "veil-share-viewer/**"
+      - "veil-proto/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust.yml"
@@ -28,9 +29,13 @@ on:
       - "veil-ffi/**"
       - "veil-desktop/src-tauri/**"
       - "veil-share-viewer/**"
+      - "veil-proto/**"
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/rust.yml"
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always

@@ -8,7 +8,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/cryptokey"
+	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
 	"github.com/jackc/pgx/v5"
 )
 

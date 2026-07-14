@@ -82,7 +82,7 @@ const file_veil_v1_profile_proto_rawDesc = "" +
 	"\x15veil/v1/profile.proto\x12\aveil.v1\"R\n" +
 	"\x0eProfileUpdated\x12\x17\n" +
 	"\auser_id\x18\x01 \x01(\tR\x06userId\x12'\n" +
-	"\x0fprofile_version\x18\x02 \x01(\x04R\x0eprofileVersionB.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\x0fprofile_version\x18\x02 \x01(\x04R\x0eprofileVersionB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_profile_proto_rawDescOnce sync.Once

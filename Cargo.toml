@@ -12,6 +12,13 @@ members = [
 ]
 resolver = "2"
 
+[workspace.package]
+authors = ["NaveLIL"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/NaveLIL/veil"
+homepage = "https://veil.erez.pro"
+publish = false
+
 [patch.crates-io]
 # OpenMLS keeps its unused `libcrux-provider` backend in Cargo.lock even when
 # default features are disabled.  The latest crates.io release still pins the
