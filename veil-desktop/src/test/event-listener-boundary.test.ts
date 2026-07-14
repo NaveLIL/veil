@@ -255,4 +255,48 @@ describe("authenticated event listener boundary", () => {
     await Promise.resolve();
     expect(connectCalls).toBe(2);
   });
+
+  it("never lets a startup snapshot overwrite a newer pending Veil Link event", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.listen.mockReset();
+    mocks.invoke.mockReset();
+    mocks.listen.mockImplementation(async (event: string, handler: (event: any) => unknown) => {
+      mocks.handlers.set(event, handler);
+      return vi.fn();
+    });
+
+    const staleSnapshot = {
+      flowId: "a".repeat(64),
+      canonicalOrigin: "http://127.0.0.1:9080",
+      selectorRef: "a".repeat(12),
+      expiresInSeconds: 240,
+    };
+    const newerEvent = {
+      flowId: "b".repeat(64),
+      canonicalOrigin: "http://127.0.0.1:9080",
+      selectorRef: "b".repeat(12),
+      expiresInSeconds: 300,
+    };
+    let resolveSnapshot!: (value: unknown) => void;
+    const snapshot = new Promise<unknown>((resolve) => { resolveSnapshot = resolve; });
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "get_pending_veil_link") return snapshot;
+      return undefined;
+    });
+
+    const { appStore } = await import("@/stores/app");
+    const setup = appStore.setupEventListeners();
+    await vi.waitFor(() => expect(mocks.handlers.has("veil://pending-link")).toBe(true));
+
+    mocks.handlers.get("veil://pending-link")?.({
+      event: "veil://pending-link",
+      id: 1,
+      payload: newerEvent,
+    });
+    resolveSnapshot(staleSnapshot);
+    await setup;
+
+    expect(appStore.pendingVeilLink()).toEqual(newerEvent);
+  });
 });

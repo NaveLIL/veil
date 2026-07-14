@@ -3770,12 +3770,22 @@ export const appStore = {
       }
     });
 
+      let pendingLinkEventObserved = false;
       await register<PendingVeilLink>("veil://pending-link", (event) => {
+        pendingLinkEventObserved = true;
         const value = pendingVeilLinkFromJSON(event.payload);
         setPendingVeilLink(value);
       });
       const pendingValue = await invoke<unknown>("get_pending_veil_link");
-      setPendingVeilLink(pendingValue === null ? null : pendingVeilLinkFromJSON(pendingValue));
+      // Listener registration must precede the snapshot so a Link cannot be
+      // missed between the two operations. If any event arrived after the
+      // listener became live, that event is newer authority and the startup
+      // snapshot must not visually roll it back. Native flow_id checks already
+      // make such a rollback fail closed; this guard keeps renderer state
+      // linear with the same authority.
+      if (!pendingLinkEventObserved) {
+        setPendingVeilLink(pendingValue === null ? null : pendingVeilLinkFromJSON(pendingValue));
+      }
       eventListenersInitialized = true;
     } catch (error) {
       for (const unlisten of registered.reverse()) {

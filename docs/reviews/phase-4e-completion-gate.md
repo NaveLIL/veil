@@ -58,7 +58,7 @@ Silent plaintext fallback, новый trust signal и параллельная A
 | `go test ./...` | PASS |
 | `go vet ./...` | PASS |
 | `go test -count=1 -tags=integration -timeout 15m ./internal/integration/...` | PASS, 216.308s |
-| `pnpm test:run` | PASS, 22 files / 124 tests |
+| `pnpm test:run` | PASS, 22 files / 125 tests |
 | `pnpm build` | PASS |
 | `pnpm test:visual` | PASS, 29 passed / 4 expected viewport skips |
 | Windows Rust release check, ASCII target | PASS |
@@ -87,6 +87,9 @@ Renderer матрица также подтвердила, что membership ref
 точный random native `flow_id`, а account/origin epoch change подавляет
 позднюю навигацию. Во время irreversible join Cancel/X/Escape закрыты,
 поэтому UI не обещает отмену уже начатой атомарной admission.
+Стартовая публикация pending Link также event-first: если после регистрации
+listener уже пришло более новое событие, запоздавший native snapshot не может
+визуально откатить renderer к прежнему `flow_id`.
 
 ## Ручная физическая матрица — обязательна до формального CLOSED
 
