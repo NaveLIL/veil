@@ -1,4 +1,11 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        Arc, Mutex,
+    },
+    time::{SystemTime, UNIX_EPOCH},
+};
 use veil_crypto::{
     aead, fingerprint, kdf, keys, ratchet, share, signature, x3dh, IdentityKeyPair, RatchetSession,
 };
@@ -69,6 +76,19 @@ pub struct PreKeyBundleData {
     pub one_time_prekey_id: Option<u32>,
 }
 
+#[derive(Clone, Eq, PartialEq, uniffi::Record)]
+pub struct MobileAuthenticatedBinding {
+    pub canonical_server_origin: String,
+    pub user_id: String,
+}
+
+#[derive(uniffi::Record)]
+pub struct RestSignatureData {
+    pub user_id: String,
+    pub timestamp_ms: String,
+    pub signature_base64: String,
+}
+
 // ── VeilIdentity (opaque object) ────────────────────────────
 
 #[derive(uniffi::Object)]
@@ -108,6 +128,210 @@ impl VeilIdentity {
         KeyBundleData {
             identity_key: self.inner.x25519_public_bytes().to_vec(),
             signing_key: self.inner.ed25519_public_bytes().to_vec(),
+        }
+    }
+}
+
+// ── VeilMobileSession (native account/origin binding) ──────
+
+/// Native mobile session backed by the same SQLCipher/per-device engine as
+/// desktop. Account authentication and request signatures never cross into
+/// JavaScript; Kotlin receives only bounded public binding metadata.
+#[derive(uniffi::Object)]
+pub struct VeilMobileSession {
+    client: Mutex<veil_client::api::VeilClient>,
+    runtime: tokio::runtime::Runtime,
+    binding: Mutex<Option<MobileAuthenticatedBinding>>,
+    last_rest_timestamp_ms: AtomicI64,
+}
+
+#[uniffi::export]
+impl VeilMobileSession {
+    #[uniffi::constructor]
+    pub fn from_mnemonic(mnemonic: String, database_path: String) -> Result<Arc<Self>, VeilError> {
+        if database_path.is_empty() || database_path.len() > 4096 {
+            return Err(VeilError::InvalidInput {
+                msg: "mobile database path is empty or oversized".to_string(),
+            });
+        }
+        let path = PathBuf::from(database_path);
+        if !path.is_absolute() {
+            return Err(VeilError::InvalidInput {
+                msg: "mobile database path must be absolute".to_string(),
+            });
+        }
+        let mut client = veil_client::api::VeilClient::new();
+        client
+            .init_with_mnemonic(&mnemonic, &path)
+            .map_err(|msg| VeilError::Session { msg })?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .worker_threads(2)
+            .thread_name("veil-mobile-native")
+            .build()
+            .map_err(|error| VeilError::Session {
+                msg: format!("create mobile native runtime: {error}"),
+            })?;
+        Ok(Arc::new(Self {
+            client: Mutex::new(client),
+            runtime,
+            binding: Mutex::new(None),
+            last_rest_timestamp_ms: AtomicI64::new(0),
+        }))
+    }
+
+    pub fn connect(
+        &self,
+        websocket_url: String,
+        canonical_server_origin: String,
+    ) -> Result<MobileAuthenticatedBinding, VeilError> {
+        validate_mobile_endpoint_pair(&websocket_url, &canonical_server_origin)?;
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let user_id = self
+            .runtime
+            .block_on(client.connect_with_device_name(&websocket_url, "veil-android"))
+            .map_err(|msg| VeilError::Session { msg })?;
+        require_canonical_user_id("authenticated mobile user ID", &user_id)?;
+        let identity_key = client
+            .identity_key()
+            .map_err(|msg| VeilError::Session { msg })?;
+        let signing_key = client
+            .signing_key()
+            .map_err(|msg| VeilError::Session { msg })?;
+        if let Err(msg) = client
+            .db()
+            .ok_or_else(|| "mobile SQLCipher database is unavailable".to_string())
+            .and_then(|database| {
+                database.bind_authenticated_self(
+                    &canonical_server_origin,
+                    &user_id,
+                    &identity_key,
+                    &signing_key,
+                )
+            })
+        {
+            client.disconnect();
+            return Err(VeilError::Session { msg });
+        }
+        let binding = MobileAuthenticatedBinding {
+            canonical_server_origin,
+            user_id,
+        };
+        *self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })? = Some(binding.clone());
+        Ok(binding)
+    }
+
+    pub fn authenticated_binding(&self) -> Result<MobileAuthenticatedBinding, VeilError> {
+        self.binding
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile binding: {error}"),
+            })?
+            .clone()
+            .ok_or_else(|| VeilError::Session {
+                msg: "mobile account is not authenticated".to_string(),
+            })
+    }
+
+    pub fn sign_rest_request(
+        &self,
+        canonical_server_origin: String,
+        method: String,
+        request_target: String,
+        body: Vec<u8>,
+    ) -> Result<RestSignatureData, VeilError> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        let origin = require_canonical_server_origin(&canonical_server_origin)?;
+        let binding = self.authenticated_binding()?;
+        if binding.canonical_server_origin != origin {
+            return Err(VeilError::Session {
+                msg: "REST origin differs from the authenticated mobile binding".to_string(),
+            });
+        }
+        let method = require_rest_method(&method)?;
+        require_rest_target(&request_target)?;
+        if body.len() > 64 * 1024 {
+            return Err(VeilError::InvalidInput {
+                msg: "REST request body exceeds the mobile signing limit".to_string(),
+            });
+        }
+        let timestamp_ms = self.next_rest_timestamp_ms()?;
+        let authority = origin
+            .strip_prefix("https://")
+            .or_else(|| origin.strip_prefix("http://"))
+            .ok_or_else(|| VeilError::InvalidInput {
+                msg: "canonical origin has no supported scheme".to_string(),
+            })?;
+        let canonical = format!(
+            "veil-rest-v1\n{method}\n{authority}\n{request_target}\n{timestamp_ms}\n{}",
+            hex::encode(Sha256::digest(&body)),
+        );
+        let signature = self
+            .client
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile client: {error}"),
+            })?
+            .sign_message(canonical.as_bytes())
+            .map_err(|msg| VeilError::Session { msg })?;
+        // Re-check after signing so a concurrent disconnect cannot publish a
+        // signature from an invalidated account/origin epoch.
+        if self.authenticated_binding()? != binding {
+            return Err(VeilError::Session {
+                msg: "mobile binding changed while signing REST request".to_string(),
+            });
+        }
+        Ok(RestSignatureData {
+            user_id: binding.user_id,
+            timestamp_ms: timestamp_ms.to_string(),
+            signature_base64: base64::engine::general_purpose::STANDARD.encode(signature),
+        })
+    }
+
+    pub fn disconnect(&self) -> Result<(), VeilError> {
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        client.disconnect();
+        *self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })? = None;
+        Ok(())
+    }
+}
+
+impl VeilMobileSession {
+    fn next_rest_timestamp_ms(&self) -> Result<i64, VeilError> {
+        let now: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| VeilError::Session {
+                msg: "system clock is before Unix epoch".to_string(),
+            })?
+            .as_millis()
+            .try_into()
+            .map_err(|_| VeilError::Session {
+                msg: "system clock exceeds signed millisecond range".to_string(),
+            })?;
+        let mut previous = self.last_rest_timestamp_ms.load(Ordering::Acquire);
+        loop {
+            let next = now.max(previous.checked_add(1).ok_or_else(|| VeilError::Session {
+                msg: "REST timestamp allocator exhausted".to_string(),
+            })?);
+            match self.last_rest_timestamp_ms.compare_exchange_weak(
+                previous,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Ok(next),
+                Err(actual) => previous = actual,
+            }
         }
     }
 }
@@ -475,6 +699,86 @@ fn require_canonical_server_origin(value: &str) -> Result<String, VeilError> {
     }
     Ok(canonical)
 }
+
+fn validate_mobile_endpoint_pair(
+    websocket_url: &str,
+    canonical_server_origin: &str,
+) -> Result<(), VeilError> {
+    let canonical_origin = require_canonical_server_origin(canonical_server_origin)?;
+    let rest = url::Url::parse(&canonical_origin).map_err(|error| VeilError::InvalidInput {
+        msg: format!("invalid canonical REST origin: {error}"),
+    })?;
+    let websocket = url::Url::parse(websocket_url).map_err(|error| VeilError::InvalidInput {
+        msg: format!("invalid mobile WebSocket URL: {error}"),
+    })?;
+    if !websocket.username().is_empty()
+        || websocket.password().is_some()
+        || websocket.query().is_some()
+        || websocket.fragment().is_some()
+        || websocket.path() != "/ws"
+    {
+        return Err(VeilError::InvalidInput {
+            msg: "mobile WebSocket URL must be an exact /ws endpoint without credentials, query, or fragment"
+                .to_string(),
+        });
+    }
+    let expected_scheme = match rest.scheme() {
+        "https" => "wss",
+        "http" => "ws",
+        _ => unreachable!("canonical origin already checked"),
+    };
+    if websocket.scheme() != expected_scheme
+        || websocket.host_str().map(str::to_ascii_lowercase)
+            != rest.host_str().map(str::to_ascii_lowercase)
+        || websocket.port_or_known_default() != rest.port_or_known_default()
+    {
+        return Err(VeilError::InvalidInput {
+            msg: "mobile WebSocket and REST endpoints must share one secure origin".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn require_rest_method(method: &str) -> Result<&str, VeilError> {
+    match method {
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" => Ok(method),
+        _ => Err(VeilError::InvalidInput {
+            msg: "unsupported REST method".to_string(),
+        }),
+    }
+}
+
+fn require_rest_target(target: &str) -> Result<(), VeilError> {
+    if target.is_empty()
+        || target.len() > 2048
+        || !target.starts_with('/')
+        || target.starts_with("//")
+        || target.contains('#')
+        || target.chars().any(|character| {
+            character.is_control() || character.is_whitespace() || !character.is_ascii()
+        })
+    {
+        return Err(VeilError::InvalidInput {
+            msg: "REST request target is invalid".to_string(),
+        });
+    }
+    let parsed = url::Url::parse(&format!("https://veil.invalid{target}")).map_err(|_| {
+        VeilError::InvalidInput {
+            msg: "REST request target is invalid".to_string(),
+        }
+    })?;
+    let canonical = match parsed.query() {
+        Some(query) => format!("{}?{query}", parsed.path()),
+        None => parsed.path().to_string(),
+    };
+    if canonical != target {
+        return Err(VeilError::InvalidInput {
+            msg: "REST request target is not canonical".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,5 +910,47 @@ mod tests {
             account_b.signing_key(),
         )
         .is_ok());
+    }
+
+    #[test]
+    fn mobile_endpoint_pair_is_exact_origin_scoped() {
+        assert!(validate_mobile_endpoint_pair(
+            "wss://chat.example.test/ws",
+            "https://chat.example.test:443",
+        )
+        .is_ok());
+        assert!(
+            validate_mobile_endpoint_pair("ws://127.0.0.1:9080/ws", "http://127.0.0.1:9080",)
+                .is_ok()
+        );
+        for websocket in [
+            "wss://other.example.test/ws",
+            "wss://chat.example.test/other",
+            "wss://chat.example.test/ws?origin=other",
+            "ws://chat.example.test/ws",
+        ] {
+            assert!(
+                validate_mobile_endpoint_pair(websocket, "https://chat.example.test:443",).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_rest_signing_inputs_are_canonical_and_bounded() {
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            assert!(require_rest_method(method).is_ok());
+        }
+        assert!(require_rest_method("get").is_err());
+        assert!(require_rest_target("/v1/push/vapid-key").is_ok());
+        assert!(require_rest_target("/v1/push/subscriptions/7/confirm").is_ok());
+        for target in [
+            "v1/push/vapid-key",
+            "//other.example.test/v1/push",
+            "/v1/push#fragment",
+            "/v1/push\nforged",
+            "/v1/пуш",
+        ] {
+            assert!(require_rest_target(target).is_err());
+        }
     }
 }

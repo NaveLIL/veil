@@ -1242,6 +1242,25 @@ impl VeilClient {
     /// Performs Ed25519 challenge-response authentication.
     /// Returns the server-assigned user_id (UUID).
     pub async fn connect(&mut self, server_url: &str) -> Result<String, String> {
+        self.connect_with_device_name(server_url, "veil-desktop")
+            .await
+    }
+
+    /// Connect with a fixed, native-platform device label. Product frontends
+    /// must not accept this value from untrusted network or message metadata.
+    pub async fn connect_with_device_name(
+        &mut self,
+        server_url: &str,
+        device_name: &str,
+    ) -> Result<String, String> {
+        if device_name.is_empty()
+            || device_name.len() > 128
+            || device_name.chars().any(|character| {
+                character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
+            })
+        {
+            return Err("device name is invalid".to_string());
+        }
         let identity = self.identity.as_ref().ok_or("not initialized")?;
         let device_identity = self
             .device_identity
@@ -1251,8 +1270,7 @@ impl VeilClient {
             server_url: server_url.to_string(),
         };
 
-        let mut conn =
-            Connection::connect(&config, identity, device_identity, "veil-desktop").await?;
+        let mut conn = Connection::connect(&config, identity, device_identity, device_name).await?;
 
         // Drain the Authenticated event to get user_id
         let user_id = match conn.events.try_recv() {
@@ -1274,6 +1292,17 @@ impl VeilClient {
         self.authenticated_user_id = Some(user_id.clone());
         self.connection = Some(conn);
         Ok(user_id)
+    }
+
+    /// Stop the authenticated transport and erase its process-local account
+    /// binding. Durable SQLCipher trust pins remain available for a later
+    /// authenticated reconnect.
+    pub fn disconnect(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.disconnect();
+        }
+        self.authenticated_user_id = None;
+        self.deferred_connection_events.clear();
     }
 
     /// Install retained SKDMs that were authenticated before the WS AuthResult

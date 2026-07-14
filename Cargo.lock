@@ -7159,11 +7159,16 @@ dependencies = [
 name = "veil-ffi"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
+ "hex",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
+ "tokio",
  "uniffi",
  "url",
  "uuid",
+ "veil-client",
  "veil-crypto",
 ]
 
