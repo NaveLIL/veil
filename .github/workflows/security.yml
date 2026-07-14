@@ -72,8 +72,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: veil-desktop/pnpm-lock.yaml
 
       - name: Audit dependencies
         working-directory: veil-desktop
@@ -92,8 +90,6 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
-          cache: pnpm
-          cache-dependency-path: veil-mobile/pnpm-lock.yaml
 
       - name: Audit dependencies
         working-directory: veil-mobile
@@ -162,8 +158,9 @@ jobs:
 
           # Files that handle secrets must import zeroize
           # signature/chunked_aead only borrow keys owned by zeroizing types;
-          # they do not retain raw private material themselves.
-          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs" ! -name "signature.rs" ! -name "chunked_aead.rs")
+          # public_key validates public material only. None retain raw private
+          # material themselves.
+          CRYPTO_FILES=$(find veil-crypto/src -name "*.rs" ! -name "lib.rs" ! -name "fingerprint.rs" ! -name "signature.rs" ! -name "chunked_aead.rs" ! -name "public_key.rs")
           FAIL=0
 
           for f in $CRYPTO_FILES; do
