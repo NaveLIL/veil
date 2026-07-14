@@ -8,7 +8,7 @@ x-logging: &default-logging
 
 services:
   postgres:
-    image: "${VEIL_POSTGRES_IMAGE:-postgres:16.14-alpine3.24}"
+    image: "${VEIL_POSTGRES_IMAGE:-postgres:18.4-alpine3.24}"
     restart: unless-stopped
     stop_grace_period: 1m
     shm_size: "256m"
@@ -30,7 +30,7 @@ services:
     pids_limit: 256
 
   migrate:
-    image: "${VEIL_POSTGRES_IMAGE:-postgres:16.14-alpine3.24}"
+    image: "${VEIL_POSTGRES_IMAGE:-postgres:18.4-alpine3.24}"
     restart: "no"
     read_only: true
     environment:
@@ -119,7 +119,7 @@ services:
         hard: 65536
 
   ntfy:
-    image: "${VEIL_NTFY_IMAGE:-binwiederhier/ntfy:v2.23.0}"
+    image: "${VEIL_NTFY_IMAGE:-binwiederhier/ntfy:v2.26.0}"
     profiles: ["push"]
     restart: unless-stopped
     command: serve
