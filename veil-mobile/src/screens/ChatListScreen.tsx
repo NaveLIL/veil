@@ -1,5 +1,6 @@
-import React, { useMemo, useRef, useState } from "react";
+import React, { useCallback, useMemo, useRef, useState } from "react";
 import {
+  AccessibilityInfo,
   StyleSheet,
   View,
   type NativeSyntheticEvent,
@@ -11,10 +12,11 @@ import { GlowBlobs } from "../components/onboarding/GlowBlobs";
 import { ChannelsIsland } from "../components/layout/ChannelsIsland";
 import { ChatIsland } from "../components/layout/ChatIsland";
 import { MembersIsland } from "../components/layout/MembersIsland";
+import { IdentityIslandSheet } from "../components/identity/IdentityIslandSheet";
 import { ServerRailIsland } from "../components/layout/ServerRailIsland";
 import { TopRail, type PageMeta } from "../components/layout/TopRail";
 import { colors } from "../lib/theme";
-import { DM_HOME_ID, useChatStore } from "../stores/chat";
+import { DM_HOME_ID, type Member, useChatStore } from "../stores/chat";
 
 const PAGES_BASE: PageMeta[] = [
   { key: "servers", label: "Servers", icon: "◇" },
@@ -25,7 +27,10 @@ const PAGES_BASE: PageMeta[] = [
 
 export default function ChatListScreen() {
   const pagerRef = useRef<PagerView>(null);
+  const identityReturnFocusHandle = useRef<number | null>(null);
   const [page, setPage] = useState(1);
+  const [identityProfile, setIdentityProfile] = useState<Member | null>(null);
+  const [identityReturnLabel, setIdentityReturnLabel] = useState("Members");
 
   const selectedServerId = useChatStore((s) => s.selectedServerId);
   const selectedChannelId = useChatStore((s) => s.selectedChannelId);
@@ -79,40 +84,73 @@ export default function ChatListScreen() {
     setPage(e.nativeEvent.position);
   };
 
+  const openIdentityFromChat = useCallback((profile: Member, triggerHandle: string | number) => {
+    const handle = Number(triggerHandle);
+    identityReturnFocusHandle.current = Number.isSafeInteger(handle) && handle > 0 ? handle : null;
+    setIdentityReturnLabel("Chat");
+    setIdentityProfile(profile);
+  }, []);
+
+  const openIdentityFromMembers = useCallback((profile: Member, triggerHandle: string | number) => {
+    const handle = Number(triggerHandle);
+    identityReturnFocusHandle.current = Number.isSafeInteger(handle) && handle > 0 ? handle : null;
+    setIdentityReturnLabel("Members");
+    setIdentityProfile(profile);
+  }, []);
+
+  const closeIdentity = useCallback(() => {
+    setIdentityProfile(null);
+    const handle = identityReturnFocusHandle.current;
+    identityReturnFocusHandle.current = null;
+    if (handle) requestAnimationFrame(() => AccessibilityInfo.setAccessibilityFocus(handle));
+  }, []);
+
   return (
     <View style={styles.root}>
       <View style={[StyleSheet.absoluteFill, styles.glowLayer]} pointerEvents="none">
         <GlowBlobs />
       </View>
 
-      <TopRail
-        pages={pages}
-        activeIndex={page}
-        onPress={goTo}
-        title={headerTitle}
-        subtitle={subtitle}
-      />
-
-      <PagerView
-        ref={pagerRef}
-        style={styles.pager}
-        initialPage={1}
-        offscreenPageLimit={3}
-        onPageSelected={onPageSelected}
+      <View
+        style={styles.contentLayer}
+        importantForAccessibility={identityProfile ? "no-hide-descendants" : "auto"}
+        pointerEvents={identityProfile ? "none" : "auto"}
       >
-        <View key="servers" style={styles.page}>
-          <ServerRailIsland onSelect={() => goTo(1)} />
-        </View>
-        <View key="channels" style={styles.page}>
-          <ChannelsIsland onSelect={() => goTo(2)} />
-        </View>
-        <View key="chat" style={styles.page}>
-          <ChatIsland />
-        </View>
-        <View key="members" style={styles.page}>
-          <MembersIsland />
-        </View>
-      </PagerView>
+        <TopRail
+          pages={pages}
+          activeIndex={page}
+          onPress={goTo}
+          title={headerTitle}
+          subtitle={subtitle}
+        />
+
+        <PagerView
+          ref={pagerRef}
+          style={styles.pager}
+          initialPage={1}
+          offscreenPageLimit={3}
+          onPageSelected={onPageSelected}
+        >
+          <View key="servers" style={styles.page}>
+            <ServerRailIsland onSelect={() => goTo(1)} />
+          </View>
+          <View key="channels" style={styles.page}>
+            <ChannelsIsland onSelect={() => goTo(2)} />
+          </View>
+          <View key="chat" style={styles.page}>
+            <ChatIsland onOpenIdentity={openIdentityFromChat} />
+          </View>
+          <View key="members" style={styles.page}>
+            <MembersIsland onOpenIdentity={openIdentityFromMembers} />
+          </View>
+        </PagerView>
+      </View>
+      <IdentityIslandSheet
+        profile={identityProfile}
+        contextLabel={isDmHome ? "Direct conversation" : "Server member"}
+        returnLabel={identityReturnLabel}
+        onClose={closeIdentity}
+      />
     </View>
   );
 }
@@ -120,6 +158,7 @@ export default function ChatListScreen() {
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.background },
   glowLayer: { opacity: 0.4 },
+  contentLayer: { flex: 1 },
   pager: { flex: 1 },
   page: { flex: 1 },
 });

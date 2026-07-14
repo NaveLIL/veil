@@ -9,6 +9,7 @@ package integration
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -34,6 +35,34 @@ func TestServers_CreateAndGet(t *testing.T) {
 	}
 	if got["owner_id"] != owner.ID {
 		t.Fatalf("get: owner_id=%v want %s", got["owner_id"], owner.ID)
+	}
+	if _, present := got["icon_url"]; present {
+		t.Fatalf("remote Space icon field leaked in response: %v", got)
+	}
+}
+
+func TestServers_RejectRemoteSpaceIcons(t *testing.T) {
+	h := New(t)
+	owner := h.CreateUser("no-remote-space-icons")
+
+	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers", map[string]any{
+		"name":     "Local Mark",
+		"icon_url": "https://remote.invalid/space.png",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("create with remote icon: status=%d body=%v", status, body)
+	}
+
+	status, _, body = h.Do(owner, http.MethodPost, "/v1/servers", map[string]string{"name": "Local Mark"})
+	if status != http.StatusCreated {
+		t.Fatalf("create deterministic-mark Space: status=%d body=%v", status, body)
+	}
+	spaceID := body["id"].(string)
+	status, _, body = h.Do(owner, http.MethodPatch, "/v1/servers/"+spaceID, map[string]any{
+		"icon_url": "https://remote.invalid/space.png",
+	})
+	if status != http.StatusBadRequest {
+		t.Fatalf("update with remote icon: status=%d body=%v", status, body)
 	}
 }
 
@@ -103,6 +132,13 @@ func TestChannels_CreateAndList(t *testing.T) {
 	if ch["name"] != "general" {
 		t.Fatalf("created channel name=%v want general", ch["name"])
 	}
+	status, _, unavailable := h.Do(u, http.MethodPost, "/v1/servers/"+srvID+"/channels", map[string]any{
+		"name":         "voice-without-runtime",
+		"channel_type": 1,
+	})
+	if status == http.StatusCreated {
+		t.Fatalf("Phase 7 Voice Room was exposed before its secure runtime: %v", unavailable)
+	}
 
 	status, _, list := h.Do(u, http.MethodGet, "/v1/servers/"+srvID+"/channels", nil)
 	if status != http.StatusOK {
@@ -114,11 +150,11 @@ func TestChannels_CreateAndList(t *testing.T) {
 	}
 }
 
-func TestServers_InvitePreviewIsPublic(t *testing.T) {
-	// PreviewInvite is intentionally unsigned. An unknown invite code must
+func TestServers_VeilLinkPreviewIsPublic(t *testing.T) {
+	// Public selector preview is intentionally unsigned. An unknown selector must
 	// return a clean 404 (not 401), proving the route bypasses authmw.
 	h := New(t)
-	resp, err := http.Get(h.Server.URL + "/v1/invites/does-not-exist")
+	resp, err := http.Get(h.Server.URL + "/v1/veil-links/" + strings.Repeat("A", 43))
 	if err != nil {
 		t.Fatalf("GET preview: %v", err)
 	}

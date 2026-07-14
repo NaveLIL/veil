@@ -1,0 +1,216 @@
+import type { PhaseprintIdentity } from "@/components/identity/Phaseprint";
+
+export type IdentityContextKind =
+  | "self"
+  | "direct-message"
+  | "message-author"
+  | "friend"
+  | "friend-request"
+  | "user-search"
+  | "group-member"
+  | "server-member";
+
+export interface IdentityContextRole {
+  name: string;
+  color?: string;
+}
+
+export interface IdentityIslandProfile extends PhaseprintIdentity {
+  displayName: string;
+  networkDisplayName?: string | null;
+  nickname?: string | null;
+  signingKey?: string | null;
+  about?: string | null;
+  avatarAssetId?: string | null;
+  profileVersion?: string | number | null;
+  profileUpdatedAt?: string | null;
+  profileOrigin?: string | null;
+  localProofState?: "not_compared" | "verified_on_this_device" | "identity_changed" | "current_account";
+  contextKind: IdentityContextKind;
+  contextLabel: string;
+  contextDetail?: string | null;
+  joinedAt?: string | null;
+  roles?: readonly IdentityContextRole[];
+  rolesTruncated?: boolean;
+  isOwner?: boolean;
+  selfIdentity?: PhaseprintIdentity | null;
+}
+
+export type IdentityProofState =
+  | "self"
+  | "not-compared"
+  | "verified-on-device"
+  | "identity-changed"
+  | "unavailable";
+
+const USER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const IDENTITY_KEY_RE = /^[0-9a-f]{64}$/i;
+const NIL_USER_ID = "00000000-0000-0000-0000-000000000000";
+
+// Role state remains complete in the store/native authorization paths. This
+// budget only bounds untrusted presentation work in profile chips and menus.
+export const IDENTITY_ROLE_PRESENTATION_BUDGET = 64;
+
+export function boundedIdentityRoles<T>(roles: readonly T[]): readonly T[] {
+  return roles.length > IDENTITY_ROLE_PRESENTATION_BUDGET
+    ? roles.slice(0, IDENTITY_ROLE_PRESENTATION_BUDGET)
+    : roles;
+}
+
+export function boundedIdentityText(
+  value: string | null | undefined,
+  fallback: string,
+  maxCodePoints = 256,
+): string {
+  const normalized = value?.trim().normalize("NFC");
+  if (!normalized) return fallback;
+  return Array.from(normalized).slice(0, maxCodePoints).join("");
+}
+
+export function canonicalIdentityOrigin(value: string | null | undefined): string | null {
+  if (!value || value.length > 512) return null;
+  try {
+    const parsed = new URL(value);
+    if (
+      (parsed.protocol !== "https:" && parsed.protocol !== "http:")
+      || parsed.username
+      || parsed.password
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+    ) return null;
+    const hostname = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+    const loopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    if (parsed.protocol === "http:" && !loopback) return null;
+    const port = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    const authority = hostname.includes(":") ? `[${hostname}]` : hostname;
+    return `${parsed.protocol}//${authority}:${port}`;
+  } catch {
+    return null;
+  }
+}
+
+export function canonicalIdentityUserId(value: string | null | undefined): string | null {
+  const candidate = value?.trim().toLowerCase();
+  if (!candidate || candidate === NIL_USER_ID || !USER_ID_RE.test(candidate)) return null;
+  return candidate;
+}
+
+export function canonicalIdentityKey(value: string | null | undefined): string | null {
+  const candidate = value?.trim().toLowerCase();
+  if (!candidate || /^0{64}$/.test(candidate) || !IDENTITY_KEY_RE.test(candidate)) return null;
+  return candidate;
+}
+
+export function identityAllowsKeylessDmResolution(profile: IdentityIslandProfile): boolean {
+  return profile.identityKey == null
+    && (profile.contextKind === "friend" || profile.contextKind === "friend-request");
+}
+
+export function isSameCanonicalIdentity(
+  left: PhaseprintIdentity,
+  right: PhaseprintIdentity,
+): boolean {
+  const leftOrigin = canonicalIdentityOrigin(left.canonicalServerOrigin);
+  const leftUserId = canonicalIdentityUserId(left.userId);
+  const leftIdentityKey = canonicalIdentityKey(left.identityKey);
+  const rightOrigin = canonicalIdentityOrigin(right.canonicalServerOrigin);
+  const rightUserId = canonicalIdentityUserId(right.userId);
+  const rightIdentityKey = canonicalIdentityKey(right.identityKey);
+
+  return !!leftOrigin
+    && !!leftUserId
+    && !!leftIdentityKey
+    && leftOrigin === rightOrigin
+    && leftUserId === rightUserId
+    && leftIdentityKey === rightIdentityKey;
+}
+
+export function identityProofState(profile: IdentityIslandProfile): IdentityProofState {
+  const hasCompleteLocator = !!canonicalIdentityOrigin(profile.canonicalServerOrigin)
+    && !!canonicalIdentityUserId(profile.userId)
+    && !!canonicalIdentityKey(profile.identityKey);
+  if (!hasCompleteLocator) return "unavailable";
+  if (profile.selfIdentity && isSameCanonicalIdentity(profile, profile.selfIdentity)) return "self";
+  if (profile.localProofState === "verified_on_this_device") return "verified-on-device";
+  if (profile.localProofState === "identity_changed") return "identity-changed";
+  return "not-compared";
+}
+
+export function mergeIdentityProofState(
+  profile: IdentityIslandProfile,
+  next: IdentityIslandProfile["localProofState"],
+): IdentityIslandProfile {
+  // Identity-change observations are durable and never auto-cleared by the
+  // native store. Mirror that monotonicity in renderer state so an older async
+  // profile/proof response cannot visually downgrade an active quarantine.
+  if (profile.localProofState === "identity_changed" && next !== "identity_changed") {
+    return profile;
+  }
+  return { ...profile, localProofState: next };
+}
+
+export function canMessageIdentity(
+  profile: IdentityIslandProfile,
+  currentCanonicalOrigin: string | null | undefined,
+  currentUserId: string | null | undefined,
+): boolean {
+  const profileOrigin = canonicalIdentityOrigin(profile.canonicalServerOrigin);
+  const currentOrigin = canonicalIdentityOrigin(currentCanonicalOrigin);
+  const targetUserId = canonicalIdentityUserId(profile.userId);
+  const selfUserId = canonicalIdentityUserId(currentUserId);
+  return !!profileOrigin
+    && profileOrigin === currentOrigin
+    && !!targetUserId
+    && targetUserId !== selfUserId;
+}
+
+export function messageAuthorContextLabel(
+  context: string | null | undefined,
+  isSelf: boolean,
+): "Your message" | "Former member" | "Message author" {
+  if (isSelf) return "Your message";
+  return context === "former_member_at_observation" ? "Former member" : "Message author";
+}
+
+export function identityProfileKey(profile: IdentityIslandProfile): string {
+  return [
+    canonicalIdentityOrigin(profile.canonicalServerOrigin) ?? "origin-unavailable",
+    canonicalIdentityUserId(profile.userId) ?? "user-unavailable",
+    canonicalIdentityKey(profile.identityKey) ?? "key-unavailable",
+    profile.contextKind,
+  ].join("\0");
+}
+
+export function identityProfileMatchesAuthenticatedOrigin(
+  profile: IdentityIslandProfile,
+  authenticatedOrigin: string | null | undefined,
+): boolean {
+  const profileOrigin = canonicalIdentityOrigin(profile.canonicalServerOrigin);
+  const scopeOrigin = canonicalIdentityOrigin(authenticatedOrigin);
+  return !!profileOrigin && profileOrigin === scopeOrigin;
+}
+
+export function identityVerificationMatchesProfile(
+  verification: {
+    canonicalServerOrigin: string | null | undefined;
+    userId: string | null | undefined;
+    identityKey: string | null | undefined;
+    signingKey: string | null | undefined;
+  },
+  profile: IdentityIslandProfile,
+): boolean {
+  const verificationOrigin = canonicalIdentityOrigin(verification.canonicalServerOrigin);
+  const verificationUserId = canonicalIdentityUserId(verification.userId);
+  const verificationIdentityKey = canonicalIdentityKey(verification.identityKey);
+  const verificationSigningKey = canonicalIdentityKey(verification.signingKey);
+  const profileSigningKey = canonicalIdentityKey(profile.signingKey);
+  return !!verificationOrigin
+    && !!verificationUserId
+    && !!verificationIdentityKey
+    && !!verificationSigningKey
+    && verificationOrigin === canonicalIdentityOrigin(profile.canonicalServerOrigin)
+    && verificationUserId === canonicalIdentityUserId(profile.userId)
+    && verificationIdentityKey === canonicalIdentityKey(profile.identityKey)
+    && (!profileSigningKey || verificationSigningKey === profileSigningKey);
+}

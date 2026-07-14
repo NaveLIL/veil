@@ -3,27 +3,33 @@ package main
 import (
 	"context"
 	_ "embed"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/auth"
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/chat"
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/db"
-	"github.com/AegisSec/veil-server/internal/gateway"
-	"github.com/AegisSec/veil-server/internal/httpmw"
-	"github.com/AegisSec/veil-server/internal/metrics"
-	"github.com/AegisSec/veil-server/internal/mls"
-	"github.com/AegisSec/veil-server/internal/push"
-	"github.com/AegisSec/veil-server/internal/servers"
-	"github.com/AegisSec/veil-server/internal/uploads"
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/chat"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/gateway"
+	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
+	"github.com/NaveLIL/veil/veil-server/internal/metrics"
+	"github.com/NaveLIL/veil/veil-server/internal/mls"
+	"github.com/NaveLIL/veil/veil-server/internal/profiles"
+	"github.com/NaveLIL/veil/veil-server/internal/push"
+	"github.com/NaveLIL/veil/veil-server/internal/servers"
+	"github.com/NaveLIL/veil/veil-server/internal/uploads"
 )
 
 //go:embed web/index.html
@@ -47,11 +53,109 @@ var robotsTxt []byte
 //go:embed web/sitemap.xml
 var sitemapXML []byte
 
+const projectRepositoryURL = "https://github.com/NaveLIL/veil"
+
+// buildCommit is replaced with the exact source commit by the release image
+// workflow. Local development builds deliberately fall back to the repository
+// root instead of constructing a misleading source URL.
+var buildCommit = "development"
+
+type sourceMetadata struct {
+	License    string `json:"license"`
+	Copyright  string `json:"copyright"`
+	Revision   string `json:"revision,omitempty"`
+	ArchiveURL string `json:"archive_url,omitempty"`
+	BrowseURL  string `json:"browse_url"`
+}
+
+func canonicalCommit(commit string) (string, bool) {
+	commit = strings.ToLower(strings.TrimSpace(commit))
+	if len(commit) != 40 {
+		return "", false
+	}
+	if _, err := hex.DecodeString(commit); err != nil {
+		return "", false
+	}
+	return commit, true
+}
+
+func validatedSourceURL(raw string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	parsed, err := url.ParseRequestURI(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" || parsed.User != nil || parsed.Fragment != "" || parsed.RawQuery != "" {
+		return "", errors.New("must be an absolute durable HTTPS URL without credentials, query, or fragment")
+	}
+	return parsed.String(), nil
+}
+
+func sourceMetadataForBuild(commit, overrideRevision, overrideArchive, overrideBrowse string) (sourceMetadata, error) {
+	metadata := sourceMetadata{
+		License:   "AGPL-3.0-or-later",
+		Copyright: "Copyright (C) 2026 NaveLIL",
+	}
+
+	overrideRevision = strings.TrimSpace(overrideRevision)
+	overrideArchive = strings.TrimSpace(overrideArchive)
+	overrideBrowse = strings.TrimSpace(overrideBrowse)
+	hasOverride := overrideRevision != "" || overrideArchive != "" || overrideBrowse != ""
+	if hasOverride {
+		if overrideRevision == "" || overrideArchive == "" || overrideBrowse == "" {
+			return sourceMetadata{}, errors.New("VEIL_SOURCE_REVISION, VEIL_SOURCE_ARCHIVE_URL, and VEIL_SOURCE_BROWSE_URL must be set together")
+		}
+		revision, ok := canonicalCommit(overrideRevision)
+		if !ok {
+			return sourceMetadata{}, errors.New("VEIL_SOURCE_REVISION must be a full 40-character Git commit")
+		}
+		archiveURL, err := validatedSourceURL(overrideArchive)
+		if err != nil {
+			return sourceMetadata{}, fmt.Errorf("VEIL_SOURCE_ARCHIVE_URL %w", err)
+		}
+		browseURL, err := validatedSourceURL(overrideBrowse)
+		if err != nil {
+			return sourceMetadata{}, fmt.Errorf("VEIL_SOURCE_BROWSE_URL %w", err)
+		}
+		metadata.Revision = revision
+		metadata.ArchiveURL = archiveURL
+		metadata.BrowseURL = browseURL
+		return metadata, nil
+	}
+
+	revision, ok := canonicalCommit(commit)
+	if !ok {
+		metadata.BrowseURL = projectRepositoryURL
+		return metadata, nil
+	}
+	metadata.Revision = revision
+	metadata.ArchiveURL = projectRepositoryURL + "/archive/" + revision + ".tar.gz"
+	metadata.BrowseURL = projectRepositoryURL + "/tree/" + revision
+	return metadata, nil
+}
+
 func main() {
 	// Switch to structured JSON logging via slog (consumed by httpmw.AccessLog).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
+	if err := httpmw.ConfigureClientIPFromEnv(); err != nil {
+		log.Fatalf("proxy configuration error: %v", err)
+	}
+	sourceInfo, err := sourceMetadataForBuild(
+		buildCommit,
+		os.Getenv("VEIL_SOURCE_REVISION"),
+		os.Getenv("VEIL_SOURCE_ARCHIVE_URL"),
+		os.Getenv("VEIL_SOURCE_BROWSE_URL"),
+	)
+	if err != nil {
+		log.Fatalf("source metadata configuration error: %v", err)
+	}
+	sourceInfoJSON, err := json.Marshal(sourceInfo)
+	if err != nil {
+		log.Fatalf("source metadata encoding error: %v", err)
+	}
+	sourceInfoJSON = append(sourceInfoJSON, '\n')
 
 	// Connect to PostgreSQL
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -62,6 +166,9 @@ func main() {
 		log.Fatalf("database connection failed: %v", err)
 	}
 	defer database.Close()
+	if err := database.ValidateCryptographicPublicKeys(ctx); err != nil {
+		log.Fatalf("database cryptographic-key preflight failed: %v", err)
+	}
 	log.Println("database connected")
 
 	// Initialize services
@@ -89,38 +196,61 @@ func main() {
 	// all share the same DB). The legacy unsigned bypass was removed in W3 —
 	// every REST call must carry the X-Veil-{User,Timestamp,Signature} triplet.
 	signedMw := authmw.New(serversSvc.SigningKeyLookup())
+	defer signedMw.Close()
 	rl := authmw.NewRateLimit(240, time.Minute) // 4 req/sec sustained, burst 240
+	defer rl.Close()
+	profileMutationRL := authmw.NewRateLimit(12, time.Minute)
+	defer profileMutationRL.Close()
+	// Bound unauthenticated key lookup + Ed25519 verification before the
+	// verified-principal limiter inside each REST route.
+	preAuthRL := authmw.NewRateLimit(600, time.Minute)
+	defer preAuthRL.Close()
 
 	// Auth REST endpoints (prekeys, devices, user lookup)
 	authHandler := auth.NewHandler(authSvc, signedMw, rl)
 	authHandler.RegisterRoutes(mux)
+	profileStore := profiles.NewPostgresStore(database.Pool)
+	profilesHandler := profiles.NewHandler(profileStore, signedMw, rl, profileMutationRL, hub)
+	profilesHandler.RegisterRoutes(mux)
+	avatarJanitorCtx, avatarJanitorCancel := context.WithCancel(context.Background())
+	defer avatarJanitorCancel()
+	go profiles.RunAvatarJanitor(avatarJanitorCtx, profileStore, slog.Default())
 
 	// Chat REST endpoints (message sync, conversations)
 	chatHandler := chat.NewHandler(chatSvc, signedMw, rl)
 	chatHandler.RegisterRoutes(mux)
 
 	serversHandler := servers.NewHandler(serversSvc, signedMw, rl)
+	veilPreviewRL := authmw.NewRateLimit(30, time.Minute)
+	defer veilPreviewRL.Close()
+	veilJoinRL := authmw.NewRateLimit(10, time.Minute)
+	defer veilJoinRL.Close()
+	serversHandler.SetVeilLinkRateLimits(veilPreviewRL, veilJoinRL)
 	serversHandler.RegisterRoutes(mux)
 
-	// Phase 4 — UnifiedPush + ntfy. The push notifier wires into the
+	// Phase 4P — UnifiedPush over RFC 8291 Web Push. The notifier wires into the
 	// gateway's offline-fanout path: when sendToUser finds zero live
-	// WS sessions, the dispatcher POSTs an encrypted envelope to every
-	// distributor URL the recipient has registered. Boots in disabled
-	// mode when VEIL_PUSH_TRANSPORT_KEY is unset (subscribe/list/delete
-	// remain reachable but no traffic leaves the gateway).
-	pushKey, err := push.LoadTransportKey()
+	// WS sessions, the dispatcher POSTs a fixed-size encrypted wake-up to every
+	// validated distributor URL. New registration and delivery fail closed when
+	// VAPID is not configured; list/policy/delete remain available.
+	vapid, err := push.LoadVAPIDConfig()
 	if err != nil {
 		log.Fatalf("push: %v", err)
 	}
+	pushEndpointPolicy, err := push.LoadEndpointPolicy()
+	if err != nil {
+		log.Fatalf("push endpoint policy: %v", err)
+	}
 	pushDispatcher := push.New(push.Options{
-		Store:        push.NewDBStore(database),
-		TransportKey: pushKey,
-		Salt:         push.LoadSalt(),
-		MaxJitter:    push.LoadJitter(),
-		Logger:       slog.Default(),
+		Store:          push.NewDBStore(database),
+		VAPID:          vapid,
+		EndpointPolicy: pushEndpointPolicy,
+		MaxJitter:      push.LoadJitter(),
+		Logger:         slog.Default(),
 	})
 	hub.SetPushNotifier(pushDispatcher)
-	pushHandler := push.NewHandler(database, signedMw, rl)
+	pushHandler := push.NewHandlerWithEndpointPolicy(database, signedMw, rl, pushEndpointPolicy)
+	pushHandler.SetDispatcher(pushDispatcher)
 	pushHandler.RegisterRoutes(mux)
 	if pushDispatcher.Enabled() {
 		log.Printf("push dispatcher enabled (jitter=%s)", push.LoadJitter())
@@ -162,6 +292,7 @@ func main() {
 	mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		w.Header().Set("Cache-Control", "public, max-age=3600")
+		w.Header().Set("Link", "</source>; rel=\"source\"")
 		w.Write(landingHTML)
 	})
 
@@ -171,6 +302,7 @@ func main() {
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
 			w.Header().Set("Cache-Control", "public, max-age=3600")
 			w.Header().Set("X-Robots-Tag", "noindex")
+			w.Header().Set("Link", "</source>; rel=\"source\"")
 			w.Write(body)
 		}
 	}
@@ -178,6 +310,23 @@ func main() {
 	mux.HandleFunc("GET /privacy/", staticHTML(privacyHTML))
 	mux.HandleFunc("GET /terms", staticHTML(termsHTML))
 	mux.HandleFunc("GET /terms/", staticHTML(termsHTML))
+	mux.HandleFunc("GET /source", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		target := sourceInfo.ArchiveURL
+		if target == "" {
+			target = sourceInfo.BrowseURL
+		}
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("GET /source/browse", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		http.Redirect(w, r, sourceInfo.BrowseURL, http.StatusTemporaryRedirect)
+	})
+	mux.HandleFunc("GET /.well-known/veil-source.json", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		w.Write(sourceInfoJSON)
+	})
 
 	mux.HandleFunc("GET /legal.css", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/css; charset=utf-8")
@@ -239,6 +388,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.HandleFunc("GET /readyz", readinessHandler(database.Pool))
 
 	// W4 — Prometheus exposition endpoint moves to a separate internal-only
 	// listener bound to VEIL_INTERNAL_ADDR (default 127.0.0.1:9090). The
@@ -251,12 +401,22 @@ func main() {
 		mux.Handle("GET /metrics", metrics.Handler())
 	}
 
+	corsOrigins, err := parseCORSOrigins()
+	if err != nil {
+		log.Fatalf("CORS configuration error: %v", err)
+	}
+	publicHandler := http.HandlerFunc(preAuthRL.Wrap(mux.ServeHTTP))
 	server := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(parseCORSOrigins()), httpmw.AccessLog(slog.Default()))(mux),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + cfg.Port,
+		Handler:           httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(corsOrigins), httpmw.AccessLog(slog.Default()))(publicHandler),
+		ReadHeaderTimeout: 10 * time.Second,
+		// Encrypted tus chunks and large signed REST responses must not be cut
+		// off by the old 15-second whole-request deadline. HeaderTimeout keeps
+		// the slowloris boundary tight while body I/O gets the same bounded
+		// window as the production reverse proxy.
+		ReadTimeout:  time.Hour,
+		WriteTimeout: time.Hour,
+		IdleTimeout:  90 * time.Second,
 	}
 
 	log.Printf("veil-gateway starting on :%s", cfg.Port)
@@ -303,6 +463,26 @@ func main() {
 	}
 }
 
+type pinger interface {
+	Ping(context.Context) error
+}
+
+func readinessHandler(database pinger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if err := database.Ping(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"unavailable"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ready"}`))
+	}
+}
+
 // metricsBindAddr resolves the VEIL_INTERNAL_ADDR env var, returning the
 // listen address for the internal mux and whether to keep /metrics on the
 // public mux as well.
@@ -329,22 +509,31 @@ func metricsBindAddr() (addr string, exposePublic bool) {
 }
 
 // parseCORSOrigins reads VEIL_CORS_ORIGINS (comma-separated) and returns the
-// allow-list. Defaults to "*" (any origin) when unset, matching the previous
-// permissive behaviour for desktop/mobile clients on first deploy.
-func parseCORSOrigins() []string {
+// allow-list. Empty configuration is fail-closed for browser origins; native
+// Tauri/mobile HTTP clients do not send Origin and are unaffected. An explicit
+// "*" remains available for isolated development only.
+func parseCORSOrigins() ([]string, error) {
 	raw := strings.TrimSpace(os.Getenv("VEIL_CORS_ORIGINS"))
 	if raw == "" {
-		return []string{"*"}
+		return nil, nil
 	}
 	parts := strings.Split(raw, ",")
 	out := make([]string, 0, len(parts))
 	for _, p := range parts {
-		if v := strings.TrimSpace(p); v != "" {
-			out = append(out, v)
+		v := strings.TrimSpace(p)
+		if v == "" {
+			continue
 		}
+		if v == "*" {
+			log.Printf("WARN: VEIL_CORS_ORIGINS=* allows every browser origin; development only")
+			out = append(out, v)
+			continue
+		}
+		parsed, err := url.Parse(v)
+		if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+			return nil, fmt.Errorf("invalid browser origin %q", v)
+		}
+		out = append(out, strings.ToLower(v))
 	}
-	if len(out) == 0 {
-		return []string{"*"}
-	}
-	return out
+	return out, nil
 }

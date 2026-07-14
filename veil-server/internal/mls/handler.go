@@ -7,7 +7,8 @@ import (
 	"errors"
 	"net/http"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/publicerr"
 	"github.com/jackc/pgx/v5"
 )
 
@@ -36,11 +37,11 @@ func NewHandler(store *Store, mw *authmw.Middleware, rl *authmw.RateLimit, hub F
 // RegisterRoutes mounts the MLS routes on a mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	signed := func(f http.HandlerFunc) http.HandlerFunc {
-		if h.mw != nil {
-			f = h.mw.RequireSigned(f)
-		}
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
+		}
+		if h.mw != nil {
+			f = h.mw.RequireSigned(f)
 		}
 		return f
 	}
@@ -258,7 +259,12 @@ func (h *Handler) uploadCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := h.store.InsertCommit(r.Context(), req.ConversationID, req.Epoch, senderUserID, blob); err != nil {
-		writeJSONErr(w, httpStatusForErr(err), err.Error())
+		status := httpStatusForErr(err)
+		mapped := err
+		if errors.Is(err, ErrEpochConflict) {
+			mapped = publicerr.New(status, "mls_epoch_conflict", "MLS epoch already committed", err)
+		}
+		publicerr.Write(w, status, mapped)
 		return
 	}
 	if h.hub != nil {

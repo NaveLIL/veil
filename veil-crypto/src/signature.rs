@@ -1,4 +1,4 @@
-use ed25519_dalek::{Signature, Signer, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, VerifyingKey};
 
 use crate::keys::IdentityKeyPair;
 
@@ -16,7 +16,7 @@ pub fn verify(public_key: &[u8; 32], message: &[u8], signature: &[u8; 64]) -> bo
     let Ok(sig) = Signature::from_slice(signature) else {
         return false;
     };
-    verifying_key.verify(message, &sig).is_ok()
+    verifying_key.verify_strict(message, &sig).is_ok()
 }
 
 #[cfg(test)]
@@ -81,5 +81,23 @@ mod tests {
         let sig2 = sign(&identity, message);
 
         assert_eq!(sig1, sig2, "Ed25519 signatures must be deterministic");
+    }
+
+    #[test]
+    fn test_weak_identity_key_and_signature_are_rejected_strictly() {
+        // The compressed Edwards identity point is a valid byte encoding but
+        // a small-order public key. Non-strict verification can accept
+        // degenerate key/signature combinations for some messages.
+        let mut weak_public_key = [0u8; 32];
+        weak_public_key[0] = 1;
+        let mut forged_signature = [0u8; 64];
+        forged_signature[0] = 1;
+
+        assert!(!verify(&weak_public_key, b"", &forged_signature));
+        assert!(!verify(
+            &weak_public_key,
+            b"veil strict verification",
+            &forged_signature,
+        ));
     }
 }

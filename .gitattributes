@@ -1,0 +1,11 @@
+* text=auto
+
+# These files execute inside Linux containers even when the repository is
+# checked out on Windows. CRLF would make /bin/sh and Docker entrypoints fail.
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Windows-native scripts should keep the platform convention.
+*.ps1 text eol=crlf

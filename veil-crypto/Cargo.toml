@@ -2,16 +2,20 @@
 name = "veil-crypto"
 version = "0.1.0"
 edition = "2021"
-authors = ["NaveLIL <warthunder.bizon@proton.me>"]
+authors.workspace = true
 description = "Cryptographic core for Veil messenger — X25519, Ed25519, XChaCha20-Poly1305, Double Ratchet, X3DH"
-license = "MIT"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [dependencies]
 # Key exchange
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 
 # Signatures
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
+curve25519-dalek = "4"
 
 # AEAD (message encryption)
 chacha20poly1305 = "0.10"
@@ -23,7 +27,7 @@ hmac = "0.12"
 argon2 = "0.5"
 
 # BIP39 mnemonic
-bip39 = "2"
+bip39 = { version = "2", features = ["zeroize"] }
 
 # Random number generation
 rand = "0.8"

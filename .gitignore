@@ -1,6 +1,5 @@
 # Rust
 target/
-Cargo.lock
 
 # Node
 node_modules/
@@ -19,10 +18,26 @@ veil-server/veil-server
 .DS_Store
 Thumbs.db
 
+# Local secrets
+.env
+.env.*
+!.env.example
+backups/
+*.jks
+*.keystore
+*.p12
+*.pfx
+*.key
+*.pem
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+
 # Build artifacts
 *.wasm
-pkg/
-!veil-server/pkg/
+veil-desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt
+veil-server/THIRD_PARTY_NOTICES.txt
 
 # Coverage
 coverage/

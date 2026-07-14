@@ -1,0 +1,14 @@
+.git
+.gitignore
+.env
+.env.*
+gateway
+gateway-linux
+veil-gateway
+cmd/gateway/downloads/*
+coverage/
+*.test
+*.out
+*.key
+*.p12
+*.pfx

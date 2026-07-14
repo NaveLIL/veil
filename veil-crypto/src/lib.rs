@@ -22,6 +22,7 @@ pub mod chunked_aead;
 pub mod fingerprint;
 pub mod kdf;
 pub mod keys;
+pub mod public_key;
 pub mod ratchet;
 pub mod sender_key;
 pub mod share;
@@ -30,5 +31,7 @@ pub mod x3dh;
 
 pub use keys::{IdentityKeyPair, KeyBundle};
 pub use ratchet::RatchetSession;
-pub use sender_key::{SenderKeyDistribution, SenderKeyStore};
+pub use sender_key::{
+    AuthenticatedSkdm, SenderKeyDistribution, SenderKeyStore, UnverifiedSkdmMetadata,
+};
 pub use x3dh::{PreKeyBundle, X3DHResult};

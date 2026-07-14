@@ -1,7 +1,7 @@
 syntax = "proto3";
 package veil.v1;
 
-option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+option go_package = "github.com/NaveLIL/veil/veil-server/pkg/proto/v1";
 
 import "veil/v1/auth.proto";
 import "veil/v1/chat.proto";
@@ -11,6 +11,7 @@ import "veil/v1/server.proto";
 import "veil/v1/media.proto";
 import "veil/v1/voice.proto";
 import "veil/v1/friends.proto";
+import "veil/v1/profile.proto";
 
 // Envelope — корневое сообщение для всех WebSocket фреймов.
 // Клиент и сервер обмениваются исключительно Envelope.
@@ -43,6 +44,7 @@ message Envelope {
     PreKeyBundle prekey_bundle = 30;
     PreKeyRequest prekey_request = 31;
     SenderKeyDistribution sender_key_dist = 32;
+    SenderKeyReceipt sender_key_receipt = 33;
 
     // Presence
     PresenceUpdate presence_update = 40;
@@ -61,6 +63,9 @@ message Envelope {
     // Servers & Channels
     ServerEvent server_event = 50;
     ChannelEvent channel_event = 51;
+
+    // Presentation-only profile invalidation; never a roster/crypto event.
+    ProfileUpdated profile_updated = 52;
 
     // Shares
     ShareCreate share_create = 60;

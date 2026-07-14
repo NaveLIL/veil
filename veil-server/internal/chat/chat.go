@@ -7,15 +7,21 @@ import (
 	"log"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/db"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
 
 var (
-	ErrNotMember     = errors.New("not a conversation member")
-	ErrMessageTooBig = errors.New("message ciphertext too large")
-	ErrNoPreKeys     = errors.New("no signed prekey available for target")
+	ErrNotMember                    = errors.New("not a conversation member")
+	ErrInsufficientPermissions      = errors.New("insufficient permissions")
+	ErrMessageTooBig                = errors.New("message ciphertext too large")
+	ErrNoPreKeys                    = errors.New("no signed prekey available for target")
+	ErrPreKeyAccessDenied           = errors.New("prekey access requires a shared conversation")
+	ErrMessageConversationMismatch  = errors.New("message does not belong to conversation")
+	ErrAttachmentAccess             = errors.New("attachment is unavailable or not owned by sender")
+	ErrSecureMessageEditUnsupported = errors.New("editing Sender-Key group/channel messages requires an exact device-routed edit protocol")
 )
 
 // Service handles message routing and prekey distribution.
@@ -36,7 +42,21 @@ func (s *Service) DB() *db.DB {
 // HandleSendMessage processes a client's send_message request.
 // Returns: message ID, server timestamp, list of recipient user IDs for fan-out.
 func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage) (string, time.Time, []string, error) {
+	return s.handleSendMessage(ctx, senderUserID, msg, nil)
+}
+
+// HandleSecureSendMessage supplies the authenticated device/roster snapshot
+// required for every new group/channel row. DM callers continue through
+// HandleSendMessage with no Sender-Key context.
+func (s *Service) HandleSecureSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage, security *db.MessageSecurityContext) (string, time.Time, []string, error) {
+	return s.handleSendMessage(ctx, senderUserID, msg, security)
+}
+
+func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, msg *pb.SendMessage, security *db.MessageSecurityContext) (string, time.Time, []string, error) {
 	// --- Validate ---
+	if msg == nil || msg.ConversationId == "" {
+		return "", time.Time{}, nil, errors.New("conversation_id required")
+	}
 	if len(msg.Ciphertext) == 0 {
 		return "", time.Time{}, nil, errors.New("empty ciphertext")
 	}
@@ -45,7 +65,12 @@ func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, ms
 	}
 
 	// --- Check membership ---
-	isMember, err := s.db.IsConversationMember(ctx, msg.ConversationId, senderUserID)
+	isMember, err := s.db.CanAccessConversation(
+		ctx,
+		msg.ConversationId,
+		senderUserID,
+		db.PermViewChannel|db.PermSendMessages,
+	)
 	if err != nil {
 		return "", time.Time{}, nil, fmt.Errorf("check membership: %w", err)
 	}
@@ -62,23 +87,63 @@ func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, ms
 
 	// --- Store message ---
 	dbMsg := &db.Message{
-		ConversationID: msg.ConversationId,
-		SenderID:       senderUserID,
-		Ciphertext:     msg.Ciphertext,
-		Header:         msg.Header,
-		MsgType:        int16(msg.MsgType),
-		ExpiresAt:      expiresAt,
+		ConversationID:  msg.ConversationId,
+		SenderID:        senderUserID,
+		Ciphertext:      msg.Ciphertext,
+		Header:          msg.Header,
+		MsgType:         int16(msg.MsgType),
+		ExpiresAt:       expiresAt,
+		SecurityContext: security,
+	}
+	if len(msg.Attachments) > 32 {
+		return "", time.Time{}, nil, errors.New("too many attachments")
+	}
+	seenAttachments := make(map[string]struct{}, len(msg.Attachments))
+	for position, attachment := range msg.Attachments {
+		if attachment == nil || !validAttachmentFileID(attachment.MediaId) {
+			return "", time.Time{}, nil, errors.New("invalid attachment media_id")
+		}
+		if _, duplicate := seenAttachments[attachment.MediaId]; duplicate {
+			return "", time.Time{}, nil, errors.New("duplicate attachment media_id")
+		}
+		seenAttachments[attachment.MediaId] = struct{}{}
+		if len(attachment.EncryptedKey) == 0 || len(attachment.EncryptedKey) > 4096 ||
+			len(attachment.Nonce) == 0 || len(attachment.Nonce) > 64 ||
+			attachment.ContentType != "application/octet-stream" ||
+			attachment.Size > uint64(1<<63-1) {
+			return "", time.Time{}, nil, errors.New("invalid encrypted attachment metadata")
+		}
+		dbMsg.Attachments = append(dbMsg.Attachments, db.MessageAttachment{
+			FileID:       attachment.MediaId,
+			Position:     int16(position),
+			EncryptedKey: append([]byte(nil), attachment.EncryptedKey...),
+			Nonce:        append([]byte(nil), attachment.Nonce...),
+			SizeBytes:    int64(attachment.Size),
+			ContentType:  attachment.ContentType,
+		})
 	}
 	if msg.ReplyToId != nil {
+		if *msg.ReplyToId == "" {
+			return "", time.Time{}, nil, errors.New("reply_to_id cannot be empty")
+		}
 		dbMsg.ReplyToID = msg.ReplyToId
 	}
 
 	if err := s.db.StoreMessage(ctx, dbMsg); err != nil {
+		if errors.Is(err, db.ErrReplyTargetMismatch) {
+			return "", time.Time{}, nil, ErrMessageConversationMismatch
+		}
+		if errors.Is(err, db.ErrAttachmentScope) {
+			return "", time.Time{}, nil, ErrAttachmentAccess
+		}
+		if errors.Is(err, db.ErrMessageSecurityContext) || errors.Is(err, db.ErrMessageRosterChanged) {
+			return "", time.Time{}, nil, err
+		}
 		return "", time.Time{}, nil, fmt.Errorf("store message: %w", err)
 	}
 
 	// --- Get recipients for fan-out ---
-	members, err := s.db.GetConversationMembers(ctx, msg.ConversationId)
+	members, err := s.db.GetAuthorizedConversationMembers(ctx, msg.ConversationId, db.ChannelReadPermissions)
 	if err != nil {
 		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
 	}
@@ -94,46 +159,69 @@ func (s *Service) HandleSendMessage(ctx context.Context, senderUserID string, ms
 	return dbMsg.ID, dbMsg.CreatedAt, recipients, nil
 }
 
-// HandleEditMessage processes a client's edit_message request.
-// Returns: edit timestamp, list of recipient user IDs for fan-out.
-func (s *Service) HandleEditMessage(ctx context.Context, senderUserID string, msg *pb.EditMessage) (time.Time, []string, error) {
-	if len(msg.NewCiphertext) == 0 {
-		return time.Time{}, nil, errors.New("empty ciphertext")
+func validAttachmentFileID(fileID string) bool {
+	if len(fileID) != 32 {
+		return false
 	}
-	if len(msg.NewCiphertext) > s.cfg.MaxMessageSize {
-		return time.Time{}, nil, ErrMessageTooBig
-	}
-
-	convID, editedAt, err := s.db.UpdateMessageCiphertext(ctx, msg.MessageId, senderUserID, msg.NewCiphertext, msg.NewHeader)
-	if err != nil {
-		return time.Time{}, nil, fmt.Errorf("edit message: %w", err)
-	}
-
-	members, err := s.db.GetConversationMembers(ctx, convID)
-	if err != nil {
-		return time.Time{}, nil, fmt.Errorf("get members: %w", err)
-	}
-
-	var recipients []string
-	for _, uid := range members {
-		if uid != senderUserID {
-			recipients = append(recipients, uid)
+	for _, character := range fileID {
+		if !((character >= '0' && character <= '9') || (character >= 'a' && character <= 'f')) {
+			return false
 		}
 	}
-	return editedAt, recipients, nil
+	return true
 }
 
-// HandleDeleteMessage processes a client's delete_message request.
-// Returns: list of recipient user IDs for fan-out.
-func (s *Service) HandleDeleteMessage(ctx context.Context, senderUserID string, msg *pb.DeleteMessage) ([]string, error) {
-	convID, err := s.db.SoftDeleteMessage(ctx, msg.MessageId, senderUserID)
+// HandleEditMessage processes a client's edit_message request.
+// Returns: edit timestamp, list of recipient user IDs for fan-out.
+
+func (s *Service) HandleEditMessage(ctx context.Context, senderUserID string, msg *pb.EditMessage) (string, time.Time, []string, error) {
+	if msg == nil || msg.MessageId == "" || msg.ConversationId == "" {
+		return "", time.Time{}, nil, errors.New("message_id and conversation_id required")
+	}
+	if len(msg.NewCiphertext) == 0 {
+		return "", time.Time{}, nil, errors.New("empty ciphertext")
+	}
+	if len(msg.NewCiphertext) > s.cfg.MaxMessageSize {
+		return "", time.Time{}, nil, ErrMessageTooBig
+	}
+	allowed, err := s.db.CanAccessConversation(
+		ctx,
+		msg.ConversationId,
+		senderUserID,
+		db.PermViewChannel|db.PermSendMessages,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("delete message: %w", err)
+		return "", time.Time{}, nil, fmt.Errorf("check conversation access: %w", err)
+	}
+	if !allowed {
+		return "", time.Time{}, nil, ErrNotMember
+	}
+	matches, err := s.db.MessageBelongsToConversation(ctx, msg.MessageId, msg.ConversationId)
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("check edit message scope: %w", err)
+	}
+	if !matches {
+		return "", time.Time{}, nil, ErrMessageConversationMismatch
+	}
+	conversationType, err := s.db.GetConversationType(ctx, msg.ConversationId)
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("lookup edit conversation type: %w", err)
+	}
+	if conversationType == 1 || conversationType == 2 {
+		return "", time.Time{}, nil, ErrSecureMessageEditUnsupported
 	}
 
-	members, err := s.db.GetConversationMembers(ctx, convID)
+	convID, editedAt, err := s.db.UpdateMessageCiphertext(ctx, msg.MessageId, senderUserID, msg.ConversationId, msg.NewCiphertext, msg.NewHeader)
 	if err != nil {
-		return nil, fmt.Errorf("get members: %w", err)
+		if errors.Is(err, db.ErrMessageMutationScope) {
+			return "", time.Time{}, nil, ErrMessageConversationMismatch
+		}
+		return "", time.Time{}, nil, fmt.Errorf("edit message: %w", err)
+	}
+
+	members, err := s.db.GetAuthorizedConversationMembers(ctx, convID, db.ChannelReadPermissions)
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
 	}
 
 	var recipients []string
@@ -142,23 +230,93 @@ func (s *Service) HandleDeleteMessage(ctx context.Context, senderUserID string, 
 			recipients = append(recipients, uid)
 		}
 	}
-	return recipients, nil
+	return convID, editedAt, recipients, nil
+}
+
+// HandleDeleteMessage processes a client's delete_message request. Returns
+// the authoritative conversation/revision and recipient IDs for fan-out.
+func (s *Service) HandleDeleteMessage(ctx context.Context, senderUserID string, msg *pb.DeleteMessage) (string, time.Time, []string, error) {
+	if msg == nil || msg.MessageId == "" || msg.ConversationId == "" {
+		return "", time.Time{}, nil, errors.New("message_id and conversation_id required")
+	}
+	matches, err := s.db.MessageBelongsToConversation(ctx, msg.MessageId, msg.ConversationId)
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("check delete message scope: %w", err)
+	}
+	if !matches {
+		return "", time.Time{}, nil, ErrMessageConversationMismatch
+	}
+	allowed, err := s.db.CanAccessConversation(ctx, msg.ConversationId, senderUserID, db.PermViewChannel)
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("check conversation access: %w", err)
+	}
+	if !allowed {
+		return "", time.Time{}, nil, ErrNotMember
+	}
+	convID, deletedAt, err := s.db.SoftDeleteMessage(ctx, msg.MessageId, senderUserID, msg.ConversationId)
+	if err != nil {
+		if errors.Is(err, db.ErrMessageMutationScope) {
+			return "", time.Time{}, nil, ErrMessageConversationMismatch
+		}
+		return "", time.Time{}, nil, fmt.Errorf("delete message: %w", err)
+	}
+
+	members, err := s.db.GetAuthorizedConversationMembers(ctx, convID, db.ChannelReadPermissions)
+	if err != nil {
+		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
+	}
+
+	var recipients []string
+	for _, uid := range members {
+		if uid != senderUserID {
+			recipients = append(recipients, uid)
+		}
+	}
+	return convID, deletedAt, recipients, nil
 }
 
 // HandleReaction processes a client's reaction_update request.
 // Returns: list of recipient user IDs for fan-out.
 func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *pb.ReactionUpdate) ([]string, error) {
+	if msg == nil || msg.MessageId == "" || msg.ConversationId == "" {
+		return nil, errors.New("message_id and conversation_id required")
+	}
+	if msg.Emoji == "" || len(msg.Emoji) > 64 {
+		return nil, errors.New("emoji must be between 1 and 64 bytes")
+	}
+
+	isMember, err := s.db.CanAccessConversation(
+		ctx,
+		msg.ConversationId,
+		senderUserID,
+		db.PermViewChannel|db.PermSendMessages,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("check membership: %w", err)
+	}
+	if !isMember {
+		return nil, ErrNotMember
+	}
+
+	matches, err := s.db.MessageBelongsToConversation(ctx, msg.MessageId, msg.ConversationId)
+	if err != nil {
+		return nil, fmt.Errorf("check reaction message: %w", err)
+	}
+	if !matches {
+		return nil, ErrMessageConversationMismatch
+	}
+
 	if msg.Add {
 		if err := s.db.AddReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji); err != nil {
 			return nil, fmt.Errorf("add reaction: %w", err)
 		}
 	} else {
-		if err := s.db.RemoveReaction(ctx, msg.MessageId, senderUserID, msg.Emoji); err != nil {
+		if err := s.db.RemoveReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji); err != nil {
 			return nil, fmt.Errorf("remove reaction: %w", err)
 		}
 	}
 
-	members, err := s.db.GetConversationMembers(ctx, msg.ConversationId)
+	members, err := s.db.GetAuthorizedConversationMembers(ctx, msg.ConversationId, db.ChannelReadPermissions)
 	if err != nil {
 		return nil, fmt.Errorf("get members: %w", err)
 	}
@@ -173,15 +331,26 @@ func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *
 }
 
 // HandlePreKeyRequest fetches a prekey bundle for establishing an X3DH session.
-func (s *Service) HandlePreKeyRequest(ctx context.Context, targetIdentityKey []byte) (*pb.PreKeyBundle, error) {
+func (s *Service) HandlePreKeyRequest(ctx context.Context, requesterUserID string, targetIdentityKey []byte) (*pb.PreKeyBundle, error) {
 	// Find user
 	user, err := s.db.FindUserByIdentityKey(ctx, targetIdentityKey)
 	if err != nil {
 		return nil, fmt.Errorf("user not found: %w", err)
 	}
+	if requesterUserID == "" {
+		return nil, ErrPreKeyAccessDenied
+	}
+	if requesterUserID != user.ID {
+		allowed, relationErr := s.db.UsersShareConversation(ctx, requesterUserID, user.ID)
+		if relationErr != nil || !allowed {
+			return nil, ErrPreKeyAccessDenied
+		}
+	}
 
-	// For now, get the first device (multi-device fan-out is Phase 6)
-	// TODO: iterate over all devices
+	// Known limitation: this protobuf bundle represents one device only.
+	// Multi-device X3DH needs a versioned per-device bundle/session protocol;
+	// iterating here would be ambiguous and could bind an OPK to the wrong
+	// device. The REST endpoint documents the same constraint.
 
 	// We need the device's signed prekey
 	// First, find devices for this user
@@ -203,21 +372,21 @@ func (s *Service) HandlePreKeyRequest(ctx context.Context, targetIdentityKey []b
 		IdentityKey:           user.IdentityKey,
 		SignedPrekey:          spk.PublicKey,
 		SignedPrekeySignature: spk.Signature,
-		SignedPrekeyId:        uint32(spk.ID),
+		SignedPrekeyId:        spk.ProtocolKeyID,
 	}
 
 	// Try to claim a one-time prekey
 	opk, err := s.db.ClaimOneTimePreKey(ctx, device.ID)
 	if err == nil && opk != nil {
 		bundle.OneTimePrekey = opk.PublicKey
-		opkID := uint32(opk.ID)
+		opkID := opk.ProtocolKeyID
 		bundle.OneTimePrekeyId = &opkID
 	}
 
 	// Check OPK count and warn
 	remaining, _ := s.db.CountUnusedOPKs(ctx, device.ID)
 	if remaining < s.cfg.PreKeyLowWarning {
-		log.Printf("WARNING: device %s has only %d OPKs remaining", device.ID, remaining)
+		log.Printf("WARNING: device_ref=%s has only %d OPKs remaining", logsafe.Ref("device", device.ID), remaining)
 	}
 
 	return bundle, nil
@@ -235,7 +404,7 @@ func (s *Service) LookupUser(ctx context.Context, userID string) (*db.User, erro
 
 // GetConversationMembers returns user IDs for fan-out.
 func (s *Service) GetConversationMembers(ctx context.Context, convID string) ([]string, error) {
-	return s.db.GetConversationMembers(ctx, convID)
+	return s.db.GetAuthorizedConversationMembers(ctx, convID, db.ChannelReadPermissions)
 }
 
 // CreateGroup creates a group conversation and returns the conversation ID.
@@ -249,15 +418,42 @@ func (s *Service) CreateGroup(ctx context.Context, name string, creatorUserID st
 	return s.db.CreateGroup(ctx, name, creatorUserID)
 }
 
+func (s *Service) CreateCircle(ctx context.Context, name, creatorUserID string, members []db.GroupMemberLocator) (string, error) {
+	if name == "" {
+		return "", errors.New("circle name required")
+	}
+	if len(name) > 100 {
+		return "", errors.New("circle name too long")
+	}
+	if len(members) < 1 || len(members) > 32 {
+		return "", errors.New("circle requires between 1 and 32 selected members")
+	}
+	seen := map[string]struct{}{creatorUserID: {}}
+	for _, member := range members {
+		if member.UserID == "" || len(member.IdentityKey) != 32 {
+			return "", errors.New("invalid initial Circle member locator")
+		}
+		if _, exists := seen[member.UserID]; exists {
+			return "", errors.New("duplicate initial Circle member")
+		}
+		seen[member.UserID] = struct{}{}
+	}
+	return s.db.CreateGroupWithMembers(ctx, name, creatorUserID, members)
+}
+
 // AddGroupMember adds a user to a group. Only admins/owners can add.
 func (s *Service) AddGroupMember(ctx context.Context, convID, requesterID, targetUserID string) error {
+	conversationType, err := s.db.GetConversationType(ctx, convID)
+	if err != nil || conversationType != 1 {
+		return errors.New("group conversation not found")
+	}
 	// Check requester is a member with admin or owner role
 	role, err := s.db.GetMemberRole(ctx, convID, requesterID)
 	if err != nil {
 		return ErrNotMember
 	}
 	if role < 1 { // must be admin(1) or owner(2)
-		return errors.New("insufficient permissions")
+		return ErrInsufficientPermissions
 	}
 
 	// Verify target user exists
@@ -271,6 +467,10 @@ func (s *Service) AddGroupMember(ctx context.Context, convID, requesterID, targe
 
 // RemoveGroupMember removes a user from a group.
 func (s *Service) RemoveGroupMember(ctx context.Context, convID, requesterID, targetUserID string) error {
+	conversationType, err := s.db.GetConversationType(ctx, convID)
+	if err != nil || conversationType != 1 {
+		return errors.New("group conversation not found")
+	}
 	// Self-leave is always allowed
 	if requesterID == targetUserID {
 		return s.db.RemoveGroupMember(ctx, convID, targetUserID)
@@ -289,7 +489,7 @@ func (s *Service) RemoveGroupMember(ctx context.Context, convID, requesterID, ta
 
 	// Cannot kick someone with equal or higher role
 	if requesterRole <= targetRole {
-		return errors.New("insufficient permissions")
+		return ErrInsufficientPermissions
 	}
 
 	return s.db.RemoveGroupMember(ctx, convID, targetUserID)
@@ -297,6 +497,10 @@ func (s *Service) RemoveGroupMember(ctx context.Context, convID, requesterID, ta
 
 // GetGroupMembers returns detailed member info for a group.
 func (s *Service) GetGroupMembers(ctx context.Context, convID, requesterID string) ([]db.GroupMember, error) {
+	conversationType, err := s.db.GetConversationType(ctx, convID)
+	if err != nil || conversationType != 1 {
+		return nil, errors.New("group conversation not found")
+	}
 	isMember, err := s.db.IsConversationMember(ctx, convID, requesterID)
 	if err != nil || !isMember {
 		return nil, ErrNotMember

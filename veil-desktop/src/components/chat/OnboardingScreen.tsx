@@ -1,6 +1,10 @@
 import { Component, createSignal, Show, For, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { appStore } from "@/stores/app";
+import { appStore, StaleUiSessionError } from "@/stores/app";
+import { AlertTriangle, ArrowRightLeft, Check, Copy, Eye, EyeOff, KeyRound, LogIn, ShieldCheck } from "lucide-solid";
+import { VeilMark } from "@/components/brand/VeilMark";
+import { Z } from "@/lib/zIndex";
+import { confirmDecision, promptDecision } from "@/lib/decisionDialog";
 
 /* ═══════════════════════════════════════════════════════
    ONBOARDING — Hebrew rain + bottom island + transitions
@@ -18,14 +22,15 @@ const HEBREW_WORDS = [
 ];
 
 const TAGLINES = [
-  { text: "Zero-knowledge encryption", sub: "Your keys never leave this device" },
-  { text: "No phone number required", sub: "True anonymity by design" },
+  { text: "End-to-end encryption", sub: "Your identity private key stays on this device" },
+  { text: "No phone number required", sub: "No email required; anonymity is not guaranteed" },
   { text: "Open protocol", sub: "Transparent and auditable" },
   { text: "Forward secrecy", sub: "Every message has a unique key" },
   { text: "Decentralized identity", sub: "You own your cryptographic identity" },
 ];
 
 type Step = "welcome" | "generate" | "restore";
+type IdentityState = "checking" | "empty" | "existing" | "unavailable";
 
 interface RainDrop {
   id: number; word: string; x: number; delay: number;
@@ -37,16 +42,30 @@ export const OnboardingScreen: Component = () => {
   const [mnemonic, setMnemonic] = createSignal("");
   const [restoreInput, setRestoreInput] = createSignal("");
   const [showPhrase, setShowPhrase] = createSignal(true);
-  const [copied, setCopied] = createSignal(false);
   const [loading, setLoading] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [identityState, setIdentityState] = createSignal<IdentityState>("checking");
   const [taglineIdx, setTaglineIdx] = createSignal(0);
   const [taglineFade, setTaglineFade] = createSignal(true);
   const [rainDrops, setRainDrops] = createSignal<RainDrop[]>([]);
   const [leaving, setLeaving] = createSignal(false);
   const [entering, setEntering] = createSignal(false);
+  const [phraseCopied, setPhraseCopied] = createSignal(false);
 
   const words = () => mnemonic().split(" ").filter(Boolean);
+  const existingIdentity = () => identityState() === "existing";
+
+  const refreshIdentityState = async (): Promise<IdentityState> => {
+    try {
+      const next = await invoke<boolean>("has_stored_identity") ? "existing" : "empty";
+      setIdentityState(next);
+      return next;
+    } catch {
+      setIdentityState("unavailable");
+      setError("Veil could not inspect the encrypted identity vault. Account creation stays blocked until the vault is available.");
+      return "unavailable";
+    }
+  };
 
   onMount(() => {
     const drops: RainDrop[] = Array.from({ length: 50 }, (_, i) => ({
@@ -61,7 +80,12 @@ export const OnboardingScreen: Component = () => {
     setRainDrops(drops);
   });
 
+  onMount(async () => {
+    await refreshIdentityState();
+  });
+
   let taglineTimer: ReturnType<typeof setInterval>;
+  let copiedTimer: ReturnType<typeof setTimeout> | undefined;
   onMount(() => {
     taglineTimer = setInterval(() => {
       setTaglineFade(false);
@@ -71,7 +95,10 @@ export const OnboardingScreen: Component = () => {
       }, 400);
     }, 4000);
   });
-  onCleanup(() => clearInterval(taglineTimer));
+  onCleanup(() => {
+    clearInterval(taglineTimer);
+    if (copiedTimer) clearTimeout(copiedTimer);
+  });
 
   const tagline = () => TAGLINES[taglineIdx()];
   const progress = () => ((taglineIdx() + 1) / TAGLINES.length) * 100;
@@ -91,6 +118,8 @@ export const OnboardingScreen: Component = () => {
     try {
       setError("");
       setLoading(true);
+      const currentIdentityState = await refreshIdentityState();
+      if (currentIdentityState !== "empty") return;
       const m = await invoke<string>("generate_mnemonic");
       setMnemonic(m);
       transitionTo("generate");
@@ -101,13 +130,8 @@ export const OnboardingScreen: Component = () => {
     }
   };
 
-  const copyToClipboard = async () => {
-    await navigator.clipboard.writeText(mnemonic());
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
-  };
-
   const initIdentity = async (phrase: string) => {
+    let identityStored = false;
     try {
       setLoading(true);
       setError("");
@@ -127,20 +151,105 @@ export const OnboardingScreen: Component = () => {
 
       const key = await invoke<string>("init_identity", { mnemonic: normalized });
       await invoke("store_seed", { mnemonic: normalized });
+      identityStored = true;
 
       appStore.setIdentity(key);
-      appStore.uploadPrekeys();
+      // Authentication and signed prekey publication are one fail-closed
+      // operation. Do not present onboarding as complete until both succeed.
+      await appStore.connectToServer();
       appStore.setScreen("disclaimer");
-      appStore.connectToServer();
-      // Phase 6 — initialise the local MLS client so subsequent
-      // upgrade-to-MLS actions and persistence have a place to land.
-      appStore.bootstrapMls().catch(() => {});
+    } catch (e) {
+      const detail = String(e);
+      if (detail.includes("a different identity already exists")) {
+        setMnemonic("");
+        setRestoreInput("");
+        setIdentityState("existing");
+        setStep("welcome");
+        setError("");
+      } else if (
+        e instanceof StaleUiSessionError
+        || detail.includes("renderer session changed while IPC was in flight")
+      ) {
+        // Signing out deliberately invalidates every renderer IPC started by
+        // the old session. This is an expected boundary, never a user-facing
+        // cryptographic failure.
+        setMnemonic("");
+        setRestoreInput("");
+        setStep("welcome");
+        await refreshIdentityState();
+      } else {
+        setError(detail);
+      }
+    } finally {
+      // Publication can fail while offline after the identity is already
+      // durable. Do not keep another UI copy of the phrase in that case.
+      if (identityStored) {
+        setMnemonic("");
+        setRestoreInput("");
+      }
+      setLoading(false);
+    }
+  };
 
-      // Clear sensitive inputs only after successful identity initialization.
-      setMnemonic("");
-      setRestoreInput("");
+  const continueWithExistingIdentity = async () => {
+    if (loading()) return;
+    setLoading(true);
+    setError("");
+    try {
+      await appStore.resumeStoredIdentity();
     } catch (e) {
       setError(String(e));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const copyRecoveryPhrase = async () => {
+    if (!mnemonic().trim() || loading()) return;
+    const approved = await confirmDecision({
+      title: "Copy recovery phrase?",
+      message: "Windows Clipboard History, cloud sync, screen recorders, and other applications may retain clipboard contents after Veil closes. Copy only to paste immediately into a trusted password manager. Veil cannot guarantee deletion from clipboard history.",
+      confirmLabel: "Copy phrase",
+      cancelLabel: "Keep it off clipboard",
+      danger: true,
+    });
+    if (!approved) return;
+    try {
+      await navigator.clipboard.writeText(mnemonic());
+      setPhraseCopied(true);
+      if (copiedTimer) clearTimeout(copiedTimer);
+      copiedTimer = setTimeout(() => setPhraseCopied(false), 3_000);
+    } catch {
+      setError("Windows denied clipboard access. Write the phrase down or save it directly in your password manager.");
+    }
+  };
+
+  const switchAccount = async () => {
+    if (loading()) return;
+    const confirmation = await promptDecision({
+      title: "Switch account",
+      message: "The current identity will be signed out from this device. Its server account is not deleted and its encrypted local vault remains recoverable with the recovery phrase. Type SWITCH ACCOUNT to continue.",
+      confirmLabel: "Switch account",
+      cancelLabel: "Cancel",
+      danger: true,
+      placeholder: "SWITCH ACCOUNT",
+      requiredValue: "SWITCH ACCOUNT",
+    });
+    if (confirmation !== "SWITCH ACCOUNT") return;
+    setLoading(true);
+    setError("");
+    try {
+      await appStore.signOut();
+      setIdentityState("empty");
+      setStep("welcome");
+    } catch (e) {
+      const detail = String(e);
+      if (e instanceof StaleUiSessionError || detail.includes("renderer session changed while IPC was in flight")) {
+        setIdentityState("empty");
+        setStep("welcome");
+      } else {
+        setError(detail);
+      }
     } finally {
       setLoading(false);
     }
@@ -149,20 +258,20 @@ export const OnboardingScreen: Component = () => {
   const S = {
     root: {
       position: "relative" as const, width: "100%", height: "100%", overflow: "hidden",
-      background: "#111117", display: "flex", "flex-direction": "column" as const,
+      background: "var(--veil-background)", display: "flex", "flex-direction": "column" as const,
       "justify-content": "flex-end", "align-items": "center",
     },
     glow1: {
       position: "absolute" as const, top: "15%", left: "30%",
       width: "500px", height: "500px", "border-radius": "50%",
-      background: "radial-gradient(circle, rgba(124,107,245,0.06) 0%, transparent 70%)",
+      background: "radial-gradient(circle, rgba(var(--veil-accent-rgb),0.06) 0%, transparent 70%)",
       filter: "blur(60px)", "pointer-events": "none" as const,
       animation: "glowPulse 6s ease-in-out infinite",
     },
     glow2: {
       position: "absolute" as const, bottom: "10%", right: "20%",
       width: "400px", height: "400px", "border-radius": "50%",
-      background: "radial-gradient(circle, rgba(124,107,245,0.04) 0%, transparent 70%)",
+      background: "radial-gradient(circle, rgba(var(--veil-accent-rgb),0.04) 0%, transparent 70%)",
       filter: "blur(80px)", "pointer-events": "none" as const,
       animation: "glowPulse 8s ease-in-out infinite 2s",
     },
@@ -172,7 +281,7 @@ export const OnboardingScreen: Component = () => {
     },
     rainDrop: (d: RainDrop) => ({
       position: "absolute" as const, left: `${d.x}%`, top: "-40px",
-      "font-size": `${d.size}px`, color: `rgba(124,107,245,${d.opacity})`,
+      "font-size": `${d.size}px`, color: `rgba(var(--veil-accent-rgb),${d.opacity})`,
       "font-family": "'Noto Sans Hebrew', 'David Libre', serif",
       "writing-mode": "vertical-rl" as const, "white-space": "nowrap" as const,
       animation: `hebrewRain ${d.duration}s linear ${d.delay}s infinite`,
@@ -181,22 +290,22 @@ export const OnboardingScreen: Component = () => {
     welcomeIsland: {
       position: "relative" as const, "z-index": "2",
       width: "calc(100% - 48px)", "max-width": "860px",
-      background: "rgba(30,31,34,0.85)", "backdrop-filter": "blur(20px)",
-      border: "1px solid rgba(255,255,255,0.06)",
+      background: "color-mix(in srgb, var(--veil-window) 85%, transparent)", "backdrop-filter": "blur(20px)",
+      border: "1px solid var(--veil-contrast-06)",
       "border-radius": "20px", padding: "36px 40px",
       "margin-bottom": "32px",
       display: "flex", "align-items": "center", gap: "36px",
-      "box-shadow": "0 8px 40px rgba(0,0,0,0.4), 0 0 80px rgba(124,107,245,0.04)",
+      "box-shadow": "0 8px 40px var(--veil-shadow), 0 0 80px rgba(var(--veil-accent-rgb),0.04)",
       transition: "opacity 0.35s ease, transform 0.35s ease",
     },
     centerIsland: {
       position: "relative" as const, "z-index": "2",
-      width: "calc(100% - 48px)", "max-width": "560px",
-      background: "rgba(30,31,34,0.9)", "backdrop-filter": "blur(20px)",
-      border: "1px solid rgba(255,255,255,0.06)",
-      "border-radius": "20px", padding: "36px 40px",
+      width: "calc(100% - 48px)", "max-width": "780px",
+      background: "color-mix(in srgb, var(--veil-window) 90%, transparent)", "backdrop-filter": "blur(20px)",
+      border: "1px solid color-mix(in srgb, var(--veil-accent) 13%, var(--veil-contrast-06))",
+      "border-radius": "24px", padding: "0", overflow: "hidden",
       margin: "auto",
-      "box-shadow": "0 8px 40px rgba(0,0,0,0.4), 0 0 80px rgba(124,107,245,0.04)",
+      "box-shadow": "0 24px 80px var(--veil-shadow), 0 0 100px rgba(var(--veil-accent-rgb),0.07)",
       transition: "opacity 0.35s ease, transform 0.35s ease",
     },
     logo: {
@@ -205,19 +314,19 @@ export const OnboardingScreen: Component = () => {
     },
     logoIcon: {
       width: "52px", height: "52px", "border-radius": "16px",
-      background: "linear-gradient(135deg, rgba(124,107,245,0.25) 0%, rgba(124,107,245,0.08) 100%)",
-      border: "1px solid rgba(124,107,245,0.15)",
+      background: "linear-gradient(135deg, rgba(var(--veil-accent-rgb),0.25) 0%, rgba(var(--veil-accent-rgb),0.08) 100%)",
+      border: "1px solid rgba(var(--veil-accent-rgb),0.15)",
       display: "flex", "align-items": "center", "justify-content": "center",
       position: "relative" as const,
     },
     logoGlow: {
       position: "absolute" as const, inset: "-8px", "border-radius": "20px",
-      background: "rgba(124,107,245,0.12)", filter: "blur(16px)",
+      background: "rgba(var(--veil-accent-rgb),0.12)", filter: "blur(16px)",
       animation: "glowPulse 4s ease-in-out infinite",
     },
     divider: {
       width: "1px", "align-self": "stretch",
-      background: "rgba(255,255,255,0.06)", "flex-shrink": "0",
+      background: "var(--veil-contrast-06)", "flex-shrink": "0",
     },
     taglineArea: {
       flex: "1", "min-width": "0", display: "flex",
@@ -230,11 +339,11 @@ export const OnboardingScreen: Component = () => {
     }),
     progressTrack: {
       width: "100%", height: "3px", "border-radius": "2px",
-      background: "rgba(255,255,255,0.04)", overflow: "hidden",
+      background: "var(--veil-contrast-04)", overflow: "hidden",
     },
     progressBar: (pct: number) => ({
       height: "100%", "border-radius": "2px",
-      background: "linear-gradient(90deg, #7c6bf5 0%, #9b8afb 100%)",
+      background: "linear-gradient(90deg, var(--veil-accent) 0%, var(--veil-accent-hi) 100%)",
       width: `${pct}%`, transition: "width 0.6s ease",
     }),
     btnCol: {
@@ -244,23 +353,23 @@ export const OnboardingScreen: Component = () => {
     btnPrimary: {
       display: "flex", "align-items": "center", "justify-content": "center",
       gap: "10px", height: "46px", "border-radius": "12px",
-      background: "linear-gradient(135deg, #7c6bf5 0%, #6955e0 100%)",
-      color: "#fff", border: "none", "font-size": "13px", "font-weight": "600",
+      background: "linear-gradient(135deg, var(--veil-accent) 0%, var(--veil-accent-deep) 100%)",
+      color: "var(--veil-on-accent)", border: "none", "font-size": "13px", "font-weight": "600",
       cursor: "pointer", transition: "transform 0.15s, box-shadow 0.15s",
-      "box-shadow": "0 4px 20px rgba(124,107,245,0.25)",
+      "box-shadow": "0 4px 20px rgba(var(--veil-accent-rgb),0.25)",
       "letter-spacing": "0.01em",
     },
     btnSecondary: {
       display: "flex", "align-items": "center", "justify-content": "center",
       gap: "10px", height: "46px", "border-radius": "12px",
-      background: "rgba(255,255,255,0.04)", color: "rgba(255,255,255,0.6)",
-      border: "1px solid rgba(255,255,255,0.06)", "font-size": "13px",
+      background: "var(--veil-contrast-04)", color: "var(--veil-contrast-60)",
+      border: "1px solid var(--veil-contrast-06)", "font-size": "13px",
       "font-weight": "500", cursor: "pointer", transition: "background 0.15s, color 0.15s",
     },
     errorBox: {
       display: "flex", "align-items": "center", gap: "10px",
       padding: "10px 14px", "border-radius": "10px",
-      background: "rgba(240,72,72,0.08)", border: "1px solid rgba(240,72,72,0.2)",
+      background: "var(--veil-danger-surface)", border: "1px solid var(--veil-danger-border)",
     },
     wordGrid: {
       display: "grid", "grid-template-columns": "repeat(3, 1fr)", gap: "8px",
@@ -268,49 +377,40 @@ export const OnboardingScreen: Component = () => {
     wordCell: {
       display: "flex", "align-items": "center", gap: "8px",
       padding: "10px 14px", "border-radius": "10px",
-      background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.04)",
+      background: "var(--veil-contrast-03)", border: "1px solid var(--veil-contrast-04)",
     },
     wordNum: {
-      "font-size": "10px", color: "rgba(255,255,255,0.2)",
+      "font-size": "10px", color: "var(--veil-contrast-20)",
       "font-family": "monospace", width: "16px", "text-align": "right" as const,
     },
     wordText: {
-      "font-size": "13px", color: "rgba(255,255,255,0.8)", "font-family": "monospace",
+      "font-size": "13px", color: "var(--veil-contrast-80)", "font-family": "monospace",
       "font-weight": "500",
     },
     textarea: {
       width: "100%", "min-height": "140px", "border-radius": "14px",
-      background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.06)",
+      background: "var(--veil-contrast-04)", border: "1px solid var(--veil-contrast-06)",
       padding: "18px 20px", "font-size": "15px", "font-family": "monospace",
-      color: "rgba(255,255,255,0.8)", resize: "none" as const, "line-height": "1.8",
+      color: "var(--veil-contrast-80)", resize: "none" as const, "line-height": "1.8",
       outline: "none", transition: "border-color 0.2s, background 0.2s",
     },
     warningBox: {
       display: "flex", "align-items": "flex-start", gap: "10px",
       padding: "14px 16px", "border-radius": "12px",
-      background: "rgba(251,191,36,0.05)", border: "1px solid rgba(251,191,36,0.12)",
+      background: "var(--veil-warning-surface)", border: "1px solid var(--veil-warning-surface)",
     },
-    copyBtn: (done: boolean) => ({
-      display: "flex", "align-items": "center", "justify-content": "center",
-      gap: "8px", height: "38px", "border-radius": "10px",
-      background: done ? "rgba(52,211,153,0.08)" : "rgba(255,255,255,0.04)",
-      color: done ? "#34d399" : "rgba(255,255,255,0.5)",
-      border: `1px solid ${done ? "rgba(52,211,153,0.2)" : "rgba(255,255,255,0.06)"}`,
-      "font-size": "12px", "font-weight": "500", cursor: "pointer",
-      transition: "all 0.2s", width: "100%",
-    }),
     backBtn: {
       display: "flex", "align-items": "center", "justify-content": "center",
       gap: "6px", height: "36px", background: "transparent", border: "none",
-      color: "rgba(255,255,255,0.3)", "font-size": "12px", cursor: "pointer",
+      color: "var(--veil-text-faint)", "font-size": "12px", cursor: "pointer",
       transition: "color 0.15s", "margin-top": "4px", width: "100%",
     },
     sectionTitle: {
-      "font-size": "18px", "font-weight": "600", color: "rgba(255,255,255,0.9)",
+      "font-size": "18px", "font-weight": "600", color: "var(--veil-contrast-90)",
       "margin-bottom": "4px",
     },
     sectionSub: {
-      "font-size": "13px", color: "rgba(255,255,255,0.35)", "margin-bottom": "20px",
+      "font-size": "13px", color: "var(--veil-text-faint)", "margin-bottom": "20px",
     },
   };
 
@@ -332,28 +432,63 @@ export const OnboardingScreen: Component = () => {
       </div>
 
       <Show when={error()}>
-        <div style={{ position: "absolute", top: "24px", left: "50%", transform: "translateX(-50%)", "z-index": "10" }}>
+        <div style={{ position: "absolute", top: "24px", left: "50%", transform: "translateX(-50%)", "z-index": Z.CONTENT_OVERLAY }}>
           <div style={S.errorBox}>
-            <span style={{ color: "rgba(240,72,72,0.7)", "font-size": "14px" }}>{"\u26A0"}</span>
-            <span style={{ "font-size": "12px", color: "rgba(240,72,72,0.8)" }}>{error()}</span>
+            <AlertTriangle size={14} strokeWidth={2} color="color-mix(in srgb, var(--veil-danger) 70%, transparent)" />
+            <span style={{ "font-size": "12px", color: "color-mix(in srgb, var(--veil-danger) 80%, transparent)" }}>{error()}</span>
           </div>
         </div>
       </Show>
 
       {/* ═══ WELCOME — horizontal island at bottom ═══ */}
+      <Show when={step() === "welcome" && existingIdentity()}>
+        <div style={{
+          position: "relative", "z-index": "2", width: "calc(100% - 48px)", "max-width": "620px",
+          background: "color-mix(in srgb, var(--veil-window) 94%, transparent)", "backdrop-filter": "blur(22px)",
+          border: "1px solid color-mix(in srgb, var(--veil-warning) 24%, var(--veil-contrast-06))",
+          "border-radius": "16px", padding: "18px 20px", "margin-bottom": "14px",
+          "box-shadow": "0 8px 32px var(--veil-shadow)", transition: "opacity 0.35s ease, transform 0.35s ease",
+        }}>
+          <div style={{ display: "flex", "align-items": "flex-start", gap: "12px" }}>
+            <div style={{
+              width: "34px", height: "34px", "flex-shrink": "0", "border-radius": "10px",
+              display: "flex", "align-items": "center", "justify-content": "center",
+              background: "color-mix(in srgb, var(--veil-accent) 14%, transparent)", color: "var(--veil-accent)",
+            }}><LogIn size={17} strokeWidth={1.8} /></div>
+            <div style={{ flex: "1", "min-width": "0" }}>
+              <div style={{ "font-size": "13px", "font-weight": "650", color: "var(--veil-contrast-85)", "margin-bottom": "4px" }}>
+                An identity is already on this device
+              </div>
+              <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "line-height": "1.55" }}>
+                Continue with the existing vault, or switch accounts first. Veil will never replace an encrypted identity database implicitly.
+              </div>
+              <div style={{ display: "flex", gap: "8px", "margin-top": "14px", "flex-wrap": "wrap" }}>
+                <button
+                  style={{ ...S.btnPrimary, height: "36px", padding: "0 14px", "font-size": "12px" }}
+                  disabled={loading()}
+                  onClick={() => void continueWithExistingIdentity()}
+                ><LogIn size={14} strokeWidth={1.9} /> Continue with existing identity</button>
+                <button
+                  style={{ ...S.btnSecondary, height: "36px", padding: "0 14px", "font-size": "12px" }}
+                  disabled={loading()}
+                  onClick={() => void switchAccount()}
+                ><ArrowRightLeft size={14} strokeWidth={1.9} /> Switch account</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      </Show>
+
       <Show when={step() === "welcome"}>
         <div style={{ ...S.welcomeIsland, ...animStyle() }}>
           <div style={S.logo}>
             <div style={S.logoIcon}>
               <div style={S.logoGlow} />
-              <svg width="26" height="26" viewBox="0 0 24 24" fill="none" style={{ position: "relative", "z-index": "1" }}>
-                <path d="M12 2L3 7v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V7l-9-5z" fill="rgba(124,107,245,0.3)" stroke="rgba(124,107,245,0.8)" stroke-width="1.5"/>
-                <path d="M9 12l2 2 4-4" stroke="#7c6bf5" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
+              <VeilMark size={26} style={{ position: "relative", "z-index": "1", color: "var(--veil-accent)" }} />
             </div>
             <div>
-              <div style={{ "font-size": "16px", "font-weight": "600", color: "rgba(255,255,255,0.85)", "letter-spacing": "0.2em", "text-align": "center" }}>VEIL</div>
-              <div style={{ "font-size": "10px", color: "rgba(255,255,255,0.25)", "text-align": "center", "margin-top": "2px" }}>Encrypted messenger</div>
+              <div style={{ "font-size": "16px", "font-weight": "600", color: "var(--veil-contrast-85)", "letter-spacing": "0.2em", "text-align": "center" }}>VEIL</div>
+              <div style={{ "font-size": "10px", color: "var(--veil-text-faint)", "text-align": "center", "margin-top": "2px" }}>Encrypted messenger</div>
             </div>
           </div>
 
@@ -361,10 +496,10 @@ export const OnboardingScreen: Component = () => {
 
           <div style={S.taglineArea}>
             <div style={S.tagText(taglineFade())}>
-              <div style={{ "font-size": "16px", "font-weight": "500", color: "rgba(255,255,255,0.85)", "margin-bottom": "4px" }}>
+              <div style={{ "font-size": "16px", "font-weight": "500", color: "var(--veil-contrast-85)", "margin-bottom": "4px" }}>
                 {tagline().text}
               </div>
-              <div style={{ "font-size": "12px", color: "rgba(255,255,255,0.35)" }}>
+              <div style={{ "font-size": "12px", color: "var(--veil-text-faint)" }}>
                 {tagline().sub}
               </div>
             </div>
@@ -376,7 +511,7 @@ export const OnboardingScreen: Component = () => {
                 {(_, i) => (
                   <div style={{
                     width: "6px", height: "6px", "border-radius": "3px",
-                    background: i() === taglineIdx() ? "#7c6bf5" : "rgba(255,255,255,0.08)",
+                    background: i() === taglineIdx() ? "var(--veil-accent)" : "var(--veil-contrast-08)",
                     transition: "background 0.3s",
                   }} />
                 )}
@@ -390,9 +525,9 @@ export const OnboardingScreen: Component = () => {
             <button
               style={S.btnPrimary}
               onClick={generateMnemonic}
-              disabled={loading()}
-              onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(124,107,245,0.35)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(124,107,245,0.25)"; }}
+              disabled={loading() || identityState() !== "empty"}
+              onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(var(--veil-accent-rgb),0.35)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(var(--veil-accent-rgb),0.25)"; }}
             >
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>
@@ -402,8 +537,9 @@ export const OnboardingScreen: Component = () => {
             <button
               style={S.btnSecondary}
               onClick={() => transitionTo("restore")}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.07)"; e.currentTarget.style.color = "rgba(255,255,255,0.8)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.04)"; e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}
+              disabled={loading() || identityState() !== "empty"}
+              onMouseEnter={(e) => { e.currentTarget.style.background = "var(--veil-contrast-07)"; e.currentTarget.style.color = "var(--veil-contrast-80)"; }}
+              onMouseLeave={(e) => { e.currentTarget.style.background = "var(--veil-contrast-04)"; e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
             >
               <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/>
@@ -417,107 +553,98 @@ export const OnboardingScreen: Component = () => {
       {/* ═══ GENERATE — center island, word grid ═══ */}
       <Show when={step() === "generate"}>
         <div style={{ ...S.centerIsland, ...animStyle() }}>
-          <div style={S.sectionTitle}>Recovery Phrase</div>
-          <div style={S.sectionSub}>Write down these 12 words in order. They are your only backup.</div>
-
-          <div style={{ position: "relative", "margin-bottom": "20px" }}>
-            <div style={{
-              ...S.wordGrid,
-              filter: showPhrase() ? "none" : "blur(8px)",
-              "user-select": showPhrase() ? "text" : "none",
-              transition: "filter 0.3s",
-            }}>
-              <For each={words()}>
-                {(word, i) => (
-                  <div style={S.wordCell}>
-                    <span style={S.wordNum}>{i() + 1}</span>
-                    <span style={S.wordText}>{word}</span>
-                  </div>
-                )}
-              </For>
+          <div class="onboarding-vault-head">
+            <div class="onboarding-vault-emblem"><VeilMark size={20} /></div>
+            <div>
+              <div class="onboarding-vault-kicker">VEIL IDENTITY VAULT</div>
+              <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>Local cryptographic identity · step 1 of 2</div>
             </div>
-            <button
-              style={{
-                position: "absolute", top: "8px", right: "8px",
-                width: "32px", height: "32px", "border-radius": "8px",
-                background: "rgba(255,255,255,0.04)", border: "none",
-                color: "rgba(255,255,255,0.3)", cursor: "pointer",
-                display: "flex", "align-items": "center", "justify-content": "center",
-                "font-size": "14px", transition: "background 0.15s",
-              }}
-              onClick={() => setShowPhrase(!showPhrase())}
-              onMouseEnter={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.08)"; }}
-              onMouseLeave={(e) => { e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
-            >
-              {showPhrase() ? "\uD83D\uDC41" : "\uD83D\uDE48"}
+            <div class="onboarding-vault-status"><ShieldCheck size={13} /> GENERATED ON DEVICE</div>
+          </div>
+          <div class="onboarding-vault-body">
+            <div class="onboarding-vault-primary">
+              <div style={S.sectionTitle}>Your recovery phrase</div>
+              <div style={S.sectionSub}>Keep these words in order. Veil cannot recover or replace them for you.</div>
+              <div style={{ position: "relative" }}>
+                <div style={{
+                  ...S.wordGrid,
+                  filter: showPhrase() ? "none" : "blur(9px)",
+                  "user-select": showPhrase() ? "text" : "none",
+                  transition: "filter 0.28s ease",
+                }}>
+                  <For each={words()}>
+                    {(word, i) => (
+                      <div style={S.wordCell}>
+                        <span style={S.wordNum}>{String(i() + 1).padStart(2, "0")}</span>
+                        <span style={S.wordText}>{word}</span>
+                      </div>
+                    )}
+                  </For>
+                </div>
+                <button class="onboarding-phrase-visibility" onClick={() => setShowPhrase(!showPhrase())}
+                  aria-label={showPhrase() ? "Hide recovery phrase" : "Show recovery phrase"}
+                  title={showPhrase() ? "Hide recovery phrase" : "Show recovery phrase"}>
+                  {showPhrase() ? <EyeOff size={15} /> : <Eye size={15} />}
+                </button>
+              </div>
+            </div>
+            <aside class="onboarding-vault-aside">
+              <div class="onboarding-vault-aside-icon"><KeyRound size={18} /></div>
+              <div style={{ "font-size": "13px", "font-weight": "650", color: "var(--veil-contrast-85)" }}>One key. No reset link.</div>
+              <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "line-height": "1.6" }}>
+                Store it on paper or directly in a trusted password manager. Never send it through chat or cloud notes.
+              </div>
+              <div class="onboarding-vault-rule" />
+              <div style={{ "font-size": "11px", color: "color-mix(in srgb, var(--veil-warning) 72%, transparent)", "line-height": "1.55" }}>
+                Clipboard use is guarded because Windows history and cloud sync may retain secrets.
+              </div>
+              <button class="onboarding-copy-phrase" onClick={() => void copyRecoveryPhrase()} disabled={loading()}>
+                {phraseCopied() ? <Check size={14} /> : <Copy size={14} />}
+                {phraseCopied() ? "Copied — paste it now" : "Copy with warning"}
+              </button>
+              <span class="sr-only" aria-live="polite">{phraseCopied() ? "Recovery phrase copied" : ""}</span>
+            </aside>
+          </div>
+          <div class="onboarding-vault-actions">
+            <button style={{ ...S.backBtn, width: "auto", margin: "0", padding: "0 12px" }} onClick={() => transitionTo("welcome")}>{"\u2190 Back"}</button>
+            <button style={{ ...S.btnPrimary, padding: "0 22px", opacity: mnemonic().trim() && !loading() ? "1" : "0.4" }}
+              onClick={() => initIdentity(mnemonic())} disabled={loading() || !mnemonic().trim()}>
+              {loading() ? "Securing identity..." : "I stored it safely \u2192"}
             </button>
           </div>
-
-          <button
-            style={S.copyBtn(copied())}
-            onClick={copyToClipboard}
-            onMouseEnter={(e) => { if (!copied()) e.currentTarget.style.background = "rgba(255,255,255,0.07)"; }}
-            onMouseLeave={(e) => { if (!copied()) e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
-          >
-            {copied() ? "\u2713 Copied!" : "\uD83D\uDCCB Copy to clipboard"}
-          </button>
-
-          <div style={{ ...S.warningBox, "margin-top": "16px" }}>
-            <span style={{ "font-size": "14px", "flex-shrink": "0", "margin-top": "1px" }}>{"\u26A0\uFE0F"}</span>
-            <span style={{ "font-size": "12px", color: "rgba(251,191,36,0.6)", "line-height": "1.5" }}>
-              Store these 12 words safely. They are the <strong style={{ color: "rgba(251,191,36,0.85)" }}>only way</strong> to recover your identity.
-            </span>
-          </div>
-
-          <button
-            style={{
-              ...S.btnPrimary,
-              width: "100%",
-              "margin-top": "20px",
-              opacity: mnemonic().trim() && !loading() ? "1" : "0.4",
-              cursor: mnemonic().trim() && !loading() ? "pointer" : "not-allowed",
-            }}
-            onClick={() => initIdentity(mnemonic())}
-            disabled={loading() || !mnemonic().trim()}
-            onMouseEnter={(e) => { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(124,107,245,0.35)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(124,107,245,0.25)"; }}
-          >
-            {loading() ? "Initializing..." : "I've saved my phrase \u2192"}
-          </button>
-
-          <button
-            style={S.backBtn}
-            onClick={() => transitionTo("welcome")}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.3)"; }}
-          >
-            {"\u2190 Back"}
-          </button>
         </div>
       </Show>
 
       {/* ═══ RESTORE — center island, large textarea ═══ */}
       <Show when={step() === "restore"}>
         <div style={{ ...S.centerIsland, ...animStyle() }}>
-          <div style={S.sectionTitle}>Restore Identity</div>
-          <div style={S.sectionSub}>Enter your 12-word recovery phrase to restore access.</div>
+          <div class="onboarding-vault-head">
+            <div class="onboarding-vault-emblem"><VeilMark size={20} /></div>
+            <div><div class="onboarding-vault-kicker">RESTORE VEIL IDENTITY</div><div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>Encrypted locally before network authentication</div></div>
+          </div>
+          <div class="onboarding-restore-body">
+          <div style={S.sectionTitle}>Enter your recovery phrase</div>
+          <div style={S.sectionSub}>The phrase is validated and processed inside the native security boundary.</div>
 
           <textarea
             style={S.textarea}
             placeholder="word1 word2 word3 word4 word5 word6 word7 word8 word9 word10 word11 word12"
+            autocomplete="off"
+            autocapitalize="none"
+            spellcheck={false}
             value={restoreInput()}
             onInput={(e) => {
               setRestoreInput(e.currentTarget.value);
               if (error()) setError("");
             }}
-            onFocus={(e) => { e.currentTarget.style.borderColor = "rgba(124,107,245,0.3)"; e.currentTarget.style.background = "rgba(255,255,255,0.06)"; }}
-            onBlur={(e) => { e.currentTarget.style.borderColor = "rgba(255,255,255,0.06)"; e.currentTarget.style.background = "rgba(255,255,255,0.04)"; }}
+            onFocus={(e) => { e.currentTarget.style.borderColor = "rgba(var(--veil-accent-rgb),0.3)"; e.currentTarget.style.background = "var(--veil-contrast-06)"; }}
+            onBlur={(e) => { e.currentTarget.style.borderColor = "var(--veil-contrast-06)"; e.currentTarget.style.background = "var(--veil-contrast-04)"; }}
           />
 
           <div style={{
             "font-size": "11px", "margin-top": "8px", "margin-bottom": "16px",
             color: restoreInput().trim().split(/\s+/).filter(Boolean).length === 12
-              ? "rgba(52,211,153,0.6)" : "rgba(255,255,255,0.2)",
+              ? "color-mix(in srgb, var(--veil-success) 60%, transparent)" : "var(--veil-contrast-20)",
             transition: "color 0.2s",
           }}>
             {restoreInput().trim() ? `${restoreInput().trim().split(/\s+/).filter(Boolean).length} / 12 words` : ""}
@@ -531,8 +658,8 @@ export const OnboardingScreen: Component = () => {
             }}
             onClick={() => initIdentity(restoreInput())}
             disabled={loading() || !restoreInput().trim()}
-            onMouseEnter={(e) => { if (restoreInput().trim()) { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(124,107,245,0.35)"; } }}
-            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(124,107,245,0.25)"; }}
+            onMouseEnter={(e) => { if (restoreInput().trim()) { e.currentTarget.style.transform = "translateY(-1px)"; e.currentTarget.style.boxShadow = "0 6px 28px rgba(var(--veil-accent-rgb),0.35)"; } }}
+            onMouseLeave={(e) => { e.currentTarget.style.transform = ""; e.currentTarget.style.boxShadow = "0 4px 20px rgba(var(--veil-accent-rgb),0.25)"; }}
           >
             {loading() ? "Restoring..." : "Restore Identity \u2192"}
           </button>
@@ -540,11 +667,12 @@ export const OnboardingScreen: Component = () => {
           <button
             style={S.backBtn}
             onClick={() => transitionTo("welcome")}
-            onMouseEnter={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.6)"; }}
-            onMouseLeave={(e) => { e.currentTarget.style.color = "rgba(255,255,255,0.3)"; }}
+            onMouseEnter={(e) => { e.currentTarget.style.color = "var(--veil-contrast-60)"; }}
+            onMouseLeave={(e) => { e.currentTarget.style.color = "var(--veil-text-faint)"; }}
           >
             {"\u2190 Back"}
           </button>
+          </div>
         </div>
       </Show>
     </div>

@@ -1,19 +1,21 @@
 import { create } from "zustand";
 
 interface AuthState {
-  mnemonic: string | null;
-  identityKey: string | null;
-  isAuthenticated: boolean;
-  setMnemonic: (m: string) => void;
-  setIdentityKey: (key: string) => void;
-  logout: () => void;
+  nativeIdentityState: "checking" | "locked" | "local_identity_ready" | "native_error";
+  publicIdentityKey: string | null;
+  nativeError: string | null;
+  setLocalIdentityReady: (publicIdentityKey: string) => void;
+  setLocked: () => void;
+  setNativeError: (message: string) => void;
 }
 
 export const useAuthStore = create<AuthState>((set) => ({
-  mnemonic: null,
-  identityKey: null,
-  isAuthenticated: false,
-  setMnemonic: (m) => set({ mnemonic: m }),
-  setIdentityKey: (key) => set({ identityKey: key, isAuthenticated: true, mnemonic: null }),
-  logout: () => set({ mnemonic: null, identityKey: null, isAuthenticated: false }),
+  nativeIdentityState: "checking",
+  publicIdentityKey: null,
+  nativeError: null,
+  setLocalIdentityReady: (publicIdentityKey) =>
+    set({ nativeIdentityState: "local_identity_ready", publicIdentityKey, nativeError: null }),
+  setLocked: () => set({ nativeIdentityState: "locked", publicIdentityKey: null, nativeError: null }),
+  setNativeError: (nativeError) =>
+    set({ nativeIdentityState: "native_error", publicIdentityKey: null, nativeError }),
 }));

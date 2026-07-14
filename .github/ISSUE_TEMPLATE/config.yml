@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: "Security vulnerability / Уязвимость"
+    url: "https://github.com/NaveLIL/veil/security/advisories/new"
+    about: "Report privately through GitHub; never publish secrets or exploit details."
+  - name: "Support guide / Поддержка"
+    url: "https://github.com/NaveLIL/veil/blob/master/SUPPORT.md"
+    about: "Choose the correct channel and sanitize diagnostics before opening an Issue."

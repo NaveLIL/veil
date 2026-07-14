@@ -139,9 +139,13 @@ type SendMessage struct {
 	TtlSeconds     *uint32                `protobuf:"varint,6,opt,name=ttl_seconds,json=ttlSeconds,proto3,oneof" json:"ttl_seconds,omitempty"` // Disappearing message TTL
 	Attachments    []*EncryptedAttachment `protobuf:"bytes,7,rep,name=attachments,proto3" json:"attachments,omitempty"`
 	// Для sealed sender: ciphertext содержит sender info внутри
-	Sealed        bool `protobuf:"varint,8,opt,name=sealed,proto3" json:"sealed,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	Sealed bool `protobuf:"varint,8,opt,name=sealed,proto3" json:"sealed,omitempty"`
+	// Required for Sender-Key group/channel traffic. The gateway accepts the
+	// ciphertext only for the exact current ready device roster.
+	RosterVersion    uint64 `protobuf:"varint,9,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
+	RosterCommitment []byte `protobuf:"bytes,10,opt,name=roster_commitment,json=rosterCommitment,proto3" json:"roster_commitment,omitempty"` // SHA-256, 32 bytes
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *SendMessage) Reset() {
@@ -230,6 +234,20 @@ func (x *SendMessage) GetSealed() bool {
 	return false
 }
 
+func (x *SendMessage) GetRosterVersion() uint64 {
+	if x != nil {
+		return x.RosterVersion
+	}
+	return 0
+}
+
+func (x *SendMessage) GetRosterCommitment() []byte {
+	if x != nil {
+		return x.RosterCommitment
+	}
+	return nil
+}
+
 type EncryptedAttachment struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MediaId       string                 `protobuf:"bytes,1,opt,name=media_id,json=mediaId,proto3" json:"media_id,omitempty"`                // ID загруженного файла
@@ -308,12 +326,17 @@ func (x *EncryptedAttachment) GetContentType() string {
 
 // Сервер → клиент: подтверждение отправки
 type MessageAck struct {
-	state           protoimpl.MessageState `protogen:"open.v1"`
-	MessageId       string                 `protobuf:"bytes,1,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"`
-	ServerTimestamp uint64                 `protobuf:"varint,2,opt,name=server_timestamp,json=serverTimestamp,proto3" json:"server_timestamp,omitempty"`
-	RefSeq          uint64                 `protobuf:"varint,3,opt,name=ref_seq,json=refSeq,proto3" json:"ref_seq,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	state               protoimpl.MessageState `protogen:"open.v1"`
+	MessageId           string                 `protobuf:"bytes,1,opt,name=message_id,json=messageId,proto3" json:"message_id,omitempty"`
+	ServerTimestamp     uint64                 `protobuf:"varint,2,opt,name=server_timestamp,json=serverTimestamp,proto3" json:"server_timestamp,omitempty"`
+	RefSeq              uint64                 `protobuf:"varint,3,opt,name=ref_seq,json=refSeq,proto3" json:"ref_seq,omitempty"`
+	TargetDeviceId      []byte                 `protobuf:"bytes,4,opt,name=target_device_id,json=targetDeviceId,proto3" json:"target_device_id,omitempty"` // Exact 16-byte device receiving an SKDM
+	ConversationId      *string                `protobuf:"bytes,5,opt,name=conversation_id,json=conversationId,proto3,oneof" json:"conversation_id,omitempty"`
+	SenderKeyGeneration *uint32                `protobuf:"varint,6,opt,name=sender_key_generation,json=senderKeyGeneration,proto3,oneof" json:"sender_key_generation,omitempty"`
+	RosterVersion       *uint64                `protobuf:"varint,7,opt,name=roster_version,json=rosterVersion,proto3,oneof" json:"roster_version,omitempty"`
+	EnvelopeCommitment  []byte                 `protobuf:"bytes,8,opt,name=envelope_commitment,json=envelopeCommitment,proto3,oneof" json:"envelope_commitment,omitempty"` // SHA-256 of the retained SKDM
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *MessageAck) Reset() {
@@ -365,6 +388,41 @@ func (x *MessageAck) GetRefSeq() uint64 {
 		return x.RefSeq
 	}
 	return 0
+}
+
+func (x *MessageAck) GetTargetDeviceId() []byte {
+	if x != nil {
+		return x.TargetDeviceId
+	}
+	return nil
+}
+
+func (x *MessageAck) GetConversationId() string {
+	if x != nil && x.ConversationId != nil {
+		return *x.ConversationId
+	}
+	return ""
+}
+
+func (x *MessageAck) GetSenderKeyGeneration() uint32 {
+	if x != nil && x.SenderKeyGeneration != nil {
+		return *x.SenderKeyGeneration
+	}
+	return 0
+}
+
+func (x *MessageAck) GetRosterVersion() uint64 {
+	if x != nil && x.RosterVersion != nil {
+		return *x.RosterVersion
+	}
+	return 0
+}
+
+func (x *MessageAck) GetEnvelopeCommitment() []byte {
+	if x != nil {
+		return x.EnvelopeCommitment
+	}
+	return nil
 }
 
 // Сервер → клиент: сообщение доставлено получателю
@@ -630,8 +688,18 @@ type MessageEvent struct {
 	Sealed      *bool                  `protobuf:"varint,13,opt,name=sealed,proto3,oneof" json:"sealed,omitempty"`
 	// Для EDITED — ID оригинального сообщения:
 	EditTimestamp *uint64 `protobuf:"varint,14,opt,name=edit_timestamp,json=editTimestamp,proto3,oneof" json:"edit_timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	// Present for device-routed Sender-Key group/channel traffic.
+	RosterVersion    uint64 `protobuf:"varint,15,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
+	RosterCommitment []byte `protobuf:"bytes,16,opt,name=roster_commitment,json=rosterCommitment,proto3" json:"roster_commitment,omitempty"`
+	SenderDeviceId   []byte `protobuf:"bytes,17,opt,name=sender_device_id,json=senderDeviceId,proto3" json:"sender_device_id,omitempty"`
+	TargetDeviceId   []byte `protobuf:"bytes,18,opt,name=target_device_id,json=targetDeviceId,proto3" json:"target_device_id,omitempty"`
+	// Persisted security context for NEW group/channel ciphertext. Empty/zero
+	// means an explicitly legacy/unknown row, never an inferred downgrade.
+	CryptoProfile        string `protobuf:"bytes,19,opt,name=crypto_profile,json=cryptoProfile,proto3" json:"crypto_profile,omitempty"` // "sender_key_v5"
+	CryptoEra            uint64 `protobuf:"varint,20,opt,name=crypto_era,json=cryptoEra,proto3" json:"crypto_era,omitempty"`            // profile-era version, currently 1
+	SenderBindingVersion uint64 `protobuf:"varint,21,opt,name=sender_binding_version,json=senderBindingVersion,proto3" json:"sender_binding_version,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *MessageEvent) Reset() {
@@ -758,6 +826,55 @@ func (x *MessageEvent) GetSealed() bool {
 func (x *MessageEvent) GetEditTimestamp() uint64 {
 	if x != nil && x.EditTimestamp != nil {
 		return *x.EditTimestamp
+	}
+	return 0
+}
+
+func (x *MessageEvent) GetRosterVersion() uint64 {
+	if x != nil {
+		return x.RosterVersion
+	}
+	return 0
+}
+
+func (x *MessageEvent) GetRosterCommitment() []byte {
+	if x != nil {
+		return x.RosterCommitment
+	}
+	return nil
+}
+
+func (x *MessageEvent) GetSenderDeviceId() []byte {
+	if x != nil {
+		return x.SenderDeviceId
+	}
+	return nil
+}
+
+func (x *MessageEvent) GetTargetDeviceId() []byte {
+	if x != nil {
+		return x.TargetDeviceId
+	}
+	return nil
+}
+
+func (x *MessageEvent) GetCryptoProfile() string {
+	if x != nil {
+		return x.CryptoProfile
+	}
+	return ""
+}
+
+func (x *MessageEvent) GetCryptoEra() uint64 {
+	if x != nil {
+		return x.CryptoEra
+	}
+	return 0
+}
+
+func (x *MessageEvent) GetSenderBindingVersion() uint64 {
+	if x != nil {
+		return x.SenderBindingVersion
 	}
 	return 0
 }
@@ -1056,13 +1173,31 @@ func (x *PreKeyRequest) GetTargetDeviceId() []byte {
 
 // Распространение Sender Key для группового чата
 type SenderKeyDistribution struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	ConversationId    string                 `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`            // Group/channel ID
-	SenderKeyMessage  []byte                 `protobuf:"bytes,2,opt,name=sender_key_message,json=senderKeyMessage,proto3" json:"sender_key_message,omitempty"`    // Encrypted sender key для каждого участника
-	Generation        uint32                 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`                                         // Key generation counter
-	TargetIdentityKey []byte                 `protobuf:"bytes,4,opt,name=target_identity_key,json=targetIdentityKey,proto3" json:"target_identity_key,omitempty"` // Для кого зашифрован данный sender key
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	ConversationId          string                 `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`                                // Group/channel ID
+	SenderKeyMessage        []byte                 `protobuf:"bytes,2,opt,name=sender_key_message,json=senderKeyMessage,proto3" json:"sender_key_message,omitempty"`                        // Encrypted sender key для каждого участника
+	Generation              uint32                 `protobuf:"varint,3,opt,name=generation,proto3" json:"generation,omitempty"`                                                             // Key generation counter
+	TargetIdentityKey       []byte                 `protobuf:"bytes,4,opt,name=target_identity_key,json=targetIdentityKey,proto3" json:"target_identity_key,omitempty"`                     // Target account X25519 key (membership locator)
+	TargetDeviceId          []byte                 `protobuf:"bytes,5,opt,name=target_device_id,json=targetDeviceId,proto3" json:"target_device_id,omitempty"`                              // Exact 16-byte recipient device ID
+	TargetDeviceIdentityKey []byte                 `protobuf:"bytes,6,opt,name=target_device_identity_key,json=targetDeviceIdentityKey,proto3" json:"target_device_identity_key,omitempty"` // Recipient device X25519 key
+	SenderDeviceId          []byte                 `protobuf:"bytes,7,opt,name=sender_device_id,json=senderDeviceId,proto3" json:"sender_device_id,omitempty"`                              // Authenticated 16-byte sender device ID
+	RosterVersion           uint64                 `protobuf:"varint,8,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
+	RosterCommitment        []byte                 `protobuf:"bytes,9,opt,name=roster_commitment,json=rosterCommitment,proto3" json:"roster_commitment,omitempty"` // SHA-256, 32 bytes
+	SenderBindingVersion    uint64                 `protobuf:"varint,10,opt,name=sender_binding_version,json=senderBindingVersion,proto3" json:"sender_binding_version,omitempty"`
+	TargetBindingVersion    uint64                 `protobuf:"varint,11,opt,name=target_binding_version,json=targetBindingVersion,proto3" json:"target_binding_version,omitempty"`
+	// Exact historical account-authorized sender-device binding. Retained SKDM
+	// restore includes this proof even after the sender account/device left the
+	// conversation, so a recipient can first-install without trusting current
+	// directory membership or accepting a compatibility fallback.
+	SenderAccountIdentityKey  []byte `protobuf:"bytes,12,opt,name=sender_account_identity_key,json=senderAccountIdentityKey,proto3" json:"sender_account_identity_key,omitempty"`
+	SenderAccountSigningKey   []byte `protobuf:"bytes,13,opt,name=sender_account_signing_key,json=senderAccountSigningKey,proto3" json:"sender_account_signing_key,omitempty"`
+	SenderDeviceIdentityKey   []byte `protobuf:"bytes,14,opt,name=sender_device_identity_key,json=senderDeviceIdentityKey,proto3" json:"sender_device_identity_key,omitempty"`
+	SenderDeviceSigningKey    []byte `protobuf:"bytes,15,opt,name=sender_device_signing_key,json=senderDeviceSigningKey,proto3" json:"sender_device_signing_key,omitempty"`
+	SenderDeviceCapabilities  uint64 `protobuf:"varint,16,opt,name=sender_device_capabilities,json=senderDeviceCapabilities,proto3" json:"sender_device_capabilities,omitempty"`
+	SenderDeviceBindingStatus uint32 `protobuf:"varint,17,opt,name=sender_device_binding_status,json=senderDeviceBindingStatus,proto3" json:"sender_device_binding_status,omitempty"`
+	SenderAccountSignature    []byte `protobuf:"bytes,18,opt,name=sender_account_signature,json=senderAccountSignature,proto3" json:"sender_account_signature,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *SenderKeyDistribution) Reset() {
@@ -1123,11 +1258,196 @@ func (x *SenderKeyDistribution) GetTargetIdentityKey() []byte {
 	return nil
 }
 
+func (x *SenderKeyDistribution) GetTargetDeviceId() []byte {
+	if x != nil {
+		return x.TargetDeviceId
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetTargetDeviceIdentityKey() []byte {
+	if x != nil {
+		return x.TargetDeviceIdentityKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceId() []byte {
+	if x != nil {
+		return x.SenderDeviceId
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetRosterVersion() uint64 {
+	if x != nil {
+		return x.RosterVersion
+	}
+	return 0
+}
+
+func (x *SenderKeyDistribution) GetRosterCommitment() []byte {
+	if x != nil {
+		return x.RosterCommitment
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderBindingVersion() uint64 {
+	if x != nil {
+		return x.SenderBindingVersion
+	}
+	return 0
+}
+
+func (x *SenderKeyDistribution) GetTargetBindingVersion() uint64 {
+	if x != nil {
+		return x.TargetBindingVersion
+	}
+	return 0
+}
+
+func (x *SenderKeyDistribution) GetSenderAccountIdentityKey() []byte {
+	if x != nil {
+		return x.SenderAccountIdentityKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderAccountSigningKey() []byte {
+	if x != nil {
+		return x.SenderAccountSigningKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceIdentityKey() []byte {
+	if x != nil {
+		return x.SenderDeviceIdentityKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceSigningKey() []byte {
+	if x != nil {
+		return x.SenderDeviceSigningKey
+	}
+	return nil
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceCapabilities() uint64 {
+	if x != nil {
+		return x.SenderDeviceCapabilities
+	}
+	return 0
+}
+
+func (x *SenderKeyDistribution) GetSenderDeviceBindingStatus() uint32 {
+	if x != nil {
+		return x.SenderDeviceBindingStatus
+	}
+	return 0
+}
+
+func (x *SenderKeyDistribution) GetSenderAccountSignature() []byte {
+	if x != nil {
+		return x.SenderAccountSignature
+	}
+	return nil
+}
+
+// Recipient -> server acknowledgement after the exact device installed one
+// retained Sender-Key distribution. The immutable stream head is preserved;
+// only the matching pending row is collected.
+type SenderKeyReceipt struct {
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	ConversationId     string                 `protobuf:"bytes,1,opt,name=conversation_id,json=conversationId,proto3" json:"conversation_id,omitempty"`
+	OwnerDeviceId      []byte                 `protobuf:"bytes,2,opt,name=owner_device_id,json=ownerDeviceId,proto3" json:"owner_device_id,omitempty"`
+	TargetDeviceId     []byte                 `protobuf:"bytes,3,opt,name=target_device_id,json=targetDeviceId,proto3" json:"target_device_id,omitempty"`
+	Generation         uint32                 `protobuf:"varint,4,opt,name=generation,proto3" json:"generation,omitempty"`
+	RosterVersion      uint64                 `protobuf:"varint,5,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
+	EnvelopeCommitment []byte                 `protobuf:"bytes,6,opt,name=envelope_commitment,json=envelopeCommitment,proto3" json:"envelope_commitment,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *SenderKeyReceipt) Reset() {
+	*x = SenderKeyReceipt{}
+	mi := &file_veil_v1_chat_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SenderKeyReceipt) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SenderKeyReceipt) ProtoMessage() {}
+
+func (x *SenderKeyReceipt) ProtoReflect() protoreflect.Message {
+	mi := &file_veil_v1_chat_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SenderKeyReceipt.ProtoReflect.Descriptor instead.
+func (*SenderKeyReceipt) Descriptor() ([]byte, []int) {
+	return file_veil_v1_chat_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *SenderKeyReceipt) GetConversationId() string {
+	if x != nil {
+		return x.ConversationId
+	}
+	return ""
+}
+
+func (x *SenderKeyReceipt) GetOwnerDeviceId() []byte {
+	if x != nil {
+		return x.OwnerDeviceId
+	}
+	return nil
+}
+
+func (x *SenderKeyReceipt) GetTargetDeviceId() []byte {
+	if x != nil {
+		return x.TargetDeviceId
+	}
+	return nil
+}
+
+func (x *SenderKeyReceipt) GetGeneration() uint32 {
+	if x != nil {
+		return x.Generation
+	}
+	return 0
+}
+
+func (x *SenderKeyReceipt) GetRosterVersion() uint64 {
+	if x != nil {
+		return x.RosterVersion
+	}
+	return 0
+}
+
+func (x *SenderKeyReceipt) GetEnvelopeCommitment() []byte {
+	if x != nil {
+		return x.EnvelopeCommitment
+	}
+	return nil
+}
+
 var File_veil_v1_chat_proto protoreflect.FileDescriptor
 
 const file_veil_v1_chat_proto_rawDesc = "" +
 	"\n" +
-	"\x12veil/v1/chat.proto\x12\aveil.v1\"\xe2\x02\n" +
+	"\x12veil/v1/chat.proto\x12\aveil.v1\"\xb6\x03\n" +
 	"\vSendMessage\x12'\n" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12\x1e\n" +
 	"\n" +
@@ -1139,7 +1459,10 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\vttl_seconds\x18\x06 \x01(\rH\x01R\n" +
 	"ttlSeconds\x88\x01\x01\x12>\n" +
 	"\vattachments\x18\a \x03(\v2\x1c.veil.v1.EncryptedAttachmentR\vattachments\x12\x16\n" +
-	"\x06sealed\x18\b \x01(\bR\x06sealedB\x0e\n" +
+	"\x06sealed\x18\b \x01(\bR\x06sealed\x12%\n" +
+	"\x0eroster_version\x18\t \x01(\x04R\rrosterVersion\x12+\n" +
+	"\x11roster_commitment\x18\n" +
+	" \x01(\fR\x10rosterCommitmentB\x0e\n" +
 	"\f_reply_to_idB\x0e\n" +
 	"\f_ttl_seconds\"\xa2\x01\n" +
 	"\x13EncryptedAttachment\x12\x19\n" +
@@ -1147,13 +1470,22 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rencrypted_key\x18\x02 \x01(\fR\fencryptedKey\x12\x14\n" +
 	"\x05nonce\x18\x03 \x01(\fR\x05nonce\x12\x12\n" +
 	"\x04size\x18\x04 \x01(\x04R\x04size\x12!\n" +
-	"\fcontent_type\x18\x05 \x01(\tR\vcontentType\"o\n" +
+	"\fcontent_type\x18\x05 \x01(\tR\vcontentType\"\xbb\x03\n" +
 	"\n" +
 	"MessageAck\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12)\n" +
 	"\x10server_timestamp\x18\x02 \x01(\x04R\x0fserverTimestamp\x12\x17\n" +
-	"\aref_seq\x18\x03 \x01(\x04R\x06refSeq\"x\n" +
+	"\aref_seq\x18\x03 \x01(\x04R\x06refSeq\x12(\n" +
+	"\x10target_device_id\x18\x04 \x01(\fR\x0etargetDeviceId\x12,\n" +
+	"\x0fconversation_id\x18\x05 \x01(\tH\x00R\x0econversationId\x88\x01\x01\x127\n" +
+	"\x15sender_key_generation\x18\x06 \x01(\rH\x01R\x13senderKeyGeneration\x88\x01\x01\x12*\n" +
+	"\x0eroster_version\x18\a \x01(\x04H\x02R\rrosterVersion\x88\x01\x01\x124\n" +
+	"\x13envelope_commitment\x18\b \x01(\fH\x03R\x12envelopeCommitment\x88\x01\x01B\x12\n" +
+	"\x10_conversation_idB\x18\n" +
+	"\x16_sender_key_generationB\x11\n" +
+	"\x0f_roster_versionB\x16\n" +
+	"\x14_envelope_commitment\"x\n" +
 	"\x10MessageDelivered\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12'\n" +
@@ -1174,7 +1506,7 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rDeleteMessage\x12\x1d\n" +
 	"\n" +
 	"message_id\x18\x01 \x01(\tR\tmessageId\x12'\n" +
-	"\x0fconversation_id\x18\x02 \x01(\tR\x0econversationId\"\xfa\x05\n" +
+	"\x0fconversation_id\x18\x02 \x01(\tR\x0econversationId\"\x9e\b\n" +
 	"\fMessageEvent\x12>\n" +
 	"\n" +
 	"event_type\x18\x01 \x01(\x0e2\x1f.veil.v1.MessageEvent.EventTypeR\teventType\x12\x1d\n" +
@@ -1195,7 +1527,15 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"ttlSeconds\x88\x01\x01\x12>\n" +
 	"\vattachments\x18\f \x03(\v2\x1c.veil.v1.EncryptedAttachmentR\vattachments\x12\x1b\n" +
 	"\x06sealed\x18\r \x01(\bH\x05R\x06sealed\x88\x01\x01\x12*\n" +
-	"\x0eedit_timestamp\x18\x0e \x01(\x04H\x06R\reditTimestamp\x88\x01\x01\"-\n" +
+	"\x0eedit_timestamp\x18\x0e \x01(\x04H\x06R\reditTimestamp\x88\x01\x01\x12%\n" +
+	"\x0eroster_version\x18\x0f \x01(\x04R\rrosterVersion\x12+\n" +
+	"\x11roster_commitment\x18\x10 \x01(\fR\x10rosterCommitment\x12(\n" +
+	"\x10sender_device_id\x18\x11 \x01(\fR\x0esenderDeviceId\x12(\n" +
+	"\x10target_device_id\x18\x12 \x01(\fR\x0etargetDeviceId\x12%\n" +
+	"\x0ecrypto_profile\x18\x13 \x01(\tR\rcryptoProfile\x12\x1d\n" +
+	"\n" +
+	"crypto_era\x18\x14 \x01(\x04R\tcryptoEra\x124\n" +
+	"\x16sender_binding_version\x18\x15 \x01(\x04R\x14senderBindingVersion\"-\n" +
 	"\tEventType\x12\a\n" +
 	"\x03NEW\x10\x00\x12\n" +
 	"\n" +
@@ -1234,21 +1574,45 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rPreKeyRequest\x12.\n" +
 	"\x13target_identity_key\x18\x01 \x01(\fR\x11targetIdentityKey\x12-\n" +
 	"\x10target_device_id\x18\x02 \x01(\fH\x00R\x0etargetDeviceId\x88\x01\x01B\x13\n" +
-	"\x11_target_device_id\"\xbe\x01\n" +
+	"\x11_target_device_id\"\xbc\a\n" +
 	"\x15SenderKeyDistribution\x12'\n" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12,\n" +
 	"\x12sender_key_message\x18\x02 \x01(\fR\x10senderKeyMessage\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x03 \x01(\rR\n" +
 	"generation\x12.\n" +
-	"\x13target_identity_key\x18\x04 \x01(\fR\x11targetIdentityKey*\xa5\x01\n" +
+	"\x13target_identity_key\x18\x04 \x01(\fR\x11targetIdentityKey\x12(\n" +
+	"\x10target_device_id\x18\x05 \x01(\fR\x0etargetDeviceId\x12;\n" +
+	"\x1atarget_device_identity_key\x18\x06 \x01(\fR\x17targetDeviceIdentityKey\x12(\n" +
+	"\x10sender_device_id\x18\a \x01(\fR\x0esenderDeviceId\x12%\n" +
+	"\x0eroster_version\x18\b \x01(\x04R\rrosterVersion\x12+\n" +
+	"\x11roster_commitment\x18\t \x01(\fR\x10rosterCommitment\x124\n" +
+	"\x16sender_binding_version\x18\n" +
+	" \x01(\x04R\x14senderBindingVersion\x124\n" +
+	"\x16target_binding_version\x18\v \x01(\x04R\x14targetBindingVersion\x12=\n" +
+	"\x1bsender_account_identity_key\x18\f \x01(\fR\x18senderAccountIdentityKey\x12;\n" +
+	"\x1asender_account_signing_key\x18\r \x01(\fR\x17senderAccountSigningKey\x12;\n" +
+	"\x1asender_device_identity_key\x18\x0e \x01(\fR\x17senderDeviceIdentityKey\x129\n" +
+	"\x19sender_device_signing_key\x18\x0f \x01(\fR\x16senderDeviceSigningKey\x12<\n" +
+	"\x1asender_device_capabilities\x18\x10 \x01(\x04R\x18senderDeviceCapabilities\x12?\n" +
+	"\x1csender_device_binding_status\x18\x11 \x01(\rR\x19senderDeviceBindingStatus\x128\n" +
+	"\x18sender_account_signature\x18\x12 \x01(\fR\x16senderAccountSignature\"\x85\x02\n" +
+	"\x10SenderKeyReceipt\x12'\n" +
+	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12&\n" +
+	"\x0fowner_device_id\x18\x02 \x01(\fR\rownerDeviceId\x12(\n" +
+	"\x10target_device_id\x18\x03 \x01(\fR\x0etargetDeviceId\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x04 \x01(\rR\n" +
+	"generation\x12%\n" +
+	"\x0eroster_version\x18\x05 \x01(\x04R\rrosterVersion\x12/\n" +
+	"\x13envelope_commitment\x18\x06 \x01(\fR\x12envelopeCommitment*\xa5\x01\n" +
 	"\vMessageType\x12\x15\n" +
 	"\x11MESSAGE_TYPE_TEXT\x10\x00\x12\x16\n" +
 	"\x12MESSAGE_TYPE_IMAGE\x10\x01\x12\x15\n" +
 	"\x11MESSAGE_TYPE_FILE\x10\x02\x12\x1b\n" +
 	"\x17MESSAGE_TYPE_VOICE_NOTE\x10\x03\x12\x1a\n" +
 	"\x16MESSAGE_TYPE_VIEW_ONCE\x10\x04\x12\x17\n" +
-	"\x13MESSAGE_TYPE_SYSTEM\x10\x05B.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\x13MESSAGE_TYPE_SYSTEM\x10\x05B2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_chat_proto_rawDescOnce sync.Once
@@ -1263,7 +1627,7 @@ func file_veil_v1_chat_proto_rawDescGZIP() []byte {
 }
 
 var file_veil_v1_chat_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_veil_v1_chat_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
+var file_veil_v1_chat_proto_msgTypes = make([]protoimpl.MessageInfo, 14)
 var file_veil_v1_chat_proto_goTypes = []any{
 	(MessageType)(0),              // 0: veil.v1.MessageType
 	(MessageEvent_EventType)(0),   // 1: veil.v1.MessageEvent.EventType
@@ -1280,6 +1644,7 @@ var file_veil_v1_chat_proto_goTypes = []any{
 	(*PreKeyBundle)(nil),          // 12: veil.v1.PreKeyBundle
 	(*PreKeyRequest)(nil),         // 13: veil.v1.PreKeyRequest
 	(*SenderKeyDistribution)(nil), // 14: veil.v1.SenderKeyDistribution
+	(*SenderKeyReceipt)(nil),      // 15: veil.v1.SenderKeyReceipt
 }
 var file_veil_v1_chat_proto_depIdxs = []int32{
 	0, // 0: veil.v1.SendMessage.msg_type:type_name -> veil.v1.MessageType
@@ -1300,6 +1665,7 @@ func file_veil_v1_chat_proto_init() {
 		return
 	}
 	file_veil_v1_chat_proto_msgTypes[0].OneofWrappers = []any{}
+	file_veil_v1_chat_proto_msgTypes[2].OneofWrappers = []any{}
 	file_veil_v1_chat_proto_msgTypes[7].OneofWrappers = []any{}
 	file_veil_v1_chat_proto_msgTypes[10].OneofWrappers = []any{}
 	file_veil_v1_chat_proto_msgTypes[11].OneofWrappers = []any{}
@@ -1309,7 +1675,7 @@ func file_veil_v1_chat_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_veil_v1_chat_proto_rawDesc), len(file_veil_v1_chat_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   13,
+			NumMessages:   14,
 			NumExtensions: 0,
 			NumServices:   0,
 		},

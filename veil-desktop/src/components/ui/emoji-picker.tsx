@@ -1,17 +1,30 @@
-import { Component, createSignal, For, Show, onMount, onCleanup } from "solid-js";
-import { Smile, Search, X } from "lucide-solid";
+import { Popover as KPopover } from "@kobalte/core/popover";
+import { Tabs as KTabs } from "@kobalte/core/tabs";
+import { Component, For, Show, createMemo, createSignal } from "solid-js";
+import {
+  Clock3,
+  Flag,
+  Gamepad2,
+  Hand,
+  Heart,
+  Leaf,
+  Pizza,
+  Search,
+  Smile,
+  X,
+  type LucideIcon,
+} from "lucide-solid";
+import { Z } from "@/lib/zIndex";
 
 /* ── Emoji categories with curated sets ────────────── */
 const CATEGORIES = [
   {
     id: "frequent",
-    icon: "🕐",
     label: "Frequently used",
     emojis: ["👍", "❤️", "😂", "🔥", "😭", "🥺", "✨", "🙏", "😊", "🎉", "💀", "😍", "🤣", "😢", "👀", "💜", "🤔", "😮", "👎", "💯", "😎", "🫡", "🤝", "👋"],
   },
   {
     id: "smileys",
-    icon: "😀",
     label: "Smileys & People",
     emojis: [
       "😀", "😃", "😄", "😁", "😆", "😅", "🤣", "😂", "🙂", "😊",
@@ -30,7 +43,6 @@ const CATEGORIES = [
   },
   {
     id: "gestures",
-    icon: "👋",
     label: "Gestures & Body",
     emojis: [
       "👋", "🤚", "🖐️", "✋", "🖖", "🫱", "🫲", "🫳", "🫴", "🫷",
@@ -43,7 +55,6 @@ const CATEGORIES = [
   },
   {
     id: "hearts",
-    icon: "❤️",
     label: "Hearts & Symbols",
     emojis: [
       "❤️", "🧡", "💛", "💚", "💙", "💜", "🖤", "🤍", "🤎", "💔",
@@ -55,7 +66,6 @@ const CATEGORIES = [
   },
   {
     id: "nature",
-    icon: "🌿",
     label: "Animals & Nature",
     emojis: [
       "🐶", "🐱", "🐭", "🐹", "🐰", "🦊", "🐻", "🐼", "🐻‍❄️", "🐨",
@@ -68,7 +78,6 @@ const CATEGORIES = [
   },
   {
     id: "food",
-    icon: "🍕",
     label: "Food & Drink",
     emojis: [
       "🍎", "🍊", "🍋", "🍌", "🍉", "🍇", "🍓", "🫐", "🍈", "🍒",
@@ -81,7 +90,6 @@ const CATEGORIES = [
   },
   {
     id: "objects",
-    icon: "💡",
     label: "Objects & Activities",
     emojis: [
       "⚽", "🏀", "🏈", "⚾", "🥎", "🎾", "🏐", "🎱", "🏓", "🎮",
@@ -94,7 +102,6 @@ const CATEGORIES = [
   },
   {
     id: "flags",
-    icon: "🚩",
     label: "Travel & Flags",
     emojis: [
       "🚗", "🚕", "🚌", "🚎", "🏎️", "🚓", "🚑", "🚒", "✈️", "🚀",
@@ -108,108 +115,283 @@ const CATEGORIES = [
 
 type EmojiCategory = typeof CATEGORIES[number];
 
+const CATEGORY_ICONS: Record<EmojiCategory["id"], LucideIcon> = {
+  frequent: Clock3,
+  smileys: Smile,
+  gestures: Hand,
+  hearts: Heart,
+  nature: Leaf,
+  food: Pizza,
+  objects: Gamepad2,
+  flags: Flag,
+};
+
+// The native emoji glyph remains visible, while common search terms and button
+// names stay deterministic across the different Windows/Linux emoji fonts.
+const EMOJI_NAMES: Readonly<Record<string, string>> = {
+  "👍": "thumbs up",
+  "👎": "thumbs down",
+  "❤️": "red heart",
+  "😂": "face with tears of joy",
+  "🤣": "rolling on the floor laughing",
+  "🔥": "fire",
+  "😭": "loudly crying face",
+  "🥺": "pleading face",
+  "✨": "sparkles",
+  "🙏": "folded hands",
+  "😊": "smiling face with smiling eyes",
+  "🎉": "party popper",
+  "💀": "skull",
+  "😍": "smiling face with heart eyes",
+  "😢": "crying face",
+  "👀": "eyes",
+  "💜": "purple heart",
+  "🤔": "thinking face",
+  "😮": "face with open mouth",
+  "💯": "hundred points",
+  "😎": "smiling face with sunglasses",
+  "🫡": "saluting face",
+  "🤝": "handshake",
+  "👋": "waving hand",
+  "😀": "grinning face",
+  "😃": "grinning face with big eyes",
+  "😄": "grinning face with smiling eyes",
+  "😁": "beaming face with smiling eyes",
+  "😆": "grinning squinting face",
+  "😅": "grinning face with sweat",
+  "🙂": "slightly smiling face",
+  "🥰": "smiling face with hearts",
+  "😘": "face blowing a kiss",
+  "🤗": "hugging face",
+  "🤫": "shushing face",
+  "😡": "enraged face",
+  "🤬": "face with symbols on mouth",
+  "👻": "ghost",
+  "🤖": "robot",
+  "💩": "pile of poo",
+  "🤡": "clown face",
+  "✌️": "victory hand",
+  "👏": "clapping hands",
+  "💪": "flexed biceps",
+  "🧠": "brain",
+  "🖤": "black heart",
+  "💔": "broken heart",
+  "✅": "check mark button",
+  "❌": "cross mark",
+  "🐶": "dog face",
+  "🐱": "cat face",
+  "🦊": "fox",
+  "🐻": "bear",
+  "🐼": "panda",
+  "🌸": "cherry blossom",
+  "🌹": "rose",
+  "🌻": "sunflower",
+  "🌿": "herb",
+  "🍀": "four leaf clover",
+  "🍎": "red apple",
+  "🍕": "pizza",
+  "🍔": "hamburger",
+  "🍟": "french fries",
+  "☕": "hot beverage",
+  "🍺": "beer mug",
+  "⚽": "soccer ball",
+  "🏀": "basketball",
+  "🎮": "video game",
+  "🎨": "artist palette",
+  "🎧": "headphones",
+  "💻": "laptop",
+  "📱": "mobile phone",
+  "💡": "light bulb",
+  "🔒": "locked",
+  "🔑": "key",
+  "🚗": "car",
+  "✈️": "airplane",
+  "🚀": "rocket",
+  "🏠": "house",
+  "🌍": "globe showing Europe and Africa",
+  "🗺️": "world map",
+  "🚩": "triangular flag",
+  "🏳️‍🌈": "rainbow flag",
+};
+
+interface EmojiEntry {
+  emoji: string;
+  category: EmojiCategory;
+}
+
+const portalHost = () =>
+  (typeof document !== "undefined" && document.getElementById("island-portal")) || undefined;
+
+function emojiName(entry: EmojiEntry): string {
+  return EMOJI_NAMES[entry.emoji] ?? `${entry.category.label} emoji ${entry.emoji}`;
+}
+
+const EmojiGrid: Component<{ entries: EmojiEntry[]; onSelect: (emoji: string) => void }> = (props) => (
+  <div style={{
+    display: "grid",
+    "grid-template-columns": "repeat(8, 1fr)",
+    gap: "2px",
+  }}>
+    <For each={props.entries}>
+      {(entry) => (
+        <button
+          type="button"
+          aria-label={`Insert ${emojiName(entry)}`}
+          title={emojiName(entry)}
+          onClick={() => props.onSelect(entry.emoji)}
+          style={{
+            width: "100%", "aspect-ratio": "1",
+            "border-radius": "6px", border: "none",
+            background: "transparent", cursor: "pointer",
+            "font-size": "22px", display: "flex",
+            "align-items": "center", "justify-content": "center",
+            transition: "background 0.12s, transform 0.12s",
+          }}
+          onMouseEnter={(event) => {
+            event.currentTarget.style.background = "color-mix(in srgb, var(--veil-accent) 12%, transparent)";
+            event.currentTarget.style.transform = "scale(1.15)";
+          }}
+          onMouseLeave={(event) => {
+            event.currentTarget.style.background = "transparent";
+            event.currentTarget.style.transform = "scale(1)";
+          }}
+        >
+          <span aria-hidden="true">{entry.emoji}</span>
+        </button>
+      )}
+    </For>
+  </div>
+);
+
 interface EmojiPickerProps {
   onSelect: (emoji: string) => void;
 }
 
 const EmojiPicker: Component<EmojiPickerProps> = (props) => {
   const [open, setOpen] = createSignal(false);
-  const [activeCategory, setActiveCategory] = createSignal<string>("frequent");
+  const [activeCategory, setActiveCategory] = createSignal<EmojiCategory["id"]>("frequent");
   const [search, setSearch] = createSignal("");
-  let containerRef: HTMLDivElement | undefined;
   let triggerRef: HTMLButtonElement | undefined;
+  let searchRef: HTMLInputElement | undefined;
 
-  /* Close on Escape or outside click */
-  const handleKeyDown = (e: KeyboardEvent) => {
-    if (e.key === "Escape") setOpen(false);
-  };
-  const handleClickOutside = (e: MouseEvent) => {
-    if (containerRef && !containerRef.contains(e.target as Node) && triggerRef && !triggerRef.contains(e.target as Node)) {
-      setOpen(false);
+  const allEntries = createMemo<EmojiEntry[]>(() => {
+    const seen = new Set<string>();
+    const entries: EmojiEntry[] = [];
+    for (const category of CATEGORIES as unknown as EmojiCategory[]) {
+      for (const emoji of category.emojis as unknown as string[]) {
+        if (seen.has(emoji)) continue;
+        seen.add(emoji);
+        entries.push({ emoji, category });
+      }
     }
-  };
-
-  onMount(() => {
-    document.addEventListener("keydown", handleKeyDown);
-    document.addEventListener("mousedown", handleClickOutside);
+    return entries;
   });
-  onCleanup(() => {
-    document.removeEventListener("keydown", handleKeyDown);
-    document.removeEventListener("mousedown", handleClickOutside);
+
+  const searchResults = createMemo(() => {
+    const query = search().trim().toLocaleLowerCase();
+    if (!query) return [];
+    return allEntries().filter((entry) => {
+      const name = emojiName(entry).toLocaleLowerCase();
+      const category = entry.category.label.toLocaleLowerCase();
+      return entry.emoji.includes(query) || name.includes(query) || category.includes(query);
+    });
   });
 
   const selectEmoji = (emoji: string) => {
     props.onSelect(emoji);
+    setSearch("");
     setOpen(false);
   };
 
   return (
-    <div style={{ position: "relative", display: "flex", "align-items": "center" }}>
-      {/* Trigger button */}
-      <button
+    <KPopover
+      open={open()}
+      onOpenChange={(nextOpen) => {
+        setOpen(nextOpen);
+        if (!nextOpen) setSearch("");
+      }}
+      placement="top-end"
+      gutter={8}
+    >
+      <KPopover.Trigger
         ref={triggerRef}
-        onClick={() => setOpen(!open())}
+        aria-label="Choose emoji"
         style={{
           width: "32px", height: "32px", "border-radius": "8px",
-          border: "none", background: open() ? "rgba(124,107,245,0.15)" : "transparent",
-          color: open() ? "#7c6bf5" : "#666", cursor: "pointer",
+          border: "none", background: open() ? "color-mix(in srgb, var(--veil-accent) 15%, transparent)" : "transparent",
+          color: open() ? "var(--veil-accent)" : "var(--veil-text-faint)", cursor: "pointer",
           display: "flex", "align-items": "center", "justify-content": "center",
           transition: "background 0.2s, color 0.2s", "flex-shrink": "0",
         }}
-        onMouseEnter={(e) => {
-          if (!open()) e.currentTarget.style.background = "rgba(255,255,255,0.06)";
+        onMouseEnter={(event: MouseEvent) => {
+          if (!open()) (event.currentTarget as HTMLButtonElement).style.background = "color-mix(in srgb, var(--veil-text-strong) 6%, transparent)";
         }}
-        onMouseLeave={(e) => {
-          if (!open()) e.currentTarget.style.background = "transparent";
+        onMouseLeave={(event: MouseEvent) => {
+          if (!open()) (event.currentTarget as HTMLButtonElement).style.background = "transparent";
         }}
-        title="Emoji"
+        title="Choose emoji"
       >
         <Smile size={20} strokeWidth={1.8} />
-      </button>
+      </KPopover.Trigger>
 
-      {/* Picker popover */}
-      <Show when={open()}>
-        <div
-          ref={containerRef}
+      <KPopover.Portal mount={portalHost()}>
+        <KPopover.Content
+          onOpenAutoFocus={(event) => {
+            event.preventDefault();
+            queueMicrotask(() => searchRef?.focus());
+          }}
+          onCloseAutoFocus={(event) => {
+            event.preventDefault();
+            queueMicrotask(() => {
+              if (triggerRef?.isConnected) triggerRef.focus();
+            });
+          }}
           style={{
-            position: "absolute",
-            bottom: "calc(100% + 8px)",
-            right: "0",
             width: "352px",
             height: "420px",
-            background: "#2B2D31",
+            background: "var(--veil-island)",
             "border-radius": "12px",
-            "box-shadow": "0 8px 32px rgba(0,0,0,0.45), 0 0 0 1px rgba(255,255,255,0.06)",
+            "box-shadow": "0 8px 32px var(--veil-shadow-strong), 0 0 0 1px var(--veil-border)",
             display: "flex",
             "flex-direction": "column",
             overflow: "hidden",
-            "z-index": "1000",
+            "z-index": Z.DROPDOWN,
             animation: "emojiPickerIn 0.18s ease-out",
           }}
         >
-          {/* Search bar */}
+          <KPopover.Title style={{
+            position: "absolute", width: "1px", height: "1px", padding: "0",
+            margin: "-1px", overflow: "hidden", clip: "rect(0, 0, 0, 0)",
+            "white-space": "nowrap", border: "0",
+          }}>
+            Choose emoji
+          </KPopover.Title>
+
           <div style={{ padding: "12px 12px 8px", "flex-shrink": "0" }}>
             <div style={{
               display: "flex", "align-items": "center", gap: "8px",
-              background: "#1E1F22", "border-radius": "8px", padding: "0 10px",
+              background: "var(--veil-control)", "border-radius": "8px", padding: "0 10px",
               height: "34px",
             }}>
-              <Search size={14} color="#666" strokeWidth={2} style={{ "flex-shrink": "0" }} />
+              <Search size={14} color="var(--veil-text-faint)" strokeWidth={2} style={{ "flex-shrink": "0" }} />
               <input
+                ref={searchRef}
+                aria-label="Search emoji"
                 style={{
                   flex: "1", background: "transparent", border: "none",
-                  color: "#ccc", "font-size": "13px", outline: "none",
+                  color: "var(--veil-text)", "font-size": "13px", outline: "none",
                 }}
                 placeholder="Search emoji..."
                 value={search()}
                 onInput={(e) => setSearch(e.currentTarget.value)}
-                autofocus
               />
               <Show when={search()}>
                 <button
+                  type="button"
+                  aria-label="Clear emoji search"
                   style={{
                     width: "18px", height: "18px", "border-radius": "4px",
-                    background: "transparent", border: "none", color: "#666",
+                    background: "transparent", border: "none", color: "var(--veil-text-faint)",
                     cursor: "pointer", display: "flex", "align-items": "center",
                     "justify-content": "center",
                   }}
@@ -221,159 +403,91 @@ const EmojiPicker: Component<EmojiPickerProps> = (props) => {
             </div>
           </div>
 
-          {/* Category tabs */}
-          <div style={{
-            display: "flex", padding: "0 8px", gap: "2px", "flex-shrink": "0",
-            "border-bottom": "1px solid rgba(255,255,255,0.06)",
-          }}>
-            <For each={CATEGORIES as unknown as EmojiCategory[]}>
-              {(cat) => (
-                <button
-                  onClick={() => {
-                    setActiveCategory(cat.id);
-                    setSearch("");
-                    /* Scroll into view */
-                    const el = document.getElementById(`emoji-cat-${cat.id}`);
-                    el?.scrollIntoView({ behavior: "smooth", block: "start" });
-                  }}
-                  style={{
-                    flex: "1", height: "36px", border: "none", cursor: "pointer",
-                    background: activeCategory() === cat.id ? "rgba(124,107,245,0.12)" : "transparent",
-                    "border-bottom": activeCategory() === cat.id ? "2px solid #7c6bf5" : "2px solid transparent",
-                    "border-radius": "0", display: "flex", "align-items": "center",
-                    "justify-content": "center", "font-size": "16px",
-                    transition: "background 0.15s, border-color 0.15s",
-                    opacity: activeCategory() === cat.id ? "1" : "0.5",
-                    "padding-bottom": "2px",
-                  }}
-                  onMouseEnter={(e) => {
-                    if (activeCategory() !== cat.id) e.currentTarget.style.background = "rgba(255,255,255,0.04)";
-                  }}
-                  onMouseLeave={(e) => {
-                    if (activeCategory() !== cat.id) e.currentTarget.style.background = "transparent";
-                  }}
-                  title={cat.label}
-                >
-                  {cat.icon}
-                </button>
-              )}
-            </For>
-          </div>
-
-          {/* Emoji grid — scrollable */}
-          <div
-            style={{
-              flex: "1", "overflow-y": "auto", padding: "8px 10px",
-              "min-height": "0",
+          <KTabs
+            value={activeCategory()}
+            onChange={(value) => {
+              setActiveCategory(value as EmojiCategory["id"]);
+              setSearch("");
             }}
-            onScroll={(e) => {
-              /* Update active tab on scroll */
-              const container = e.currentTarget;
-              const kids = container.querySelectorAll("[data-cat-id]");
-              let closestId = "frequent";
-              let closestDist = Infinity;
-              kids.forEach((kid) => {
-                const top = (kid as HTMLElement).offsetTop - container.scrollTop;
-                if (top <= 20 && Math.abs(top) < closestDist) {
-                  closestDist = Math.abs(top);
-                  closestId = (kid as HTMLElement).dataset.catId ?? "frequent";
-                }
-              });
-              setActiveCategory(closestId);
-            }}
+            activationMode="automatic"
+            style={{ display: "flex", "flex-direction": "column", flex: "1", "min-height": "0" }}
           >
-            <Show when={!search()}>
+            <KTabs.List
+              aria-label="Emoji categories"
+              style={{
+                display: search().trim() ? "none" : "flex",
+                padding: "0 8px", gap: "2px", "flex-shrink": "0",
+                "border-bottom": "1px solid var(--veil-border)",
+              }}
+            >
               <For each={CATEGORIES as unknown as EmojiCategory[]}>
                 {(cat) => (
-                  <div id={`emoji-cat-${cat.id}`} data-cat-id={cat.id}>
-                    <div style={{
-                      "font-size": "11px", "font-weight": "600", color: "#777",
-                      "text-transform": "uppercase", "letter-spacing": "0.05em",
-                      padding: "8px 4px 6px",
-                    }}>
-                      {cat.label}
-                    </div>
-                    <div style={{
-                      display: "grid",
-                      "grid-template-columns": "repeat(8, 1fr)",
-                      gap: "2px",
-                    }}>
-                      <For each={cat.emojis as unknown as string[]}>
-                        {(emoji) => (
-                          <button
-                            onClick={() => selectEmoji(emoji)}
-                            style={{
-                              width: "100%", "aspect-ratio": "1",
-                              "border-radius": "6px", border: "none",
-                              background: "transparent", cursor: "pointer",
-                              "font-size": "22px", display: "flex",
-                              "align-items": "center", "justify-content": "center",
-                              transition: "background 0.12s, transform 0.12s",
-                            }}
-                            onMouseEnter={(e) => {
-                              e.currentTarget.style.background = "rgba(124,107,245,0.12)";
-                              e.currentTarget.style.transform = "scale(1.15)";
-                            }}
-                            onMouseLeave={(e) => {
-                              e.currentTarget.style.background = "transparent";
-                              e.currentTarget.style.transform = "scale(1)";
-                            }}
-                          >
-                            {emoji}
-                          </button>
-                        )}
-                      </For>
-                    </div>
-                  </div>
+                  <KTabs.Trigger
+                    value={cat.id}
+                    aria-label={cat.label}
+                    title={cat.label}
+                    style={{
+                      flex: "1", height: "36px", border: "none", cursor: "pointer",
+                      background: activeCategory() === cat.id ? "color-mix(in srgb, var(--veil-accent) 12%, transparent)" : "transparent",
+                      "border-bottom": activeCategory() === cat.id ? "2px solid var(--veil-accent)" : "2px solid transparent",
+                      "border-radius": "0", display: "flex", "align-items": "center",
+                      "justify-content": "center",
+                      transition: "background 0.15s, border-color 0.15s",
+                      opacity: activeCategory() === cat.id ? "1" : "0.55",
+                      "padding-bottom": "2px", color: "var(--veil-text-muted)",
+                    }}
+                  >
+                    {(() => {
+                      const Icon = CATEGORY_ICONS[cat.id];
+                      return <Icon size={16} strokeWidth={1.8} aria-hidden="true" />;
+                    })()}
+                  </KTabs.Trigger>
                 )}
               </For>
-            </Show>
+            </KTabs.List>
 
-            {/* Search results — flat grid of all matching */}
-            <Show when={!!search()}>
-              {(() => {
-                /* For now, show all emojis — web emoji search needs a name map.
-                   We flatten all categories and user can visually scan. */
-                const allEmojis = CATEGORIES.flatMap(c => c.emojis as unknown as string[]);
-                return (
-                  <div style={{
-                    display: "grid",
-                    "grid-template-columns": "repeat(8, 1fr)",
-                    gap: "2px",
-                  }}>
-                    <For each={allEmojis}>
-                      {(emoji) => (
-                        <button
-                          onClick={() => selectEmoji(emoji)}
-                          style={{
-                            width: "100%", "aspect-ratio": "1",
-                            "border-radius": "6px", border: "none",
-                            background: "transparent", cursor: "pointer",
-                            "font-size": "22px", display: "flex",
-                            "align-items": "center", "justify-content": "center",
-                            transition: "background 0.12s, transform 0.12s",
-                          }}
-                          onMouseEnter={(e) => {
-                            e.currentTarget.style.background = "rgba(124,107,245,0.12)";
-                            e.currentTarget.style.transform = "scale(1.15)";
-                          }}
-                          onMouseLeave={(e) => {
-                            e.currentTarget.style.background = "transparent";
-                            e.currentTarget.style.transform = "scale(1)";
-                          }}
-                        >
-                          {emoji}
-                        </button>
-                      )}
-                    </For>
-                  </div>
-                );
-              })()}
-            </Show>
-          </div>
-        </div>
-      </Show>
-    </div>
+            <div style={{ flex: "1", "overflow-y": "auto", padding: "8px 10px", "min-height": "0" }}>
+              <Show when={search().trim()}>
+                <section aria-label="Emoji search results">
+                  <Show
+                    when={searchResults().length > 0}
+                    fallback={
+                      <p role="status" style={{
+                        margin: "28px 8px", "text-align": "center",
+                        color: "var(--veil-text-muted)", "font-size": "12px",
+                      }}>
+                        No emoji found for “{search().trim()}”.
+                      </p>
+                    }
+                  >
+                    <EmojiGrid entries={searchResults()} onSelect={selectEmoji} />
+                  </Show>
+                </section>
+              </Show>
+              <div style={{ display: search().trim() ? "none" : "block" }}>
+                <For each={CATEGORIES as unknown as EmojiCategory[]}>
+                  {(cat) => (
+                    <KTabs.Content value={cat.id}>
+                      <div style={{
+                        "font-size": "11px", "font-weight": "600", color: "var(--veil-text-faint)",
+                        "text-transform": "uppercase", "letter-spacing": "0.05em",
+                        padding: "8px 4px 6px",
+                      }}>
+                        {cat.label}
+                      </div>
+                      <EmojiGrid
+                        entries={(cat.emojis as unknown as string[]).map((emoji) => ({ emoji, category: cat }))}
+                        onSelect={selectEmoji}
+                      />
+                    </KTabs.Content>
+                  )}
+                </For>
+              </div>
+            </div>
+          </KTabs>
+        </KPopover.Content>
+      </KPopover.Portal>
+    </KPopover>
   );
 };
 

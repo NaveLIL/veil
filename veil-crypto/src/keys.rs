@@ -110,15 +110,29 @@ impl IdentityKeyPair {
 
     /// Open a sealed Sender Key Distribution Message addressed to us.
     /// Returns `(sender_identity_key, skdm_json_bytes)`.
+    #[deprecated(note = "unauthenticated SKDM v1 is disabled; use open_authenticated_sealed_skdm")]
     pub fn open_sealed_skdm(&self, wire: &[u8]) -> Result<([u8; 32], Vec<u8>), String> {
-        let secret = self.x25519_secret.to_bytes();
-        let public = *self.x25519_public.as_bytes();
-        let result = crate::sender_key::open_skdm(&secret, &public, wire);
-        // best-effort zeroize of the local copy of the secret
-        let mut s = secret;
-        use zeroize::Zeroize;
-        s.zeroize();
-        result
+        let _ = wire;
+        Err("unauthenticated sealed SKDM v1 is disabled".to_string())
+    }
+
+    /// Verify and open an authenticated v3 Sender Key Distribution Message.
+    pub fn open_authenticated_sealed_skdm(
+        &self,
+        expected_sender_identity_key: &[u8; 32],
+        expected_sender_signing_key: &[u8; 32],
+        expected_group_id: &str,
+        expected_generation: u32,
+        wire: &[u8],
+    ) -> Result<crate::sender_key::AuthenticatedSkdm, String> {
+        crate::sender_key::open_skdm_authenticated(
+            self,
+            expected_sender_identity_key,
+            expected_sender_signing_key,
+            expected_group_id,
+            expected_generation,
+            wire,
+        )
     }
 
     /// Get reference to the Ed25519 verifying key.

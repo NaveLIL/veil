@@ -9,14 +9,21 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/chat"
-	"github.com/AegisSec/veil-server/internal/config"
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/chat"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
 )
 
 func main() {
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatalf("configuration error: %v", err)
+	}
+	if err := httpmw.ConfigureClientIPFromEnv(); err != nil {
+		log.Fatalf("proxy configuration error: %v", err)
+	}
 
 	port := os.Getenv("CHAT_PORT")
 	if port == "" {
@@ -31,11 +38,18 @@ func main() {
 		log.Fatalf("database connection failed: %v", err)
 	}
 	defer database.Close()
+	if err := database.ValidateCryptographicPublicKeys(ctx); err != nil {
+		log.Fatalf("database cryptographic-key preflight failed: %v", err)
+	}
 	log.Println("database connected")
 
 	chatSvc := chat.NewService(database, cfg)
 	signedMw := authmw.New(chatSvc.SigningKeyLookup())
+	defer signedMw.Close()
 	rl := authmw.NewRateLimit(240, time.Minute)
+	defer rl.Close()
+	preAuthRL := authmw.NewRateLimit(600, time.Minute)
+	defer preAuthRL.Close()
 	handler := chat.NewHandler(chatSvc, signedMw, rl)
 
 	mux := http.NewServeMux()
@@ -47,9 +61,10 @@ func main() {
 		w.Write([]byte(`{"service":"veil-chat","status":"ok"}`))
 	})
 
+	publicHandler := http.HandlerFunc(preAuthRL.Wrap(mux.ServeHTTP))
 	server := &http.Server{
 		Addr:         ":" + port,
-		Handler:      mux,
+		Handler:      publicHandler,
 		ReadTimeout:  10 * time.Second,
 		WriteTimeout: 10 * time.Second,
 		IdleTimeout:  30 * time.Second,

@@ -1,0 +1,11 @@
+syntax = "proto3";
+package veil.v1;
+
+option go_package = "github.com/NaveLIL/veil/veil-server/pkg/proto/v1";
+
+// Presentation-only invalidation hint. Profile contents remain on the signed
+// REST surface and must be fetched again for the exact authenticated origin.
+message ProfileUpdated {
+  string user_id = 1;
+  uint64 profile_version = 2;
+}

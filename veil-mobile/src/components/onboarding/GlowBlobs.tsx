@@ -31,8 +31,8 @@ export const GlowBlobs: React.FC = () => {
 
 const Blob: React.FC<{
   size: number;
-  top: string;
-  left: string;
+  top: `${number}%`;
+  left: `${number}%`;
   opacity: number;
   delay: number;
   duration: number;
@@ -73,9 +73,7 @@ const Blob: React.FC<{
         position: "absolute",
         width: size,
         height: size,
-        // @ts-expect-error: percentage strings are valid for absolute positioning.
         top,
-        // @ts-expect-error: percentage strings are valid for absolute positioning.
         left,
         opacity: op,
         transform: [{ scale }, { translateX: -size / 2 }, { translateY: -size / 2 }],

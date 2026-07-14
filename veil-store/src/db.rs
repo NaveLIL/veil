@@ -1,30 +1,1057 @@
-use rusqlite::Connection;
+use crate::models::{
+    AccountSnapshot, AccountSnapshotSource, HistoricalAccountContinuity, LocalIdentityVerification,
+    Message, MessageAuthorContext, NetworkProfile, ProfileLocator,
+};
+use rusqlite::{Connection, OptionalExtension, Row};
 use std::path::Path;
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
+
+/// X3DH private prekey material. Rows live only inside SQLCipher; consumed
+/// one-time secrets are nulled atomically when the initial ratchet is stored.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct LocalPreKey {
+    pub key_type: u8, // 0=signed, 1=one-time
+    pub protocol_key_id: u32,
+    pub secret_key: [u8; 32],
+    pub public_key: [u8; 32],
+    pub signature: Option<[u8; 64]>,
+}
+
+/// Private per-install device identity stored only inside SQLCipher. Public
+/// fields and the account signature are duplicated deliberately: loading code
+/// can derive the public keys again and reject silent private-key corruption.
+#[derive(Zeroize, ZeroizeOnDrop)]
+pub struct LocalDeviceIdentityV1 {
+    pub device_id: [u8; 16],
+    pub version: u64,
+    pub x25519_secret: [u8; 32],
+    pub ed25519_secret: [u8; 32],
+    pub device_identity_key: [u8; 32],
+    pub device_signing_key: [u8; 32],
+    pub capabilities: u64,
+    pub status: u8,
+    pub account_identity_key: [u8; 32],
+    pub account_signing_key: [u8; 32],
+    pub account_signature: [u8; 64],
+}
 
 /// Encrypted SQLite database using SQLCipher.
 pub struct VeilDb {
     conn: Connection,
 }
 
+pub type PendingInitialHeaderRow = ([u8; 32], Vec<u8>);
+pub type MessageBinding = (String, Vec<u8>, bool, Option<i64>);
+pub type TrustedSigningKeyBinding = ([u8; 32], [u8; 32]);
+pub type StoredSenderKey = (Vec<u8>, Vec<u8>, bool);
+type StoredSenderKeyMaterial = ([u8; 32], Zeroizing<Vec<u8>>);
+
+/// Exact-origin SQLCipher context for one current search result.
+///
+/// The native layer serializes these messages through the same renderer
+/// mapper as `get_messages`; this storage type deliberately contains no
+/// search-index data or navigation authority.
+#[derive(Debug, Clone)]
+pub struct SearchResultContext {
+    pub conversation_type: crate::models::ConversationType,
+    pub server_id: Option<String>,
+    pub messages: Vec<Message>,
+}
+
+const MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER: usize = 128;
+const MAX_CANONICAL_SERVER_ORIGIN_BYTES: usize = 512;
+const MAX_PROFILE_ORIGIN_BYTES: usize = 512;
+const MAX_ACCOUNT_PRESENTATION_BYTES: usize = 256;
+const MAX_NETWORK_PROFILE_DISPLAY_BYTES: usize = 512;
+const MAX_NETWORK_PROFILE_ABOUT_BYTES: usize = 2048;
+const MAX_OBSERVED_AT_BYTES: usize = 64;
+
+struct RawAccountSnapshot {
+    canonical_server_origin: String,
+    user_id: String,
+    identity_key: Vec<u8>,
+    signing_key: Vec<u8>,
+    username: Option<String>,
+    display_name: Option<String>,
+    profile_version: Option<Vec<u8>>,
+    profile_origin: String,
+    source: u8,
+    observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedSelfBinding {
+    user_id: String,
+    identity_key: [u8; 32],
+    signing_key: [u8; 32],
+}
+
+impl RawAccountSnapshot {
+    fn decode(self) -> Result<AccountSnapshot, String> {
+        let identity_key = fixed_bytes::<32>("account identity key", self.identity_key)?;
+        let signing_key = fixed_bytes::<32>("account signing key", self.signing_key)?;
+        let profile_version = self
+            .profile_version
+            .map(|value| fixed_bytes::<8>("account profile version", value).map(u64::from_be_bytes))
+            .transpose()?;
+        let source = AccountSnapshotSource::from_u8(self.source)
+            .ok_or_else(|| format!("invalid persisted account snapshot source: {}", self.source))?;
+        let snapshot = AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: self.canonical_server_origin,
+                user_id: self.user_id,
+                identity_key,
+            },
+            signing_key,
+            username: self.username,
+            display_name: self.display_name,
+            profile_version,
+            profile_origin: self.profile_origin,
+            source,
+            observed_at: self.observed_at,
+        };
+        validate_account_snapshot(&snapshot)?;
+        Ok(snapshot)
+    }
+}
+
+fn raw_account_snapshot_from_row(
+    row: &Row<'_>,
+    first_column: usize,
+) -> rusqlite::Result<Option<RawAccountSnapshot>> {
+    let canonical_server_origin: Option<String> = row.get(first_column)?;
+    Ok(match canonical_server_origin {
+        Some(canonical_server_origin) => Some(RawAccountSnapshot {
+            canonical_server_origin,
+            user_id: row.get(first_column + 1)?,
+            identity_key: row.get(first_column + 2)?,
+            signing_key: row.get(first_column + 3)?,
+            username: row.get(first_column + 4)?,
+            display_name: row.get(first_column + 5)?,
+            profile_version: row.get(first_column + 6)?,
+            profile_origin: row.get(first_column + 7)?,
+            source: row.get(first_column + 8)?,
+            observed_at: row.get(first_column + 9)?,
+        }),
+        None => None,
+    })
+}
+
+fn raw_account_snapshot_required_from_row(
+    row: &Row<'_>,
+    first_column: usize,
+) -> rusqlite::Result<RawAccountSnapshot> {
+    Ok(RawAccountSnapshot {
+        canonical_server_origin: row.get(first_column)?,
+        user_id: row.get(first_column + 1)?,
+        identity_key: row.get(first_column + 2)?,
+        signing_key: row.get(first_column + 3)?,
+        username: row.get(first_column + 4)?,
+        display_name: row.get(first_column + 5)?,
+        profile_version: row.get(first_column + 6)?,
+        profile_origin: row.get(first_column + 7)?,
+        source: row.get(first_column + 8)?,
+        observed_at: row.get(first_column + 9)?,
+    })
+}
+
+fn validate_canonical_uuid(label: &str, value: &str) -> Result<(), String> {
+    let parsed =
+        uuid::Uuid::parse_str(value).map_err(|_| format!("{label} must be a canonical UUID"))?;
+    if parsed.is_nil() || parsed.hyphenated().to_string() != value {
+        return Err(format!("{label} must be a non-nil canonical UUID"));
+    }
+    Ok(())
+}
+
+fn validate_canonical_server_origin(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || value.len() > MAX_CANONICAL_SERVER_ORIGIN_BYTES
+        || !value.is_ascii()
+        || value.bytes().any(|byte| byte.is_ascii_uppercase())
+    {
+        return Err("canonical server origin is empty, oversized, or non-canonical".to_string());
+    }
+    let authority = value
+        .strip_prefix("https://")
+        .or_else(|| value.strip_prefix("http://"))
+        .ok_or_else(|| "canonical server origin must use http or https".to_string())?;
+    if authority.is_empty()
+        || authority.contains(['/', '?', '#', '@'])
+        || authority.bytes().any(|byte| byte.is_ascii_whitespace())
+    {
+        return Err("canonical server origin must contain only an authority".to_string());
+    }
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, port) = bracketed.split_once("]:").ok_or_else(|| {
+            "canonical IPv6 server origin must include an explicit port".to_string()
+        })?;
+        if host.is_empty()
+            || !host
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || matches!(byte, b':' | b'.'))
+        {
+            return Err("canonical server origin contains an invalid IPv6 host".to_string());
+        }
+        (host, port)
+    } else {
+        let (host, port) = authority
+            .rsplit_once(':')
+            .ok_or_else(|| "canonical server origin must include an explicit port".to_string())?;
+        if host.is_empty()
+            || !host.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+            })
+        {
+            return Err("canonical server origin contains an invalid host".to_string());
+        }
+        (host, port)
+    };
+    if host.is_empty()
+        || port
+            .parse::<u16>()
+            .ok()
+            .is_none_or(|parsed| parsed == 0 || parsed.to_string() != port)
+    {
+        return Err("canonical server origin contains an invalid port".to_string());
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    label: &str,
+    value: &str,
+    max_bytes: usize,
+    allow_empty: bool,
+) -> Result<(), String> {
+    if value.len() > max_bytes
+        || (!allow_empty && value.is_empty())
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "{label} is empty, oversized, or contains control characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_optional_presentation(label: &str, value: Option<&str>) -> Result<(), String> {
+    if let Some(value) = value {
+        validate_bounded_text(label, value, MAX_ACCOUNT_PRESENTATION_BYTES, false)?;
+    }
+    Ok(())
+}
+
+fn validate_profile_locator(locator: &ProfileLocator) -> Result<(), String> {
+    validate_canonical_server_origin(&locator.canonical_server_origin)?;
+    validate_canonical_uuid("profile locator user id", &locator.user_id)?;
+    if locator.identity_key == [0u8; 32] {
+        return Err("profile locator identity key must not be all zero".to_string());
+    }
+    Ok(())
+}
+
+fn is_directional_control(value: char) -> bool {
+    matches!(
+        value,
+        '\u{061c}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{202a}'
+            | '\u{202b}'
+            | '\u{202c}'
+            | '\u{202d}'
+            | '\u{202e}'
+            | '\u{2066}'
+            | '\u{2067}'
+            | '\u{2068}'
+            | '\u{2069}'
+            | '\u{206a}'
+            | '\u{206b}'
+            | '\u{206c}'
+            | '\u{206d}'
+            | '\u{206e}'
+            | '\u{206f}'
+    )
+}
+
+fn is_unsafe_profile_invisible(value: char) -> bool {
+    matches!(
+        value,
+        '\u{00ad}'
+            | '\u{034f}'
+            | '\u{180e}'
+            | '\u{200b}'
+            | '\u{2028}'
+            | '\u{2029}'
+            | '\u{2060}'
+            | '\u{feff}'
+    )
+}
+
+fn validate_network_profile(profile: &NetworkProfile) -> Result<(), String> {
+    validate_profile_locator(&profile.locator)?;
+    if profile.profile_version > i64::MAX as u64 {
+        return Err("network profile version exceeds the server contract".to_string());
+    }
+    validate_bounded_text(
+        "network profile username",
+        &profile.username,
+        MAX_ACCOUNT_PRESENTATION_BYTES,
+        false,
+    )?;
+    if let Some(display_name) = profile.display_name.as_deref() {
+        validate_bounded_text(
+            "network profile display name",
+            display_name,
+            MAX_NETWORK_PROFILE_DISPLAY_BYTES,
+            false,
+        )?;
+    }
+    if profile.about.len() > MAX_NETWORK_PROFILE_ABOUT_BYTES {
+        return Err("network profile presentation text is oversized".to_string());
+    }
+    match (
+        profile.avatar_asset_id.as_deref(),
+        profile.avatar_digest,
+        profile.avatar_content_type.as_deref(),
+    ) {
+        (None, None, None) => {}
+        (Some(asset_id), Some(digest), Some("image/jpeg")) => {
+            let parsed = uuid::Uuid::parse_str(asset_id)
+                .map_err(|_| "network profile avatar id is invalid".to_string())?;
+            if parsed.hyphenated().to_string() != asset_id || digest == [0u8; 32] {
+                return Err("network profile avatar metadata is invalid".to_string());
+            }
+        }
+        _ => return Err("network profile avatar metadata is incomplete".to_string()),
+    }
+    for value in std::iter::once(&profile.username)
+        .chain(profile.display_name.iter())
+        .chain(std::iter::once(&profile.about))
+    {
+        if value.chars().any(|character| {
+            is_directional_control(character) || is_unsafe_profile_invisible(character)
+        }) {
+            return Err("network profile contains unsafe invisible characters".to_string());
+        }
+    }
+    if profile
+        .about
+        .chars()
+        .any(|character| character != '\n' && character.is_control())
+    {
+        return Err("network profile about contains control characters".to_string());
+    }
+    validate_bounded_text(
+        "network profile update timestamp",
+        &profile.profile_updated_at,
+        MAX_OBSERVED_AT_BYTES,
+        false,
+    )?;
+    validate_bounded_text(
+        "network profile observation timestamp",
+        &profile.observed_at,
+        MAX_OBSERVED_AT_BYTES,
+        false,
+    )
+}
+
+fn validate_account_snapshot_envelope(snapshot: &AccountSnapshot) -> Result<(), String> {
+    validate_profile_locator(&snapshot.locator)?;
+    validate_optional_presentation("account username", snapshot.username.as_deref())?;
+    validate_optional_presentation("account display name", snapshot.display_name.as_deref())?;
+    if snapshot.profile_origin.len() > MAX_PROFILE_ORIGIN_BYTES {
+        return Err("account profile origin is oversized".to_string());
+    }
+    validate_canonical_server_origin(&snapshot.profile_origin)?;
+    if snapshot.profile_origin != snapshot.locator.canonical_server_origin {
+        return Err("account profile origin differs from its locator origin".to_string());
+    }
+    validate_bounded_text(
+        "account observation timestamp",
+        &snapshot.observed_at,
+        MAX_OBSERVED_AT_BYTES,
+        false,
+    )
+}
+
+fn validate_account_snapshot(snapshot: &AccountSnapshot) -> Result<(), String> {
+    validate_account_snapshot_envelope(snapshot)?;
+    if !veil_crypto::public_key::valid_ed25519_public_key(&snapshot.signing_key) {
+        return Err("account signing key is not a valid prime-order Ed25519 key".to_string());
+    }
+    Ok(())
+}
+
+fn load_account_by_origin_user(
+    conn: &Connection,
+    canonical_server_origin: &str,
+    user_id: &str,
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM identity_directory_v1
+         WHERE canonical_server_origin = ?1 AND user_id = ?2",
+        rusqlite::params![canonical_server_origin, user_id],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load account directory entry by user: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn load_account_by_origin_identity(
+    conn: &Connection,
+    canonical_server_origin: &str,
+    identity_key: &[u8; 32],
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM identity_directory_v1
+         WHERE canonical_server_origin = ?1 AND identity_key = ?2",
+        rusqlite::params![canonical_server_origin, identity_key.as_slice()],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load account directory entry by identity: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn load_account_by_origin_signing(
+    conn: &Connection,
+    canonical_server_origin: &str,
+    signing_key: &[u8; 32],
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM identity_directory_v1
+         WHERE canonical_server_origin = ?1 AND signing_key = ?2",
+        rusqlite::params![canonical_server_origin, signing_key.as_slice()],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load account directory entry by signing key: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn load_exact_account(
+    conn: &Connection,
+    locator: &ProfileLocator,
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM identity_directory_v1
+         WHERE canonical_server_origin = ?1 AND user_id = ?2 AND identity_key = ?3",
+        rusqlite::params![
+            locator.canonical_server_origin,
+            locator.user_id,
+            locator.identity_key.as_slice(),
+        ],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load exact account directory entry: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn load_authenticated_self_binding(
+    conn: &Connection,
+    canonical_server_origin: &str,
+) -> Result<Option<AuthenticatedSelfBinding>, String> {
+    let binding = conn
+        .query_row(
+            "SELECT user_id, identity_key, signing_key
+         FROM authenticated_self_bindings_v1
+         WHERE canonical_server_origin = ?1",
+            rusqlite::params![canonical_server_origin],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("load authenticated self binding: {error}"))?
+        .map(|(user_id, identity_key, signing_key)| {
+            Ok::<AuthenticatedSelfBinding, String>(AuthenticatedSelfBinding {
+                user_id,
+                identity_key: fixed_bytes::<32>("authenticated self identity key", identity_key)?,
+                signing_key: fixed_bytes::<32>("authenticated self signing key", signing_key)?,
+            })
+        })
+        .transpose()?;
+    if let Some(binding) = binding.as_ref() {
+        validate_canonical_uuid("authenticated self user id", &binding.user_id)?;
+        if binding.identity_key == [0u8; 32]
+            || binding.identity_key == binding.signing_key
+            || !veil_crypto::public_key::valid_ed25519_public_key(&binding.signing_key)
+        {
+            return Err("persisted authenticated self binding has invalid keys".to_string());
+        }
+    }
+    Ok(binding)
+}
+
+fn ensure_self_binding_directory_compatible(
+    conn: &Connection,
+    canonical_server_origin: &str,
+    binding: &AuthenticatedSelfBinding,
+) -> Result<(), String> {
+    let conflict = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM identity_directory_v1
+                WHERE canonical_server_origin = ?1
+                  AND (user_id = ?2 OR identity_key = ?3 OR signing_key = ?4)
+                  AND NOT (user_id = ?2 AND identity_key = ?3 AND signing_key = ?4)
+            )",
+            rusqlite::params![
+                canonical_server_origin,
+                &binding.user_id,
+                binding.identity_key.as_slice(),
+                binding.signing_key.as_slice(),
+            ],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(|error| format!("validate authenticated self directory binding: {error}"))?;
+    if conflict {
+        return Err(
+            "persisted identity directory conflicts with the authenticated self binding"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validated_self_binding_for_origin(
+    conn: &Connection,
+    canonical_server_origin: &str,
+) -> Result<Option<AuthenticatedSelfBinding>, String> {
+    let binding = load_authenticated_self_binding(conn, canonical_server_origin)?;
+    if let Some(binding) = binding.as_ref() {
+        ensure_self_binding_directory_compatible(conn, canonical_server_origin, binding)?;
+    }
+    Ok(binding)
+}
+
+fn ensure_account_snapshot_compatible_with_self(
+    incoming: &AccountSnapshot,
+    binding: Option<&AuthenticatedSelfBinding>,
+) -> Result<(), String> {
+    let Some(binding) = binding else {
+        return Ok(());
+    };
+    let overlaps_self = incoming.locator.user_id == binding.user_id
+        || incoming.locator.identity_key == binding.identity_key
+        || incoming.signing_key == binding.signing_key;
+    let exact_self = incoming.locator.user_id == binding.user_id
+        && incoming.locator.identity_key == binding.identity_key
+        && incoming.signing_key == binding.signing_key;
+    if overlaps_self && !exact_self {
+        return Err(
+            "account directory entry conflicts with the authenticated self binding".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn load_message_author(
+    conn: &Connection,
+    message_id: &str,
+) -> Result<Option<AccountSnapshot>, String> {
+    conn.query_row(
+        "SELECT canonical_server_origin, user_id, identity_key, signing_key,
+                username, display_name, profile_version, profile_origin,
+                source, observed_at
+         FROM message_author_snapshots_v1
+         WHERE message_id = ?1",
+        rusqlite::params![message_id],
+        |row| raw_account_snapshot_required_from_row(row, 0),
+    )
+    .optional()
+    .map_err(|e| format!("load message author snapshot: {e}"))?
+    .map(RawAccountSnapshot::decode)
+    .transpose()
+}
+
+fn merge_account_presentation(
+    existing: &AccountSnapshot,
+    incoming: &AccountSnapshot,
+) -> Result<AccountSnapshot, String> {
+    if let (Some(existing_version), Some(incoming_version)) =
+        (existing.profile_version, incoming.profile_version)
+    {
+        if incoming_version < existing_version {
+            return Err("account profile version rollback rejected".to_string());
+        }
+        if incoming_version == existing_version
+            && (incoming.username != existing.username
+                || incoming.display_name != existing.display_name
+                || incoming.profile_origin != existing.profile_origin)
+        {
+            return Err("account profile changed without a version advance".to_string());
+        }
+    }
+
+    if incoming.source < existing.source {
+        return Ok(existing.clone());
+    }
+
+    // A source which truthfully reports no version cannot erase or reinterpret
+    // presentation metadata which was already accepted at an exact version.
+    if existing.profile_version.is_some() && incoming.profile_version.is_none() {
+        return Ok(existing.clone());
+    }
+
+    Ok(incoming.clone())
+}
+
+fn account_snapshot_continuity_conflict_users(
+    conn: &Connection,
+    incoming: &AccountSnapshot,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut users = std::collections::BTreeSet::new();
+    let origin = &incoming.locator.canonical_server_origin;
+    if let Some(existing) = load_account_by_origin_user(conn, origin, &incoming.locator.user_id)? {
+        if existing.locator.identity_key != incoming.locator.identity_key
+            || existing.signing_key != incoming.signing_key
+        {
+            users.insert(existing.locator.user_id);
+        }
+    }
+    if let Some(existing) =
+        load_account_by_origin_identity(conn, origin, &incoming.locator.identity_key)?
+    {
+        if existing.locator.user_id != incoming.locator.user_id
+            || existing.signing_key != incoming.signing_key
+        {
+            users.insert(existing.locator.user_id);
+        }
+    }
+    if let Some(existing) = load_account_by_origin_signing(conn, origin, &incoming.signing_key)? {
+        if existing.locator.user_id != incoming.locator.user_id
+            || existing.locator.identity_key != incoming.locator.identity_key
+        {
+            users.insert(existing.locator.user_id);
+        }
+    }
+    if let Some(binding) = load_authenticated_self_binding(conn, origin)? {
+        let overlaps_self = incoming.locator.user_id == binding.user_id
+            || incoming.locator.identity_key == binding.identity_key
+            || incoming.signing_key == binding.signing_key;
+        let exact_self = incoming.locator.user_id == binding.user_id
+            && incoming.locator.identity_key == binding.identity_key
+            && incoming.signing_key == binding.signing_key;
+        if overlaps_self && !exact_self {
+            users.insert(binding.user_id);
+        }
+    }
+    Ok(users)
+}
+
+fn record_identity_change_observation_for(
+    conn: &Connection,
+    alarm_user_id: &str,
+    incoming: &AccountSnapshot,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO identity_change_observations_v1
+            (canonical_server_origin, user_id, observed_identity_key,
+             observed_signing_key, source, observed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT(canonical_server_origin, user_id)
+         DO UPDATE SET observed_identity_key = excluded.observed_identity_key,
+                       observed_signing_key = excluded.observed_signing_key,
+                       source = excluded.source,
+                       observed_at = excluded.observed_at",
+        rusqlite::params![
+            incoming.locator.canonical_server_origin,
+            alarm_user_id,
+            incoming.locator.identity_key.as_slice(),
+            incoming.signing_key.as_slice(),
+            incoming.source.as_u8(),
+            incoming.observed_at,
+        ],
+    )
+    .map_err(|error| format!("record blocking identity change observation: {error}"))?;
+    Ok(())
+}
+
+fn has_identity_change_observation(
+    conn: &Connection,
+    canonical_server_origin: &str,
+    user_id: &str,
+) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM identity_change_observations_v1
+             WHERE canonical_server_origin = ?1 AND user_id = ?2
+         )",
+        rusqlite::params![canonical_server_origin, user_id],
+        |row| row.get(0),
+    )
+    .map_err(|error| format!("load blocking identity change observation: {error}"))
+}
+
+fn merge_account_snapshot(
+    conn: &Connection,
+    incoming: &AccountSnapshot,
+) -> Result<AccountSnapshot, String> {
+    validate_account_snapshot(incoming)?;
+    let self_binding =
+        validated_self_binding_for_origin(conn, &incoming.locator.canonical_server_origin)?;
+    ensure_account_snapshot_compatible_with_self(incoming, self_binding.as_ref())?;
+    merge_prevalidated_account_snapshot(conn, incoming)
+}
+
+fn merge_prevalidated_account_snapshot(
+    conn: &Connection,
+    incoming: &AccountSnapshot,
+) -> Result<AccountSnapshot, String> {
+    let existing_user = load_account_by_origin_user(
+        conn,
+        &incoming.locator.canonical_server_origin,
+        &incoming.locator.user_id,
+    )?;
+    if let Some(existing) = existing_user.as_ref() {
+        if existing.locator.identity_key != incoming.locator.identity_key {
+            return Err("account identity changed for an origin-scoped user".to_string());
+        }
+        if existing.signing_key != incoming.signing_key {
+            return Err("account signing key changed for an origin-scoped user".to_string());
+        }
+    }
+    if let Some(existing) = load_account_by_origin_identity(
+        conn,
+        &incoming.locator.canonical_server_origin,
+        &incoming.locator.identity_key,
+    )? {
+        if existing.locator.user_id != incoming.locator.user_id {
+            return Err("account identity maps to another user on this server origin".to_string());
+        }
+        if existing.signing_key != incoming.signing_key {
+            return Err("account identity maps to another signing key".to_string());
+        }
+    }
+    if let Some(existing) = load_account_by_origin_signing(
+        conn,
+        &incoming.locator.canonical_server_origin,
+        &incoming.signing_key,
+    )? {
+        if existing.locator.user_id != incoming.locator.user_id
+            || existing.locator.identity_key != incoming.locator.identity_key
+        {
+            return Err(
+                "account signing key maps to another user or identity on this server origin"
+                    .to_string(),
+            );
+        }
+    }
+
+    let effective = match existing_user {
+        Some(existing) => merge_account_presentation(&existing, incoming)?,
+        None => incoming.clone(),
+    };
+    let profile_version = effective.profile_version.map(u64::to_be_bytes);
+    if load_exact_account(conn, &effective.locator)?.is_some() {
+        conn.execute(
+            "UPDATE identity_directory_v1
+             SET username = ?4, display_name = ?5, profile_version = ?6,
+                 profile_origin = ?7, source = ?8, observed_at = ?9
+             WHERE canonical_server_origin = ?1 AND user_id = ?2 AND identity_key = ?3",
+            rusqlite::params![
+                effective.locator.canonical_server_origin,
+                effective.locator.user_id,
+                effective.locator.identity_key.as_slice(),
+                effective.username,
+                effective.display_name,
+                profile_version.as_ref().map(<[u8; 8]>::as_slice),
+                effective.profile_origin,
+                effective.source.as_u8(),
+                effective.observed_at,
+            ],
+        )
+        .map_err(|e| format!("update account directory entry: {e}"))?;
+    } else {
+        conn.execute(
+            "INSERT INTO identity_directory_v1
+                (canonical_server_origin, user_id, identity_key, signing_key,
+                 username, display_name, profile_version, profile_origin,
+                 source, observed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            rusqlite::params![
+                effective.locator.canonical_server_origin,
+                effective.locator.user_id,
+                effective.locator.identity_key.as_slice(),
+                effective.signing_key.as_slice(),
+                effective.username,
+                effective.display_name,
+                profile_version.as_ref().map(<[u8; 8]>::as_slice),
+                effective.profile_origin,
+                effective.source.as_u8(),
+                effective.observed_at,
+            ],
+        )
+        .map_err(|e| format!("insert account directory entry: {e}"))?;
+    }
+    Ok(effective)
+}
+
+fn run_savepoint<T>(
+    conn: &Connection,
+    name: &'static str,
+    operation: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    conn.execute_batch(&format!("SAVEPOINT {name}"))
+        .map_err(|e| format!("begin {name}: {e}"))?;
+    match operation() {
+        Ok(value) => match conn.execute_batch(&format!("RELEASE SAVEPOINT {name}")) {
+            Ok(()) => Ok(value),
+            Err(commit_error) => {
+                let rollback = conn.execute_batch(&format!(
+                    "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name};"
+                ));
+                Err(match rollback {
+                    Ok(()) => format!("commit {name}: {commit_error}"),
+                    Err(rollback_error) => format!(
+                        "commit {name}: {commit_error}; rollback also failed: {rollback_error}"
+                    ),
+                })
+            }
+        },
+        Err(error) => {
+            let rollback = conn.execute_batch(&format!(
+                "ROLLBACK TO SAVEPOINT {name}; RELEASE SAVEPOINT {name};"
+            ));
+            Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; {name} rollback also failed: {rollback_error}")
+                }
+            })
+        }
+    }
+}
+
+pub struct StoredIncomingSenderKeyGeneration {
+    pub sender_identity_key: [u8; 32],
+    pub generation: u32,
+    pub iteration: u32,
+    pub state_revision: u64,
+    /// All-zero is reserved for a migrated legacy state whose original
+    /// distribution commitment cannot be reconstructed after ratcheting.
+    pub distribution_commitment: [u8; 32],
+    pub key_data: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceBindingPinV1 {
+    pub device_id: [u8; 16],
+    pub account_identity_key: [u8; 32],
+    pub account_signing_key: [u8; 32],
+    pub device_identity_key: [u8; 32],
+    pub device_signing_key: [u8; 32],
+    pub binding_version: u64,
+    pub capabilities: u64,
+    pub status: u8,
+    pub account_signature: [u8; 64],
+}
+
+pub struct DeviceRosterSnapshotV1<'a> {
+    pub conversation_id: &'a str,
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub required_capabilities: u64,
+    pub canonical_snapshot: &'a [u8],
+    pub bindings: &'a [DeviceBindingPinV1],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoricalDeviceBindingProofV1 {
+    pub sender_account_signing_key: [u8; 32],
+    pub sender_device_capabilities: u64,
+    pub sender_device_binding_status: u8,
+    pub sender_account_signature: [u8; 64],
+    pub target_device_identity_key: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingSenderKeyRouteV1 {
+    pub sender_account_identity_key: [u8; 32],
+    pub sender_device_id: [u8; 16],
+    pub sender_device_identity_key: [u8; 32],
+    pub sender_device_signing_key: [u8; 32],
+    pub sender_binding_version: u64,
+    pub target_device_id: [u8; 16],
+    pub target_binding_version: u64,
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub envelope_commitment: [u8; 32],
+    /// `None` exists only for routes installed by an interim development
+    /// schema. Any newly received SKDM must atomically upgrade it to `Some`.
+    pub historical_sender_binding: Option<HistoricalDeviceBindingProofV1>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSenderKeyDeviceEnvelopeV1 {
+    pub conversation_id: String,
+    pub generation: u32,
+    pub target_account_identity_key: [u8; 32],
+    pub target_device_id: [u8; 16],
+    pub target_device_identity_key: [u8; 32],
+    pub target_binding_version: u64,
+    pub sender_device_id: [u8; 16],
+    pub sender_device_identity_key: [u8; 32],
+    pub sender_binding_version: u64,
+    pub roster_version: u64,
+    pub roster_commitment: [u8; 32],
+    pub envelope_commitment: [u8; 32],
+    pub sealed_envelope: Vec<u8>,
+}
+
+fn fixed_bytes<const N: usize>(label: &str, value: Vec<u8>) -> Result<[u8; N], String> {
+    let actual = value.len();
+    value
+        .try_into()
+        .map_err(|_| format!("invalid persisted {label} length: expected {N}, got {actual}"))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn upsert_incoming_sender_key_generation(
+    conn: &Connection,
+    group_id: &str,
+    sender_identity_key: &[u8; 32],
+    generation: u32,
+    iteration: u32,
+    state_revision: u64,
+    distribution_commitment: &[u8; 32],
+    key_data: &[u8],
+) -> Result<(), String> {
+    if group_id.is_empty() || generation == 0 || iteration > 2000 {
+        return Err("invalid incoming sender-key generation scope".to_string());
+    }
+    if key_data.is_empty() || key_data.len() > 65_536 {
+        return Err("invalid incoming sender-key state size".to_string());
+    }
+
+    let existing = conn
+        .query_row(
+            "SELECT iteration, state_revision, distribution_commitment, key_data
+             FROM sender_key_incoming_generations
+             WHERE group_id = ?1 AND sender_identity_key = ?2 AND generation = ?3",
+            rusqlite::params![
+                group_id,
+                sender_identity_key.as_slice(),
+                i64::from(generation),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, u32>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(3)?),
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| format!("load incoming sender-key generation before save: {e}"))?;
+
+    let is_new_generation = existing.is_none();
+    if let Some((old_iteration, old_revision, old_commitment, old_data)) = existing {
+        let old_revision = u64::from_be_bytes(fixed_bytes::<8>(
+            "incoming sender-key revision",
+            old_revision,
+        )?);
+        let old_commitment = fixed_bytes::<32>(
+            "incoming sender-key distribution commitment",
+            old_commitment,
+        )?;
+        if old_commitment != *distribution_commitment {
+            return Err("incoming sender-key generation commitment changed".to_string());
+        }
+        if state_revision < old_revision || iteration < old_iteration {
+            return Err("incoming sender-key state rollback rejected".to_string());
+        }
+        if state_revision == old_revision {
+            if iteration != old_iteration || old_data.as_slice() != key_data {
+                return Err(
+                    "incoming sender-key state changed without a revision advance".to_string(),
+                );
+            }
+            return Ok(());
+        }
+    }
+    if is_new_generation {
+        let retained: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sender_key_incoming_generations
+                 WHERE group_id = ?1 AND sender_identity_key = ?2",
+                rusqlite::params![group_id, sender_identity_key.as_slice()],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("count retained incoming sender-key generations: {e}"))?;
+        if retained >= MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER as i64 {
+            return Err("incoming sender-key generation retention limit reached".to_string());
+        }
+    }
+
+    conn.execute(
+        "INSERT INTO sender_key_incoming_generations
+            (group_id, sender_identity_key, generation, iteration,
+             state_revision, distribution_commitment, key_data, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+         ON CONFLICT(group_id, sender_identity_key, generation) DO UPDATE SET
+            iteration = excluded.iteration,
+            state_revision = excluded.state_revision,
+            distribution_commitment = excluded.distribution_commitment,
+            key_data = excluded.key_data,
+            updated_at = datetime('now')",
+        rusqlite::params![
+            group_id,
+            sender_identity_key.as_slice(),
+            i64::from(generation),
+            iteration,
+            state_revision.to_be_bytes().as_slice(),
+            distribution_commitment.as_slice(),
+            key_data,
+        ],
+    )
+    .map_err(|e| format!("save incoming sender-key generation: {e}"))?;
+    Ok(())
+}
+
 impl VeilDb {
     /// Open (or create) an encrypted database at the given path.
     /// The `key` is a 32-byte encryption key derived from user identity.
     pub fn open(path: &Path, key: &[u8; 32]) -> Result<Self, String> {
-        match Self::open_inner(path, key) {
-            Ok(db) => Ok(db),
-            Err(e) if path.exists() && e.contains("not a database") => {
-                // Stale/unencrypted DB from a previous run — remove and retry.
-                let _ = std::fs::remove_file(path);
-                // Also remove WAL/SHM journals if present.
-                let wal = path.with_extension("db-wal");
-                let shm = path.with_extension("db-shm");
-                let _ = std::fs::remove_file(wal);
-                let _ = std::fs::remove_file(shm);
-                Self::open_inner(path, key)
+        // Never delete a database automatically. With SQLCipher, a wrong key
+        // is intentionally indistinguishable from a corrupt/non-database file;
+        // treating that error as disposable data can destroy message history.
+        Self::open_inner(path, key).map_err(|e| {
+            if path.exists() && e.contains("not a database") {
+                format!(
+                    "encrypted database could not be opened (wrong identity key or corruption); file was left untouched: {e}"
+                )
+            } else {
+                e
             }
-            Err(e) => Err(e),
-        }
+        })
     }
 
     fn open_inner(path: &Path, key: &[u8; 32]) -> Result<Self, String> {
@@ -32,7 +1059,8 @@ impl VeilDb {
 
         // Set SQLCipher encryption key
         let mut hex_key = hex::encode(key);
-        let res = conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";\n", hex_key));
+        let key_pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";\n", hex_key));
+        let res = conn.execute_batch(&key_pragma);
         hex_key.zeroize();
         res.map_err(|e| format!("set key: {e}"))?;
 
@@ -44,10 +1072,13 @@ impl VeilDb {
         )
         .map_err(|e| format!("cipher pragmas: {e}"))?;
 
-        // Performance settings
+        // Ratchet and Sender-Key state is committed before its ciphertext is
+        // released to the transport. WAL + FULL is therefore a protocol
+        // safety requirement: NORMAL may lose the latest commit on power loss
+        // and cause message-key/nonce reuse after restart.
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;
+             PRAGMA synchronous = FULL;
              PRAGMA foreign_keys = ON;",
         )
         .map_err(|e| format!("pragmas: {e}"))?;
@@ -62,7 +1093,8 @@ impl VeilDb {
         let conn = Connection::open_in_memory().map_err(|e| format!("open memory db: {e}"))?;
 
         let mut hex_key = hex::encode(key);
-        let res = conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";\n", hex_key));
+        let key_pragma = Zeroizing::new(format!("PRAGMA key = \"x'{}'\";\n", hex_key));
+        let res = conn.execute_batch(&key_pragma);
         hex_key.zeroize();
         res.map_err(|e| format!("set key: {e}"))?;
 
@@ -91,6 +1123,8 @@ impl VeilDb {
                 conv_type INTEGER NOT NULL,  -- 0=DM, 1=GROUP, 2=CHANNEL
                 peer_identity_key BLOB,      -- DM: peer's X25519 public key
                 server_id TEXT,
+                server_origin TEXT,
+                peer_user_id TEXT,
                 name TEXT,
                 last_message_at TEXT,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -104,7 +1138,7 @@ impl VeilDb {
                 msg_type INTEGER DEFAULT 0,
                 reply_to_id TEXT,
                 is_outgoing INTEGER DEFAULT 0,
-                status INTEGER DEFAULT 0,    -- 0=sending, 1=sent, 2=delivered, 3=read
+                status INTEGER DEFAULT 0,    -- 0=sending, 1=sent, 2=delivered, 3=read, 4=failed, 5=delivery unknown
                 expires_at TEXT,
                 server_timestamp INTEGER,
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -113,10 +1147,248 @@ impl VeilDb {
             CREATE INDEX IF NOT EXISTS idx_messages_conv
                 ON messages(conversation_id, server_timestamp);
 
+            -- Attachment secrets and private metadata live only in SQLCipher.
+            -- The authoritative message UUID may replace a local optimistic
+            -- UUID, so the FK follows ON UPDATE as well as ON DELETE.
+            CREATE TABLE IF NOT EXISTS message_attachments_v1 (
+                message_id TEXT NOT NULL
+                    REFERENCES messages(id) ON UPDATE CASCADE ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 15),
+                media_id TEXT NOT NULL
+                    CHECK(length(media_id) = 32 AND media_id = lower(media_id)),
+                file_name TEXT NOT NULL
+                    CHECK(length(CAST(file_name AS BLOB)) BETWEEN 1 AND 1024),
+                detected_mime TEXT NOT NULL
+                    CHECK(length(CAST(detected_mime AS BLOB)) BETWEEN 1 AND 255),
+                format_version INTEGER NOT NULL CHECK(format_version BETWEEN 1 AND 255),
+                nonce_prefix BLOB NOT NULL CHECK(length(nonce_prefix) = 16),
+                chunk_count INTEGER NOT NULL CHECK(chunk_count BETWEEN 1 AND 32769),
+                plaintext_size INTEGER NOT NULL CHECK(plaintext_size BETWEEN 0 AND 2147483648),
+                ciphertext_size INTEGER NOT NULL CHECK(ciphertext_size BETWEEN 16 AND 2148007952),
+                content_key BLOB NOT NULL CHECK(length(content_key) = 32),
+                PRIMARY KEY (message_id, ordinal),
+                UNIQUE (message_id, media_id)
+            );
+
+            -- Origin-scoped, authoritative account directory. Account and
+            -- signing keys are immutable continuity bindings; only
+            -- presentation metadata can advance under the merge policy in
+            -- Rust. The exact locator remains explicit even though the
+            -- current immutable account model also makes origin/user unique.
+            CREATE TABLE IF NOT EXISTS identity_directory_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                identity_key BLOB NOT NULL CHECK(length(identity_key) = 32),
+                signing_key BLOB NOT NULL CHECK(length(signing_key) = 32),
+                username TEXT CHECK(username IS NULL OR length(username) BETWEEN 1 AND 256),
+                display_name TEXT CHECK(display_name IS NULL OR length(display_name) BETWEEN 1 AND 256),
+                profile_version BLOB CHECK(profile_version IS NULL OR length(profile_version) = 8),
+                profile_origin TEXT NOT NULL CHECK(length(profile_origin) BETWEEN 1 AND 512),
+                source INTEGER NOT NULL CHECK(source IN (1, 2)),
+                observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
+                PRIMARY KEY (canonical_server_origin, user_id, identity_key),
+                UNIQUE (canonical_server_origin, user_id),
+                UNIQUE (canonical_server_origin, identity_key)
+            );
+
+            -- Pre-release hard cutover: an existing same-origin signing-key
+            -- alias is ambiguous, so index creation must fail instead of
+            -- guessing which development row to retain.
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_directory_v1_origin_signing
+                ON identity_directory_v1(canonical_server_origin, signing_key);
+
+            -- Signed network profile cache. It is presentation-only and may
+            -- exist only for an exact account already pinned in the directory.
+            CREATE TABLE IF NOT EXISTS network_profiles_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                identity_key BLOB NOT NULL CHECK(length(identity_key) = 32),
+                username TEXT NOT NULL
+                    CHECK(length(CAST(username AS BLOB)) BETWEEN 1 AND 256),
+                display_name TEXT
+                    CHECK(display_name IS NULL OR
+                          length(CAST(display_name AS BLOB)) BETWEEN 1 AND 512),
+                about TEXT NOT NULL
+                    CHECK(length(CAST(about AS BLOB)) <= 2048),
+                avatar_asset_id TEXT,
+                avatar_digest BLOB CHECK(avatar_digest IS NULL OR length(avatar_digest) = 32),
+                avatar_content_type TEXT CHECK(avatar_content_type IS NULL OR avatar_content_type = 'image/jpeg'),
+                profile_version BLOB NOT NULL CHECK(length(profile_version) = 8),
+                profile_updated_at TEXT NOT NULL
+                    CHECK(length(profile_updated_at) BETWEEN 1 AND 64),
+                observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
+                PRIMARY KEY (canonical_server_origin, user_id, identity_key),
+                FOREIGN KEY (canonical_server_origin, user_id, identity_key)
+                    REFERENCES identity_directory_v1
+                        (canonical_server_origin, user_id, identity_key)
+                    ON DELETE CASCADE
+            );
+
+            -- X25519-only v1 comparisons did not authenticate the independent
+            -- Ed25519 account key. Pre-release cutover deliberately discards
+            -- them instead of silently upgrading a weaker proof.
+            DROP TABLE IF EXISTS local_identity_verifications_v1;
+
+            -- Explicit physical/out-of-band account comparison made on this
+            -- device. No foreign key is intentional: the verified old tuple
+            -- must remain available to diagnose a later key change.
+            CREATE TABLE IF NOT EXISTS local_account_verifications_v2 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                verified_identity_key BLOB NOT NULL
+                    CHECK(length(verified_identity_key) = 32),
+                verified_signing_key BLOB NOT NULL
+                    CHECK(length(verified_signing_key) = 32),
+                verified_at TEXT NOT NULL CHECK(length(verified_at) BETWEEN 1 AND 64),
+                PRIMARY KEY (canonical_server_origin, user_id)
+            );
+
+            -- An authenticated directory may present a different key for an
+            -- already pinned origin/user. The candidate is never promoted to
+            -- the account directory or crypto routing state, but the durable
+            -- observation makes the blocking Identity changed state reachable
+            -- after restart. There is intentionally no FK: the alarm must
+            -- survive cleanup of presentation/cache rows.
+            CREATE TABLE IF NOT EXISTS identity_change_observations_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                observed_identity_key BLOB NOT NULL
+                    CHECK(length(observed_identity_key) = 32),
+                observed_signing_key BLOB NOT NULL
+                    CHECK(length(observed_signing_key) = 32),
+                source INTEGER NOT NULL CHECK(source IN (1, 2)),
+                observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
+                PRIMARY KEY (canonical_server_origin, user_id)
+            );
+
+            -- Durable binding between this SQLCipher identity and the account
+            -- assigned by each authenticated server origin. The first
+            -- successful WebSocket authentication pins all account
+            -- coordinates; later reconnects and process restarts may only
+            -- refresh the observation timestamp, never remap the account.
+            CREATE TABLE IF NOT EXISTS authenticated_self_bindings_v1 (
+                canonical_server_origin TEXT PRIMARY KEY
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                identity_key BLOB NOT NULL CHECK(length(identity_key) = 32),
+                signing_key BLOB NOT NULL CHECK(length(signing_key) = 32),
+                first_authenticated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                last_authenticated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK(identity_key <> signing_key)
+            );
+
+            -- Immutable author attribution captured when plaintext is
+            -- committed. It follows an outgoing local UUID when the server
+            -- ACK replaces that UUID and is removed with the message.
+            CREATE TABLE IF NOT EXISTS message_author_snapshots_v1 (
+                message_id TEXT PRIMARY KEY
+                    REFERENCES messages(id) ON UPDATE CASCADE ON DELETE CASCADE,
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                identity_key BLOB NOT NULL CHECK(length(identity_key) = 32),
+                signing_key BLOB NOT NULL CHECK(length(signing_key) = 32),
+                username TEXT CHECK(username IS NULL OR length(username) BETWEEN 1 AND 256),
+                display_name TEXT CHECK(display_name IS NULL OR length(display_name) BETWEEN 1 AND 256),
+                profile_version BLOB CHECK(profile_version IS NULL OR length(profile_version) = 8),
+                profile_origin TEXT NOT NULL CHECK(length(profile_origin) BETWEEN 1 AND 512),
+                source INTEGER NOT NULL CHECK(source IN (1, 2)),
+                author_context INTEGER CHECK(author_context IN (1, 2)),
+                observed_at TEXT NOT NULL CHECK(length(observed_at) BETWEEN 1 AND 64),
+                FOREIGN KEY (canonical_server_origin, user_id, identity_key)
+                    REFERENCES identity_directory_v1
+                        (canonical_server_origin, user_id, identity_key)
+            );
+
+            CREATE TABLE IF NOT EXISTS remote_message_state (
+                message_id TEXT PRIMARY KEY,
+                conversation_id TEXT NOT NULL,
+                sender_key BLOB NOT NULL CHECK(length(sender_key) = 32),
+                revision_ms INTEGER NOT NULL,
+                state INTEGER NOT NULL CHECK(state IN (0, 1, 2, 3)),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             CREATE TABLE IF NOT EXISTS ratchet_sessions (
                 peer_identity_key BLOB PRIMARY KEY,
                 session_data BLOB NOT NULL,  -- Serialized RatchetSession (encrypted by SQLCipher)
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS pending_initial_headers (
+                peer_identity_key BLOB PRIMARY KEY CHECK(length(peer_identity_key) = 32),
+                header_data BLOB NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS client_state (
+                key TEXT PRIMARY KEY,
+                value BLOB NOT NULL
+            );
+
+            -- Independent per-install X25519 + Ed25519 identity. Creation is
+            -- performed only by the unlocked client after the account identity
+            -- is available; schema migration itself never invents key material.
+            CREATE TABLE IF NOT EXISTS device_identity_v1 (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                device_id BLOB NOT NULL UNIQUE CHECK(length(device_id) = 16),
+                version BLOB NOT NULL CHECK(length(version) = 8),
+                x25519_secret BLOB NOT NULL CHECK(length(x25519_secret) = 32),
+                ed25519_secret BLOB NOT NULL CHECK(length(ed25519_secret) = 32),
+                device_identity_key BLOB NOT NULL CHECK(length(device_identity_key) = 32),
+                device_signing_key BLOB NOT NULL CHECK(length(device_signing_key) = 32),
+                capabilities BLOB NOT NULL CHECK(length(capabilities) = 8),
+                status INTEGER NOT NULL CHECK(status BETWEEN 1 AND 3),
+                account_identity_key BLOB NOT NULL CHECK(length(account_identity_key) = 32),
+                account_signing_key BLOB NOT NULL CHECK(length(account_signing_key) = 32),
+                account_signature BLOB NOT NULL CHECK(length(account_signature) = 64),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS device_binding_pins_v1 (
+                device_id BLOB PRIMARY KEY CHECK(length(device_id) = 16),
+                account_identity_key BLOB NOT NULL CHECK(length(account_identity_key) = 32),
+                account_signing_key BLOB NOT NULL CHECK(length(account_signing_key) = 32),
+                device_identity_key BLOB NOT NULL CHECK(length(device_identity_key) = 32),
+                device_signing_key BLOB NOT NULL CHECK(length(device_signing_key) = 32),
+                binding_version BLOB NOT NULL CHECK(length(binding_version) = 8),
+                capabilities BLOB NOT NULL CHECK(length(capabilities) = 8),
+                status INTEGER NOT NULL CHECK(status BETWEEN 1 AND 3),
+                account_signature BLOB NOT NULL CHECK(length(account_signature) = 64),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS conversation_device_roster_snapshots_v1 (
+                conversation_id TEXT PRIMARY KEY,
+                roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                required_capabilities BLOB NOT NULL CHECK(length(required_capabilities) = 8),
+                canonical_snapshot BLOB NOT NULL CHECK(length(canonical_snapshot) BETWEEN 1 AND 1048576),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE IF NOT EXISTS local_prekeys (
+                key_type INTEGER NOT NULL CHECK(key_type IN (0, 1)),
+                protocol_key_id INTEGER NOT NULL CHECK(protocol_key_id > 0),
+                secret_key BLOB,
+                public_key BLOB NOT NULL,
+                signature BLOB,
+                consumed INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (key_type, protocol_key_id),
+                CHECK((consumed = 0 AND length(secret_key) = 32) OR
+                      (consumed = 1 AND secret_key IS NULL))
+            );
+
+            CREATE TABLE IF NOT EXISTS trusted_identity_keys (
+                identity_key BLOB PRIMARY KEY CHECK(length(identity_key) = 32),
+                signing_key BLOB NOT NULL CHECK(length(signing_key) = 32),
+                first_seen_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             CREATE TABLE IF NOT EXISTS contacts (
@@ -151,6 +1423,81 @@ impl VeilDb {
                 is_outgoing INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now')),
                 PRIMARY KEY (group_id, sender_identity_key)
+            );
+
+            -- Incoming Sender-Key receive state is retained by exact
+            -- generation. `sender_keys_local` remains authoritative only for
+            -- outgoing state and as a read-once legacy source for old clients.
+            CREATE TABLE IF NOT EXISTS sender_key_incoming_generations (
+                group_id TEXT NOT NULL,
+                sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                iteration INTEGER NOT NULL CHECK(iteration BETWEEN 0 AND 2000),
+                state_revision BLOB NOT NULL CHECK(length(state_revision) = 8),
+                distribution_commitment BLOB NOT NULL CHECK(length(distribution_commitment) = 32),
+                key_data BLOB NOT NULL CHECK(length(key_data) BETWEEN 1 AND 65536),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, sender_identity_key, generation)
+            );
+
+            -- Immutable authenticated route proof for each installed incoming
+            -- device-owned Sender-Key generation. It remains available after
+            -- the live roster advances so REST history can be checked against
+            -- the exact historical device/binding/roster context.
+            CREATE TABLE IF NOT EXISTS sender_key_incoming_routes_v1 (
+                group_id TEXT NOT NULL,
+                sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                sender_account_identity_key BLOB NOT NULL CHECK(length(sender_account_identity_key) = 32),
+                sender_device_id BLOB NOT NULL CHECK(length(sender_device_id) = 16),
+                sender_device_signing_key BLOB NOT NULL CHECK(length(sender_device_signing_key) = 32),
+                sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
+                target_device_id BLOB NOT NULL CHECK(length(target_device_id) = 16),
+                target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
+                roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
+                installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, sender_identity_key, generation),
+                FOREIGN KEY (group_id, sender_identity_key, generation)
+                    REFERENCES sender_key_incoming_generations
+                        (group_id, sender_identity_key, generation)
+                    ON DELETE CASCADE
+            );
+
+            -- Exact authenticated SKDM bytes awaiting the gateway's durable
+            -- storage ACK. The first envelope for a generation/recipient is
+            -- immutable because a randomized re-seal of the same generation
+            -- would create conflicting receiver state.
+            CREATE TABLE IF NOT EXISTS pending_sender_key_envelopes (
+                conversation_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                target_identity_key BLOB NOT NULL CHECK(length(target_identity_key) = 32),
+                sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 4096),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (conversation_id, generation, target_identity_key)
+            );
+
+            -- Upgraded exact-device retry cache. Every routing and roster
+            -- coordinate is part of the immutable row; randomized re-sealing
+            -- for the same target/generation is rejected.
+            CREATE TABLE IF NOT EXISTS pending_sender_key_device_envelopes_v1 (
+                conversation_id TEXT NOT NULL,
+                generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                target_account_identity_key BLOB NOT NULL CHECK(length(target_account_identity_key) = 32),
+                target_device_id BLOB NOT NULL CHECK(length(target_device_id) = 16),
+                target_device_identity_key BLOB NOT NULL CHECK(length(target_device_identity_key) = 32),
+                target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
+                sender_device_id BLOB NOT NULL CHECK(length(sender_device_id) = 16),
+                sender_device_identity_key BLOB NOT NULL CHECK(length(sender_device_identity_key) = 32),
+                sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
+                roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
+                sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 4096),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (conversation_id, generation, target_device_id)
             );
 
             CREATE TABLE IF NOT EXISTS reactions (
@@ -251,6 +1598,12 @@ impl VeilDb {
             )
             .map_err(|e| format!("migrations: {e}"))?;
 
+        self.ensure_conversation_identity_schema()?;
+        self.ensure_network_profile_avatar_schema()?;
+        self.ensure_message_author_context_schema()?;
+        self.rebuild_interim_sender_key_tables()?;
+        self.ensure_sender_key_historical_proof_schema()?;
+
         // Add `crypto_mode` to conversations if missing. Older DBs created
         // before Phase 6 don't have this column. SQLite has no
         // `ADD COLUMN IF NOT EXISTS`, so we attempt and ignore the error.
@@ -258,6 +1611,349 @@ impl VeilDb {
             "ALTER TABLE conversations ADD COLUMN crypto_mode TEXT NOT NULL DEFAULT 'sender_key';",
         );
 
+        // Legacy incoming rows used status=0 even though only locally-created
+        // outgoing rows can be in flight. Normalize them before any UI read so
+        // a disconnect can never label received history as DeliveryUnknown.
+        self.conn
+            .execute(
+                "UPDATE messages SET status = 2 WHERE is_outgoing = 0 AND status = 0",
+                [],
+            )
+            .map_err(|e| format!("normalize incoming message status: {e}"))?;
+
+        Ok(())
+    }
+
+    /// Add the nullable origin/account coordinates used by authenticated
+    /// directory sync without guessing values for legacy rows. Introspection
+    /// and both ALTERs share one transaction so a partial upgrade cannot be
+    /// published if the second column addition fails.
+    fn ensure_conversation_identity_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin conversation identity schema upgrade: {e}"))?;
+        let has_server_origin: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversations')
+                    WHERE name = 'server_origin'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect conversation server origin column: {e}"))?;
+        if !has_server_origin {
+            tx.execute_batch("ALTER TABLE conversations ADD COLUMN server_origin TEXT;")
+                .map_err(|e| format!("add conversation server origin column: {e}"))?;
+        }
+        let has_peer_user_id: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('conversations')
+                    WHERE name = 'peer_user_id'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect conversation peer user id column: {e}"))?;
+        if !has_peer_user_id {
+            tx.execute_batch("ALTER TABLE conversations ADD COLUMN peer_user_id TEXT;")
+                .map_err(|e| format!("add conversation peer user id column: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit conversation identity schema upgrade: {e}"))
+    }
+
+    fn ensure_network_profile_avatar_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin network profile avatar schema upgrade: {e}"))?;
+        for (name, definition) in [
+            ("avatar_asset_id", "TEXT"),
+            (
+                "avatar_digest",
+                "BLOB CHECK(avatar_digest IS NULL OR length(avatar_digest) = 32)",
+            ),
+            (
+                "avatar_content_type",
+                "TEXT CHECK(avatar_content_type IS NULL OR avatar_content_type = 'image/jpeg')",
+            ),
+        ] {
+            let present: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM pragma_table_info('network_profiles_v1') WHERE name=?1)",
+                    rusqlite::params![name],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("inspect network profile {name} column: {e}"))?;
+            if !present {
+                tx.execute_batch(&format!(
+                    "ALTER TABLE network_profiles_v1 ADD COLUMN {name} {definition};"
+                ))
+                .map_err(|e| format!("add network profile {name} column: {e}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit network profile avatar schema upgrade: {e}"))
+    }
+
+    fn ensure_message_author_context_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin message author context schema upgrade: {e}"))?;
+        let present: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('message_author_snapshots_v1')
+                    WHERE name = 'author_context'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect message author context column: {e}"))?;
+        if !present {
+            // Existing development rows remain unknown rather than inferring
+            // membership from the presentation-authority `source` column.
+            tx.execute_batch(
+                "ALTER TABLE message_author_snapshots_v1
+                 ADD COLUMN author_context INTEGER CHECK(author_context IN (1, 2));",
+            )
+            .map_err(|e| format!("add message author context column: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit message author context schema upgrade: {e}"))
+    }
+
+    fn normalized_table_sql(&self, table: &str) -> Result<String, String> {
+        let sql: String = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                rusqlite::params![table],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect {table} schema: {e}"))?;
+        Ok(sql
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase())
+    }
+
+    /// Historical account-authorized binding material is kept separately so
+    /// databases created by the interim route schema remain readable. A
+    /// replay can atomically add the missing proof without fabricating fields
+    /// for already-installed generations.
+    fn ensure_sender_key_historical_proof_schema(&self) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin historical Sender-Key proof schema: {e}"))?;
+        tx
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS sender_key_historical_device_proofs_v1 (
+                    group_id TEXT NOT NULL,
+                    sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                    generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                    sender_account_signing_key BLOB NOT NULL CHECK(length(sender_account_signing_key) = 32),
+                    sender_device_capabilities BLOB NOT NULL CHECK(length(sender_device_capabilities) = 8),
+                    sender_device_binding_status INTEGER NOT NULL CHECK(sender_device_binding_status BETWEEN 1 AND 3),
+                    sender_account_signature BLOB NOT NULL CHECK(length(sender_account_signature) = 64),
+                    target_device_identity_key BLOB CHECK(target_device_identity_key IS NULL OR length(target_device_identity_key) = 32),
+                    installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (group_id, sender_identity_key, generation),
+                    FOREIGN KEY (group_id, sender_identity_key, generation)
+                        REFERENCES sender_key_incoming_routes_v1
+                            (group_id, sender_identity_key, generation)
+                        ON DELETE CASCADE
+                );",
+            )
+            .map_err(|e| format!("create historical Sender-Key proof schema: {e}"))?;
+        let has_target_identity: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('sender_key_historical_device_proofs_v1')
+                    WHERE name = 'target_device_identity_key'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("inspect historical Sender-Key proof schema: {e}"))?;
+        if !has_target_identity {
+            tx.execute_batch(
+                "ALTER TABLE sender_key_historical_device_proofs_v1
+                 ADD COLUMN target_device_identity_key BLOB
+                 CHECK(target_device_identity_key IS NULL OR length(target_device_identity_key) = 32);",
+            )
+            .map_err(|e| format!("upgrade historical Sender-Key proof schema: {e}"))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit historical Sender-Key proof schema: {e}"))
+    }
+
+    /// Repair the short-lived development schema that used a route-scoped PK
+    /// (allowing two randomized seals for one target/generation), a 64 KiB
+    /// envelope limit, and an orphanable incoming-route table. Rebuilds are
+    /// transactional and fail closed on ambiguous duplicate rows.
+    fn rebuild_interim_sender_key_tables(&self) -> Result<(), String> {
+        let pending_sql = self.normalized_table_sql("pending_sender_key_device_envelopes_v1")?;
+        let pending_current = pending_sql
+            .contains("primary key (conversation_id, generation, target_device_id)")
+            && pending_sql.contains("length(sealed_envelope) between 1 and 4096");
+        if !pending_current {
+            let ambiguous: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pending_sender_key_device_envelopes_v1
+                        GROUP BY conversation_id, generation, target_device_id
+                        HAVING count(*) > 1
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("preflight interim sender-key cache duplicates: {e}"))?;
+            let oversized: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM pending_sender_key_device_envelopes_v1
+                        WHERE length(sealed_envelope) NOT BETWEEN 1 AND 4096
+                     )",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("preflight interim sender-key cache sizes: {e}"))?;
+            if ambiguous || oversized {
+                return Err(
+                    "interim exact-device Sender-Key cache is ambiguous or exceeds protocol bounds"
+                        .to_string(),
+                );
+            }
+            let backup_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='pending_sender_key_device_envelopes_v1_interim')",
+                [],
+                |row| row.get(0),
+            ).map_err(|e| format!("inspect interim sender-key cache backup: {e}"))?;
+            if backup_exists {
+                return Err("interim sender-key cache backup already exists".to_string());
+            }
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| format!("begin interim sender-key cache rebuild: {e}"))?;
+            tx.execute_batch(
+                "ALTER TABLE pending_sender_key_device_envelopes_v1
+                    RENAME TO pending_sender_key_device_envelopes_v1_interim;
+                 CREATE TABLE pending_sender_key_device_envelopes_v1 (
+                    conversation_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                    target_account_identity_key BLOB NOT NULL CHECK(length(target_account_identity_key) = 32),
+                    target_device_id BLOB NOT NULL CHECK(length(target_device_id) = 16),
+                    target_device_identity_key BLOB NOT NULL CHECK(length(target_device_identity_key) = 32),
+                    target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
+                    sender_device_id BLOB NOT NULL CHECK(length(sender_device_id) = 16),
+                    sender_device_identity_key BLOB NOT NULL CHECK(length(sender_device_identity_key) = 32),
+                    sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
+                    roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                    roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                    envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
+                    sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 4096),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (conversation_id, generation, target_device_id)
+                 );
+                 INSERT INTO pending_sender_key_device_envelopes_v1
+                    SELECT * FROM pending_sender_key_device_envelopes_v1_interim;
+                 DROP TABLE pending_sender_key_device_envelopes_v1_interim;",
+            ).map_err(|e| format!("rebuild interim sender-key cache: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("commit interim sender-key cache rebuild: {e}"))?;
+        }
+
+        let route_sql = self.normalized_table_sql("sender_key_incoming_routes_v1")?;
+        let route_current = route_sql
+            .contains("foreign key (group_id, sender_identity_key, generation)")
+            && route_sql.contains("on delete cascade");
+        if !route_current {
+            let proof_table_exists: bool = self
+                .conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master
+                                   WHERE type='table' AND name='sender_key_historical_device_proofs_v1')",
+                    [],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("inspect historical proof table before route rebuild: {e}"))?;
+            if proof_table_exists {
+                let proof_rows: i64 = self
+                    .conn
+                    .query_row(
+                        "SELECT count(*) FROM sender_key_historical_device_proofs_v1",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|e| format!("count historical proofs before route rebuild: {e}"))?;
+                if proof_rows != 0 {
+                    return Err(
+                        "cannot rebuild interim incoming routes with historical proofs present"
+                            .to_string(),
+                    );
+                }
+            }
+            let backup_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sender_key_incoming_routes_v1_interim')",
+                [],
+                |row| row.get(0),
+            ).map_err(|e| format!("inspect interim incoming-route backup: {e}"))?;
+            if backup_exists {
+                return Err("interim incoming Sender-Key route backup already exists".to_string());
+            }
+            let tx = self
+                .conn
+                .unchecked_transaction()
+                .map_err(|e| format!("begin interim incoming-route rebuild: {e}"))?;
+            if proof_table_exists {
+                tx.execute_batch("DROP TABLE sender_key_historical_device_proofs_v1;")
+                    .map_err(|e| {
+                        format!("drop empty historical proof table for route rebuild: {e}")
+                    })?;
+            }
+            tx.execute_batch(
+                "ALTER TABLE sender_key_incoming_routes_v1
+                    RENAME TO sender_key_incoming_routes_v1_interim;
+                 CREATE TABLE sender_key_incoming_routes_v1 (
+                    group_id TEXT NOT NULL,
+                    sender_identity_key BLOB NOT NULL CHECK(length(sender_identity_key) = 32),
+                    generation INTEGER NOT NULL CHECK(generation BETWEEN 1 AND 4294967295),
+                    sender_account_identity_key BLOB NOT NULL CHECK(length(sender_account_identity_key) = 32),
+                    sender_device_id BLOB NOT NULL CHECK(length(sender_device_id) = 16),
+                    sender_device_signing_key BLOB NOT NULL CHECK(length(sender_device_signing_key) = 32),
+                    sender_binding_version BLOB NOT NULL CHECK(length(sender_binding_version) = 8),
+                    target_device_id BLOB NOT NULL CHECK(length(target_device_id) = 16),
+                    target_binding_version BLOB NOT NULL CHECK(length(target_binding_version) = 8),
+                    roster_version BLOB NOT NULL CHECK(length(roster_version) = 8),
+                    roster_commitment BLOB NOT NULL CHECK(length(roster_commitment) = 32),
+                    envelope_commitment BLOB NOT NULL CHECK(length(envelope_commitment) = 32),
+                    installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (group_id, sender_identity_key, generation),
+                    FOREIGN KEY (group_id, sender_identity_key, generation)
+                        REFERENCES sender_key_incoming_generations
+                            (group_id, sender_identity_key, generation)
+                        ON DELETE CASCADE
+                 );
+                 INSERT INTO sender_key_incoming_routes_v1
+                    SELECT * FROM sender_key_incoming_routes_v1_interim;
+                 DROP TABLE sender_key_incoming_routes_v1_interim;",
+            ).map_err(|e| format!("rebuild interim incoming Sender-Key routes: {e}"))?;
+            tx.commit()
+                .map_err(|e| format!("commit interim incoming-route rebuild: {e}"))?;
+            if proof_table_exists {
+                self.ensure_sender_key_historical_proof_schema()?;
+            }
+        }
         Ok(())
     }
 
@@ -406,6 +2102,781 @@ impl VeilDb {
         &self.conn
     }
 
+    /// Pin the exact self account assigned by one authenticated origin.
+    ///
+    /// This executes before offline sync. A server may assign the same user
+    /// UUID as another self-hosted instance, but one origin may never remap
+    /// the local account UUID or either long-term account key after the first
+    /// successful authentication, including across process restarts.
+    pub fn bind_authenticated_self(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        identity_key: &[u8; 32],
+        signing_key: &[u8; 32],
+    ) -> Result<(), String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("authenticated self user id", user_id)?;
+        if identity_key == &[0u8; 32]
+            || !veil_crypto::public_key::valid_ed25519_public_key(signing_key)
+        {
+            return Err("authenticated self keys are not valid account public keys".to_string());
+        }
+        if identity_key == signing_key {
+            return Err(
+                "authenticated self identity and signing keys must be distinct".to_string(),
+            );
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin authenticated self binding: {error}"))?;
+        let existing = load_authenticated_self_binding(&tx, canonical_server_origin)?;
+
+        match existing {
+            Some(stored) => {
+                if stored.user_id != user_id
+                    || stored.identity_key != *identity_key
+                    || stored.signing_key != *signing_key
+                {
+                    return Err(
+                        "authenticated server attempted to remap the durable self account"
+                            .to_string(),
+                    );
+                }
+                ensure_self_binding_directory_compatible(&tx, canonical_server_origin, &stored)?;
+                tx.execute(
+                    "UPDATE authenticated_self_bindings_v1
+                     SET last_authenticated_at = datetime('now')
+                     WHERE canonical_server_origin = ?1",
+                    rusqlite::params![canonical_server_origin],
+                )
+                .map_err(|error| format!("refresh authenticated self binding: {error}"))?;
+            }
+            None => {
+                let pending = AuthenticatedSelfBinding {
+                    user_id: user_id.to_string(),
+                    identity_key: *identity_key,
+                    signing_key: *signing_key,
+                };
+                ensure_self_binding_directory_compatible(&tx, canonical_server_origin, &pending)?;
+                tx.execute(
+                    "INSERT INTO authenticated_self_bindings_v1
+                        (canonical_server_origin, user_id, identity_key, signing_key)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        canonical_server_origin,
+                        user_id,
+                        identity_key.as_slice(),
+                        signing_key.as_slice(),
+                    ],
+                )
+                .map_err(|error| format!("insert authenticated self binding: {error}"))?;
+            }
+        }
+        tx.commit()
+            .map_err(|error| format!("commit authenticated self binding: {error}"))
+    }
+
+    /// Merge a complete authenticated account-directory batch atomically.
+    /// Any identity/signing substitution, alias, profile rollback, or
+    /// equal-version equivocation rolls the whole batch back.
+    pub fn upsert_identity_directory(&self, snapshots: &[AccountSnapshot]) -> Result<(), String> {
+        for snapshot in snapshots {
+            // Validate every untrusted presentation/scope field before using
+            // it in a continuity query. The Ed25519 subgroup check deliberately
+            // follows conflict classification: malformed presented key bytes
+            // may be retained as incident evidence for an existing baseline,
+            // but are never admitted into the directory.
+            validate_account_snapshot_envelope(snapshot)?;
+        }
+
+        // A continuity conflict is security evidence, not a candidate update.
+        // Persist only the alarm in its own atomic savepoint, then reject the
+        // entire directory batch before any presentation or routing state can
+        // change. A matching future response cannot silently clear this alarm;
+        // accepting a replacement requires a separately reviewed rotation flow.
+        let mut identity_changes =
+            std::collections::BTreeMap::<(String, String), &AccountSnapshot>::new();
+        for snapshot in snapshots {
+            for alarm_user_id in account_snapshot_continuity_conflict_users(&self.conn, snapshot)? {
+                identity_changes.insert(
+                    (
+                        snapshot.locator.canonical_server_origin.clone(),
+                        alarm_user_id,
+                    ),
+                    snapshot,
+                );
+            }
+        }
+        if !identity_changes.is_empty() {
+            run_savepoint(&self.conn, "veil_identity_change_observations", || {
+                for ((_, alarm_user_id), snapshot) in &identity_changes {
+                    record_identity_change_observation_for(&self.conn, alarm_user_id, snapshot)?;
+                }
+                Ok(())
+            })?;
+            return Err(
+                "account identity changed; directory batch rejected and quarantined".to_string(),
+            );
+        }
+
+        for snapshot in snapshots {
+            validate_account_snapshot(snapshot)?;
+        }
+
+        run_savepoint(&self.conn, "veil_identity_directory_batch", || {
+            let mut self_bindings =
+                std::collections::HashMap::<String, Option<AuthenticatedSelfBinding>>::new();
+            for snapshot in snapshots {
+                let origin = &snapshot.locator.canonical_server_origin;
+                if !self_bindings.contains_key(origin) {
+                    self_bindings.insert(
+                        origin.clone(),
+                        validated_self_binding_for_origin(&self.conn, origin)?,
+                    );
+                }
+                ensure_account_snapshot_compatible_with_self(
+                    snapshot,
+                    self_bindings.get(origin).and_then(Option::as_ref),
+                )?;
+            }
+            for snapshot in snapshots {
+                merge_prevalidated_account_snapshot(&self.conn, snapshot)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Resolve one exact `(origin, user_id, identity_key)` locator.
+    pub fn resolve_account_snapshot(
+        &self,
+        locator: &ProfileLocator,
+    ) -> Result<Option<AccountSnapshot>, String> {
+        validate_profile_locator(locator)?;
+        load_exact_account(&self.conn, locator)
+    }
+
+    /// Resolve the single immutable account currently pinned for an exact
+    /// `(origin, user_id)` namespace. This deliberately does not accept an
+    /// identity-key candidate, so callers can distinguish a missing durable
+    /// baseline from an exact match while preflighting continuity changes.
+    pub fn resolve_account_by_origin_user(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+    ) -> Result<Option<AccountSnapshot>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("account directory user id", user_id)?;
+        load_account_by_origin_user(&self.conn, canonical_server_origin, user_id)
+    }
+
+    /// Compare one author tuple from an authenticated active-history row with
+    /// every overlapping durable origin-scoped account/self baseline before
+    /// any device proof, decryption, or process-local pin is touched. A
+    /// mismatch becomes durable incident evidence owned by the baseline user,
+    /// while a first observation remains service-mediated TOFU and is
+    /// deliberately not promoted here.
+    pub fn observe_historical_account_candidate(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        identity_key: &[u8; 32],
+        signing_key: &[u8; 32],
+        observed_at: &str,
+    ) -> Result<HistoricalAccountContinuity, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("historical account candidate user id", user_id)?;
+        validate_bounded_text(
+            "historical account candidate observation timestamp",
+            observed_at,
+            MAX_OBSERVED_AT_BYTES,
+            false,
+        )?;
+        let candidate = AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: canonical_server_origin.to_string(),
+                user_id: user_id.to_string(),
+                identity_key: *identity_key,
+            },
+            signing_key: *signing_key,
+            username: None,
+            display_name: None,
+            profile_version: None,
+            profile_origin: canonical_server_origin.to_string(),
+            source: AccountSnapshotSource::AuthenticatedHistory,
+            observed_at: observed_at.to_string(),
+        };
+        let conflict_users = account_snapshot_continuity_conflict_users(&self.conn, &candidate)?;
+        if !conflict_users.is_empty() {
+            run_savepoint(&self.conn, "veil_historical_identity_observation", || {
+                for alarm_user_id in &conflict_users {
+                    record_identity_change_observation_for(&self.conn, alarm_user_id, &candidate)?;
+                }
+                Ok(())
+            })?;
+            return Ok(HistoricalAccountContinuity::IdentityChanged(
+                conflict_users.into_iter().collect(),
+            ));
+        }
+
+        if load_account_by_origin_user(&self.conn, canonical_server_origin, user_id)?.is_some() {
+            return Ok(HistoricalAccountContinuity::Compatible);
+        }
+        if let Some(binding) = load_authenticated_self_binding(&self.conn, canonical_server_origin)?
+        {
+            if binding.user_id == user_id
+                && binding.identity_key == *identity_key
+                && binding.signing_key == *signing_key
+            {
+                return Ok(HistoricalAccountContinuity::Compatible);
+            }
+        }
+        Ok(HistoricalAccountContinuity::NoBaseline)
+    }
+
+    /// List durable continuity alarms for one authenticated origin so the
+    /// renderer signal can name the baseline account rather than an attacker-
+    /// supplied alias UUID. The rows remain authoritative in SQLCipher even
+    /// when event delivery is unavailable.
+    pub fn identity_change_users_for_origin(
+        &self,
+        canonical_server_origin: &str,
+    ) -> Result<Vec<String>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT user_id
+                 FROM identity_change_observations_v1
+                 WHERE canonical_server_origin = ?1
+                 ORDER BY user_id",
+            )
+            .map_err(|error| format!("prepare identity-change users: {error}"))?;
+        let users = statement
+            .query_map(rusqlite::params![canonical_server_origin], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("query identity-change users: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("collect identity-change users: {error}"))?;
+        for user_id in &users {
+            validate_canonical_uuid("identity-change observation user id", user_id)?;
+        }
+        Ok(users)
+    }
+
+    /// Store one signed network profile against an exact pinned account.
+    /// Rollback and equal-version equivocation fail closed.
+    pub fn upsert_network_profile(&self, profile: &NetworkProfile) -> Result<(), String> {
+        validate_network_profile(profile)?;
+        run_savepoint(&self.conn, "veil_network_profile_upsert", || {
+            if load_exact_account(&self.conn, &profile.locator)?.is_none() {
+                return Err("network profile has no exact pinned account directory entry".into());
+            }
+            let existing = self
+                .conn
+                .query_row(
+                    "SELECT username, display_name, about, avatar_asset_id,
+                            avatar_digest, avatar_content_type, profile_version,
+                            profile_updated_at
+                     FROM network_profiles_v1
+                     WHERE canonical_server_origin = ?1 AND user_id = ?2
+                       AND identity_key = ?3",
+                    rusqlite::params![
+                        profile.locator.canonical_server_origin,
+                        profile.locator.user_id,
+                        profile.locator.identity_key.as_slice(),
+                    ],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, Option<String>>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                            row.get::<_, Option<Vec<u8>>>(4)?,
+                            row.get::<_, Option<String>>(5)?,
+                            row.get::<_, Vec<u8>>(6)?,
+                            row.get::<_, String>(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| format!("load existing network profile: {error}"))?;
+            if let Some((
+                username,
+                display_name,
+                about,
+                avatar_asset_id,
+                avatar_digest,
+                avatar_content_type,
+                version,
+                updated_at,
+            )) = existing
+            {
+                let version =
+                    fixed_bytes::<8>("network profile version", version).map(u64::from_be_bytes)?;
+                if profile.profile_version < version {
+                    return Err("network profile version rollback rejected".into());
+                }
+                if profile.profile_version == version
+                    && (profile.username != username
+                        || profile.display_name != display_name
+                        || profile.about != about
+                        || profile.avatar_asset_id != avatar_asset_id
+                        || profile.avatar_digest.map(|value| value.to_vec()) != avatar_digest
+                        || profile.avatar_content_type != avatar_content_type
+                        || profile.profile_updated_at != updated_at)
+                {
+                    return Err("network profile changed without a version advance".into());
+                }
+            }
+
+            let version = profile.profile_version.to_be_bytes();
+            self.conn
+                .execute(
+                    "INSERT INTO network_profiles_v1
+                        (canonical_server_origin, user_id, identity_key,
+                         username, display_name, about, avatar_asset_id,
+                         avatar_digest, avatar_content_type, profile_version,
+                         profile_updated_at, observed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(canonical_server_origin, user_id, identity_key)
+                     DO UPDATE SET username = excluded.username,
+                         display_name = excluded.display_name,
+                         about = excluded.about,
+                         avatar_asset_id = excluded.avatar_asset_id,
+                         avatar_digest = excluded.avatar_digest,
+                         avatar_content_type = excluded.avatar_content_type,
+                         profile_version = excluded.profile_version,
+                         profile_updated_at = excluded.profile_updated_at,
+                         observed_at = excluded.observed_at",
+                    rusqlite::params![
+                        profile.locator.canonical_server_origin,
+                        profile.locator.user_id,
+                        profile.locator.identity_key.as_slice(),
+                        profile.username,
+                        profile.display_name,
+                        profile.about,
+                        profile.avatar_asset_id,
+                        profile.avatar_digest.map(|value| value.to_vec()),
+                        profile.avatar_content_type,
+                        version.as_slice(),
+                        profile.profile_updated_at,
+                        profile.observed_at,
+                    ],
+                )
+                .map_err(|error| format!("upsert network profile: {error}"))?;
+            Ok(())
+        })
+    }
+
+    /// Atomically merge an authenticated account snapshot and its signed
+    /// network profile. This is used for the current account on a fresh
+    /// device, where no conversation directory entry exists yet.
+    ///
+    /// The presentation fields remain non-authoritative for crypto trust: the
+    /// caller must supply identity and signing keys from the already
+    /// authenticated native session. Any conflict or profile rejection rolls
+    /// the directory merge back with the profile write.
+    pub fn upsert_authenticated_network_profile(
+        &self,
+        profile: &NetworkProfile,
+        signing_key: [u8; 32],
+    ) -> Result<(), String> {
+        validate_network_profile(profile)?;
+        let snapshot = AccountSnapshot {
+            locator: profile.locator.clone(),
+            signing_key,
+            username: Some(profile.username.clone()),
+            display_name: profile.display_name.clone(),
+            profile_version: Some(profile.profile_version),
+            profile_origin: profile.locator.canonical_server_origin.clone(),
+            source: AccountSnapshotSource::AuthenticatedConversationDirectory,
+            observed_at: profile.observed_at.clone(),
+        };
+        validate_account_snapshot(&snapshot)?;
+
+        run_savepoint(&self.conn, "veil_authenticated_network_profile", || {
+            let self_binding = validated_self_binding_for_origin(
+                &self.conn,
+                &profile.locator.canonical_server_origin,
+            )?
+            .ok_or("authenticated network profile has no pinned self binding")?;
+            ensure_account_snapshot_compatible_with_self(&snapshot, Some(&self_binding))?;
+            merge_prevalidated_account_snapshot(&self.conn, &snapshot)?;
+            self.upsert_network_profile(profile)
+        })
+    }
+
+    /// Load one exact origin/user/key-bound signed profile cache row.
+    pub fn load_network_profile(
+        &self,
+        locator: &ProfileLocator,
+    ) -> Result<Option<NetworkProfile>, String> {
+        validate_profile_locator(locator)?;
+        self.conn
+            .query_row(
+                "SELECT username, display_name, about, avatar_asset_id,
+                        avatar_digest, avatar_content_type, profile_version,
+                        profile_updated_at, observed_at
+                 FROM network_profiles_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2
+                   AND identity_key = ?3",
+                rusqlite::params![
+                    locator.canonical_server_origin,
+                    locator.user_id,
+                    locator.identity_key.as_slice(),
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<Vec<u8>>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load network profile: {error}"))?
+            .map(
+                |(
+                    username,
+                    display_name,
+                    about,
+                    avatar_asset_id,
+                    avatar_digest,
+                    avatar_content_type,
+                    version,
+                    profile_updated_at,
+                    observed_at,
+                )| {
+                    let profile = NetworkProfile {
+                        locator: locator.clone(),
+                        username,
+                        display_name,
+                        about,
+                        avatar_asset_id,
+                        avatar_digest: avatar_digest
+                            .map(|value| fixed_bytes::<32>("network profile avatar digest", value))
+                            .transpose()?,
+                        avatar_content_type,
+                        profile_version: fixed_bytes::<8>("network profile version", version)
+                            .map(u64::from_be_bytes)?,
+                        profile_updated_at,
+                        observed_at,
+                    };
+                    validate_network_profile(&profile)?;
+                    Ok(profile)
+                },
+            )
+            .transpose()
+    }
+
+    /// Load a cached profile only when the currently unlocked account is
+    /// durably bound to the same origin. This is the offline/restart read path;
+    /// it never upgrades trust and cannot cross an origin, account or key.
+    pub fn load_network_profile_for_authenticated_account(
+        &self,
+        canonical_server_origin: &str,
+        current_user_id: &str,
+        current_identity_key: &[u8; 32],
+        current_signing_key: &[u8; 32],
+        locator: &ProfileLocator,
+    ) -> Result<Option<NetworkProfile>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("authenticated profile cache user", current_user_id)?;
+        validate_profile_locator(locator)?;
+        if locator.canonical_server_origin != canonical_server_origin {
+            return Err("cached profile locator crosses the authenticated origin".to_string());
+        }
+        let binding = validated_self_binding_for_origin(&self.conn, canonical_server_origin)?
+            .ok_or("cached profile origin has no authenticated self binding")?;
+        if binding.user_id != current_user_id
+            || binding.identity_key != *current_identity_key
+            || binding.signing_key != *current_signing_key
+        {
+            return Err(
+                "cached profile requester differs from the authenticated binding".to_string(),
+            );
+        }
+        self.load_network_profile(locator)
+    }
+
+    /// Load device-local proof for an exact peer while offline, scoped by the
+    /// currently unlocked cryptographic identity and the durable self binding
+    /// for the peer's origin. No renderer-supplied account UUID is trusted.
+    pub fn local_identity_verification_for_unlocked_account(
+        &self,
+        current_identity_key: &[u8; 32],
+        current_signing_key: &[u8; 32],
+        locator: &ProfileLocator,
+    ) -> Result<LocalIdentityVerification, String> {
+        validate_profile_locator(locator)?;
+        let binding =
+            validated_self_binding_for_origin(&self.conn, &locator.canonical_server_origin)?
+                .ok_or("identity proof origin has no authenticated self binding")?;
+        if binding.identity_key != *current_identity_key
+            || binding.signing_key != *current_signing_key
+        {
+            return Err("identity proof requester differs from the unlocked account".to_string());
+        }
+        if binding.user_id == locator.user_id && binding.identity_key == locator.identity_key {
+            return Err("the current account cannot verify itself".to_string());
+        }
+        let proof = self.local_identity_verification(locator)?;
+        if proof == LocalIdentityVerification::IdentityChanged {
+            return Ok(proof);
+        }
+        match load_account_by_origin_user(
+            &self.conn,
+            &locator.canonical_server_origin,
+            &locator.user_id,
+        )? {
+            Some(pinned) if pinned.locator.identity_key != locator.identity_key => {
+                return Ok(LocalIdentityVerification::IdentityChanged);
+            }
+            Some(_) => {}
+            None => {
+                return Err("identity proof target has no exact pinned account entry".to_string());
+            }
+        }
+        Ok(proof)
+    }
+
+    /// Record an explicit account-v2 comparison of one exact identity on this
+    /// device, binding both its X25519 and Ed25519 account keys.
+    pub fn mark_account_verified_v2(
+        &self,
+        locator: &ProfileLocator,
+        verified_at: &str,
+    ) -> Result<(), String> {
+        validate_profile_locator(locator)?;
+        validate_bounded_text(
+            "identity verification timestamp",
+            verified_at,
+            MAX_OBSERVED_AT_BYTES,
+            false,
+        )?;
+        let account = load_exact_account(&self.conn, locator)?
+            .ok_or("cannot verify an identity absent from the pinned directory")?;
+        if has_identity_change_observation(
+            &self.conn,
+            &locator.canonical_server_origin,
+            &locator.user_id,
+        )? {
+            return Err(
+                "cannot verify an identity while a blocking identity change is pending".into(),
+            );
+        }
+        let self_binding =
+            validated_self_binding_for_origin(&self.conn, &locator.canonical_server_origin)?
+                .ok_or("cannot verify an identity without an authenticated self binding")?;
+        if self_binding.user_id == locator.user_id
+            && self_binding.identity_key == locator.identity_key
+        {
+            return Err("the current account cannot verify itself".into());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO local_account_verifications_v2
+                    (canonical_server_origin, user_id, verified_identity_key,
+                     verified_signing_key, verified_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(canonical_server_origin, user_id)
+                 DO UPDATE SET verified_identity_key = excluded.verified_identity_key,
+                               verified_signing_key = excluded.verified_signing_key,
+                               verified_at = excluded.verified_at",
+                rusqlite::params![
+                    locator.canonical_server_origin,
+                    locator.user_id,
+                    locator.identity_key.as_slice(),
+                    account.signing_key.as_slice(),
+                    verified_at,
+                ],
+            )
+            .map_err(|error| format!("store local account-v2 verification: {error}"))?;
+        Ok(())
+    }
+
+    /// Compare the currently observed locator to this device's explicit pin.
+    pub fn local_identity_verification(
+        &self,
+        locator: &ProfileLocator,
+    ) -> Result<LocalIdentityVerification, String> {
+        validate_profile_locator(locator)?;
+        if has_identity_change_observation(
+            &self.conn,
+            &locator.canonical_server_origin,
+            &locator.user_id,
+        )? {
+            return Ok(LocalIdentityVerification::IdentityChanged);
+        }
+        let verified_keys = self
+            .conn
+            .query_row(
+                "SELECT verified_identity_key, verified_signing_key
+                 FROM local_account_verifications_v2
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2",
+                rusqlite::params![locator.canonical_server_origin, locator.user_id],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("load local account-v2 verification: {error}"))?;
+        match verified_keys {
+            None => Ok(LocalIdentityVerification::NotCompared),
+            Some((identity, signing)) => {
+                let identity = fixed_bytes::<32>("verified identity key", identity)?;
+                let signing = fixed_bytes::<32>("verified signing key", signing)?;
+                if identity != locator.identity_key {
+                    return Ok(LocalIdentityVerification::IdentityChanged);
+                }
+                let Some(current) = load_account_by_origin_user(
+                    &self.conn,
+                    &locator.canonical_server_origin,
+                    &locator.user_id,
+                )?
+                else {
+                    return Ok(LocalIdentityVerification::IdentityChanged);
+                };
+                if current.locator.identity_key != identity || current.signing_key != signing {
+                    return Ok(LocalIdentityVerification::IdentityChanged);
+                }
+                if validated_self_binding_for_origin(&self.conn, &locator.canonical_server_origin)?
+                    .is_none()
+                {
+                    return Ok(LocalIdentityVerification::IdentityChanged);
+                }
+                Ok(LocalIdentityVerification::VerifiedOnThisDevice)
+            }
+        }
+    }
+
+    /// Resolve a message sender within the authoritative origin already bound
+    /// to its conversation. Legacy unscoped conversations return `None` rather
+    /// than borrowing the currently connected origin.
+    pub fn resolve_account_by_conversation_sender(
+        &self,
+        conversation_id: &str,
+        identity_key: &[u8; 32],
+    ) -> Result<Option<AccountSnapshot>, String> {
+        if conversation_id.is_empty() {
+            return Err("conversation id must not be empty".to_string());
+        }
+        let origin = self
+            .conn
+            .query_row(
+                "SELECT server_origin FROM conversations WHERE id = ?1",
+                rusqlite::params![conversation_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|e| format!("load conversation origin for account resolution: {e}"))?
+            .flatten();
+        match origin {
+            Some(origin) => load_account_by_origin_identity(&self.conn, &origin, identity_key),
+            None => Ok(None),
+        }
+    }
+
+    /// Attach immutable author attribution to an already-persisted message.
+    /// The directory merge and author write share a nested-safe SAVEPOINT, so
+    /// this method can participate in the existing receive transaction.
+    pub fn attach_message_author(
+        &self,
+        message_id: &str,
+        snapshot: &AccountSnapshot,
+    ) -> Result<(), String> {
+        self.attach_message_author_with_context(
+            message_id,
+            snapshot,
+            MessageAuthorContext::from_snapshot_source(snapshot.source),
+        )
+    }
+
+    /// Attach author metadata with an explicit immutable membership context.
+    /// Callers which resolve presentation fields through a stronger cached
+    /// directory snapshot must still pass the context of the current
+    /// authenticated observation rather than deriving membership from that
+    /// merged presentation authority.
+    pub fn attach_message_author_with_context(
+        &self,
+        message_id: &str,
+        snapshot: &AccountSnapshot,
+        author_context: MessageAuthorContext,
+    ) -> Result<(), String> {
+        if message_id.is_empty() {
+            return Err("message id must not be empty".to_string());
+        }
+        validate_account_snapshot(snapshot)?;
+        run_savepoint(&self.conn, "veil_attach_message_author", || {
+            let effective = merge_account_snapshot(&self.conn, snapshot)?;
+            let message_binding = self
+                .conn
+                .query_row(
+                    "SELECT m.sender_key, c.server_origin
+                     FROM messages AS m
+                     JOIN conversations AS c ON c.id = m.conversation_id
+                     WHERE m.id = ?1",
+                    rusqlite::params![message_id],
+                    |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .optional()
+                .map_err(|e| format!("load message binding before author attach: {e}"))?
+                .ok_or("cannot attach an author to a missing message")?;
+            if message_binding.0.as_slice() != effective.locator.identity_key {
+                return Err("message sender key differs from its author identity".to_string());
+            }
+            if message_binding.1.as_deref()
+                != Some(effective.locator.canonical_server_origin.as_str())
+            {
+                return Err(
+                    "message conversation origin differs from its author locator".to_string(),
+                );
+            }
+            if let Some(existing) = load_message_author(&self.conn, message_id)? {
+                if existing.locator != effective.locator
+                    || existing.signing_key != effective.signing_key
+                {
+                    return Err("message author binding changed".to_string());
+                }
+                return Ok(());
+            }
+
+            let profile_version = effective.profile_version.map(u64::to_be_bytes);
+            self.conn
+                .execute(
+                    "INSERT INTO message_author_snapshots_v1
+                        (message_id, canonical_server_origin, user_id,
+                         identity_key, signing_key, username, display_name,
+                         profile_version, profile_origin, source, author_context, observed_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        message_id,
+                        &effective.locator.canonical_server_origin,
+                        &effective.locator.user_id,
+                        effective.locator.identity_key.as_slice(),
+                        effective.signing_key.as_slice(),
+                        effective.username.as_deref(),
+                        effective.display_name.as_deref(),
+                        profile_version.as_ref().map(<[u8; 8]>::as_slice),
+                        &effective.profile_origin,
+                        effective.source.as_u8(),
+                        author_context.as_u8(),
+                        &effective.observed_at,
+                    ],
+                )
+                .map_err(|e| format!("attach message author snapshot: {e}"))?;
+            Ok(())
+        })
+    }
+
     // ─── CRUD: Conversations ──────────────────────────────
 
     pub fn insert_conversation(
@@ -426,11 +2897,206 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Insert or refresh a conversation learned from the authenticated server
+    /// directory.  Cryptographic bindings are immutable: a signed response may
+    /// fill a previously-unknown DM peer/server, but it may never silently
+    /// replace an existing binding or change the conversation kind.
+    #[allow(clippy::too_many_arguments)] // Persisted directory fields stay explicit at trust boundary.
+    pub fn upsert_directory_conversation(
+        &self,
+        id: &str,
+        conv_type: u8,
+        canonical_server_origin: &str,
+        name: Option<&str>,
+        peer_user_id: Option<&str>,
+        peer_identity_key: Option<&[u8]>,
+        server_id: Option<&str>,
+        created_at: &str,
+    ) -> Result<(), String> {
+        if id.is_empty() || created_at.is_empty() {
+            return Err("directory conversation id and created_at must not be empty".to_string());
+        }
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_bounded_text(
+            "directory conversation created_at",
+            created_at,
+            MAX_OBSERVED_AT_BYTES,
+            false,
+        )?;
+        if let Some(name) = name {
+            validate_bounded_text(
+                "directory conversation name",
+                name,
+                MAX_ACCOUNT_PRESENTATION_BYTES,
+                true,
+            )?;
+        }
+        if let Some(server_id) = server_id {
+            validate_canonical_uuid("directory conversation server id", server_id)?;
+        }
+        if conv_type > 2 {
+            return Err("invalid directory conversation type".to_string());
+        }
+        if conv_type == 0 {
+            let peer_user_id =
+                peer_user_id.ok_or("DM directory entry must contain a peer user id")?;
+            validate_canonical_uuid("DM directory peer user id", peer_user_id)?;
+            if peer_identity_key.map(<[u8]>::len) != Some(32) {
+                return Err(
+                    "DM directory entry must contain a 32-byte peer identity key".to_string(),
+                );
+            }
+            if peer_identity_key == Some([0u8; 32].as_slice()) {
+                return Err("DM directory peer identity key must not be all zero".to_string());
+            }
+        } else if peer_identity_key.is_some() || peer_user_id.is_some() {
+            return Err(
+                "non-DM directory entry must not contain a peer account binding".to_string(),
+            );
+        }
+
+        let existing = self.conn.query_row(
+            "SELECT conv_type, peer_identity_key, server_id, server_origin, peer_user_id
+             FROM conversations WHERE id = ?1",
+            rusqlite::params![id],
+            |row| {
+                Ok((
+                    row.get::<_, u8>(0)?,
+                    row.get::<_, Option<Vec<u8>>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                ))
+            },
+        );
+
+        match existing {
+            Ok((stored_type, stored_peer, stored_server, stored_origin, stored_peer_user_id)) => {
+                if stored_type != conv_type {
+                    return Err("authenticated directory changed the conversation type".to_string());
+                }
+                if stored_origin.is_none() {
+                    return Err(
+                        "legacy unscoped conversation requires an explicit migration; refusing to adopt the active origin"
+                            .to_string(),
+                    );
+                }
+                if conv_type != 0 && (stored_peer.is_some() || stored_peer_user_id.is_some()) {
+                    return Err(
+                        "persisted non-DM conversation contains a peer account binding".to_string(),
+                    );
+                }
+                if let (Some(stored), Some(received)) = (stored_peer.as_deref(), peer_identity_key)
+                {
+                    if stored != received {
+                        return Err(
+                            "authenticated directory changed the pinned DM peer".to_string()
+                        );
+                    }
+                }
+                if let (Some(stored), Some(received)) = (stored_server.as_deref(), server_id) {
+                    if stored != received {
+                        return Err("authenticated directory changed the pinned server".to_string());
+                    }
+                }
+                if stored_origin.as_deref() != Some(canonical_server_origin) {
+                    return Err(
+                        "authenticated directory changed the conversation origin".to_string()
+                    );
+                }
+                if let (Some(stored), Some(received)) =
+                    (stored_peer_user_id.as_deref(), peer_user_id)
+                {
+                    if stored != received {
+                        return Err(
+                            "authenticated directory changed the pinned DM peer user".to_string()
+                        );
+                    }
+                }
+
+                self.conn
+                    .execute(
+                        "UPDATE conversations
+                         SET name = ?2,
+                             peer_identity_key = COALESCE(peer_identity_key, ?3),
+                             server_id = COALESCE(server_id, ?4),
+                             created_at = ?5,
+                             server_origin = ?6,
+                             peer_user_id = COALESCE(peer_user_id, ?7)
+                         WHERE id = ?1",
+                        rusqlite::params![
+                            id,
+                            name,
+                            peer_identity_key,
+                            server_id,
+                            created_at,
+                            canonical_server_origin,
+                            peer_user_id,
+                        ],
+                    )
+                    .map_err(|e| format!("update directory conversation: {e}"))?;
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                self.conn
+                    .execute(
+                        "INSERT INTO conversations
+                           (id, conv_type, name, peer_identity_key, server_id,
+                            created_at, server_origin, peer_user_id)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                        rusqlite::params![
+                            id,
+                            conv_type,
+                            name,
+                            peer_identity_key,
+                            server_id,
+                            created_at,
+                            canonical_server_origin,
+                            peer_user_id,
+                        ],
+                    )
+                    .map_err(|e| format!("insert directory conversation: {e}"))?;
+            }
+            Err(e) => return Err(format!("load directory conversation: {e}")),
+        }
+        Ok(())
+    }
+
+    /// Atomically persist the text-channel conversations from one authenticated
+    /// server directory page. A conflicting existing scope rolls back every
+    /// row from the page so renderer state can never observe a partial trust
+    /// boundary.
+    pub fn upsert_directory_channels(
+        &self,
+        canonical_server_origin: &str,
+        server_id: &str,
+        channels: &[(String, String, String)],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin channel directory transaction: {e}"))?;
+        for (conversation_id, name, created_at) in channels {
+            self.upsert_directory_conversation(
+                conversation_id,
+                2,
+                canonical_server_origin,
+                Some(name),
+                None,
+                None,
+                Some(server_id),
+                created_at,
+            )?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit channel directory transaction: {e}"))
+    }
+
     pub fn get_conversations(&self) -> Result<Vec<crate::models::Conversation>, String> {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, conv_type, peer_identity_key, server_id, name, last_message_at, created_at
+                "SELECT id, conv_type, peer_identity_key, server_id, server_origin,
+                        peer_user_id, name, last_message_at, created_at
                  FROM conversations ORDER BY last_message_at DESC NULLS LAST",
             )
             .map_err(|e| format!("prepare: {e}"))?;
@@ -446,9 +3112,11 @@ impl VeilDb {
                     },
                     peer_identity_key: row.get(2)?,
                     server_id: row.get(3)?,
-                    name: row.get(4)?,
-                    last_message_at: row.get(5)?,
-                    created_at: row.get(6)?,
+                    server_origin: row.get(4)?,
+                    peer_user_id: row.get(5)?,
+                    name: row.get(6)?,
+                    last_message_at: row.get(7)?,
+                    created_at: row.get(8)?,
                 })
             })
             .map_err(|e| format!("query: {e}"))?;
@@ -457,8 +3125,50 @@ impl VeilDb {
             .map_err(|e| format!("collect: {e}"))
     }
 
+    /// Return only authenticated channel conversations belonging to the exact
+    /// server namespace. Originless legacy rows are deliberately excluded:
+    /// their bare server UUID cannot authorize Sender-Key roster invalidation.
+    pub fn list_origin_scoped_channel_conversation_ids(
+        &self,
+        canonical_server_origin: &str,
+        server_id: &str,
+    ) -> Result<Vec<String>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("origin-scoped channel server id", server_id)?;
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id
+                 FROM conversations
+                 WHERE conv_type = 2 AND server_origin = ?1 AND server_id = ?2
+                 ORDER BY id",
+            )
+            .map_err(|e| format!("prepare origin-scoped channel lookup: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![canonical_server_origin, server_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| format!("query origin-scoped channels: {e}"))?;
+
+        let mut conversation_ids = Vec::new();
+        for row in rows {
+            let conversation_id = row.map_err(|e| format!("read origin-scoped channel id: {e}"))?;
+            validate_canonical_uuid(
+                "persisted origin-scoped channel conversation id",
+                &conversation_id,
+            )?;
+            conversation_ids.push(conversation_id);
+        }
+        Ok(conversation_ids)
+    }
+
     // ─── CRUD: Messages ───────────────────────────────────
 
+    // The parameters mirror the persisted protocol record explicitly. Keeping
+    // them separate avoids constructing an additional plaintext-owning DTO.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_message(
         &self,
         id: &str,
@@ -479,7 +3189,7 @@ impl VeilDb {
                     sender_key,
                     plaintext,
                     is_outgoing as u8,
-                    if is_outgoing { 1u8 } else { 0u8 },
+                    if is_outgoing { 1u8 } else { 2u8 },
                     server_timestamp,
                     reply_to_id,
                 ],
@@ -496,6 +3206,707 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Persist private attachment state inside the caller's current
+    /// transaction/savepoint. The message row must already exist.
+    pub fn insert_message_attachments(
+        &self,
+        message_id: &str,
+        attachments: &[crate::models::MessageAttachment],
+    ) -> Result<(), String> {
+        if message_id.is_empty() || attachments.len() > 16 {
+            return Err("invalid attachment message binding".to_string());
+        }
+        let mut media_ids = std::collections::HashSet::new();
+        for (expected_ordinal, attachment) in attachments.iter().enumerate() {
+            if usize::from(attachment.ordinal) != expected_ordinal
+                || attachment.file_name.is_empty()
+                || attachment.file_name.len() > 1024
+                || attachment.detected_mime.is_empty()
+                || attachment.detected_mime.len() > 255
+                || attachment.format_version == 0
+                || attachment.chunk_count == 0
+                || attachment.chunk_count > 32_769
+                || attachment.plaintext_size > 2 * 1024 * 1024 * 1024
+                || attachment.ciphertext_size < 16
+                || attachment.ciphertext_size > 2_148_007_952
+                || attachment.media_id.len() != 32
+                || !attachment
+                    .media_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || !media_ids.insert(attachment.media_id.as_str())
+            {
+                return Err("invalid private attachment record".to_string());
+            }
+            let chunk_count = i64::try_from(attachment.chunk_count)
+                .map_err(|_| "attachment chunk count exceeds SQLCipher integer".to_string())?;
+            let plaintext_size = i64::try_from(attachment.plaintext_size)
+                .map_err(|_| "attachment plaintext size exceeds SQLCipher integer".to_string())?;
+            let ciphertext_size = i64::try_from(attachment.ciphertext_size)
+                .map_err(|_| "attachment ciphertext size exceeds SQLCipher integer".to_string())?;
+            self.conn
+                .execute(
+                    "INSERT INTO message_attachments_v1
+                       (message_id, ordinal, media_id, file_name, detected_mime,
+                        format_version, nonce_prefix, chunk_count, plaintext_size,
+                        ciphertext_size, content_key)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    rusqlite::params![
+                        message_id,
+                        attachment.ordinal,
+                        attachment.media_id,
+                        attachment.file_name,
+                        attachment.detected_mime,
+                        attachment.format_version,
+                        attachment.nonce_prefix.as_slice(),
+                        chunk_count,
+                        plaintext_size,
+                        ciphertext_size,
+                        attachment.content_key.as_slice(),
+                    ],
+                )
+                .map_err(|error| format!("insert private attachment state: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn get_message_attachments(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<crate::models::MessageAttachment>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT ordinal, media_id, file_name, detected_mime, format_version,
+                        nonce_prefix, chunk_count, plaintext_size, ciphertext_size,
+                        content_key
+                 FROM message_attachments_v1
+                 WHERE message_id = ?1
+                 ORDER BY ordinal",
+            )
+            .map_err(|error| format!("prepare private attachment query: {error}"))?;
+        let rows = statement
+            .query_map(rusqlite::params![message_id], |row| {
+                Ok((
+                    row.get::<_, u8>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u8>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            })
+            .map_err(|error| format!("query private attachments: {error}"))?;
+        let mut attachments = Vec::new();
+        for row in rows {
+            let (
+                ordinal,
+                media_id,
+                file_name,
+                detected_mime,
+                format_version,
+                nonce_prefix,
+                chunk_count,
+                plaintext_size,
+                ciphertext_size,
+                content_key,
+            ) = row.map_err(|error| format!("read private attachment: {error}"))?;
+            attachments.push(crate::models::MessageAttachment {
+                ordinal,
+                media_id,
+                file_name,
+                detected_mime,
+                format_version,
+                nonce_prefix: fixed_bytes("attachment nonce prefix", nonce_prefix)?,
+                chunk_count: u64::try_from(chunk_count)
+                    .map_err(|_| "negative attachment chunk count".to_string())?,
+                plaintext_size: u64::try_from(plaintext_size)
+                    .map_err(|_| "negative attachment plaintext size".to_string())?,
+                ciphertext_size: u64::try_from(ciphertext_size)
+                    .map_err(|_| "negative attachment ciphertext size".to_string())?,
+                content_key: fixed_bytes("attachment content key", content_key)?,
+            });
+        }
+        // Reuse the insert-side structural validator without writing: exact
+        // ordinal continuity and duplicate checks are invariants on read too.
+        for (expected, attachment) in attachments.iter().enumerate() {
+            if usize::from(attachment.ordinal) != expected {
+                return Err("persisted attachment ordinals are not contiguous".to_string());
+            }
+        }
+        Ok(attachments)
+    }
+
+    pub fn insert_outgoing_pending_message_with_attachments(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        sender_key: &[u8; 32],
+        plaintext: &str,
+        reply_to_id: Option<&str>,
+        attachments: &[crate::models::MessageAttachment],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin attachment message transaction: {error}"))?;
+        tx.execute(
+            "INSERT INTO messages
+               (id, conversation_id, sender_key, plaintext, is_outgoing, status, reply_to_id, msg_type)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6)",
+            rusqlite::params![
+                id,
+                conversation_id,
+                sender_key.as_slice(),
+                plaintext,
+                reply_to_id,
+                if attachments.is_empty() { 0u8 } else { 2u8 },
+            ],
+        )
+        .map_err(|error| format!("insert pending attachment message: {error}"))?;
+        // `unchecked_transaction` is active on the same connection; helper
+        // writes participate in it and cannot publish attachment keys alone.
+        self.insert_message_attachments(id, attachments)?;
+        tx.execute(
+            "UPDATE conversations SET last_message_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|error| format!("update attachment conversation timestamp: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit pending attachment message: {error}"))
+    }
+
+    /// Whether an authoritative server message UUID is already present.
+    /// Offline sync checks this before decrypting so a replay cannot advance a
+    /// Double Ratchet or Sender Key state twice.
+    pub fn message_exists(&self, message_id: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+                rusqlite::params![message_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("check message existence: {e}"))
+    }
+
+    pub fn get_remote_message_state(
+        &self,
+        message_id: &str,
+    ) -> Result<Option<crate::models::RemoteMessageState>, String> {
+        self.conn
+            .query_row(
+                "SELECT message_id, conversation_id, sender_key, revision_ms, state
+                 FROM remote_message_state WHERE message_id = ?1",
+                rusqlite::params![message_id],
+                |row| {
+                    let raw_state: u8 = row.get(4)?;
+                    Ok(crate::models::RemoteMessageState {
+                        message_id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        sender_key: row.get(2)?,
+                        revision_ms: row.get(3)?,
+                        state: match raw_state {
+                            1 => crate::models::RemoteMessageStateKind::Deleted,
+                            2 => crate::models::RemoteMessageStateKind::Expired,
+                            3 => crate::models::RemoteMessageStateKind::Unavailable,
+                            _ => crate::models::RemoteMessageStateKind::Active,
+                        },
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(format!("load remote message state: {other}")),
+            })
+    }
+
+    pub fn get_message_binding(&self, message_id: &str) -> Result<Option<MessageBinding>, String> {
+        self.conn
+            .query_row(
+                "SELECT conversation_id, sender_key, is_outgoing, server_timestamp
+                 FROM messages WHERE id = ?1",
+                rusqlite::params![message_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get::<_, u8>(2)? != 0,
+                        row.get(3)?,
+                    ))
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(format!("load message binding: {other}")),
+            })
+    }
+
+    pub fn record_remote_message_state(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_key: &[u8; 32],
+        revision_ms: i64,
+        state: crate::models::RemoteMessageStateKind,
+    ) -> Result<(), String> {
+        if message_id.is_empty() || conversation_id.is_empty() || revision_ms < 0 {
+            return Err("invalid remote message state".to_string());
+        }
+        if let Some(existing) = self.get_remote_message_state(message_id)? {
+            if existing.conversation_id != conversation_id || existing.sender_key != sender_key {
+                return Err("remote message UUID changed its conversation or sender".to_string());
+            }
+            if revision_ms < existing.revision_ms {
+                return Err("remote message revision moved backwards".to_string());
+            }
+            if revision_ms == existing.revision_ms
+                && existing.state != state
+                && !(existing.state == crate::models::RemoteMessageStateKind::Unavailable
+                    && state == crate::models::RemoteMessageStateKind::Active)
+                // Expiration is a deterministic time transition and older
+                // servers report the content revision (created/edited time),
+                // not a new mutation timestamp. It is terminal, so allowing
+                // Active -> Expired at equal revision cannot resurrect data.
+                && !(existing.state == crate::models::RemoteMessageStateKind::Active
+                    && state == crate::models::RemoteMessageStateKind::Expired)
+            {
+                return Err("remote message changed state without a new revision".to_string());
+            }
+        }
+        self.conn
+            .execute(
+                "INSERT INTO remote_message_state
+                   (message_id, conversation_id, sender_key, revision_ms, state, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+                 ON CONFLICT(message_id) DO UPDATE SET
+                   revision_ms=excluded.revision_ms,
+                   state=excluded.state,
+                   updated_at=datetime('now')",
+                rusqlite::params![
+                    message_id,
+                    conversation_id,
+                    sender_key.as_slice(),
+                    revision_ms,
+                    state as u8,
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("record remote message state: {e}"))
+    }
+
+    /// Authoritatively replace reactions for one server message. A nested
+    /// SAVEPOINT keeps this atomic both standalone and inside receive sync.
+    pub fn replace_message_reactions(
+        &self,
+        message_id: &str,
+        reactions: &[crate::models::RemoteReaction],
+    ) -> Result<(), String> {
+        self.conn
+            .execute_batch("SAVEPOINT veil_replace_reactions")
+            .map_err(|e| format!("begin reaction replace: {e}"))?;
+        let operation = (|| {
+            self.conn
+                .execute(
+                    "DELETE FROM reactions WHERE message_id = ?1",
+                    rusqlite::params![message_id],
+                )
+                .map_err(|e| format!("clear message reactions: {e}"))?;
+            for reaction in reactions {
+                if reaction.emoji.is_empty()
+                    || reaction.emoji.len() > 64
+                    || reaction.user_id.is_empty()
+                    || reaction.username.len() > 256
+                {
+                    return Err("invalid authoritative reaction row".to_string());
+                }
+                self.conn
+                    .execute(
+                        "INSERT INTO reactions (message_id, user_id, emoji, username)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            message_id,
+                            reaction.user_id,
+                            reaction.emoji,
+                            reaction.username,
+                        ],
+                    )
+                    .map_err(|e| format!("insert authoritative reaction: {e}"))?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            let rollback = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_replace_reactions;
+                 RELEASE SAVEPOINT veil_replace_reactions;",
+            );
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; reaction rollback failed: {rollback_error}")
+                }
+            });
+        }
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_replace_reactions")
+            .map_err(|e| format!("commit reaction replace: {e}"))
+    }
+
+    pub fn update_incoming_message_text_scoped(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_key: &[u8; 32],
+        new_text: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE messages SET plaintext = ?1
+                 WHERE id = ?2 AND conversation_id = ?3 AND sender_key = ?4
+                   AND is_outgoing = 0",
+                rusqlite::params![new_text, message_id, conversation_id, sender_key.as_slice(),],
+            )
+            .map_err(|e| format!("update incoming message text: {e}"))?;
+        if changed != 1 {
+            return Err("scoped incoming message for edit was not found".to_string());
+        }
+        Ok(())
+    }
+
+    pub fn delete_message_scoped(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM messages WHERE id = ?1 AND conversation_id = ?2",
+                rusqlite::params![message_id, conversation_id],
+            )
+            .map_err(|e| format!("delete scoped message: {e}"))?;
+        if changed > 1 {
+            return Err("scoped message delete affected multiple rows".to_string());
+        }
+        Ok(())
+    }
+
+    /// Begin the single-client receive savepoint. The VeilClient mutex
+    /// serializes callers, so a fixed name is safe and lets crypto-state writes
+    /// performed by existing helpers participate in the same SQLite unit.
+    pub fn begin_receive_savepoint(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch("SAVEPOINT veil_receive_message")
+            .map_err(|e| format!("begin receive savepoint: {e}"))
+    }
+
+    pub fn commit_receive_savepoint(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_receive_message")
+            .map_err(|e| format!("commit receive savepoint: {e}"))
+    }
+
+    pub fn rollback_receive_savepoint(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_receive_message;
+                 RELEASE SAVEPOINT veil_receive_message;",
+            )
+            .map_err(|e| format!("rollback receive savepoint: {e}"))
+    }
+
+    /// Ensure the FK parent and its crypto binding inside the active receive
+    /// savepoint. Existing bindings are verified, never overwritten.
+    pub fn ensure_receive_conversation(
+        &self,
+        conversation_id: &str,
+        sender_key_mode: bool,
+        sender_identity_key: &[u8; 32],
+        fallback_name: Option<&str>,
+    ) -> Result<(), String> {
+        if conversation_id.is_empty() {
+            return Err("receive conversation id must not be empty".to_string());
+        }
+        let existing = self.conn.query_row(
+            "SELECT conv_type, peer_identity_key FROM conversations WHERE id = ?1",
+            rusqlite::params![conversation_id],
+            |row| Ok((row.get::<_, u8>(0)?, row.get::<_, Option<Vec<u8>>>(1)?)),
+        );
+        match existing {
+            Ok((conv_type, peer)) => {
+                if sender_key_mode {
+                    if !matches!(conv_type, 1 | 2) || peer.is_some() {
+                        return Err(
+                            "sender-key message conflicts with the pinned conversation type"
+                                .to_string(),
+                        );
+                    }
+                } else if conv_type != 0 || peer.as_deref() != Some(sender_identity_key.as_slice())
+                {
+                    return Err("DM sender conflicts with the pinned conversation peer".to_string());
+                }
+                self.conn
+                    .execute(
+                        "UPDATE conversations SET name = COALESCE(name, ?2) WHERE id = ?1",
+                        rusqlite::params![conversation_id, fallback_name],
+                    )
+                    .map_err(|e| format!("refresh receive conversation: {e}"))?;
+            }
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                self.conn
+                    .execute(
+                        "INSERT INTO conversations
+                           (id, conv_type, name, peer_identity_key)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        rusqlite::params![
+                            conversation_id,
+                            if sender_key_mode { 2u8 } else { 0u8 },
+                            fallback_name,
+                            if sender_key_mode {
+                                None::<&[u8]>
+                            } else {
+                                Some(sender_identity_key.as_slice())
+                            },
+                        ],
+                    )
+                    .map_err(|e| format!("insert receive conversation: {e}"))?;
+            }
+            Err(e) => return Err(format!("load receive conversation: {e}")),
+        }
+        Ok(())
+    }
+
+    pub fn insert_outgoing_pending_message(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        sender_key: &[u8; 32],
+        plaintext: &str,
+        reply_to_id: Option<&str>,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin pending message transaction: {e}"))?;
+        tx.execute(
+            "INSERT INTO messages
+               (id, conversation_id, sender_key, plaintext, is_outgoing, status, reply_to_id)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5)",
+            rusqlite::params![
+                id,
+                conversation_id,
+                sender_key.as_slice(),
+                plaintext,
+                reply_to_id,
+            ],
+        )
+        .map_err(|e| format!("insert pending outgoing message: {e}"))?;
+        tx.execute(
+            "UPDATE conversations SET last_message_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| format!("update pending conversation timestamp: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit pending outgoing message: {e}"))
+    }
+
+    /// Replace the optimistic local UUID with the authoritative server UUID
+    /// and mark it sent. References are migrated in the same transaction.
+    pub fn acknowledge_outgoing_message(
+        &self,
+        local_message_id: &str,
+        server_message_id: &str,
+        server_timestamp_ms: i64,
+    ) -> Result<(), String> {
+        if local_message_id.is_empty() || server_message_id.is_empty() {
+            return Err("message ids must not be empty".to_string());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin message ACK transaction: {e}"))?;
+        if local_message_id != server_message_id {
+            let collision: bool = tx
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE id = ?1)",
+                    rusqlite::params![server_message_id],
+                    |row| row.get(0),
+                )
+                .map_err(|e| format!("check server message id collision: {e}"))?;
+            if collision {
+                return Err("server message id already exists locally".to_string());
+            }
+        }
+        let changed = tx
+            .execute(
+                "UPDATE messages
+                 SET id = ?1, server_timestamp = ?2, status = 1
+                 WHERE id = ?3 AND is_outgoing = 1 AND status = 0",
+                rusqlite::params![server_message_id, server_timestamp_ms, local_message_id],
+            )
+            .map_err(|e| format!("acknowledge outgoing message: {e}"))?;
+        if changed != 1 {
+            return Err("pending outgoing message not found".to_string());
+        }
+        tx.execute(
+            "UPDATE messages SET reply_to_id = ?1 WHERE reply_to_id = ?2",
+            rusqlite::params![server_message_id, local_message_id],
+        )
+        .map_err(|e| format!("migrate message reply references: {e}"))?;
+        tx.execute(
+            "UPDATE reactions SET message_id = ?1 WHERE message_id = ?2",
+            rusqlite::params![server_message_id, local_message_id],
+        )
+        .map_err(|e| format!("migrate reaction references: {e}"))?;
+        tx.commit().map_err(|e| format!("commit message ACK: {e}"))
+    }
+
+    /// Preserve plaintext for an asynchronously rejected send while making it
+    /// impossible to confuse the row with an in-flight message after restart.
+    pub fn mark_outgoing_message_failed(&self, local_message_id: &str) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE messages SET status = 4
+                 WHERE id = ?1 AND is_outgoing = 1 AND status = 0",
+                rusqlite::params![local_message_id],
+            )
+            .map_err(|e| format!("mark outgoing message failed: {e}"))?;
+        if changed != 1 {
+            return Err("pending outgoing message not found for failure".to_string());
+        }
+        Ok(())
+    }
+
+    /// An ACK lost to reconnect/crash is ambiguous: the server may already
+    /// have stored and fanned out the ciphertext. Preserve the local plaintext
+    /// without claiming either success or failure.
+    pub fn mark_outgoing_message_unknown(&self, local_message_id: &str) -> Result<(), String> {
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE messages SET status = 5
+                 WHERE id = ?1 AND is_outgoing = 1 AND status = 0",
+                rusqlite::params![local_message_id],
+            )
+            .map_err(|e| format!("mark outgoing message delivery unknown: {e}"))?;
+        if changed != 1 {
+            return Err("pending outgoing message not found for unknown delivery".to_string());
+        }
+        Ok(())
+    }
+
+    /// Mark a whole terminated socket epoch ambiguous atomically. If any row
+    /// cannot be transitioned, none are changed; the client can then block a
+    /// reconnect and retry instead of leaving a mixture of Sending/Unknown.
+    pub fn mark_outgoing_messages_unknown(
+        &self,
+        local_message_ids: &[String],
+    ) -> Result<(), String> {
+        if local_message_ids.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin outgoing delivery-state transaction: {e}"))?;
+        for local_message_id in local_message_ids {
+            let changed = tx
+                .execute(
+                    "UPDATE messages SET status = 5
+                     WHERE id = ?1 AND is_outgoing = 1 AND status = 0",
+                    rusqlite::params![local_message_id],
+                )
+                .map_err(|e| format!("mark outgoing message delivery unknown: {e}"))?;
+            if changed != 1 {
+                return Err(format!(
+                    "pending outgoing message {local_message_id} not found for unknown delivery"
+                ));
+            }
+        }
+        tx.commit()
+            .map_err(|e| format!("commit outgoing delivery states: {e}"))
+    }
+
+    /// Process state contains the sequence-to-local-id correlation. After a
+    /// crash/restart that map is gone, so every surviving status=0 row must be
+    /// made explicitly ambiguous instead of pretending it is still sending.
+    pub fn recover_unacknowledged_outgoing_messages(&self) -> Result<usize, String> {
+        self.conn
+            .execute(
+                "UPDATE messages SET status = 5 WHERE is_outgoing = 1 AND status = 0",
+                [],
+            )
+            .map_err(|e| format!("recover unacknowledged outgoing messages: {e}"))
+    }
+
+    pub fn discard_failed_outgoing_message(&self, local_message_id: &str) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin discard local message transaction: {e}"))?;
+        let conversation_id: String = tx
+            .query_row(
+                "SELECT conversation_id FROM messages
+                 WHERE id = ?1 AND is_outgoing = 1 AND status IN (4, 5)",
+                rusqlite::params![local_message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("find discarded message conversation: {e}"))?
+            .ok_or_else(|| "failed or unknown outgoing message not found".to_string())?;
+        let changed = tx
+            .execute(
+                "DELETE FROM messages WHERE id = ?1 AND is_outgoing = 1 AND status IN (4, 5)",
+                rusqlite::params![local_message_id],
+            )
+            .map_err(|e| format!("discard failed outgoing message: {e}"))?;
+        if changed != 1 {
+            return Err("failed or unknown outgoing message not found".to_string());
+        }
+        tx.execute(
+            "UPDATE conversations
+             SET last_message_at = (
+               SELECT CASE
+                 WHEN server_timestamp IS NOT NULL
+                   THEN strftime('%Y-%m-%d %H:%M:%f', server_timestamp / 1000.0, 'unixepoch')
+                 ELSE created_at
+               END
+               FROM messages
+               WHERE conversation_id = ?1
+               ORDER BY COALESCE(
+                 server_timestamp,
+                 CAST(strftime('%s', created_at) AS INTEGER) * 1000
+               ) DESC, rowid DESC
+               LIMIT 1
+             )
+             WHERE id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| format!("recalculate conversation last message: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit discarded local message: {e}"))
+    }
+
+    pub fn is_discardable_outgoing_message(&self, local_message_id: &str) -> Result<bool, String> {
+        self.conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM messages
+                   WHERE id = ?1 AND is_outgoing = 1 AND status IN (4, 5)
+                 )",
+                rusqlite::params![local_message_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("check discardable outgoing message: {e}"))
+    }
+
     pub fn get_messages(
         &self,
         conversation_id: &str,
@@ -504,40 +3915,398 @@ impl VeilDb {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, conversation_id, sender_key, plaintext, msg_type, reply_to_id,
-                        is_outgoing, status, expires_at, server_timestamp, created_at
-                 FROM messages
-                 WHERE conversation_id = ?1
-                 ORDER BY server_timestamp ASC, created_at ASC
-                 LIMIT ?2",
+                "SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                        m.msg_type, m.reply_to_id, m.is_outgoing, m.status,
+                        m.expires_at, m.server_timestamp, m.created_at,
+                        m.effective_timestamp, m.local_order,
+                        a.canonical_server_origin, a.user_id, a.identity_key,
+                        a.signing_key, a.username, a.display_name,
+                        a.profile_version, a.profile_origin, a.source, a.observed_at,
+                        a.author_context
+                 FROM (
+                   SELECT id, conversation_id, sender_key, plaintext, msg_type, reply_to_id,
+                          is_outgoing, status, expires_at, server_timestamp, created_at,
+                          COALESCE(
+                            server_timestamp,
+                            CAST(strftime('%s', created_at) AS INTEGER) * 1000
+                          ) AS effective_timestamp,
+                          rowid AS local_order
+                   FROM messages
+                   WHERE conversation_id = ?1
+                   ORDER BY effective_timestamp DESC, local_order DESC
+                   LIMIT ?2
+                 ) AS m
+                 LEFT JOIN message_author_snapshots_v1 AS a ON a.message_id = m.id
+                 ORDER BY m.effective_timestamp ASC, m.local_order ASC",
             )
             .map_err(|e| format!("prepare: {e}"))?;
 
         let rows = stmt
             .query_map(rusqlite::params![conversation_id, limit], |row| {
-                Ok(crate::models::Message {
-                    id: row.get(0)?,
-                    conversation_id: row.get(1)?,
-                    sender_key: row.get(2)?,
-                    plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    msg_type: row.get(4)?,
-                    reply_to_id: row.get(5)?,
-                    is_outgoing: row.get::<_, u8>(6)? != 0,
-                    status: match row.get::<_, u8>(7)? {
-                        1 => crate::models::MessageStatus::Sent,
-                        2 => crate::models::MessageStatus::Delivered,
-                        3 => crate::models::MessageStatus::Read,
-                        _ => crate::models::MessageStatus::Sending,
+                Ok((
+                    Message {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        sender_key: row.get(2)?,
+                        plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        msg_type: row.get(4)?,
+                        reply_to_id: row.get(5)?,
+                        is_outgoing: row.get::<_, u8>(6)? != 0,
+                        status: match row.get::<_, u8>(7)? {
+                            1 => crate::models::MessageStatus::Sent,
+                            2 => crate::models::MessageStatus::Delivered,
+                            3 => crate::models::MessageStatus::Read,
+                            4 => crate::models::MessageStatus::Failed,
+                            5 => crate::models::MessageStatus::Unknown,
+                            _ => crate::models::MessageStatus::Sending,
+                        },
+                        expires_at: row.get(8)?,
+                        server_timestamp: row.get(9)?,
+                        created_at: row.get(10)?,
+                        author: None,
+                        author_context: None,
+                        attachments: Vec::new(),
                     },
-                    expires_at: row.get(8)?,
-                    server_timestamp: row.get(9)?,
-                    created_at: row.get(10)?,
-                })
+                    raw_account_snapshot_from_row(row, 13)?,
+                    row.get::<_, Option<u8>>(23)?,
+                ))
             })
             .map_err(|e| format!("query: {e}"))?;
 
+        let mut messages = Vec::new();
+        for row in rows {
+            let (mut message, author, author_context) =
+                row.map_err(|e| format!("collect message: {e}"))?;
+            message.author = author.map(RawAccountSnapshot::decode).transpose()?;
+            message.author_context = author_context
+                .map(|value| {
+                    MessageAuthorContext::from_u8(value)
+                        .ok_or_else(|| "invalid persisted message author context".to_string())
+                })
+                .transpose()?;
+            message.attachments = self.get_message_attachments(&message.id)?;
+            messages.push(message);
+        }
+        Ok(messages)
+    }
+
+    /// Read one newest-first page for an origin-scoped in-memory search rebuild.
+    ///
+    /// The cursor follows the same `(effective_timestamp, message_id)` order as
+    /// the live RAM index. This keeps budget eviction and restart rebuilds on
+    /// one deterministic definition of the newest continuous slice, including
+    /// rows inserted out of timestamp order. Callers hold decrypted rows only
+    /// in process memory and apply their own global memory/document budget.
+    pub fn get_search_index_page(
+        &self,
+        canonical_server_origin: &str,
+        before: Option<&crate::models::SearchIndexCursor>,
+        limit: u32,
+    ) -> Result<Vec<crate::models::SearchIndexDocument>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        if limit == 0 || limit > 2_048 {
+            return Err("search rebuild page limit must be between 1 and 2048".to_string());
+        }
+        if let Some(cursor) = before {
+            validate_canonical_uuid("search rebuild cursor message id", &cursor.message_id)?;
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH scoped AS (
+                   SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                          COALESCE(
+                            m.server_timestamp,
+                            CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+                          ) AS effective_timestamp
+                   FROM messages AS m
+                   INNER JOIN conversations AS c ON c.id = m.conversation_id
+                   WHERE c.server_origin = ?1
+                     AND m.plaintext <> ''
+                 )
+                 SELECT id, conversation_id, sender_key, plaintext,
+                        effective_timestamp
+                 FROM scoped
+                 WHERE ?2 IS NULL
+                    OR effective_timestamp < ?2
+                    OR (
+                      effective_timestamp = ?2
+                      AND id COLLATE BINARY < ?3 COLLATE BINARY
+                    )
+                 ORDER BY effective_timestamp DESC, id COLLATE BINARY DESC
+                 LIMIT ?4",
+            )
+            .map_err(|e| format!("prepare search rebuild page: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    canonical_server_origin,
+                    before.map(|cursor| cursor.timestamp),
+                    before.map(|cursor| cursor.message_id.as_str()),
+                    limit
+                ],
+                |row| {
+                    Ok(crate::models::SearchIndexDocument {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        sender_key: row.get(2)?,
+                        plaintext: row.get(3)?,
+                        timestamp: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(|e| format!("query search rebuild page: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|e| format!("collect: {e}"))
+            .map_err(|e| format!("collect search rebuild page: {e}"))
+    }
+
+    /// Load one current message row for a RAM search-index hit.
+    ///
+    /// The index is deliberately not an identity authority. Callers must
+    /// hydrate author metadata from this origin-scoped SQLCipher row and may
+    /// only expose it after matching the indexed message/conversation/sender.
+    pub fn get_message_for_search(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        canonical_server_origin: &str,
+    ) -> Result<Option<crate::models::Message>, String> {
+        if message_id.is_empty() || conversation_id.is_empty() {
+            return Err("search message and conversation ids must not be empty".to_string());
+        }
+        validate_canonical_server_origin(canonical_server_origin)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                        m.msg_type, m.reply_to_id, m.is_outgoing, m.status,
+                        m.expires_at, m.server_timestamp, m.created_at,
+                        a.canonical_server_origin, a.user_id, a.identity_key,
+                        a.signing_key, a.username, a.display_name,
+                        a.profile_version, a.profile_origin, a.source, a.observed_at,
+                        a.author_context
+                 FROM messages AS m
+                 JOIN conversations AS c ON c.id = m.conversation_id
+                 LEFT JOIN message_author_snapshots_v1 AS a ON a.message_id = m.id
+                 WHERE m.id = ?1 AND m.conversation_id = ?2
+                   AND c.server_origin = ?3",
+                rusqlite::params![message_id, conversation_id, canonical_server_origin],
+                |row| {
+                    Ok((
+                        Message {
+                            id: row.get(0)?,
+                            conversation_id: row.get(1)?,
+                            sender_key: row.get(2)?,
+                            plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                            msg_type: row.get(4)?,
+                            reply_to_id: row.get(5)?,
+                            is_outgoing: row.get::<_, u8>(6)? != 0,
+                            status: match row.get::<_, u8>(7)? {
+                                1 => crate::models::MessageStatus::Sent,
+                                2 => crate::models::MessageStatus::Delivered,
+                                3 => crate::models::MessageStatus::Read,
+                                4 => crate::models::MessageStatus::Failed,
+                                5 => crate::models::MessageStatus::Unknown,
+                                _ => crate::models::MessageStatus::Sending,
+                            },
+                            expires_at: row.get(8)?,
+                            server_timestamp: row.get(9)?,
+                            created_at: row.get(10)?,
+                            author: None,
+                            author_context: None,
+                            attachments: Vec::new(),
+                        },
+                        raw_account_snapshot_from_row(row, 11)?,
+                        row.get::<_, Option<u8>>(21)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load message for search: {error}"))?;
+        row.map(|(mut message, author, author_context)| {
+            message.author = author.map(RawAccountSnapshot::decode).transpose()?;
+            message.author_context = author_context
+                .map(|value| {
+                    MessageAuthorContext::from_u8(value)
+                        .ok_or_else(|| "invalid persisted message author context".to_string())
+                })
+                .transpose()?;
+            Ok(message)
+        })
+        .transpose()
+    }
+
+    /// Return a bounded chronological window centred on one current message.
+    ///
+    /// Both the conversation and target are re-read from SQLCipher for the
+    /// caller's exact authenticated origin. Missing/deleted targets return
+    /// `None`; malformed conversation, author, sender, or attachment rows fail
+    /// the whole lookup rather than exposing a partially trusted context.
+    pub fn get_search_result_context(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        canonical_server_origin: &str,
+    ) -> Result<Option<SearchResultContext>, String> {
+        if message_id.is_empty() || conversation_id.is_empty() {
+            return Err("search message and conversation ids must not be empty".to_string());
+        }
+        validate_canonical_server_origin(canonical_server_origin)?;
+
+        let conversation = self
+            .conn
+            .query_row(
+                "SELECT conv_type, server_id
+                 FROM conversations
+                 WHERE id = ?1 AND server_origin = ?2",
+                rusqlite::params![conversation_id, canonical_server_origin],
+                |row| Ok((row.get::<_, u8>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("load search result conversation: {error}"))?;
+        let Some((conversation_type, stored_server_id)) = conversation else {
+            return Ok(None);
+        };
+        let (conversation_type, server_id) = match conversation_type {
+            0 if stored_server_id.is_none() => (crate::models::ConversationType::DM, None),
+            1 if stored_server_id.is_none() => (crate::models::ConversationType::Group, None),
+            0 | 1 => {
+                return Err("non-channel search context contains a persisted server id".to_string())
+            }
+            2 => {
+                let server_id =
+                    stored_server_id.ok_or("channel search context has no persisted server id")?;
+                validate_canonical_uuid("channel search context server id", &server_id)?;
+                (crate::models::ConversationType::Channel, Some(server_id))
+            }
+            _ => return Err("search context has an invalid conversation type".to_string()),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH ordered AS (
+                   SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                          m.msg_type, m.reply_to_id, m.is_outgoing, m.status,
+                          m.expires_at, m.server_timestamp, m.created_at,
+                          COALESCE(
+                            m.server_timestamp,
+                            CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+                          ) AS effective_timestamp,
+                          m.rowid AS local_order,
+                          ROW_NUMBER() OVER (
+                            ORDER BY COALESCE(
+                              m.server_timestamp,
+                              CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+                            ) ASC, m.rowid ASC
+                          ) AS message_rank,
+                          COUNT(*) OVER () AS total_count
+                   FROM messages AS m
+                   WHERE m.conversation_id = ?1
+                 ),
+                 target AS (
+                   SELECT message_rank, total_count
+                   FROM ordered
+                   WHERE id = ?2
+                 ),
+                 bounds AS (
+                   SELECT MAX(1, MIN(message_rank - 99, total_count - 199)) AS first_rank
+                   FROM target
+                 )
+                 SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                        m.msg_type, m.reply_to_id, m.is_outgoing, m.status,
+                        m.expires_at, m.server_timestamp, m.created_at,
+                        a.canonical_server_origin, a.user_id, a.identity_key,
+                        a.signing_key, a.username, a.display_name,
+                        a.profile_version, a.profile_origin, a.source, a.observed_at,
+                        a.author_context
+                 FROM ordered AS m
+                 CROSS JOIN bounds AS b
+                 LEFT JOIN message_author_snapshots_v1 AS a ON a.message_id = m.id
+                 WHERE m.message_rank BETWEEN b.first_rank AND b.first_rank + 199
+                 ORDER BY m.effective_timestamp ASC, m.local_order ASC",
+            )
+            .map_err(|error| format!("prepare search result context: {error}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![conversation_id, message_id], |row| {
+                Ok((
+                    Message {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        sender_key: row.get(2)?,
+                        plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        msg_type: row.get(4)?,
+                        reply_to_id: row.get(5)?,
+                        is_outgoing: row.get::<_, u8>(6)? != 0,
+                        status: match row.get::<_, u8>(7)? {
+                            0 => crate::models::MessageStatus::Sending,
+                            1 => crate::models::MessageStatus::Sent,
+                            2 => crate::models::MessageStatus::Delivered,
+                            3 => crate::models::MessageStatus::Read,
+                            4 => crate::models::MessageStatus::Failed,
+                            5 => crate::models::MessageStatus::Unknown,
+                            value => {
+                                return Err(rusqlite::Error::IntegralValueOutOfRange(
+                                    7,
+                                    value as i64,
+                                ))
+                            }
+                        },
+                        expires_at: row.get(8)?,
+                        server_timestamp: row.get(9)?,
+                        created_at: row.get(10)?,
+                        author: None,
+                        author_context: None,
+                        attachments: Vec::new(),
+                    },
+                    raw_account_snapshot_from_row(row, 11)?,
+                    row.get::<_, Option<u8>>(21)?,
+                ))
+            })
+            .map_err(|error| format!("query search result context: {error}"))?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            let (mut message, author, author_context) =
+                row.map_err(|error| format!("collect search result context: {error}"))?;
+            if message.sender_key.len() != 32 {
+                return Err("search context contains an invalid sender key".to_string());
+            }
+            message.author = author.map(RawAccountSnapshot::decode).transpose()?;
+            if message.author.as_ref().is_some_and(|author| {
+                author.locator.canonical_server_origin != canonical_server_origin
+                    || author.locator.identity_key.as_slice() != message.sender_key.as_slice()
+            }) {
+                return Err(
+                    "search context contains a cross-origin or mismatched author".to_string(),
+                );
+            }
+            message.author_context = author_context
+                .map(|value| {
+                    MessageAuthorContext::from_u8(value).ok_or_else(|| {
+                        "invalid persisted search context author context".to_string()
+                    })
+                })
+                .transpose()?;
+            message.attachments = self.get_message_attachments(&message.id)?;
+            messages.push(message);
+        }
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        if !messages.iter().any(|message| message.id == message_id) {
+            return Err("search context window omitted its target message".to_string());
+        }
+        if messages.len() > 200 {
+            return Err("search context exceeded its 200-message bound".to_string());
+        }
+
+        Ok(Some(SearchResultContext {
+            conversation_type,
+            server_id,
+            messages,
+        }))
     }
 
     /// Update the plaintext of an existing message (edit).
@@ -583,6 +4352,67 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Persist a newly initiated ratchet together with the X3DH metadata that
+    /// must remain on outgoing messages until peer possession is proven.
+    pub fn save_initiator_session(
+        &self,
+        peer_identity_key: &[u8; 32],
+        session_data: &[u8],
+        initial_header_data: &[u8],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin initiator session transaction: {e}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO ratchet_sessions
+               (peer_identity_key, session_data, updated_at)
+             VALUES (?1, ?2, datetime('now'))",
+            rusqlite::params![peer_identity_key.as_slice(), session_data],
+        )
+        .map_err(|e| format!("save initiator ratchet session: {e}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO pending_initial_headers
+               (peer_identity_key, header_data, updated_at)
+             VALUES (?1, ?2, datetime('now'))",
+            rusqlite::params![peer_identity_key.as_slice(), initial_header_data],
+        )
+        .map_err(|e| format!("save pending X3DH header: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit initiator session transaction: {e}"))
+    }
+
+    pub fn load_pending_initial_headers(&self) -> Result<Vec<PendingInitialHeaderRow>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT peer_identity_key, header_data FROM pending_initial_headers")
+            .map_err(|e| format!("prepare pending X3DH headers: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| format!("query pending X3DH headers: {e}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (peer, data) = row.map_err(|e| format!("read pending X3DH header: {e}"))?;
+            let peer: [u8; 32] = peer
+                .try_into()
+                .map_err(|peer: Vec<u8>| format!("invalid pending peer length: {}", peer.len()))?;
+            result.push((peer, data));
+        }
+        Ok(result)
+    }
+
+    pub fn clear_pending_initial_header(&self, peer_identity_key: &[u8; 32]) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_initial_headers WHERE peer_identity_key = ?1",
+                rusqlite::params![peer_identity_key.as_slice()],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("clear pending X3DH header: {e}"))
+    }
+
     pub fn load_ratchet_session(
         &self,
         peer_identity_key: &[u8],
@@ -596,6 +4426,629 @@ impl VeilDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("load ratchet session: {e}")),
         }
+    }
+
+    /// Return the stable per-install device ID stored inside SQLCipher, or
+    /// atomically initialize it from `proposed` on first use.
+    pub fn get_or_create_device_id(&self, proposed: [u8; 16]) -> Result<[u8; 16], String> {
+        if proposed == [0u8; 16] {
+            return Err("refusing an all-zero device id".to_string());
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO client_state (key, value) VALUES ('device_id', ?1)",
+                rusqlite::params![proposed.as_slice()],
+            )
+            .map_err(|e| format!("store device id: {e}"))?;
+        let bytes: Vec<u8> = self
+            .conn
+            .query_row(
+                "SELECT value FROM client_state WHERE key = 'device_id'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("load device id: {e}"))?;
+        let persisted: [u8; 16] = bytes
+            .try_into()
+            .map_err(|v: Vec<u8>| format!("invalid persisted device id length: {}", v.len()))?;
+        if persisted != [0u8; 16] {
+            return Ok(persisted);
+        }
+
+        // Repair the fail-open value produced by older Windows builds when
+        // the OS RNG failed. A fresh ID is safer than keeping a globally
+        // colliding device identity.
+        self.conn
+            .execute(
+                "UPDATE client_state SET value = ?1 WHERE key = 'device_id' AND value = ?2",
+                rusqlite::params![proposed.as_slice(), [0u8; 16].as_slice()],
+            )
+            .map_err(|e| format!("repair all-zero device id: {e}"))?;
+        Ok(proposed)
+    }
+
+    /// Load the durable device identity. A separate marker is committed in the
+    /// same transaction as the key row so deletion/corruption cannot be
+    /// mistaken for a legacy installation and silently generate a replacement.
+    pub fn load_device_identity_v1(&self) -> Result<Option<LocalDeviceIdentityV1>, String> {
+        let marker: Option<Vec<u8>> = self
+            .conn
+            .query_row(
+                "SELECT value FROM client_state WHERE key = 'device_binding_v1_created'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("load device binding marker: {e}"))?;
+
+        type DeviceRow = (
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            i64,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+        );
+        let row: Option<DeviceRow> = self
+            .conn
+            .query_row(
+                "SELECT device_id, version, x25519_secret, ed25519_secret,
+                        device_identity_key, device_signing_key, capabilities,
+                        status, account_identity_key, account_signing_key,
+                        account_signature
+                   FROM device_identity_v1 WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load device identity: {e}"))?;
+
+        match (marker, row) {
+            (None, None) => Ok(None),
+            (Some(_), None) => Err(
+                "device binding marker exists but private device identity is missing".to_string(),
+            ),
+            (None, Some(_)) => {
+                Err("private device identity exists without its binding marker".to_string())
+            }
+            (Some(marker), Some(row)) => {
+                let device_id = fixed_bytes::<16>("device id", row.0)?;
+                let marker = fixed_bytes::<16>("device binding marker", marker)?;
+                if marker != device_id {
+                    return Err("device binding marker does not match device identity".to_string());
+                }
+                let version = u64::from_be_bytes(fixed_bytes::<8>("device version", row.1)?);
+                let capabilities =
+                    u64::from_be_bytes(fixed_bytes::<8>("device capabilities", row.6)?);
+                let status = u8::try_from(row.7)
+                    .map_err(|_| "persisted device status is out of range".to_string())?;
+                if !(1..=3).contains(&status) {
+                    return Err("persisted device status is invalid".to_string());
+                }
+                Ok(Some(LocalDeviceIdentityV1 {
+                    device_id,
+                    version,
+                    x25519_secret: fixed_bytes::<32>("device X25519 secret", row.2)?,
+                    ed25519_secret: fixed_bytes::<32>("device Ed25519 secret", row.3)?,
+                    device_identity_key: fixed_bytes::<32>("device identity key", row.4)?,
+                    device_signing_key: fixed_bytes::<32>("device signing key", row.5)?,
+                    capabilities,
+                    status,
+                    account_identity_key: fixed_bytes::<32>("account identity key", row.8)?,
+                    account_signing_key: fixed_bytes::<32>("account signing key", row.9)?,
+                    account_signature: fixed_bytes::<64>("device account signature", row.10)?,
+                }))
+            }
+        }
+    }
+
+    /// Commit the first device identity and its non-deletable-without-detection
+    /// marker atomically. Existing bindings are immutable through this API.
+    pub fn create_device_identity_v1(
+        &self,
+        identity: &LocalDeviceIdentityV1,
+    ) -> Result<(), String> {
+        if identity.device_id == [0u8; 16] || identity.version == 0 {
+            return Err("refusing an invalid device identity".to_string());
+        }
+        let persisted_device_id = self.get_or_create_device_id(identity.device_id)?;
+        if persisted_device_id != identity.device_id {
+            return Err("device identity does not match the stable installation id".to_string());
+        }
+        if self.load_device_identity_v1()?.is_some() {
+            return Err("device identity already exists and is immutable".to_string());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin device identity transaction: {e}"))?;
+        tx.execute(
+            "INSERT INTO device_identity_v1
+               (singleton, device_id, version, x25519_secret, ed25519_secret,
+                device_identity_key, device_signing_key, capabilities, status,
+                account_identity_key, account_signing_key, account_signature)
+             VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                identity.device_id.as_slice(),
+                identity.version.to_be_bytes().as_slice(),
+                identity.x25519_secret.as_slice(),
+                identity.ed25519_secret.as_slice(),
+                identity.device_identity_key.as_slice(),
+                identity.device_signing_key.as_slice(),
+                identity.capabilities.to_be_bytes().as_slice(),
+                identity.status,
+                identity.account_identity_key.as_slice(),
+                identity.account_signing_key.as_slice(),
+                identity.account_signature.as_slice(),
+            ],
+        )
+        .map_err(|e| format!("store device identity: {e}"))?;
+        tx.execute(
+            "INSERT INTO client_state (key, value)
+             VALUES ('device_binding_v1_created', ?1)",
+            rusqlite::params![identity.device_id.as_slice()],
+        )
+        .map_err(|e| format!("store device binding marker: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit device identity: {e}"))?;
+        Ok(())
+    }
+
+    /// Commit an independently validated roster proof and every observed
+    /// account-authorized device binding as one rollback-resistant snapshot.
+    pub fn commit_device_roster_snapshot_v1(
+        &self,
+        snapshot: &DeviceRosterSnapshotV1<'_>,
+    ) -> Result<(), String> {
+        if snapshot.conversation_id.is_empty()
+            || snapshot.roster_version == 0
+            || snapshot.roster_version > i64::MAX as u64
+            || snapshot.required_capabilities == 0
+            || snapshot.required_capabilities > i64::MAX as u64
+            || snapshot.canonical_snapshot.is_empty()
+            || snapshot.canonical_snapshot.len() > 1_048_576
+        {
+            return Err("invalid device roster snapshot scope".to_string());
+        }
+        let mut unique_devices = std::collections::HashSet::new();
+        for binding in snapshot.bindings {
+            if binding.device_id == [0u8; 16]
+                || !unique_devices.insert(binding.device_id)
+                || binding.binding_version == 0
+                || binding.binding_version > i64::MAX as u64
+                || binding.capabilities > i64::MAX as u64
+                || !(1..=3).contains(&binding.status)
+                || std::collections::HashSet::from([
+                    binding.account_identity_key,
+                    binding.account_signing_key,
+                    binding.device_identity_key,
+                    binding.device_signing_key,
+                ])
+                .len()
+                    != 4
+            {
+                return Err("invalid device binding pin in roster snapshot".to_string());
+            }
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin device roster snapshot transaction: {e}"))?;
+        let existing_roster = tx
+            .query_row(
+                "SELECT roster_version, roster_commitment, required_capabilities,
+                        canonical_snapshot
+                 FROM conversation_device_roster_snapshots_v1
+                 WHERE conversation_id = ?1",
+                rusqlite::params![snapshot.conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load pinned device roster head: {e}"))?;
+        if let Some((version, commitment, capabilities, canonical)) = existing_roster {
+            let version = u64::from_be_bytes(fixed_bytes("roster version", version)?);
+            if snapshot.roster_version < version {
+                return Err("device roster version rollback rejected".to_string());
+            }
+            if snapshot.roster_version == version
+                && (commitment.as_slice() != snapshot.roster_commitment
+                    || u64::from_be_bytes(fixed_bytes::<8>(
+                        "roster required capabilities",
+                        capabilities,
+                    )?) != snapshot.required_capabilities
+                    || canonical.as_slice() != snapshot.canonical_snapshot)
+            {
+                return Err("same device roster version changed committed state".to_string());
+            }
+        }
+
+        for binding in snapshot.bindings {
+            type PinRow = (
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                i64,
+                Vec<u8>,
+            );
+            let existing: Option<PinRow> = tx
+                .query_row(
+                    "SELECT account_identity_key, account_signing_key,
+                            device_identity_key, device_signing_key,
+                            binding_version, capabilities, status,
+                            account_signature
+                     FROM device_binding_pins_v1 WHERE device_id = ?1",
+                    rusqlite::params![binding.device_id.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| format!("load device binding pin: {e}"))?;
+            if let Some(existing) = existing {
+                let old_version =
+                    u64::from_be_bytes(fixed_bytes("pinned binding version", existing.4)?);
+                let old_capabilities =
+                    u64::from_be_bytes(fixed_bytes("pinned binding capabilities", existing.5)?);
+                let old_status = u8::try_from(existing.6)
+                    .map_err(|_| "pinned device binding status is invalid".to_string())?;
+                if existing.0.as_slice() != binding.account_identity_key
+                    || existing.1.as_slice() != binding.account_signing_key
+                    || existing.2.as_slice() != binding.device_identity_key
+                    || existing.3.as_slice() != binding.device_signing_key
+                {
+                    return Err("pinned device/account key replacement rejected".to_string());
+                }
+                if binding.binding_version < old_version {
+                    return Err("device binding version rollback rejected".to_string());
+                }
+                if old_status == 3 && binding.status != 3 {
+                    return Err("revoked device binding cannot become active again".to_string());
+                }
+                if binding.binding_version == old_version
+                    && (binding.capabilities != old_capabilities
+                        || binding.status != old_status
+                        || existing.7.as_slice() != binding.account_signature)
+                {
+                    return Err("same device binding version changed signed state".to_string());
+                }
+            }
+
+            tx.execute(
+                "INSERT INTO device_binding_pins_v1
+                    (device_id, account_identity_key, account_signing_key,
+                     device_identity_key, device_signing_key, binding_version,
+                     capabilities, status, account_signature, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                 ON CONFLICT(device_id) DO UPDATE SET
+                    binding_version = excluded.binding_version,
+                    capabilities = excluded.capabilities,
+                    status = excluded.status,
+                    account_signature = excluded.account_signature,
+                    updated_at = datetime('now')",
+                rusqlite::params![
+                    binding.device_id.as_slice(),
+                    binding.account_identity_key.as_slice(),
+                    binding.account_signing_key.as_slice(),
+                    binding.device_identity_key.as_slice(),
+                    binding.device_signing_key.as_slice(),
+                    binding.binding_version.to_be_bytes().as_slice(),
+                    binding.capabilities.to_be_bytes().as_slice(),
+                    binding.status,
+                    binding.account_signature.as_slice(),
+                ],
+            )
+            .map_err(|e| format!("pin device binding: {e}"))?;
+        }
+
+        tx.execute(
+            "INSERT INTO conversation_device_roster_snapshots_v1
+                (conversation_id, roster_version, roster_commitment,
+                 required_capabilities, canonical_snapshot, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+             ON CONFLICT(conversation_id) DO UPDATE SET
+                roster_version = excluded.roster_version,
+                roster_commitment = excluded.roster_commitment,
+                required_capabilities = excluded.required_capabilities,
+                canonical_snapshot = excluded.canonical_snapshot,
+                updated_at = datetime('now')",
+            rusqlite::params![
+                snapshot.conversation_id,
+                snapshot.roster_version.to_be_bytes().as_slice(),
+                snapshot.roster_commitment.as_slice(),
+                snapshot.required_capabilities.to_be_bytes().as_slice(),
+                snapshot.canonical_snapshot,
+            ],
+        )
+        .map_err(|e| format!("persist device roster snapshot: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit device roster snapshot: {e}"))
+    }
+
+    pub fn load_device_roster_head_v1(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(u64, [u8; 32], u64)>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT roster_version, roster_commitment, required_capabilities
+                 FROM conversation_device_roster_snapshots_v1
+                 WHERE conversation_id = ?1",
+                rusqlite::params![conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load device roster head: {e}"))?;
+        row.map(|(version, commitment, capabilities)| {
+            Ok((
+                u64::from_be_bytes(fixed_bytes("roster version", version)?),
+                fixed_bytes("roster commitment", commitment)?,
+                u64::from_be_bytes(fixed_bytes("roster capabilities", capabilities)?),
+            ))
+        })
+        .transpose()
+    }
+
+    /// Trust-on-authenticated-directory: insert the first observed Ed25519 key
+    /// for an X25519 identity and reject any later substitution.
+    pub fn pin_trusted_signing_key(
+        &self,
+        identity_key: &[u8; 32],
+        signing_key: &[u8; 32],
+    ) -> Result<(), String> {
+        let existing: Option<Vec<u8>> = match self.conn.query_row(
+            "SELECT signing_key FROM trusted_identity_keys WHERE identity_key = ?1",
+            rusqlite::params![identity_key.as_slice()],
+            |row| row.get(0),
+        ) {
+            Ok(value) => Some(value),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(format!("load trusted signing key: {e}")),
+        };
+        if let Some(existing) = existing {
+            if existing.as_slice() != signing_key {
+                return Err("trusted signing key changed for pinned identity".to_string());
+            }
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "INSERT INTO trusted_identity_keys (identity_key, signing_key) VALUES (?1, ?2)",
+                rusqlite::params![identity_key.as_slice(), signing_key.as_slice()],
+            )
+            .map_err(|e| format!("pin trusted signing key: {e}"))?;
+        Ok(())
+    }
+
+    pub fn load_trusted_signing_keys(&self) -> Result<Vec<TrustedSigningKeyBinding>, String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT identity_key, signing_key FROM trusted_identity_keys")
+            .map_err(|e| format!("prepare trusted signing keys: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .map_err(|e| format!("query trusted signing keys: {e}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (identity, signing) = row.map_err(|e| format!("read trusted key: {e}"))?;
+            let identity = identity.try_into().map_err(|v: Vec<u8>| {
+                format!("invalid trusted identity key length: {}", v.len())
+            })?;
+            let signing = signing
+                .try_into()
+                .map_err(|v: Vec<u8>| format!("invalid trusted signing key length: {}", v.len()))?;
+            result.push((identity, signing));
+        }
+        Ok(result)
+    }
+
+    /// Store freshly generated X3DH prekeys as one transaction. Private bytes
+    /// are protected by SQLCipher and zeroized by `LocalPreKey` on drop.
+    pub fn save_local_prekeys(&self, keys: &[LocalPreKey]) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin local prekey transaction: {e}"))?;
+        for key in keys {
+            let signature = key.signature.as_ref().map(|value| value.as_slice());
+            tx.execute(
+                "INSERT INTO local_prekeys
+                   (key_type, protocol_key_id, secret_key, public_key, signature, consumed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)
+                 ON CONFLICT(key_type, protocol_key_id) DO UPDATE SET
+                   secret_key=excluded.secret_key,
+                   public_key=excluded.public_key,
+                   signature=excluded.signature,
+                   consumed=0",
+                rusqlite::params![
+                    key.key_type,
+                    i64::from(key.protocol_key_id),
+                    key.secret_key.as_slice(),
+                    key.public_key.as_slice(),
+                    signature,
+                ],
+            )
+            .map_err(|e| format!("save local prekey {}: {e}", key.protocol_key_id))?;
+        }
+        tx.commit()
+            .map_err(|e| format!("commit local prekeys: {e}"))
+    }
+
+    /// Load only live prekeys. Consumed OTK rows retain their public IDs for
+    /// monotonic allocation but never retain their private bytes.
+    pub fn load_local_prekeys(&self) -> Result<Vec<LocalPreKey>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT key_type, protocol_key_id, secret_key, public_key, signature
+                 FROM local_prekeys WHERE consumed = 0 ORDER BY key_type, protocol_key_id",
+            )
+            .map_err(|e| format!("prepare local prekeys: {e}"))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, u8>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Option<Vec<u8>>>(4)?,
+                ))
+            })
+            .map_err(|e| format!("query local prekeys: {e}"))?;
+
+        let mut result = Vec::new();
+        for row in rows {
+            let (key_type, protocol_key_id, secret, public, signature) =
+                row.map_err(|e| format!("read local prekey: {e}"))?;
+            let secret = Zeroizing::new(secret);
+            let secret_key = secret.as_slice().try_into().map_err(|_| {
+                format!(
+                    "invalid local prekey secret length for {protocol_key_id}: {}",
+                    secret.len()
+                )
+            })?;
+            let public_key = public.try_into().map_err(|v: Vec<u8>| {
+                format!(
+                    "invalid local prekey public length for {protocol_key_id}: {}",
+                    v.len()
+                )
+            })?;
+            let signature = signature
+                .map(|value| {
+                    value.try_into().map_err(|v: Vec<u8>| {
+                        format!(
+                            "invalid local prekey signature length for {protocol_key_id}: {}",
+                            v.len()
+                        )
+                    })
+                })
+                .transpose()?;
+            result.push(LocalPreKey {
+                key_type,
+                protocol_key_id,
+                secret_key,
+                public_key,
+                signature,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn max_local_prekey_id(&self, key_type: u8) -> Result<u32, String> {
+        let value: i64 = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(MAX(protocol_key_id), 0) FROM local_prekeys WHERE key_type = ?1",
+                rusqlite::params![key_type],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("load local prekey counter: {e}"))?;
+        u32::try_from(value).map_err(|_| "local prekey id exceeds u32".to_string())
+    }
+
+    /// Atomically persist the authenticated first ratchet state and destroy the
+    /// claimed one-time private key. Either both changes commit or neither does.
+    pub fn commit_initial_ratchet_session(
+        &self,
+        peer_identity_key: &[u8; 32],
+        session_data: &[u8],
+        one_time_prekey_id: Option<u32>,
+    ) -> Result<(), String> {
+        // SAVEPOINT composes with the outer atomic receive savepoint while
+        // still providing standalone all-or-nothing semantics in direct use.
+        self.conn
+            .execute_batch("SAVEPOINT veil_initial_ratchet")
+            .map_err(|e| format!("begin initial ratchet savepoint: {e}"))?;
+        let operation = (|| {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO ratchet_sessions
+                       (peer_identity_key, session_data, updated_at)
+                     VALUES (?1, ?2, datetime('now'))",
+                    rusqlite::params![peer_identity_key.as_slice(), session_data],
+                )
+                .map_err(|e| format!("save initial ratchet session: {e}"))?;
+            if let Some(id) = one_time_prekey_id {
+                let changed = self
+                    .conn
+                    .execute(
+                        "UPDATE local_prekeys
+                         SET secret_key = NULL, consumed = 1
+                         WHERE key_type = 1 AND protocol_key_id = ?1 AND consumed = 0",
+                        rusqlite::params![i64::from(id)],
+                    )
+                    .map_err(|e| format!("consume local one-time prekey: {e}"))?;
+                if changed != 1 {
+                    return Err(format!(
+                        "one-time prekey {id} was missing or already consumed"
+                    ));
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            let rollback = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_initial_ratchet;
+                 RELEASE SAVEPOINT veil_initial_ratchet;",
+            );
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; initial ratchet rollback failed: {rollback_error}")
+                }
+            });
+        }
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_initial_ratchet")
+            .map_err(|e| format!("commit initial ratchet: {e}"))
     }
 
     // ─── CRUD: Group Members ──────────────────────────────
@@ -677,6 +5130,622 @@ impl VeilDb {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_incoming_sender_key_generation(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        generation: u32,
+        iteration: u32,
+        state_revision: u64,
+        distribution_commitment: &[u8; 32],
+        key_data: &[u8],
+    ) -> Result<(), String> {
+        self.conn
+            .execute_batch("SAVEPOINT veil_incoming_sender_key")
+            .map_err(|e| format!("begin incoming sender-key savepoint: {e}"))?;
+        let operation = upsert_incoming_sender_key_generation(
+            &self.conn,
+            group_id,
+            sender_identity_key,
+            generation,
+            iteration,
+            state_revision,
+            distribution_commitment,
+            key_data,
+        );
+        if let Err(error) = operation {
+            let rollback = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_incoming_sender_key;
+                 RELEASE SAVEPOINT veil_incoming_sender_key;",
+            );
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; incoming sender-key rollback failed: {rollback_error}")
+                }
+            });
+        }
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_incoming_sender_key")
+            .map_err(|e| format!("commit incoming sender-key savepoint: {e}"))
+    }
+
+    /// Atomically install an incoming generation and its immutable historical
+    /// route proof. The same generation can be replayed only with byte-for-byte
+    /// identical device/binding/roster metadata.
+    pub fn begin_retained_sender_key_conversation_v1(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch("SAVEPOINT veil_retained_sender_key_conversation")
+            .map_err(|e| format!("begin retained Sender-Key conversation savepoint: {e}"))
+    }
+
+    pub fn commit_retained_sender_key_conversation_v1(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_retained_sender_key_conversation")
+            .map_err(|e| format!("commit retained Sender-Key conversation savepoint: {e}"))
+    }
+
+    pub fn rollback_retained_sender_key_conversation_v1(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_retained_sender_key_conversation;
+                 RELEASE SAVEPOINT veil_retained_sender_key_conversation;",
+            )
+            .map_err(|e| format!("rollback retained Sender-Key conversation savepoint: {e}"))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_incoming_sender_key_generation_with_route_v1(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        generation: u32,
+        iteration: u32,
+        state_revision: u64,
+        distribution_commitment: &[u8; 32],
+        key_data: &[u8],
+        route: &IncomingSenderKeyRouteV1,
+    ) -> Result<(), String> {
+        let historical = route
+            .historical_sender_binding
+            .as_ref()
+            .ok_or("incoming sender-key route has no historical device proof")?;
+        if route.sender_device_identity_key != *sender_identity_key
+            || route.sender_device_id == [0u8; 16]
+            || route.target_device_id == [0u8; 16]
+            || route.sender_binding_version == 0
+            || route.sender_binding_version > i64::MAX as u64
+            || route.target_binding_version == 0
+            || route.target_binding_version > i64::MAX as u64
+            || route.roster_version == 0
+            || route.roster_version > i64::MAX as u64
+            || historical.sender_account_signing_key == [0u8; 32]
+            || historical.sender_device_capabilities > i64::MAX as u64
+            || !(1..=3).contains(&historical.sender_device_binding_status)
+            || historical.target_device_identity_key == Some([0u8; 32])
+            || historical.target_device_identity_key.is_none()
+            || std::collections::HashSet::from([
+                route.sender_account_identity_key,
+                historical.sender_account_signing_key,
+                route.sender_device_identity_key,
+                route.sender_device_signing_key,
+            ])
+            .len()
+                != 4
+        {
+            return Err("invalid incoming sender-key route proof".to_string());
+        }
+        self.conn
+            .execute_batch("SAVEPOINT veil_incoming_sender_key_route")
+            .map_err(|e| format!("begin incoming sender-key route savepoint: {e}"))?;
+        let operation = (|| {
+            let trusted_signing: Option<Vec<u8>> = self
+                .conn
+                .query_row(
+                    "SELECT signing_key FROM trusted_identity_keys WHERE identity_key = ?1",
+                    rusqlite::params![route.sender_account_identity_key.as_slice()],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("load historical trusted signing pin: {e}"))?;
+            if trusted_signing
+                .as_ref()
+                .is_some_and(|stored| stored.as_slice() != historical.sender_account_signing_key)
+            {
+                return Err("trusted signing key changed for pinned identity".to_string());
+            }
+            if trusted_signing.is_none() {
+                self.conn
+                    .execute(
+                        "INSERT INTO trusted_identity_keys (identity_key, signing_key)
+                         VALUES (?1, ?2)",
+                        rusqlite::params![
+                            route.sender_account_identity_key.as_slice(),
+                            historical.sender_account_signing_key.as_slice(),
+                        ],
+                    )
+                    .map_err(|e| format!("pin historical trusted signing key: {e}"))?;
+            }
+
+            type ExistingDevicePin = (
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                Vec<u8>,
+                i64,
+                Vec<u8>,
+            );
+            let existing_pin: Option<ExistingDevicePin> = self
+                .conn
+                .query_row(
+                    "SELECT account_identity_key, account_signing_key,
+                            device_identity_key, device_signing_key,
+                            binding_version, capabilities, status,
+                            account_signature
+                     FROM device_binding_pins_v1 WHERE device_id = ?1",
+                    rusqlite::params![route.sender_device_id.as_slice()],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|e| format!("load historical device binding pin: {e}"))?;
+            let mut advance_pin = true;
+            if let Some(existing) = existing_pin {
+                let old_version =
+                    u64::from_be_bytes(fixed_bytes("pinned binding version", existing.4)?);
+                let old_capabilities =
+                    u64::from_be_bytes(fixed_bytes("pinned binding capabilities", existing.5)?);
+                let old_status = u8::try_from(existing.6)
+                    .map_err(|_| "pinned device binding status is invalid".to_string())?;
+                if existing.0.as_slice() != route.sender_account_identity_key
+                    || existing.1.as_slice() != historical.sender_account_signing_key
+                    || existing.2.as_slice() != route.sender_device_identity_key
+                    || existing.3.as_slice() != route.sender_device_signing_key
+                {
+                    return Err("pinned device/account key replacement rejected".to_string());
+                }
+                if route.sender_binding_version < old_version {
+                    // Historical decrypt proof is accepted, but must never
+                    // lower or reactivate the current binding head.
+                    advance_pin = false;
+                } else if route.sender_binding_version == old_version {
+                    if old_capabilities != historical.sender_device_capabilities
+                        || old_status != historical.sender_device_binding_status
+                        || existing.7.as_slice() != historical.sender_account_signature
+                    {
+                        return Err("same device binding version changed signed state".to_string());
+                    }
+                    advance_pin = false;
+                } else if old_status == 3 && historical.sender_device_binding_status != 3 {
+                    return Err("revoked device binding cannot become active again".to_string());
+                }
+            }
+            if advance_pin {
+                self.conn
+                    .execute(
+                        "INSERT INTO device_binding_pins_v1
+                            (device_id, account_identity_key, account_signing_key,
+                             device_identity_key, device_signing_key, binding_version,
+                             capabilities, status, account_signature, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, datetime('now'))
+                         ON CONFLICT(device_id) DO UPDATE SET
+                            binding_version = excluded.binding_version,
+                            capabilities = excluded.capabilities,
+                            status = excluded.status,
+                            account_signature = excluded.account_signature,
+                            updated_at = datetime('now')",
+                        rusqlite::params![
+                            route.sender_device_id.as_slice(),
+                            route.sender_account_identity_key.as_slice(),
+                            historical.sender_account_signing_key.as_slice(),
+                            route.sender_device_identity_key.as_slice(),
+                            route.sender_device_signing_key.as_slice(),
+                            route.sender_binding_version.to_be_bytes().as_slice(),
+                            historical
+                                .sender_device_capabilities
+                                .to_be_bytes()
+                                .as_slice(),
+                            historical.sender_device_binding_status,
+                            historical.sender_account_signature.as_slice(),
+                        ],
+                    )
+                    .map_err(|e| format!("pin historical device binding: {e}"))?;
+            }
+
+            upsert_incoming_sender_key_generation(
+                &self.conn,
+                group_id,
+                sender_identity_key,
+                generation,
+                iteration,
+                state_revision,
+                distribution_commitment,
+                key_data,
+            )?;
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO sender_key_incoming_routes_v1
+                        (group_id, sender_identity_key, generation,
+                         sender_account_identity_key, sender_device_id,
+                         sender_device_signing_key, sender_binding_version,
+                         target_device_id, target_binding_version, roster_version,
+                         roster_commitment, envelope_commitment)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                    rusqlite::params![
+                        group_id,
+                        sender_identity_key.as_slice(),
+                        i64::from(generation),
+                        route.sender_account_identity_key.as_slice(),
+                        route.sender_device_id.as_slice(),
+                        route.sender_device_signing_key.as_slice(),
+                        route.sender_binding_version.to_be_bytes().as_slice(),
+                        route.target_device_id.as_slice(),
+                        route.target_binding_version.to_be_bytes().as_slice(),
+                        route.roster_version.to_be_bytes().as_slice(),
+                        route.roster_commitment.as_slice(),
+                        route.envelope_commitment.as_slice(),
+                    ],
+                )
+                .map_err(|e| format!("save incoming sender-key route proof: {e}"))?;
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO sender_key_historical_device_proofs_v1
+                        (group_id, sender_identity_key, generation,
+                         sender_account_signing_key, sender_device_capabilities,
+                         sender_device_binding_status, sender_account_signature,
+                         target_device_identity_key)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                     ON CONFLICT(group_id, sender_identity_key, generation) DO UPDATE SET
+                        target_device_identity_key = excluded.target_device_identity_key
+                     WHERE sender_key_historical_device_proofs_v1.target_device_identity_key IS NULL",
+                    rusqlite::params![
+                        group_id,
+                        sender_identity_key.as_slice(),
+                        i64::from(generation),
+                        historical.sender_account_signing_key.as_slice(),
+                        historical
+                            .sender_device_capabilities
+                            .to_be_bytes()
+                            .as_slice(),
+                        historical.sender_device_binding_status,
+                        historical.sender_account_signature.as_slice(),
+                        historical
+                            .target_device_identity_key
+                            .as_ref()
+                            .map(|key| key.as_slice()),
+                    ],
+                )
+                .map_err(|e| format!("save historical sender device proof: {e}"))?;
+            let stored = self
+                .load_incoming_sender_key_route_v1(group_id, sender_identity_key, generation)?
+                .ok_or("incoming sender-key route proof disappeared after save")?;
+            if stored != *route {
+                return Err("incoming sender-key route proof changed for generation".to_string());
+            }
+            Ok(())
+        })();
+        if let Err(error) = operation {
+            let rollback = self.conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT veil_incoming_sender_key_route;
+                 RELEASE SAVEPOINT veil_incoming_sender_key_route;",
+            );
+            return Err(match rollback {
+                Ok(()) => error,
+                Err(rollback_error) => {
+                    format!("{error}; incoming sender-key route rollback failed: {rollback_error}")
+                }
+            });
+        }
+        self.conn
+            .execute_batch("RELEASE SAVEPOINT veil_incoming_sender_key_route")
+            .map_err(|e| format!("commit incoming sender-key route savepoint: {e}"))
+    }
+
+    pub fn load_incoming_sender_key_route_v1(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        generation: u32,
+    ) -> Result<Option<IncomingSenderKeyRouteV1>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT r.sender_account_identity_key, r.sender_device_id,
+                    r.sender_device_signing_key, r.sender_binding_version,
+                    r.target_device_id, r.target_binding_version, r.roster_version,
+                    r.roster_commitment, r.envelope_commitment,
+                    p.sender_account_signing_key, p.sender_device_capabilities,
+                    p.sender_device_binding_status, p.sender_account_signature,
+                    p.target_device_identity_key
+             FROM sender_key_incoming_routes_v1 r
+             LEFT JOIN sender_key_historical_device_proofs_v1 p
+               ON p.group_id = r.group_id
+              AND p.sender_identity_key = r.sender_identity_key
+              AND p.generation = r.generation
+             WHERE r.group_id = ?1 AND r.sender_identity_key = ?2 AND r.generation = ?3",
+                rusqlite::params![
+                    group_id,
+                    sender_identity_key.as_slice(),
+                    i64::from(generation)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, Vec<u8>>(4)?,
+                        row.get::<_, Vec<u8>>(5)?,
+                        row.get::<_, Vec<u8>>(6)?,
+                        row.get::<_, Vec<u8>>(7)?,
+                        row.get::<_, Vec<u8>>(8)?,
+                        row.get::<_, Option<Vec<u8>>>(9)?,
+                        row.get::<_, Option<Vec<u8>>>(10)?,
+                        row.get::<_, Option<i64>>(11)?,
+                        row.get::<_, Option<Vec<u8>>>(12)?,
+                        row.get::<_, Option<Vec<u8>>>(13)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load incoming sender-key route proof: {e}"))?;
+        row.map(|row| {
+            Ok(IncomingSenderKeyRouteV1 {
+                sender_account_identity_key: fixed_bytes("route sender account identity", row.0)?,
+                sender_device_id: fixed_bytes("route sender device id", row.1)?,
+                sender_device_identity_key: *sender_identity_key,
+                sender_device_signing_key: fixed_bytes("route sender device signing key", row.2)?,
+                sender_binding_version: u64::from_be_bytes(fixed_bytes(
+                    "route sender binding version",
+                    row.3,
+                )?),
+                target_device_id: fixed_bytes("route target device id", row.4)?,
+                target_binding_version: u64::from_be_bytes(fixed_bytes(
+                    "route target binding version",
+                    row.5,
+                )?),
+                roster_version: u64::from_be_bytes(fixed_bytes("route roster version", row.6)?),
+                roster_commitment: fixed_bytes("route roster commitment", row.7)?,
+                envelope_commitment: fixed_bytes("route envelope commitment", row.8)?,
+                historical_sender_binding: match (row.9, row.10, row.11, row.12, row.13) {
+                    (None, None, None, None, None) => None,
+                    (Some(signing), Some(capabilities), Some(status), Some(signature), target) => {
+                        Some(HistoricalDeviceBindingProofV1 {
+                            sender_account_signing_key: fixed_bytes(
+                                "route sender account signing key",
+                                signing,
+                            )?,
+                            sender_device_capabilities: u64::from_be_bytes(fixed_bytes(
+                                "route sender device capabilities",
+                                capabilities,
+                            )?),
+                            sender_device_binding_status: u8::try_from(status).map_err(|_| {
+                                "route sender device binding status is invalid".to_string()
+                            })?,
+                            sender_account_signature: fixed_bytes(
+                                "route sender account signature",
+                                signature,
+                            )?,
+                            target_device_identity_key: target
+                                .map(|key| fixed_bytes("route target device identity key", key))
+                                .transpose()?,
+                        })
+                    }
+                    _ => {
+                        return Err(
+                            "persisted historical sender device proof is partial".to_string()
+                        )
+                    }
+                },
+            })
+        })
+        .transpose()
+    }
+
+    /// Promote one legacy single-row incoming state into the generation-keyed
+    /// table. Insert/verification and legacy deletion are atomic, so a crash
+    /// leaves either the old readable row or the complete new row.
+    #[allow(clippy::too_many_arguments)]
+    pub fn migrate_legacy_incoming_sender_key_generation(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        generation: u32,
+        iteration: u32,
+        state_revision: u64,
+        distribution_commitment: &[u8; 32],
+        key_data: &[u8],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin legacy sender-key migration: {e}"))?;
+        upsert_incoming_sender_key_generation(
+            &tx,
+            group_id,
+            sender_identity_key,
+            generation,
+            iteration,
+            state_revision,
+            distribution_commitment,
+            key_data,
+        )?;
+        let deleted = tx
+            .execute(
+                "DELETE FROM sender_keys_local
+                 WHERE group_id = ?1 AND sender_identity_key = ?2 AND is_outgoing = 0",
+                rusqlite::params![group_id, sender_identity_key.as_slice()],
+            )
+            .map_err(|e| format!("delete migrated legacy sender key: {e}"))?;
+        if deleted > 1 {
+            return Err("legacy sender-key migration deleted multiple rows".to_string());
+        }
+        tx.commit()
+            .map_err(|e| format!("commit legacy sender-key migration: {e}"))
+    }
+
+    pub fn load_incoming_sender_key_generations_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<StoredIncomingSenderKeyGeneration>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_identity_key, generation, iteration,
+                        state_revision, distribution_commitment, key_data
+                 FROM sender_key_incoming_generations
+                 WHERE group_id = ?1
+                 ORDER BY sender_identity_key ASC, generation ASC",
+            )
+            .map_err(|e| format!("prepare load incoming sender-key generations: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(5)?),
+                ))
+            })
+            .map_err(|e| format!("query incoming sender-key generations: {e}"))?;
+
+        let mut result = Vec::new();
+        let mut current_sender = None;
+        let mut current_sender_generations = 0usize;
+        for row in rows {
+            let (sender, generation, iteration, revision, commitment, key_data) =
+                row.map_err(|e| format!("read incoming sender-key generation: {e}"))?;
+            let sender_identity_key = fixed_bytes("incoming sender identity", sender)?;
+            if current_sender == Some(sender_identity_key) {
+                current_sender_generations += 1;
+            } else {
+                current_sender = Some(sender_identity_key);
+                current_sender_generations = 1;
+            }
+            if current_sender_generations > MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER {
+                return Err(
+                    "persisted incoming sender-key generation retention limit exceeded".to_string(),
+                );
+            }
+            result.push(StoredIncomingSenderKeyGeneration {
+                sender_identity_key,
+                generation: u32::try_from(generation)
+                    .map_err(|_| "incoming sender-key generation exceeds u32".to_string())?,
+                iteration: u32::try_from(iteration)
+                    .map_err(|_| "incoming sender-key iteration exceeds u32".to_string())?,
+                state_revision: u64::from_be_bytes(fixed_bytes(
+                    "incoming sender-key revision",
+                    revision,
+                )?),
+                distribution_commitment: fixed_bytes(
+                    "incoming sender-key distribution commitment",
+                    commitment,
+                )?,
+                key_data,
+            });
+        }
+        Ok(result)
+    }
+
+    pub fn load_legacy_incoming_sender_keys_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<StoredSenderKeyMaterial>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_identity_key, key_data
+                 FROM sender_keys_local
+                 WHERE group_id = ?1 AND is_outgoing = 0
+                 ORDER BY sender_identity_key ASC",
+            )
+            .map_err(|e| format!("prepare load legacy incoming sender keys: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(1)?),
+                ))
+            })
+            .map_err(|e| format!("query legacy incoming sender keys: {e}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (sender, key_data) =
+                row.map_err(|e| format!("read legacy incoming sender key: {e}"))?;
+            result.push((
+                fixed_bytes("legacy incoming sender identity", sender)?,
+                key_data,
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Commit a fresh outgoing generation and invalidate every cached sealed
+    /// envelope from the previous generation as one durable transition.
+    ///
+    /// Splitting these writes can leave a crash-recovered client with the old
+    /// generation but without its immutable retry envelopes (or vice versa).
+    /// The runtime prepares the new state off to the side and only publishes it
+    /// in memory after this transaction succeeds.
+    pub fn commit_sender_key_rotation(
+        &self,
+        group_id: &str,
+        sender_identity_key: &[u8; 32],
+        key_data: &[u8],
+    ) -> Result<(), String> {
+        if group_id.is_empty() {
+            return Err("sender-key rotation group id must not be empty".to_string());
+        }
+        if key_data.is_empty() || key_data.len() > 4096 {
+            return Err("invalid rotated sender-key state size".to_string());
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin sender-key rotation transaction: {e}"))?;
+        tx.execute(
+            "DELETE FROM sender_keys_local
+             WHERE group_id = ?1 AND is_outgoing = 1 AND sender_identity_key <> ?2",
+            rusqlite::params![group_id, sender_identity_key.as_slice()],
+        )
+        .map_err(|e| format!("remove superseded sender-key owner state: {e}"))?;
+        tx.execute(
+            "INSERT OR REPLACE INTO sender_keys_local
+                (group_id, sender_identity_key, key_data, is_outgoing, updated_at)
+             VALUES (?1, ?2, ?3, 1, datetime('now'))",
+            rusqlite::params![group_id, sender_identity_key.as_slice(), key_data],
+        )
+        .map_err(|e| format!("persist rotated sender key: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_sender_key_envelopes WHERE conversation_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("invalidate rotated sender-key envelopes: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_sender_key_device_envelopes_v1 WHERE conversation_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("invalidate rotated exact-device sender-key envelopes: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit sender-key rotation: {e}"))
+    }
+
     pub fn load_sender_key(
         &self,
         group_id: &str,
@@ -695,13 +5764,56 @@ impl VeilDb {
     }
 
     pub fn delete_sender_keys_for_group(&self, group_id: &str) -> Result<(), String> {
-        self.conn
-            .execute(
-                "DELETE FROM sender_keys_local WHERE group_id = ?1",
-                rusqlite::params![group_id],
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin delete sender keys: {e}"))?;
+        tx.execute(
+            "DELETE FROM sender_keys_local WHERE group_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("delete legacy/outgoing sender keys: {e}"))?;
+        tx.execute(
+            "DELETE FROM sender_key_incoming_generations WHERE group_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("delete incoming sender-key generations: {e}"))?;
+        tx.execute(
+            "DELETE FROM sender_key_incoming_routes_v1 WHERE group_id = ?1",
+            rusqlite::params![group_id],
+        )
+        .map_err(|e| format!("delete incoming sender-key route proofs: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit delete sender keys: {e}"))
+    }
+
+    pub fn load_outgoing_sender_keys_for_group(
+        &self,
+        group_id: &str,
+    ) -> Result<Vec<StoredSenderKeyMaterial>, String> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT sender_identity_key, key_data
+                 FROM sender_keys_local
+                 WHERE group_id = ?1 AND is_outgoing = 1
+                 ORDER BY sender_identity_key ASC",
             )
-            .map_err(|e| format!("delete sender keys: {e}"))?;
-        Ok(())
+            .map_err(|e| format!("prepare load outgoing sender keys: {e}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![group_id], |row| {
+                Ok((
+                    row.get::<_, Vec<u8>>(0)?,
+                    Zeroizing::new(row.get::<_, Vec<u8>>(1)?),
+                ))
+            })
+            .map_err(|e| format!("query outgoing sender keys: {e}"))?;
+        let mut result = Vec::new();
+        for row in rows {
+            let (sender, key_data) = row.map_err(|e| format!("read outgoing sender key: {e}"))?;
+            result.push((fixed_bytes("outgoing sender identity", sender)?, key_data));
+        }
+        Ok(result)
     }
 
     /// Load every saved sender key entry for a group (incoming + outgoing).
@@ -709,7 +5821,7 @@ impl VeilDb {
     pub fn load_sender_keys_for_group(
         &self,
         group_id: &str,
-    ) -> Result<Vec<(Vec<u8>, Vec<u8>, bool)>, String> {
+    ) -> Result<Vec<StoredSenderKey>, String> {
         let mut stmt = self
             .conn
             .prepare(
@@ -728,6 +5840,307 @@ impl VeilDb {
             .map_err(|e| format!("query sender keys: {e}"))?;
         rows.collect::<Result<Vec<_>, _>>()
             .map_err(|e| format!("collect sender keys: {e}"))
+    }
+
+    /// Persist the first sealed SKDM accepted locally for one exact
+    /// conversation/generation/recipient tuple. A retry may reuse the row only
+    /// when both the sender binding and the bytes are identical.
+    pub fn save_pending_sender_key_envelope(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+        target_identity_key: &[u8; 32],
+        sender_identity_key: &[u8; 32],
+        sealed_envelope: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        if conversation_id.is_empty() || generation == 0 {
+            return Err("invalid pending sender-key envelope scope".to_string());
+        }
+        if sealed_envelope.is_empty() || sealed_envelope.len() > 4096 {
+            return Err("invalid pending sender-key envelope size".to_string());
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO pending_sender_key_envelopes
+                   (conversation_id, generation, target_identity_key,
+                    sender_identity_key, sealed_envelope)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    target_identity_key.as_slice(),
+                    sender_identity_key.as_slice(),
+                    sealed_envelope,
+                ],
+            )
+            .map_err(|e| format!("save pending sender-key envelope: {e}"))?;
+
+        let (stored_sender, stored_envelope): (Vec<u8>, Vec<u8>) = self
+            .conn
+            .query_row(
+                "SELECT sender_identity_key, sealed_envelope
+                 FROM pending_sender_key_envelopes
+                 WHERE conversation_id = ?1 AND generation = ?2
+                   AND target_identity_key = ?3",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    target_identity_key.as_slice(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| format!("verify pending sender-key envelope: {e}"))?;
+        if stored_sender.as_slice() != sender_identity_key.as_slice()
+            || stored_envelope.as_slice() != sealed_envelope
+        {
+            return Err(
+                "pending sender-key generation is already committed to different bytes".to_string(),
+            );
+        }
+        Ok(stored_envelope)
+    }
+
+    pub fn load_pending_sender_key_envelope(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+        target_identity_key: &[u8; 32],
+        expected_sender_identity_key: &[u8; 32],
+    ) -> Result<Option<Vec<u8>>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT sender_identity_key, sealed_envelope
+                 FROM pending_sender_key_envelopes
+                 WHERE conversation_id = ?1 AND generation = ?2
+                   AND target_identity_key = ?3",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    target_identity_key.as_slice(),
+                ],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("load pending sender-key envelope: {e}"))?;
+        let Some((sender_identity_key, sealed_envelope)) = row else {
+            return Ok(None);
+        };
+        if sender_identity_key.as_slice() != expected_sender_identity_key.as_slice() {
+            return Err("pending sender-key envelope belongs to another sender".to_string());
+        }
+        if sealed_envelope.is_empty() || sealed_envelope.len() > 4096 {
+            return Err("persisted sender-key envelope has an invalid size".to_string());
+        }
+        Ok(Some(sealed_envelope))
+    }
+
+    pub fn save_pending_sender_key_device_envelope_v1(
+        &self,
+        envelope: &PendingSenderKeyDeviceEnvelopeV1,
+    ) -> Result<Vec<u8>, String> {
+        if envelope.conversation_id.is_empty()
+            || envelope.generation == 0
+            || envelope.target_device_id == [0u8; 16]
+            || envelope.sender_device_id == [0u8; 16]
+            || envelope.target_binding_version == 0
+            || envelope.target_binding_version > i64::MAX as u64
+            || envelope.sender_binding_version == 0
+            || envelope.sender_binding_version > i64::MAX as u64
+            || envelope.roster_version == 0
+            || envelope.roster_version > i64::MAX as u64
+            || envelope.sealed_envelope.is_empty()
+            || envelope.sealed_envelope.len() > 4_096
+        {
+            return Err("invalid exact-device sender-key envelope".to_string());
+        }
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO pending_sender_key_device_envelopes_v1
+                (conversation_id, generation, target_account_identity_key,
+                 target_device_id, target_device_identity_key,
+                 target_binding_version, sender_device_id,
+                 sender_device_identity_key, sender_binding_version,
+                 roster_version, roster_commitment, envelope_commitment,
+                 sealed_envelope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                rusqlite::params![
+                    envelope.conversation_id,
+                    i64::from(envelope.generation),
+                    envelope.target_account_identity_key.as_slice(),
+                    envelope.target_device_id.as_slice(),
+                    envelope.target_device_identity_key.as_slice(),
+                    envelope.target_binding_version.to_be_bytes().as_slice(),
+                    envelope.sender_device_id.as_slice(),
+                    envelope.sender_device_identity_key.as_slice(),
+                    envelope.sender_binding_version.to_be_bytes().as_slice(),
+                    envelope.roster_version.to_be_bytes().as_slice(),
+                    envelope.roster_commitment.as_slice(),
+                    envelope.envelope_commitment.as_slice(),
+                    envelope.sealed_envelope,
+                ],
+            )
+            .map_err(|e| format!("save exact-device sender-key envelope: {e}"))?;
+        let stored = self
+            .load_pending_sender_key_device_envelope_v1(
+                &envelope.conversation_id,
+                envelope.generation,
+                &envelope.target_device_id,
+                envelope.target_binding_version,
+                envelope.roster_version,
+            )?
+            .ok_or("exact-device sender-key envelope disappeared after save")?;
+        if stored != *envelope {
+            return Err("exact-device sender-key envelope tuple changed".to_string());
+        }
+        Ok(stored.sealed_envelope)
+    }
+
+    pub fn load_pending_sender_key_device_envelope_v1(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+        target_device_id: &[u8; 16],
+        target_binding_version: u64,
+        roster_version: u64,
+    ) -> Result<Option<PendingSenderKeyDeviceEnvelopeV1>, String> {
+        type Row = (
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<u8>,
+        );
+        let row: Option<Row> = self
+            .conn
+            .query_row(
+                "SELECT target_account_identity_key, target_device_identity_key,
+                    sender_device_id, sender_device_identity_key,
+                    sender_binding_version, roster_commitment,
+                    envelope_commitment, sealed_envelope, target_binding_version,
+                    roster_version
+             FROM pending_sender_key_device_envelopes_v1
+             WHERE conversation_id = ?1 AND generation = ?2
+               AND target_device_id = ?3",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    target_device_id.as_slice(),
+                ],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load exact-device sender-key envelope: {e}"))?;
+        row.map(|row| {
+            let stored_target_version =
+                u64::from_be_bytes(fixed_bytes("cached target binding version", row.8)?);
+            if stored_target_version != target_binding_version {
+                return Err("cached target binding version mismatch".to_string());
+            }
+            let stored_roster_version =
+                u64::from_be_bytes(fixed_bytes("cached roster version", row.9)?);
+            if stored_roster_version != roster_version {
+                return Err("cached roster version mismatch".to_string());
+            }
+            Ok(PendingSenderKeyDeviceEnvelopeV1 {
+                conversation_id: conversation_id.to_string(),
+                generation,
+                target_account_identity_key: fixed_bytes("cached target account identity", row.0)?,
+                target_device_id: *target_device_id,
+                target_device_identity_key: fixed_bytes("cached target device identity", row.1)?,
+                target_binding_version,
+                sender_device_id: fixed_bytes("cached sender device id", row.2)?,
+                sender_device_identity_key: fixed_bytes("cached sender device identity", row.3)?,
+                sender_binding_version: u64::from_be_bytes(fixed_bytes(
+                    "cached sender binding version",
+                    row.4,
+                )?),
+                roster_version,
+                roster_commitment: fixed_bytes("cached roster commitment", row.5)?,
+                envelope_commitment: fixed_bytes("cached envelope commitment", row.6)?,
+                sealed_envelope: row.7,
+            })
+        })
+        .transpose()
+    }
+
+    pub fn delete_pending_sender_key_device_generation_v1(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+        roster_version: u64,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_sender_key_device_envelopes_v1
+             WHERE conversation_id = ?1 AND generation = ?2 AND roster_version = ?3",
+                rusqlite::params![
+                    conversation_id,
+                    i64::from(generation),
+                    roster_version.to_be_bytes().as_slice()
+                ],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("delete exact-device sender-key envelopes: {e}"))
+    }
+
+    /// Remove a completed generation only after all corresponding gateway
+    /// durable-storage ACKs have been observed by the client.
+    pub fn delete_pending_sender_key_envelope_generation(
+        &self,
+        conversation_id: &str,
+        generation: u32,
+    ) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM pending_sender_key_envelopes
+                 WHERE conversation_id = ?1 AND generation = ?2",
+                rusqlite::params![conversation_id, i64::from(generation)],
+            )
+            .map(|_| ())
+            .map_err(|e| format!("delete acknowledged sender-key envelopes: {e}"))
+    }
+
+    /// Rotation is a protocol boundary: cached envelopes from every older
+    /// roster/generation must be invalidated before the new key is created.
+    pub fn delete_pending_sender_key_envelopes_for_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("begin sender-key cache invalidation: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_sender_key_envelopes WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| format!("invalidate pending sender-key envelopes: {e}"))?;
+        tx.execute(
+            "DELETE FROM pending_sender_key_device_envelopes_v1 WHERE conversation_id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|e| format!("invalidate pending exact-device sender-key envelopes: {e}"))?;
+        tx.commit()
+            .map_err(|e| format!("commit sender-key cache invalidation: {e}"))
     }
 
     // ─── CRUD: Reactions ──────────────────────────────────
@@ -1007,6 +6420,26 @@ impl VeilDb {
             .map_err(|e| format!("collect channels: {e}"))
     }
 
+    /// Resolve a cached server/channel from its backing conversation without
+    /// loading or replacing any renderer channel lists. Search results can
+    /// reference channels that have not been opened in the current session.
+    pub fn find_channel_context_by_conversation(
+        &self,
+        conversation_id: &str,
+    ) -> Result<Option<(String, String)>, String> {
+        self.conn
+            .query_row(
+                "SELECT server_id, id
+                 FROM server_channels_cache
+                 WHERE conversation_id = ?1
+                 LIMIT 1",
+                rusqlite::params![conversation_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|e| format!("resolve channel conversation: {e}"))
+    }
+
     // ─── CRUD: Roles cache ────────────────────────────────
 
     pub fn replace_roles(
@@ -1195,6 +6628,112 @@ impl VeilDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+
+    const ORIGIN_A: &str = "https://alpha.example:443";
+    const ORIGIN_B: &str = "https://beta.example:443";
+    const USER_A: &str = "00000000-0000-0000-0000-0000000000a1";
+    const USER_B: &str = "00000000-0000-0000-0000-0000000000b2";
+
+    fn test_signing_key(seed: u8) -> [u8; 32] {
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    fn sample_account(
+        canonical_server_origin: &str,
+        user_id: &str,
+        seed: u8,
+        source: AccountSnapshotSource,
+        profile_version: Option<u64>,
+    ) -> AccountSnapshot {
+        AccountSnapshot {
+            locator: ProfileLocator {
+                canonical_server_origin: canonical_server_origin.to_string(),
+                user_id: user_id.to_string(),
+                identity_key: [seed; 32],
+            },
+            signing_key: test_signing_key(seed.wrapping_add(1)),
+            username: Some(format!("user-{seed}")),
+            display_name: Some(format!("User {seed}")),
+            profile_version,
+            profile_origin: canonical_server_origin.to_string(),
+            source,
+            observed_at: "2026-07-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn sample_network_profile(account: &AccountSnapshot, version: u64) -> NetworkProfile {
+        NetworkProfile {
+            locator: account.locator.clone(),
+            username: account.username.clone().unwrap(),
+            display_name: account.display_name.clone(),
+            about: "A signed origin-scoped profile.".to_string(),
+            avatar_asset_id: None,
+            avatar_digest: None,
+            avatar_content_type: None,
+            profile_version: version,
+            profile_updated_at: "2026-07-13T02:00:00Z".to_string(),
+            observed_at: "2026-07-13T02:00:01Z".to_string(),
+        }
+    }
+
+    fn sample_device_identity(device_id: [u8; 16]) -> LocalDeviceIdentityV1 {
+        LocalDeviceIdentityV1 {
+            device_id,
+            version: 1,
+            x25519_secret: [0x11; 32],
+            ed25519_secret: [0x22; 32],
+            device_identity_key: [0x33; 32],
+            device_signing_key: [0x44; 32],
+            capabilities: 3,
+            status: 1,
+            account_identity_key: [0x55; 32],
+            account_signing_key: [0x66; 32],
+            account_signature: [0x77; 64],
+        }
+    }
+
+    fn sample_binding_pin(seed: u8, version: u64, status: u8) -> DeviceBindingPinV1 {
+        DeviceBindingPinV1 {
+            device_id: [seed; 16],
+            account_identity_key: [seed.wrapping_add(1); 32],
+            account_signing_key: [seed.wrapping_add(2); 32],
+            device_identity_key: [seed.wrapping_add(3); 32],
+            device_signing_key: [seed.wrapping_add(4); 32],
+            binding_version: version,
+            capabilities: 3,
+            status,
+            account_signature: [seed.wrapping_add(5); 64],
+        }
+    }
+
+    fn sample_incoming_route(
+        binding: &DeviceBindingPinV1,
+        target_device_id: [u8; 16],
+        target_device_identity_key: [u8; 32],
+    ) -> IncomingSenderKeyRouteV1 {
+        IncomingSenderKeyRouteV1 {
+            sender_account_identity_key: binding.account_identity_key,
+            sender_device_id: binding.device_id,
+            sender_device_identity_key: binding.device_identity_key,
+            sender_device_signing_key: binding.device_signing_key,
+            sender_binding_version: binding.binding_version,
+            target_device_id,
+            target_binding_version: 1,
+            roster_version: 1,
+            roster_commitment: [0x91; 32],
+            envelope_commitment: [0x92; 32],
+            historical_sender_binding: Some(HistoricalDeviceBindingProofV1 {
+                sender_account_signing_key: binding.account_signing_key,
+                sender_device_capabilities: binding.capabilities,
+                sender_device_binding_status: binding.status,
+                sender_account_signature: binding.account_signature,
+                target_device_identity_key: Some(target_device_identity_key),
+            }),
+        }
+    }
     use rusqlite::params;
 
     #[test]
@@ -1235,5 +6774,3608 @@ mod tests {
             .unwrap();
 
         assert_eq!(name, "Test Group");
+    }
+
+    #[test]
+    fn search_rebuild_page_is_origin_scoped_and_keyset_paginated() {
+        let db = VeilDb::open_memory(&[42u8; 32]).unwrap();
+        const A_1: &str = "550e8400-e29b-41d4-a716-446655440010";
+        const A_2: &str = "550e8400-e29b-41d4-a716-446655440020";
+        const A_3: &str = "550e8400-e29b-41d4-a716-446655440030";
+        const A_TIE: &str = "550e8400-e29b-41d4-a716-446655440031";
+        const A_EMPTY: &str = "550e8400-e29b-41d4-a716-446655440040";
+        const B_1: &str = "550e8400-e29b-41d4-a716-446655440050";
+        db.upsert_directory_conversation(
+            "search-a",
+            1,
+            ORIGIN_A,
+            Some("Alpha"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        db.upsert_directory_conversation(
+            "search-b",
+            1,
+            ORIGIN_B,
+            Some("Beta"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+
+        db.insert_message(
+            A_3,
+            "search-a",
+            &[1u8; 32],
+            "newest lower tie",
+            false,
+            Some(5),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            B_1,
+            "search-b",
+            &[2u8; 32],
+            "other origin",
+            false,
+            Some(99),
+            None,
+        )
+        .unwrap();
+        db.insert_message(A_1, "search-a", &[1u8; 32], "oldest", false, Some(1), None)
+            .unwrap();
+        db.insert_message(A_EMPTY, "search-a", &[1u8; 32], "", false, Some(100), None)
+            .unwrap();
+        db.insert_message(
+            A_TIE,
+            "search-a",
+            &[1u8; 32],
+            "newest higher tie",
+            false,
+            Some(5),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            A_2,
+            "search-a",
+            &[1u8; 32],
+            "middle inserted last",
+            false,
+            Some(3),
+            None,
+        )
+        .unwrap();
+
+        let first = db.get_search_index_page(ORIGIN_A, None, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec![A_TIE, A_3]
+        );
+        assert!(first.iter().all(|row| row.conversation_id == "search-a"));
+        let cursor = crate::models::SearchIndexCursor {
+            timestamp: first[1].timestamp,
+            message_id: first[1].id.clone(),
+        };
+        let second = db
+            .get_search_index_page(ORIGIN_A, Some(&cursor), 2)
+            .unwrap();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].id, A_2);
+        assert_eq!(second[1].id, A_1);
+        assert_eq!(second[1].timestamp, 1);
+    }
+
+    #[test]
+    fn search_result_context_is_origin_scoped_bounded_and_centred_on_target() {
+        let db = VeilDb::open_memory(&[43u8; 32]).unwrap();
+        db.upsert_directory_conversation(
+            "context-a",
+            1,
+            ORIGIN_A,
+            Some("Alpha"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        for index in 0..250 {
+            db.insert_message(
+                &format!("context-{index}"),
+                "context-a",
+                &[1u8; 32],
+                &format!("message {index}"),
+                false,
+                Some(index + 1),
+                None,
+            )
+            .unwrap();
+        }
+
+        let middle = db
+            .get_search_result_context("context-125", "context-a", ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            middle.conversation_type,
+            crate::models::ConversationType::Group
+        );
+        assert_eq!(middle.server_id, None);
+        assert_eq!(middle.messages.len(), 200);
+        assert_eq!(middle.messages.first().unwrap().id, "context-26");
+        assert_eq!(middle.messages.last().unwrap().id, "context-225");
+        assert!(middle
+            .messages
+            .iter()
+            .any(|message| message.id == "context-125"));
+
+        let first = db
+            .get_search_result_context("context-0", "context-a", ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.messages.first().unwrap().id, "context-0");
+        assert_eq!(first.messages.last().unwrap().id, "context-199");
+
+        let last = db
+            .get_search_result_context("context-249", "context-a", ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.messages.first().unwrap().id, "context-50");
+        assert_eq!(last.messages.last().unwrap().id, "context-249");
+
+        assert!(db
+            .get_search_result_context("context-125", "context-a", ORIGIN_B)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_search_result_context("deleted", "context-a", ORIGIN_A)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn search_result_context_fails_closed_for_corrupt_message_or_channel_rows() {
+        let db = VeilDb::open_memory(&[44u8; 32]).unwrap();
+        db.upsert_directory_conversation(
+            "context-corrupt",
+            1,
+            ORIGIN_A,
+            Some("Corrupt"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "corrupt-message",
+            "context-corrupt",
+            &[2u8; 32],
+            "body",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE messages SET sender_key = X'01' WHERE id = 'corrupt-message'",
+                [],
+            )
+            .unwrap();
+        assert!(db
+            .get_search_result_context("corrupt-message", "context-corrupt", ORIGIN_A)
+            .unwrap_err()
+            .contains("invalid sender key"));
+
+        db.conn
+            .execute(
+                "INSERT INTO conversations
+                   (id, conv_type, server_origin, name, created_at)
+                 VALUES ('channel-without-server', 2, ?1, 'general', '2026-07-14T00:00:00Z')",
+                rusqlite::params![ORIGIN_A],
+            )
+            .unwrap();
+        assert!(db
+            .get_search_result_context("missing", "channel-without-server", ORIGIN_A)
+            .unwrap_err()
+            .contains("no persisted server id"));
+
+        db.conn
+            .execute(
+                "UPDATE conversations SET server_id = ?1 WHERE id = 'context-corrupt'",
+                rusqlite::params!["550e8400-e29b-41d4-a716-446655440099"],
+            )
+            .unwrap();
+        assert!(db
+            .get_search_result_context("corrupt-message", "context-corrupt", ORIGIN_A)
+            .unwrap_err()
+            .contains("non-channel search context"));
+    }
+
+    #[test]
+    fn search_result_context_publishes_server_id_only_for_channels() {
+        let db = VeilDb::open_memory(&[45u8; 32]).unwrap();
+        let server_id = "550e8400-e29b-41d4-a716-446655440045";
+        db.upsert_directory_conversation(
+            "channel-context",
+            2,
+            ORIGIN_A,
+            Some("general"),
+            None,
+            None,
+            Some(server_id),
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "channel-message",
+            "channel-context",
+            &[3u8; 32],
+            "channel body",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        let context = db
+            .get_search_result_context("channel-message", "channel-context", ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            context.conversation_type,
+            crate::models::ConversationType::Channel
+        );
+        assert_eq!(context.server_id.as_deref(), Some(server_id));
+    }
+
+    #[test]
+    fn search_result_context_rehydrates_persisted_author_context_and_attachments() {
+        let db = VeilDb::open_memory(&[46u8; 32]).unwrap();
+        let conversation_id = "550e8400-e29b-41d4-a716-446655440046";
+        let message_id = "550e8400-e29b-41d4-a716-446655440047";
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x46,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(7),
+        );
+        db.upsert_directory_conversation(
+            conversation_id,
+            1,
+            ORIGIN_A,
+            Some("Composition"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        let attachment = crate::models::MessageAttachment {
+            ordinal: 0,
+            media_id: "0123456789abcdef0123456789abcdef".to_string(),
+            file_name: "evidence.txt".to_string(),
+            detected_mime: "text/plain".to_string(),
+            format_version: 2,
+            nonce_prefix: [0x47; 16],
+            chunk_count: 1,
+            plaintext_size: 8,
+            ciphertext_size: 24,
+            content_key: [0x48; 32],
+        };
+        db.insert_outgoing_pending_message_with_attachments(
+            message_id,
+            conversation_id,
+            &author.locator.identity_key,
+            "search composition",
+            None,
+            std::slice::from_ref(&attachment),
+        )
+        .unwrap();
+        db.attach_message_author_with_context(
+            message_id,
+            &author,
+            MessageAuthorContext::DirectoryMemberAtObservation,
+        )
+        .unwrap();
+
+        let context = db
+            .get_search_result_context(message_id, conversation_id, ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.messages.len(), 1);
+        let hydrated = &context.messages[0];
+        assert_eq!(hydrated.author.as_ref(), Some(&author));
+        assert_eq!(
+            hydrated.author_context,
+            Some(MessageAuthorContext::DirectoryMemberAtObservation)
+        );
+        assert_eq!(hydrated.attachments.len(), 1);
+        assert_eq!(hydrated.attachments[0].file_name, attachment.file_name);
+        assert_eq!(hydrated.attachments[0].media_id, attachment.media_id);
+        assert_eq!(hydrated.attachments[0].content_key, attachment.content_key);
+
+        db.conn
+            .execute(
+                "UPDATE messages SET sender_key = ?1 WHERE id = ?2",
+                rusqlite::params![[0x49u8; 32].as_slice(), message_id],
+            )
+            .unwrap();
+        assert!(db
+            .get_search_result_context(message_id, conversation_id, ORIGIN_A)
+            .unwrap_err()
+            .contains("mismatched author"));
+    }
+
+    #[test]
+    fn resolves_cached_channel_context_without_loading_channel_lists() {
+        let mut db = VeilDb::open_memory(&[42u8; 32]).unwrap();
+        db.replace_servers(&[crate::models::CachedServer {
+            id: "server-1".into(),
+            name: "Server".into(),
+            description: None,
+            icon_url: None,
+            owner_id: "owner".into(),
+            position: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }])
+        .unwrap();
+        db.upsert_channel(&crate::models::CachedChannel {
+            id: "channel-1".into(),
+            server_id: "server-1".into(),
+            conversation_id: Some("conversation-1".into()),
+            name: "general".into(),
+            channel_type: 0,
+            category_id: None,
+            position: 0,
+            topic: None,
+            nsfw: false,
+            slowmode_secs: 0,
+        })
+        .unwrap();
+
+        assert_eq!(
+            db.find_channel_context_by_conversation("conversation-1")
+                .unwrap(),
+            Some(("server-1".into(), "channel-1".into()))
+        );
+        assert!(db
+            .find_channel_context_by_conversation("missing")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn device_id_is_stable_across_reinitialization() {
+        let db = VeilDb::open_memory(&[7u8; 32]).unwrap();
+        assert_eq!(db.get_or_create_device_id([1u8; 16]).unwrap(), [1u8; 16]);
+        assert_eq!(db.get_or_create_device_id([2u8; 16]).unwrap(), [1u8; 16]);
+    }
+
+    #[test]
+    fn device_id_rejects_and_repairs_legacy_zero_value() {
+        let db = VeilDb::open_memory(&[8u8; 32]).unwrap();
+        assert!(db.get_or_create_device_id([0u8; 16]).is_err());
+        db.conn
+            .execute(
+                "INSERT INTO client_state (key, value) VALUES ('device_id', ?1)",
+                rusqlite::params![[0u8; 16].as_slice()],
+            )
+            .unwrap();
+        assert_eq!(db.get_or_create_device_id([3u8; 16]).unwrap(), [3u8; 16]);
+        assert_eq!(db.get_or_create_device_id([4u8; 16]).unwrap(), [3u8; 16]);
+    }
+
+    #[test]
+    fn device_identity_is_created_only_explicitly_and_is_immutable() {
+        let db = VeilDb::open_memory(&[0x81u8; 32]).unwrap();
+        assert!(db.load_device_identity_v1().unwrap().is_none());
+
+        let identity = sample_device_identity([0x10; 16]);
+        db.create_device_identity_v1(&identity).unwrap();
+        let loaded = db.load_device_identity_v1().unwrap().unwrap();
+        assert_eq!(loaded.device_id, identity.device_id);
+        assert_eq!(loaded.version, identity.version);
+        assert_eq!(loaded.x25519_secret, identity.x25519_secret);
+        assert_eq!(loaded.ed25519_secret, identity.ed25519_secret);
+        assert_eq!(loaded.device_identity_key, identity.device_identity_key);
+        assert_eq!(loaded.device_signing_key, identity.device_signing_key);
+        assert_eq!(loaded.capabilities, identity.capabilities);
+        assert_eq!(loaded.status, identity.status);
+        assert_eq!(loaded.account_signature, identity.account_signature);
+        assert!(db.create_device_identity_v1(&identity).is_err());
+    }
+
+    #[test]
+    fn device_binding_marker_makes_missing_or_mismatched_material_fail_closed() {
+        let db = VeilDb::open_memory(&[0x82u8; 32]).unwrap();
+        let identity = sample_device_identity([0x20; 16]);
+        db.create_device_identity_v1(&identity).unwrap();
+        db.conn
+            .execute("DELETE FROM device_identity_v1 WHERE singleton = 1", [])
+            .unwrap();
+        assert!(db
+            .load_device_identity_v1()
+            .err()
+            .unwrap()
+            .contains("private device identity is missing"));
+
+        db.conn
+            .execute(
+                "UPDATE client_state SET value = ?1
+                 WHERE key = 'device_binding_v1_created'",
+                rusqlite::params![[0x21u8; 16].as_slice()],
+            )
+            .unwrap();
+        // Reinsert structurally valid material without changing the marker.
+        db.conn
+            .execute(
+                "INSERT INTO device_identity_v1
+                   (singleton, device_id, version, x25519_secret, ed25519_secret,
+                    device_identity_key, device_signing_key, capabilities, status,
+                    account_identity_key, account_signing_key, account_signature)
+                 VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    identity.device_id.as_slice(),
+                    identity.version.to_be_bytes().as_slice(),
+                    identity.x25519_secret.as_slice(),
+                    identity.ed25519_secret.as_slice(),
+                    identity.device_identity_key.as_slice(),
+                    identity.device_signing_key.as_slice(),
+                    identity.capabilities.to_be_bytes().as_slice(),
+                    identity.status,
+                    identity.account_identity_key.as_slice(),
+                    identity.account_signing_key.as_slice(),
+                    identity.account_signature.as_slice(),
+                ],
+            )
+            .unwrap();
+        assert!(db
+            .load_device_identity_v1()
+            .err()
+            .unwrap()
+            .contains("marker does not match"));
+    }
+
+    #[test]
+    fn device_identity_survives_sqlcipher_restart() {
+        let path =
+            std::env::temp_dir().join(format!("veil-device-identity-{}.db", uuid::Uuid::new_v4()));
+        let db_key = [0x83u8; 32];
+        let identity = sample_device_identity([0x30; 16]);
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.create_device_identity_v1(&identity).unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            let loaded = reopened.load_device_identity_v1().unwrap().unwrap();
+            assert_eq!(loaded.device_id, identity.device_id);
+            assert_eq!(loaded.x25519_secret, identity.x25519_secret);
+            assert_eq!(loaded.ed25519_secret, identity.ed25519_secret);
+            assert_eq!(loaded.account_signature, identity.account_signature);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn trusted_signing_key_is_pinned_per_identity() {
+        let db = VeilDb::open_memory(&[9u8; 32]).unwrap();
+        db.pin_trusted_signing_key(&[1u8; 32], &[2u8; 32]).unwrap();
+        db.pin_trusted_signing_key(&[1u8; 32], &[2u8; 32]).unwrap();
+        assert!(db.pin_trusted_signing_key(&[1u8; 32], &[3u8; 32]).is_err());
+        assert_eq!(
+            db.load_trusted_signing_keys().unwrap(),
+            vec![([1u8; 32], [2u8; 32])]
+        );
+    }
+
+    #[test]
+    fn pending_sender_key_envelope_is_first_write_immutable_and_scoped() {
+        let db = VeilDb::open_memory(&[0x91u8; 32]).unwrap();
+        let sender = [1u8; 32];
+        let target_a = [2u8; 32];
+        let target_b = [3u8; 32];
+        let first = b"sealed-generation-one";
+
+        assert_eq!(
+            db.save_pending_sender_key_envelope("group-cache", 7, &target_a, &sender, first)
+                .unwrap(),
+            first
+        );
+        assert_eq!(
+            db.save_pending_sender_key_envelope("group-cache", 7, &target_a, &sender, first)
+                .unwrap(),
+            first
+        );
+        assert!(db
+            .save_pending_sender_key_envelope(
+                "group-cache",
+                7,
+                &target_a,
+                &sender,
+                b"different-randomized-seal",
+            )
+            .is_err());
+        assert_eq!(
+            db.load_pending_sender_key_envelope("group-cache", 7, &target_a, &sender)
+                .unwrap()
+                .unwrap(),
+            first
+        );
+
+        db.save_pending_sender_key_envelope("group-cache", 7, &target_b, &sender, b"target-b")
+            .unwrap();
+        db.save_pending_sender_key_envelope(
+            "group-cache",
+            8,
+            &target_a,
+            &sender,
+            b"generation-eight",
+        )
+        .unwrap();
+        db.delete_pending_sender_key_envelope_generation("group-cache", 7)
+            .unwrap();
+        assert!(db
+            .load_pending_sender_key_envelope("group-cache", 7, &target_a, &sender)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .load_pending_sender_key_envelope("group-cache", 7, &target_b, &sender)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .load_pending_sender_key_envelope("group-cache", 8, &target_a, &sender)
+            .unwrap()
+            .is_some());
+        db.delete_pending_sender_key_envelopes_for_conversation("group-cache")
+            .unwrap();
+        assert!(db
+            .load_pending_sender_key_envelope("group-cache", 8, &target_a, &sender)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn sender_key_rotation_rolls_back_state_when_cache_invalidation_fails() {
+        let db = VeilDb::open_memory(&[0x95u8; 32]).unwrap();
+        let sender = [0x11u8; 32];
+        let target = [0x22u8; 32];
+        let old_state = b"old-outgoing-state";
+        db.save_sender_key("group-atomic-rotation", &sender, old_state, true)
+            .unwrap();
+        db.save_pending_sender_key_envelope(
+            "group-atomic-rotation",
+            7,
+            &target,
+            &sender,
+            b"immutable-old-envelope",
+        )
+        .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER abort_sender_key_cache_delete
+                 BEFORE DELETE ON pending_sender_key_envelopes
+                 BEGIN
+                   SELECT RAISE(ABORT, 'injected cache delete failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = db
+            .commit_sender_key_rotation("group-atomic-rotation", &sender, b"new-outgoing-state")
+            .unwrap_err();
+        assert!(error.contains("injected cache delete failure"));
+        assert_eq!(
+            db.load_sender_key("group-atomic-rotation", &sender)
+                .unwrap()
+                .unwrap(),
+            old_state
+        );
+        assert_eq!(
+            db.load_pending_sender_key_envelope("group-atomic-rotation", 7, &target, &sender,)
+                .unwrap()
+                .unwrap(),
+            b"immutable-old-envelope"
+        );
+    }
+
+    #[test]
+    fn pending_sender_key_envelope_survives_sqlcipher_restart() {
+        let path =
+            std::env::temp_dir().join(format!("veil-pending-skdm-{}.db", uuid::Uuid::new_v4()));
+        let db_key = [0x92u8; 32];
+        let sender = [4u8; 32];
+        let target = [5u8; 32];
+        let sealed = b"exact-sealed-envelope-survives-restart";
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.save_pending_sender_key_envelope("group-restart", 19, &target, &sender, sealed)
+                .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened
+                    .load_pending_sender_key_envelope("group-restart", 19, &target, &sender,)
+                    .unwrap()
+                    .unwrap(),
+                sealed
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn incoming_sender_key_generations_persist_ordered_and_reject_state_rollback() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-incoming-generations-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let key = [0xA1; 32];
+        let sender = [0x31; 32];
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            db.save_incoming_sender_key_generation(
+                "group-generations",
+                &sender,
+                2,
+                0,
+                1,
+                &[0x22; 32],
+                b"generation-two-revision-one",
+            )
+            .unwrap();
+            db.save_incoming_sender_key_generation(
+                "group-generations",
+                &sender,
+                1,
+                0,
+                1,
+                &[0x11; 32],
+                b"generation-one-revision-one",
+            )
+            .unwrap();
+            db.save_incoming_sender_key_generation(
+                "group-generations",
+                &sender,
+                1,
+                1,
+                2,
+                &[0x11; 32],
+                b"generation-one-revision-two",
+            )
+            .unwrap();
+            assert!(db
+                .save_incoming_sender_key_generation(
+                    "group-generations",
+                    &sender,
+                    1,
+                    0,
+                    1,
+                    &[0x11; 32],
+                    b"generation-one-revision-one",
+                )
+                .unwrap_err()
+                .contains("rollback"));
+            assert!(db
+                .save_incoming_sender_key_generation(
+                    "group-generations",
+                    &sender,
+                    1,
+                    1,
+                    2,
+                    &[0x11; 32],
+                    b"changed-without-revision",
+                )
+                .unwrap_err()
+                .contains("without a revision"));
+        }
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            let rows = db
+                .load_incoming_sender_key_generations_for_group("group-generations")
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(
+                (
+                    rows[0].generation,
+                    rows[0].iteration,
+                    rows[0].state_revision
+                ),
+                (1, 1, 2)
+            );
+            assert_eq!(rows[0].key_data.as_slice(), b"generation-one-revision-two");
+            assert_eq!(rows[1].generation, 2);
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn incoming_sender_key_generation_retention_cap_is_fail_closed_and_scoped() {
+        let db = VeilDb::open_memory(&[0xA7; 32]).unwrap();
+        let sender = [0xA8; 32];
+        for generation in 1..=MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER as u32 {
+            db.save_incoming_sender_key_generation(
+                "bounded-conversation",
+                &sender,
+                generation,
+                0,
+                1,
+                &[generation as u8; 32],
+                &[generation as u8],
+            )
+            .unwrap();
+        }
+        let error = db
+            .save_incoming_sender_key_generation(
+                "bounded-conversation",
+                &sender,
+                MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER as u32 + 1,
+                0,
+                1,
+                &[0xFF; 32],
+                b"must-not-persist",
+            )
+            .unwrap_err();
+        assert!(error.contains("retention limit"));
+        assert_eq!(
+            db.load_incoming_sender_key_generations_for_group("bounded-conversation")
+                .unwrap()
+                .len(),
+            MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER,
+        );
+        db.save_incoming_sender_key_generation(
+            "independent-conversation",
+            &sender,
+            1,
+            0,
+            1,
+            &[0xF1; 32],
+            b"independent",
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_incoming_sender_key_generations_for_group("independent-conversation")
+                .unwrap()
+                .len(),
+            1,
+        );
+    }
+
+    #[test]
+    fn injected_legacy_sender_key_migration_failure_rolls_back_new_generation() {
+        let db = VeilDb::open_memory(&[0xA2; 32]).unwrap();
+        let sender = [0x41; 32];
+        db.save_sender_key("group-legacy-rollback", &sender, b"legacy-state", false)
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER abort_legacy_sender_key_delete
+                 BEFORE DELETE ON sender_keys_local
+                 BEGIN SELECT RAISE(ABORT, 'injected legacy migration failure'); END;",
+            )
+            .unwrap();
+        let error = db
+            .migrate_legacy_incoming_sender_key_generation(
+                "group-legacy-rollback",
+                &sender,
+                7,
+                0,
+                0,
+                &[0u8; 32],
+                b"legacy-state",
+            )
+            .unwrap_err();
+        assert!(error.contains("injected legacy migration failure"));
+        assert_eq!(
+            db.load_sender_key("group-legacy-rollback", &sender)
+                .unwrap()
+                .unwrap(),
+            b"legacy-state"
+        );
+        assert!(db
+            .load_incoming_sender_key_generations_for_group("group-legacy-rollback")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn device_roster_pins_survive_restart_and_reject_rollback_or_equivocation() {
+        let path =
+            std::env::temp_dir().join(format!("veil-roster-pins-{}.db", uuid::Uuid::new_v4()));
+        let key = [0xA3; 32];
+        let binding = sample_binding_pin(0x20, 1, 1);
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000101",
+                roster_version: 5,
+                roster_commitment: [0x51; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"canonical-roster-five",
+                bindings: std::slice::from_ref(&binding),
+            })
+            .unwrap();
+        }
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            assert_eq!(
+                db.load_device_roster_head_v1("00000000-0000-0000-0000-000000000101")
+                    .unwrap(),
+                Some((5, [0x51; 32], 3))
+            );
+            assert!(db
+                .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                    conversation_id: "00000000-0000-0000-0000-000000000101",
+                    roster_version: 4,
+                    roster_commitment: [0x41; 32],
+                    required_capabilities: 3,
+                    canonical_snapshot: b"rollback",
+                    bindings: std::slice::from_ref(&binding),
+                })
+                .unwrap_err()
+                .contains("rollback"));
+            assert!(db
+                .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                    conversation_id: "00000000-0000-0000-0000-000000000101",
+                    roster_version: 5,
+                    roster_commitment: [0x52; 32],
+                    required_capabilities: 3,
+                    canonical_snapshot: b"same-version-equivocation",
+                    bindings: std::slice::from_ref(&binding),
+                })
+                .unwrap_err()
+                .contains("same device roster version"));
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn device_binding_pin_rejects_key_replacement_rollback_and_revoked_resurrection_atomically() {
+        let db = VeilDb::open_memory(&[0xA4; 32]).unwrap();
+        let original = sample_binding_pin(0x30, 2, 1);
+        db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000201",
+            roster_version: 1,
+            roster_commitment: [0x61; 32],
+            required_capabilities: 3,
+            canonical_snapshot: b"initial",
+            bindings: std::slice::from_ref(&original),
+        })
+        .unwrap();
+
+        let mut replacement = original.clone();
+        replacement.binding_version = 3;
+        replacement.device_identity_key[0] ^= 1;
+        assert!(db
+            .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000202",
+                roster_version: 1,
+                roster_commitment: [0x62; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"replacement",
+                bindings: std::slice::from_ref(&replacement),
+            })
+            .unwrap_err()
+            .contains("replacement"));
+
+        let mut rollback = original.clone();
+        rollback.binding_version = 1;
+        assert!(db
+            .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000203",
+                roster_version: 1,
+                roster_commitment: [0x63; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"binding-rollback",
+                bindings: std::slice::from_ref(&rollback),
+            })
+            .unwrap_err()
+            .contains("binding version rollback"));
+
+        let mut revoked = original.clone();
+        revoked.binding_version = 3;
+        revoked.status = 3;
+        revoked.account_signature[0] ^= 1;
+        db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000204",
+            roster_version: 1,
+            roster_commitment: [0x64; 32],
+            required_capabilities: 3,
+            canonical_snapshot: b"revoked",
+            bindings: std::slice::from_ref(&revoked),
+        })
+        .unwrap();
+        let mut resurrected = revoked.clone();
+        resurrected.binding_version = 4;
+        resurrected.status = 1;
+        assert!(db
+            .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000205",
+                roster_version: 1,
+                roster_commitment: [0x65; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"resurrected",
+                bindings: std::slice::from_ref(&resurrected),
+            })
+            .unwrap_err()
+            .contains("cannot become active"));
+
+        let fresh = sample_binding_pin(0x40, 1, 1);
+        let mut conflict = revoked.clone();
+        conflict.binding_version = 4;
+        conflict.device_signing_key[0] ^= 1;
+        assert!(db
+            .commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+                conversation_id: "00000000-0000-0000-0000-000000000206",
+                roster_version: 1,
+                roster_commitment: [0x66; 32],
+                required_capabilities: 3,
+                canonical_snapshot: b"atomic-failure",
+                bindings: &[fresh.clone(), conflict],
+            })
+            .is_err());
+        let count: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM device_binding_pins_v1 WHERE device_id = ?1",
+                rusqlite::params![fresh.device_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "failed roster transaction leaked its first pin");
+        assert!(db
+            .load_device_roster_head_v1("00000000-0000-0000-0000-000000000206")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn historical_sender_proof_first_seen_tofu_pins_atomically_and_conflicts_roll_back() {
+        let db = VeilDb::open_memory(&[0xB1; 32]).unwrap();
+        let binding = sample_binding_pin(0x51, 1, 1);
+        let route = sample_incoming_route(&binding, [0x61; 16], [0x62; 32]);
+        db.save_incoming_sender_key_generation_with_route_v1(
+            "historical-tofu",
+            &binding.device_identity_key,
+            1,
+            0,
+            1,
+            &[0x63; 32],
+            b"incoming-state",
+            &route,
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_incoming_sender_key_route_v1(
+                "historical-tofu",
+                &binding.device_identity_key,
+                1,
+            )
+            .unwrap(),
+            Some(route)
+        );
+        assert!(db
+            .load_trusted_signing_keys()
+            .unwrap()
+            .contains(&(binding.account_identity_key, binding.account_signing_key,)));
+
+        let conflict_db = VeilDb::open_memory(&[0xB2; 32]).unwrap();
+        conflict_db
+            .pin_trusted_signing_key(&binding.account_identity_key, &[0xEE; 32])
+            .unwrap();
+        let error = conflict_db
+            .save_incoming_sender_key_generation_with_route_v1(
+                "historical-conflict",
+                &binding.device_identity_key,
+                1,
+                0,
+                1,
+                &[0x64; 32],
+                b"must-rollback",
+                &sample_incoming_route(&binding, [0x65; 16], [0x66; 32]),
+            )
+            .unwrap_err();
+        assert!(error.contains("trusted signing key changed"));
+        assert!(conflict_db
+            .load_incoming_sender_key_generations_for_group("historical-conflict")
+            .unwrap()
+            .is_empty());
+        let leaked_device_pin: i64 = conflict_db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM device_binding_pins_v1 WHERE device_id = ?1",
+                rusqlite::params![binding.device_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(leaked_device_pin, 0);
+    }
+
+    #[test]
+    fn historical_binding_below_current_head_never_downgrades_or_reactivates_it() {
+        let db = VeilDb::open_memory(&[0xB3; 32]).unwrap();
+        let historical = sample_binding_pin(0x71, 1, 1);
+        let mut current = historical.clone();
+        current.binding_version = 2;
+        current.account_signature = [0x81; 64];
+        db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000701",
+            roster_version: 1,
+            roster_commitment: [0x82; 32],
+            required_capabilities: 3,
+            canonical_snapshot: b"current-active",
+            bindings: std::slice::from_ref(&current),
+        })
+        .unwrap();
+        let route = sample_incoming_route(&historical, [0x83; 16], [0x84; 32]);
+        db.save_incoming_sender_key_generation_with_route_v1(
+            "historical-below-active",
+            &historical.device_identity_key,
+            1,
+            0,
+            1,
+            &[0x85; 32],
+            b"historical-active",
+            &route,
+        )
+        .unwrap();
+
+        let mut revoked = current.clone();
+        revoked.binding_version = 3;
+        revoked.status = 3;
+        revoked.account_signature = [0x86; 64];
+        db.commit_device_roster_snapshot_v1(&DeviceRosterSnapshotV1 {
+            conversation_id: "00000000-0000-0000-0000-000000000702",
+            roster_version: 1,
+            roster_commitment: [0x87; 32],
+            required_capabilities: 3,
+            canonical_snapshot: b"current-revoked",
+            bindings: std::slice::from_ref(&revoked),
+        })
+        .unwrap();
+        let mut second_route = route.clone();
+        second_route.roster_version = 2;
+        second_route.roster_commitment = [0x88; 32];
+        second_route.envelope_commitment = [0x89; 32];
+        db.save_incoming_sender_key_generation_with_route_v1(
+            "historical-below-revoked",
+            &historical.device_identity_key,
+            2,
+            0,
+            1,
+            &[0x8A; 32],
+            b"historical-revoked",
+            &second_route,
+        )
+        .unwrap();
+        let (version, status): (Vec<u8>, i64) = db
+            .conn
+            .query_row(
+                "SELECT binding_version, status FROM device_binding_pins_v1 WHERE device_id = ?1",
+                rusqlite::params![historical.device_id.as_slice()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            u64::from_be_bytes(fixed_bytes("test version", version).unwrap()),
+            3
+        );
+        assert_eq!(status, 3);
+
+        let mut equivocation = second_route;
+        equivocation.sender_device_identity_key = [0xFE; 32];
+        let error = db
+            .save_incoming_sender_key_generation_with_route_v1(
+                "historical-equivocation",
+                &[0xFE; 32],
+                3,
+                0,
+                1,
+                &[0x8B; 32],
+                b"must-not-persist",
+                &equivocation,
+            )
+            .unwrap_err();
+        assert!(error.contains("replacement"));
+        assert!(db
+            .load_incoming_sender_key_generations_for_group("historical-equivocation")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn interim_exact_device_tables_rebuild_idempotently_and_fail_closed_on_ambiguity() {
+        let db = VeilDb::open_memory(&[0xA5; 32]).unwrap();
+        db.conn
+            .execute_batch(
+                "DROP TABLE sender_key_incoming_routes_v1;
+                 DROP TABLE pending_sender_key_device_envelopes_v1;
+                 CREATE TABLE pending_sender_key_device_envelopes_v1 (
+                    conversation_id TEXT NOT NULL,
+                    generation INTEGER NOT NULL,
+                    target_account_identity_key BLOB NOT NULL,
+                    target_device_id BLOB NOT NULL,
+                    target_device_identity_key BLOB NOT NULL,
+                    target_binding_version BLOB NOT NULL,
+                    sender_device_id BLOB NOT NULL,
+                    sender_device_identity_key BLOB NOT NULL,
+                    sender_binding_version BLOB NOT NULL,
+                    roster_version BLOB NOT NULL,
+                    roster_commitment BLOB NOT NULL,
+                    envelope_commitment BLOB NOT NULL,
+                    sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 65536),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (conversation_id, generation, target_device_id,
+                                 target_binding_version, roster_version)
+                 );
+                 CREATE TABLE sender_key_incoming_routes_v1 (
+                    group_id TEXT NOT NULL,
+                    sender_identity_key BLOB NOT NULL,
+                    generation INTEGER NOT NULL,
+                    sender_account_identity_key BLOB NOT NULL,
+                    sender_device_id BLOB NOT NULL,
+                    sender_device_signing_key BLOB NOT NULL,
+                    sender_binding_version BLOB NOT NULL,
+                    target_device_id BLOB NOT NULL,
+                    target_binding_version BLOB NOT NULL,
+                    roster_version BLOB NOT NULL,
+                    roster_commitment BLOB NOT NULL,
+                    envelope_commitment BLOB NOT NULL,
+                    installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (group_id, sender_identity_key, generation)
+                 );",
+            )
+            .unwrap();
+        db.save_incoming_sender_key_generation(
+            "group-interim",
+            &[0x11; 32],
+            1,
+            0,
+            1,
+            &[0x12; 32],
+            b"state",
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO sender_key_incoming_routes_v1 VALUES
+                (?1, ?2, 1, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, datetime('now'))",
+                rusqlite::params![
+                    "group-interim",
+                    [0x11u8; 32].as_slice(),
+                    [0x13u8; 32].as_slice(),
+                    [0x14u8; 16].as_slice(),
+                    [0x15u8; 32].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x16u8; 16].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x17u8; 32].as_slice(),
+                    [0x18u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO pending_sender_key_device_envelopes_v1 VALUES
+                (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))",
+                rusqlite::params![
+                    "group-interim",
+                    [0x21u8; 32].as_slice(),
+                    [0x22u8; 16].as_slice(),
+                    [0x23u8; 32].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x24u8; 16].as_slice(),
+                    [0x25u8; 32].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x26u8; 32].as_slice(),
+                    [0x27u8; 32].as_slice(),
+                    b"sealed",
+                ],
+            )
+            .unwrap();
+        db.rebuild_interim_sender_key_tables().unwrap();
+        db.rebuild_interim_sender_key_tables().unwrap();
+        assert!(db
+            .normalized_table_sql("pending_sender_key_device_envelopes_v1")
+            .unwrap()
+            .contains("primary key (conversation_id, generation, target_device_id)"));
+        assert!(db
+            .normalized_table_sql("sender_key_incoming_routes_v1")
+            .unwrap()
+            .contains("on delete cascade"));
+        db.conn
+            .execute_batch(
+                "DROP TABLE sender_key_historical_device_proofs_v1;
+                 CREATE TABLE sender_key_historical_device_proofs_v1 (
+                    group_id TEXT NOT NULL, sender_identity_key BLOB NOT NULL,
+                    generation INTEGER NOT NULL, sender_account_signing_key BLOB NOT NULL,
+                    sender_device_capabilities BLOB NOT NULL,
+                    sender_device_binding_status INTEGER NOT NULL,
+                    sender_account_signature BLOB NOT NULL,
+                    PRIMARY KEY (group_id, sender_identity_key, generation),
+                    FOREIGN KEY (group_id, sender_identity_key, generation)
+                      REFERENCES sender_key_incoming_routes_v1
+                        (group_id, sender_identity_key, generation) ON DELETE CASCADE
+                 );",
+            )
+            .unwrap();
+        db.ensure_sender_key_historical_proof_schema().unwrap();
+        db.ensure_sender_key_historical_proof_schema().unwrap();
+        let target_column_present: bool = db
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('sender_key_historical_device_proofs_v1')
+                    WHERE name = 'target_device_identity_key'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(target_column_present);
+
+        db.conn
+            .execute_batch(
+                "DROP TABLE pending_sender_key_device_envelopes_v1;
+                 CREATE TABLE pending_sender_key_device_envelopes_v1 (
+                    conversation_id TEXT NOT NULL, generation INTEGER NOT NULL,
+                    target_account_identity_key BLOB NOT NULL, target_device_id BLOB NOT NULL,
+                    target_device_identity_key BLOB NOT NULL, target_binding_version BLOB NOT NULL,
+                    sender_device_id BLOB NOT NULL, sender_device_identity_key BLOB NOT NULL,
+                    sender_binding_version BLOB NOT NULL, roster_version BLOB NOT NULL,
+                    roster_commitment BLOB NOT NULL, envelope_commitment BLOB NOT NULL,
+                    sealed_envelope BLOB NOT NULL CHECK(length(sealed_envelope) BETWEEN 1 AND 65536),
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (conversation_id, generation, target_device_id,
+                                 target_binding_version, roster_version)
+                 );",
+            )
+            .unwrap();
+        for version in [1u64, 2] {
+            db.conn
+                .execute(
+                    "INSERT INTO pending_sender_key_device_envelopes_v1 VALUES
+                    (?1, 1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, datetime('now'))",
+                    rusqlite::params![
+                        "group-ambiguous",
+                        [0x31u8; 32].as_slice(),
+                        [0x32u8; 16].as_slice(),
+                        [0x33u8; 32].as_slice(),
+                        version.to_be_bytes().as_slice(),
+                        [0x34u8; 16].as_slice(),
+                        [0x35u8; 32].as_slice(),
+                        1u64.to_be_bytes().as_slice(),
+                        version.to_be_bytes().as_slice(),
+                        [0x36u8; 32].as_slice(),
+                        [0x37u8; 32].as_slice(),
+                        b"sealed",
+                    ],
+                )
+                .unwrap();
+        }
+        assert!(db
+            .rebuild_interim_sender_key_tables()
+            .unwrap_err()
+            .contains("ambiguous"));
+        let rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM pending_sender_key_device_envelopes_v1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 2);
+        assert!(db
+            .normalized_table_sql("pending_sender_key_device_envelopes_v1")
+            .unwrap()
+            .contains("target_binding_version, roster_version"));
+    }
+
+    #[test]
+    fn interim_route_rebuild_rolls_back_when_an_orphan_cannot_gain_its_foreign_key() {
+        let db = VeilDb::open_memory(&[0xA6; 32]).unwrap();
+        db.conn.execute_batch(
+            "DROP TABLE sender_key_incoming_routes_v1;
+             CREATE TABLE sender_key_incoming_routes_v1 (
+                group_id TEXT NOT NULL, sender_identity_key BLOB NOT NULL, generation INTEGER NOT NULL,
+                sender_account_identity_key BLOB NOT NULL, sender_device_id BLOB NOT NULL,
+                sender_device_signing_key BLOB NOT NULL, sender_binding_version BLOB NOT NULL,
+                target_device_id BLOB NOT NULL, target_binding_version BLOB NOT NULL,
+                roster_version BLOB NOT NULL, roster_commitment BLOB NOT NULL,
+                envelope_commitment BLOB NOT NULL, installed_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (group_id, sender_identity_key, generation)
+             );"
+        ).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO sender_key_incoming_routes_v1 VALUES
+                ('orphan', ?1, 9, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, datetime('now'))",
+                rusqlite::params![
+                    [0x41u8; 32].as_slice(),
+                    [0x42u8; 32].as_slice(),
+                    [0x43u8; 16].as_slice(),
+                    [0x44u8; 32].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x45u8; 16].as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    1u64.to_be_bytes().as_slice(),
+                    [0x46u8; 32].as_slice(),
+                    [0x47u8; 32].as_slice(),
+                ],
+            )
+            .unwrap();
+        assert!(db.rebuild_interim_sender_key_tables().is_err());
+        assert!(!db
+            .normalized_table_sql("sender_key_incoming_routes_v1")
+            .unwrap()
+            .contains("foreign key"));
+        let rows: i64 = db
+            .conn
+            .query_row(
+                "SELECT count(*) FROM sender_key_incoming_routes_v1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 1);
+    }
+
+    #[test]
+    fn outgoing_ack_replaces_local_id_atomically() {
+        let db = VeilDb::open_memory(&[10u8; 32]).unwrap();
+        db.insert_conversation("conv-ack", 0, None, Some(&[4u8; 32]), None)
+            .unwrap();
+        db.insert_outgoing_pending_message("local-id", "conv-ack", &[5u8; 32], "pending", None)
+            .unwrap();
+        let before = db.get_messages("conv-ack", 10).unwrap();
+        assert_eq!(before[0].id, "local-id");
+        assert_eq!(before[0].status, crate::models::MessageStatus::Sending);
+
+        db.acknowledge_outgoing_message("local-id", "server-id", 1234)
+            .unwrap();
+        let after = db.get_messages("conv-ack", 10).unwrap();
+        assert_eq!(after[0].id, "server-id");
+        assert_eq!(after[0].status, crate::models::MessageStatus::Sent);
+        assert_eq!(after[0].server_timestamp, Some(1234));
+        assert!(db
+            .acknowledge_outgoing_message("local-id", "different-server-id", 1235)
+            .is_err());
+    }
+
+    #[test]
+    fn attachment_secrets_follow_ack_and_delete_atomically() {
+        let db = VeilDb::open_memory(&[0x71u8; 32]).unwrap();
+        db.insert_conversation("attachment-conversation", 1, Some("Circle"), None, None)
+            .unwrap();
+        let attachment = crate::models::MessageAttachment {
+            ordinal: 0,
+            media_id: "0123456789abcdef0123456789abcdef".to_string(),
+            file_name: "safe.txt".to_string(),
+            detected_mime: "text/plain".to_string(),
+            format_version: 2,
+            nonce_prefix: [3u8; 16],
+            chunk_count: 1,
+            plaintext_size: 5,
+            ciphertext_size: 21,
+            content_key: [4u8; 32],
+        };
+        db.insert_outgoing_pending_message_with_attachments(
+            "local-attachment",
+            "attachment-conversation",
+            &[5u8; 32],
+            "caption",
+            None,
+            &[attachment],
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_messages("attachment-conversation", 10).unwrap()[0].attachments[0].content_key,
+            [4u8; 32]
+        );
+
+        db.acknowledge_outgoing_message("local-attachment", "server-attachment", 1234)
+            .unwrap();
+        assert!(db
+            .get_message_attachments("local-attachment")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.get_message_attachments("server-attachment").unwrap()[0].file_name,
+            "safe.txt"
+        );
+
+        db.delete_message_scoped("server-attachment", "attachment-conversation")
+            .unwrap();
+        assert!(db
+            .get_message_attachments("server-attachment")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn rejected_outgoing_message_remains_failed_until_explicitly_discarded() {
+        let db = VeilDb::open_memory(&[0x62u8; 32]).unwrap();
+        db.insert_conversation("conv-failed", 1, Some("Group"), None, None)
+            .unwrap();
+        db.insert_outgoing_pending_message(
+            "local-failed",
+            "conv-failed",
+            &[5u8; 32],
+            "keep this draft",
+            None,
+        )
+        .unwrap();
+
+        db.mark_outgoing_message_failed("local-failed").unwrap();
+        let failed = db.get_messages("conv-failed", 10).unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].status, crate::models::MessageStatus::Failed);
+        assert_eq!(failed[0].plaintext, "keep this draft");
+
+        db.discard_failed_outgoing_message("local-failed").unwrap();
+        assert!(db.get_messages("conv-failed", 10).unwrap().is_empty());
+        assert!(db
+            .get_conversations()
+            .unwrap()
+            .into_iter()
+            .find(|conversation| conversation.id == "conv-failed")
+            .unwrap()
+            .last_message_at
+            .is_none());
+    }
+
+    #[test]
+    fn crash_recovery_marks_sending_rows_unknown_and_keeps_latest_window() {
+        let db = VeilDb::open_memory(&[0x63u8; 32]).unwrap();
+        db.insert_conversation("conv-unknown", 1, Some("Group"), None, None)
+            .unwrap();
+        for (id, text) in [
+            ("local-1", "first"),
+            ("local-2", "second"),
+            ("local-3", "possibly delivered"),
+        ] {
+            db.insert_outgoing_pending_message(id, "conv-unknown", &[6u8; 32], text, None)
+                .unwrap();
+        }
+
+        assert_eq!(db.recover_unacknowledged_outgoing_messages().unwrap(), 3);
+        let latest = db.get_messages("conv-unknown", 2).unwrap();
+        assert_eq!(
+            latest
+                .iter()
+                .map(|message| message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["local-2", "local-3"]
+        );
+        assert!(latest
+            .iter()
+            .all(|message| message.status == crate::models::MessageStatus::Unknown));
+        assert_eq!(latest[1].plaintext, "possibly delivered");
+    }
+
+    #[test]
+    fn directory_upsert_fills_but_never_replaces_crypto_bindings() {
+        let db = VeilDb::open_memory(&[11u8; 32]).unwrap();
+        let peer = [4u8; 32];
+        db.upsert_directory_conversation(
+            "dm-directory",
+            0,
+            ORIGIN_A,
+            Some("Alice"),
+            Some(USER_A),
+            Some(&peer),
+            None,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        db.upsert_directory_conversation(
+            "dm-directory",
+            0,
+            ORIGIN_A,
+            Some("Alice renamed"),
+            Some(USER_A),
+            Some(&peer),
+            None,
+            "2026-01-01T00:00:00Z",
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_conversations().unwrap()[0].name.as_deref(),
+            Some("Alice renamed")
+        );
+        assert!(db
+            .upsert_directory_conversation(
+                "dm-directory",
+                0,
+                ORIGIN_A,
+                Some("Mallory"),
+                Some(USER_A),
+                Some(&[5u8; 32]),
+                None,
+                "2026-01-01T00:00:00Z",
+            )
+            .is_err());
+        assert!(db
+            .upsert_directory_conversation(
+                "dm-directory",
+                1,
+                ORIGIN_A,
+                Some("type swap"),
+                None,
+                None,
+                None,
+                "2026-01-01T00:00:00Z",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn authenticated_channel_page_is_atomic_and_origin_scoped() {
+        let db = VeilDb::open_memory(&[0xBA; 32]).unwrap();
+        let server_id = "00000000-0000-0000-0000-0000000000d3";
+        let first = "00000000-0000-0000-0000-0000000000c4";
+        let conflicting = "00000000-0000-0000-0000-0000000000c5";
+        db.upsert_directory_conversation(
+            conflicting,
+            2,
+            ORIGIN_B,
+            Some("Existing beta channel"),
+            None,
+            None,
+            Some(server_id),
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+
+        assert!(db
+            .upsert_directory_channels(
+                ORIGIN_A,
+                server_id,
+                &[
+                    (
+                        first.to_string(),
+                        "Alpha general".to_string(),
+                        "2026-07-12T12:01:00Z".to_string(),
+                    ),
+                    (
+                        conflicting.to_string(),
+                        "Substituted channel".to_string(),
+                        "2026-07-12T12:02:00Z".to_string(),
+                    ),
+                ],
+            )
+            .is_err());
+        let conversations = db.get_conversations().unwrap();
+        assert!(!conversations
+            .iter()
+            .any(|conversation| conversation.id == first));
+        let retained = conversations
+            .iter()
+            .find(|conversation| conversation.id == conflicting)
+            .unwrap();
+        assert_eq!(retained.server_origin.as_deref(), Some(ORIGIN_B));
+        assert_eq!(retained.name.as_deref(), Some("Existing beta channel"));
+
+        db.upsert_directory_channels(
+            ORIGIN_A,
+            server_id,
+            &[(
+                first.to_string(),
+                "Alpha general".to_string(),
+                "2026-07-12T12:01:00Z".to_string(),
+            )],
+        )
+        .unwrap();
+        assert_eq!(
+            db.list_origin_scoped_channel_conversation_ids(ORIGIN_A, server_id)
+                .unwrap(),
+            vec![first.to_string()]
+        );
+    }
+
+    #[test]
+    fn origin_scoped_channel_lookup_isolates_same_server_uuid_and_excludes_originless_rows() {
+        let db = VeilDb::open_memory(&[0xB8; 32]).unwrap();
+        let server_id = "00000000-0000-0000-0000-0000000000d1";
+        let channel_a = "00000000-0000-0000-0000-0000000000c1";
+        let channel_b = "00000000-0000-0000-0000-0000000000c2";
+        let originless_channel = "00000000-0000-0000-0000-0000000000c3";
+
+        for (conversation_id, origin, name) in [
+            (channel_a, ORIGIN_A, "Alpha channel"),
+            (channel_b, ORIGIN_B, "Beta channel"),
+        ] {
+            db.upsert_directory_conversation(
+                conversation_id,
+                2,
+                origin,
+                Some(name),
+                None,
+                None,
+                Some(server_id),
+                "2026-07-12T12:00:00Z",
+            )
+            .unwrap();
+        }
+        db.insert_conversation(
+            originless_channel,
+            2,
+            Some("Originless legacy channel"),
+            None,
+            Some(server_id),
+        )
+        .unwrap();
+
+        assert_eq!(
+            db.list_origin_scoped_channel_conversation_ids(ORIGIN_A, server_id)
+                .unwrap(),
+            vec![channel_a.to_string()]
+        );
+        assert_eq!(
+            db.list_origin_scoped_channel_conversation_ids(ORIGIN_B, server_id)
+                .unwrap(),
+            vec![channel_b.to_string()]
+        );
+        assert!(!db
+            .list_origin_scoped_channel_conversation_ids(ORIGIN_A, server_id)
+            .unwrap()
+            .iter()
+            .any(|conversation_id| conversation_id == originless_channel));
+    }
+
+    #[test]
+    fn origin_scoped_channel_lookup_validates_inputs_and_persisted_ids() {
+        let db = VeilDb::open_memory(&[0xB9; 32]).unwrap();
+        let server_id = "00000000-0000-0000-0000-0000000000d2";
+
+        assert!(db
+            .list_origin_scoped_channel_conversation_ids("https://Alpha.example:443", server_id)
+            .is_err());
+        assert!(db
+            .list_origin_scoped_channel_conversation_ids(
+                ORIGIN_A,
+                "00000000-0000-0000-0000-000000000000",
+            )
+            .is_err());
+
+        db.conn
+            .execute(
+                "INSERT INTO conversations
+                    (id, conv_type, server_id, server_origin, name)
+                 VALUES ('not-a-canonical-uuid', 2, ?1, ?2, 'Corrupt channel')",
+                rusqlite::params![server_id, ORIGIN_A],
+            )
+            .unwrap();
+        assert!(db
+            .list_origin_scoped_channel_conversation_ids(ORIGIN_A, server_id)
+            .is_err());
+    }
+
+    #[test]
+    fn identity_directory_scopes_the_same_user_uuid_by_origin() {
+        let db = VeilDb::open_memory(&[0xB1; 32]).unwrap();
+        let alpha = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x11,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let beta = sample_account(
+            ORIGIN_B,
+            USER_A,
+            0x22,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_identity_directory(&[alpha.clone(), beta.clone()])
+            .unwrap();
+
+        assert_eq!(
+            db.resolve_account_snapshot(&alpha.locator).unwrap(),
+            Some(alpha)
+        );
+        assert_eq!(
+            db.resolve_account_snapshot(&beta.locator).unwrap(),
+            Some(beta)
+        );
+    }
+
+    #[test]
+    fn authenticated_self_binding_is_origin_scoped_and_immutable() {
+        let db = VeilDb::open_memory(&[0xA1; 32]).unwrap();
+        let identity_key = [0x11; 32];
+        let signing_key = test_signing_key(0x12);
+
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        db.bind_authenticated_self(ORIGIN_B, USER_B, &identity_key, &signing_key)
+            .unwrap();
+
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_B, &identity_key, &signing_key)
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &[0x13; 32], &signing_key)
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &[0x14; 32])
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &[0u8; 32], &signing_key)
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &identity_key)
+            .is_err());
+    }
+
+    #[test]
+    fn authenticated_self_binding_survives_file_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-authenticated-self-binding-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xA2; 32];
+        let identity_key = [0x21; 32];
+        let signing_key = test_signing_key(0x22);
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+                .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            reopened
+                .bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+                .unwrap();
+            assert!(reopened
+                .bind_authenticated_self(ORIGIN_A, USER_B, &identity_key, &signing_key)
+                .is_err());
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn authenticated_self_binding_rejects_upgrade_poisoning_before_insert() {
+        let db = VeilDb::open_memory(&[0xA3; 32]).unwrap();
+        let persisted_self = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x31,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&persisted_self))
+            .unwrap();
+
+        assert!(db
+            .bind_authenticated_self(
+                ORIGIN_A,
+                USER_B,
+                &persisted_self.locator.identity_key,
+                &persisted_self.signing_key,
+            )
+            .is_err());
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &persisted_self.locator.identity_key,
+            &persisted_self.signing_key,
+        )
+        .unwrap();
+
+        let stored_user: String = db
+            .conn
+            .query_row(
+                "SELECT user_id FROM authenticated_self_bindings_v1
+                 WHERE canonical_server_origin = ?1",
+                rusqlite::params![ORIGIN_A],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_user, USER_A);
+    }
+
+    #[test]
+    fn authenticated_self_binding_rejects_later_directory_poisoning_atomically() {
+        let db = VeilDb::open_memory(&[0xA4; 32]).unwrap();
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x36,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &self_account.locator.identity_key,
+            &self_account.signing_key,
+        )
+        .unwrap();
+
+        let unrelated = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x37,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let mut substituted_self = self_account.clone();
+        substituted_self.locator.identity_key = [0x38; 32];
+        substituted_self.signing_key = test_signing_key(0x39);
+        assert!(db
+            .upsert_identity_directory(&[unrelated.clone(), substituted_self])
+            .is_err());
+        assert!(db
+            .resolve_account_snapshot(&unrelated.locator)
+            .unwrap()
+            .is_none());
+
+        let mut identity_alias = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x3A,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        identity_alias.locator.identity_key = self_account.locator.identity_key;
+        assert!(db.upsert_identity_directory(&[identity_alias]).is_err());
+
+        let mut signing_alias = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x3B,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        signing_alias.signing_key = self_account.signing_key;
+        assert!(db.upsert_identity_directory(&[signing_alias]).is_err());
+        assert_eq!(
+            db.identity_change_users_for_origin(ORIGIN_A).unwrap(),
+            vec![USER_A.to_string()]
+        );
+        assert!(db
+            .resolve_account_by_origin_user(ORIGIN_A, USER_B)
+            .unwrap()
+            .is_none());
+
+        db.upsert_identity_directory(&[unrelated.clone(), self_account.clone()])
+            .unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&self_account.locator).unwrap(),
+            Some(self_account)
+        );
+        assert_eq!(
+            db.resolve_account_snapshot(&unrelated.locator).unwrap(),
+            Some(unrelated)
+        );
+
+        let other_origin = sample_account(
+            ORIGIN_B,
+            USER_A,
+            0x3C,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&other_origin))
+            .unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&other_origin.locator).unwrap(),
+            Some(other_origin)
+        );
+    }
+
+    #[test]
+    fn authenticated_self_reconnect_revalidates_the_persisted_directory() {
+        let db = VeilDb::open_memory(&[0xA5; 32]).unwrap();
+        let identity_key = [0x41; 32];
+        let signing_key = test_signing_key(0x42);
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        let poisoned_identity_key = [0x43u8; 32];
+        let poisoned_signing_key = test_signing_key(0x44);
+
+        db.conn
+            .execute(
+                "INSERT INTO identity_directory_v1
+                    (canonical_server_origin, user_id, identity_key, signing_key,
+                     username, display_name, profile_version, profile_origin,
+                     source, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, 'poisoned', NULL, NULL, ?1, 2,
+                         '2026-07-12T12:00:00Z')",
+                rusqlite::params![
+                    ORIGIN_A,
+                    USER_A,
+                    poisoned_identity_key.as_slice(),
+                    poisoned_signing_key.as_slice()
+                ],
+            )
+            .unwrap();
+
+        assert!(db
+            .bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .is_err());
+    }
+
+    #[test]
+    fn identity_directory_substitution_or_alias_rolls_back_the_whole_batch() {
+        let db = VeilDb::open_memory(&[0xB2; 32]).unwrap();
+        let original = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x31,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+
+        let unrelated = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x32,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let mut substituted = original.clone();
+        substituted.locator.identity_key = [0x33; 32];
+        substituted.signing_key = test_signing_key(0x34);
+        assert!(db
+            .upsert_identity_directory(&[unrelated.clone(), substituted])
+            .is_err());
+        assert!(db
+            .resolve_account_snapshot(&unrelated.locator)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            db.resolve_account_snapshot(&original.locator).unwrap(),
+            Some(original.clone())
+        );
+        assert_eq!(
+            db.local_identity_verification(&original.locator).unwrap(),
+            LocalIdentityVerification::IdentityChanged
+        );
+
+        let mut signing_substitution = original.clone();
+        signing_substitution.signing_key = test_signing_key(0x35);
+        assert!(db
+            .upsert_identity_directory(&[signing_substitution])
+            .is_err());
+
+        let mut aliased = original.clone();
+        aliased.locator.user_id = USER_B.to_string();
+        assert!(db.upsert_identity_directory(&[aliased]).is_err());
+        assert_eq!(
+            db.resolve_account_snapshot(&original.locator).unwrap(),
+            Some(original)
+        );
+    }
+
+    #[test]
+    fn identity_directory_signing_key_is_unique_per_origin_and_batch_atomic() {
+        let db = VeilDb::open_memory(&[0xB8; 32]).unwrap();
+        let original = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x3D,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let mut signing_alias = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x3E,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        signing_alias.signing_key = original.signing_key;
+
+        assert!(db
+            .upsert_identity_directory(&[original.clone(), signing_alias.clone()])
+            .is_err());
+        assert!(db
+            .resolve_account_snapshot(&original.locator)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .resolve_account_snapshot(&signing_alias.locator)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .identity_change_users_for_origin(ORIGIN_A)
+            .unwrap()
+            .is_empty());
+
+        db.upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        db.upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        assert!(db
+            .upsert_identity_directory(std::slice::from_ref(&signing_alias))
+            .is_err());
+        assert_eq!(
+            db.identity_change_users_for_origin(ORIGIN_A).unwrap(),
+            vec![USER_A.to_string()]
+        );
+
+        let mut cross_origin = signing_alias;
+        cross_origin.locator.canonical_server_origin = ORIGIN_B.to_string();
+        cross_origin.profile_origin = ORIGIN_B.to_string();
+        db.upsert_identity_directory(std::slice::from_ref(&cross_origin))
+            .unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&cross_origin.locator).unwrap(),
+            Some(cross_origin)
+        );
+    }
+
+    #[test]
+    fn identity_directory_signing_alias_is_rejected_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-identity-signing-alias-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xB9; 32];
+        let original = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x3F,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.upsert_identity_directory(std::slice::from_ref(&original))
+                .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            let mut signing_alias = sample_account(
+                ORIGIN_A,
+                USER_B,
+                0x40,
+                AccountSnapshotSource::AuthenticatedConversationDirectory,
+                None,
+            );
+            signing_alias.signing_key = original.signing_key;
+            assert!(reopened
+                .upsert_identity_directory(std::slice::from_ref(&signing_alias))
+                .is_err());
+            assert_eq!(
+                reopened
+                    .resolve_account_snapshot(&original.locator)
+                    .unwrap(),
+                Some(original.clone())
+            );
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened.identity_change_users_for_origin(ORIGIN_A).unwrap(),
+                vec![USER_A.to_string()]
+            );
+            assert_eq!(
+                reopened
+                    .local_identity_verification(&original.locator)
+                    .unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn historical_account_candidate_alarm_is_durable_and_never_promotes_the_candidate() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-historical-account-candidate-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xBA; 32];
+        let original = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x45,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.upsert_identity_directory(std::slice::from_ref(&original))
+                .unwrap();
+            assert_eq!(
+                db.observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_A,
+                    &original.locator.identity_key,
+                    &original.signing_key,
+                    "2026-07-13T12:10:00Z",
+                )
+                .unwrap(),
+                HistoricalAccountContinuity::Compatible
+            );
+            let mut unpinned_weak_signing = [0u8; 32];
+            unpinned_weak_signing[0] = 1;
+            assert_eq!(
+                db.observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_B,
+                    &[0x46; 32],
+                    &unpinned_weak_signing,
+                    "2026-07-13T12:11:00Z",
+                )
+                .unwrap(),
+                HistoricalAccountContinuity::NoBaseline
+            );
+            assert!(db
+                .identity_change_users_for_origin(ORIGIN_A)
+                .unwrap()
+                .is_empty());
+
+            let mut weak_changed_signing = [0u8; 32];
+            weak_changed_signing[0] = 1;
+            assert_eq!(
+                db.observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_A,
+                    &original.locator.identity_key,
+                    &weak_changed_signing,
+                    "2026-07-13T12:12:00Z",
+                )
+                .unwrap(),
+                HistoricalAccountContinuity::IdentityChanged(vec![USER_A.to_string()])
+            );
+            assert_eq!(
+                db.resolve_account_snapshot(&original.locator).unwrap(),
+                Some(original.clone())
+            );
+            assert_eq!(
+                db.local_identity_verification(&original.locator).unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened
+                    .local_identity_verification(&original.locator)
+                    .unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+            assert_eq!(
+                reopened
+                    .resolve_account_snapshot(&original.locator)
+                    .unwrap(),
+                Some(original)
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn historical_account_candidate_alarms_cross_user_and_self_alias_owners() {
+        let original = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x47,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+
+        let identity_alias_db = VeilDb::open_memory(&[0xBB; 32]).unwrap();
+        identity_alias_db
+            .upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        assert_eq!(
+            identity_alias_db
+                .observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_B,
+                    &original.locator.identity_key,
+                    &original.signing_key,
+                    "2026-07-13T12:13:00Z",
+                )
+                .unwrap(),
+            HistoricalAccountContinuity::IdentityChanged(vec![USER_A.to_string()])
+        );
+        assert!(identity_alias_db
+            .resolve_account_by_origin_user(ORIGIN_A, USER_B)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            identity_alias_db
+                .identity_change_users_for_origin(ORIGIN_A)
+                .unwrap(),
+            vec![USER_A.to_string()]
+        );
+
+        let signing_alias_db = VeilDb::open_memory(&[0xBC; 32]).unwrap();
+        signing_alias_db
+            .upsert_identity_directory(std::slice::from_ref(&original))
+            .unwrap();
+        let signing_alias_identity = [0x49; 32];
+        assert_eq!(
+            signing_alias_db
+                .observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_B,
+                    &signing_alias_identity,
+                    &original.signing_key,
+                    "2026-07-13T12:14:00Z",
+                )
+                .unwrap(),
+            HistoricalAccountContinuity::IdentityChanged(vec![USER_A.to_string()])
+        );
+        assert!(signing_alias_db
+            .resolve_account_by_origin_user(ORIGIN_A, USER_B)
+            .unwrap()
+            .is_none());
+
+        let self_alias_db = VeilDb::open_memory(&[0xBD; 32]).unwrap();
+        self_alias_db
+            .bind_authenticated_self(
+                ORIGIN_A,
+                USER_A,
+                &original.locator.identity_key,
+                &original.signing_key,
+            )
+            .unwrap();
+        assert_eq!(
+            self_alias_db
+                .observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_A,
+                    &original.locator.identity_key,
+                    &original.signing_key,
+                    "2026-07-13T12:15:00Z",
+                )
+                .unwrap(),
+            HistoricalAccountContinuity::Compatible
+        );
+        assert_eq!(
+            self_alias_db
+                .observe_historical_account_candidate(
+                    ORIGIN_A,
+                    USER_B,
+                    &original.locator.identity_key,
+                    &original.signing_key,
+                    "2026-07-13T12:16:00Z",
+                )
+                .unwrap(),
+            HistoricalAccountContinuity::IdentityChanged(vec![USER_A.to_string()])
+        );
+        assert!(self_alias_db
+            .resolve_account_by_origin_user(ORIGIN_A, USER_B)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            self_alias_db
+                .identity_change_users_for_origin(ORIGIN_A)
+                .unwrap(),
+            vec![USER_A.to_string()]
+        );
+    }
+
+    #[test]
+    fn identity_directory_source_and_profile_versions_merge_fail_closed() {
+        let db = VeilDb::open_memory(&[0xB3; 32]).unwrap();
+        let mut historical = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x41,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        historical.display_name = Some("Historical".to_string());
+        db.upsert_identity_directory(&[historical.clone()]).unwrap();
+
+        let mut directory = historical.clone();
+        directory.source = AccountSnapshotSource::AuthenticatedConversationDirectory;
+        directory.display_name = Some("Directory".to_string());
+        directory.observed_at = "2026-07-12T12:01:00Z".to_string();
+        db.upsert_identity_directory(&[directory.clone()]).unwrap();
+
+        let mut stale_history = historical;
+        stale_history.display_name = Some("Stale history".to_string());
+        stale_history.observed_at = "2026-07-12T12:02:00Z".to_string();
+        db.upsert_identity_directory(&[stale_history]).unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&directory.locator)
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Directory")
+        );
+
+        directory.profile_version = Some(2);
+        directory.display_name = Some("Version two".to_string());
+        db.upsert_identity_directory(&[directory.clone()]).unwrap();
+
+        let mut rollback = directory.clone();
+        rollback.profile_version = Some(1);
+        assert!(db.upsert_identity_directory(&[rollback]).is_err());
+
+        let mut equivocation = directory.clone();
+        equivocation.display_name = Some("Different version two".to_string());
+        assert!(db.upsert_identity_directory(&[equivocation]).is_err());
+
+        let mut unversioned = directory.clone();
+        unversioned.profile_version = None;
+        unversioned.display_name = Some("Unversioned replacement".to_string());
+        db.upsert_identity_directory(&[unversioned]).unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&directory.locator)
+                .unwrap()
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Version two")
+        );
+
+        let mut version_three = directory.clone();
+        version_three.profile_version = Some(3);
+        version_three.display_name = Some("Version three".to_string());
+        db.upsert_identity_directory(&[version_three.clone()])
+            .unwrap();
+        assert_eq!(
+            db.resolve_account_snapshot(&directory.locator)
+                .unwrap()
+                .unwrap(),
+            version_three
+        );
+    }
+
+    #[test]
+    fn network_profile_requires_an_exact_directory_and_is_origin_scoped() {
+        let db = VeilDb::open_memory(&[0xC1; 32]).unwrap();
+        let alpha = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x51,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(1),
+        );
+        let beta = sample_account(
+            ORIGIN_B,
+            USER_A,
+            0x52,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(1),
+        );
+        let alpha_profile = sample_network_profile(&alpha, 1);
+        assert!(db.upsert_network_profile(&alpha_profile).is_err());
+
+        db.upsert_identity_directory(&[alpha.clone(), beta.clone()])
+            .unwrap();
+        let mut beta_profile = sample_network_profile(&beta, 1);
+        beta_profile.display_name = Some("Beta account".to_string());
+        db.upsert_network_profile(&alpha_profile).unwrap();
+        db.upsert_network_profile(&beta_profile).unwrap();
+
+        assert_eq!(
+            db.load_network_profile(&alpha.locator).unwrap(),
+            Some(alpha_profile)
+        );
+        assert_eq!(
+            db.load_network_profile(&beta.locator).unwrap(),
+            Some(beta_profile)
+        );
+    }
+
+    #[test]
+    fn network_profile_rejects_rollback_equivocation_and_unsafe_text() {
+        let db = VeilDb::open_memory(&[0xC2; 32]).unwrap();
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x53,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(3),
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&account))
+            .unwrap();
+        let mut current = sample_network_profile(&account, 3);
+        current.about = "first line\nsecond line".to_string();
+        current.avatar_asset_id = Some("550e8400-e29b-41d4-a716-446655440000".to_string());
+        current.avatar_digest = Some([0xA5; 32]);
+        current.avatar_content_type = Some("image/jpeg".to_string());
+        db.upsert_network_profile(&current).unwrap();
+
+        let mut rollback = current.clone();
+        rollback.profile_version = 2;
+        assert!(db.upsert_network_profile(&rollback).is_err());
+
+        let mut equivocation = current.clone();
+        equivocation.about = "changed at the same revision".to_string();
+        assert!(db.upsert_network_profile(&equivocation).is_err());
+
+        let mut avatar_equivocation = current.clone();
+        avatar_equivocation.avatar_digest = Some([0xA6; 32]);
+        assert!(db.upsert_network_profile(&avatar_equivocation).is_err());
+
+        let mut incomplete_avatar = current.clone();
+        incomplete_avatar.profile_version = 4;
+        incomplete_avatar.avatar_digest = None;
+        assert!(db.upsert_network_profile(&incomplete_avatar).is_err());
+
+        let mut bidi = current.clone();
+        bidi.profile_version = 4;
+        bidi.about = "safe\u{202e}evil".to_string();
+        assert!(db.upsert_network_profile(&bidi).is_err());
+        for unsafe_character in [
+            '\u{00ad}', '\u{034f}', '\u{180e}', '\u{200b}', '\u{2028}', '\u{2029}', '\u{2060}',
+            '\u{feff}',
+        ] {
+            let mut spoofing = current.clone();
+            spoofing.profile_version = 4;
+            spoofing.display_name = Some(format!("safe{unsafe_character}hidden"));
+            assert!(db.upsert_network_profile(&spoofing).is_err());
+        }
+        assert_eq!(
+            db.load_network_profile(&account.locator).unwrap(),
+            Some(current)
+        );
+    }
+
+    #[test]
+    fn authenticated_network_profile_bootstraps_fresh_self_atomically() {
+        let db = VeilDb::open_memory(&[0xC5; 32]).unwrap();
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x57,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(1),
+        );
+        let profile = sample_network_profile(&account, 1);
+        assert!(db
+            .upsert_authenticated_network_profile(&profile, account.signing_key)
+            .is_err());
+        assert!(db
+            .resolve_account_snapshot(&account.locator)
+            .unwrap()
+            .is_none());
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &account.locator.identity_key,
+            &account.signing_key,
+        )
+        .unwrap();
+
+        db.upsert_authenticated_network_profile(&profile, account.signing_key)
+            .unwrap();
+        assert_eq!(
+            db.load_network_profile(&account.locator).unwrap(),
+            Some(profile.clone())
+        );
+        assert_eq!(
+            db.resolve_account_snapshot(&account.locator)
+                .unwrap()
+                .unwrap()
+                .signing_key,
+            account.signing_key
+        );
+
+        let conflicting_signing_key = test_signing_key(0x59);
+        let mut advanced = profile.clone();
+        advanced.profile_version = 2;
+        advanced.display_name = Some("Must roll back".to_string());
+        assert!(db
+            .upsert_authenticated_network_profile(&advanced, conflicting_signing_key)
+            .is_err());
+        assert_eq!(
+            db.load_network_profile(&account.locator).unwrap(),
+            Some(profile)
+        );
+    }
+
+    #[test]
+    fn authenticated_profile_cache_survives_restart_and_rejects_cross_origin_reads() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-network-profile-cache-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xC7; 32];
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x61,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(2),
+        );
+        let mut profile = sample_network_profile(&account, 2);
+        profile.display_name = Some("Restart cache".to_string());
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self(
+                ORIGIN_A,
+                USER_A,
+                &account.locator.identity_key,
+                &account.signing_key,
+            )
+            .unwrap();
+            db.upsert_authenticated_network_profile(&profile, account.signing_key)
+                .unwrap();
+        }
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                db.load_network_profile_for_authenticated_account(
+                    ORIGIN_A,
+                    USER_A,
+                    &account.locator.identity_key,
+                    &account.signing_key,
+                    &account.locator,
+                )
+                .unwrap(),
+                Some(profile.clone())
+            );
+            assert!(db
+                .load_network_profile_for_authenticated_account(
+                    ORIGIN_B,
+                    USER_A,
+                    &account.locator.identity_key,
+                    &account.signing_key,
+                    &account.locator,
+                )
+                .is_err());
+            assert!(db
+                .load_network_profile_for_authenticated_account(
+                    ORIGIN_A,
+                    USER_A,
+                    &[0x62; 32],
+                    &account.signing_key,
+                    &account.locator,
+                )
+                .is_err());
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn local_verification_v2_detects_signing_change_after_restart() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-local-identity-verification-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xC3; 32];
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x53,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x54,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let mut changed_account = account.clone();
+        changed_account.signing_key = test_signing_key(0x56);
+        changed_account.source = AccountSnapshotSource::AuthenticatedHistory;
+        changed_account.observed_at = "2026-07-13T02:11:00Z".to_string();
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self(
+                ORIGIN_A,
+                USER_B,
+                &self_account.locator.identity_key,
+                &self_account.signing_key,
+            )
+            .unwrap();
+            db.upsert_identity_directory(&[self_account.clone(), account.clone()])
+                .unwrap();
+            assert_eq!(
+                db.local_identity_verification(&account.locator).unwrap(),
+                LocalIdentityVerification::NotCompared
+            );
+            db.mark_account_verified_v2(&account.locator, "2026-07-13T02:10:00Z")
+                .unwrap();
+            assert_eq!(
+                db.local_identity_verification(&account.locator).unwrap(),
+                LocalIdentityVerification::VerifiedOnThisDevice
+            );
+            assert!(db
+                .upsert_identity_directory(std::slice::from_ref(&changed_account))
+                .is_err());
+        }
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                db.local_identity_verification(&account.locator).unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+            assert_eq!(
+                db.local_identity_verification_for_unlocked_account(
+                    &self_account.locator.identity_key,
+                    &self_account.signing_key,
+                    &account.locator,
+                )
+                .unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+            assert_eq!(
+                db.local_identity_verification(&changed_account.locator)
+                    .unwrap(),
+                LocalIdentityVerification::IdentityChanged
+            );
+            assert_eq!(
+                db.resolve_account_snapshot(&account.locator).unwrap(),
+                Some(account.clone())
+            );
+            assert_eq!(
+                db.resolve_account_snapshot(&changed_account.locator)
+                    .unwrap(),
+                Some(account.clone())
+            );
+            assert!(db
+                .mark_account_verified_v2(&account.locator, "2026-07-13T02:12:00Z")
+                .is_err());
+            let other_origin = ProfileLocator {
+                canonical_server_origin: ORIGIN_B.to_string(),
+                ..changed_account.locator.clone()
+            };
+            assert_eq!(
+                db.local_identity_verification(&other_origin).unwrap(),
+                LocalIdentityVerification::NotCompared
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn offline_proof_reports_durable_origin_user_key_mismatch_without_seeding_it() {
+        let db = VeilDb::open_memory(&[0xC4; 32]).unwrap();
+        let self_a = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x63,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let mut self_b = self_a.clone();
+        self_b.locator.canonical_server_origin = ORIGIN_B.to_string();
+        self_b.profile_origin = ORIGIN_B.to_string();
+        let peer_a = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x64,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_B,
+            &self_a.locator.identity_key,
+            &self_a.signing_key,
+        )
+        .unwrap();
+        db.bind_authenticated_self(
+            ORIGIN_B,
+            USER_B,
+            &self_b.locator.identity_key,
+            &self_b.signing_key,
+        )
+        .unwrap();
+        db.upsert_identity_directory(&[self_a.clone(), self_b, peer_a.clone()])
+            .unwrap();
+
+        assert_eq!(
+            db.local_identity_verification_for_unlocked_account(
+                &self_a.locator.identity_key,
+                &self_a.signing_key,
+                &peer_a.locator,
+            )
+            .unwrap(),
+            LocalIdentityVerification::NotCompared
+        );
+        let changed_a = ProfileLocator {
+            identity_key: [0x65; 32],
+            ..peer_a.locator.clone()
+        };
+        assert_eq!(
+            db.local_identity_verification_for_unlocked_account(
+                &self_a.locator.identity_key,
+                &self_a.signing_key,
+                &changed_a,
+            )
+            .unwrap(),
+            LocalIdentityVerification::IdentityChanged
+        );
+        assert!(db.resolve_account_snapshot(&changed_a).unwrap().is_none());
+
+        let unknown = ProfileLocator {
+            user_id: "550e8400-e29b-41d4-a716-446655440099".to_string(),
+            identity_key: [0x66; 32],
+            ..peer_a.locator.clone()
+        };
+        assert!(db
+            .local_identity_verification_for_unlocked_account(
+                &self_a.locator.identity_key,
+                &self_a.signing_key,
+                &unknown,
+            )
+            .is_err());
+
+        let cross_origin = ProfileLocator {
+            canonical_server_origin: ORIGIN_B.to_string(),
+            ..changed_a
+        };
+        assert!(db
+            .local_identity_verification_for_unlocked_account(
+                &self_a.locator.identity_key,
+                &self_a.signing_key,
+                &cross_origin,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn local_verification_rejects_the_authenticated_self_identity() {
+        let db = VeilDb::open_memory(&[0xC4; 32]).unwrap();
+        let account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x56,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &account.locator.identity_key,
+            &account.signing_key,
+        )
+        .unwrap();
+        db.upsert_identity_directory(std::slice::from_ref(&account))
+            .unwrap();
+        assert!(db
+            .mark_account_verified_v2(&account.locator, "2026-07-13T02:20:00Z")
+            .is_err());
+        assert_eq!(
+            db.local_identity_verification(&account.locator).unwrap(),
+            LocalIdentityVerification::NotCompared
+        );
+    }
+
+    #[test]
+    fn account_v2_verification_binds_signing_key_and_never_upgrades_v1() {
+        let db = VeilDb::open_memory(&[0xC5; 32]).unwrap();
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x73,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        let peer = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x74,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_B,
+            &self_account.locator.identity_key,
+            &self_account.signing_key,
+        )
+        .unwrap();
+        db.upsert_identity_directory(&[self_account, peer.clone()])
+            .unwrap();
+
+        db.conn
+            .execute_batch(
+                "CREATE TABLE local_identity_verifications_v1 (
+                    canonical_server_origin TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    verified_identity_key BLOB NOT NULL,
+                    verified_at TEXT NOT NULL,
+                    PRIMARY KEY (canonical_server_origin, user_id)
+                 );",
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO local_identity_verifications_v1
+                    (canonical_server_origin, user_id, verified_identity_key, verified_at)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    ORIGIN_A,
+                    USER_A,
+                    peer.locator.identity_key.as_slice(),
+                    "2026-07-13T02:30:00Z",
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            db.local_identity_verification(&peer.locator).unwrap(),
+            LocalIdentityVerification::NotCompared
+        );
+
+        db.mark_account_verified_v2(&peer.locator, "2026-07-13T02:31:00Z")
+            .unwrap();
+        assert_eq!(
+            db.local_identity_verification(&peer.locator).unwrap(),
+            LocalIdentityVerification::VerifiedOnThisDevice
+        );
+        let mut presentation_only = peer.clone();
+        presentation_only.display_name = Some("Renamed presentation".to_string());
+        presentation_only.observed_at = "2026-07-13T02:32:00Z".to_string();
+        db.upsert_identity_directory(std::slice::from_ref(&presentation_only))
+            .unwrap();
+        assert_eq!(
+            db.local_identity_verification(&peer.locator).unwrap(),
+            LocalIdentityVerification::VerifiedOnThisDevice
+        );
+
+        let mut signing_change = peer.clone();
+        signing_change.signing_key = test_signing_key(0x76);
+        signing_change.observed_at = "2026-07-13T02:33:00Z".to_string();
+        assert!(db
+            .upsert_identity_directory(std::slice::from_ref(&signing_change))
+            .is_err());
+        assert_eq!(
+            db.local_identity_verification(&peer.locator).unwrap(),
+            LocalIdentityVerification::IdentityChanged
+        );
+        assert!(db
+            .mark_account_verified_v2(&peer.locator, "2026-07-13T02:34:00Z")
+            .is_err());
+    }
+
+    #[test]
+    fn authoritative_conversation_keeps_conversation_and_peer_ids_distinct() {
+        let db = VeilDb::open_memory(&[0xB4; 32]).unwrap();
+        let conversation_id = "00000000-0000-0000-0000-0000000000c3";
+        let peer_key = [0x51; 32];
+        db.upsert_directory_conversation(
+            conversation_id,
+            0,
+            ORIGIN_A,
+            Some("Peer"),
+            Some(USER_A),
+            Some(&peer_key),
+            None,
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+
+        let stored = db.get_conversations().unwrap().remove(0);
+        assert_eq!(stored.id, conversation_id);
+        assert_eq!(stored.peer_user_id.as_deref(), Some(USER_A));
+        assert_ne!(stored.id, stored.peer_user_id.unwrap());
+        assert_eq!(stored.server_origin.as_deref(), Some(ORIGIN_A));
+
+        assert!(db
+            .upsert_directory_conversation(
+                conversation_id,
+                0,
+                ORIGIN_B,
+                Some("Cross-origin"),
+                Some(USER_A),
+                Some(&peer_key),
+                None,
+                "2026-07-12T12:00:00Z",
+            )
+            .is_err());
+        assert!(db
+            .upsert_directory_conversation(
+                conversation_id,
+                0,
+                ORIGIN_A,
+                Some("Different peer"),
+                Some(USER_B),
+                Some(&peer_key),
+                None,
+                "2026-07-12T12:00:00Z",
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn account_snapshot_validation_rejects_zero_keys_and_cross_origin_profiles() {
+        let db = VeilDb::open_memory(&[0xB5; 32]).unwrap();
+        let mut zero_identity = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x61,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        zero_identity.locator.identity_key = [0; 32];
+        assert!(db.upsert_identity_directory(&[zero_identity]).is_err());
+
+        let mut zero_signing = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x62,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        zero_signing.signing_key = [0; 32];
+        assert!(db.upsert_identity_directory(&[zero_signing]).is_err());
+
+        let mut low_order_signing = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x64,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        low_order_signing.signing_key = [0; 32];
+        low_order_signing.signing_key[0] = 1;
+        assert!(db
+            .upsert_identity_directory(std::slice::from_ref(&low_order_signing))
+            .is_err());
+        assert!(db
+            .bind_authenticated_self(
+                ORIGIN_A,
+                USER_A,
+                &low_order_signing.locator.identity_key,
+                &low_order_signing.signing_key,
+            )
+            .is_err());
+
+        let mut cross_origin = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x63,
+            AccountSnapshotSource::AuthenticatedHistory,
+            None,
+        );
+        cross_origin.profile_origin = ORIGIN_B.to_string();
+        assert!(db.upsert_identity_directory(&[cross_origin]).is_err());
+    }
+
+    #[test]
+    fn author_attach_requires_exact_sender_and_scoped_conversation() {
+        let db = VeilDb::open_memory(&[0xB6; 32]).unwrap();
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x71,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.insert_conversation(
+            "legacy-author",
+            0,
+            None,
+            Some(&author.locator.identity_key),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            "legacy-message",
+            "legacy-author",
+            &author.locator.identity_key,
+            "legacy",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert!(db.attach_message_author("legacy-message", &author).is_err());
+        assert!(db
+            .resolve_account_snapshot(&author.locator)
+            .unwrap()
+            .is_none());
+        assert!(db.get_messages("legacy-author", 10).unwrap()[0]
+            .author
+            .is_none());
+
+        db.upsert_directory_conversation(
+            "scoped-author",
+            0,
+            ORIGIN_A,
+            Some("Peer"),
+            Some(USER_A),
+            Some(&author.locator.identity_key),
+            None,
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "wrong-sender-message",
+            "scoped-author",
+            &[0x72; 32],
+            "wrong sender",
+            false,
+            Some(2),
+            None,
+        )
+        .unwrap();
+        assert!(db
+            .attach_message_author("wrong-sender-message", &author)
+            .is_err());
+        assert!(db
+            .resolve_account_snapshot(&author.locator)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn message_author_context_is_separate_from_authority_and_immutable_per_message() {
+        let db = VeilDb::open_memory(&[0xBC; 32]).unwrap();
+        let directory_author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x75,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(4),
+        );
+        db.upsert_identity_directory(std::slice::from_ref(&directory_author))
+            .unwrap();
+        db.upsert_directory_conversation(
+            "author-context-conversation",
+            1,
+            ORIGIN_A,
+            Some("Context group"),
+            None,
+            None,
+            None,
+            "2026-07-13T13:00:00Z",
+        )
+        .unwrap();
+
+        db.insert_message(
+            "former-author-message",
+            "author-context-conversation",
+            &directory_author.locator.identity_key,
+            "restored history",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        db.attach_message_author_with_context(
+            "former-author-message",
+            &directory_author,
+            MessageAuthorContext::FormerMemberAtObservation,
+        )
+        .unwrap();
+
+        let former = db
+            .get_messages("author-context-conversation", 10)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            former.author.as_ref().map(|author| author.source),
+            Some(AccountSnapshotSource::AuthenticatedConversationDirectory),
+            "presentation authority must not be downgraded by history",
+        );
+        assert_eq!(
+            former.author_context,
+            Some(MessageAuthorContext::FormerMemberAtObservation),
+        );
+
+        // A later directory replay cannot rewrite the immutable provenance of
+        // an already-committed historical message.
+        db.attach_message_author_with_context(
+            "former-author-message",
+            &directory_author,
+            MessageAuthorContext::DirectoryMemberAtObservation,
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_messages("author-context-conversation", 10).unwrap()[0].author_context,
+            Some(MessageAuthorContext::FormerMemberAtObservation),
+        );
+
+        // A new message observed after the account is present again receives
+        // the current-directory context without rewriting the older message.
+        db.insert_message(
+            "rejoined-author-message",
+            "author-context-conversation",
+            &directory_author.locator.identity_key,
+            "after rejoin",
+            false,
+            Some(2),
+            None,
+        )
+        .unwrap();
+        db.attach_message_author("rejoined-author-message", &directory_author)
+            .unwrap();
+        let messages = db.get_messages("author-context-conversation", 10).unwrap();
+        assert_eq!(
+            messages[0].author_context,
+            Some(MessageAuthorContext::FormerMemberAtObservation)
+        );
+        assert_eq!(
+            messages[1].author_context,
+            Some(MessageAuthorContext::DirectoryMemberAtObservation)
+        );
+    }
+
+    #[test]
+    fn author_snapshot_survives_a_file_backed_sqlcipher_restart() {
+        let path =
+            std::env::temp_dir().join(format!("veil-author-snapshot-{}.db", uuid::Uuid::new_v4()));
+        let db_key = [0xB7; 32];
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x81,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(7),
+        );
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.upsert_directory_conversation(
+                "restart-author-conversation",
+                0,
+                ORIGIN_A,
+                Some("Peer"),
+                Some(USER_A),
+                Some(&author.locator.identity_key),
+                None,
+                "2026-07-12T12:00:00Z",
+            )
+            .unwrap();
+            db.insert_message(
+                "restart-author-message",
+                "restart-author-conversation",
+                &author.locator.identity_key,
+                "persisted author",
+                false,
+                Some(10),
+                None,
+            )
+            .unwrap();
+            db.attach_message_author("restart-author-message", &author)
+                .unwrap();
+            db.attach_message_author("restart-author-message", &author)
+                .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            let message = reopened
+                .get_messages("restart-author-conversation", 10)
+                .unwrap()
+                .remove(0);
+            assert_eq!(message.author, Some(author));
+            assert_eq!(
+                message.author_context,
+                Some(MessageAuthorContext::DirectoryMemberAtObservation)
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn search_hydration_is_exact_message_conversation_and_origin_scoped() {
+        let db = VeilDb::open_memory(&[0xBA; 32]).unwrap();
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x83,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(9),
+        );
+        db.upsert_directory_conversation(
+            "search-author-conversation",
+            1,
+            ORIGIN_A,
+            Some("Search group"),
+            None,
+            None,
+            None,
+            "2026-07-13T12:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "search-author-message",
+            "search-author-conversation",
+            &author.locator.identity_key,
+            "origin scoped search",
+            false,
+            Some(42),
+            None,
+        )
+        .unwrap();
+        db.attach_message_author("search-author-message", &author)
+            .unwrap();
+
+        let loaded = db
+            .get_message_for_search(
+                "search-author-message",
+                "search-author-conversation",
+                ORIGIN_A,
+            )
+            .unwrap()
+            .expect("exact search row must resolve");
+        assert_eq!(loaded.author, Some(author));
+        assert_eq!(
+            loaded.author_context,
+            Some(MessageAuthorContext::DirectoryMemberAtObservation)
+        );
+        assert!(db
+            .get_message_for_search("search-author-message", "different-conversation", ORIGIN_A,)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_message_for_search(
+                "search-author-message",
+                "search-author-conversation",
+                ORIGIN_B,
+            )
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn outgoing_ack_cascades_the_author_snapshot_to_the_server_uuid() {
+        let db = VeilDb::open_memory(&[0xB8; 32]).unwrap();
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x91,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.upsert_directory_conversation(
+            "author-ack-conversation",
+            1,
+            ORIGIN_A,
+            Some("Group"),
+            None,
+            None,
+            None,
+            "2026-07-12T12:00:00Z",
+        )
+        .unwrap();
+        db.insert_outgoing_pending_message(
+            "local-author-id",
+            "author-ack-conversation",
+            &author.locator.identity_key,
+            "pending",
+            None,
+        )
+        .unwrap();
+        db.attach_message_author("local-author-id", &author)
+            .unwrap();
+        db.acknowledge_outgoing_message("local-author-id", "server-author-id", 123)
+            .unwrap();
+
+        assert!(load_message_author(&db.conn, "local-author-id")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            load_message_author(&db.conn, "server-author-id").unwrap(),
+            Some(author.clone())
+        );
+        assert_eq!(
+            db.get_messages("author-ack-conversation", 10).unwrap()[0].author,
+            Some(author)
+        );
+        assert_eq!(
+            db.get_messages("author-ack-conversation", 10).unwrap()[0].author_context,
+            Some(MessageAuthorContext::DirectoryMemberAtObservation)
+        );
+    }
+
+    #[test]
+    fn conversation_identity_schema_upgrade_is_idempotent_and_does_not_guess_legacy_scope() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE conversations (
+                id TEXT PRIMARY KEY,
+                conv_type INTEGER NOT NULL,
+                peer_identity_key BLOB,
+                server_id TEXT,
+                name TEXT,
+                last_message_at TEXT,
+                created_at TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO conversations (id, conv_type, name)
+             VALUES ('legacy-unscoped', 1, 'Legacy');",
+        )
+        .unwrap();
+        let db = VeilDb { conn };
+        db.run_migrations().unwrap();
+        db.run_migrations().unwrap();
+
+        let columns: (bool, bool) = db
+            .conn
+            .query_row(
+                "SELECT
+                    EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='server_origin'),
+                    EXISTS(SELECT 1 FROM pragma_table_info('conversations') WHERE name='peer_user_id')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(columns, (true, true));
+        let legacy = db.get_conversations().unwrap().remove(0);
+        assert!(legacy.server_origin.is_none());
+        assert!(legacy.peer_user_id.is_none());
+
+        db.insert_message(
+            "legacy-history-message",
+            "legacy-unscoped",
+            &[0xA1; 32],
+            "legacy history must keep its unknown origin",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        assert!(db
+            .upsert_directory_conversation(
+                "legacy-unscoped",
+                1,
+                ORIGIN_B,
+                Some("Attempted adoption"),
+                None,
+                None,
+                None,
+                "2026-07-12T12:00:00Z",
+            )
+            .is_err());
+        let legacy_after = db.get_conversations().unwrap().remove(0);
+        assert!(legacy_after.server_origin.is_none());
+        assert_eq!(db.get_messages("legacy-unscoped", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn message_exists_supports_replay_safe_offline_sync() {
+        let db = VeilDb::open_memory(&[12u8; 32]).unwrap();
+        db.insert_conversation("sync-conv", 1, Some("Group"), None, None)
+            .unwrap();
+        assert!(!db.message_exists("server-message").unwrap());
+        db.insert_message(
+            "server-message",
+            "sync-conv",
+            &[6u8; 32],
+            "hello",
+            false,
+            Some(123),
+            None,
+        )
+        .unwrap();
+        assert!(db.message_exists("server-message").unwrap());
+        assert_eq!(
+            db.get_messages("sync-conv", 10).unwrap()[0].status,
+            crate::models::MessageStatus::Delivered
+        );
+
+        // Opening a pre-fix database normalizes legacy incoming status=0.
+        db.conn
+            .execute(
+                "UPDATE messages SET status = 0 WHERE id = 'server-message'",
+                [],
+            )
+            .unwrap();
+        db.run_migrations().unwrap();
+        assert_eq!(
+            db.get_messages("sync-conv", 10).unwrap()[0].status,
+            crate::models::MessageStatus::Delivered
+        );
+    }
+
+    #[test]
+    fn remote_revisions_and_reactions_reconcile_authoritatively() {
+        use crate::models::{RemoteMessageStateKind, RemoteReaction};
+
+        let db = VeilDb::open_memory(&[13u8; 32]).unwrap();
+        db.insert_conversation("remote-conv", 0, None, Some(&[8u8; 32]), None)
+            .unwrap();
+        db.insert_message(
+            "remote-message",
+            "remote-conv",
+            &[8u8; 32],
+            "hello",
+            false,
+            Some(100),
+            None,
+        )
+        .unwrap();
+        db.record_remote_message_state(
+            "remote-message",
+            "remote-conv",
+            &[8u8; 32],
+            100,
+            RemoteMessageStateKind::Active,
+        )
+        .unwrap();
+        db.replace_message_reactions(
+            "remote-message",
+            &[
+                RemoteReaction {
+                    emoji: "👍".to_string(),
+                    user_id: "u1".to_string(),
+                    username: "Alice".to_string(),
+                },
+                RemoteReaction {
+                    emoji: "🔥".to_string(),
+                    user_id: "u2".to_string(),
+                    username: "Bob".to_string(),
+                },
+            ],
+        )
+        .unwrap();
+        assert_eq!(db.get_reactions("remote-message").unwrap().len(), 2);
+        db.replace_message_reactions(
+            "remote-message",
+            &[RemoteReaction {
+                emoji: "👍".to_string(),
+                user_id: "u1".to_string(),
+                username: "Alice".to_string(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(db.get_reactions("remote-message").unwrap().len(), 1);
+        assert!(db
+            .record_remote_message_state(
+                "remote-message",
+                "other-conv",
+                &[8u8; 32],
+                101,
+                RemoteMessageStateKind::Active,
+            )
+            .is_err());
+        assert!(db
+            .record_remote_message_state(
+                "remote-message",
+                "remote-conv",
+                &[8u8; 32],
+                99,
+                RemoteMessageStateKind::Active,
+            )
+            .is_err());
+        db.record_remote_message_state(
+            "remote-message",
+            "remote-conv",
+            &[8u8; 32],
+            100,
+            RemoteMessageStateKind::Expired,
+        )
+        .unwrap();
+        assert!(db
+            .record_remote_message_state(
+                "remote-message",
+                "remote-conv",
+                &[8u8; 32],
+                100,
+                RemoteMessageStateKind::Active,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn failed_open_never_deletes_or_replaces_existing_file() {
+        let path =
+            std::env::temp_dir().join(format!("veil-preserve-db-{}.db", uuid::Uuid::new_v4()));
+        let original = b"existing encrypted or corrupt user data";
+        std::fs::write(&path, original).unwrap();
+
+        assert!(VeilDb::open(&path, &[42u8; 32]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn file_database_uses_full_wal_durability_for_crypto_state() {
+        let path =
+            std::env::temp_dir().join(format!("veil-durable-db-{}.db", uuid::Uuid::new_v4()));
+        let db = VeilDb::open(&path, &[43u8; 32]).unwrap();
+        let journal_mode: String = db
+            .conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        let synchronous: i64 = db
+            .conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        assert_eq!(synchronous, 2, "SQLite FULL synchronous mode is 2");
+        drop(db);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn initial_ratchet_commit_atomically_consumes_otk_secret() {
+        let db = VeilDb::open_memory(&[8u8; 32]).unwrap();
+        db.save_local_prekeys(&[
+            LocalPreKey {
+                key_type: 0,
+                protocol_key_id: 3,
+                secret_key: [10u8; 32],
+                public_key: [11u8; 32],
+                signature: Some([12u8; 64]),
+            },
+            LocalPreKey {
+                key_type: 1,
+                protocol_key_id: 9,
+                secret_key: [20u8; 32],
+                public_key: [21u8; 32],
+                signature: None,
+            },
+        ])
+        .unwrap();
+        assert_eq!(db.max_local_prekey_id(0).unwrap(), 3);
+        assert_eq!(db.max_local_prekey_id(1).unwrap(), 9);
+        assert_eq!(db.load_local_prekeys().unwrap().len(), 2);
+
+        let peer = [30u8; 32];
+        db.commit_initial_ratchet_session(&peer, b"ratchet-one", Some(9))
+            .unwrap();
+        let remaining = db.load_local_prekeys().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].key_type, 0);
+        assert_eq!(
+            db.load_ratchet_session(&peer).unwrap().unwrap(),
+            b"ratchet-one"
+        );
+        let erased: (Option<Vec<u8>>, u8) = db
+            .conn
+            .query_row(
+                "SELECT secret_key, consumed FROM local_prekeys
+                 WHERE key_type = 1 AND protocol_key_id = 9",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(erased.0.is_none());
+        assert_eq!(erased.1, 1);
+
+        // Reusing the OTK fails and rolls back the attempted session update.
+        assert!(db
+            .commit_initial_ratchet_session(&peer, b"ratchet-two", Some(9))
+            .is_err());
+        assert_eq!(
+            db.load_ratchet_session(&peer).unwrap().unwrap(),
+            b"ratchet-one"
+        );
     }
 }

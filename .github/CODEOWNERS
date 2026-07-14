@@ -1,0 +1,10 @@
+# Keep review ownership explicit as the maintainer team grows.
+* @NaveLIL
+
+# Supply-chain and deployment changes always stay visible to the project owner.
+/.github/ @NaveLIL
+/deploy/ @NaveLIL
+/veil-server/Dockerfile @NaveLIL
+/Cargo.lock @NaveLIL
+/veil-desktop/pnpm-lock.yaml @NaveLIL
+/veil-mobile/pnpm-lock.yaml @NaveLIL

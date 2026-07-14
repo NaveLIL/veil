@@ -1,42 +1,63 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: veil
       POSTGRES_USER: veil
-      POSTGRES_PASSWORD: veildev
-    ports:
-      - "5433:5432"
+      POSTGRES_PASSWORD: "${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in .env}"
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./veil-server/migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U veil"]
+      test: ["CMD-SHELL", "pg_isready -U veil -d veil"]
       interval: 5s
       timeout: 3s
       retries: 5
 
+  migrate:
+    image: postgres:16-alpine
+    restart: "no"
+    environment:
+      DATABASE_URL: "postgres://veil:${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in .env}@postgres:5432/veil?sslmode=disable"
+    volumes:
+      - ./veil-server/migrations:/migrations:ro
+      - ./scripts/apply-migrations.sh:/usr/local/bin/apply-migrations:ro
+    entrypoint: ["/bin/sh", "/usr/local/bin/apply-migrations"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   gateway:
     build:
-      context: ./veil-server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: veil-server/Dockerfile
+      args:
+        VEIL_BUILD_COMMIT: "${VEIL_BUILD_COMMIT:-development}"
+    restart: unless-stopped
     ports:
-      - "9080:8080"
+      - "127.0.0.1:9080:8080"
     environment:
       PORT: "8080"
-      DATABASE_URL: "postgres://veil:veildev@postgres:5432/veil?sslmode=disable"
-      VEIL_WS_ORIGINS:           "${VEIL_WS_ORIGINS:-*}"
+      DATABASE_URL: "postgres://veil:${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in .env}@postgres:5432/veil?sslmode=disable"
+      VEIL_WS_ORIGINS:           "${VEIL_WS_ORIGINS:?set VEIL_WS_ORIGINS in .env}"
+      VEIL_CORS_ORIGINS:         "${VEIL_CORS_ORIGINS:-}"
       VEIL_WS_MAX_CONNS_PER_IP:  "${VEIL_WS_MAX_CONNS_PER_IP:-64}"
-      # Phase 4 — UnifiedPush + ntfy. Generate a 32-byte key with:
-      #   openssl rand -base64 32
-      # then set VEIL_PUSH_TRANSPORT_KEY in your .env so the dispatcher
-      # boots in enabled mode. Leaving it empty disables push delivery
-      # (subscribe/list/delete endpoints stay reachable).
-      VEIL_PUSH_TRANSPORT_KEY: "${VEIL_PUSH_TRANSPORT_KEY:-}"
-      VEIL_PUSH_HASH_SALT:     "${VEIL_PUSH_HASH_SALT:-veil/push/v1}"
+      VEIL_ALLOW_REGISTRATION:    "${VEIL_ALLOW_REGISTRATION:-true}"
+      VEIL_SOURCE_REVISION:      "${VEIL_SOURCE_REVISION:-}"
+      VEIL_SOURCE_ARCHIVE_URL:   "${VEIL_SOURCE_ARCHIVE_URL:-}"
+      VEIL_SOURCE_BROWSE_URL:    "${VEIL_SOURCE_BROWSE_URL:-}"
+      # Compose traffic may arrive through the bundled Caddy proxy. Outside
+      # this topology the application default remains false/fail-closed.
+      VEIL_TRUST_PROXY_HEADERS:  "${VEIL_TRUST_PROXY_HEADERS:-true}"
+      # Phase 4P — RFC 8291 Web Push + VAPID. Generate the private key with:
+      #   cd veil-server && go run ./cmd/vapid-keygen
+      # Registration and delivery fail closed while either value is absent.
+      VEIL_PUSH_VAPID_PRIVATE_KEY: "${VEIL_PUSH_VAPID_PRIVATE_KEY:-}"
+      VEIL_PUSH_VAPID_SUBJECT:     "${VEIL_PUSH_VAPID_SUBJECT:-}"
       VEIL_PUSH_JITTER_MS:     "${VEIL_PUSH_JITTER_MS:-2000}"
+      # Exact private origin only; paths under ntfy are allowed, neighboring
+      # containers/private IPs remain blocked by the SSRF policy.
+      VEIL_PUSH_ALLOWED_PRIVATE_ORIGINS: "${VEIL_PUSH_ALLOWED_PRIVATE_ORIGINS:-http://ntfy:80}"
       # Phase 3 — tus.io resumable encrypted uploads. Generate the
       # bearer-token HMAC key with:
       #   openssl rand -base64 32
@@ -53,23 +74,33 @@ services:
     volumes:
       - uploadsdata:/var/veil/uploads
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
   # Self-hosted UnifiedPush distributor. Mobile clients can register
-  # against http://<your-host>:9081/<topic> and the gateway POSTs the
-  # encrypted envelope there. Operators who prefer ntfy.sh can drop
+  # against http://<your-host>:9081/<up-topic> and the gateway POSTs RFC 8291
+  # encrypted Web Push records there. Operators who prefer ntfy.sh can drop
   # this service and point clients at the public instance.
   ntfy:
-    image: binwiederhier/ntfy:v2.11.0
+    image: binwiederhier/ntfy:v2.23.0
+    restart: unless-stopped
     command: serve
     ports:
-      - "9081:80"
+      - "127.0.0.1:9081:80"
     environment:
       NTFY_BASE_URL: "http://localhost:9081"
       NTFY_BEHIND_PROXY: "false"
       NTFY_AUTH_FILE: "/var/lib/ntfy/user.db"
       NTFY_AUTH_DEFAULT_ACCESS: "deny-all"
+      # UnifiedPush endpoints are random bearer capabilities under up*.
+      # Other ntfy topics remain private/denied.
+      NTFY_AUTH_ACCESS: "*:up*:rw"
       NTFY_CACHE_FILE: "/var/lib/ntfy/cache.db"
       NTFY_ATTACHMENT_CACHE_DIR: "/var/lib/ntfy/attachments"
     volumes:
@@ -77,7 +108,7 @@ services:
 
   # Опциональный reverse-proxy для публичного домена с автоматическим
   # TLS (Let's Encrypt). Включается через профиль:
-  #   VEIL_PUBLIC_HOST=secret.erez.pro VEIL_TLS_EMAIL=admin@example.com \
+  #   VEIL_PUBLIC_HOST=veil.erez.pro VEIL_TLS_EMAIL=admin@example.com \
   #     docker compose --profile proxy up -d
   # Без VEIL_PUBLIC_HOST смысла поднимать нет — gateway уже доступен
   # на :9080 для локальной разработки.
@@ -97,7 +128,8 @@ services:
       - caddydata:/data
       - caddyconfig:/config
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
 
 volumes:
   pgdata:

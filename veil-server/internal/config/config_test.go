@@ -1,21 +1,32 @@
 package config_test
 
 import (
-	"os"
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/config"
 )
 
-func TestLoadDefaults(t *testing.T) {
-	// Unset all env vars to test defaults
-	os.Unsetenv("PORT")
-	os.Unsetenv("DATABASE_URL")
-	os.Unsetenv("AUTH_CHALLENGE_TTL")
-	os.Unsetenv("AUTH_MAX_ATTEMPTS")
+func TestLoadRequiresDatabaseURL(t *testing.T) {
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("VEIL_ALLOW_INSECURE_DEV_DATABASE", "")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load succeeded without DATABASE_URL or explicit dev opt-in")
+	}
+}
 
-	cfg := config.Load()
+func TestLoadDefaultsWithExplicitDevOptIn(t *testing.T) {
+	t.Setenv("PORT", "")
+	t.Setenv("DATABASE_URL", "")
+	t.Setenv("VEIL_ALLOW_INSECURE_DEV_DATABASE", "1")
+	t.Setenv("AUTH_CHALLENGE_TTL", "")
+	t.Setenv("AUTH_MAX_ATTEMPTS", "")
+	t.Setenv("VEIL_ALLOW_REGISTRATION", "")
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if cfg.Port != "8080" {
 		t.Errorf("default Port = %q, want %q", cfg.Port, "8080")
@@ -26,22 +37,29 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.AuthMaxAttempts != 3 {
 		t.Errorf("default AuthMaxAttempts = %d, want 3", cfg.AuthMaxAttempts)
 	}
+	if cfg.AllowRegistration {
+		t.Error("default AllowRegistration = true, want fail-closed false")
+	}
 	if cfg.MaxMessageSize != 64*1024 {
 		t.Errorf("default MaxMessageSize = %d, want %d", cfg.MaxMessageSize, 64*1024)
+	}
+	if cfg.DatabaseURL != "postgres://veil:veil@localhost:5432/veil?sslmode=disable" {
+		t.Errorf("unexpected explicit dev DatabaseURL %q", cfg.DatabaseURL)
 	}
 }
 
 func TestLoadFromEnv(t *testing.T) {
-	os.Setenv("PORT", "9090")
-	os.Setenv("AUTH_CHALLENGE_TTL", "1m")
-	os.Setenv("AUTH_MAX_ATTEMPTS", "5")
-	defer func() {
-		os.Unsetenv("PORT")
-		os.Unsetenv("AUTH_CHALLENGE_TTL")
-		os.Unsetenv("AUTH_MAX_ATTEMPTS")
-	}()
+	t.Setenv("DATABASE_URL", "postgresql://app:secret@db.internal:5432/veil_prod?sslmode=require")
+	t.Setenv("VEIL_ALLOW_INSECURE_DEV_DATABASE", "")
+	t.Setenv("PORT", "9090")
+	t.Setenv("AUTH_CHALLENGE_TTL", "1m")
+	t.Setenv("AUTH_MAX_ATTEMPTS", "5")
+	t.Setenv("VEIL_ALLOW_REGISTRATION", "true")
 
-	cfg := config.Load()
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	if cfg.Port != "9090" {
 		t.Errorf("Port = %q, want %q", cfg.Port, "9090")
@@ -51,5 +69,33 @@ func TestLoadFromEnv(t *testing.T) {
 	}
 	if cfg.AuthMaxAttempts != 5 {
 		t.Errorf("AuthMaxAttempts = %d, want 5", cfg.AuthMaxAttempts)
+	}
+	if !cfg.AllowRegistration {
+		t.Error("AllowRegistration = false, want true")
+	}
+}
+
+func TestLoadRejectsMalformedRegistrationFlag(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgresql://app:secret@db.internal:5432/veil_prod?sslmode=require")
+	t.Setenv("VEIL_ALLOW_REGISTRATION", "sometimes")
+	if _, err := config.Load(); err == nil {
+		t.Fatal("Load accepted malformed VEIL_ALLOW_REGISTRATION")
+	}
+}
+
+func TestLoadRejectsMalformedDatabaseURL(t *testing.T) {
+	t.Setenv("VEIL_ALLOW_INSECURE_DEV_DATABASE", "")
+	for _, value := range []string{
+		"mysql://db.internal/veil",
+		"postgres:///veil",
+		"postgres://db.internal",
+		" postgres://db.internal/veil",
+	} {
+		t.Run(value, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", value)
+			if _, err := config.Load(); err == nil {
+				t.Fatalf("Load accepted malformed DATABASE_URL %q", value)
+			}
+		})
 	}
 }

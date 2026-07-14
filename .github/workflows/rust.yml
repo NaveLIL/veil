@@ -7,10 +7,15 @@ on:
       - "veil-crypto/**"
       - "veil-store/**"
       - "veil-client/**"
+      - "veil-uploads/**"
+      - "veil-search/**"
+      - "veil-mls/**"
       - "veil-ffi/**"
       - "veil-desktop/src-tauri/**"
       - "veil-share-viewer/**"
+      - "veil-proto/**"
       - "Cargo.toml"
+      - "Cargo.lock"
       - ".github/workflows/rust.yml"
   pull_request:
     branches: [master, main]
@@ -18,10 +23,19 @@ on:
       - "veil-crypto/**"
       - "veil-store/**"
       - "veil-client/**"
+      - "veil-uploads/**"
+      - "veil-search/**"
+      - "veil-mls/**"
       - "veil-ffi/**"
       - "veil-desktop/src-tauri/**"
       - "veil-share-viewer/**"
+      - "veil-proto/**"
       - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/rust.yml"
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -34,17 +48,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/bin/
@@ -59,7 +73,29 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev
+          sudo apt-get install -y \
+            libayatana-appindicator3-dev \
+            libsecret-1-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            protobuf-compiler
+          protoc --version
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf
+          protoc --version
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
+            choco install protoc --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          protoc --version
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -76,6 +112,10 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo build --workspace
 
+      - name: Clippy (all targets, Windows)
+        if: runner.os == 'Windows'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
       - name: Build workspace (macOS — exclude desktop)
         if: runner.os == 'macOS'
         run: cargo build --workspace --exclude veil-desktop
@@ -86,9 +126,19 @@ jobs:
         env:
           RUST_BACKTRACE: 1
 
+      - name: Build workspace (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --workspace
+
       - name: Run tests (macOS — exclude desktop)
         if: runner.os == 'macOS'
         run: cargo test --workspace --exclude veil-desktop -- --nocapture
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Run tests (Windows)
+        if: runner.os == 'Windows'
+        run: cargo test --workspace -- --nocapture
         env:
           RUST_BACKTRACE: 1
 
@@ -96,15 +146,15 @@ jobs:
     name: WASM Build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Install Rust + wasm32 target
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry/
@@ -119,8 +169,8 @@ jobs:
     name: Benchmarks (check only)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Build benchmarks (no run)
         run: cargo bench -p veil-crypto --no-run

@@ -11,3 +11,21 @@ members = [
     "veil-mls",
 ]
 resolver = "2"
+
+[workspace.package]
+authors = ["NaveLIL"]
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/NaveLIL/veil"
+homepage = "https://veil.erez.pro"
+publish = false
+
+[patch.crates-io]
+# OpenMLS keeps its unused `libcrux-provider` backend in Cargo.lock even when
+# default features are disabled.  The latest crates.io release still pins the
+# vulnerable libcrux-aead 0.0.7 (RUSTSEC-2026-0124); upstream has already
+# updated it to 0.0.8.  Pin the reviewed upstream revision until the next
+# hpke-rs-libcrux release is published.
+hpke-rs-libcrux = { git = "https://github.com/celabshq/hpke-rs", rev = "654df20e5c2e6657f0ac17f2a903f179bb97a5ae" }
+
+[profile.release.package.veil-share-viewer]
+opt-level = "s"

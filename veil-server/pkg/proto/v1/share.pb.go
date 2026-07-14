@@ -188,7 +188,7 @@ const file_veil_v1_share_proto_rawDesc = "" +
 	"\bshare_id\x18\x01 \x01(\tR\ashareId\x12\x10\n" +
 	"\x03url\x18\x02 \x01(\tR\x03url\x12\x1d\n" +
 	"\n" +
-	"expires_at\x18\x03 \x01(\x04R\texpiresAtB.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"expires_at\x18\x03 \x01(\x04R\texpiresAtB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_share_proto_rawDescOnce sync.Once

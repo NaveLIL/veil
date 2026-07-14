@@ -2,11 +2,15 @@
 name = "veil-search"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 description = "Local-only Tantivy full-text index for decrypted Veil messages"
 
 [dependencies]
-tantivy = "0.22"
+tantivy = "0.26.1"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 thiserror = "1"

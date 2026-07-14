@@ -3,6 +3,7 @@ package httpmw
 import (
 	"bufio"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
@@ -10,17 +11,35 @@ import (
 	"strings"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/metrics"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
+	"github.com/NaveLIL/veil/veil-server/internal/metrics"
 )
 
 // AccessLog wraps an http.Handler and emits one structured log line per
 // request after it completes. The log line includes the HTTP method, path,
-// status code, response size, duration, client IP and the authenticated
-// user ID (if any). Useful both for forensic audit and perf debugging.
+// status code, response size, duration, and short-lived pseudonymous
+// correlation references for the client IP and authenticated user (if any).
+// Raw stable identifiers are deliberately excluded from access logs.
 //
 // The middleware reads X-User-ID after the inner handler has run, so it
 // captures the value set by authmw.RequireSigned on success.
 func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
+	return accessLog(logger, logsafe.Ref)
+}
+
+// AccessLogWithPseudonymSecret is identical to AccessLog but accepts an
+// explicit 32-byte process secret. It exists for deterministic tests and for
+// deployments that need same-day correlation across rolling gateway workers.
+// The secret itself must come from a secret manager and must never be logged.
+func AccessLogWithPseudonymSecret(logger *slog.Logger, secret []byte) func(http.Handler) http.Handler {
+	pseudonyms, err := logsafe.New(secret)
+	if err != nil {
+		panic(fmt.Errorf("httpmw: initialize pseudonymizer: %w", err))
+	}
+	return accessLog(logger, pseudonyms.Ref)
+}
+
+func accessLog(logger *slog.Logger, pseudonymize func(domain, raw string) string) func(http.Handler) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -31,26 +50,23 @@ func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 			next.ServeHTTP(rw, r)
 			dur := time.Since(start)
 
-			user := r.Header.Get("X-User-ID")
-			if user == "" {
-				user = "-"
-			}
+			userRef := pseudonymize("user", r.Header.Get("X-User-ID"))
+			ipRef := pseudonymize("ip", clientIP(r))
+			pathLabel := routeTemplate(r)
 			logger.Info("http",
 				slog.String("method", r.Method),
-				slog.String("path", r.URL.Path),
+				slog.String("path", pathLabel),
 				slog.Int("status", rw.status),
 				slog.Int("bytes", rw.bytes),
 				slog.String("dur", dur.String()),
 				slog.String("dur_ms", strconv.FormatInt(dur.Milliseconds(), 10)),
-				slog.String("user", user),
-				slog.String("ip", clientIP(r)),
+				slog.String("user_ref", userRef),
+				slog.String("ip_ref", ipRef),
 			)
 
-			// Prometheus: use the matched route template (e.g.
-			// "/v1/servers/{serverID}") instead of the raw URL so id-bearing
-			// paths do not blow up label cardinality. Falls back to URL.Path
-			// for routes not registered on the mux (e.g. /metrics, /health).
-			pathLabel := routeTemplate(r)
+			// The same bounded template is used for metrics and logs so neither
+			// surface receives raw path parameters or attacker-controlled label
+			// cardinality.
 			metrics.ObserveHTTP(r.Method, pathLabel, rw.status, dur)
 		})
 	}
@@ -58,12 +74,17 @@ func AccessLog(logger *slog.Logger) func(http.Handler) http.Handler {
 
 // routeTemplate returns the matched ServeMux pattern stripped of its
 // HTTP-method prefix (e.g. "GET /v1/servers/{id}" → "/v1/servers/{id}").
-// Falls back to r.URL.Path when no pattern is available so /metrics and
-// /health still produce stable labels.
+// Only fixed operational endpoints are allowed as an unmatched fallback.
+// Every other unmatched path is collapsed to one non-sensitive label.
 func routeTemplate(r *http.Request) string {
 	p := r.Pattern
 	if p == "" {
-		return r.URL.Path
+		switch r.URL.Path {
+		case "/health", "/metrics":
+			return r.URL.Path
+		default:
+			return "<unmatched>"
+		}
 	}
 	if i := strings.IndexByte(p, ' '); i >= 0 {
 		p = p[i+1:]

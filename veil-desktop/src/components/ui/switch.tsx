@@ -17,12 +17,12 @@ interface Props {
   label?: string;
   description?: string;
   disabled?: boolean;
-  /** Accent colour when on. Defaults to purple primary. */
+  /** Accent colour when on. Defaults to the active theme accent. */
   accent?: string;
 }
 
 export const Switch: Component<Props> = (props) => {
-  const accent = () => props.accent ?? "#7c6bf5";
+  const accent = () => props.accent ?? "var(--veil-accent)";
 
   return (
     <KSwitch
@@ -46,7 +46,7 @@ export const Switch: Component<Props> = (props) => {
               style={{
                 "font-size": "13px",
                 "font-weight": "500",
-                color: "#ddd",
+                color: "var(--veil-text)",
                 cursor: "inherit",
               }}
             >
@@ -57,7 +57,7 @@ export const Switch: Component<Props> = (props) => {
             <KSwitch.Description
               style={{
                 "font-size": "12px",
-                color: "#888",
+                color: "var(--veil-text-muted)",
                 "line-height": "1.45",
               }}
             >
@@ -74,8 +74,8 @@ export const Switch: Component<Props> = (props) => {
             width: "34px",
             height: "20px",
             "border-radius": "999px",
-            background: props.checked ? accent() : "rgba(255,255,255,0.08)",
-            border: `1px solid ${props.checked ? accent() : "rgba(255,255,255,0.06)"}`,
+            background: props.checked ? accent() : "color-mix(in srgb, var(--veil-text-strong) 8%, transparent)",
+            border: `1px solid ${props.checked ? accent() : "var(--veil-border)"}`,
             transition: "background 0.18s, border-color 0.18s",
             "flex-shrink": "0",
             cursor: "inherit",
@@ -90,8 +90,8 @@ export const Switch: Component<Props> = (props) => {
             width: "14px",
             height: "14px",
             "border-radius": "999px",
-            background: "#fff",
-            "box-shadow": "0 2px 4px rgba(0,0,0,0.35)",
+            background: "var(--veil-on-accent)",
+            "box-shadow": "0 2px 4px var(--veil-shadow-soft)",
             transition: "left 0.18s",
           }}
         />

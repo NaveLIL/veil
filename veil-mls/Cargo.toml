@@ -2,7 +2,11 @@
 name = "veil-mls"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 description = "OpenMLS (RFC 9420) wrapper for Veil — Phase 6 group E2EE."
 
 [dependencies]

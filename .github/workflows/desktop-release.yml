@@ -1,0 +1,691 @@
+name: Desktop Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  VITE_VEIL_WS_URL: wss://veil.erez.pro/ws
+  VITE_VEIL_HTTP_URL: https://veil.erez.pro
+  VEIL_PROJECT_SOURCE_URL: https://github.com/${{ github.repository }}/tree/${{ github.sha }}
+
+jobs:
+  validate:
+    name: Validate release tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse stable semantic version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a stable release tag in the form vMAJOR.MINOR.PATCH; got: $GITHUB_REF_NAME" >&2
+            exit 1
+          fi
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Require the current default branch and aligned versions
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          git fetch --no-tags origin "$DEFAULT_BRANCH"
+          if [[ "$GITHUB_SHA" != "$(git rev-parse "origin/$DEFAULT_BRANCH")" ]]; then
+            echo "Release tag must point to the current tip of $DEFAULT_BRANCH" >&2
+            exit 1
+          fi
+
+          package_version="$(jq -r .version veil-desktop/package.json)"
+          tauri_version="$(jq -r .version veil-desktop/src-tauri/tauri.conf.json)"
+          cargo_version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' veil-desktop/src-tauri/Cargo.toml | head -n 1)"
+          for actual in "$package_version" "$tauri_version" "$cargo_version"; do
+            if [[ "$actual" != "$version" ]]; then
+              echo "Tag version $version does not match desktop version $actual" >&2
+              exit 1
+            fi
+          done
+
+  quality:
+    name: Release quality gate
+    needs: validate
+    runs-on: ubuntu-22.04
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Linux test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libayatana-appindicator3-dev \
+            libsecret-1-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            pkg-config \
+            protobuf-compiler
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache Cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry/
+            ~/.cargo/git/
+            target/
+          key: release-quality-${{ hashFiles('Cargo.lock', '**/Cargo.toml') }}
+
+      - name: Install Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: "1.26.5"
+          cache-dependency-path: veil-server/go.sum
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.29.2
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: veil-desktop/pnpm-lock.yaml
+
+      - name: Install locked frontend dependencies
+        working-directory: veil-desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Check and test Rust workspace
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets -- -D warnings
+          cargo test --workspace -- --nocapture
+
+      - name: Check and test Go server
+        working-directory: veil-server
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Test desktop UI
+        working-directory: veil-desktop
+        run: pnpm test:run
+
+  linux:
+    name: Linux (.deb + AppImage)
+    needs: [validate, quality]
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      NO_STRIP: "true"
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libayatana-appindicator3-dev \
+            libsecret-1-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            librsvg2-dev \
+            patchelf \
+            pkg-config \
+            protobuf-compiler \
+            wget
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install pinned Rust license collector
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.29.2
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: veil-desktop/pnpm-lock.yaml
+
+      - name: Install locked frontend dependencies
+        working-directory: veil-desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Generate release-only Tauri config
+        working-directory: veil-desktop
+        shell: bash
+        run: |
+          set -euo pipefail
+          jq --arg version "$RELEASE_VERSION" \
+            '.version = $version' \
+            src-tauri/tauri.conf.json > src-tauri/tauri.release.conf.json
+
+      - name: Build Linux packages
+        working-directory: veil-desktop
+        run: pnpm tauri build --ci --bundles "deb,appimage" --config src-tauri/tauri.release.conf.json
+
+      - name: Normalize Linux asset names
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t debs < <(find "$CARGO_TARGET_DIR/release/bundle/deb" -maxdepth 1 -type f -name '*.deb' -print)
+          mapfile -t appimages < <(find "$CARGO_TARGET_DIR/release/bundle/appimage" -maxdepth 1 -type f -name '*.AppImage' -print)
+          if [[ ${#debs[@]} -ne 1 ]]; then
+            echo "Expected exactly one .deb, found ${#debs[@]}" >&2
+            exit 1
+          fi
+          if [[ ${#appimages[@]} -ne 1 ]]; then
+            echo "Expected exactly one AppImage, found ${#appimages[@]}" >&2
+            exit 1
+          fi
+
+          deb_version="$(dpkg-deb -f "${debs[0]}" Version)"
+          deb_arch="$(dpkg-deb -f "${debs[0]}" Architecture)"
+          deb_depends="$(dpkg-deb -f "${debs[0]}" Depends)"
+          deb_package="$(dpkg-deb -f "${debs[0]}" Package)"
+          if [[ "$deb_version" != "$RELEASE_VERSION" ]]; then
+            echo "Debian package version $deb_version does not match release $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          if [[ "$deb_arch" != "amd64" || -z "$deb_depends" ]]; then
+            echo "Unexpected Debian metadata: architecture=$deb_arch depends=$deb_depends" >&2
+            exit 1
+          fi
+          sudo apt-get install -y "${debs[0]}"
+          installed_version="$(dpkg-query -W -f='${Version}' "$deb_package")"
+          if [[ "$installed_version" != "$RELEASE_VERSION" ]]; then
+            echo "Installed Debian package version $installed_version does not match $RELEASE_VERSION" >&2
+            exit 1
+          fi
+          if ! file -b "${appimages[0]}" | grep -Eq 'ELF 64-bit.*x86-64'; then
+            echo "AppImage is not an x86-64 ELF executable" >&2
+            file "${appimages[0]}" >&2
+            exit 1
+          fi
+          chmod +x "${appimages[0]}"
+          "${appimages[0]}" --appimage-extract >/dev/null
+          test -x squashfs-root/AppRun
+          checked_elfs=0
+          while IFS= read -r binary; do
+            if file -b "$binary" | grep -q '^ELF '; then
+              ldd_output="$(ldd "$binary" 2>&1 || true)"
+              printf '%s\n' "$ldd_output"
+              if grep -q 'not found' <<< "$ldd_output"; then
+                echo "Unresolved AppImage dependency in $binary" >&2
+                exit 1
+              fi
+              checked_elfs=$((checked_elfs + 1))
+            fi
+          done < <(find squashfs-root/usr/bin -maxdepth 1 -type f -perm -u+x -print)
+          if [[ "$checked_elfs" -eq 0 ]]; then
+            echo "No executable ELF payload found in AppImage" >&2
+            exit 1
+          fi
+
+          install -D -m 0644 "${debs[0]}" release-assets/Veil-linux-amd64.deb
+          install -D -m 0755 "${appimages[0]}" release-assets/Veil-linux-x86_64.AppImage
+          install -D -m 0644 \
+            veil-desktop/src-tauri/resources/THIRD_PARTY_NOTICES.txt \
+            release-assets/Veil-linux-THIRD_PARTY_NOTICES.txt
+
+      - name: Upload Linux release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veil-linux-release
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  windows:
+    name: Windows (signed NSIS + MSI)
+    needs: [validate, quality]
+    if: ${{ vars.VEIL_ENABLE_WINDOWS_RELEASE == 'true' }}
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}\target
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+
+      - name: Install pinned Rust license collector
+        run: cargo install cargo-about --version 0.9.1 --locked --features cli
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: 10.29.2
+
+      - name: Install Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: veil-desktop/pnpm-lock.yaml
+
+      - name: Require signing credentials
+        shell: pwsh
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX) -or
+              [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
+            throw "WINDOWS_CERTIFICATE_PFX and WINDOWS_CERTIFICATE_PASSWORD secrets are required when VEIL_ENABLE_WINDOWS_RELEASE=true"
+          }
+
+      - name: Import Authenticode certificate
+        id: certificate
+        shell: pwsh
+        run: |
+          $pfxPath = Join-Path $env:RUNNER_TEMP "veil-signing.pfx"
+          try {
+            [IO.File]::WriteAllBytes($pfxPath, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE_PFX))
+            $password = ConvertTo-SecureString $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force
+            $imported = @(Import-PfxCertificate -FilePath $pfxPath -CertStoreLocation Cert:\CurrentUser\My -Password $password)
+            $cert = $imported | Where-Object HasPrivateKey | Select-Object -First 1
+            if ($null -eq $cert) { throw "Imported certificate has no private key" }
+            "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
+          } finally {
+            Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Generate signed release-only Tauri config
+        working-directory: veil-desktop
+        shell: pwsh
+        env:
+          CERT_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
+        run: |
+          $config = Get-Content src-tauri\tauri.conf.json -Raw | ConvertFrom-Json
+          $config.version = $env:RELEASE_VERSION
+          if ($null -eq $config.bundle.windows) {
+            $config.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{})
+          }
+          $config.bundle.windows | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $env:CERT_THUMBPRINT -Force
+          $config.bundle.windows | Add-Member -NotePropertyName digestAlgorithm -NotePropertyValue "sha256" -Force
+          $config.bundle.windows | Add-Member -NotePropertyName timestampUrl -NotePropertyValue "http://timestamp.digicert.com" -Force
+          $config | ConvertTo-Json -Depth 100 | Set-Content src-tauri\tauri.release.conf.json -Encoding utf8
+
+      - name: Install locked frontend dependencies
+        working-directory: veil-desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Build signed Windows installers
+        working-directory: veil-desktop
+        run: pnpm tauri build --ci --bundles "nsis,msi" --config src-tauri/tauri.release.conf.json
+
+      - name: Verify signatures and normalize Windows asset names
+        shell: pwsh
+        run: |
+          $bundleRoot = Join-Path $env:CARGO_TARGET_DIR "release\bundle"
+          $nsis = @(Get-ChildItem (Join-Path $bundleRoot "nsis") -Filter *.exe -File)
+          $msi = @(Get-ChildItem (Join-Path $bundleRoot "msi") -Filter *.msi -File)
+          if ($nsis.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($nsis.Count)" }
+          if ($msi.Count -ne 1) { throw "Expected exactly one MSI installer, found $($msi.Count)" }
+          $artifacts = @($nsis[0], $msi[0])
+          foreach ($artifact in $artifacts) {
+            $signature = Get-AuthenticodeSignature -LiteralPath $artifact.FullName
+            if ($signature.Status -ne "Valid") {
+              throw "Invalid Authenticode signature on $($artifact.FullName): $($signature.Status)"
+            }
+          }
+          New-Item -ItemType Directory -Path release-assets -Force | Out-Null
+          Copy-Item -LiteralPath $nsis[0].FullName -Destination release-assets\Veil-windows-x64-setup.exe
+          Copy-Item -LiteralPath $msi[0].FullName -Destination release-assets\Veil-windows-x64.msi
+          Copy-Item -LiteralPath veil-desktop\src-tauri\resources\THIRD_PARTY_NOTICES.txt -Destination release-assets\Veil-windows-THIRD_PARTY_NOTICES.txt
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: veil-windows-release
+          path: release-assets/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: [validate, linux, windows]
+    if: >-
+      ${{ always()
+          && needs.validate.result == 'success'
+          && needs.linux.result == 'success'
+          && (needs.windows.result == 'success' || needs.windows.result == 'skipped') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - name: Check out exact release source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Download Linux assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: veil-linux-release
+          path: release-assets
+
+      - name: Download Windows assets
+        if: ${{ needs.windows.result == 'success' }}
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: veil-windows-release
+          path: release-assets
+
+      - name: Generate checksums and latest.json
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_filename="Veil-${RELEASE_VERSION}-source.tar.gz"
+          source_tar="$RUNNER_TEMP/veil-source.tar"
+          source_mtime="$(git show -s --format=%ct "$GITHUB_SHA")"
+          git archive \
+            --format=tar \
+            --prefix="veil-${RELEASE_VERSION}/" \
+            "$GITHUB_SHA" \
+            > "$source_tar"
+          tar \
+            --append \
+            --file="$source_tar" \
+            --owner=0 \
+            --group=0 \
+            --numeric-owner \
+            --mode=0644 \
+            --mtime="@$source_mtime" \
+            --transform="s|^Veil-linux-THIRD_PARTY_NOTICES.txt$|veil-${RELEASE_VERSION}/THIRD_PARTY_NOTICES.txt|" \
+            -C release-assets \
+            Veil-linux-THIRD_PARTY_NOTICES.txt
+          gzip -n -c "$source_tar" > "release-assets/$source_filename"
+          tar -tzf "release-assets/$source_filename" \
+            | grep -Fx "veil-${RELEASE_VERSION}/THIRD_PARTY_NOTICES.txt"
+          cd release-assets
+
+          expected=(
+            Veil-linux-amd64.deb
+            Veil-linux-x86_64.AppImage
+            Veil-linux-THIRD_PARTY_NOTICES.txt
+            "$source_filename"
+          )
+          if [[ -f Veil-windows-x64-setup.exe || -f Veil-windows-x64.msi ]]; then
+            expected+=(
+              Veil-windows-x64-setup.exe
+              Veil-windows-x64.msi
+              Veil-windows-THIRD_PARTY_NOTICES.txt
+            )
+          fi
+          for filename in "${expected[@]}"; do
+            if [[ ! -s "$filename" ]]; then
+              echo "Missing or empty release asset: $filename" >&2
+              exit 1
+            fi
+          done
+
+          : > SHA256SUMS
+          files='[]'
+          notices='[]'
+          add_file() {
+            local platform="$1"
+            local kind="$2"
+            local label="$3"
+            local filename="$4"
+            local size sha
+            size="$(stat -c '%s' "$filename")"
+            sha="$(sha256sum "$filename" | awk '{print $1}')"
+            printf '%s  %s\n' "$sha" "$filename" >> SHA256SUMS
+            files="$(
+              jq -c \
+                --arg platform "$platform" \
+                --arg kind "$kind" \
+                --arg label "$label" \
+                --arg filename "$filename" \
+                --argjson size "$size" \
+                --arg sha256 "$sha" \
+                '. + [{
+                  platform: $platform,
+                  kind: $kind,
+                  label: $label,
+                  filename: $filename,
+                  size: $size,
+                  sha256: $sha256
+                }]' <<< "$files"
+            )"
+          }
+
+          add_notice() {
+            local platform="$1"
+            local filename="$2"
+            local size sha
+            size="$(stat -c '%s' "$filename")"
+            sha="$(sha256sum "$filename" | awk '{print $1}')"
+            printf '%s  %s\n' "$sha" "$filename" >> SHA256SUMS
+            notices="$(
+              jq -c \
+                --arg platform "$platform" \
+                --arg filename "$filename" \
+                --argjson size "$size" \
+                --arg sha256 "$sha" \
+                '. + [{
+                  platform: $platform,
+                  filename: $filename,
+                  size: $size,
+                  sha256: $sha256
+                }]' <<< "$notices"
+            )"
+          }
+
+          add_file linux deb "Linux Debian/Ubuntu (x86_64)" Veil-linux-amd64.deb
+          add_file linux appimage "Linux AppImage (x86_64)" Veil-linux-x86_64.AppImage
+          add_notice linux Veil-linux-THIRD_PARTY_NOTICES.txt
+          if [[ -f Veil-windows-x64-setup.exe ]]; then
+            add_file windows exe "Windows installer (x64)" Veil-windows-x64-setup.exe
+            add_file windows msi "Windows MSI (x64)" Veil-windows-x64.msi
+            add_notice windows Veil-windows-THIRD_PARTY_NOTICES.txt
+          fi
+
+          source_size="$(stat -c '%s' "$source_filename")"
+          source_sha256="$(sha256sum "$source_filename" | awk '{print $1}')"
+          printf '%s  %s\n' "$source_sha256" "$source_filename" >> SHA256SUMS
+          source_url="/downloads/$source_filename"
+
+          published_at="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          jq -n \
+            --arg version "$RELEASE_VERSION" \
+            --arg published_at "$published_at" \
+            --arg commit "$GITHUB_SHA" \
+            --arg license "AGPL-3.0-or-later" \
+            --arg source_filename "$source_filename" \
+            --arg source_url "$source_url" \
+            --arg source_sha256 "$source_sha256" \
+            --argjson source_size "$source_size" \
+            --argjson files "$files" \
+            --argjson notices "$notices" \
+            '{
+              version: $version,
+              published_at: $published_at,
+              commit: $commit,
+              license: $license,
+              source: {
+                filename: $source_filename,
+                url: $source_url,
+                size: $source_size,
+                sha256: $source_sha256
+              },
+              notices: $notices,
+              files: $files
+            }' > latest.json
+
+          sha256sum --check SHA256SUMS
+          jq --exit-status \
+            --arg version "$RELEASE_VERSION" \
+            '.version == $version
+              and .license == "AGPL-3.0-or-later"
+              and (.commit | test("^[0-9a-f]{40}$"))
+              and (.source.filename | test("^Veil-[0-9]+\\.[0-9]+\\.[0-9]+-source\\.tar\\.gz$"))
+              and (.source.sha256 | test("^[0-9a-f]{64}$"))
+              and (.source.size > 0)
+              and (.notices | length) >= 1
+              and all(.notices[];
+                (.platform == "linux" or .platform == "windows")
+                and (.filename | test("^Veil-(linux|windows)-THIRD_PARTY_NOTICES\\.txt$"))
+                and (.sha256 | test("^[0-9a-f]{64}$"))
+                and (.size > 0))
+              and (.files | length) >= 2' \
+            latest.json > /dev/null
+          cat SHA256SUMS
+          jq . latest.json
+
+      - name: Stage draft GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="$GITHUB_REF_NAME"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            is_draft="$(gh release view "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isDraft \
+              --jq .isDraft)"
+            if [[ "$is_draft" != "true" ]]; then
+              echo "Refusing to replace assets on already-published release $tag" >&2
+              exit 1
+            fi
+          else
+            gh release create "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --prerelease \
+              --latest=false \
+              --generate-notes \
+              --title "Veil $RELEASE_VERSION Preview"
+          fi
+          gh release upload "$tag" release-assets/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
+
+      - name: Atomically sync release assets to VPS
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+          VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
+        run: |
+          set -euo pipefail
+          configured=0
+          for value in "$VPS_HOST" "$VPS_USER" "$VPS_SSH_PRIVATE_KEY" "$VPS_SSH_KNOWN_HOSTS"; do
+            [[ -n "$value" ]] && configured=$((configured + 1))
+          done
+          if [[ "$configured" -ne 4 ]]; then
+            echo "VPS sync requires all four VPS_* secrets before a public release can be published." >&2
+            exit 1
+          fi
+          VPS_SSH_PORT="${VPS_SSH_PORT:-22}"
+          if [[ ! "$VPS_SSH_PORT" =~ ^[0-9]+$ ]]; then
+            echo "VPS_SSH_PORT must be numeric" >&2
+            exit 1
+          fi
+
+          key_file="$RUNNER_TEMP/veil-vps-key"
+          known_hosts_file="$RUNNER_TEMP/veil-known-hosts"
+          archive="$RUNNER_TEMP/veil-release-assets.tar.gz"
+          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" | tr -d '\r' > "$key_file"
+          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" | tr -d '\r' > "$known_hosts_file"
+          chmod 600 "$key_file" "$known_hosts_file"
+          tar -C release-assets -czf "$archive" .
+
+          ssh_options=(
+            -i "$key_file"
+            -o "Port=$VPS_SSH_PORT"
+            -o "UserKnownHostsFile=$known_hosts_file"
+            -o "StrictHostKeyChecking=yes"
+            -o "BatchMode=yes"
+          )
+          destination="${VPS_USER}@${VPS_HOST}"
+          stage_name="${GITHUB_REF_NAME}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          remote_base="/srv/veil/releases"
+          remote_stage="$remote_base/.incoming/$stage_name"
+
+          ssh "${ssh_options[@]}" "$destination" \
+            "umask 022; mkdir -p '$remote_stage' '$remote_base'"
+          scp "${ssh_options[@]}" "$archive" \
+            "$destination:$remote_stage/release-assets.tar.gz"
+
+          ssh "${ssh_options[@]}" "$destination" \
+            "sh -s -- '$stage_name'" <<'REMOTE_SCRIPT'
+          set -eu
+          stage_name="$1"
+          base="/srv/veil/releases"
+          stage="$base/.incoming/$stage_name"
+          release_name="$stage_name"
+          release_dir="$base/$release_name"
+
+          test -f "$stage/release-assets.tar.gz"
+          tar -xzf "$stage/release-assets.tar.gz" -C "$stage"
+          rm -f "$stage/release-assets.tar.gz"
+          test -s "$stage/latest.json"
+          (cd "$stage" && sha256sum --check SHA256SUMS)
+          test ! -e "$release_dir"
+          mv "$stage" "$release_dir"
+
+          current_tmp="$base/.current-$stage_name"
+          ln -s "$release_name" "$current_tmp"
+          mv -Tf "$current_tmp" "$base/current"
+          REMOTE_SCRIPT
+
+          rm -f "$key_file" "$known_hosts_file" "$archive"
+          echo "Published $GITHUB_REF_NAME to $VPS_HOST:$remote_base/current"
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release edit "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --draft=false \
+            --prerelease \
+            --latest=false

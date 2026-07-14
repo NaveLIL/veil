@@ -845,7 +845,7 @@ const file_veil_v1_server_proto_rawDesc = "" +
 	"\vChannelType\x12\x10\n" +
 	"\fCHANNEL_TEXT\x10\x00\x12\x11\n" +
 	"\rCHANNEL_VOICE\x10\x01\x12\x14\n" +
-	"\x10CHANNEL_CATEGORY\x10\x02B.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\x10CHANNEL_CATEGORY\x10\x02B2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_server_proto_rawDescOnce sync.Once

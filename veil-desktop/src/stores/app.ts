@@ -1,6 +1,15 @@
 import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { decisionDialog } from "@/lib/decisionDialog";
+import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  validatedLiveMessage,
+  validatedSearchResultContext,
+  validatedStoredMessages,
+  type MessageAuthorContextWire,
+  type SearchResultContextDto,
+  type StoredMessageDto,
+} from "@/lib/identityIpcBoundary";
 
 // ─── Types ───────────────────────────────────────────
 
@@ -8,9 +17,11 @@ export type Screen = "onboarding" | "locked" | "disclaimer" | "chat" | "settings
 
 export interface Conversation {
   id: string;
-  type: "dm" | "group";
+  type: "dm" | "group" | "channel";
   name: string;
-  avatarUrl?: string;
+  serverOrigin?: string;
+  peerUserId?: string;
+  peerKey?: string;
   lastMessage?: string;
   lastMessageTime?: number;
   unreadCount: number;
@@ -29,7 +40,6 @@ export interface Server {
   id: string;
   name: string;
   description?: string;
-  iconUrl?: string;
   ownerId: string;
 }
 
@@ -72,31 +82,416 @@ export interface Message {
   id: string;
   conversationId: string;
   senderName: string;
+  senderUserId?: string;
   senderKey: string;
+  senderSigningKey?: string;
+  senderProfileVersion?: string;
+  senderProfileOrigin?: string;
+  senderOrigin?: string;
+  senderAuthorContext?: MessageAuthorContextWire;
   text: string;
   timestamp: number;
   isOwn: boolean;
+  pending?: boolean;
+  failed?: boolean;
+  deliveryUnknown?: boolean;
   replyToId?: string;
+  attachments?: MessageAttachment[];
 }
+
+export interface MessageAttachment {
+  ordinal: number;
+  mediaId: string;
+  fileName: string;
+  detectedMime: string;
+  plaintextSize: number;
+}
+
+export interface PushSubscription {
+  id: string;
+  endpointHint: string;
+  deviceLabel?: string;
+  kind: "unifiedpush";
+  createdAt: string;
+  lastUsed?: string;
+  enabled: boolean;
+  mutedUntil?: string;
+  validated: boolean;
+}
+
+export interface ServerBan {
+  userId: string;
+  username: string;
+  bannedBy: string;
+  reason?: string;
+  createdAt: string;
+}
+
+export interface RoomAccessRule {
+  targetId: string;
+  targetType: 0 | 1;
+  allow: number;
+  deny: number;
+}
+
+export interface VeilLinkRecord {
+  id: string;
+  public_selector: string;
+  version: 1;
+  type: "space";
+  space_id: string;
+  max_uses: number;
+  uses: number;
+  expires_at: string;
+  revoked_at?: string;
+  created_at: string;
+}
+
+export interface CreatedVeilLink extends VeilLinkRecord {
+  secret: string;
+  share_url: string;
+}
+
+export interface PendingVeilLink {
+  flowId: string;
+  canonicalOrigin: string;
+  selectorRef: string;
+  expiresInSeconds: number;
+}
+
+export interface ConversationCryptoDiagnostic {
+  conversationId: string;
+  code: string;
+  detail: string;
+}
+
+export type WorkspaceRouteScope = {
+  canonicalServerOrigin: string;
+  bindingGeneration: string;
+};
+
+export type WorkspaceRoute =
+  | { kind: "home"; view: "overview" | "friends" | "requests"; scope: WorkspaceRouteScope | null }
+  | { kind: "direct"; directId: string; scope: WorkspaceRouteScope }
+  | { kind: "circle"; circleId: string; scope: WorkspaceRouteScope }
+  | { kind: "space"; spaceId: string; roomId?: string; scope: WorkspaceRouteScope };
 
 // ─── Global App State ────────────────────────────────
 
-const [screen, setScreen] = createSignal<Screen>("onboarding");
+const [screen, setScreenRaw] = createSignal<Screen>("onboarding");
 const [identity, setIdentity] = createSignal<string | null>(null);
 const [userId, setUserId] = createSignal<string | null>(null);
 const [conversations, setConversations] = createSignal<Conversation[]>([]);
-const [activeConversationId, setActiveConversationId] = createSignal<string | null>(null);
+const [workspaceRoute, setWorkspaceRouteRaw] = createSignal<WorkspaceRoute>({
+  kind: "home",
+  view: "overview",
+  scope: null,
+});
 const [messages, setMessages] = createSignal<Message[]>([]);
 const [isSidebarCollapsed, setSidebarCollapsed] = createSignal(false);
 const [connected, setConnected] = createSignal(false);
-const [serverUrl, setServerUrl] = createSignal("ws://5.144.181.72:9080/ws");
-const [serverHttpUrl, setServerHttpUrl] = createSignal("http://5.144.181.72:9080");
+const [reconnecting, setReconnecting] = createSignal(false);
+
+const DEFAULT_SERVER_ENDPOINTS = {
+  // A packaged client must never silently target an unrelated public service.
+  // Production builds provide VITE_VEIL_{WS,HTTP}_URL explicitly; the safe
+  // fallback is the loopback gateway used by the local Compose setup.
+  ws: "ws://127.0.0.1:9080/ws",
+  http: "http://127.0.0.1:9080",
+} as const;
+const SERVER_ENDPOINTS_STORAGE_KEY = "veil.server-endpoints.v1";
+
+type ServerEndpoints = { ws: string; http: string };
+
+export interface AuthenticatedServerScope {
+  userId: string;
+  canonicalServerOrigin: string;
+  bindingGeneration: string;
+}
+
+export interface NetworkProfileView {
+  canonicalServerOrigin: string;
+  userId: string;
+  identityKey: string;
+  username: string;
+  displayName: string | null;
+  about: string;
+  avatarAssetId: string | null;
+  avatarJpegBase64: string | null;
+  profileVersion: string;
+  profileUpdatedAt: string;
+  observedAt: string;
+  proofState: "not_compared" | "verified_on_this_device" | "identity_changed" | "current_account";
+}
+
+export interface IdentityVerificationView {
+  canonicalServerOrigin: string;
+  userId: string;
+  identityKey: string;
+  signingKey: string;
+  fingerprintVersion: "account_v2";
+  fingerprintHex: string;
+  fingerprintEmoji: string;
+  proofState: "not_compared" | "verified_on_this_device" | "identity_changed";
+}
+
+export interface CachedIdentityProofView {
+  canonicalServerOrigin: string;
+  userId: string;
+  identityKey: string;
+  proofState: "not_compared" | "verified_on_this_device" | "identity_changed";
+}
+
+export interface ProfileUpdateNotice {
+  canonicalServerOrigin: string;
+  userId: string;
+  profileVersion: string;
+}
+
+export interface IdentityChangeNotice {
+  canonicalServerOrigin: string;
+  userId: string;
+}
+
+export interface ServerEndpointChange {
+  originChanged: boolean;
+  transportChanged: boolean;
+}
+
+export function canonicalServerOriginFromHttpUrl(httpRaw: string): string {
+  const url = new URL(httpRaw);
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error("Server origin must use http or https");
+  }
+  const bareHost = url.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+  const authority = bareHost.includes(":") ? `[${bareHost}]` : bareHost;
+  const port = url.port || (url.protocol === "https:" ? "443" : "80");
+  return `${url.protocol}//${authority}:${port}`;
+}
+
+function pendingVeilLinkFromJSON(value: unknown): PendingVeilLink | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Partial<PendingVeilLink>;
+  if (
+    typeof candidate.flowId !== "string"
+    || !/^[0-9a-f]{64}$/.test(candidate.flowId)
+    || typeof candidate.canonicalOrigin !== "string"
+    || typeof candidate.selectorRef !== "string"
+    || !/^[0-9a-f]{12}$/.test(candidate.selectorRef)
+    || typeof candidate.expiresInSeconds !== "number"
+    || !Number.isSafeInteger(candidate.expiresInSeconds)
+    || candidate.expiresInSeconds < 0
+    || candidate.expiresInSeconds > 5 * 60
+  ) return null;
+  try {
+    const parsed = new URL(candidate.canonicalOrigin);
+    const bareHost = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+    const loopback = bareHost === "localhost"
+      || bareHost === "127.0.0.1"
+      || bareHost === "::1";
+    if (
+      parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.username
+      || parsed.password
+      || (parsed.protocol === "http:" && !loopback)
+      || canonicalServerOriginFromHttpUrl(candidate.canonicalOrigin) !== candidate.canonicalOrigin
+    ) return null;
+  } catch {
+    return null;
+  }
+  return candidate as PendingVeilLink;
+}
+
+function normalizeServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpoints | null {
+  try {
+    const ws = new URL(wsRaw.trim());
+    const http = new URL(httpRaw.trim());
+    const loopback = (hostname: string) =>
+      hostname === "localhost" || hostname === "127.0.0.1" || hostname === "[::1]";
+
+    const securePair = ws.protocol === "wss:" && http.protocol === "https:";
+    const localPair = ws.protocol === "ws:" && http.protocol === "http:" &&
+      loopback(ws.hostname) && loopback(http.hostname);
+    if ((!securePair && !localPair) || ws.host !== http.host) return null;
+    if (ws.username || ws.password || ws.search || ws.hash) return null;
+    if (http.username || http.password || http.search || http.hash) return null;
+
+    return {
+      ws: ws.toString(),
+      http: http.toString().replace(/\/$/, ""),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function initialServerEndpoints(): ServerEndpoints {
+  const configured = normalizeServerEndpoints(
+    import.meta.env.VITE_VEIL_WS_URL || "",
+    import.meta.env.VITE_VEIL_HTTP_URL || "",
+  );
+  if (configured) return configured;
+
+  try {
+    const stored = JSON.parse(localStorage.getItem(SERVER_ENDPOINTS_STORAGE_KEY) || "null") as
+      | Partial<ServerEndpoints>
+      | null;
+    if (stored && typeof stored.ws === "string" && typeof stored.http === "string") {
+      const normalized = normalizeServerEndpoints(stored.ws, stored.http);
+      if (normalized) return normalized;
+    }
+  } catch {
+    // Treat malformed or unavailable renderer storage as untrusted input.
+  }
+
+  return { ...DEFAULT_SERVER_ENDPOINTS };
+}
+
+const initialEndpoints = initialServerEndpoints();
+const [serverUrl, setServerUrl] = createSignal(initialEndpoints.ws);
+const [serverHttpUrl, setServerHttpUrl] = createSignal(initialEndpoints.http);
+const [authenticatedServerScope, setAuthenticatedServerScope] =
+  createSignal<AuthenticatedServerScope | null>(null);
+const [pendingAuthenticatedServerScope, setPendingAuthenticatedServerScope] =
+  createSignal<AuthenticatedServerScope | null>(null);
+const [profileUpdateNotice, setProfileUpdateNotice] = createSignal<ProfileUpdateNotice | null>(null);
+const [identityChangeNotice, setIdentityChangeNotice] = createSignal<IdentityChangeNotice | null>(null);
+const [bindingTransitioning, setBindingTransitioning] = createSignal(false);
+const [originTransitioning, setOriginTransitioning] = createSignal(false);
+const [originEpoch, setOriginEpoch] = createSignal(0);
+
+function setServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpointChange {
+  const normalized = normalizeServerEndpoints(wsRaw, httpRaw);
+  if (!normalized) throw new Error("Invalid or insecure server endpoint pair");
+  const transportChanged = normalized.ws !== serverUrl() || normalized.http !== serverHttpUrl();
+  const currentNamespaceOrigin = authenticatedServerScope()?.canonicalServerOrigin
+    ?? canonicalServerOriginFromHttpUrl(serverHttpUrl());
+  const originChanged = canonicalServerOriginFromHttpUrl(normalized.http)
+    !== currentNamespaceOrigin;
+  if (transportChanged) {
+    endpointSelectionEpoch += 1;
+    if (originChanged) beginOriginTransition();
+    else beginBindingTransition();
+  }
+  setServerUrl(normalized.ws);
+  setServerHttpUrl(normalized.http);
+  try {
+    localStorage.setItem(SERVER_ENDPOINTS_STORAGE_KEY, JSON.stringify(normalized));
+  } catch {
+    // The active session can still use the endpoint when storage is disabled.
+  }
+  return { originChanged, transportChanged };
+}
 const [servers, setServers] = createSignal<Server[]>([]);
-const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
 const [channelsByServer, setChannelsByServer] = createSignal<Record<string, Channel[]>>({});
-const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
+
+function currentWorkspaceScope(): WorkspaceRouteScope | null {
+  const scope = authenticatedServerScope();
+  return scope ? {
+    canonicalServerOrigin: scope.canonicalServerOrigin,
+    bindingGeneration: scope.bindingGeneration,
+  } : null;
+}
+
+function navigationWorkspaceScope(): WorkspaceRouteScope | null {
+  const live = currentWorkspaceScope();
+  if (live) return live;
+  if (bindingTransitioning() && !originTransitioning()) return workspaceRoute().scope;
+  return null;
+}
+
+export function workspaceRouteMatchesScope(
+  route: WorkspaceRoute,
+  scope: WorkspaceRouteScope | null,
+): boolean {
+  if (route.kind === "home" && route.scope === null) return scope === null;
+  return !!route.scope && !!scope
+    && route.scope.canonicalServerOrigin === scope.canonicalServerOrigin
+    && route.scope.bindingGeneration === scope.bindingGeneration;
+}
+
+function liveWorkspaceRoute(): WorkspaceRoute {
+  const route = workspaceRoute();
+  const scope = currentWorkspaceScope();
+  if (workspaceRouteMatchesScope(route, scope)) return route;
+  // A same-origin binding refresh may keep local reading, selection and draft
+  // state visible while every network mutation remains unpublished and fails
+  // closed. A real origin transition never receives this exception.
+  if (!scope && bindingTransitioning() && !originTransitioning() && route.scope) return route;
+  return { kind: "home", view: "overview", scope };
+}
+
+const activeServerId = () => {
+  const route = liveWorkspaceRoute();
+  return route.kind === "space" ? route.spaceId : null;
+};
+const activeChannelId = () => {
+  const route = liveWorkspaceRoute();
+  return route.kind === "space" ? route.roomId ?? null : null;
+};
+const activeConversationId = () => {
+  const route = liveWorkspaceRoute();
+  if (route.kind === "direct") return route.directId;
+  if (route.kind === "circle") return route.circleId;
+  if (route.kind !== "space" || !route.roomId) return null;
+  return (channelsByServer()[route.spaceId] ?? [])
+    .find((room) => room.id === route.roomId)?.conversationId ?? null;
+};
+
+function setActiveServerId(serverId: string | null): void {
+  const scope = navigationWorkspaceScope();
+  if (!serverId || !scope) {
+    setWorkspaceRouteRaw({ kind: "home", view: "overview", scope });
+    return;
+  }
+  const previous = liveWorkspaceRoute();
+  setWorkspaceRouteRaw({
+    kind: "space",
+    spaceId: serverId,
+    roomId: previous.kind === "space" && previous.spaceId === serverId ? previous.roomId : undefined,
+    scope,
+  });
+}
+
+function setActiveChannelId(roomId: string | null): void {
+  const route = liveWorkspaceRoute();
+  const scope = navigationWorkspaceScope();
+  if (route.kind !== "space" || !scope) return;
+  setWorkspaceRouteRaw({ kind: "space", spaceId: route.spaceId, roomId: roomId ?? undefined, scope });
+}
+
+function setActiveConversationId(conversationId: string | null): void {
+  const route = liveWorkspaceRoute();
+  const scope = navigationWorkspaceScope();
+  if (!conversationId) {
+    if (route.kind === "direct" || route.kind === "circle") {
+      setWorkspaceRouteRaw({ kind: "home", view: "overview", scope });
+    }
+    return;
+  }
+  if (!scope) return;
+  if (route.kind === "space") {
+    const room = (channelsByServer()[route.spaceId] ?? [])
+      .find((candidate) => candidate.conversationId === conversationId);
+    if (room) setWorkspaceRouteRaw({ ...route, roomId: room.id, scope });
+    return;
+  }
+  const conversation = conversations().find((candidate) => candidate.id === conversationId);
+  setWorkspaceRouteRaw(conversation?.type === "group"
+    ? { kind: "circle", circleId: conversationId, scope }
+    : { kind: "direct", directId: conversationId, scope });
+}
+
+export type SenderKeyStatus = "checking" | "pending" | "ready" | "error";
+const [senderKeyStatus, setSenderKeyStatus] = createSignal<Record<string, SenderKeyStatus>>({});
+const [conversationCryptoDiagnostics, setConversationCryptoDiagnostics] = createSignal<
+  Record<string, ConversationCryptoDiagnostic>
+>({});
 const [serverMembers, setServerMembers] = createSignal<Record<string, ServerMember[]>>({});
 const [serverRoles, setServerRoles] = createSignal<Record<string, Role[]>>({});
+const [pendingVeilLink, setPendingVeilLink] = createSignal<PendingVeilLink | null>(null);
 // Currently-open server settings overlay; null = closed.
 const [serverSettingsId, setServerSettingsId] = createSignal<string | null>(null);
 // Typing indicators: conversationId → Set of identityKeys currently typing
@@ -106,6 +501,100 @@ let lastTypingSent = 0;
 // Reactions: messageId → { emoji → { userId, username }[] }
 export type ReactionMap = Record<string, { userId: string; username: string }[]>;
 const [reactions, setReactions] = createSignal<Record<string, ReactionMap>>({});
+const rejectedOutgoingMessageIds = new Set<string>();
+const acknowledgedOutgoingMessageIds = new Map<string, string>();
+const discardedOutgoingMessageIds = new Set<string>();
+const messageLoadGenerations = new Map<string, number>();
+const senderKeyDistributionFlights = new Map<string, Promise<void>>();
+
+function nextMessageLoadGeneration(conversationId: string): number {
+  const generation = (messageLoadGenerations.get(conversationId) ?? 0) + 1;
+  messageLoadGenerations.set(conversationId, generation);
+  return generation;
+}
+
+function messagePreview(message: Message): string {
+  if (message.failed) return `Not sent: ${message.text}`;
+  if (message.deliveryUnknown) return `Delivery unknown: ${message.text}`;
+  if (message.pending) return `Sending: ${message.text}`;
+  return message.text;
+}
+
+function rendererMessagesFromStored(stored: StoredMessageDto[]): Message[] {
+  return stored
+    .filter((message) => !discardedOutgoingMessageIds.has(message.id))
+    .map((message) => {
+      const acknowledgedId = acknowledgedOutgoingMessageIds.get(message.id);
+      const rejected = rejectedOutgoingMessageIds.has(message.id);
+      return {
+        id: acknowledgedId ?? message.id,
+        conversationId: message.conversationId,
+        senderName: message.isOwn
+          ? "You"
+          : (message.senderName?.trim() || "Unknown author"),
+        senderUserId: message.senderUserId,
+        senderKey: message.senderKey,
+        senderSigningKey: message.senderSigningKey,
+        senderProfileVersion: message.senderProfileVersion,
+        senderProfileOrigin: message.senderProfileOrigin,
+        senderOrigin: message.senderOrigin,
+        senderAuthorContext: message.senderAuthorContext,
+        text: message.text,
+        timestamp: message.timestamp || new Date(message.createdAt).getTime(),
+        isOwn: message.isOwn,
+        pending: !acknowledgedId && !rejected && message.pending,
+        failed: !acknowledgedId && (message.failed || rejected),
+        deliveryUnknown: !acknowledgedId && !rejected && message.deliveryUnknown,
+        replyToId: message.replyToId
+          ? acknowledgedOutgoingMessageIds.get(message.replyToId) ?? message.replyToId
+          : undefined,
+        attachments: message.attachments,
+      } satisfies Message;
+    });
+}
+
+function publishConversationMessages(
+  conversationId: string,
+  loaded: Message[],
+): void {
+  let merged: Message[] = [];
+  setMessages((previous) => {
+    const loadedIds = new Set(loaded.map((message) => message.id));
+    // Preserve other histories and any optimistic item which has not reached
+    // SQLCipher yet. Exact search windows intentionally replace only the
+    // selected conversation's persisted projection.
+    const otherConversations = previous.filter(
+      (message) => message.conversationId !== conversationId,
+    );
+    const localOnly = previous.filter(
+      (message) => message.conversationId === conversationId
+        && message.pending
+        && !discardedOutgoingMessageIds.has(message.id)
+        && !loadedIds.has(message.id),
+    );
+    merged = [...otherConversations, ...loaded, ...localOnly];
+    return merged;
+  });
+  updateConversationPreview(conversationId, merged);
+}
+
+function updateConversationPreview(conversationId: string, snapshot = messages()): void {
+  const latest = snapshot
+    .filter((message) => message.conversationId === conversationId)
+    .reduce<Message | undefined>(
+      (current, candidate) => !current || candidate.timestamp >= current.timestamp ? candidate : current,
+      undefined,
+    );
+  setConversations((previous) => previous.map((conversation) =>
+    conversation.id === conversationId
+      ? {
+        ...conversation,
+        lastMessage: latest ? messagePreview(latest) : undefined,
+        lastMessageTime: latest?.timestamp,
+      }
+      : conversation,
+  ));
+}
 
 // Friends & Presence
 export interface Friend {
@@ -127,19 +616,478 @@ export interface FriendRequest {
 const [friends, setFriends] = createSignal<Friend[]>([]);
 const [friendRequests, setFriendRequests] = createSignal<FriendRequest[]>([]);
 const [presenceMap, setPresenceMap] = createSignal<Record<string, number>>({});
+const [friendDirectoryReady, setFriendDirectoryReady] = createSignal(false);
+const [pinConfigured, setPinConfigured] = createSignal(false);
 // identityKey → status
 
 // Phase 6 — per-conversation crypto mode cache. The chat header reads
 // from this signal to render the "MLS" badge instead of the legacy
 // "Encrypted" label. Populated lazily on conversation activation and
 // after a successful upgrade-to-MLS flow.
-const [cryptoModeByConv, setCryptoModeByConv] = createSignal<Record<string, "sender_key" | "mls">>({});
-// Whether the local MLS client (mls_init) has been initialised this
-// session. Driven by `bootstrapMls()` after identity init.
-const [mlsReady, setMlsReady] = createSignal(false);
-
-const AUTO_LOCK_SECONDS = 300; // 5 minutes
+const [autoLockSeconds, setAutoLockSeconds] = createSignal(300);
 let autoLockTimer: ReturnType<typeof setInterval> | null = null;
+let lastActivityTouch = 0;
+
+// Every native lock invalidates all asynchronous renderer work that was
+// started by the previous unlocked session.  Checking only `screen()` is not
+// enough: a slow IPC response can arrive after the user has already unlocked
+// again and would otherwise repopulate the new session with stale plaintext.
+let uiSessionEpoch = 0;
+let uiSessionActive = true;
+let endpointSelectionEpoch = 0;
+const publishedServerScopesByOrigin = new Map<string, AuthenticatedServerScope>();
+let connectionAttempt: {
+  endpointKey: string;
+  endpointSelectionEpoch: number;
+  promise: Promise<string>;
+} | null = null;
+let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+let reconnectAttempt = 0;
+let eventListenersInitialized = false;
+let eventListenersInitialization: Promise<void> | null = null;
+
+const RECONNECT_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000] as const;
+
+function cancelReconnectTimer(resetAttempt = false): void {
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = null;
+  if (resetAttempt) reconnectAttempt = 0;
+}
+
+function scheduleReconnect(expectedEpoch: number, immediate = false): void {
+  if (
+    reconnectTimer
+    || connected()
+    || !isUiSessionEpochCurrent(expectedEpoch)
+  ) return;
+
+  const delay = immediate
+    ? 0
+    : RECONNECT_DELAYS_MS[Math.min(reconnectAttempt, RECONNECT_DELAYS_MS.length - 1)];
+  if (!immediate) reconnectAttempt += 1;
+  setReconnecting(true);
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    if (connected() || !isUiSessionEpochCurrent(expectedEpoch)) {
+      setReconnecting(false);
+      return;
+    }
+    void appStore.connectToServer(true).catch((error) => {
+      if (!(error instanceof StaleUiSessionError)) {
+        console.warn("secure reconnect failed:", error);
+      }
+    });
+  }, delay);
+}
+
+const setScreen: typeof setScreenRaw = ((value: Parameters<typeof setScreenRaw>[0]) => {
+  const next = typeof value === "function" ? value(screen()) : value;
+  if (!uiSessionActive && next !== "locked" && next !== "onboarding") return screen();
+  return setScreenRaw(next);
+}) as typeof setScreenRaw;
+
+export function captureUiSessionEpoch(): number {
+  return uiSessionEpoch;
+}
+
+export function isUiSessionEpochCurrent(epoch: number): boolean {
+  return uiSessionActive && screen() !== "locked" && epoch === uiSessionEpoch;
+}
+
+export class StaleUiSessionError extends Error {
+  constructor() {
+    super("renderer session changed while IPC was in flight");
+    this.name = "StaleUiSessionError";
+  }
+}
+
+function requireCurrentUiSession(epoch: number): void {
+  if (!isUiSessionEpochCurrent(epoch)) throw new StaleUiSessionError();
+}
+
+function rethrowIfStale(error: unknown): void {
+  if (error instanceof StaleUiSessionError) throw error;
+}
+
+function acceptsSensitiveEvent(): boolean {
+  return uiSessionActive
+    && screen() !== "locked"
+    && !originTransitioning()
+    && !bindingTransitioning();
+}
+
+type NativeScopeTag = {
+  serverScopeOrigin: string;
+  serverBindingGeneration: string;
+};
+
+function nativeScopeTag(payload: unknown): NativeScopeTag | null {
+  if (!payload || typeof payload !== "object") return null;
+  const candidate = payload as Partial<NativeScopeTag>;
+  if (
+    typeof candidate.serverScopeOrigin !== "string"
+    || typeof candidate.serverBindingGeneration !== "string"
+  ) return null;
+  return {
+    serverScopeOrigin: candidate.serverScopeOrigin,
+    serverBindingGeneration: candidate.serverBindingGeneration,
+  };
+}
+
+export function nativeEventMatchesAuthenticatedScope(
+  payload: unknown,
+  scope: AuthenticatedServerScope | null,
+): boolean {
+  if (!scope) return false;
+  const tag = nativeScopeTag(payload);
+  return tag?.serverScopeOrigin === scope.canonicalServerOrigin
+    && tag.serverBindingGeneration === scope.bindingGeneration;
+}
+
+export function validateAuthenticatedServerScope(
+  value: unknown,
+  expectedOrigin: string,
+  continuityScope: AuthenticatedServerScope | null,
+): AuthenticatedServerScope {
+  const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+  if (!value || typeof value !== "object") {
+    throw new Error("native connection returned an invalid authenticated server scope");
+  }
+  const scope = value as Partial<AuthenticatedServerScope>;
+  if (
+    scope.canonicalServerOrigin !== expectedOrigin
+    || typeof scope.userId !== "string"
+    || !canonicalUuid.test(scope.userId)
+    || typeof scope.bindingGeneration !== "string"
+    || !/^[1-9][0-9]*$/.test(scope.bindingGeneration)
+  ) {
+    throw new Error("native connection returned an invalid authenticated server scope");
+  }
+  const validated = scope as AuthenticatedServerScope;
+  if (
+    continuityScope
+    && (
+      continuityScope.canonicalServerOrigin !== validated.canonicalServerOrigin
+      || continuityScope.userId !== validated.userId
+      || BigInt(validated.bindingGeneration) <= BigInt(continuityScope.bindingGeneration)
+    )
+  ) {
+    throw new Error("native connection broke authenticated account continuity");
+  }
+  return validated;
+}
+
+function authenticatedScopesEqual(
+  left: AuthenticatedServerScope | null,
+  right: AuthenticatedServerScope | null,
+): boolean {
+  return left !== null
+    && right !== null
+    && left.userId === right.userId
+    && left.canonicalServerOrigin === right.canonicalServerOrigin
+    && left.bindingGeneration === right.bindingGeneration;
+}
+
+function requirePublishedMutationScope(): AuthenticatedServerScope {
+  const scope = authenticatedServerScope();
+  if (
+    !connected()
+    || bindingTransitioning()
+    || originTransitioning()
+    || !scope
+  ) {
+    throw new Error("authenticated server binding is not published for this action");
+  }
+  return scope;
+}
+
+function requireCurrentMutationScope(
+  sessionEpoch: number,
+  scope: AuthenticatedServerScope,
+): void {
+  requireCurrentUiSession(sessionEpoch);
+  if (!connected() || !authenticatedScopesEqual(authenticatedServerScope(), scope)) {
+    throw new StaleUiSessionError();
+  }
+}
+
+function authenticatedMutationScopeArgs(scope: AuthenticatedServerScope) {
+  return {
+    expectedServerOrigin: scope.canonicalServerOrigin,
+    expectedBindingGeneration: scope.bindingGeneration,
+  };
+}
+
+const UNSAFE_PROFILE_CHARACTER = /[\u00ad\u034f\u061c\u180e\u200b\u200e\u200f\u2028\u2029\u202a-\u202e\u2060\u2066-\u206f\ufeff]/u;
+
+function hasUnsafeProfileText(value: string, allowLineFeed: boolean): boolean {
+  return UNSAFE_PROFILE_CHARACTER.test(value)
+    || /\p{Cc}/u.test(allowLineFeed ? value.replaceAll("\n", "") : value);
+}
+
+export function validatedNetworkProfileView(
+  value: unknown,
+  scope: Pick<AuthenticatedServerScope, "canonicalServerOrigin">,
+  expectedUserId: string,
+  expectedIdentityKey: string,
+): NetworkProfileView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("native profile response is invalid");
+  }
+  const profile = value as Record<string, unknown>;
+  const displayName = profile.displayName;
+  const proofState = profile.proofState;
+  const unsafeUsername = typeof profile.username === "string"
+    && hasUnsafeProfileText(profile.username, false);
+  const unsafeDisplayName = typeof displayName === "string"
+    && hasUnsafeProfileText(displayName, false);
+  const unsafeAbout = typeof profile.about === "string"
+    && hasUnsafeProfileText(profile.about, true);
+  if (
+    profile.canonicalServerOrigin !== scope.canonicalServerOrigin
+    || profile.userId !== expectedUserId
+    || profile.identityKey !== expectedIdentityKey
+    || typeof profile.username !== "string"
+    || profile.username.length === 0
+    || profile.username.length > 256
+    || unsafeUsername
+    || (displayName !== null && (typeof displayName !== "string" || displayName.length > 512))
+    || unsafeDisplayName
+    || typeof profile.about !== "string"
+    || profile.about.length > 2048
+    || unsafeAbout
+    || (profile.avatarAssetId !== null && (typeof profile.avatarAssetId !== "string" || !/^[0-9a-f-]{36}$/.test(profile.avatarAssetId)))
+    || (profile.avatarJpegBase64 !== null && (typeof profile.avatarJpegBase64 !== "string" || profile.avatarJpegBase64.length > 360_000))
+    || (profile.avatarAssetId === null && profile.avatarJpegBase64 !== null)
+    || typeof profile.profileVersion !== "string"
+    || !/^(0|[1-9][0-9]*)$/.test(profile.profileVersion)
+    || profile.profileVersion.length > 19
+    || BigInt(profile.profileVersion) > 9223372036854775807n
+    || typeof profile.profileUpdatedAt !== "string"
+    || profile.profileUpdatedAt.length > 64
+    || typeof profile.observedAt !== "string"
+    || profile.observedAt.length > 64
+    || ![
+      "not_compared",
+      "verified_on_this_device",
+      "identity_changed",
+      "current_account",
+    ].includes(String(proofState))
+  ) {
+    throw new Error("native profile response changed its authenticated locator or schema");
+  }
+  return profile as unknown as NetworkProfileView;
+}
+
+export function validatedIdentityVerificationView(
+  value: unknown,
+  scope: Pick<AuthenticatedServerScope, "canonicalServerOrigin">,
+  expectedUserId: string,
+  expectedIdentityKey: string,
+): IdentityVerificationView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("native identity verification response is invalid");
+  }
+  const verification = value as Record<string, unknown>;
+  if (
+    verification.canonicalServerOrigin !== scope.canonicalServerOrigin
+    || verification.userId !== expectedUserId
+    || verification.identityKey !== expectedIdentityKey
+    || typeof verification.signingKey !== "string"
+    || !/^[0-9a-f]{64}$/.test(verification.signingKey)
+    || /^0{64}$/.test(verification.signingKey)
+    || verification.fingerprintVersion !== "account_v2"
+    || typeof verification.fingerprintHex !== "string"
+    || !/^[0-9a-f]{64}$/.test(verification.fingerprintHex)
+    || typeof verification.fingerprintEmoji !== "string"
+    || verification.fingerprintEmoji.length === 0
+    || verification.fingerprintEmoji.length > 256
+    || ![
+      "not_compared",
+      "verified_on_this_device",
+      "identity_changed",
+    ].includes(String(verification.proofState))
+  ) {
+    throw new Error("native identity verification response changed its locator or schema");
+  }
+  return verification as unknown as IdentityVerificationView;
+}
+
+export function validatedCachedIdentityProofView(
+  value: unknown,
+  expectedServerOrigin: string,
+  expectedUserId: string,
+  expectedIdentityKey: string,
+): CachedIdentityProofView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("native cached identity proof response is invalid");
+  }
+  const proof = value as Record<string, unknown>;
+  if (
+    proof.canonicalServerOrigin !== expectedServerOrigin
+    || proof.userId !== expectedUserId
+    || proof.identityKey !== expectedIdentityKey
+    || ![
+      "not_compared",
+      "verified_on_this_device",
+      "identity_changed",
+    ].includes(String(proof.proofState))
+    || "fingerprintHex" in proof
+    || "fingerprintEmoji" in proof
+    || "signingKey" in proof
+  ) {
+    throw new Error("native cached identity proof changed its locator or schema");
+  }
+  return proof as unknown as CachedIdentityProofView;
+}
+
+function acceptsAuthenticatedEvent(payload: unknown): boolean {
+  return uiSessionActive
+    && screen() !== "locked"
+    && !originTransitioning()
+    && !bindingTransitioning()
+    && nativeEventMatchesAuthenticatedScope(payload, authenticatedServerScope());
+}
+
+function matchesPendingOrCurrentAuthenticatedScope(payload: unknown): boolean {
+  if (!uiSessionActive || screen() === "locked") return false;
+  return nativeEventMatchesAuthenticatedScope(payload, pendingAuthenticatedServerScope())
+    || nativeEventMatchesAuthenticatedScope(payload, authenticatedServerScope());
+}
+
+function activateUiSession(expectedEpoch: number): boolean {
+  if (expectedEpoch !== uiSessionEpoch) return false;
+  uiSessionEpoch += 1;
+  uiSessionActive = true;
+  return true;
+}
+
+async function serializeConnectionAttempt(
+  endpointKey: string,
+  selectedEndpointEpoch: number,
+  start: () => Promise<string>,
+  forceAfterCurrent = false,
+): Promise<string> {
+  const existing = connectionAttempt;
+  if (existing) {
+    if (
+      !forceAfterCurrent
+      && existing.endpointKey === endpointKey
+      && existing.endpointSelectionEpoch === selectedEndpointEpoch
+    ) return existing.promise;
+    // Native connect transitions are serialized. Wait for an older endpoint
+    // attempt to reach its fail-closed boundary, then start the newly selected
+    // origin instead of accidentally coalescing the two requests.
+    try {
+      await existing.promise;
+    } catch {
+      // The requested endpoint still needs its own attempt.
+    }
+    return serializeConnectionAttempt(endpointKey, selectedEndpointEpoch, start, false);
+  }
+
+  const attempt = start();
+  connectionAttempt = { endpointKey, endpointSelectionEpoch: selectedEndpointEpoch, promise: attempt };
+  try {
+    return await attempt;
+  } finally {
+    if (connectionAttempt?.promise === attempt) connectionAttempt = null;
+  }
+}
+
+function selectedEndpointKey(): string {
+  return `${serverUrl()}\n${serverHttpUrl()}`;
+}
+
+function requireCurrentEndpointSelection(
+  selectedEpoch: number,
+  endpointKey: string,
+): void {
+  if (selectedEpoch !== endpointSelectionEpoch || endpointKey !== selectedEndpointKey()) {
+    throw new StaleUiSessionError();
+  }
+}
+
+function resetOriginScopedUiState(): void {
+  setUserId(null);
+  setConnected(false);
+  setConversations([]);
+  setMessages([]);
+  rejectedOutgoingMessageIds.clear();
+  acknowledgedOutgoingMessageIds.clear();
+  discardedOutgoingMessageIds.clear();
+  messageLoadGenerations.clear();
+  setActiveConversationId(null);
+  setServers([]);
+  setActiveServerId(null);
+  setChannelsByServer({});
+  setActiveChannelId(null);
+  setSenderKeyStatus({});
+  setConversationCryptoDiagnostics({});
+  setServerMembers({});
+  setServerRoles({});
+  setServerSettingsId(null);
+  Object.values(typingTimers).forEach(clearTimeout);
+  typingTimers = {};
+  lastTypingSent = 0;
+  setTypingUsers({});
+  setReactions({});
+  setFriends([]);
+  setFriendRequests([]);
+  setPresenceMap({});
+  setFriendDirectoryReady(false);
+  setProfileUpdateNotice(null);
+  setIdentityChangeNotice(null);
+}
+
+function beginBindingTransition(serverSettingsFallback: "chat" | "settings" = "chat"): void {
+  cancelReconnectTimer();
+  decisionDialog.cancelAll();
+  uiSessionEpoch += 1;
+  setAuthenticatedServerScope(null);
+  setPendingAuthenticatedServerScope(null);
+  setProfileUpdateNotice(null);
+  setIdentityChangeNotice(null);
+  setBindingTransitioning(true);
+  setConnected(false);
+  setUserId(null);
+  setReconnecting(true);
+  setFriends([]);
+  setFriendRequests([]);
+  setPresenceMap({});
+  setFriendDirectoryReady(false);
+  Object.values(typingTimers).forEach(clearTimeout);
+  typingTimers = {};
+  lastTypingSent = 0;
+  setTypingUsers({});
+  if (screen() === "serverSettings") setScreen(serverSettingsFallback);
+}
+
+function beginOriginTransition(): void {
+  beginBindingTransition("settings");
+  cancelReconnectTimer(true);
+  setOriginEpoch((value) => value + 1);
+  setOriginTransitioning(true);
+  resetOriginScopedUiState();
+}
+
+function clearSensitiveUi(): void {
+  cancelReconnectTimer(true);
+  decisionDialog.cancelAll();
+  setReconnecting(false);
+  uiSessionEpoch += 1;
+  uiSessionActive = false;
+  setScreen("locked");
+  setIdentity(null);
+  setPendingVeilLink(null);
+  setAuthenticatedServerScope(null);
+  setPendingAuthenticatedServerScope(null);
+  setBindingTransitioning(false);
+  setOriginTransitioning(false);
+  publishedServerScopesByOrigin.clear();
+  setOriginEpoch((value) => value + 1);
+  resetOriginScopedUiState();
+}
 
 // ─── JSON ↔ store-type adapters (snake_case from Rust ↔ camelCase) ────
 
@@ -148,19 +1096,7 @@ function serverFromJSON(v: any): Server {
     id: v.id,
     name: v.name,
     description: v.description ?? undefined,
-    iconUrl: v.icon_url ?? undefined,
     ownerId: v.owner_id,
-  };
-}
-
-function serverToJSON(s: Server): any {
-  return {
-    id: s.id,
-    name: s.name,
-    description: s.description ?? null,
-    icon_url: s.iconUrl ?? null,
-    owner_id: s.ownerId,
-    created_at: "",
   };
 }
 
@@ -205,6 +1141,38 @@ function roleFromJSON(v: any): Role {
   };
 }
 
+function cryptoDiagnosticFromJSON(value: any): ConversationCryptoDiagnostic | null {
+  if (
+    !value
+    || typeof value.conversationId !== "string"
+    || typeof value.code !== "string"
+    || typeof value.detail !== "string"
+  ) return null;
+  return {
+    conversationId: value.conversationId,
+    code: value.code,
+    detail: value.detail,
+  };
+}
+
+function replaceConversationCryptoDiagnostics(values: unknown[]): void {
+  const next: Record<string, ConversationCryptoDiagnostic> = {};
+  for (const value of values) {
+    const diagnostic = cryptoDiagnosticFromJSON(value);
+    if (diagnostic) next[diagnostic.conversationId] = diagnostic;
+  }
+  setConversationCryptoDiagnostics(next);
+}
+
+function upsertConversationCryptoDiagnostic(value: unknown): void {
+  const diagnostic = cryptoDiagnosticFromJSON(value);
+  if (!diagnostic) return;
+  setConversationCryptoDiagnostics((previous) => ({
+    ...previous,
+    [diagnostic.conversationId]: diagnostic,
+  }));
+}
+
 export const appStore = {
   screen,
   setScreen,
@@ -214,6 +1182,7 @@ export const appStore = {
   setUserId,
   conversations,
   setConversations,
+  workspaceRoute: liveWorkspaceRoute,
   activeConversationId,
   setActiveConversationId,
   messages,
@@ -221,10 +1190,17 @@ export const appStore = {
   isSidebarCollapsed,
   setSidebarCollapsed,
   connected,
+  reconnecting,
   serverUrl,
-  setServerUrl,
   serverHttpUrl,
-  setServerHttpUrl,
+  setServerEndpoints,
+  authenticatedServerScope,
+  pendingAuthenticatedServerScope,
+  profileUpdateNotice,
+  identityChangeNotice,
+  bindingTransitioning,
+  originTransitioning,
+  originEpoch,
   servers,
   setServers,
   activeServerId,
@@ -232,50 +1208,93 @@ export const appStore = {
   channelsByServer,
   activeChannelId,
   setActiveChannelId,
+  senderKeyStatus,
+  conversationCryptoDiagnostics,
+  activeConversationCryptoDiagnostic: () => {
+    const conversationId = activeConversationId();
+    return conversationId ? conversationCryptoDiagnostics()[conversationId] ?? null : null;
+  },
   serverMembers,
   serverRoles,
+  pendingVeilLink,
   serverSettingsId,
   typingUsers,
   reactions,
   friends,
   friendRequests,
   presenceMap,
-  cryptoModeByConv,
-  mlsReady,
-
+  friendDirectoryReady,
+  autoLockSeconds,
   activeConversation: () => {
     const id = activeConversationId();
     if (!id) return null;
     const real = conversations().find((c) => c.id === id);
-    if (real) return real;
-    // Virtual conversation backed by an active text channel — keeps ChatIsland working
-    // before the channel beats its way into the conversations list (Phase E).
+    // An active server channel is an explicit security/UI kind even if its
+    // backing conversation has also arrived through the generic DB list.
     const sid = activeServerId();
     const cid = activeChannelId();
     if (sid && cid) {
       const ch = (channelsByServer()[sid] ?? []).find((c) => c.id === cid && c.conversationId === id);
       if (ch) {
         return {
+          ...real,
           id,
+          type: "channel",
           name: `# ${ch.name}`,
-          unreadCount: 0,
+          unreadCount: real?.unreadCount ?? 0,
           online: false,
-        } as Conversation;
+        } satisfies Conversation;
       }
     }
+    if (real) return real;
     return null;
   },
 
   selectConversation: (id: string) => {
+    if (!acceptsSensitiveEvent()) return;
     // Selecting a DM clears any active server/channel context
     setActiveServerId(null);
     setActiveChannelId(null);
     setActiveConversationId(id);
-    // Lazily resolve crypto_mode for the chat header badge.
-    appStore.refreshCryptoMode(id);
+  },
+
+  /**
+   * Navigate to an already-retained local DM while the same origin is
+   * reconnecting. This never creates state, accepts no remote event payload,
+   * and remains blocked across lock or origin transitions.
+   */
+  selectRetainedLocalDm: (id: string): boolean => {
+    if (
+      !uiSessionActive
+      || screen() === "locked"
+      || originTransitioning()
+      || !conversations().some((conversation) => conversation.id === id && conversation.type === "dm")
+    ) return false;
+    setActiveServerId(null);
+    setActiveChannelId(null);
+    setActiveConversationId(id);
+    return true;
+  },
+
+  resolveChannelContext: async (conversationId: string): Promise<{ serverId: string; channelId: string } | null> => {
+    const findLoaded = () => {
+      for (const [serverId, channels] of Object.entries(channelsByServer())) {
+        const channel = channels.find((candidate) => candidate.conversationId === conversationId);
+        if (channel) return { serverId, channelId: channel.id };
+      }
+      return null;
+    };
+    const loaded = findLoaded();
+    if (loaded) return loaded;
+
+    // Legacy server/channel cache rows have no origin column. Until the cache
+    // schema is origin-scoped, a bare conversation UUID must not navigate into
+    // a possibly colliding server on another self-hosted instance.
+    return null;
   },
 
   addMessage: (msg: Message) => {
+    if (!acceptsSensitiveEvent()) return;
     setMessages((prev) => [...prev, msg]);
     // Update conversation's last message
     setConversations((prev) =>
@@ -287,47 +1306,336 @@ export const appStore = {
     );
   },
 
-  /** Connect to Veil gateway and start listening for events. */
-  connectToServer: async () => {
-    try {
-      const uid = await invoke<string>("connect_to_server", { serverUrl: serverUrl() });
-      setConnected(true);
-      setUserId(uid);
-      // Request friend list and announce online after connecting
-      appStore.requestFriendList();
-      appStore.sendPresence(1); // ONLINE
-      // Load Discord-like servers (cache-first then refresh)
-      appStore.loadServers();
-    } catch (e) {
-      console.error("connect failed:", e);
-      setConnected(false);
+  /** Connect to Veil gateway and publish one native-authenticated namespace. */
+  connectToServer: (forceAfterCurrent = false) => {
+    if (!eventListenersInitialized) {
+      return Promise.reject(
+        new Error("authenticated transport requires the complete native event listener set"),
+      );
     }
+    const requestedServerUrl = serverUrl();
+    const requestedHttpUrl = serverHttpUrl();
+    const expectedOrigin = canonicalServerOriginFromHttpUrl(requestedHttpUrl);
+    const endpointKey = `${requestedServerUrl}\n${requestedHttpUrl}`;
+    const selectedEndpointEpoch = endpointSelectionEpoch;
+    return serializeConnectionAttempt(endpointKey, selectedEndpointEpoch, async () => {
+      // A queued B attempt must never start after the user has already chosen
+      // endpoint C. Check before touching renderer or native transport state.
+      requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+      const continuityScope = publishedServerScopesByOrigin.get(expectedOrigin) ?? null;
+      beginBindingTransition();
+      const sessionEpoch = captureUiSessionEpoch();
+      try {
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        const nativeScope = await invoke<unknown>("connect_to_server", {
+          serverUrl: requestedServerUrl,
+          serverHttpUrl: requestedHttpUrl,
+        });
+        requireCurrentUiSession(sessionEpoch);
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        const scope = validateAuthenticatedServerScope(
+          nativeScope,
+          expectedOrigin,
+          continuityScope,
+        );
+        setPendingAuthenticatedServerScope(scope);
+        const diagnostics = await invoke<ConversationCryptoDiagnostic[]>(
+          "get_conversation_crypto_diagnostics",
+        );
+        requireCurrentUiSession(sessionEpoch);
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        // An authenticated transport without published X3DH prekeys cannot
+        // safely receive new DMs. Treat prekey publication as part of connect.
+        await invoke("upload_prekeys", { serverHttpUrl: requestedHttpUrl });
+        requireCurrentUiSession(sessionEpoch);
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        await invoke("confirm_authenticated_session_scope", {
+          userId: scope.userId,
+          canonicalServerOrigin: scope.canonicalServerOrigin,
+          bindingGeneration: scope.bindingGeneration,
+        });
+        requireCurrentUiSession(sessionEpoch);
+        requireCurrentEndpointSelection(selectedEndpointEpoch, endpointKey);
+        if (!authenticatedScopesEqual(pendingAuthenticatedServerScope(), scope)) {
+          throw new StaleUiSessionError();
+        }
+
+        replaceConversationCryptoDiagnostics(diagnostics);
+        setAuthenticatedServerScope(scope);
+        if (!workspaceRouteMatchesScope(workspaceRoute(), scope)) {
+          setWorkspaceRouteRaw({ kind: "home", view: "overview", scope: {
+            canonicalServerOrigin: scope.canonicalServerOrigin,
+            bindingGeneration: scope.bindingGeneration,
+          } });
+        }
+        setPendingAuthenticatedServerScope(null);
+        publishedServerScopesByOrigin.set(scope.canonicalServerOrigin, scope);
+        setOriginTransitioning(false);
+        setUserId(scope.userId);
+        setConnected(true);
+        setReconnecting(false);
+        setBindingTransitioning(false);
+        reconnectAttempt = 0;
+
+        // Renderer hydration is generation-guarded but deliberately not part
+        // of the serialized native bind. A disconnect during hydration can now
+        // queue a real reconnect instead of coalescing with a dead attempt.
+        void (async () => {
+          try {
+            await appStore.loadConversations();
+            requireCurrentUiSession(sessionEpoch);
+            if (!authenticatedScopesEqual(authenticatedServerScope(), scope)) {
+              throw new StaleUiSessionError();
+            }
+            const selectedConversation = activeConversationId();
+            if (selectedConversation) {
+              await appStore.loadMessages(selectedConversation);
+              requireCurrentUiSession(sessionEpoch);
+            }
+            appStore.requestFriendList();
+            appStore.sendPresence(1); // ONLINE
+            void appStore.loadServers();
+            await Promise.allSettled(
+              conversations()
+                .filter((conversation) => conversation.type === "group")
+                .map((conversation) => appStore.getGroupMembers(conversation.id)),
+            );
+            requireCurrentUiSession(sessionEpoch);
+          } catch (error) {
+            if (!(error instanceof StaleUiSessionError)) {
+              console.warn("authenticated renderer hydration failed:", error);
+            }
+          }
+        })();
+        return scope.userId;
+      } catch (e) {
+        rethrowIfStale(e);
+        console.error("connect failed:", e);
+        setAuthenticatedServerScope(null);
+        setPendingAuthenticatedServerScope(null);
+        setBindingTransitioning(true);
+        setConnected(false);
+        setUserId(null);
+        setReconnecting(true);
+        // Let serializeConnectionAttempt clear the rejected shared promise
+        // before the next attempt enters it.
+        setTimeout(() => scheduleReconnect(sessionEpoch), 0);
+        throw e;
+      }
+    }, forceAfterCurrent);
+  },
+
+  ensureConnected: () => {
+    if (connected() || !acceptsSensitiveEvent()) return;
+    scheduleReconnect(captureUiSessionEpoch(), true);
+  },
+
+  refreshConversationCryptoDiagnostics: async (): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const diagnostics = await invoke<ConversationCryptoDiagnostic[]>(
+      "get_conversation_crypto_diagnostics",
+    );
+    requireCurrentUiSession(sessionEpoch);
+    replaceConversationCryptoDiagnostics(diagnostics);
   },
 
   /** Send a text message to the active conversation. */
   sendMessage: async (text: string, replyToId?: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const convId = activeConversationId();
     if (!convId) return;
+    const mutationScope = requirePublishedMutationScope();
+    const quarantine = conversationCryptoDiagnostics()[convId];
+    if (quarantine) {
+      throw new Error(
+        `Conversation cryptography is unavailable (${quarantine.code}): ${quarantine.detail}`,
+      );
+    }
     try {
-      await invoke("send_message", { conversationId: convId, text, replyToId: replyToId ?? null });
+      const conversation = appStore.activeConversation();
+      if (conversation?.type === "group" || conversation?.type === "channel") {
+        // Revalidate the exact permission-filtered roster before every group or
+        // server-channel send. The native command is a no-op when the current
+        // generation is already distributed, and creates/distributes a fresh
+        // generation when rotation is required.
+        await appStore.distributeSenderKey(convId);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
+      }
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+      await invoke("send_message", {
+        conversationId: convId,
+        text,
+        replyToId: replyToId ?? null,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+      setConversations((prev) =>
+        prev.map((conversation) =>
+          conversation.id === convId
+            ? { ...conversation, lastMessage: text, lastMessageTime: Date.now() }
+            : conversation,
+        ),
+      );
       // Backend already persisted the outgoing message to the local DB
       // (api.rs send_message inserts before returning). The gateway filters
       // the sender from broadcast, so we won't get a veil://message echo.
       // Refresh from DB to display the just-sent message exactly once.
       appStore.loadMessages(convId).catch(() => {});
     } catch (e) {
+      rethrowIfStale(e);
       console.error("send failed:", e);
+      // Failures after the durable insert are represented by a Failed row;
+      // refresh it before returning control to the composer. Failures before
+      // insertion simply leave the existing timeline unchanged.
+      await appStore.loadMessages(convId);
+      throw e;
+    }
+  },
+
+  /** Pick, sanitize, stream-encrypt, and send files through native code. */
+  sendAttachments: async (
+    text: string,
+    replyToId?: string,
+    dropCapability?: string,
+  ): Promise<boolean> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const convId = activeConversationId();
+    if (!convId) return false;
+    const mutationScope = requirePublishedMutationScope();
+    const quarantine = conversationCryptoDiagnostics()[convId];
+    if (quarantine) {
+      throw new Error(
+        `Conversation cryptography is unavailable (${quarantine.code}): ${quarantine.detail}`,
+      );
+    }
+    try {
+      const conversation = appStore.activeConversation();
+      if (conversation?.type === "group" || conversation?.type === "channel") {
+        await appStore.distributeSenderKey(convId);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
+      }
+      const sequence = await invoke<number | null>("send_attachment_message", {
+        conversationId: convId,
+        text,
+        replyToId: replyToId ?? null,
+        dropCapability: dropCapability ?? null,
+        expectedBinding: authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+      if (sequence === null) return false;
+      await appStore.loadMessages(convId);
+      return true;
+    } catch (error) {
+      rethrowIfStale(error);
+      await appStore.loadMessages(convId);
+      throw error;
+    }
+  },
+
+  saveAttachment: async (messageId: string, ordinal: number): Promise<string | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const result = await invoke<string | null>("save_message_attachment", {
+      messageId,
+      ordinal,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return result;
+  },
+
+  createAttachmentMediaSource: async (messageId: string, ordinal: number): Promise<string> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const result = await invoke<string>("create_attachment_media_source", {
+      messageId,
+      ordinal,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    if (!/^(?:veilfile:\/\/localhost|http:\/\/veilfile\.localhost)\/[0-9a-f]{64}$/.test(result)) {
+      throw new Error("native media source violated its capability contract");
+    }
+    return result;
+  },
+
+  listPushSubscriptions: async (): Promise<PushSubscription[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const result = await invoke<PushSubscription[]>("list_push_subscriptions", {
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return result;
+  },
+
+  deletePushSubscription: async (subscriptionId: string): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("delete_push_subscription", {
+      subscriptionId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
+  updatePushSubscriptionPolicy: async (
+    subscriptionId: string,
+    policy: { enabled?: boolean; muteSeconds?: number },
+  ): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("update_push_subscription_policy", {
+      subscriptionId,
+      enabled: policy.enabled ?? null,
+      muteSeconds: policy.muteSeconds ?? null,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
+  discardFailedMessage: async (localMessageId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const existing = messages().find((message) => message.id === localMessageId);
+    const conversationId = existing?.conversationId;
+    discardedOutgoingMessageIds.add(localMessageId);
+    if (conversationId) nextMessageLoadGeneration(conversationId);
+    try {
+      await invoke("discard_failed_outgoing_message", {
+        localMessageId,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+      rejectedOutgoingMessageIds.delete(localMessageId);
+      acknowledgedOutgoingMessageIds.delete(localMessageId);
+      const remaining = messages().filter((message) => message.id !== localMessageId);
+      setMessages(remaining);
+      if (conversationId) {
+        nextMessageLoadGeneration(conversationId);
+        updateConversationPreview(conversationId, remaining);
+      }
+      discardedOutgoingMessageIds.delete(localMessageId);
+    } catch (error) {
+      discardedOutgoingMessageIds.delete(localMessageId);
+      if (conversationId && isUiSessionEpochCurrent(sessionEpoch)) {
+        await appStore.loadMessages(conversationId);
+      }
+      throw error;
     }
   },
 
   editMessage: async (messageId: string, newText: string) => {
     const convId = activeConversationId();
-    if (!convId) return;
+    if (!convId || messages().some((message) => message.id === messageId && (message.pending || message.failed || message.deliveryUnknown))) return;
     try {
-      await invoke("edit_message", { messageId, conversationId: convId, newText });
-      setMessages((prev) =>
-        prev.map((m) => (m.id === messageId ? { ...m, text: newText } : m))
-      );
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("edit_message", {
+        messageId,
+        conversationId: convId,
+        newText,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
     } catch (e) {
       console.error("edit failed:", e);
     }
@@ -335,10 +1643,14 @@ export const appStore = {
 
   deleteMessage: async (messageId: string) => {
     const convId = activeConversationId();
-    if (!convId) return;
+    if (!convId || messages().some((message) => message.id === messageId && (message.pending || message.failed || message.deliveryUnknown))) return;
     try {
-      await invoke("delete_message", { messageId, conversationId: convId });
-      setMessages((prev) => prev.filter((m) => m.id !== messageId));
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("delete_message", {
+        messageId,
+        conversationId: convId,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
     } catch (e) {
       console.error("delete failed:", e);
     }
@@ -348,10 +1660,20 @@ export const appStore = {
   sendTyping: () => {
     const convId = activeConversationId();
     if (!convId) return;
+    let mutationScope: AuthenticatedServerScope;
+    try {
+      mutationScope = requirePublishedMutationScope();
+    } catch {
+      return;
+    }
     const now = Date.now();
     if (now - lastTypingSent < 3000) return;
     lastTypingSent = now;
-    invoke("send_typing", { conversationId: convId, started: true }).catch(() => {});
+    invoke("send_typing", {
+      conversationId: convId,
+      started: true,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    }).catch(() => {});
   },
 
   /** Get display names of users currently typing in a conversation. */
@@ -361,7 +1683,7 @@ export const appStore = {
     const names: string[] = [];
     for (const key of set) {
       const msg = allMessages.find((m) => m.senderKey === key && !m.isOwn);
-      names.push(msg?.senderName ?? key.slice(0, 8));
+      names.push(msg?.senderName ?? "Unknown author");
     }
     return names;
   },
@@ -370,7 +1692,9 @@ export const appStore = {
   toggleReaction: async (messageId: string, emoji: string) => {
     const convId = activeConversationId();
     const uid = userId();
-    if (!convId || !uid) return;
+    if (!convId || !uid || messages().some((message) =>
+      message.id === messageId && (message.pending || message.failed || message.deliveryUnknown)
+    )) return;
 
     // Check if we already reacted with this emoji
     const msgReactions = reactions()[messageId] ?? {};
@@ -378,22 +1702,16 @@ export const appStore = {
     const alreadyReacted = emojiList.some((r) => r.userId === uid);
     const add = !alreadyReacted;
 
-    // Optimistic update
-    setReactions((prev) => {
-      const copy = { ...prev };
-      const msgR = { ...(copy[messageId] ?? {}) };
-      if (add) {
-        msgR[emoji] = [...(msgR[emoji] ?? []), { userId: uid, username: "You" }];
-      } else {
-        msgR[emoji] = (msgR[emoji] ?? []).filter((r) => r.userId !== uid);
-        if (msgR[emoji].length === 0) delete msgR[emoji];
-      }
-      copy[messageId] = msgR;
-      return copy;
-    });
-
     try {
-      await invoke("toggle_reaction", { messageId, conversationId: convId, emoji, userId: uid, add });
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("toggle_reaction", {
+        messageId,
+        conversationId: convId,
+        emoji,
+        userId: uid,
+        add,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
     } catch (e) {
       console.error("reaction failed:", e);
     }
@@ -404,7 +1722,8 @@ export const appStore = {
   /** Request the full friend list from server. */
   requestFriendList: async () => {
     try {
-      await invoke("request_friend_list");
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("request_friend_list", authenticatedMutationScopeArgs(mutationScope));
     } catch (e) {
       console.error("requestFriendList failed:", e);
     }
@@ -413,6 +1732,9 @@ export const appStore = {
   /** Send a friend request to a user by their user_id. */
   /** Send a friend request. Returns "sent" | "already_pending" | "already_friends" | "error". */
   sendFriendRequest: async (targetUserId: string, message?: string): Promise<string> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    if (!connected() || !friendDirectoryReady()) return "error";
+    const mutationScope = requirePublishedMutationScope();
     // Local duplicate check — if already pending, don't even bother the server
     const existing = friendRequests().find(
       (r) => (r.outgoing && r.fromUserId === targetUserId) || (!r.outgoing && r.fromUserId === targetUserId),
@@ -422,7 +1744,12 @@ export const appStore = {
     if (alreadyFriend) return "already_friends";
 
     try {
-      await invoke("send_friend_request", { targetUserId, message: message ?? null });
+      await invoke("send_friend_request", {
+        targetUserId,
+        message: message ?? null,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       // Optimistically add outgoing request so it appears in Pending immediately
       setFriendRequests((prev) => [
         ...prev,
@@ -436,9 +1763,11 @@ export const appStore = {
         },
       ]);
       // Also request the real list from server (will overwrite optimistic entry)
-      await invoke("request_friend_list");
+      await invoke("request_friend_list", authenticatedMutationScopeArgs(mutationScope));
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       return "sent";
     } catch (e) {
+      rethrowIfStale(e);
       console.error("sendFriendRequest failed:", e);
       return "error";
     }
@@ -446,11 +1775,22 @@ export const appStore = {
 
   /** Accept or reject a friend request. */
   respondFriendRequest: async (requestId: string, accept: boolean) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    if (!connected() || !friendDirectoryReady()) {
+      throw new Error("friend directory is not ready for this server origin");
+    }
+    const mutationScope = requirePublishedMutationScope();
     try {
-      await invoke("respond_friend_request", { requestId, accept });
+      await invoke("respond_friend_request", {
+        requestId,
+        accept,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       // Remove from pending list optimistically
       setFriendRequests((prev) => prev.filter((r) => r.requestId !== requestId));
     } catch (e) {
+      rethrowIfStale(e);
       console.error("respondFriendRequest failed:", e);
       throw e;
     }
@@ -458,10 +1798,20 @@ export const appStore = {
 
   /** Remove a friend. */
   removeFriend: async (targetUserId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    if (!connected() || !friendDirectoryReady()) {
+      throw new Error("friend directory is not ready for this server origin");
+    }
+    const mutationScope = requirePublishedMutationScope();
     try {
-      await invoke("remove_friend", { userId: targetUserId });
+      await invoke("remove_friend", {
+        userId: targetUserId,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       setFriends((prev) => prev.filter((f) => f.userId !== targetUserId));
     } catch (e) {
+      rethrowIfStale(e);
       console.error("removeFriend failed:", e);
       throw e;
     }
@@ -470,7 +1820,12 @@ export const appStore = {
   /** Send presence status. 1=online, 2=offline, 3=away, 4=dnd */
   sendPresence: async (status: number) => {
     try {
-      await invoke("send_presence", { status, statusText: null });
+      const mutationScope = requirePublishedMutationScope();
+      await invoke("send_presence", {
+        status,
+        statusText: null,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
     } catch (e) {
       console.error("sendPresence failed:", e);
     }
@@ -478,28 +1833,49 @@ export const appStore = {
 
   /** Search for a user by username. */
   searchUser: async (username: string): Promise<{ userId: string; username: string; identityKey: string } | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    if (!connected() || !friendDirectoryReady()) return null;
     try {
       const result = await invoke<{ user_id: string; username: string; identity_key: string }>(
         "search_user",
         { serverHttpUrl: serverHttpUrl(), username },
       );
+      requireCurrentUiSession(sessionEpoch);
       return { userId: result.user_id, username: result.username, identityKey: result.identity_key };
     } catch (e) {
+      rethrowIfStale(e);
       console.error("searchUser failed:", e);
       return null;
     }
   },
 
-  /** Create a DM conversation with a peer (by their user_id). */
-  createDm: async (peerUserId: string, peerName?: string): Promise<string | null> => {
+  /**
+   * Create a DM conversation with a peer (by their user_id).
+   *
+   * When the caller is acting from an identity-bearing surface it must pass
+   * the identity key shown to the user. Native code binds the server response
+   * to that key before committing any conversation state. Keyless discovery
+   * surfaces may omit it and retain the signed-directory fail-closed checks.
+   */
+  createDm: async (
+    peerUserId: string,
+    peerName?: string,
+    expectedPeerIdentityKey?: string,
+  ): Promise<string> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const ourId = userId();
-    if (!ourId) return null;
+    if (!ourId || !connected()) {
+      throw new Error("Connect to the Veil server before creating an encrypted conversation");
+    }
+    const mutationScope = requirePublishedMutationScope();
     try {
       const convId = await invoke<string>("create_dm", {
         serverHttpUrl: serverHttpUrl(),
         ourUserId: ourId,
         peerUserId,
+        expectedPeerIdentityKey: expectedPeerIdentityKey ?? null,
       });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       // Add conversation to local list
       const exists = conversations().some((c) => c.id === convId);
       if (!exists) {
@@ -509,53 +1885,73 @@ export const appStore = {
             id: convId,
             type: "dm" as const,
             name: peerName || peerUserId.slice(0, 8),
+            serverOrigin: mutationScope.canonicalServerOrigin,
+            peerUserId,
+            peerKey: expectedPeerIdentityKey,
             unreadCount: 0,
           },
         ]);
+      } else if (expectedPeerIdentityKey) {
+        setConversations((prev) => prev.map((conversation) =>
+          conversation.id === convId && conversation.type === "dm"
+            ? {
+              ...conversation,
+              serverOrigin: mutationScope.canonicalServerOrigin,
+              peerUserId,
+              peerKey: expectedPeerIdentityKey,
+            }
+            : conversation,
+        ));
       }
-      setActiveConversationId(convId);
       return convId;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("create DM failed:", e);
-      return null;
+      throw e;
     }
   },
 
   // ─── PIN Lock ───────────────────────────────────────
 
   /** Set a PIN code for app lock. */
-  setPin: async (pin: string) => {
-    await invoke("set_pin", { pin });
+  setPin: async (pin: string, currentPin?: string) => {
+    await invoke("set_pin", { pin, currentPin: currentPin ?? null });
+    setPinConfigured(true);
+  },
+
+  clearPin: async (currentPin: string) => {
+    await invoke("clear_pin", { currentPin });
+    setPinConfigured(false);
   },
 
   /** Verify PIN and unlock. */
   verifyPin: async (pin: string): Promise<boolean> => {
+    const unlockAttemptEpoch = captureUiSessionEpoch();
     const ok = await invoke<boolean>("verify_pin", { pin });
     if (ok) {
-      // Delay heavy init so unlock + stagger animations play smoothly.
-      // LockScreen transitions to chat at +600ms, stagger ends ~+1400ms.
-      // Starting Argon2id-heavy init_from_seed earlier saturates CPU and
-      // prevents the browser from rendering CSS transitions.
+      // Native PIN verification has already initialized the identity and
+      // SQLCipher database atomically. It also replaces the native VeilClient,
+      // so renderer transport state from a hot reload must never be trusted.
+      cancelReconnectTimer(true);
+      setConnected(false);
+      setReconnecting(false);
+      setUserId(null);
+      const key = await invoke<string>("get_identity_key");
+      if (!activateUiSession(unlockAttemptEpoch)) return false;
+      setIdentity(key);
+      const unlockedEpoch = captureUiSessionEpoch();
       setTimeout(async () => {
-        try {
-          const key = await invoke<string>("init_from_seed");
-          setIdentity(key);
-        } catch (e) {
-          console.error("init_from_seed failed:", e);
-        }
+        if (!isUiSessionEpochCurrent(unlockedEpoch)) return;
         await appStore.loadConversations();
+        if (!isUiSessionEpochCurrent(unlockedEpoch)) return;
         appStore.startAutoLock();
-        if (!connected()) {
-          appStore.connectToServer();
-        }
-        // Phase 6: bring up the MLS client (restores prior groups
-        // from SQLCipher snapshot if any).
-        appStore.bootstrapMls().catch(() => {});
-        // First-launch backfill of the local search index. Idempotent: backend
-        // marks itself "done" and no-ops on subsequent launches.
-        invoke<number>("ensure_search_backfill")
-          .then((n) => { if (n > 0) console.info(`[search] backfilled ${n} messages`); })
-          .catch((e) => console.warn("ensure_search_backfill failed:", e));
+        // Always reconcile transport state: verify_pin created a fresh native
+        // client even when a stale Solid signal claimed the old socket was live.
+        // ensureConnected coalesces with the chat-screen reconnect effect.
+        appStore.ensureConnected();
+        // The native authenticated-connect transaction rebuilds the exact
+        // origin-scoped RAM index after offline sync. Do not race it with a
+        // second renderer-owned rebuild while the binding is still changing.
       }, 1500);
     }
     return ok;
@@ -563,78 +1959,234 @@ export const appStore = {
 
   /** Check if a PIN is configured. */
   hasPin: async (): Promise<boolean> => {
-    return invoke<boolean>("has_pin");
+    const configured = await invoke<boolean>("has_pin");
+    setPinConfigured(configured);
+    return configured;
   },
 
-  /** Lock the app (show PIN screen). */
-  lock: () => {
-    setScreen("locked");
+  /** Lock the native session, not just the WebView. */
+  lock: async () => {
+    if (!pinConfigured()) return;
+    // Clear the DOM and invalidate every in-flight renderer task before the
+    // first asynchronous boundary. The native command is the key/DB boundary.
+    clearSensitiveUi();
+    const lockedEpoch = captureUiSessionEpoch();
+
+    try {
+      await invoke("lock_app");
+    } catch (e) {
+      console.error("native lock failed:", e);
+      // A stale renderer PIN cache is the one recoverable failure: native
+      // lock_app checks PIN existence before destroying any state. Rebuild a
+      // minimal UI from native/SQLCipher instead of resurrecting old arrays.
+      try {
+        const stillConfigured = await invoke<boolean>("has_pin");
+        setPinConfigured(stillConfigured);
+        if (!stillConfigured) {
+          const key = await invoke<string>("get_identity_key");
+          if (!activateUiSession(lockedEpoch)) return;
+          setIdentity(key);
+          setScreen("chat");
+          await appStore.loadConversations();
+          appStore.connectToServer().catch((error) =>
+            console.warn("secure reconnect after cancelled lock failed:", error),
+          );
+        }
+      } catch {
+        // Unknown native failure stays fail-closed on the lock screen.
+      }
+    }
   },
 
-  /** Start auto-lock timer: lock after 5 min inactivity. */
+  /** Remove the active account from this device and return to onboarding. */
+  signOut: async () => {
+    await invoke("sign_out");
+    clearSensitiveUi();
+    const clearedEpoch = captureUiSessionEpoch();
+    if (!activateUiSession(clearedEpoch)) {
+      throw new StaleUiSessionError();
+    }
+    setPinConfigured(false);
+    setScreen("onboarding");
+  },
+
+  /** Re-open the keychain identity and publish a fresh renderer session. */
+  resumeStoredIdentity: async (): Promise<void> => {
+    if (await appStore.hasPin()) {
+      setScreen("locked");
+      return;
+    }
+
+    const dormantEpoch = captureUiSessionEpoch();
+    const key = await invoke<string>("init_from_seed");
+    if (uiSessionActive) {
+      requireCurrentUiSession(dormantEpoch);
+    } else if (!activateUiSession(dormantEpoch)) {
+      throw new StaleUiSessionError();
+    }
+
+    setIdentity(key);
+    setScreen("chat");
+    await appStore.loadConversations();
+    await appStore.connectToServer().catch((error) => {
+      if (!(error instanceof StaleUiSessionError)) {
+        console.warn("secure connect after identity resume failed:", error);
+      }
+    });
+  },
+
+  /** Start auto-lock timer using the native persisted inactivity period. */
   startAutoLock: () => {
     if (autoLockTimer) clearInterval(autoLockTimer);
     autoLockTimer = setInterval(async () => {
-      const hasPin = await invoke<boolean>("has_pin");
-      if (!hasPin) return;
-      const idle = await invoke<number>("idle_seconds");
-      if (idle >= AUTO_LOCK_SECONDS) {
-        setScreen("locked");
+      const sessionEpoch = captureUiSessionEpoch();
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+      if (!pinConfigured()) return;
+      try {
+        const idle = await invoke<number>("idle_seconds");
+        if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+        if (idle >= autoLockSeconds()) {
+          await appStore.lock();
+        }
+      } catch (error) {
+        if (isUiSessionEpochCurrent(sessionEpoch)) {
+          console.warn("idle timer check failed:", error);
+        }
       }
     }, 10_000); // check every 10s
   },
 
+  loadAutoLockSetting: async (): Promise<number> => {
+    const seconds = await invoke<number>("get_auto_lock_seconds");
+    setAutoLockSeconds(seconds);
+    return seconds;
+  },
+
+  setAutoLockMinutes: async (minutes: number): Promise<void> => {
+    const seconds = minutes * 60;
+    await invoke("set_auto_lock_seconds", { seconds });
+    setAutoLockSeconds(seconds);
+  },
+
   /** Touch activity (called on user interaction). */
   touchActivity: () => {
+    const now = Date.now();
+    if (now - lastActivityTouch < 1000) return;
+    lastActivityTouch = now;
     invoke("touch_activity").catch(() => {});
   },
 
   /** Load persisted conversations from the encrypted DB. */
   loadConversations: async () => {
+    const sessionEpoch = captureUiSessionEpoch();
     try {
-      const convs = await invoke<Array<{ id: string; type: string; name: string; peerKey?: string; lastMessageAt?: string }>>("get_conversations");
-      setConversations(convs.map(c => ({
-        id: c.id,
-        type: (c.type === "group" ? "group" : "dm") as "dm" | "group",
-        name: c.name || c.id.slice(0, 8),
-        unreadCount: 0,
-        lastMessageTime: c.lastMessageAt ? new Date(c.lastMessageAt).getTime() : undefined,
-      })));
+      const convs = await invoke<Array<{
+        id: string;
+        type: string;
+        name: string;
+        serverOrigin?: string;
+        peerUserId?: string;
+        peerKey?: string;
+        lastMessageAt?: string;
+      }>>("get_conversations");
+      requireCurrentUiSession(sessionEpoch);
+      setConversations(
+        convs
+          // Server channels are rendered through channelsByServer. Treating a
+          // channel row as a DM would expose the wrong send/decrypt workflow.
+          .filter((c) => c.type !== "channel")
+          .map(c => ({
+            id: c.id,
+            type: (c.type === "group" ? "group" : "dm") as "dm" | "group",
+            name: c.name || c.id.slice(0, 8),
+            serverOrigin: c.serverOrigin,
+            peerUserId: c.peerUserId,
+            peerKey: c.peerKey,
+            unreadCount: 0,
+            lastMessageTime: c.lastMessageAt ? new Date(c.lastMessageAt).getTime() : undefined,
+          })),
+      );
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("loadConversations failed:", e);
     }
   },
 
   /** Load persisted messages for a conversation. */
   loadMessages: async (conversationId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = authenticatedServerScope();
+    if (!expectedScope) return;
+    const generation = nextMessageLoadGeneration(conversationId);
     try {
-      const msgs = await invoke<Array<{ id: string; conversationId: string; senderKey: string; text: string; isOwn: boolean; timestamp: number; createdAt: string; replyToId?: string }>>(
+      const response = await invoke<unknown>(
         "get_messages",
         { conversationId },
       );
-      const loaded: Message[] = msgs.map(m => ({
-        id: m.id,
-        conversationId: m.conversationId,
-        senderName: m.isOwn ? "You" : m.senderKey.slice(0, 8),
-        senderKey: m.senderKey,
-        text: m.text,
-        timestamp: m.timestamp || new Date(m.createdAt).getTime(),
-        isOwn: m.isOwn,
-        replyToId: m.replyToId ?? undefined,
-      }));
-      setMessages(prev => {
-        const loadedIds = new Set(loaded.map(m => m.id));
-        // Keep messages from OTHER conversations untouched. For the current
-        // conversation, keep only local optimistic items not yet in DB so we
-        // don't duplicate, and prepend the DB-loaded list.
-        const otherConvs = prev.filter(m => m.conversationId !== conversationId);
-        const localOnly = prev.filter(
-          m => m.conversationId === conversationId && !loadedIds.has(m.id),
-        );
-        return [...otherConvs, ...loaded, ...localOnly];
-      });
+      requireCurrentUiSession(sessionEpoch);
+      if (!authenticatedScopesEqual(authenticatedServerScope(), expectedScope)) {
+        throw new StaleUiSessionError();
+      }
+      if (messageLoadGenerations.get(conversationId) !== generation) return;
+      const msgs = validatedStoredMessages(
+        response,
+        conversationId,
+        expectedScope.canonicalServerOrigin,
+      );
+      publishConversationMessages(conversationId, rendererMessagesFromStored(msgs));
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
+      if (messageLoadGenerations.get(conversationId) !== generation) return;
       console.error("loadMessages failed:", e);
+    }
+  },
+
+  /**
+   * Publish a bounded SQLCipher history window containing one exact search
+   * hit. The caller receives authoritative route metadata so a Room can never
+   * be mistaken for a direct conversation by UUID alone.
+   */
+  loadSearchResultContext: async (
+    messageId: string,
+    conversationId: string,
+  ): Promise<Pick<SearchResultContextDto, "conversationType" | "serverId">> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = authenticatedServerScope();
+    if (!expectedScope) {
+      throw new Error("search result has no authenticated origin context");
+    }
+    const generation = nextMessageLoadGeneration(conversationId);
+    try {
+      const response = await invoke<unknown>("get_search_result_context", {
+        messageId,
+        conversationId,
+      });
+      requireCurrentUiSession(sessionEpoch);
+      if (!authenticatedScopesEqual(authenticatedServerScope(), expectedScope)) {
+        throw new StaleUiSessionError();
+      }
+      if (messageLoadGenerations.get(conversationId) !== generation) {
+        throw new StaleUiSessionError();
+      }
+      const context = validatedSearchResultContext(
+        response,
+        messageId,
+        conversationId,
+        expectedScope.canonicalServerOrigin,
+      );
+      publishConversationMessages(
+        conversationId,
+        rendererMessagesFromStored(context.messages),
+      );
+      return {
+        conversationType: context.conversationType,
+        serverId: context.serverId,
+      };
+    } catch (error) {
+      if (messageLoadGenerations.get(conversationId) !== generation) {
+        throw new StaleUiSessionError();
+      }
+      throw error;
     }
   },
 
@@ -644,93 +2196,55 @@ export const appStore = {
       await invoke("upload_prekeys", { serverHttpUrl: serverHttpUrl() });
     } catch (e) {
       console.error("uploadPrekeys failed:", e);
-    }
-  },
-
-  /** Establish an E2E encrypted session with a peer. */
-  establishSession: async (peerIdentityKey: string) => {
-    try {
-      await invoke("establish_session", {
-        serverHttpUrl: serverHttpUrl(),
-        peerIdentityKey,
-      });
-    } catch (e) {
-      console.error("establishSession failed:", e);
+      throw e;
     }
   },
 
   // ─── Groups ─────────────────────────────────────────
 
-  /** Create a new group. Works offline (local) or online (server). */
-  createGroup: async (name: string): Promise<string | null> => {
+  /** Create a group only after the server confirms its authenticated roster. */
+  createGroup: async (
+    name: string,
+    initialMember: { userId: string; identityKey: string },
+  ): Promise<string | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
-    // If connected and have userId — create on server
-    if (uid && connected()) {
+    if (!uid || !connected()) {
+      throw new Error("Connect to the Veil server before creating an encrypted group");
+    }
+    try {
+      const convId = await invoke<string>("create_group", {
+        serverHttpUrl: serverHttpUrl(),
+        userId: uid,
+        name,
+        memberUserId: initialMember.userId,
+        memberIdentityKey: initialMember.identityKey,
+      });
+      requireCurrentUiSession(sessionEpoch);
       try {
-        const convId = await invoke<string>("create_group", {
-          serverHttpUrl: serverHttpUrl(),
-          userId: uid,
-          name,
-        });
-        setConversations((prev) => [
-          ...prev,
-          { id: convId, type: "group" as const, name, unreadCount: 0 },
-        ]);
-        setActiveConversationId(convId);
-        return convId;
-      } catch (e) {
-        console.error("createGroup (server) failed:", e);
-        // Fall through to local creation
+        await appStore.refreshConversationCryptoDiagnostics();
+      } catch (diagnosticError) {
+        rethrowIfStale(diagnosticError);
+        console.warn("created group diagnostic refresh failed:", diagnosticError);
       }
-    }
-    // Offline / fallback: create locally with a temp UUID
-    const localId = crypto.randomUUID();
-    setConversations((prev) => [
-      ...prev,
-      { id: localId, type: "group" as const, name, unreadCount: 0 },
-    ]);
-    setActiveConversationId(localId);
-    return localId;
-  },
-
-  /** Add a member to a group. */
-  addGroupMember: async (groupId: string, targetUserId: string) => {
-    const uid = userId();
-    if (!uid) return;
-    try {
-      await invoke("add_group_member", {
-        serverHttpUrl: serverHttpUrl(),
-        userId: uid,
-        groupId,
-        targetUserId,
-      });
+      requireCurrentUiSession(sessionEpoch);
+      setConversations((prev) => prev.some((conversation) => conversation.id === convId)
+        ? prev
+        : [...prev, { id: convId, type: "group" as const, name, unreadCount: 0 }]);
+      return convId;
     } catch (e) {
-      console.error("addGroupMember failed:", e);
-      throw e;
-    }
-  },
-
-  /** Remove a member from a group (or leave). */
-  removeGroupMember: async (groupId: string, targetUserId: string) => {
-    const uid = userId();
-    if (!uid) return;
-    try {
-      await invoke("remove_group_member", {
-        serverHttpUrl: serverHttpUrl(),
-        userId: uid,
-        groupId,
-        targetUserId,
-      });
-    } catch (e) {
-      console.error("removeGroupMember failed:", e);
+      rethrowIfStale(e);
+      console.error("createGroup failed:", e);
       throw e;
     }
   },
 
   /** Get group members from the server. */
   getGroupMembers: async (groupId: string): Promise<GroupMember[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
     try {
       const members = await invoke<Array<{
         user_id: string;
@@ -742,7 +2256,9 @@ export const appStore = {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         groupId,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       return members.map((m) => ({
         userId: m.user_id,
         identityKey: m.identity_key,
@@ -751,18 +2267,26 @@ export const appStore = {
         joinedAt: m.joined_at,
       }));
     } catch (e) {
+      rethrowIfStale(e);
       console.error("getGroupMembers failed:", e);
-      return [];
+      throw e;
     }
   },
 
   // ─── Servers / Channels / Roles / Invites ────────
 
-  selectServer: (serverId: string | null) => {
+  selectServer: (serverId: string | null, autoSelect = true) => {
+    if (!acceptsSensitiveEvent()) return;
     setActiveServerId(serverId);
     if (serverId) {
       // Auto-select first text channel of the server, if any
       const chans = channelsByServer()[serverId] ?? [];
+      if (!autoSelect) {
+        setActiveChannelId(null);
+        setActiveConversationId(null);
+        if (chans.length === 0) appStore.loadChannels(serverId);
+        return;
+      }
       const firstText = chans.find((c) => c.channelType === 0);
       if (firstText) {
         appStore.selectChannel(firstText.id);
@@ -779,133 +2303,455 @@ export const appStore = {
   },
 
   selectChannel: (channelId: string | null) => {
+    if (!acceptsSensitiveEvent()) return;
     setActiveChannelId(channelId);
     if (!channelId) {
       setActiveConversationId(null);
       return;
     }
-    // Bind the channel's underlying conversation so ChatIsland renders it.
+    // Bind the channel's underlying conversation so the active chat renders it.
     const sid = activeServerId();
     if (!sid) return;
     const ch = (channelsByServer()[sid] ?? []).find((c) => c.id === channelId);
     if (ch?.conversationId) {
       const convId = ch.conversationId;
       setActiveConversationId(convId);
+      let mutationScope: AuthenticatedServerScope | null = null;
+      try {
+        mutationScope = requirePublishedMutationScope();
+      } catch {
+        // The local conversation may remain readable while reconnecting, but
+        // no channel/Sender-Key mutation belongs to an unpublished binding.
+      }
       // Mark this conversation as a channel — outgoing messages will be encrypted
       // with sender keys; hydrate any persisted sender-key state from the local DB.
-      invoke("mark_channel_conversation", { conversationId: convId }).catch(() => {});
-      invoke("hydrate_channel_sender_keys", { conversationId: convId }).catch(() => {});
-      appStore.loadMessages(convId).catch(() => {});
-      // Distribute (or refresh) our sender key to known members.
-      const members = serverMembers()[sid] ?? [];
-      if (members.length > 0) {
-        appStore.distributeSenderKey(convId, members);
+      if (mutationScope) {
+        const scopeArgs = authenticatedMutationScopeArgs(mutationScope);
+        // A fresh channel has no local crypto classification yet. Marking and
+        // hydration are strict prerequisites for roster installation; running
+        // all three IPC calls concurrently made the first distribution race
+        // the classification and fail closed until the user reopened it.
+        void (async () => {
+          try {
+            await invoke("mark_channel_conversation", {
+              conversationId: convId,
+              ...scopeArgs,
+            });
+            await invoke("hydrate_channel_sender_keys", {
+              conversationId: convId,
+              ...scopeArgs,
+            });
+            await appStore.distributeSenderKey(convId);
+          } catch (error) {
+            if (!(error instanceof StaleUiSessionError)) {
+              console.warn("channel encryption preparation failed:", error);
+            }
+          }
+        })();
       }
+      appStore.loadMessages(convId).catch(() => {});
     } else {
       setActiveConversationId(null);
     }
   },
 
-  /** Hydrate the server rail from local cache (instant), then refresh from REST. */
-  loadServers: async () => {
-    // 1. Cache first for instant UI
-    try {
-      const cached = await invoke<Array<any>>("cache_load_servers");
-      setServers(cached.map(serverFromJSON));
-    } catch (e) {
-      console.warn("cache_load_servers failed:", e);
+  loadNetworkProfile: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+  ): Promise<NetworkProfileView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const requesterUserId = userId();
+    if (!requesterUserId || requesterUserId !== mutationScope.userId) {
+      throw new Error("profile request has no current authenticated account");
     }
-    // 2. REST refresh
+    const profile = await invoke<unknown>("get_network_profile", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: requesterUserId,
+      targetUserId,
+      expectedIdentityKey,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedNetworkProfileView(
+      profile,
+      mutationScope,
+      targetUserId,
+      expectedIdentityKey,
+    );
+  },
+
+  loadCachedNetworkProfile: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+    expectedServerOrigin: string,
+  ): Promise<NetworkProfileView | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const requesterUserId = userId();
+    const requesterIdentityKey = identity()?.trim().toLowerCase();
+    const parsedOrigin = new URL(expectedServerOrigin);
+    if (
+      !requesterUserId
+      || !requesterIdentityKey
+      || !/^[0-9a-f]{64}$/.test(requesterIdentityKey)
+      || !/^[0-9a-f]{64}$/.test(expectedIdentityKey)
+      || parsedOrigin.pathname !== "/"
+      || parsedOrigin.search
+      || parsedOrigin.hash
+      || canonicalServerOriginFromHttpUrl(expectedServerOrigin) !== expectedServerOrigin
+    ) {
+      throw new Error("cached profile request has no exact authenticated locator");
+    }
+    const profile = await invoke<unknown>("get_cached_network_profile", {
+      userId: requesterUserId,
+      targetUserId,
+      expectedIdentityKey,
+      expectedServerOrigin,
+    });
+    requireCurrentUiSession(sessionEpoch);
+    if (
+      userId() !== requesterUserId
+      || identity()?.trim().toLowerCase() !== requesterIdentityKey
+    ) {
+      throw new StaleUiSessionError();
+    }
+    if (profile === null) return null;
+    return validatedNetworkProfileView(
+      profile,
+      { canonicalServerOrigin: expectedServerOrigin },
+      targetUserId,
+      expectedIdentityKey,
+    );
+  },
+
+  loadCachedIdentityVerification: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+    expectedServerOrigin: string,
+  ): Promise<CachedIdentityProofView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const currentIdentityKey = identity()?.trim().toLowerCase();
+    const parsedOrigin = new URL(expectedServerOrigin);
+    if (
+      !currentIdentityKey
+      || !/^[0-9a-f]{64}$/.test(currentIdentityKey)
+      || !/^[0-9a-f]{64}$/.test(expectedIdentityKey)
+      || parsedOrigin.pathname !== "/"
+      || parsedOrigin.search
+      || parsedOrigin.hash
+      || canonicalServerOriginFromHttpUrl(expectedServerOrigin) !== expectedServerOrigin
+    ) {
+      throw new Error("cached identity proof request has no exact unlocked locator");
+    }
+    const verification = await invoke<unknown>("get_cached_identity_verification", {
+      targetUserId,
+      expectedIdentityKey,
+      expectedServerOrigin,
+    });
+    requireCurrentUiSession(sessionEpoch);
+    if (identity()?.trim().toLowerCase() !== currentIdentityKey) {
+      throw new StaleUiSessionError();
+    }
+    return validatedCachedIdentityProofView(
+      verification,
+      expectedServerOrigin,
+      targetUserId,
+      expectedIdentityKey,
+    );
+  },
+
+  updateNetworkProfile: async (
+    expectedVersion: string,
+    displayName: string | null,
+    about: string,
+  ): Promise<NetworkProfileView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const currentUserId = userId();
+    const currentIdentityKey = identity()?.trim().toLowerCase();
+    if (
+      !currentUserId
+      || currentUserId !== mutationScope.userId
+      || !currentIdentityKey
+      || !/^[0-9a-f]{64}$/.test(currentIdentityKey)
+    ) {
+      throw new Error("profile update has no current authenticated identity");
+    }
+    const profile = await invoke<unknown>("update_network_profile", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: currentUserId,
+      expectedVersion,
+      displayName,
+      about,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedNetworkProfileView(
+      profile,
+      mutationScope,
+      currentUserId,
+      currentIdentityKey,
+    );
+  },
+
+  updateProfileAvatar: async (expectedVersion: string): Promise<NetworkProfileView | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const currentUserId = userId();
+    const currentIdentityKey = identity()?.trim().toLowerCase();
+    if (!currentUserId || !currentIdentityKey || !/^[0-9a-f]{64}$/.test(currentIdentityKey)) {
+      throw new Error("avatar update has no current authenticated identity");
+    }
+    const profile = await invoke<unknown>("update_profile_avatar", {
+      serverHttpUrl: serverHttpUrl(), userId: currentUserId, expectedVersion,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    if (profile === null) return null;
+    return validatedNetworkProfileView(profile, mutationScope, currentUserId, currentIdentityKey);
+  },
+
+  removeProfileAvatar: async (expectedVersion: string): Promise<NetworkProfileView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const currentUserId = userId();
+    const currentIdentityKey = identity()?.trim().toLowerCase();
+    if (!currentUserId || !currentIdentityKey || !/^[0-9a-f]{64}$/.test(currentIdentityKey)) {
+      throw new Error("avatar removal has no current authenticated identity");
+    }
+    const profile = await invoke<unknown>("remove_profile_avatar", {
+      serverHttpUrl: serverHttpUrl(), userId: currentUserId, expectedVersion,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedNetworkProfileView(profile, mutationScope, currentUserId, currentIdentityKey);
+  },
+
+  loadIdentityVerification: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+  ): Promise<IdentityVerificationView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const requesterUserId = userId();
+    if (!requesterUserId || requesterUserId !== mutationScope.userId) {
+      throw new Error("identity verification has no current authenticated account");
+    }
+    const verification = await invoke<unknown>("get_identity_verification", {
+      userId: requesterUserId,
+      targetUserId,
+      expectedIdentityKey,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedIdentityVerificationView(
+      verification,
+      mutationScope,
+      targetUserId,
+      expectedIdentityKey,
+    );
+  },
+
+  confirmIdentityVerification: async (
+    targetUserId: string,
+    expectedIdentityKey: string,
+    expectedFingerprintHex: string,
+  ): Promise<IdentityVerificationView> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const requesterUserId = userId();
+    if (!requesterUserId || requesterUserId !== mutationScope.userId) {
+      throw new Error("identity verification has no current authenticated account");
+    }
+    const verification = await invoke<unknown>("confirm_identity_verification", {
+      userId: requesterUserId,
+      targetUserId,
+      expectedIdentityKey,
+      expectedFingerprintHex,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return validatedIdentityVerificationView(
+      verification,
+      mutationScope,
+      targetUserId,
+      expectedIdentityKey,
+    );
+  },
+
+  /** Load server rows only from the currently authenticated REST namespace. */
+  loadServers: async (): Promise<boolean> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    // The v1 desktop cache has bare UUID keys and no server origin. It stays
+    // disabled until an origin-scoped schema can make collisions impossible.
     const uid = userId();
-    if (!uid) return;
+    if (!uid) return false;
     try {
       const fresh = await invoke<Array<any>>("list_servers", {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
       });
+      requireCurrentUiSession(sessionEpoch);
       setServers(fresh.map(serverFromJSON));
-      await invoke("cache_save_servers", { servers: fresh }).catch(() => {});
+      // Member-only directories carry the server-pinned identity/signing-key
+      // bindings needed to verify authenticated Sender Key distributions.
+      await Promise.allSettled(
+        fresh.map((server: any) => appStore.loadServerMembers(server.id)),
+      );
+      requireCurrentUiSession(sessionEpoch);
+      return true;
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return false;
       console.error("list_servers failed:", e);
+      return false;
     }
   },
 
-  loadChannels: async (serverId: string) => {
-    // 1. Cache first
-    try {
-      const cached = await invoke<Array<any>>("cache_load_channels", { serverId });
-      setChannelsByServer((prev) => ({ ...prev, [serverId]: cached.map(channelFromJSON) }));
-    } catch {}
-    // 2. REST refresh
+  loadChannels: async (serverId: string, autoSelectFirst = true): Promise<boolean> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
-    if (!uid) return;
+    if (!uid) return false;
     try {
+      const mutationScope = requirePublishedMutationScope();
       const fresh = await invoke<Array<any>>("list_channels", {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         serverId,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       setChannelsByServer((prev) => ({ ...prev, [serverId]: fresh.map(channelFromJSON) }));
-      await invoke("cache_save_channels", { serverId, channels: fresh }).catch(() => {});
       // If active server but no active channel, pick first text channel
-      if (activeServerId() === serverId && !activeChannelId()) {
+      if (autoSelectFirst && activeServerId() === serverId && !activeChannelId()) {
         const firstText = fresh.find((c) => (c.channel_type ?? 0) === 0);
         if (firstText) appStore.selectChannel(firstText.id);
       }
+      return true;
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return false;
       console.error("list_channels failed:", e);
+      return false;
     }
   },
 
   loadServerMembers: async (serverId: string) => {
-    try {
-      const cached = await invoke<Array<any>>("cache_load_server_members", { serverId });
-      setServerMembers((prev) => ({ ...prev, [serverId]: cached.map(memberFromJSON) }));
-    } catch {}
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     try {
+      const mutationScope = requirePublishedMutationScope();
       const fresh = await invoke<Array<any>>("list_server_members", {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         serverId,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       const mapped = fresh.map(memberFromJSON);
       setServerMembers((prev) => ({ ...prev, [serverId]: mapped }));
-      await invoke("cache_save_server_members", { serverId, members: fresh }).catch(() => {});
       // If we're viewing a channel of this server, push our sender key to the freshly
       // known members. (Idempotent: noop for already-up-to-date peers, refresh on change.)
       if (activeServerId() === serverId) {
         const convId = activeConversationId();
         if (convId) {
-          appStore.distributeSenderKey(convId, mapped);
+          appStore.distributeSenderKey(convId).catch((e) =>
+            console.warn("distribute_sender_key failed:", e),
+          );
         }
       }
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("list_server_members failed:", e);
     }
   },
 
-  /**
-   * Phase E: Distribute the current outgoing sender key for `conversationId`
-   * to every known member that has an identity_key (skip self, skip unknown).
-   */
-  distributeSenderKey: (conversationId: string, members: ServerMember[]) => {
-    const peers = members
-      .map((m) => m.identityKey)
-      .filter((k): k is string => typeof k === "string" && k.length === 64);
-    if (peers.length === 0) return;
-    invoke<number>("distribute_sender_key", {
+  /** Distribute a sender key using the native authenticated member directory. */
+  distributeSenderKey: async (conversationId: string): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const flightKey = `${mutationScope.canonicalServerOrigin}\n${mutationScope.bindingGeneration}\n${conversationId}`;
+    const existingFlight = senderKeyDistributionFlights.get(flightKey);
+    if (existingFlight) return existingFlight;
+
+    const flight = (async () => {
+      const selfUserId = userId();
+      if (!selfUserId) throw new Error("sender-key distribution requires an authenticated user");
+      setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "checking" }));
+      try {
+        await invoke<number>("distribute_sender_key", {
+          conversationId,
+          serverHttpUrl: serverHttpUrl(),
+          userId: selfUserId,
+          ...authenticatedMutationScopeArgs(mutationScope),
+        });
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
+        let status = await appStore.refreshSenderKeyStatus(conversationId);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
+
+        // Distribution fan-out completes before every recipient ACK arrives.
+        // Keep the original Send action pending for a short bounded window so a
+        // normal online group does not make the user click Send twice. No message
+        // is persisted or transmitted until native reports the generation ready.
+        const deadline = Date.now() + 8_000;
+        while (status === "checking" || status === "pending") {
+          if (Date.now() >= deadline) {
+            throw new Error(
+              "Sender-key acknowledgement is still pending; your draft was kept and sending remains blocked",
+            );
+          }
+          await new Promise<void>((resolve) => setTimeout(resolve, 250));
+          requireCurrentMutationScope(sessionEpoch, mutationScope);
+          status = await appStore.refreshSenderKeyStatus(conversationId);
+          requireCurrentMutationScope(sessionEpoch, mutationScope);
+        }
+        if (status !== "ready") {
+          throw new Error("Sender-key distribution failed; sending remains blocked");
+        }
+      } catch (error) {
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
+        try {
+          // Whatever native reports after the failed distribution attempt is
+          // authoritative. In particular, a final ACK may have made it ready
+          // between the command error and this refresh.
+          const refreshed = await appStore.refreshSenderKeyStatus(conversationId);
+          requireCurrentMutationScope(sessionEpoch, mutationScope);
+          if (refreshed === "checking") {
+            setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "error" }));
+          }
+        } catch (refreshError) {
+          rethrowIfStale(refreshError);
+          setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: "error" }));
+        }
+        throw error;
+      }
+    })();
+    senderKeyDistributionFlights.set(flightKey, flight);
+    try {
+      await flight;
+    } finally {
+      if (senderKeyDistributionFlights.get(flightKey) === flight) {
+        senderKeyDistributionFlights.delete(flightKey);
+      }
+    }
+  },
+
+  refreshSenderKeyStatus: async (conversationId: string): Promise<SenderKeyStatus> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const status = await invoke<SenderKeyStatus>("sender_key_distribution_status", {
       conversationId,
-      peerIdentityKeys: peers,
-    }).catch((e) => console.warn("distribute_sender_key failed:", e));
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    const normalized: SenderKeyStatus = ["checking", "pending", "ready", "error"].includes(status)
+      ? status
+      : "error";
+    setSenderKeyStatus((previous) => ({ ...previous, [conversationId]: normalized }));
+    return normalized;
   },
 
   loadServerRoles: async (serverId: string) => {
-    try {
-      const cached = await invoke<Array<any>>("cache_load_roles", { serverId });
-      setServerRoles((prev) => ({ ...prev, [serverId]: cached.map(roleFromJSON) }));
-    } catch {}
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     try {
@@ -914,14 +2760,16 @@ export const appStore = {
         userId: uid,
         serverId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setServerRoles((prev) => ({ ...prev, [serverId]: fresh.map(roleFromJSON) }));
-      await invoke("cache_save_roles", { serverId, roles: fresh }).catch(() => {});
     } catch (e) {
+      if (e instanceof StaleUiSessionError) return;
       console.error("list_roles failed:", e);
     }
   },
 
   createServer: async (name: string): Promise<Server | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid || !name.trim()) return null;
     try {
@@ -930,20 +2778,19 @@ export const appStore = {
         userId: uid,
         name: name.trim(),
       });
+      requireCurrentUiSession(sessionEpoch);
       const created = serverFromJSON(s);
       setServers((prev) => [...prev, created]);
-      // Persist the updated list
-      await invoke("cache_save_servers", {
-        servers: [...servers().map(serverToJSON)],
-      }).catch(() => {});
       return created;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("create_server failed:", e);
       throw e;
     }
   },
 
   deleteServer: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     try {
@@ -952,6 +2799,7 @@ export const appStore = {
         userId: uid,
         serverId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setServers((prev) => prev.filter((s) => s.id !== serverId));
       setChannelsByServer((prev) => {
         const c = { ...prev };
@@ -962,14 +2810,15 @@ export const appStore = {
         setActiveServerId(null);
         setActiveChannelId(null);
       }
-      await invoke("cache_delete_server", { serverId }).catch(() => {});
     } catch (e) {
+      rethrowIfStale(e);
       console.error("delete_server failed:", e);
       throw e;
     }
   },
 
   leaveServer: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     try {
@@ -978,13 +2827,14 @@ export const appStore = {
         userId: uid,
         serverId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setServers((prev) => prev.filter((s) => s.id !== serverId));
       if (activeServerId() === serverId) {
         setActiveServerId(null);
         setActiveChannelId(null);
       }
-      await invoke("cache_delete_server", { serverId }).catch(() => {});
     } catch (e) {
+      rethrowIfStale(e);
       console.error("leave_server failed:", e);
       throw e;
     }
@@ -997,6 +2847,7 @@ export const appStore = {
     categoryId?: string,
     topic?: string,
   ): Promise<Channel | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
     try {
@@ -1009,6 +2860,7 @@ export const appStore = {
         categoryId: categoryId ?? null,
         topic: topic ?? null,
       });
+      requireCurrentUiSession(sessionEpoch);
       const ch = channelFromJSON(c);
       setChannelsByServer((prev) => ({
         ...prev,
@@ -1016,12 +2868,14 @@ export const appStore = {
       }));
       return ch;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("create_channel failed:", e);
       throw e;
     }
   },
 
   deleteChannel: async (serverId: string, channelId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     try {
@@ -1030,13 +2884,14 @@ export const appStore = {
         userId: uid,
         channelId,
       });
+      requireCurrentUiSession(sessionEpoch);
       setChannelsByServer((prev) => ({
         ...prev,
         [serverId]: (prev[serverId] ?? []).filter((c) => c.id !== channelId),
       }));
       if (activeChannelId() === channelId) setActiveChannelId(null);
-      await invoke("cache_delete_channel", { channelId }).catch(() => {});
     } catch (e) {
+      rethrowIfStale(e);
       console.error("delete_channel failed:", e);
       throw e;
     }
@@ -1046,44 +2901,93 @@ export const appStore = {
     serverId: string,
     maxUses: number,
     expiresInSecs: number,
-  ): Promise<{ code: string } | null> => {
+  ): Promise<CreatedVeilLink | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
+    const mutationScope = requirePublishedMutationScope();
     try {
-      const inv = await invoke<{ code: string }>("create_invite", {
+      const inv = await invoke<CreatedVeilLink>("create_invite", {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         serverId,
-        maxUses,
-        expiresInSecs,
+        options: { maxUses, expiresInSecs },
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       return inv;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("create_invite failed:", e);
       throw e;
     }
   },
 
-  previewInvite: async (code: string): Promise<any> => {
-    return invoke("preview_invite", { serverHttpUrl: serverHttpUrl(), code });
+  refreshPendingVeilLink: async (): Promise<PendingVeilLink | null> => {
+    const value = await invoke<unknown>("get_pending_veil_link");
+    const pending = value === null ? null : pendingVeilLinkFromJSON(value);
+    if (value !== null && !pending) {
+      setPendingVeilLink(null);
+      throw new Error("native pending Veil Link state is invalid");
+    }
+    setPendingVeilLink(pending);
+    return pending;
   },
 
-  useInvite: async (code: string): Promise<Server | null> => {
+  cancelPendingVeilLink: async (expectedPendingFlowId: string): Promise<boolean> => {
+    if (!/^[0-9a-f]{64}$/.test(expectedPendingFlowId)) {
+      throw new Error("pending Veil Link flow id is invalid");
+    }
+    const cleared = await invoke<boolean>("cancel_pending_veil_link", { expectedPendingFlowId });
+    if (cleared && pendingVeilLink()?.flowId === expectedPendingFlowId) {
+      setPendingVeilLink(null);
+    }
+    return cleared;
+  },
+
+  previewInvite: async (expectedPendingFlowId: string): Promise<any> => {
+    if (!/^[0-9a-f]{64}$/.test(expectedPendingFlowId)) {
+      throw new Error("pending Veil Link flow id is invalid");
+    }
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) throw new Error("No authenticated account for this Veil Node");
+    const mutationScope = requirePublishedMutationScope();
+    const preview = await invoke("preview_invite", {
+      userId: uid,
+      expectedPendingFlowId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return preview;
+  },
+
+  useInvite: async (expectedPendingFlowId: string): Promise<Server | null> => {
+    if (!/^[0-9a-f]{64}$/.test(expectedPendingFlowId)) {
+      throw new Error("pending Veil Link flow id is invalid");
+    }
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
+    const mutationScope = requirePublishedMutationScope();
     try {
       const s = await invoke<any>("use_invite", {
-        serverHttpUrl: serverHttpUrl(),
         userId: uid,
-        code,
+        expectedPendingFlowId,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       const joined = serverFromJSON(s);
       setServers((prev) => {
         if (prev.some((p) => p.id === joined.id)) return prev;
         return [...prev, joined];
       });
+      if (pendingVeilLink()?.flowId === expectedPendingFlowId) {
+        setPendingVeilLink(null);
+      }
       return joined;
     } catch (e) {
+      rethrowIfStale(e);
       console.error("use_invite failed:", e);
       throw e;
     }
@@ -1092,6 +2996,7 @@ export const appStore = {
   // ─── Server settings overlay ─────────────────────
 
   openServerSettings: (serverId: string) => {
+    if (!acceptsSensitiveEvent()) return;
     setServerSettingsId(serverId);
     setScreen("serverSettings");
     // Make sure members + roles + invites data is warm. Run in parallel so the
@@ -1103,6 +3008,7 @@ export const appStore = {
   },
 
   closeServerSettings: () => {
+    if (!acceptsSensitiveEvent()) return;
     setServerSettingsId(null);
     setScreen("chat");
   },
@@ -1111,8 +3017,9 @@ export const appStore = {
 
   updateServer: async (
     serverId: string,
-    patch: { name?: string; description?: string; iconUrl?: string },
+    patch: { name?: string; description?: string },
   ) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("update_server", {
@@ -1121,8 +3028,8 @@ export const appStore = {
       serverId,
       name: patch.name ?? null,
       description: patch.description ?? null,
-      iconUrl: patch.iconUrl ?? null,
     });
+    requireCurrentUiSession(sessionEpoch);
     setServers((prev) =>
       prev.map((s) =>
         s.id === serverId
@@ -1130,7 +3037,6 @@ export const appStore = {
               ...s,
               name: patch.name ?? s.name,
               description: patch.description ?? s.description,
-              iconUrl: patch.iconUrl ?? s.iconUrl,
             }
           : s,
       ),
@@ -1142,6 +3048,7 @@ export const appStore = {
     channelId: string,
     patch: { name?: string; topic?: string; nsfw?: boolean; slowmodeSecs?: number },
   ) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     await invoke("update_channel", {
@@ -1153,6 +3060,7 @@ export const appStore = {
       nsfw: patch.nsfw ?? null,
       slowmodeSecs: patch.slowmodeSecs ?? null,
     });
+    requireCurrentUiSession(sessionEpoch);
     setChannelsByServer((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((c) =>
@@ -1178,6 +3086,7 @@ export const appStore = {
       clearCategory?: boolean;
     }>,
   ) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
     // Optimistic local update
@@ -1214,7 +3123,9 @@ export const appStore = {
         serverId,
         items: payload,
       });
+      requireCurrentUiSession(sessionEpoch);
     } catch (e) {
+      rethrowIfStale(e);
       console.error("reorder_channels failed", e);
       // Refresh from server on failure
       await (appStore as any).loadChannels(serverId);
@@ -1227,6 +3138,7 @@ export const appStore = {
     permissions: number,
     color?: number,
   ): Promise<Role | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
     const r = await invoke<any>("create_role", {
@@ -1237,6 +3149,7 @@ export const appStore = {
       permissions,
       color: color ?? null,
     });
+    requireCurrentUiSession(sessionEpoch);
     const role = roleFromJSON(r);
     setServerRoles((prev) => ({
       ...prev,
@@ -1250,8 +3163,10 @@ export const appStore = {
     roleId: string,
     patch: { name?: string; permissions?: number; color?: number },
   ) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("update_role", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
@@ -1260,7 +3175,9 @@ export const appStore = {
       name: patch.name ?? null,
       permissions: patch.permissions ?? null,
       color: patch.color ?? null,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerRoles((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((r) =>
@@ -1277,14 +3194,18 @@ export const appStore = {
   },
 
   deleteRole: async (serverId: string, roleId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("delete_role", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
       roleId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerRoles((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).filter((r) => r.id !== roleId),
@@ -1292,15 +3213,19 @@ export const appStore = {
   },
 
   assignRole: async (serverId: string, targetUserId: string, roleId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("assign_role", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
       targetUserId,
       roleId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((m) =>
@@ -1312,15 +3237,19 @@ export const appStore = {
   },
 
   unassignRole: async (serverId: string, targetUserId: string, roleId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("unassign_role", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
       targetUserId,
       roleId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).map((m) =>
@@ -1332,15 +3261,19 @@ export const appStore = {
   },
 
   kickMember: async (serverId: string, targetUserId: string, reason?: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("kick_server_member", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
       targetUserId,
       reason: reason ?? null,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     setServerMembers((prev) => ({
       ...prev,
       [serverId]: (prev[serverId] ?? []).filter((m) => m.userId !== targetUserId),
@@ -1348,53 +3281,124 @@ export const appStore = {
   },
 
   listInvites: async (serverId: string): Promise<any[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
     const invs = await invoke<any[]>("list_invites", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     return invs;
   },
 
-  revokeInvite: async (code: string) => {
+  revokeInvite: async (serverId: string, inviteId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("revoke_invite", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
-      code,
+      serverId,
+      inviteId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
   },
 
   /** Set up Tauri event listeners for incoming server events. */
-  setupEventListeners: async () => {
-    await listen<{ messageId: string; conversationId: string; senderKey: string; senderName: string; text: string; timestamp: number; replyToId?: string }>(
+  setupEventListeners: () => {
+    // App.tsx is hot-reloaded during development. Registering another copy of
+    // every native listener on each remount multiplies reconnects and REST
+    // refreshes, so the store owns one listener set for its lifetime.
+    if (eventListenersInitialized) return Promise.resolve();
+    if (eventListenersInitialization) return eventListenersInitialization;
+    const initialization = (async () => {
+      const registered: UnlistenFn[] = [];
+      const register = async <T>(event: string, handler: EventCallback<T>) => {
+        registered.push(await listen<T>(event, handler));
+      };
+      try {
+      await register("veil://locked", () => {
+      // Native expiry already destroyed key/DB state. Clear renderer plaintext
+      // synchronously before any fallible keychain or IPC operation.
+      clearSensitiveUi();
+      invoke("lock_app").catch((error) => console.error("native auto-lock follow-up failed:", error));
+    });
+
+      await register<{ conversations: number; messages: number; duplicates: number; unavailableHistory: number; retainedSenderKeys: number; edits: number; tombstones: number; unavailableConversations: ConversationCryptoDiagnostic[] }>(
+      "veil://sync-complete",
+      (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        replaceConversationCryptoDiagnostics(event.payload.unavailableConversations ?? []);
+        if (event.payload.unavailableHistory > 0) {
+          console.warn(
+            `offline sync skipped ${event.payload.unavailableHistory} historical message(s) from former members whose identity was never pinned on this device`,
+          );
+        }
+      },
+    );
+
+      await register<ConversationCryptoDiagnostic>(
+      "veil://conversation-crypto-unavailable",
+      (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        upsertConversationCryptoDiagnostic(event.payload);
+      },
+    );
+
+      await register<unknown>(
       "veil://message",
       (event) => {
-        const d = event.payload;
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        const scope = authenticatedServerScope();
+        if (!scope) return;
+        let d;
+        try {
+          d = validatedLiveMessage(event.payload, scope.canonicalServerOrigin);
+        } catch (error) {
+          console.error("native live message failed its renderer schema boundary", error);
+          return;
+        }
         const isOwn = d.senderKey === identity();
+        const senderName = isOwn ? "You" : (d.senderName?.trim() || "Unknown author");
+        nextMessageLoadGeneration(d.conversationId);
         appStore.addMessage({
           id: d.messageId,
           conversationId: d.conversationId,
-          senderName: d.senderName || "Unknown",
+          senderName,
+          senderUserId: d.senderUserId,
           senderKey: d.senderKey,
+          senderSigningKey: d.senderSigningKey,
+          senderProfileVersion: d.senderProfileVersion,
+          senderProfileOrigin: d.senderProfileOrigin,
+          senderOrigin: d.senderOrigin,
+          senderAuthorContext: d.senderAuthorContext,
           text: d.text,
           timestamp: d.timestamp,
           isOwn,
           replyToId: d.replyToId ?? undefined,
+          attachments: d.attachments,
         });
 
-        // Auto-create conversation if not present
+        // Only the native, origin-scoped directory may choose a conversation
+        // kind. Server channels deliberately stay out of the DM/group rail.
         const exists = conversations().some((c) => c.id === d.conversationId);
-        if (!exists) {
+        const conversationType = d.conversationType;
+        if (!exists && (conversationType === "dm" || conversationType === "group")) {
           setConversations((prev) => [
             ...prev,
             {
               id: d.conversationId,
-              type: "dm",
-              name: d.senderName || d.senderKey.slice(0, 8),
+              type: conversationType,
+              name: d.conversationName?.trim()
+                || (conversationType === "dm" ? senderName : "Unknown conversation"),
+              serverOrigin: d.senderOrigin,
+              peerUserId: conversationType === "dm" ? d.conversationPeerUserId : undefined,
               lastMessage: d.text,
               lastMessageTime: d.timestamp,
               unreadCount: 1,
@@ -1404,31 +3408,143 @@ export const appStore = {
       },
     );
 
-    await listen<{ reason: string }>("veil://disconnected", () => {
-      setConnected(false);
+      await register<{ reason: string }>("veil://disconnected", (event) => {
+      if (!matchesPendingOrCurrentAuthenticatedScope(event.payload)) return;
+      beginBindingTransition();
+      const disconnectedEpoch = captureUiSessionEpoch();
+      const affectedConversations = new Set<string>();
+      let disconnectedSnapshot: Message[] = [];
+      setMessages((previous) => {
+        disconnectedSnapshot = previous.map((message) => {
+          if (!message.isOwn || !message.pending) return message;
+          affectedConversations.add(message.conversationId);
+          return { ...message, pending: false, deliveryUnknown: true };
+        });
+        return disconnectedSnapshot;
+      });
+      for (const conversationId of affectedConversations) {
+        nextMessageLoadGeneration(conversationId);
+        updateConversationPreview(conversationId, disconnectedSnapshot);
+      }
+      // Native has already removed the matching REST binding. Keep the last
+      // SQLCipher snapshot visible, but do not issue another IPC read until a
+      // new exact scope has passed the publication gate.
+      scheduleReconnect(disconnectedEpoch);
     });
 
-    await listen<{ messageId: string; conversationId: string; newText: string; editTimestamp: number }>(
+      await register("veil://membership-refresh-required", (event) => {
+      if (!acceptsAuthenticatedEvent(event.payload)) return;
+      void appStore.connectToServer(true).catch((error) => {
+        if (!(error instanceof StaleUiSessionError)) {
+          console.error("membership refresh reconnect failed:", error);
+        }
+      });
+    });
+
+      await register<{ messageId: string; localMessageId?: string | null; refSeq: number }>(
+      "veil://message-ack",
+      (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        const { messageId, localMessageId } = event.payload;
+        const active = appStore.activeConversation();
+        if (active?.type === "group" || active?.type === "channel") {
+          void appStore.refreshSenderKeyStatus(active.id).catch(() => {});
+        }
+        if (!localMessageId || localMessageId === messageId) return;
+        acknowledgedOutgoingMessageIds.set(localMessageId, messageId);
+        rejectedOutgoingMessageIds.delete(localMessageId);
+
+        // The native client inserts an optimistic local UUID before the
+        // gateway assigns the durable message UUID. Keep the UI, reply
+        // references and reaction cache on the same identity as the DB.
+        let acknowledgedConversationId: string | undefined;
+        let acknowledgedSnapshot: Message[] = [];
+        setMessages((prev) => {
+          const hasLocal = prev.some((message) => message.id === localMessageId);
+          if (!hasLocal) return prev;
+          acknowledgedConversationId = prev.find(
+            (message) => message.id === localMessageId,
+          )?.conversationId;
+          const hasServer = prev.some((message) => message.id === messageId);
+          acknowledgedSnapshot = prev
+            .filter((message) => !hasServer || message.id !== localMessageId)
+            .map((message) => ({
+              ...message,
+              id: message.id === localMessageId ? messageId : message.id,
+              pending: message.id === localMessageId ? false : message.pending,
+              replyToId: message.replyToId === localMessageId ? messageId : message.replyToId,
+            }));
+          return acknowledgedSnapshot;
+        });
+        if (acknowledgedConversationId) {
+          nextMessageLoadGeneration(acknowledgedConversationId);
+          updateConversationPreview(acknowledgedConversationId, acknowledgedSnapshot);
+        }
+
+        setReactions((prev) => {
+          const local = prev[localMessageId];
+          if (!local) return prev;
+          const copy = { ...prev, [messageId]: local };
+          delete copy[localMessageId];
+          return copy;
+        });
+        const activeConversation = activeConversationId();
+        if (activeConversation) {
+          void appStore.loadMessages(activeConversation).catch(() => {});
+        }
+      },
+    );
+
+      await register<{ messageId: string; conversationId: string; newText: string; editTimestamp: number }>(
       "veil://message-edited",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const d = event.payload;
-        setMessages((prev) =>
-          prev.map((m) => (m.id === d.messageId ? { ...m, text: d.newText } : m))
-        );
+        nextMessageLoadGeneration(d.conversationId);
+        let editedSnapshot: Message[] = [];
+        let editedLocally = false;
+        setMessages((prev) => {
+          editedSnapshot = prev.map((m) => {
+            if (m.id !== d.messageId) return m;
+            editedLocally = true;
+            return { ...m, text: d.newText };
+          });
+          return editedSnapshot;
+        });
+        if (editedLocally) {
+          updateConversationPreview(d.conversationId, editedSnapshot);
+        } else if (activeConversationId() === d.conversationId) {
+          void appStore.loadMessages(d.conversationId).catch(() => {});
+        }
       },
     );
 
-    await listen<{ messageId: string; conversationId: string }>(
+      await register<{ messageId: string; conversationId: string }>(
       "veil://message-deleted",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const d = event.payload;
-        setMessages((prev) => prev.filter((m) => m.id !== d.messageId));
+        nextMessageLoadGeneration(d.conversationId);
+        let remainingSnapshot: Message[] = [];
+        let deletedLocally = false;
+        setMessages((prev) => {
+          deletedLocally = prev.some((m) => m.id === d.messageId);
+          remainingSnapshot = prev.filter((m) => m.id !== d.messageId);
+          return remainingSnapshot;
+        });
+        if (deletedLocally) {
+          updateConversationPreview(d.conversationId, remainingSnapshot);
+        } else if (activeConversationId() === d.conversationId) {
+          void appStore.loadMessages(d.conversationId).catch(() => {});
+        }
       },
     );
 
-    await listen<{ conversationId: string; identityKey: string; started: boolean }>(
+      await register<{ conversationId: string; identityKey: string; started: boolean }>(
       "veil://typing",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        const eventEpoch = captureUiSessionEpoch();
         const { conversationId, identityKey, started } = event.payload;
         setTypingUsers((prev) => {
           const copy = { ...prev };
@@ -1446,6 +3562,7 @@ export const appStore = {
         if (typingTimers[timerKey]) clearTimeout(typingTimers[timerKey]);
         if (started) {
           typingTimers[timerKey] = setTimeout(() => {
+            if (!isUiSessionEpochCurrent(eventEpoch)) return;
             setTypingUsers((prev) => {
               const copy = { ...prev };
               const set = new Set(copy[conversationId] ?? []);
@@ -1461,13 +3578,42 @@ export const appStore = {
       },
     );
 
-    await listen<{ code: number; message: string }>("veil://error", (event) => {
+      await register<{ code: number; message: string; localMessageId?: string | null }>("veil://error", (event) => {
+      if (!acceptsAuthenticatedEvent(event.payload)) return;
       console.error("server error:", event.payload);
+      const active = appStore.activeConversation();
+      if (active?.type === "group" || active?.type === "channel") {
+        void appStore.refreshSenderKeyStatus(active.id).catch(() => {});
+      }
+      const localMessageId = event.payload.localMessageId;
+      if (localMessageId) {
+        rejectedOutgoingMessageIds.add(localMessageId);
+        let found = false;
+        let failedConversationId: string | undefined;
+        let nextMessages: Message[] = [];
+        setMessages((previous) => {
+          nextMessages = previous.map((message) => {
+          if (message.id !== localMessageId) return message;
+          found = true;
+          failedConversationId = message.conversationId;
+          return { ...message, pending: false, failed: true, deliveryUnknown: false };
+          });
+          return nextMessages;
+        });
+        if (failedConversationId) {
+          nextMessageLoadGeneration(failedConversationId);
+          updateConversationPreview(failedConversationId, nextMessages);
+        }
+        if (!found && activeConversationId()) {
+          void appStore.loadMessages(activeConversationId()!).catch(() => {});
+        }
+      }
     });
 
-    await listen<{ messageId: string; conversationId: string; emoji: string; userId: string; username: string; add: boolean }>(
+      await register<{ messageId: string; conversationId: string; emoji: string; userId: string; username: string; add: boolean }>(
       "veil://reaction",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
         const { messageId, emoji, userId: uid, username, add } = event.payload;
         setReactions((prev) => {
           const copy = { ...prev };
@@ -1489,9 +3635,10 @@ export const appStore = {
 
     // ── Friend / Presence events ──
 
-    await listen<{ identityKey: string; status: number; statusText?: string; lastSeen?: number }>(
+      await register<{ identityKey: string; status: number; statusText?: string; lastSeen?: number }>(
       "veil://presence",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const { identityKey, status } = event.payload;
         setPresenceMap((prev) => ({ ...prev, [identityKey]: status }));
         // Also update friend list status
@@ -1504,9 +3651,10 @@ export const appStore = {
       },
     );
 
-    await listen<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number }>(
+      await register<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number }>(
       "veil://friend-request",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const d = event.payload;
         setFriendRequests((prev) => [
           ...prev,
@@ -1522,9 +3670,10 @@ export const appStore = {
       },
     );
 
-    await listen<{ userId: string; username: string }>(
+      await register<{ userId: string; username: string }>(
       "veil://friend-accepted",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const { userId: uid, username } = event.payload;
         // Add to friends list
         setFriends((prev) => {
@@ -1536,20 +3685,61 @@ export const appStore = {
       },
     );
 
-    await listen<{ userId: string }>(
+      await register<{ userId: string }>(
       "veil://friend-removed",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const { userId: uid } = event.payload;
         setFriends((prev) => prev.filter((f) => f.userId !== uid));
       },
     );
 
-    await listen<{
+      await register<{ userId: string; profileVersion: string }>(
+      "veil://profile-updated",
+      (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        const scope = authenticatedServerScope();
+        if (!scope) return;
+        const { userId: updatedUserId, profileVersion } = event.payload;
+        const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+        if (
+          typeof updatedUserId !== "string"
+          || typeof profileVersion !== "string"
+          || !canonicalUuid.test(updatedUserId)
+          || !/^[1-9][0-9]*$/.test(profileVersion)
+          || profileVersion.length > 19
+          || BigInt(profileVersion) > 9223372036854775807n
+        ) return;
+        setProfileUpdateNotice({
+          canonicalServerOrigin: scope.canonicalServerOrigin,
+          userId: updatedUserId,
+          profileVersion,
+        });
+      },
+      );
+
+      await register<{ userId: string }>(
+      "veil://identity-changed",
+      (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload)) return;
+        const scope = authenticatedServerScope();
+        const changedUserId = event.payload.userId;
+        const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+        if (!scope || typeof changedUserId !== "string" || !canonicalUuid.test(changedUserId)) return;
+        setIdentityChangeNotice({
+          canonicalServerOrigin: scope.canonicalServerOrigin,
+          userId: changedUserId,
+        });
+      },
+    );
+
+      await register<{
       friends: Array<{ userId: string; username: string; status: number; lastSeen?: number }>;
       pendingRequests: Array<{ requestId: string; fromUserId: string; fromUsername: string; message?: string; timestamp: number; outgoing: boolean }>;
     }>(
       "veil://friend-list",
       (event) => {
+        if (!acceptsAuthenticatedEvent(event.payload) || !connected()) return;
         const d = event.payload;
         setFriends(d.friends.map((f) => ({ userId: f.userId, username: f.username, status: f.status, lastSeen: f.lastSeen })));
         setFriendRequests(d.pendingRequests.map((r) => ({
@@ -1560,6 +3750,7 @@ export const appStore = {
           timestamp: r.timestamp,
           outgoing: r.outgoing,
         })));
+        setFriendDirectoryReady(true);
       },
     );
 
@@ -1576,13 +3767,14 @@ export const appStore = {
     const SE_ROLE_UPDATED = 8;
     const SE_ROLE_DELETED = 9;
 
-    await listen<{
+      await register<{
       eventType: number;
       serverId: string;
-      serverInfo?: { id: string; name: string; iconUrl?: string; ownerIdentityKey: string };
+      serverInfo?: { id: string; name: string; ownerIdentityKey: string };
       memberInfo?: { identityKey: string; username: string; roleIds: string[]; reason?: string };
       roleInfo?: { id: string; name: string; permissions: number; position: number; color?: number };
     }>("veil://server-event", (event) => {
+      if (!acceptsAuthenticatedEvent(event.payload)) return;
       const d = event.payload;
       switch (d.eventType) {
         case SE_CREATED:
@@ -1596,7 +3788,6 @@ export const appStore = {
             setActiveServerId(null);
             setActiveChannelId(null);
           }
-          invoke("cache_delete_server", { serverId: d.serverId }).catch(() => {});
           break;
         case SE_MEMBER_JOINED:
         case SE_MEMBER_LEFT:
@@ -1618,7 +3809,7 @@ export const appStore = {
     const CE_DELETED = 2;
     const CE_REORDERED = 3;
 
-    await listen<{
+      await register<{
       eventType: number;
       serverId: string;
       channel: {
@@ -1631,6 +3822,7 @@ export const appStore = {
         topic?: string;
       };
     }>("veil://channel-event", (event) => {
+      if (!acceptsAuthenticatedEvent(event.payload)) return;
       const d = event.payload;
       const ch = d.channel;
       switch (d.eventType) {
@@ -1646,98 +3838,155 @@ export const appStore = {
             [d.serverId]: (prev[d.serverId] ?? []).filter((c) => c.id !== ch.id),
           }));
           if (activeChannelId() === ch.id) setActiveChannelId(null);
-          invoke("cache_delete_channel", { channelId: ch.id }).catch(() => {});
           break;
       }
     });
 
-    // Deep links: veil://add/{userId} or veil://share/{id}
-    await listen<string[]>("deep-link://new-url", (event) => {
-      const urls = event.payload;
-      for (const raw of urls) {
+      let pendingLinkEventObserved = false;
+      await register<PendingVeilLink>("veil://pending-link", (event) => {
+        pendingLinkEventObserved = true;
+        const value = pendingVeilLinkFromJSON(event.payload);
+        setPendingVeilLink(value);
+      });
+      const pendingValue = await invoke<unknown>("get_pending_veil_link");
+      // Listener registration must precede the snapshot so a Link cannot be
+      // missed between the two operations. If any event arrived after the
+      // listener became live, that event is newer authority and the startup
+      // snapshot must not visually roll it back. Native flow_id checks already
+      // make such a rollback fail closed; this guard keeps renderer state
+      // linear with the same authority.
+      if (!pendingLinkEventObserved) {
+        setPendingVeilLink(pendingValue === null ? null : pendingVeilLinkFromJSON(pendingValue));
+      }
+      eventListenersInitialized = true;
+    } catch (error) {
+      for (const unlisten of registered.reverse()) {
         try {
-          const url = new URL(raw);
-          const parts = url.pathname.replace(/^\/+/, "").split("/");
-          if (url.protocol === "veil:" && parts[0] === "add" && parts[1]) {
-            // Auto-create DM with this user
-            appStore.createDm(parts[1]);
-          }
-          // veil://share/{id} — future
+          unlisten();
         } catch {
-          // ignore malformed
+          // Continue removing the rest of a partially installed listener set.
         }
+      }
+      eventListenersInitialized = false;
+        throw error;
+      }
+    })();
+    eventListenersInitialization = initialization;
+    return initialization.finally(() => {
+      if (eventListenersInitialization === initialization) {
+        eventListenersInitialization = null;
       }
     });
   },
 
+  listRoomAccessRules: async (channelId: string): Promise<RoomAccessRule[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
+    const rows = await invoke<Array<any>>("list_channel_overwrites", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      channelId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return rows.map((row) => ({
+      targetId: row.target_id,
+      targetType: row.target_type,
+      allow: row.allow,
+      deny: row.deny,
+    }));
+  },
+
+  upsertRoomAccessRule: async (channelId: string, rule: RoomAccessRule) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("upsert_channel_overwrite", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      channelId,
+      targetId: rule.targetId,
+      targetType: rule.targetType,
+      allow: rule.allow,
+      deny: rule.deny,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
+  banMember: async (serverId: string, targetUserId: string, reason?: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("ban_server_member", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      targetUserId,
+      reason: reason ?? null,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    setServerMembers((previous) => ({
+      ...previous,
+      [serverId]: (previous[serverId] ?? []).filter((member) => member.userId !== targetUserId),
+    }));
+  },
+
+  listBans: async (serverId: string): Promise<ServerBan[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
+    const rows = await invoke<Array<any>>("list_server_bans", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return rows.map((row) => ({
+      userId: row.user_id,
+      username: row.username,
+      bannedBy: row.banned_by,
+      reason: row.reason ?? undefined,
+      createdAt: row.created_at,
+    }));
+  },
+
+  unbanMember: async (serverId: string, targetUserId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("unban_server_member", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      targetUserId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
+  revokeAllInvites: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("revoke_all_invites", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
   // ─── Phase 6: OpenMLS orchestration ────────────────
 
-  /** Initialise the local MLS client. The leaf identity is derived
-   *  from the user's identity key + a fixed device label so the same
-   *  device gets the same MLS leaf across restarts (signer + group
-   *  state are restored from SQLCipher).
-   *
-   *  Idempotent: safe to call multiple times. Returns the hex-encoded
-   *  Ed25519 public signature key (or null on failure). */
-  bootstrapMls: async (): Promise<string | null> => {
-    try {
-      const ident = identity();
-      if (!ident) return null;
-      // The desktop binds one MLS leaf per device. We don't currently
-      // enumerate physical devices, so use a stable label.
-      const leafSeed = `${ident}::desktop`;
-      // Hash to 32 bytes via SubtleCrypto (SHA-256 is fine — leaf is
-      // an opaque identifier, not a credential).
-      const enc = new TextEncoder().encode(leafSeed);
-      const digest = await crypto.subtle.digest("SHA-256", enc);
-      const leafHex = Array.from(new Uint8Array(digest))
-        .map((b) => b.toString(16).padStart(2, "0"))
-        .join("");
-      console.log("[veil-mls] invoking mls_init, leaf=", leafHex.slice(0, 8) + "…");
-      const pub = await invoke<string>("mls_init", { leafIdentityHex: leafHex });
-      console.log("[veil-mls] mls_init OK, pubkey=", pub.slice(0, 8) + "…");
-      setMlsReady(true);
-      return pub;
-    } catch (e) {
-      console.error("[veil-mls] bootstrap failed:", String(e));
-      setMlsReady(false);
-      return null;
-    }
-  },
-
-  /** Refresh the cached crypto_mode for a single conversation. */
-  refreshCryptoMode: async (conversationId: string): Promise<void> => {
-    try {
-      const mode = await invoke<string>("get_conversation_crypto_mode", { conversationId });
-      const normalized: "sender_key" | "mls" = mode === "mls" ? "mls" : "sender_key";
-      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: normalized }));
-    } catch (e) {
-      // Fall back to the legacy default — not fatal.
-      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: "sender_key" }));
-    }
-  },
-
-  /** Mark a conversation as MLS-encrypted in the local DB. Currently a
-   *  shallow flag — full upgrade-to-MLS over the network (KP fetch,
-   *  Welcome publication, commit broadcast) is implemented in a
-   *  follow-up; this lets the UI badge transition independently for
-   *  validation. */
-  upgradeConversationToMls: async (conversationId: string): Promise<boolean> => {
-    if (!mlsReady()) {
-      console.warn("upgradeConversationToMls: MLS not initialised; calling bootstrapMls first");
-      const pub = await appStore.bootstrapMls();
-      if (!pub) return false;
-    }
-    try {
-      // Group ID == hex(uuid bytes) — matches mls_create_group's contract.
-      const uuidHex = conversationId.replace(/-/g, "");
-      await invoke<number>("mls_create_group", { groupIdHex: uuidHex });
-      await invoke("set_conversation_crypto_mode", { conversationId, mode: "mls" });
-      setCryptoModeByConv((prev) => ({ ...prev, [conversationId]: "mls" }));
-      return true;
-    } catch (e) {
-      console.error("upgradeConversationToMls failed:", e);
-      return false;
-    }
-  },
 };

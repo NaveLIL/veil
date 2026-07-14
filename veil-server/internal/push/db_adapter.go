@@ -3,7 +3,7 @@ package push
 import (
 	"context"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 )
 
 // dbStore adapts *db.DB to the push.Store interface so the push
@@ -17,8 +17,8 @@ func NewDBStore(database *db.DB) Store {
 	return &dbStore{db: database}
 }
 
-func (s *dbStore) ListPushSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
-	rows, err := s.db.ListPushSubscriptions(ctx, userID)
+func (s *dbStore) ListActivePushSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
+	rows, err := s.db.ListActivePushSubscriptions(ctx, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -28,6 +28,8 @@ func (s *dbStore) ListPushSubscriptions(ctx context.Context, userID string) ([]S
 			ID:          r.ID,
 			UserID:      r.UserID,
 			EndpointURL: r.EndpointURL,
+			PublicKey:   r.PublicKey,
+			AuthSecret:  r.AuthSecret,
 			PushKind:    r.PushKind,
 		})
 	}

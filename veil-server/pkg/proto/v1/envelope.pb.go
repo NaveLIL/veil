@@ -47,6 +47,7 @@ type Envelope struct {
 	//	*Envelope_PrekeyBundle
 	//	*Envelope_PrekeyRequest
 	//	*Envelope_SenderKeyDist
+	//	*Envelope_SenderKeyReceipt
 	//	*Envelope_PresenceUpdate
 	//	*Envelope_TypingEvent
 	//	*Envelope_FriendRequest
@@ -59,6 +60,7 @@ type Envelope struct {
 	//	*Envelope_FriendListResponse
 	//	*Envelope_ServerEvent
 	//	*Envelope_ChannelEvent
+	//	*Envelope_ProfileUpdated
 	//	*Envelope_ShareCreate
 	//	*Envelope_ShareCreated
 	//	*Envelope_MediaUploadRequest
@@ -268,6 +270,15 @@ func (x *Envelope) GetSenderKeyDist() *SenderKeyDistribution {
 	return nil
 }
 
+func (x *Envelope) GetSenderKeyReceipt() *SenderKeyReceipt {
+	if x != nil {
+		if x, ok := x.Payload.(*Envelope_SenderKeyReceipt); ok {
+			return x.SenderKeyReceipt
+		}
+	}
+	return nil
+}
+
 func (x *Envelope) GetPresenceUpdate() *PresenceUpdate {
 	if x != nil {
 		if x, ok := x.Payload.(*Envelope_PresenceUpdate); ok {
@@ -371,6 +382,15 @@ func (x *Envelope) GetChannelEvent() *ChannelEvent {
 	if x != nil {
 		if x, ok := x.Payload.(*Envelope_ChannelEvent); ok {
 			return x.ChannelEvent
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetProfileUpdated() *ProfileUpdated {
+	if x != nil {
+		if x, ok := x.Payload.(*Envelope_ProfileUpdated); ok {
+			return x.ProfileUpdated
 		}
 	}
 	return nil
@@ -528,6 +548,10 @@ type Envelope_SenderKeyDist struct {
 	SenderKeyDist *SenderKeyDistribution `protobuf:"bytes,32,opt,name=sender_key_dist,json=senderKeyDist,proto3,oneof"`
 }
 
+type Envelope_SenderKeyReceipt struct {
+	SenderKeyReceipt *SenderKeyReceipt `protobuf:"bytes,33,opt,name=sender_key_receipt,json=senderKeyReceipt,proto3,oneof"`
+}
+
 type Envelope_PresenceUpdate struct {
 	// Presence
 	PresenceUpdate *PresenceUpdate `protobuf:"bytes,40,opt,name=presence_update,json=presenceUpdate,proto3,oneof"`
@@ -577,6 +601,11 @@ type Envelope_ServerEvent struct {
 
 type Envelope_ChannelEvent struct {
 	ChannelEvent *ChannelEvent `protobuf:"bytes,51,opt,name=channel_event,json=channelEvent,proto3,oneof"`
+}
+
+type Envelope_ProfileUpdated struct {
+	// Presentation-only profile invalidation; never a roster/crypto event.
+	ProfileUpdated *ProfileUpdated `protobuf:"bytes,52,opt,name=profile_updated,json=profileUpdated,proto3,oneof"`
 }
 
 type Envelope_ShareCreate struct {
@@ -652,6 +681,8 @@ func (*Envelope_PrekeyRequest) isEnvelope_Payload() {}
 
 func (*Envelope_SenderKeyDist) isEnvelope_Payload() {}
 
+func (*Envelope_SenderKeyReceipt) isEnvelope_Payload() {}
+
 func (*Envelope_PresenceUpdate) isEnvelope_Payload() {}
 
 func (*Envelope_TypingEvent) isEnvelope_Payload() {}
@@ -675,6 +706,8 @@ func (*Envelope_FriendListResponse) isEnvelope_Payload() {}
 func (*Envelope_ServerEvent) isEnvelope_Payload() {}
 
 func (*Envelope_ChannelEvent) isEnvelope_Payload() {}
+
+func (*Envelope_ProfileUpdated) isEnvelope_Payload() {}
 
 func (*Envelope_ShareCreate) isEnvelope_Payload() {}
 
@@ -758,7 +791,7 @@ var File_veil_v1_envelope_proto protoreflect.FileDescriptor
 
 const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\n" +
-	"\x16veil/v1/envelope.proto\x12\aveil.v1\x1a\x12veil/v1/auth.proto\x1a\x12veil/v1/chat.proto\x1a\x16veil/v1/presence.proto\x1a\x13veil/v1/share.proto\x1a\x14veil/v1/server.proto\x1a\x13veil/v1/media.proto\x1a\x13veil/v1/voice.proto\x1a\x15veil/v1/friends.proto\"\xba\x13\n" +
+	"\x16veil/v1/envelope.proto\x12\aveil.v1\x1a\x12veil/v1/auth.proto\x1a\x12veil/v1/chat.proto\x1a\x16veil/v1/presence.proto\x1a\x13veil/v1/share.proto\x1a\x14veil/v1/server.proto\x1a\x13veil/v1/media.proto\x1a\x13veil/v1/voice.proto\x1a\x15veil/v1/friends.proto\x1a\x15veil/v1/profile.proto\"\xc9\x14\n" +
 	"\bEnvelope\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\x04R\ttimestamp\x12?\n" +
@@ -780,7 +813,8 @@ const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\x0ereaction_event\x18\x1c \x01(\v2\x16.veil.v1.ReactionEventH\x00R\rreactionEvent\x12<\n" +
 	"\rprekey_bundle\x18\x1e \x01(\v2\x15.veil.v1.PreKeyBundleH\x00R\fprekeyBundle\x12?\n" +
 	"\x0eprekey_request\x18\x1f \x01(\v2\x16.veil.v1.PreKeyRequestH\x00R\rprekeyRequest\x12H\n" +
-	"\x0fsender_key_dist\x18  \x01(\v2\x1e.veil.v1.SenderKeyDistributionH\x00R\rsenderKeyDist\x12B\n" +
+	"\x0fsender_key_dist\x18  \x01(\v2\x1e.veil.v1.SenderKeyDistributionH\x00R\rsenderKeyDist\x12I\n" +
+	"\x12sender_key_receipt\x18! \x01(\v2\x19.veil.v1.SenderKeyReceiptH\x00R\x10senderKeyReceipt\x12B\n" +
 	"\x0fpresence_update\x18( \x01(\v2\x17.veil.v1.PresenceUpdateH\x00R\x0epresenceUpdate\x129\n" +
 	"\ftyping_event\x18) \x01(\v2\x14.veil.v1.TypingEventH\x00R\vtypingEvent\x12?\n" +
 	"\x0efriend_request\x18* \x01(\v2\x16.veil.v1.FriendRequestH\x00R\rfriendRequest\x12O\n" +
@@ -792,7 +826,8 @@ const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\x13friend_list_request\x180 \x01(\v2\x1a.veil.v1.FriendListRequestH\x00R\x11friendListRequest\x12O\n" +
 	"\x14friend_list_response\x181 \x01(\v2\x1b.veil.v1.FriendListResponseH\x00R\x12friendListResponse\x129\n" +
 	"\fserver_event\x182 \x01(\v2\x14.veil.v1.ServerEventH\x00R\vserverEvent\x12<\n" +
-	"\rchannel_event\x183 \x01(\v2\x15.veil.v1.ChannelEventH\x00R\fchannelEvent\x129\n" +
+	"\rchannel_event\x183 \x01(\v2\x15.veil.v1.ChannelEventH\x00R\fchannelEvent\x12B\n" +
+	"\x0fprofile_updated\x184 \x01(\v2\x17.veil.v1.ProfileUpdatedH\x00R\x0eprofileUpdated\x129\n" +
 	"\fshare_create\x18< \x01(\v2\x14.veil.v1.ShareCreateH\x00R\vshareCreate\x12<\n" +
 	"\rshare_created\x18= \x01(\v2\x15.veil.v1.ShareCreatedH\x00R\fshareCreated\x12O\n" +
 	"\x14media_upload_request\x18F \x01(\v2\x1b.veil.v1.MediaUploadRequestH\x00R\x12mediaUploadRequest\x12C\n" +
@@ -810,7 +845,7 @@ const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x1c\n" +
 	"\aref_seq\x18\x03 \x01(\x04H\x00R\x06refSeq\x88\x01\x01B\n" +
 	"\n" +
-	"\b_ref_seqB.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\b_ref_seqB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_envelope_proto_rawDescOnce sync.Once
@@ -844,26 +879,28 @@ var file_veil_v1_envelope_proto_goTypes = []any{
 	(*PreKeyBundle)(nil),          // 15: veil.v1.PreKeyBundle
 	(*PreKeyRequest)(nil),         // 16: veil.v1.PreKeyRequest
 	(*SenderKeyDistribution)(nil), // 17: veil.v1.SenderKeyDistribution
-	(*PresenceUpdate)(nil),        // 18: veil.v1.PresenceUpdate
-	(*TypingEvent)(nil),           // 19: veil.v1.TypingEvent
-	(*FriendRequest)(nil),         // 20: veil.v1.FriendRequest
-	(*FriendRequestEvent)(nil),    // 21: veil.v1.FriendRequestEvent
-	(*FriendRespond)(nil),         // 22: veil.v1.FriendRespond
-	(*FriendAcceptedEvent)(nil),   // 23: veil.v1.FriendAcceptedEvent
-	(*FriendRemove)(nil),          // 24: veil.v1.FriendRemove
-	(*FriendRemovedEvent)(nil),    // 25: veil.v1.FriendRemovedEvent
-	(*FriendListRequest)(nil),     // 26: veil.v1.FriendListRequest
-	(*FriendListResponse)(nil),    // 27: veil.v1.FriendListResponse
-	(*ServerEvent)(nil),           // 28: veil.v1.ServerEvent
-	(*ChannelEvent)(nil),          // 29: veil.v1.ChannelEvent
-	(*ShareCreate)(nil),           // 30: veil.v1.ShareCreate
-	(*ShareCreated)(nil),          // 31: veil.v1.ShareCreated
-	(*MediaUploadRequest)(nil),    // 32: veil.v1.MediaUploadRequest
-	(*MediaUploadUrl)(nil),        // 33: veil.v1.MediaUploadUrl
-	(*VoiceTokenRequest)(nil),     // 34: veil.v1.VoiceTokenRequest
-	(*VoiceToken)(nil),            // 35: veil.v1.VoiceToken
-	(*SyncRequest)(nil),           // 36: veil.v1.SyncRequest
-	(*SyncBatch)(nil),             // 37: veil.v1.SyncBatch
+	(*SenderKeyReceipt)(nil),      // 18: veil.v1.SenderKeyReceipt
+	(*PresenceUpdate)(nil),        // 19: veil.v1.PresenceUpdate
+	(*TypingEvent)(nil),           // 20: veil.v1.TypingEvent
+	(*FriendRequest)(nil),         // 21: veil.v1.FriendRequest
+	(*FriendRequestEvent)(nil),    // 22: veil.v1.FriendRequestEvent
+	(*FriendRespond)(nil),         // 23: veil.v1.FriendRespond
+	(*FriendAcceptedEvent)(nil),   // 24: veil.v1.FriendAcceptedEvent
+	(*FriendRemove)(nil),          // 25: veil.v1.FriendRemove
+	(*FriendRemovedEvent)(nil),    // 26: veil.v1.FriendRemovedEvent
+	(*FriendListRequest)(nil),     // 27: veil.v1.FriendListRequest
+	(*FriendListResponse)(nil),    // 28: veil.v1.FriendListResponse
+	(*ServerEvent)(nil),           // 29: veil.v1.ServerEvent
+	(*ChannelEvent)(nil),          // 30: veil.v1.ChannelEvent
+	(*ProfileUpdated)(nil),        // 31: veil.v1.ProfileUpdated
+	(*ShareCreate)(nil),           // 32: veil.v1.ShareCreate
+	(*ShareCreated)(nil),          // 33: veil.v1.ShareCreated
+	(*MediaUploadRequest)(nil),    // 34: veil.v1.MediaUploadRequest
+	(*MediaUploadUrl)(nil),        // 35: veil.v1.MediaUploadUrl
+	(*VoiceTokenRequest)(nil),     // 36: veil.v1.VoiceTokenRequest
+	(*VoiceToken)(nil),            // 37: veil.v1.VoiceToken
+	(*SyncRequest)(nil),           // 38: veil.v1.SyncRequest
+	(*SyncBatch)(nil),             // 39: veil.v1.SyncBatch
 }
 var file_veil_v1_envelope_proto_depIdxs = []int32{
 	2,  // 0: veil.v1.Envelope.auth_challenge:type_name -> veil.v1.AuthChallenge
@@ -882,32 +919,34 @@ var file_veil_v1_envelope_proto_depIdxs = []int32{
 	15, // 13: veil.v1.Envelope.prekey_bundle:type_name -> veil.v1.PreKeyBundle
 	16, // 14: veil.v1.Envelope.prekey_request:type_name -> veil.v1.PreKeyRequest
 	17, // 15: veil.v1.Envelope.sender_key_dist:type_name -> veil.v1.SenderKeyDistribution
-	18, // 16: veil.v1.Envelope.presence_update:type_name -> veil.v1.PresenceUpdate
-	19, // 17: veil.v1.Envelope.typing_event:type_name -> veil.v1.TypingEvent
-	20, // 18: veil.v1.Envelope.friend_request:type_name -> veil.v1.FriendRequest
-	21, // 19: veil.v1.Envelope.friend_request_event:type_name -> veil.v1.FriendRequestEvent
-	22, // 20: veil.v1.Envelope.friend_respond:type_name -> veil.v1.FriendRespond
-	23, // 21: veil.v1.Envelope.friend_accepted_event:type_name -> veil.v1.FriendAcceptedEvent
-	24, // 22: veil.v1.Envelope.friend_remove:type_name -> veil.v1.FriendRemove
-	25, // 23: veil.v1.Envelope.friend_removed_event:type_name -> veil.v1.FriendRemovedEvent
-	26, // 24: veil.v1.Envelope.friend_list_request:type_name -> veil.v1.FriendListRequest
-	27, // 25: veil.v1.Envelope.friend_list_response:type_name -> veil.v1.FriendListResponse
-	28, // 26: veil.v1.Envelope.server_event:type_name -> veil.v1.ServerEvent
-	29, // 27: veil.v1.Envelope.channel_event:type_name -> veil.v1.ChannelEvent
-	30, // 28: veil.v1.Envelope.share_create:type_name -> veil.v1.ShareCreate
-	31, // 29: veil.v1.Envelope.share_created:type_name -> veil.v1.ShareCreated
-	32, // 30: veil.v1.Envelope.media_upload_request:type_name -> veil.v1.MediaUploadRequest
-	33, // 31: veil.v1.Envelope.media_upload_url:type_name -> veil.v1.MediaUploadUrl
-	34, // 32: veil.v1.Envelope.voice_token_request:type_name -> veil.v1.VoiceTokenRequest
-	35, // 33: veil.v1.Envelope.voice_token:type_name -> veil.v1.VoiceToken
-	36, // 34: veil.v1.Envelope.sync_request:type_name -> veil.v1.SyncRequest
-	37, // 35: veil.v1.Envelope.sync_batch:type_name -> veil.v1.SyncBatch
-	1,  // 36: veil.v1.Envelope.error:type_name -> veil.v1.Error
-	37, // [37:37] is the sub-list for method output_type
-	37, // [37:37] is the sub-list for method input_type
-	37, // [37:37] is the sub-list for extension type_name
-	37, // [37:37] is the sub-list for extension extendee
-	0,  // [0:37] is the sub-list for field type_name
+	18, // 16: veil.v1.Envelope.sender_key_receipt:type_name -> veil.v1.SenderKeyReceipt
+	19, // 17: veil.v1.Envelope.presence_update:type_name -> veil.v1.PresenceUpdate
+	20, // 18: veil.v1.Envelope.typing_event:type_name -> veil.v1.TypingEvent
+	21, // 19: veil.v1.Envelope.friend_request:type_name -> veil.v1.FriendRequest
+	22, // 20: veil.v1.Envelope.friend_request_event:type_name -> veil.v1.FriendRequestEvent
+	23, // 21: veil.v1.Envelope.friend_respond:type_name -> veil.v1.FriendRespond
+	24, // 22: veil.v1.Envelope.friend_accepted_event:type_name -> veil.v1.FriendAcceptedEvent
+	25, // 23: veil.v1.Envelope.friend_remove:type_name -> veil.v1.FriendRemove
+	26, // 24: veil.v1.Envelope.friend_removed_event:type_name -> veil.v1.FriendRemovedEvent
+	27, // 25: veil.v1.Envelope.friend_list_request:type_name -> veil.v1.FriendListRequest
+	28, // 26: veil.v1.Envelope.friend_list_response:type_name -> veil.v1.FriendListResponse
+	29, // 27: veil.v1.Envelope.server_event:type_name -> veil.v1.ServerEvent
+	30, // 28: veil.v1.Envelope.channel_event:type_name -> veil.v1.ChannelEvent
+	31, // 29: veil.v1.Envelope.profile_updated:type_name -> veil.v1.ProfileUpdated
+	32, // 30: veil.v1.Envelope.share_create:type_name -> veil.v1.ShareCreate
+	33, // 31: veil.v1.Envelope.share_created:type_name -> veil.v1.ShareCreated
+	34, // 32: veil.v1.Envelope.media_upload_request:type_name -> veil.v1.MediaUploadRequest
+	35, // 33: veil.v1.Envelope.media_upload_url:type_name -> veil.v1.MediaUploadUrl
+	36, // 34: veil.v1.Envelope.voice_token_request:type_name -> veil.v1.VoiceTokenRequest
+	37, // 35: veil.v1.Envelope.voice_token:type_name -> veil.v1.VoiceToken
+	38, // 36: veil.v1.Envelope.sync_request:type_name -> veil.v1.SyncRequest
+	39, // 37: veil.v1.Envelope.sync_batch:type_name -> veil.v1.SyncBatch
+	1,  // 38: veil.v1.Envelope.error:type_name -> veil.v1.Error
+	39, // [39:39] is the sub-list for method output_type
+	39, // [39:39] is the sub-list for method input_type
+	39, // [39:39] is the sub-list for extension type_name
+	39, // [39:39] is the sub-list for extension extendee
+	0,  // [0:39] is the sub-list for field type_name
 }
 
 func init() { file_veil_v1_envelope_proto_init() }
@@ -923,6 +962,7 @@ func file_veil_v1_envelope_proto_init() {
 	file_veil_v1_media_proto_init()
 	file_veil_v1_voice_proto_init()
 	file_veil_v1_friends_proto_init()
+	file_veil_v1_profile_proto_init()
 	file_veil_v1_envelope_proto_msgTypes[0].OneofWrappers = []any{
 		(*Envelope_AuthChallenge)(nil),
 		(*Envelope_AuthResponse)(nil),
@@ -940,6 +980,7 @@ func file_veil_v1_envelope_proto_init() {
 		(*Envelope_PrekeyBundle)(nil),
 		(*Envelope_PrekeyRequest)(nil),
 		(*Envelope_SenderKeyDist)(nil),
+		(*Envelope_SenderKeyReceipt)(nil),
 		(*Envelope_PresenceUpdate)(nil),
 		(*Envelope_TypingEvent)(nil),
 		(*Envelope_FriendRequest)(nil),
@@ -952,6 +993,7 @@ func file_veil_v1_envelope_proto_init() {
 		(*Envelope_FriendListResponse)(nil),
 		(*Envelope_ServerEvent)(nil),
 		(*Envelope_ChannelEvent)(nil),
+		(*Envelope_ProfileUpdated)(nil),
 		(*Envelope_ShareCreate)(nil),
 		(*Envelope_ShareCreated)(nil),
 		(*Envelope_MediaUploadRequest)(nil),

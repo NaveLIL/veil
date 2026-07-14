@@ -7,6 +7,13 @@ import (
 	"time"
 )
 
+const (
+	// The desktop streaming API accepts exactly 2 GiB of plaintext. tus sees
+	// ciphertext length, so the default must also include one 16-byte v2 AEAD
+	// tag for each 1 MiB chunk (2048 chunks at the maximum boundary).
+	defaultMaxUploadSize int64 = (2 << 30) + (2048 * 16)
+)
+
 // Config bundles every operator-tunable knob for the uploads subsystem.
 // Defaults are reasonable for a small self-hosted deployment; override
 // via env vars (see LoadConfigFromEnv).
@@ -18,8 +25,8 @@ type Config struct {
 	// it to build Location headers; it must match the route mount.
 	BasePath string
 
-	// MaxUploadSize is the per-upload byte cap. Zero disables the cap
-	// (tusd will allow any single upload).
+	// MaxUploadSize is the per-upload ciphertext byte cap. Zero disables the
+	// cap (tusd will allow any single upload).
 	MaxUploadSize int64
 
 	// QuotaWindow is the trailing window over which UserDailyQuota is
@@ -52,7 +59,7 @@ func LoadConfigFromEnv() Config {
 	cfg := Config{
 		LocalDir:             envOrDefault("UPLOAD_LOCAL_DIR", "/var/veil/uploads"),
 		BasePath:             "/v1/uploads/files/",
-		MaxUploadSize:        envInt64OrDefault("UPLOAD_MAX_BYTES", 1<<30), // 1 GiB
+		MaxUploadSize:        envInt64OrDefault("UPLOAD_MAX_BYTES", defaultMaxUploadSize),
 		QuotaWindow:          envDurationOrDefault("UPLOAD_QUOTA_WINDOW", 24*time.Hour),
 		UserDailyQuota:       envInt64OrDefault("UPLOAD_USER_DAILY_QUOTA_BYTES", 5<<30), // 5 GiB
 		RetentionAfterFinish: envDurationOrDefault("UPLOAD_RETENTION", 30*24*time.Hour),

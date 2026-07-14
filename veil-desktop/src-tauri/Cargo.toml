@@ -2,7 +2,11 @@
 name = "veil-desktop"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 
 [lib]
 name = "veil_desktop_lib"
@@ -23,10 +27,20 @@ veil-crypto = { path = "../../veil-crypto" }
 veil-store = { path = "../../veil-store" }
 veil-client = { path = "../../veil-client" }
 veil-search = { path = "../../veil-search" }
-veil-mls = { path = "../../veil-mls" }
+veil-uploads = { path = "../../veil-uploads" }
 hex = "0.4"
 rand = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 base64 = "0.22"
 sha2 = "0.10"
+subtle = "2"
+zeroize = "1"
+rfd = { version = "=0.17.2", default-features = false, features = ["xdg-portal"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+tempfile = "3"
+chrono = "0.4"
+infer = "0.16"
+
+[dev-dependencies]
+ed25519-dalek = "2"

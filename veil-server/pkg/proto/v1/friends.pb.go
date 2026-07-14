@@ -641,7 +641,7 @@ const file_veil_v1_friends_proto_rawDesc = "" +
 	"\ttimestamp\x18\x05 \x01(\x04R\ttimestamp\x12\x1a\n" +
 	"\boutgoing\x18\x06 \x01(\bR\boutgoingB\n" +
 	"\n" +
-	"\b_messageB.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\b_messageB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_friends_proto_rawDescOnce sync.Once

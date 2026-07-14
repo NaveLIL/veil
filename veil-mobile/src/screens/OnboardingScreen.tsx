@@ -3,6 +3,7 @@ import {
   Animated,
   Easing,
   KeyboardAvoidingView,
+  Linking,
   Platform,
   Pressable,
   ScrollView,
@@ -13,7 +14,6 @@ import {
   View,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
-import * as Clipboard from "expo-clipboard";
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { colors, motion, radii, spacing } from "../lib/theme";
@@ -25,19 +25,21 @@ import { TaglineCarousel } from "../components/onboarding/TaglineCarousel";
 import VeilCrypto from "../native/crypto";
 import { useAuthStore } from "../stores/auth";
 
-type Step = "welcome" | "generate" | "restore";
+type Step = "welcome" | "generate" | "confirm" | "restore";
+
+const CONFIRM_WORD_INDICES = [2, 6, 10] as const;
 
 export default function OnboardingScreen() {
   const { height } = useWindowDimensions();
   const [step, setStep] = useState<Step>("welcome");
   const [mnemonic, setMnemonic] = useState("");
   const [restoreInput, setRestoreInput] = useState("");
+  const [confirmWords, setConfirmWords] = useState(["", "", ""]);
   const [showPhrase, setShowPhrase] = useState(true);
-  const [copied, setCopied] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
 
-  const { setIdentityKey } = useAuthStore();
+  const setLocalIdentityReady = useAuthStore((state) => state.setLocalIdentityReady);
 
   // Step transition: opacity + translateY + scale.
   const t = useRef(new Animated.Value(1)).current;
@@ -94,6 +96,16 @@ export default function OnboardingScreen() {
     }).start();
   }, [error, errorAnim]);
 
+  useEffect(() => {
+    const sensitive = step === "generate" || step === "confirm" || step === "restore";
+    void VeilCrypto.setSensitiveScreen(sensitive).catch(() => {
+      if (sensitive) setError("Screen capture protection is unavailable on this device.");
+    });
+    return () => {
+      void VeilCrypto.setSensitiveScreen(false).catch(() => undefined);
+    };
+  }, [step]);
+
   const generateMnemonic = async () => {
     try {
       setError("");
@@ -106,12 +118,6 @@ export default function OnboardingScreen() {
     } finally {
       setLoading(false);
     }
-  };
-
-  const copyToClipboard = async () => {
-    await Clipboard.setStringAsync(mnemonic);
-    setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
   };
 
   const initIdentity = async (phrase: string) => {
@@ -132,12 +138,24 @@ export default function OnboardingScreen() {
       // Clear sensitive state only after successful init.
       setMnemonic("");
       setRestoreInput("");
-      setIdentityKey(key);
+      setLocalIdentityReady(key);
     } catch (e) {
       setError(String(e));
     } finally {
       setLoading(false);
     }
+  };
+
+  const confirmAndInitIdentity = async () => {
+    const words = mnemonic.split(" ").filter(Boolean);
+    const matches = CONFIRM_WORD_INDICES.every(
+      (wordIndex, inputIndex) => words[wordIndex] === confirmWords[inputIndex].trim().toLowerCase(),
+    );
+    if (!matches) {
+      setError("Those words do not match your recovery phrase. Check your offline copy and try again.");
+      return;
+    }
+    await initIdentity(mnemonic);
   };
 
   const words = mnemonic.split(" ").filter(Boolean);
@@ -192,10 +210,20 @@ export default function OnboardingScreen() {
                 words={words}
                 showPhrase={showPhrase}
                 onToggleVisibility={() => setShowPhrase((v) => !v)}
-                copied={copied}
-                onCopy={copyToClipboard}
-                onContinue={() => initIdentity(mnemonic)}
+                onContinue={() => animateStep("confirm")}
                 onBack={() => animateStep("welcome")}
+                loading={loading}
+              />
+            ) : null}
+
+            {step === "confirm" ? (
+              <ConfirmStep
+                values={confirmWords}
+                onChange={(index, value) =>
+                  setConfirmWords((current) => current.map((word, i) => (i === index ? value : word)))
+                }
+                onContinue={confirmAndInitIdentity}
+                onBack={() => animateStep("generate")}
                 loading={loading}
               />
             ) : null}
@@ -253,7 +281,67 @@ const WelcomeStep: React.FC<{
         />
       </View>
     </Island>
+
+    <Pressable
+      accessibilityRole="link"
+      accessibilityLabel="Open Veil source code and license"
+      onPress={() => void Linking.openURL("https://github.com/NaveLIL/veil")}
+      style={styles.licenseLink}
+    >
+      <Text style={styles.licenseText}>© 2026 NaveLIL · AGPL-3.0-or-later · no warranty · Source &amp; License</Text>
+    </Pressable>
   </View>
+);
+
+/* ─── Confirm recovery ───────────────────────────────── */
+
+const ConfirmStep: React.FC<{
+  values: string[];
+  onChange: (index: number, value: string) => void;
+  onContinue: () => void;
+  onBack: () => void;
+  loading: boolean;
+}> = ({ values, onChange, onContinue, onBack, loading }) => (
+  <ScrollView
+    contentContainerStyle={styles.scrollPad}
+    showsVerticalScrollIndicator={false}
+    keyboardShouldPersistTaps="handled"
+  >
+    <Island padding={spacing.xxl}>
+      <Text style={styles.sectionTitle}>Confirm your offline copy</Text>
+      <Text style={styles.sectionSub}>
+        Enter the requested words from the recovery phrase you saved. Veil cannot recover it for you.
+      </Text>
+
+      <View style={styles.confirmStack}>
+        {CONFIRM_WORD_INDICES.map((wordIndex, inputIndex) => (
+          <View key={wordIndex} style={styles.confirmRow}>
+            <Text style={styles.confirmLabel}>Word {wordIndex + 1}</Text>
+            <TextInput
+              style={styles.confirmInput}
+              value={values[inputIndex]}
+              onChangeText={(value) => onChange(inputIndex, value)}
+              autoCapitalize="none"
+              autoCorrect={false}
+              spellCheck={false}
+              secureTextEntry
+              returnKeyType={inputIndex === values.length - 1 ? "done" : "next"}
+            />
+          </View>
+        ))}
+      </View>
+
+      <IslandButton
+        label="Create encrypted identity"
+        onPress={onContinue}
+        loading={loading}
+        disabled={values.some((value) => !value.trim())}
+      />
+      <Pressable onPress={onBack} style={styles.backBtn}>
+        <Text style={styles.backText}>← Review phrase</Text>
+      </Pressable>
+    </Island>
+  </ScrollView>
 );
 
 /* ─── Generate ──────────────────────────────────────── */
@@ -262,12 +350,10 @@ const GenerateStep: React.FC<{
   words: string[];
   showPhrase: boolean;
   onToggleVisibility: () => void;
-  copied: boolean;
-  onCopy: () => void;
   onContinue: () => void;
   onBack: () => void;
   loading: boolean;
-}> = ({ words, showPhrase, onToggleVisibility, copied, onCopy, onContinue, onBack, loading }) => (
+}> = ({ words, showPhrase, onToggleVisibility, onContinue, onBack, loading }) => (
   <ScrollView
     contentContainerStyle={styles.scrollPad}
     showsVerticalScrollIndicator={false}
@@ -302,15 +388,6 @@ const GenerateStep: React.FC<{
       </View>
 
       <View style={styles.row}>
-        <Pressable
-          style={[styles.smallBtn, copied ? styles.smallBtnSuccess : null]}
-          onPress={onCopy}
-          android_ripple={{ color: "rgba(255,255,255,0.08)" }}
-        >
-          <Text style={[styles.smallBtnText, copied ? { color: colors.success } : null]}>
-            {copied ? "✓ Copied" : "Copy"}
-          </Text>
-        </Pressable>
         <Pressable
           style={styles.smallBtn}
           onPress={onToggleVisibility}
@@ -443,6 +520,16 @@ const styles = StyleSheet.create({
     letterSpacing: 1,
   },
   welcomeIsland: { gap: spacing.xl },
+  licenseLink: {
+    alignSelf: "center",
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+  },
+  licenseText: {
+    color: colors.textLo,
+    fontSize: 10,
+    textAlign: "center",
+  },
   divider: {
     height: StyleSheet.hairlineWidth,
     backgroundColor: colors.border,
@@ -528,10 +615,6 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     overflow: "hidden",
   },
-  smallBtnSuccess: {
-    backgroundColor: colors.successBg,
-    borderColor: colors.successBorder,
-  },
   smallBtnText: {
     fontSize: 12,
     fontWeight: "600",
@@ -549,6 +632,29 @@ const styles = StyleSheet.create({
     fontSize: 15,
     lineHeight: 24,
     padding: spacing.lg,
+  },
+  confirmStack: {
+    gap: spacing.md,
+    marginBottom: spacing.xl,
+  },
+  confirmRow: {
+    gap: 7,
+  },
+  confirmLabel: {
+    color: colors.textLo,
+    fontSize: 12,
+    fontWeight: "600",
+  },
+  confirmInput: {
+    height: 46,
+    borderRadius: radii.md,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: "rgba(255,255,255,0.04)",
+    color: colors.textHi,
+    fontFamily: "monospace",
+    fontSize: 15,
+    paddingHorizontal: spacing.lg,
   },
 
   backBtn: {

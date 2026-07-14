@@ -227,7 +227,7 @@ const file_veil_v1_presence_proto_rawDesc = "" +
 	"\x0fPRESENCE_ONLINE\x10\x01\x12\x14\n" +
 	"\x10PRESENCE_OFFLINE\x10\x02\x12\x11\n" +
 	"\rPRESENCE_AWAY\x10\x03\x12\x10\n" +
-	"\fPRESENCE_DND\x10\x04B.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"\fPRESENCE_DND\x10\x04B2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_presence_proto_rawDescOnce sync.Once

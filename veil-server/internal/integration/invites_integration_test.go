@@ -1,161 +1,430 @@
 //go:build integration
 
-// End-to-end tests for the invite surface (create/list/preview/use/revoke +
-// expiry and max-uses enforcement). Run with the integration tag:
-//
-//	go test -tags=integration ./internal/integration/...
 package integration
 
 import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
+	"strings"
 	"testing"
-	"time"
 )
 
-func TestInvites_CreateListAndUseJoinsServer(t *testing.T) {
-	h := New(t)
-	owner := h.CreateUser("owner")
-	joiner := h.CreateUser("joiner")
-	srvID := mkServer(t, h, owner, "Joinable")
-
-	// Create invite.
-	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers/"+srvID+"/invites", map[string]any{
-		"max_uses":        0,
-		"expires_in_secs": 0,
+func createVeilLink(t *testing.T, h *Harness, owner *User, spaceID string, maxUses int32) map[string]any {
+	t.Helper()
+	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers/"+spaceID+"/veil-links", map[string]any{
+		"max_uses": maxUses, "expires_in_secs": 24 * 60 * 60,
 	})
 	if status != http.StatusCreated {
-		t.Fatalf("create invite: status=%d body=%v", status, body)
+		t.Fatalf("create Veil Link: status=%d body=%v", status, body)
 	}
-	code, _ := body["code"].(string)
-	if code == "" {
-		t.Fatalf("create invite: missing code (%v)", body)
+	for _, field := range []string{"id", "public_selector", "secret", "share_url"} {
+		if body[field] == "" || body[field] == nil {
+			t.Fatalf("create Veil Link missing %s: %v", field, body)
+		}
 	}
-
-	// List invites — owner can see it.
-	status, _, list := h.Do(owner, http.MethodGet, "/v1/servers/"+srvID+"/invites", nil)
-	if status != http.StatusOK {
-		t.Fatalf("list invites: status=%d body=%v", status, list)
-	}
-	invs, _ := list["invites"].([]any)
-	if len(invs) == 0 {
-		t.Fatalf("list invites: empty (%v)", list)
-	}
-
-	// Joiner uses invite — should be added to server.
-	status, _, used := h.Do(joiner, http.MethodPost, "/v1/invites/"+code+"/use", nil)
-	if status != http.StatusOK {
-		t.Fatalf("use invite: status=%d body=%v", status, used)
-	}
-	if used["id"] != srvID {
-		t.Fatalf("use invite: returned server id=%v want %s", used["id"], srvID)
-	}
-
-	// Joiner can now list members.
-	status, _, members := h.Do(joiner, http.MethodGet, "/v1/servers/"+srvID+"/members", nil)
-	if status != http.StatusOK {
-		t.Fatalf("joiner list members after join: status=%d body=%v", status, members)
-	}
-	mlist, _ := members["members"].([]any)
-	if len(mlist) != 2 {
-		t.Fatalf("members after join: want 2, got %d (%v)", len(mlist), members)
-	}
+	return body
 }
 
-func TestInvites_PreviewIsPublicAndReturnsServer(t *testing.T) {
-	h := New(t)
-	owner := h.CreateUser("owner")
-	srvID := mkServer(t, h, owner, "Public")
-	code := mkInviteCode(t, h, owner, srvID)
+func joinVeilLink(t *testing.T, h *Harness, user *User, link map[string]any) (int, map[string]any) {
+	t.Helper()
+	selector := link["public_selector"].(string)
+	secret := link["secret"].(string)
+	status, _, body := h.Do(user, http.MethodPost, "/v1/veil-links/"+selector+"/join", map[string]string{"secret": secret})
+	return status, body
+}
 
-	resp, err := http.Get(h.Server.URL + "/v1/invites/" + code)
+func TestVeilLinks_CreateListPreviewAndJoin(t *testing.T) {
+	h := New(t)
+	owner := h.CreateUser("veil-link-owner")
+	joiner := h.CreateUser("veil-link-joiner")
+	spaceID := mkServer(t, h, owner, "Joinable Space")
+	link := createVeilLink(t, h, owner, spaceID, 2)
+
+	selector := link["public_selector"].(string)
+	secret := link["secret"].(string)
+	if len(selector) != 43 || len(secret) != 43 || selector == secret {
+		t.Fatalf("selector/secret entropy contract violated")
+	}
+	shareURL := link["share_url"].(string)
+	if !strings.Contains(shareURL, "/join/v1/"+selector+"#s="+secret) {
+		t.Fatalf("unexpected share URL %q", shareURL)
+	}
+
+	status, _, listed := h.Do(owner, http.MethodGet, "/v1/servers/"+spaceID+"/veil-links", nil)
+	if status != http.StatusOK {
+		t.Fatalf("list links status=%d body=%v", status, listed)
+	}
+	encoded, _ := json.Marshal(listed)
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "secret_hash") {
+		t.Fatalf("list re-exposed secret material: %s", encoded)
+	}
+
+	resp, err := http.Get(h.Server.URL + "/v1/veil-links/" + selector)
 	if err != nil {
-		t.Fatalf("GET preview: %v", err)
+		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
-		t.Fatalf("preview: status=%d body=%s", resp.StatusCode, raw)
+	if resp.StatusCode != http.StatusOK || resp.Header.Get("Cache-Control") != "no-store" ||
+		resp.Header.Get("Referrer-Policy") != "no-referrer" {
+		t.Fatalf("public preview status/headers=%d %v", resp.StatusCode, resp.Header)
 	}
-	var parsed map[string]any
 	raw, _ := io.ReadAll(resp.Body)
-	if err := json.Unmarshal(raw, &parsed); err != nil {
-		t.Fatalf("decode preview: %v body=%s", err, raw)
+	if strings.Contains(string(raw), spaceID) || strings.Contains(string(raw), owner.ID) || strings.Contains(string(raw), secret) {
+		t.Fatalf("public preview disclosed private identifiers: %s", raw)
 	}
-	srv, _ := parsed["server"].(map[string]any)
-	if srv["id"] != srvID {
-		t.Fatalf("preview: server id=%v want %s (%v)", srv["id"], srvID, parsed)
+	var publicPreview struct {
+		Space struct {
+			MarkSeed string `json:"mark_seed"`
+		} `json:"space"`
+	}
+	if err := json.Unmarshal(raw, &publicPreview); err != nil || len(publicPreview.Space.MarkSeed) != 43 {
+		t.Fatalf("public preview mark seed contract failed: err=%v body=%s", err, raw)
+	}
+
+	portal, err := http.Get(h.Server.URL + "/join/v1/" + selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer portal.Body.Close()
+	portalBody, _ := io.ReadAll(portal.Body)
+	portalCSP := portal.Header.Get("Content-Security-Policy")
+	exactPortalCSP := regexp.MustCompile(`^default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-[A-Za-z0-9+/]{24}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'none'; img-src 'self'$`)
+	if portal.StatusCode != http.StatusOK ||
+		!exactPortalCSP.MatchString(portalCSP) ||
+		portal.Header.Get("Referrer-Policy") != "no-referrer" ||
+		!strings.Contains(string(portalBody), "A Veil Link for a private Space") ||
+		!strings.Contains(string(portalBody), "Review in Veil, then confirm") ||
+		!strings.Contains(string(portalBody), "/assets/veil-link-bg-v1-38824a5f41228389.jpg") ||
+		!strings.Contains(string(portalBody), "M4 4H8V11.8L4 13ZM4 16L8 14.8V20H4ZM10 2H14V10.5L10 11.7ZM10 14.7L14 13.5V22H10ZM16 5H20V8.2L16 9.4ZM16 12.4L20 11.2V19H16Z") ||
+		!strings.Contains(string(portalBody), `data-seed="`+publicPreview.Space.MarkSeed+`"`) ||
+		strings.Contains(string(portalBody), secret) || strings.Contains(string(portalBody), owner.ID) {
+		t.Fatalf("unsafe Veil Link portal status=%d headers=%v body=%s", portal.StatusCode, portal.Header, portalBody)
+	}
+	invalidPortal, err := http.Get(h.Server.URL + "/join/v1/not-a-selector")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer invalidPortal.Body.Close()
+	if invalidPortal.StatusCode != http.StatusNotFound {
+		t.Fatalf("invalid portal status=%d", invalidPortal.StatusCode)
+	}
+
+	previewPath := "/v1/veil-links/" + selector + "/preview"
+	previewBody := map[string]string{"secret": secret}
+	status, _, signedPreview := h.Do(joiner, http.MethodPost, previewPath, previewBody)
+	if status != http.StatusOK || signedPreview["already_member"] != false {
+		t.Fatalf("pre-join authenticated preview status=%d body=%v", status, signedPreview)
+	}
+
+	status, used := joinVeilLink(t, h, joiner, link)
+	if status != http.StatusOK || used["id"] != spaceID {
+		t.Fatalf("join status=%d body=%v", status, used)
+	}
+	status, _, signedPreview = h.Do(joiner, http.MethodPost, previewPath, previewBody)
+	if status != http.StatusOK || signedPreview["already_member"] != true {
+		t.Fatalf("member authenticated preview status=%d body=%v", status, signedPreview)
+	}
+	var createdEvents, joinedEvents int
+	if err := h.DB.Pool.QueryRow(t.Context(),
+		`SELECT count(*) FILTER (WHERE event_type='created'),
+		        count(*) FILTER (WHERE event_type='joined')
+		 FROM veil_link_events WHERE server_id=$1::uuid`, spaceID,
+	).Scan(&createdEvents, &joinedEvents); err != nil {
+		t.Fatal(err)
+	}
+	if createdEvents != 1 || joinedEvents != 1 {
+		t.Fatalf("bounded Veil Link lifecycle events = created:%d joined:%d", createdEvents, joinedEvents)
 	}
 }
 
-func TestInvites_RevokePreventsUse(t *testing.T) {
+func TestVeilLinks_SecretExpiryUseAndRevocationAreFailClosed(t *testing.T) {
 	h := New(t)
-	owner := h.CreateUser("owner")
-	joiner := h.CreateUser("joiner")
-	srvID := mkServer(t, h, owner, "Revoked")
-	code := mkInviteCode(t, h, owner, srvID)
+	owner := h.CreateUser("veil-link-bounds-owner")
+	first := h.CreateUser("veil-link-bounds-first")
+	second := h.CreateUser("veil-link-bounds-second")
+	spaceID := mkServer(t, h, owner, "Bounded Space")
+	link := createVeilLink(t, h, owner, spaceID, 1)
 
-	status, _, _ := h.Do(owner, http.MethodDelete, "/v1/invites/"+code, nil)
-	if status != http.StatusOK {
-		t.Fatalf("revoke: status=%d", status)
+	selector := link["public_selector"].(string)
+	status, _, _ := h.Do(first, http.MethodPost, "/v1/veil-links/"+selector+"/join", map[string]string{"secret": strings.Repeat("A", 43)})
+	if status == http.StatusOK {
+		t.Fatal("wrong secret joined Space")
+	}
+	if status, _ := joinVeilLink(t, h, first, link); status != http.StatusOK {
+		t.Fatalf("first join status=%d", status)
+	}
+	if status, _ := joinVeilLink(t, h, second, link); status == http.StatusOK {
+		t.Fatal("exhausted Veil Link admitted second member")
 	}
 
-	status, _, body := h.Do(joiner, http.MethodPost, "/v1/invites/"+code+"/use", nil)
-	if status == http.StatusOK {
-		t.Fatalf("revoked invite must not be usable, got 200 (%v)", body)
+	revocable := createVeilLink(t, h, owner, spaceID, 2)
+	path := "/v1/servers/" + spaceID + "/veil-links/" + revocable["id"].(string)
+	if status, _, _ := h.Do(owner, http.MethodDelete, path, nil); status != http.StatusOK {
+		t.Fatalf("revoke status=%d", status)
+	}
+	if status, _ := joinVeilLink(t, h, second, revocable); status == http.StatusOK {
+		t.Fatal("revoked Veil Link admitted member")
+	}
+	var revokedEvents int
+	if err := h.DB.Pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM veil_link_events
+		 WHERE server_id=$1::uuid AND link_id=$2::uuid AND event_type='revoked'`,
+		spaceID, revocable["id"],
+	).Scan(&revokedEvents); err != nil {
+		t.Fatal(err)
+	}
+	if revokedEvents != 1 {
+		t.Fatalf("revoke lifecycle event count = %d", revokedEvents)
+	}
+
+	revokeAll := createVeilLink(t, h, owner, spaceID, 2)
+	if status, _, body := h.Do(owner, http.MethodDelete, "/v1/servers/"+spaceID+"/veil-links", nil); status != http.StatusOK {
+		t.Fatalf("revoke-all status=%d body=%v", status, body)
+	}
+	if status, _ := joinVeilLink(t, h, second, revokeAll); status == http.StatusOK {
+		t.Fatal("revoke-all left a Veil Link active")
+	}
+	var revokeAllEvents int
+	if err := h.DB.Pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM veil_link_events
+		 WHERE server_id=$1::uuid AND link_id IS NULL AND event_type='revoked_all'`, spaceID,
+	).Scan(&revokeAllEvents); err != nil {
+		t.Fatal(err)
+	}
+	if revokeAllEvents != 1 {
+		t.Fatalf("revoke-all lifecycle event count = %d", revokeAllEvents)
+	}
+
+	expired := createVeilLink(t, h, owner, spaceID, 2)
+	if _, err := h.DB.Pool.Exec(t.Context(), `UPDATE server_invites
+		SET created_at=now()-interval '10 minutes', expires_at=now()-interval '1 second'
+		WHERE id=$1::uuid`, expired["id"]); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := joinVeilLink(t, h, second, expired); status == http.StatusOK {
+		t.Fatal("expired Veil Link admitted member")
 	}
 }
 
-func TestInvites_MaxUsesEnforced(t *testing.T) {
+func TestVeilLinks_MaxUseAdmissionIsAtomicUnderConcurrency(t *testing.T) {
 	h := New(t)
-	owner := h.CreateUser("owner")
-	first := h.CreateUser("first")
-	second := h.CreateUser("second")
-	srvID := mkServer(t, h, owner, "Capped")
+	owner := h.CreateUser("veil-link-race-owner")
+	first := h.CreateUser("veil-link-race-first")
+	second := h.CreateUser("veil-link-race-second")
+	spaceID := mkServer(t, h, owner, "Atomic admission")
+	link := createVeilLink(t, h, owner, spaceID, 1)
+	ctx := t.Context()
 
-	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers/"+srvID+"/invites", map[string]any{
-		"max_uses":        1,
-		"expires_in_secs": 0,
-	})
-	if status != http.StatusCreated {
-		t.Fatalf("create invite: status=%d body=%v", status, body)
+	start := make(chan struct{})
+	type admissionResult struct {
+		userID  string
+		spaceID string
+		joined  bool
+		err     error
 	}
-	code := body["code"].(string)
+	results := make(chan admissionResult, 2)
+	selector := link["public_selector"].(string)
+	secret := link["secret"].(string)
+	for _, user := range []*User{first, second} {
+		go func(candidate *User) {
+			<-start
+			space, joined, err := h.DB.UseInvite(ctx, selector, secret, candidate.ID)
+			admittedSpaceID := ""
+			if space != nil {
+				admittedSpaceID = space.ID
+			}
+			results <- admissionResult{
+				userID: candidate.ID, spaceID: admittedSpaceID, joined: joined, err: err,
+			}
+		}(user)
+	}
+	close(start)
 
-	// First use must succeed.
-	status, _, _ = h.Do(first, http.MethodPost, "/v1/invites/"+code+"/use", nil)
-	if status != http.StatusOK {
-		t.Fatalf("first use: status=%d", status)
+	var winner, loser admissionResult
+	for range 2 {
+		result := <-results
+		if result.err == nil && result.joined {
+			if winner.userID != "" {
+				t.Fatalf("multiple concurrent admissions succeeded: first=%s second=%s", winner.userID, result.userID)
+			}
+			winner = result
+		} else if result.err != nil && !result.joined && result.spaceID == "" {
+			if loser.userID != "" {
+				t.Fatalf("multiple concurrent admissions were rejected: first=%s second=%s", loser.userID, result.userID)
+			}
+			loser = result
+		} else {
+			t.Fatalf("unexpected concurrent admission result for %s: space=%q joined=%v err=%v", result.userID, result.spaceID, result.joined, result.err)
+		}
+	}
+	if winner.userID == "" || loser.userID == "" || winner.spaceID != spaceID {
+		t.Fatalf("concurrent max-use result: winner=%+v loser=%+v want-space=%s", winner, loser, spaceID)
 	}
 
-	// Second use must be rejected.
-	status, _, body2 := h.Do(second, http.MethodPost, "/v1/invites/"+code+"/use", nil)
-	if status == http.StatusOK {
-		t.Fatalf("second use over max_uses=1 must fail, got 200 (%v)", body2)
+	repeatedSpace, repeatedJoined, err := h.DB.UseInvite(ctx, selector, secret, winner.userID)
+	if err != nil || repeatedJoined || repeatedSpace == nil || repeatedSpace.ID != spaceID {
+		t.Fatalf("winner repeat was not idempotent: space=%v joined=%v err=%v", repeatedSpace, repeatedJoined, err)
+	}
+	rejectedSpace, rejectedJoined, rejectedErr := h.DB.UseInvite(ctx, selector, secret, loser.userID)
+	if rejectedErr == nil || rejectedJoined || rejectedSpace != nil {
+		t.Fatalf("loser repeat bypassed exhausted admission: space=%v joined=%v err=%v", rejectedSpace, rejectedJoined, rejectedErr)
+	}
+
+	invite, err := h.DB.GetInvite(ctx, selector)
+	if err != nil || invite.Uses != 1 {
+		t.Fatalf("concurrent admission use count: invite=%v err=%v", invite, err)
+	}
+	var winnerMemberships, loserMemberships, winnerRoomRoster, loserRoomRoster, joinedEvents int
+	if err := h.DB.Pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM server_members
+		   WHERE server_id=$1::uuid AND user_id=$2::uuid),
+		  (SELECT count(*) FROM server_members
+		   WHERE server_id=$1::uuid AND user_id=$3::uuid),
+		  (SELECT count(*) FROM conversation_members member
+		   JOIN channels room ON room.conversation_id=member.conversation_id
+		   WHERE room.server_id=$1::uuid AND member.user_id=$2::uuid),
+		  (SELECT count(*) FROM conversation_members member
+		   JOIN channels room ON room.conversation_id=member.conversation_id
+		   WHERE room.server_id=$1::uuid AND member.user_id=$3::uuid),
+		  (SELECT count(*) FROM veil_link_events
+		   WHERE server_id=$1::uuid AND link_id=$4::uuid AND event_type='joined')`,
+		spaceID, winner.userID, loser.userID, link["id"],
+	).Scan(&winnerMemberships, &loserMemberships, &winnerRoomRoster, &loserRoomRoster, &joinedEvents); err != nil {
+		t.Fatal(err)
+	}
+	if winnerMemberships != 1 || loserMemberships != 0 || winnerRoomRoster != 1 || loserRoomRoster != 0 || joinedEvents != 1 {
+		t.Fatalf(
+			"concurrent admission committed winner-members=%d loser-members=%d winner-room-roster=%d loser-room-roster=%d joined-events=%d",
+			winnerMemberships, loserMemberships, winnerRoomRoster, loserRoomRoster, joinedEvents,
+		)
 	}
 }
 
-func TestInvites_ExpiredCannotBeUsed(t *testing.T) {
+func TestVeilLinks_StrictBoundsIdempotenceAndDeletedSpace(t *testing.T) {
 	h := New(t)
-	owner := h.CreateUser("owner")
-	joiner := h.CreateUser("joiner")
-	srvID := mkServer(t, h, owner, "Expiring")
-
-	// 1-second TTL invite.
-	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers/"+srvID+"/invites", map[string]any{
-		"max_uses":        0,
-		"expires_in_secs": 1,
-	})
-	if status != http.StatusCreated {
-		t.Fatalf("create invite: status=%d body=%v", status, body)
+	owner := h.CreateUser("strict-link-owner")
+	joiner := h.CreateUser("strict-link-joiner")
+	other := h.CreateUser("strict-link-other")
+	spaceID := mkServer(t, h, owner, "Strict Space")
+	path := "/v1/servers/" + spaceID + "/veil-links"
+	for name, body := range map[string]any{
+		"malformed":    "{",
+		"trailing":     `{"max_uses":1,"expires_in_secs":300} {}`,
+		"unlimited":    map[string]any{"max_uses": 0, "expires_in_secs": 300},
+		"too many":     map[string]any{"max_uses": 101, "expires_in_secs": 300},
+		"short expiry": map[string]any{"max_uses": 1, "expires_in_secs": 299},
+		"long expiry":  map[string]any{"max_uses": 1, "expires_in_secs": 7*24*60*60 + 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if status, _, _ := h.Do(owner, http.MethodPost, path, body); status != http.StatusBadRequest {
+				t.Fatalf("invalid input status=%d", status)
+			}
+		})
 	}
-	code := body["code"].(string)
 
-	time.Sleep(1500 * time.Millisecond)
+	link := createVeilLink(t, h, owner, spaceID, 1)
+	if status, _ := joinVeilLink(t, h, owner, link); status != http.StatusOK {
+		t.Fatalf("existing owner idempotent join status=%d", status)
+	}
+	if status, _ := joinVeilLink(t, h, joiner, link); status != http.StatusOK {
+		t.Fatalf("first membership status=%d", status)
+	}
+	if status, _ := joinVeilLink(t, h, joiner, link); status != http.StatusOK {
+		t.Fatalf("existing member repeat status=%d", status)
+	}
+	previewPath := "/v1/veil-links/" + link["public_selector"].(string) + "/preview"
+	previewBody := map[string]string{"secret": link["secret"].(string)}
+	if status, _, preview := h.Do(joiner, http.MethodPost, previewPath, previewBody); status != http.StatusOK || preview["already_member"] != true {
+		t.Fatalf("consumed link did not route existing member: status=%d body=%v", status, preview)
+	}
+	if status, _, _ := h.Do(other, http.MethodPost, previewPath, previewBody); status == http.StatusOK {
+		t.Fatal("consumed link preview offered admission to a new member")
+	}
+	inv, err := h.DB.GetInvite(t.Context(), link["public_selector"].(string))
+	if err != nil || inv.Uses != 1 {
+		t.Fatalf("idempotence changed use count: inv=%v err=%v", inv, err)
+	}
+	if status, _ := joinVeilLink(t, h, other, link); status == http.StatusOK {
+		t.Fatal("second new member bypassed max uses")
+	}
 
-	status, _, body2 := h.Do(joiner, http.MethodPost, "/v1/invites/"+code+"/use", nil)
-	if status == http.StatusOK {
-		t.Fatalf("expired invite must not be usable, got 200 (%v)", body2)
+	deletedSpace := mkServer(t, h, owner, "Deleted Space")
+	deleted := createVeilLink(t, h, owner, deletedSpace, 2)
+	if err := h.DB.DeleteServer(t.Context(), deletedSpace); err != nil {
+		t.Fatal(err)
+	}
+	if status, _ := joinVeilLink(t, h, other, deleted); status == http.StatusOK {
+		t.Fatal("link joined a deleted Space")
+	}
+}
+
+func TestKickMember_StrictOptionalJSONAndReasonBound(t *testing.T) {
+	h := New(t)
+	owner := h.CreateUser("strict-kick-owner")
+	target := h.CreateUser("strict-kick-target")
+	spaceID := mkServer(t, h, owner, "Strict kick")
+	joinViaInvite(t, h, target, mkInviteCode(t, h, owner, spaceID))
+	path := "/v1/servers/" + spaceID + "/members/" + target.ID
+	for name, body := range map[string]any{
+		"malformed": "{",
+		"trailing":  `{"reason":"spam"} {}`,
+		"oversize":  map[string]string{"reason": strings.Repeat("x", 513)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			status, _, _ := h.Do(owner, http.MethodDelete, path, body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("invalid kick body status=%d", status)
+			}
+			member, err := h.DB.IsServerMember(t.Context(), spaceID, target.ID)
+			if err != nil || !member {
+				t.Fatalf("invalid kick changed membership: member=%v err=%v", member, err)
+			}
+		})
+	}
+	if status, _, _ := h.Do(owner, http.MethodDelete, path, nil); status != http.StatusOK {
+		t.Fatalf("empty optional kick body status=%d", status)
+	}
+}
+
+func TestSpaceBanBlocksVeilLinkWithoutConsumingUseUntilExplicitUnban(t *testing.T) {
+	h := New(t)
+	owner := h.CreateUser("ban-owner")
+	target := h.CreateUser("ban-target")
+	spaceID := mkServer(t, h, owner, "Moderated Space")
+	firstLink := createVeilLink(t, h, owner, spaceID, 1)
+	if status, _ := joinVeilLink(t, h, target, firstLink); status != http.StatusOK {
+		t.Fatalf("initial join status=%d", status)
+	}
+
+	banPath := "/v1/servers/" + spaceID + "/bans/" + target.ID
+	if status, _, body := h.Do(owner, http.MethodPut, banPath, map[string]string{"reason": "raid"}); status != http.StatusOK {
+		t.Fatalf("ban status=%d body=%v", status, body)
+	}
+	if member, err := h.DB.IsServerMember(t.Context(), spaceID, target.ID); err != nil || member {
+		t.Fatalf("banned account retained Space membership: member=%v err=%v", member, err)
+	}
+
+	rejoinLink := createVeilLink(t, h, owner, spaceID, 1)
+	if status, _ := joinVeilLink(t, h, target, rejoinLink); status == http.StatusOK {
+		t.Fatal("banned account rejoined through a Veil Link")
+	}
+	invite, err := h.DB.GetInvite(t.Context(), rejoinLink["public_selector"].(string))
+	if err != nil || invite.Uses != 0 {
+		t.Fatalf("rejected ban consumed link use: invite=%v err=%v", invite, err)
+	}
+	if status, _, body := h.Do(owner, http.MethodGet, "/v1/servers/"+spaceID+"/bans", nil); status != http.StatusOK {
+		t.Fatalf("list bans status=%d body=%v", status, body)
+	} else if bans, ok := body["bans"].([]any); !ok || len(bans) != 1 {
+		t.Fatalf("unexpected ban list: %v", body)
+	}
+
+	if status, _, body := h.Do(owner, http.MethodDelete, banPath, nil); status != http.StatusOK {
+		t.Fatalf("unban status=%d body=%v", status, body)
+	}
+	if status, _ := joinVeilLink(t, h, target, rejoinLink); status != http.StatusOK {
+		t.Fatalf("unbanned account did not rejoin status=%d", status)
 	}
 }

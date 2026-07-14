@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"strings"
 	"time"
+	"unicode/utf8"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/db"
-	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
 
 // Broadcaster delivers WebSocket envelopes to a set of users.
@@ -21,6 +23,19 @@ type Service struct {
 	db    *db.DB
 	bcast Broadcaster
 }
+
+const (
+	minInviteUses       int32 = 1
+	maxInviteUses       int32 = 100
+	minInviteExpirySecs int64 = 5 * 60
+	maxInviteExpirySecs int64 = 7 * 24 * 60 * 60
+	maxKickReasonBytes        = 512
+)
+
+var (
+	ErrInvalidInviteInput = errors.New("invalid invite limits")
+	ErrInvalidKickReason  = errors.New("invalid kick reason")
+)
 
 func NewService(database *db.DB, bcast Broadcaster) *Service {
 	return &Service{db: database, bcast: bcast}
@@ -51,11 +66,33 @@ func (s *Service) memberIDs(ctx context.Context, serverID string) []string {
 	return ids
 }
 
+// channelViewerIDs returns only members allowed to learn channel metadata.
+// Message-history is intentionally not required for channel create/update
+// events, but VIEW_CHANNEL is always enforced.
+func (s *Service) channelViewerIDs(ctx context.Context, channelID string) []string {
+	channel, err := s.db.GetChannel(ctx, channelID)
+	if err != nil {
+		return nil
+	}
+	members, err := s.db.GetServerMembers(ctx, channel.ServerID)
+	if err != nil {
+		return nil
+	}
+	ids := make([]string, 0, len(members))
+	for _, member := range members {
+		allowed, permissionErr := s.db.HasAllChannelPermissions(ctx, channelID, member.UserID, db.PermViewChannel)
+		if permissionErr == nil && allowed {
+			ids = append(ids, member.UserID)
+		}
+	}
+	return ids
+}
+
 // ─── Server ──────────────────────────────────────────
 
 func (s *Service) CreateServer(ctx context.Context, name, ownerID string) (*db.Server, error) {
-	if len(name) > 100 {
-		return nil, errors.New("server name too long")
+	if err := validateServerName(name); err != nil {
+		return nil, err
 	}
 	srv, err := s.db.CreateServer(ctx, name, ownerID)
 	if err != nil {
@@ -89,7 +126,10 @@ func (s *Service) UpdateServer(ctx context.Context, serverID, requesterID string
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
 	}
-	if err := s.db.UpdateServer(ctx, serverID, name, description, iconURL); err != nil {
+	if err := validateServerMetadata(name, description, iconURL); err != nil {
+		return err
+	}
+	if err := s.db.UpdateServer(ctx, serverID, name, description); err != nil {
 		return err
 	}
 	srv, _ := s.db.GetServer(ctx, serverID)
@@ -141,6 +181,11 @@ func (s *Service) LeaveServer(ctx context.Context, serverID, userID string) erro
 
 // KickMember removes a member; requires KICK_MEMBERS permission.
 func (s *Service) KickMember(ctx context.Context, serverID, requesterID, targetID string, reason *string) error {
+	normalizedReason, err := normalizeKickReason(reason)
+	if err != nil {
+		return err
+	}
+	reason = normalizedReason
 	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermKickMembers)
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
@@ -151,6 +196,21 @@ func (s *Service) KickMember(ctx context.Context, serverID, requesterID, targetI
 	owner, _ := s.db.IsServerOwner(ctx, serverID, targetID)
 	if owner {
 		return errors.New("cannot kick the owner")
+	}
+	targetMember, err := s.db.IsServerMember(ctx, serverID, targetID)
+	if err != nil || !targetMember {
+		return errors.New("target is not a server member")
+	}
+	requesterOwner, err := s.db.IsServerOwner(ctx, serverID, requesterID)
+	if err != nil {
+		return errors.New("server not found")
+	}
+	if !requesterOwner {
+		requesterHighest, requesterErr := s.db.GetHighestRolePosition(ctx, serverID, requesterID)
+		targetHighest, targetErr := s.db.GetHighestRolePosition(ctx, serverID, targetID)
+		if requesterErr != nil || targetErr != nil || requesterHighest <= targetHighest {
+			return errors.New("target member is outside the requester's role hierarchy")
+		}
 	}
 	user, _ := s.db.FindUserByID(ctx, targetID)
 	memberIDs := s.memberIDs(ctx, serverID)
@@ -174,6 +234,77 @@ func (s *Service) KickMember(ctx context.Context, serverID, requesterID, targetI
 	return nil
 }
 
+// BanMember atomically persists an admission denial and removes the member
+// from every current Space/Room roster. It does not change cryptographic trust
+// state; the existing authoritative roster event drives Sender-Key rotation.
+func (s *Service) BanMember(ctx context.Context, serverID, requesterID, targetID string, reason *string) error {
+	normalizedReason, err := normalizeKickReason(reason)
+	if err != nil {
+		return err
+	}
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermBanMembers)
+	if err != nil || !can {
+		return errors.New("insufficient permissions")
+	}
+	if requesterID == targetID {
+		return errors.New("cannot ban yourself")
+	}
+	owner, _ := s.db.IsServerOwner(ctx, serverID, targetID)
+	if owner {
+		return errors.New("cannot ban the owner")
+	}
+	targetMember, err := s.db.IsServerMember(ctx, serverID, targetID)
+	if err != nil || !targetMember {
+		return errors.New("target is not a server member")
+	}
+	requesterOwner, err := s.db.IsServerOwner(ctx, serverID, requesterID)
+	if err != nil {
+		return errors.New("server not found")
+	}
+	if !requesterOwner {
+		requesterHighest, requesterErr := s.db.GetHighestRolePosition(ctx, serverID, requesterID)
+		targetHighest, targetErr := s.db.GetHighestRolePosition(ctx, serverID, targetID)
+		if requesterErr != nil || targetErr != nil || requesterHighest <= targetHighest {
+			return errors.New("target member is outside the requester's role hierarchy")
+		}
+	}
+	user, _ := s.db.FindUserByID(ctx, targetID)
+	memberIDs := s.memberIDs(ctx, serverID)
+	if err := s.db.BanServerMember(ctx, serverID, targetID, requesterID, normalizedReason); err != nil {
+		return err
+	}
+	if user != nil {
+		s.bcast.BroadcastToUsers(memberIDs, &pb.Envelope{
+			Payload: &pb.Envelope_ServerEvent{ServerEvent: &pb.ServerEvent{
+				EventType: pb.ServerEvent_MEMBER_BANNED,
+				ServerId:  serverID,
+				MemberInfo: &pb.MemberInfo{
+					IdentityKey: user.IdentityKey,
+					Username:    user.Username,
+					Reason:      normalizedReason,
+				},
+			}},
+		})
+	}
+	return nil
+}
+
+func (s *Service) ListBans(ctx context.Context, serverID, requesterID string) ([]db.ServerBan, error) {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermBanMembers)
+	if err != nil || !can {
+		return nil, errors.New("insufficient permissions")
+	}
+	return s.db.GetServerBans(ctx, serverID)
+}
+
+func (s *Service) UnbanMember(ctx context.Context, serverID, requesterID, targetID string) error {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermBanMembers)
+	if err != nil || !can {
+		return errors.New("insufficient permissions")
+	}
+	return s.db.UnbanServerMember(ctx, serverID, targetID)
+}
+
 // ─── Members ─────────────────────────────────────────
 
 func (s *Service) ListMembers(ctx context.Context, serverID, requesterID string) ([]db.ServerMember, error) {
@@ -191,7 +322,11 @@ func (s *Service) ListChannels(ctx context.Context, serverID, requesterID string
 	if err != nil || !ok {
 		return nil, errors.New("not a server member")
 	}
-	return s.db.GetServerChannels(ctx, serverID)
+	channels, err := s.db.GetVisibleServerChannels(ctx, serverID, requesterID)
+	if err != nil {
+		return nil, errors.New("insufficient permissions")
+	}
+	return channels, nil
 }
 
 func (s *Service) CreateChannel(ctx context.Context, serverID, requesterID, name string, channelType int16, categoryID, topic *string) (*db.Channel, error) {
@@ -199,14 +334,17 @@ func (s *Service) CreateChannel(ctx context.Context, serverID, requesterID, name
 	if err != nil || !can {
 		return nil, errors.New("insufficient permissions")
 	}
-	if name == "" || len(name) > 100 {
-		return nil, errors.New("invalid channel name")
+	if channelType != 0 && channelType != 2 {
+		return nil, errors.New("room type is not active in this release")
+	}
+	if err := validateChannelMetadata(&name, topic); err != nil {
+		return nil, err
 	}
 	ch, err := s.db.CreateChannel(ctx, serverID, name, channelType, categoryID, topic)
 	if err != nil {
 		return nil, err
 	}
-	s.broadcastChannelEvent(ctx, serverID, pb.ChannelEvent_CREATED, channelToInfo(ch))
+	s.broadcastChannelEvent(ctx, ch.ID, pb.ChannelEvent_CREATED, channelToInfo(ch))
 	return ch, nil
 }
 
@@ -215,16 +353,51 @@ func (s *Service) UpdateChannel(ctx context.Context, channelID, requesterID stri
 	if err != nil {
 		return errors.New("channel not found")
 	}
-	can, err := s.db.HasPermission(ctx, ch.ServerID, requesterID, db.PermManageChannels)
+	can, err := s.db.HasAllChannelPermissions(ctx, ch.ID, requesterID, db.PermManageChannels)
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
+	}
+	if err := validateChannelMetadata(name, topic); err != nil {
+		return err
 	}
 	if err := s.db.UpdateChannel(ctx, channelID, name, topic, nsfw, slowmode, nil, nil, false); err != nil {
 		return err
 	}
 	updated, _ := s.db.GetChannel(ctx, channelID)
 	if updated != nil {
-		s.broadcastChannelEvent(ctx, ch.ServerID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
+		s.broadcastChannelEvent(ctx, ch.ID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
+	}
+	return nil
+}
+
+func validateServerName(name string) error {
+	if !utf8.ValidString(name) || strings.TrimSpace(name) == "" || len(name) > 100 {
+		return errors.New("server name must be 1..100 UTF-8 bytes")
+	}
+	return nil
+}
+
+func validateServerMetadata(name, description, iconURL *string) error {
+	if name != nil {
+		if err := validateServerName(*name); err != nil {
+			return err
+		}
+	}
+	if description != nil && (!utf8.ValidString(*description) || len(*description) > 2000) {
+		return errors.New("server description must be valid UTF-8 up to 2000 bytes")
+	}
+	if iconURL != nil {
+		return errors.New("remote Space icons are not supported")
+	}
+	return nil
+}
+
+func validateChannelMetadata(name, topic *string) error {
+	if name != nil && (!utf8.ValidString(*name) || strings.TrimSpace(*name) == "" || len(*name) > 100) {
+		return errors.New("channel name must be 1..100 UTF-8 bytes")
+	}
+	if topic != nil && (!utf8.ValidString(*topic) || len(*topic) > 2000) {
+		return errors.New("channel topic must be valid UTF-8 up to 2000 bytes")
 	}
 	return nil
 }
@@ -256,6 +429,10 @@ func (s *Service) ReorderChannels(ctx context.Context, serverID, requesterID str
 		if ch.ServerID != serverID {
 			return errors.New("channel does not belong to server")
 		}
+		canManage, permissionErr := s.db.HasAllChannelPermissions(ctx, ch.ID, requesterID, db.PermManageChannels)
+		if permissionErr != nil || !canManage {
+			return errors.New("insufficient permissions")
+		}
 		pos := it.Position
 		if err := s.db.UpdateChannel(ctx, it.ChannelID, nil, nil, nil, nil, &pos, it.CategoryID, it.ClearCategory); err != nil {
 			return err
@@ -264,7 +441,7 @@ func (s *Service) ReorderChannels(ctx context.Context, serverID, requesterID str
 	// Broadcast a single UPDATED per channel so clients refresh the tree.
 	for _, it := range items {
 		if updated, _ := s.db.GetChannel(ctx, it.ChannelID); updated != nil {
-			s.broadcastChannelEvent(ctx, serverID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
+			s.broadcastChannelEvent(ctx, updated.ID, pb.ChannelEvent_UPDATED, channelToInfo(updated))
 		}
 	}
 	return nil
@@ -275,18 +452,168 @@ func (s *Service) DeleteChannel(ctx context.Context, channelID, requesterID stri
 	if err != nil {
 		return errors.New("channel not found")
 	}
-	can, err := s.db.HasPermission(ctx, ch.ServerID, requesterID, db.PermManageChannels)
+	can, err := s.db.HasAllChannelPermissions(ctx, ch.ID, requesterID, db.PermManageChannels)
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
 	}
+	viewers := s.channelViewerIDs(ctx, ch.ID)
 	if err := s.db.DeleteChannel(ctx, channelID); err != nil {
 		return err
 	}
-	s.broadcastChannelEvent(ctx, ch.ServerID, pb.ChannelEvent_DELETED, channelToInfo(ch))
+	s.broadcastChannelEventTo(ctx, viewers, ch.ServerID, pb.ChannelEvent_DELETED, channelToInfo(ch))
 	return nil
 }
 
 // ─── Roles ───────────────────────────────────────────
+
+func (s *Service) authorizeChannelOverwriteManager(ctx context.Context, channelID, requesterID string, allow uint64) (*db.Channel, error) {
+	if allow&^db.AllChannelPermissions != 0 {
+		return nil, db.ErrInvalidChannelOverwrite
+	}
+	channel, err := s.db.GetChannel(ctx, channelID)
+	if err != nil {
+		return nil, errors.New("channel not found")
+	}
+	permissions, err := s.db.GetChannelPermissions(ctx, channelID, requesterID)
+	if err != nil {
+		return nil, errors.New("insufficient permissions")
+	}
+	if err := validateChannelOverwriteGrant(permissions, allow); err != nil {
+		return nil, err
+	}
+	return channel, nil
+}
+
+func validateChannelOverwriteGrant(permissions, allow uint64) error {
+	if allow&^db.AllChannelPermissions != 0 {
+		return db.ErrInvalidChannelOverwrite
+	}
+	if permissions&db.PermAdministrator == 0 && permissions&db.PermManageChannels == 0 {
+		return errors.New("insufficient permissions")
+	}
+	if permissions&db.PermAdministrator == 0 && allow&^permissions != 0 {
+		return errors.New("cannot grant channel permissions the requester does not possess")
+	}
+	return nil
+}
+
+func (s *Service) ListChannelOverwrites(ctx context.Context, channelID, requesterID string) ([]db.ChannelOverwrite, error) {
+	if _, err := s.authorizeChannelOverwriteManager(ctx, channelID, requesterID, 0); err != nil {
+		return nil, err
+	}
+	return s.db.GetChannelOverwrites(ctx, channelID)
+}
+
+func (s *Service) UpsertChannelOverwrite(ctx context.Context, requesterID string, overwrite db.ChannelOverwrite) error {
+	channel, err := s.authorizeChannelOverwriteManager(ctx, overwrite.ChannelID, requesterID, overwrite.Allow)
+	if err != nil {
+		return err
+	}
+	before := s.channelViewerIDs(ctx, overwrite.ChannelID)
+	if err := s.db.UpsertChannelOverwrite(ctx, overwrite); err != nil {
+		if errors.Is(err, db.ErrInvalidChannelOverwrite) {
+			return err
+		}
+		return db.ErrInvalidChannelOverwrite
+	}
+	after := s.channelViewerIDs(ctx, overwrite.ChannelID)
+	s.broadcastChannelEventTo(
+		ctx, unionUserIDs(before, after), channel.ServerID,
+		pb.ChannelEvent_UPDATED, channelToInfo(channel),
+	)
+	return nil
+}
+
+func (s *Service) DeleteChannelOverwrite(ctx context.Context, channelID, requesterID, targetID string, targetType int16) error {
+	channel, err := s.authorizeChannelOverwriteManager(ctx, channelID, requesterID, 0)
+	if err != nil {
+		return err
+	}
+	before := s.channelViewerIDs(ctx, channelID)
+	if err := s.db.DeleteChannelOverwrite(ctx, channelID, targetID, targetType); err != nil {
+		if errors.Is(err, db.ErrInvalidChannelOverwrite) {
+			return err
+		}
+		return errors.New("channel overwrite not found")
+	}
+	after := s.channelViewerIDs(ctx, channelID)
+	s.broadcastChannelEventTo(
+		ctx, unionUserIDs(before, after), channel.ServerID,
+		pb.ChannelEvent_UPDATED, channelToInfo(channel),
+	)
+	return nil
+}
+
+func unionUserIDs(groups ...[]string) []string {
+	seen := make(map[string]struct{})
+	result := make([]string, 0)
+	for _, group := range groups {
+		for _, userID := range group {
+			if _, exists := seen[userID]; exists {
+				continue
+			}
+			seen[userID] = struct{}{}
+			result = append(result, userID)
+		}
+	}
+	return result
+}
+
+type roleManager struct {
+	owner       bool
+	permissions uint64
+	highest     int16
+}
+
+func (s *Service) authorizeRoleManager(ctx context.Context, serverID, requesterID string) (roleManager, error) {
+	owner, err := s.db.IsServerOwner(ctx, serverID, requesterID)
+	if err != nil {
+		return roleManager{}, errors.New("server not found")
+	}
+	permissions, err := s.db.GetUserPermissions(ctx, serverID, requesterID)
+	if err != nil || (!owner && permissions&db.PermAdministrator == 0 && permissions&db.PermManageRoles == 0) {
+		return roleManager{}, errors.New("insufficient permissions")
+	}
+	if owner {
+		return roleManager{owner: true, permissions: db.PermAdministrator, highest: 32767}, nil
+	}
+	highest, err := s.db.GetHighestRolePosition(ctx, serverID, requesterID)
+	if err != nil {
+		return roleManager{}, errors.New("insufficient permissions")
+	}
+	return roleManager{permissions: permissions, highest: highest}, nil
+}
+
+func (manager roleManager) canGrant(permissions uint64) bool {
+	if permissions&^db.AllRolePermissions != 0 {
+		return false
+	}
+	if manager.owner || manager.permissions&db.PermAdministrator != 0 {
+		return true
+	}
+	return permissions&^manager.permissions == 0
+}
+
+func (s *Service) canManageRoleTarget(ctx context.Context, serverID, requesterID, targetID string, manager roleManager) bool {
+	if manager.owner {
+		return true
+	}
+	// A non-owner cannot alter their own assignments. This closes the
+	// multi-role and equal-position variants of self-escalation.
+	if requesterID == targetID {
+		return false
+	}
+	targetOwner, err := s.db.IsServerOwner(ctx, serverID, targetID)
+	if err != nil || targetOwner {
+		return false
+	}
+	isMember, err := s.db.IsServerMember(ctx, serverID, targetID)
+	if err != nil || !isMember {
+		return false
+	}
+	targetHighest, err := s.db.GetHighestRolePosition(ctx, serverID, targetID)
+	return err == nil && targetHighest < manager.highest
+}
 
 func (s *Service) ListRoles(ctx context.Context, serverID, requesterID string) ([]db.Role, error) {
 	ok, err := s.db.IsServerMember(ctx, serverID, requesterID)
@@ -297,14 +624,25 @@ func (s *Service) ListRoles(ctx context.Context, serverID, requesterID string) (
 }
 
 func (s *Service) CreateRole(ctx context.Context, serverID, requesterID, name string, perms uint64, color *int32) (*db.Role, error) {
-	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageRoles)
-	if err != nil || !can {
-		return nil, errors.New("insufficient permissions")
-	}
 	if name == "" || len(name) > 100 {
 		return nil, errors.New("invalid role name")
 	}
-	r, err := s.db.CreateRole(ctx, serverID, name, perms, color)
+	manager, err := s.authorizeRoleManager(ctx, serverID, requesterID)
+	if err != nil {
+		return nil, err
+	}
+	if !manager.canGrant(perms) {
+		return nil, errors.New("cannot grant permissions the requester does not possess")
+	}
+	var positionCeiling *int16
+	if !manager.owner {
+		if manager.highest <= 0 {
+			return nil, errors.New("role hierarchy prevents creating a manageable role")
+		}
+		ceiling := manager.highest - 1
+		positionCeiling = &ceiling
+	}
+	r, err := s.db.CreateRole(ctx, serverID, name, perms, color, positionCeiling)
 	if err != nil {
 		return nil, err
 	}
@@ -317,11 +655,24 @@ func (s *Service) CreateRole(ctx context.Context, serverID, requesterID, name st
 }
 
 func (s *Service) UpdateRole(ctx context.Context, serverID, roleID, requesterID string, name *string, perms *uint64, color *int32) error {
-	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageRoles)
-	if err != nil || !can {
-		return errors.New("insufficient permissions")
+	manager, err := s.authorizeRoleManager(ctx, serverID, requesterID)
+	if err != nil {
+		return err
 	}
-	if err := s.db.UpdateRole(ctx, roleID, name, perms, color); err != nil {
+	role, err := s.db.GetRole(ctx, serverID, roleID)
+	if err != nil {
+		return errors.New("role not found in server")
+	}
+	if !manager.owner && role.Position >= manager.highest {
+		return errors.New("role hierarchy prevents this update")
+	}
+	if name != nil && (*name == "" || len(*name) > 100) {
+		return errors.New("invalid role name")
+	}
+	if perms != nil && !manager.canGrant(*perms) {
+		return errors.New("cannot grant permissions the requester does not possess")
+	}
+	if err := s.db.UpdateRole(ctx, serverID, roleID, name, perms, color); err != nil {
 		return err
 	}
 	roles, _ := s.db.GetServerRoles(ctx, serverID)
@@ -339,11 +690,21 @@ func (s *Service) UpdateRole(ctx context.Context, serverID, roleID, requesterID 
 }
 
 func (s *Service) DeleteRole(ctx context.Context, serverID, roleID, requesterID string) error {
-	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageRoles)
-	if err != nil || !can {
-		return errors.New("insufficient permissions")
+	manager, err := s.authorizeRoleManager(ctx, serverID, requesterID)
+	if err != nil {
+		return err
 	}
-	if err := s.db.DeleteRole(ctx, roleID); err != nil {
+	role, err := s.db.GetRole(ctx, serverID, roleID)
+	if err != nil {
+		return errors.New("role not found in server")
+	}
+	if role.IsDefault {
+		return errors.New("default role cannot be deleted")
+	}
+	if !manager.owner && role.Position >= manager.highest {
+		return errors.New("role hierarchy prevents this deletion")
+	}
+	if err := s.db.DeleteRole(ctx, serverID, roleID); err != nil {
 		return err
 	}
 	s.broadcastServerEvent(ctx, serverID, pb.ServerEvent_ROLE_DELETED, &pb.ServerEvent{
@@ -355,37 +716,85 @@ func (s *Service) DeleteRole(ctx context.Context, serverID, roleID, requesterID 
 }
 
 func (s *Service) AssignRole(ctx context.Context, serverID, requesterID, targetID, roleID string) error {
-	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageRoles)
-	if err != nil || !can {
-		return errors.New("insufficient permissions")
+	manager, err := s.authorizeRoleManager(ctx, serverID, requesterID)
+	if err != nil {
+		return err
 	}
-	return s.db.AssignRole(ctx, serverID, targetID, roleID)
+	role, err := s.db.GetRole(ctx, serverID, roleID)
+	if err != nil || role.IsDefault {
+		return errors.New("role not found or cannot be assigned")
+	}
+	if !manager.owner && (role.Position >= manager.highest || !manager.canGrant(role.Permissions)) {
+		return errors.New("role hierarchy or permission scope prevents assignment")
+	}
+	if !s.canManageRoleTarget(ctx, serverID, requesterID, targetID, manager) {
+		return errors.New("target member is outside the requester's role hierarchy")
+	}
+	if err := s.db.AssignRole(ctx, serverID, targetID, roleID); err != nil {
+		return err
+	}
+	s.broadcastRoleAssignment(ctx, serverID, targetID, role)
+	return nil
 }
 
 func (s *Service) UnassignRole(ctx context.Context, serverID, requesterID, targetID, roleID string) error {
-	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageRoles)
-	if err != nil || !can {
-		return errors.New("insufficient permissions")
+	manager, err := s.authorizeRoleManager(ctx, serverID, requesterID)
+	if err != nil {
+		return err
 	}
-	return s.db.UnassignRole(ctx, serverID, targetID, roleID)
+	role, err := s.db.GetRole(ctx, serverID, roleID)
+	if err != nil || role.IsDefault {
+		return errors.New("role not found or cannot be unassigned")
+	}
+	if !manager.owner && role.Position >= manager.highest {
+		return errors.New("role hierarchy prevents unassignment")
+	}
+	if !s.canManageRoleTarget(ctx, serverID, requesterID, targetID, manager) {
+		return errors.New("target member is outside the requester's role hierarchy")
+	}
+	if err := s.db.UnassignRole(ctx, serverID, targetID, roleID); err != nil {
+		return err
+	}
+	s.broadcastRoleAssignment(ctx, serverID, targetID, role)
+	return nil
 }
 
 // ─── Invites ─────────────────────────────────────────
 
-func (s *Service) CreateInvite(ctx context.Context, serverID, requesterID string, maxUses int32, expiresInSecs int64) (*db.Invite, error) {
+func (s *Service) CreateInvite(ctx context.Context, serverID, requesterID string, maxUses int32, expiresInSecs int64) (*db.CreatedInvite, error) {
+	if err := validateInviteInput(maxUses, expiresInSecs); err != nil {
+		return nil, err
+	}
 	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermCreateInvite)
 	if err != nil || !can {
 		return nil, errors.New("insufficient permissions")
 	}
-	var expiresAt *time.Time
-	if expiresInSecs > 0 {
-		t := time.Now().Add(time.Duration(expiresInSecs) * time.Second)
-		expiresAt = &t
+	return s.db.CreateInvite(ctx, serverID, requesterID, maxUses, time.Duration(expiresInSecs)*time.Second)
+}
+
+func validateInviteInput(maxUses int32, expiresInSecs int64) error {
+	if maxUses < minInviteUses || maxUses > maxInviteUses ||
+		expiresInSecs < minInviteExpirySecs || expiresInSecs > maxInviteExpirySecs {
+		return ErrInvalidInviteInput
 	}
-	if maxUses < 0 {
-		maxUses = 0
+	return nil
+}
+
+func normalizeKickReason(reason *string) (*string, error) {
+	if reason == nil {
+		return nil, nil
 	}
-	return s.db.CreateInvite(ctx, serverID, requesterID, maxUses, expiresAt)
+	if !utf8.ValidString(*reason) {
+		return nil, ErrInvalidKickReason
+	}
+	normalized := strings.TrimSpace(*reason)
+	if normalized == "" {
+		return nil, nil
+	}
+	if len(normalized) > maxKickReasonBytes {
+		return nil, ErrInvalidKickReason
+	}
+	return &normalized, nil
 }
 
 func (s *Service) ListInvites(ctx context.Context, serverID, requesterID string) ([]db.Invite, error) {
@@ -396,26 +805,30 @@ func (s *Service) ListInvites(ctx context.Context, serverID, requesterID string)
 	return s.db.GetServerInvites(ctx, serverID)
 }
 
-func (s *Service) RevokeInvite(ctx context.Context, code, requesterID string) error {
-	inv, err := s.db.GetInvite(ctx, code)
-	if err != nil {
-		return errors.New("invite not found")
-	}
-	can, err := s.db.HasPermission(ctx, inv.ServerID, requesterID, db.PermManageServer)
+func (s *Service) RevokeInvite(ctx context.Context, serverID, inviteID, requesterID string) error {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageServer)
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
 	}
-	return s.db.RevokeInvite(ctx, code)
+	return s.db.RevokeInvite(ctx, serverID, inviteID, requesterID)
+}
+
+func (s *Service) RevokeAllInvites(ctx context.Context, serverID, requesterID string) error {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageServer)
+	if err != nil || !can {
+		return errors.New("insufficient permissions")
+	}
+	return s.db.RevokeAllInvites(ctx, serverID, requesterID)
 }
 
 // UseInvite joins the requester to the server; returns the joined server.
-func (s *Service) UseInvite(ctx context.Context, code, userID string) (*db.Server, error) {
-	srv, err := s.db.UseInvite(ctx, code, userID)
+func (s *Service) UseInvite(ctx context.Context, selector, secret, userID string) (*db.Server, error) {
+	srv, joined, err := s.db.UseInvite(ctx, selector, secret, userID)
 	if err != nil {
 		return nil, err
 	}
 	user, _ := s.db.FindUserByID(ctx, userID)
-	if user != nil {
+	if joined && user != nil {
 		s.broadcastServerEvent(ctx, srv.ID, pb.ServerEvent_MEMBER_JOINED, &pb.ServerEvent{
 			EventType:  pb.ServerEvent_MEMBER_JOINED,
 			ServerId:   srv.ID,
@@ -426,16 +839,41 @@ func (s *Service) UseInvite(ctx context.Context, code, userID string) (*db.Serve
 }
 
 // PreviewInvite returns server info for an invite without joining.
-func (s *Service) PreviewInvite(ctx context.Context, code string) (*db.Server, *db.Invite, error) {
-	inv, err := s.db.GetInvite(ctx, code)
+func (s *Service) PreviewInvite(ctx context.Context, selector string) (*db.Server, *db.Invite, error) {
+	inv, err := s.db.GetInvite(ctx, selector)
 	if err != nil {
-		return nil, nil, errors.New("invite not found")
+		return nil, nil, errors.New("veil link unavailable")
+	}
+	if inv.Version != 1 || inv.LinkType != "space" || inv.RevokedAt != nil ||
+		time.Now().After(inv.ExpiresAt) || inv.Uses >= inv.MaxUses {
+		return nil, nil, errors.New("veil link unavailable")
 	}
 	srv, err := s.db.GetServer(ctx, inv.ServerID)
 	if err != nil {
-		return nil, nil, errors.New("server not found")
+		return nil, nil, errors.New("veil link unavailable")
 	}
 	return srv, inv, nil
+}
+
+func (s *Service) AuthenticatedPreviewInvite(ctx context.Context, selector, secret, userID string) (*db.Server, *db.Invite, bool, error) {
+	inv, err := s.db.AuthenticateInvite(ctx, selector, secret)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	alreadyMember, err := s.db.IsServerMember(ctx, inv.ServerID, userID)
+	if err != nil {
+		return nil, nil, false, errors.New("veil link unavailable")
+	}
+	// A consumed link remains useful to an existing member as a safe route back
+	// to the Space, but it must never admit a new account beyond max_uses.
+	if !alreadyMember && inv.Uses >= inv.MaxUses {
+		return nil, nil, false, errors.New("veil link unavailable")
+	}
+	srv, err := s.db.GetServer(ctx, inv.ServerID)
+	if err != nil {
+		return nil, nil, false, errors.New("veil link unavailable")
+	}
+	return srv, inv, alreadyMember, nil
 }
 
 // ─── Internal broadcast helpers ──────────────────────
@@ -451,8 +889,15 @@ func (s *Service) broadcastServerEvent(ctx context.Context, serverID string, _ p
 	})
 }
 
-func (s *Service) broadcastChannelEvent(ctx context.Context, serverID string, evType pb.ChannelEvent_EventType, info *pb.ChannelInfo) {
-	memberIDs := s.memberIDs(ctx, serverID)
+func (s *Service) broadcastChannelEvent(ctx context.Context, channelID string, evType pb.ChannelEvent_EventType, info *pb.ChannelInfo) {
+	channel, err := s.db.GetChannel(ctx, channelID)
+	if err != nil {
+		return
+	}
+	s.broadcastChannelEventTo(ctx, s.channelViewerIDs(ctx, channelID), channel.ServerID, evType, info)
+}
+
+func (s *Service) broadcastChannelEventTo(_ context.Context, memberIDs []string, serverID string, evType pb.ChannelEvent_EventType, info *pb.ChannelInfo) {
 	if len(memberIDs) == 0 {
 		return
 	}
@@ -462,6 +907,37 @@ func (s *Service) broadcastChannelEvent(ctx context.Context, serverID string, ev
 			ServerId:    serverID,
 			ChannelInfo: info,
 		}},
+	})
+}
+
+// broadcastRoleAssignment sends the target's complete current role set. The
+// same ROLE_UPDATED event represents assign and unassign; clients compare the
+// authoritative MemberInfo.RoleIds and then refresh authorized channel
+// directories before distributing sender keys.
+func (s *Service) broadcastRoleAssignment(ctx context.Context, serverID, targetID string, role *db.Role) {
+	members, err := s.db.GetServerMembers(ctx, serverID)
+	if err != nil {
+		return
+	}
+	var info *pb.MemberInfo
+	for _, member := range members {
+		if member.UserID == targetID {
+			info = &pb.MemberInfo{
+				IdentityKey: member.IdentityKey,
+				Username:    member.Username,
+				RoleIds:     append([]string(nil), member.RoleIDs...),
+			}
+			break
+		}
+	}
+	if info == nil {
+		return
+	}
+	s.broadcastServerEvent(ctx, serverID, pb.ServerEvent_ROLE_UPDATED, &pb.ServerEvent{
+		EventType:  pb.ServerEvent_ROLE_UPDATED,
+		ServerId:   serverID,
+		MemberInfo: info,
+		RoleInfo:   roleToInfo(role),
 	})
 }
 

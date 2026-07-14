@@ -3,12 +3,16 @@ package db
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // ─── Permission bitmask ──────────────────────────────
@@ -26,9 +30,16 @@ const (
 	PermManageServer       uint64 = 1 << 9
 	PermReadMessageHistory uint64 = 1 << 10 // gets epoch key envelopes; can decrypt
 	PermAdministrator      uint64 = 1 << 32
+	AllRolePermissions            = PermViewChannel | PermSendMessages | PermManageMessages |
+		PermMentionEveryone | PermManageChannels | PermManageRoles | PermKickMembers |
+		PermBanMembers | PermCreateInvite | PermManageServer | PermReadMessageHistory |
+		PermAdministrator
+	AllChannelPermissions = PermViewChannel | PermSendMessages | PermManageMessages |
+		PermMentionEveryone | PermManageChannels | PermReadMessageHistory
 
-	// Default @everyone gets visibility + read + send + invite. No history by default.
-	DefaultEveryonePerms = PermViewChannel | PermReadMessageHistory | PermSendMessages | PermCreateInvite
+	// Default @everyone gets visibility + history + send. Admission capability
+	// creation is owner/explicit-role only.
+	DefaultEveryonePerms = PermViewChannel | PermReadMessageHistory | PermSendMessages
 )
 
 // ─── Models ──────────────────────────────────────────
@@ -37,7 +48,6 @@ type Server struct {
 	ID          string
 	Name        string
 	Description *string
-	IconURL     *string
 	OwnerID     string
 	CreatedAt   time.Time
 }
@@ -46,6 +56,7 @@ type ServerMember struct {
 	ServerID    string
 	UserID      string
 	IdentityKey []byte
+	SigningKey  []byte
 	Username    string
 	Nickname    *string
 	JoinedAt    time.Time
@@ -78,13 +89,45 @@ type Channel struct {
 	CreatedAt      time.Time
 }
 
+const (
+	ChannelOverwriteRole int16 = iota
+	ChannelOverwriteUser
+)
+
+type ChannelOverwrite struct {
+	ChannelID  string
+	TargetID   string
+	TargetType int16
+	Allow      uint64
+	Deny       uint64
+}
+
 type Invite struct {
-	Code      string
+	ID             string
+	PublicSelector string
+	SecretHash     []byte
+	Version        int16
+	LinkType       string
+	ServerID       string
+	CreatedBy      string
+	MaxUses        int32
+	Uses           int32
+	ExpiresAt      time.Time
+	RevokedAt      *time.Time
+	CreatedAt      time.Time
+}
+
+type CreatedInvite struct {
+	Invite
+	Secret string
+}
+
+type ServerBan struct {
 	ServerID  string
-	CreatedBy string
-	MaxUses   int32
-	Uses      int32
-	ExpiresAt *time.Time
+	UserID    string
+	Username  string
+	BannedBy  string
+	Reason    *string
 	CreatedAt time.Time
 }
 
@@ -105,9 +148,9 @@ func (db *DB) CreateServer(ctx context.Context, name string, ownerUserID string)
 	var s Server
 	err = tx.QueryRow(ctx,
 		`INSERT INTO servers (name, owner_id) VALUES ($1, $2::uuid)
-		 RETURNING id, name, description, icon_url, owner_id, created_at`,
+		 RETURNING id, name, description, owner_id, created_at`,
 		name, ownerUserID,
-	).Scan(&s.ID, &s.Name, &s.Description, &s.IconURL, &s.OwnerID, &s.CreatedAt)
+	).Scan(&s.ID, &s.Name, &s.Description, &s.OwnerID, &s.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("create server: %w", err)
 	}
@@ -154,9 +197,9 @@ func (db *DB) CreateServer(ctx context.Context, name string, ownerUserID string)
 func (db *DB) GetServer(ctx context.Context, serverID string) (*Server, error) {
 	var s Server
 	err := db.Pool.QueryRow(ctx,
-		`SELECT id, name, description, icon_url, owner_id, created_at
+		`SELECT id, name, description, owner_id, created_at
 		 FROM servers WHERE id = $1 AND deleted_at IS NULL`, serverID,
-	).Scan(&s.ID, &s.Name, &s.Description, &s.IconURL, &s.OwnerID, &s.CreatedAt)
+	).Scan(&s.ID, &s.Name, &s.Description, &s.OwnerID, &s.CreatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +209,7 @@ func (db *DB) GetServer(ctx context.Context, serverID string) (*Server, error) {
 // GetUserServers returns all servers a user is a member of.
 func (db *DB) GetUserServers(ctx context.Context, userID string) ([]Server, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT s.id, s.name, s.description, s.icon_url, s.owner_id, s.created_at
+		`SELECT s.id, s.name, s.description, s.owner_id, s.created_at
 		 FROM servers s
 		 JOIN server_members sm ON sm.server_id = s.id
 		 WHERE sm.user_id = $1::uuid AND s.deleted_at IS NULL
@@ -178,7 +221,7 @@ func (db *DB) GetUserServers(ctx context.Context, userID string) ([]Server, erro
 	var out []Server
 	for rows.Next() {
 		var s Server
-		if err := rows.Scan(&s.ID, &s.Name, &s.Description, &s.IconURL, &s.OwnerID, &s.CreatedAt); err != nil {
+		if err := rows.Scan(&s.ID, &s.Name, &s.Description, &s.OwnerID, &s.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, s)
@@ -186,15 +229,14 @@ func (db *DB) GetUserServers(ctx context.Context, userID string) ([]Server, erro
 	return out, rows.Err()
 }
 
-// UpdateServer updates name/description/icon. Empty strings → no change.
-func (db *DB) UpdateServer(ctx context.Context, serverID string, name, description, iconURL *string) error {
+// UpdateServer updates Space name/description. Artwork stays local and deterministic.
+func (db *DB) UpdateServer(ctx context.Context, serverID string, name, description *string) error {
 	_, err := db.Pool.Exec(ctx,
 		`UPDATE servers
 		 SET name = COALESCE($2, name),
-		     description = COALESCE($3, description),
-		     icon_url = COALESCE($4, icon_url)
+		     description = COALESCE($3, description)
 		 WHERE id = $1`,
-		serverID, name, description, iconURL)
+		serverID, name, description)
 	return err
 }
 
@@ -267,16 +309,86 @@ func (db *DB) RemoveServerMember(ctx context.Context, serverID, userID string) e
 	return tx.Commit(ctx)
 }
 
+// BanServerMember records the authoritative admission denial and removes the
+// current Space/Room rosters in the same transaction. A failed operation never
+// leaves a kicked-but-unbanned account that can immediately rejoin.
+func (db *DB) BanServerMember(ctx context.Context, serverID, userID, bannedBy string, reason *string) error {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO server_bans (server_id, user_id, banned_by, reason)
+		 VALUES ($1, $2::uuid, $3::uuid, $4)
+		 ON CONFLICT (server_id, user_id) DO UPDATE
+		 SET banned_by=EXCLUDED.banned_by, reason=EXCLUDED.reason, created_at=now()`,
+		serverID, userID, bannedBy, reason,
+	); err != nil {
+		return fmt.Errorf("record Space ban: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM conversation_members
+		 WHERE user_id=$2::uuid AND conversation_id IN (
+			SELECT conversation_id FROM channels
+			WHERE server_id=$1 AND conversation_id IS NOT NULL
+		)`, serverID, userID,
+	); err != nil {
+		return fmt.Errorf("remove banned Room rosters: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM server_members WHERE server_id=$1 AND user_id=$2::uuid`,
+		serverID, userID,
+	); err != nil {
+		return fmt.Errorf("remove banned Space member: %w", err)
+	}
+	return tx.Commit(ctx)
+}
+
+func (db *DB) UnbanServerMember(ctx context.Context, serverID, userID string) error {
+	command, err := db.Pool.Exec(ctx,
+		`DELETE FROM server_bans WHERE server_id=$1 AND user_id=$2::uuid`, serverID, userID)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() == 0 {
+		return errors.New("ban not found")
+	}
+	return nil
+}
+
+func (db *DB) GetServerBans(ctx context.Context, serverID string) ([]ServerBan, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT ban.server_id, ban.user_id, user_account.username,
+		        ban.banned_by, ban.reason, ban.created_at
+		 FROM server_bans ban
+		 JOIN users user_account ON user_account.id=ban.user_id
+		 WHERE ban.server_id=$1 ORDER BY ban.created_at DESC`, serverID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	bans := make([]ServerBan, 0)
+	for rows.Next() {
+		var ban ServerBan
+		if err := rows.Scan(&ban.ServerID, &ban.UserID, &ban.Username, &ban.BannedBy, &ban.Reason, &ban.CreatedAt); err != nil {
+			return nil, err
+		}
+		bans = append(bans, ban)
+	}
+	return bans, rows.Err()
+}
+
 // GetServerMembers returns all members of a server with their assigned role IDs.
 func (db *DB) GetServerMembers(ctx context.Context, serverID string) ([]ServerMember, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT sm.server_id, sm.user_id, u.identity_key, u.username, sm.nickname, sm.joined_at,
+		`SELECT sm.server_id, sm.user_id, u.identity_key, u.signing_key, u.username, sm.nickname, sm.joined_at,
 		        COALESCE(array_agg(mr.role_id) FILTER (WHERE mr.role_id IS NOT NULL), '{}')::uuid[]
 		 FROM server_members sm
 		 JOIN users u ON u.id = sm.user_id
 		 LEFT JOIN member_roles mr ON mr.server_id = sm.server_id AND mr.user_id = sm.user_id
 		 WHERE sm.server_id = $1
-		 GROUP BY sm.server_id, sm.user_id, u.identity_key, u.username, sm.nickname, sm.joined_at
+		 GROUP BY sm.server_id, sm.user_id, u.identity_key, u.signing_key, u.username, sm.nickname, sm.joined_at
 		 ORDER BY sm.joined_at ASC`,
 		serverID)
 	if err != nil {
@@ -287,7 +399,7 @@ func (db *DB) GetServerMembers(ctx context.Context, serverID string) ([]ServerMe
 	for rows.Next() {
 		var m ServerMember
 		var roleIDs []string
-		if err := rows.Scan(&m.ServerID, &m.UserID, &m.IdentityKey, &m.Username, &m.Nickname, &m.JoinedAt, &roleIDs); err != nil {
+		if err := rows.Scan(&m.ServerID, &m.UserID, &m.IdentityKey, &m.SigningKey, &m.Username, &m.Nickname, &m.JoinedAt, &roleIDs); err != nil {
 			return nil, err
 		}
 		m.RoleIDs = roleIDs
@@ -310,8 +422,9 @@ func (db *DB) GetUserPermissions(ctx context.Context, serverID, userID string) (
 	var perms int64
 	err = db.Pool.QueryRow(ctx,
 		`SELECT COALESCE(BIT_OR(r.permissions), 0)
-		 FROM roles r
-		 WHERE r.server_id = $1 AND (
+		 FROM server_members sm
+		 JOIN roles r ON r.server_id = sm.server_id
+		 WHERE sm.server_id = $1 AND sm.user_id = $2::uuid AND (
 		     r.is_default = TRUE
 		     OR r.id IN (
 		         SELECT role_id FROM member_roles
@@ -363,15 +476,56 @@ func (db *DB) GetServerRoles(ctx context.Context, serverID string) ([]Role, erro
 	return out, rows.Err()
 }
 
+// GetRole returns a role only when both its server and role IDs match.
+func (db *DB) GetRole(ctx context.Context, serverID, roleID string) (*Role, error) {
+	var role Role
+	var permissions int64
+	err := db.Pool.QueryRow(ctx,
+		`SELECT id, server_id, name, permissions, position, color, is_default, hoist, mentionable
+		 FROM roles WHERE server_id = $1::uuid AND id = $2::uuid`,
+		serverID, roleID,
+	).Scan(&role.ID, &role.ServerID, &role.Name, &permissions, &role.Position,
+		&role.Color, &role.IsDefault, &role.Hoist, &role.Mentionable)
+	if err != nil {
+		return nil, err
+	}
+	role.Permissions = uint64(permissions)
+	return &role, nil
+}
+
+// GetHighestRolePosition returns the highest assigned/default role for a
+// member. Callers must separately handle the server owner, whose hierarchy is
+// above every database role.
+func (db *DB) GetHighestRolePosition(ctx context.Context, serverID, userID string) (int16, error) {
+	var position int16
+	err := db.Pool.QueryRow(ctx,
+		`SELECT COALESCE(MAX(r.position), 0)
+		 FROM server_members sm
+		 JOIN roles r ON r.server_id = sm.server_id
+		 WHERE sm.server_id = $1::uuid AND sm.user_id = $2::uuid
+		   AND (r.is_default = TRUE OR EXISTS (
+		     SELECT 1 FROM member_roles mr
+		     WHERE mr.server_id = sm.server_id AND mr.user_id = sm.user_id AND mr.role_id = r.id
+		   ))`,
+		serverID, userID,
+	).Scan(&position)
+	return position, err
+}
+
 // CreateRole creates a new role. Returns the new role.
-func (db *DB) CreateRole(ctx context.Context, serverID, name string, perms uint64, color *int32) (*Role, error) {
+func (db *DB) CreateRole(ctx context.Context, serverID, name string, perms uint64, color *int32, positionCeiling *int16) (*Role, error) {
 	var r Role
 	var p int64
 	err := db.Pool.QueryRow(ctx,
 		`INSERT INTO roles (server_id, name, permissions, position, color)
-		 VALUES ($1, $2, $3, COALESCE((SELECT MAX(position) + 1 FROM roles WHERE server_id = $1), 1), $4)
+		 VALUES ($1, $2, $3,
+		   CASE WHEN $5::smallint IS NULL
+		     THEN LEAST(COALESCE((SELECT MAX(position)::integer + 1 FROM roles WHERE server_id = $1), 1), 32767)
+		     ELSE LEAST(COALESCE((SELECT MAX(position)::integer + 1 FROM roles WHERE server_id = $1), 1), $5::smallint)
+		   END,
+		   $4)
 		 RETURNING id, server_id, name, permissions, position, color, is_default, hoist, mentionable`,
-		serverID, name, int64(perms), color,
+		serverID, name, int64(perms), color, positionCeiling,
 	).Scan(&r.ID, &r.ServerID, &r.Name, &p, &r.Position, &r.Color, &r.IsDefault, &r.Hoist, &r.Mentionable)
 	if err != nil {
 		return nil, err
@@ -381,25 +535,32 @@ func (db *DB) CreateRole(ctx context.Context, serverID, name string, perms uint6
 }
 
 // UpdateRole updates name/permissions/color of a role.
-func (db *DB) UpdateRole(ctx context.Context, roleID string, name *string, perms *uint64, color *int32) error {
+func (db *DB) UpdateRole(ctx context.Context, serverID, roleID string, name *string, perms *uint64, color *int32) error {
 	var permsArg interface{}
 	if perms != nil {
 		permsArg = int64(*perms)
 	}
-	_, err := db.Pool.Exec(ctx,
+	result, err := db.Pool.Exec(ctx,
 		`UPDATE roles
-		 SET name = COALESCE($2, name),
-		     permissions = COALESCE($3, permissions),
-		     color = COALESCE($4, color)
-		 WHERE id = $1`,
-		roleID, name, permsArg, color)
-	return err
+		 SET name = COALESCE($3, name),
+		     permissions = COALESCE($4, permissions),
+		     color = COALESCE($5, color)
+		 WHERE server_id = $1::uuid AND id = $2::uuid`,
+		serverID, roleID, name, permsArg, color)
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("role not found in server")
+	}
+	return nil
 }
 
 // DeleteRole removes a role (default @everyone cannot be deleted).
-func (db *DB) DeleteRole(ctx context.Context, roleID string) error {
+func (db *DB) DeleteRole(ctx context.Context, serverID, roleID string) error {
 	res, err := db.Pool.Exec(ctx,
-		`DELETE FROM roles WHERE id = $1 AND is_default = FALSE`, roleID)
+		`DELETE FROM roles WHERE server_id = $1::uuid AND id = $2::uuid AND is_default = FALSE`,
+		serverID, roleID)
 	if err != nil {
 		return err
 	}
@@ -411,19 +572,40 @@ func (db *DB) DeleteRole(ctx context.Context, roleID string) error {
 
 // AssignRole assigns a role to a member.
 func (db *DB) AssignRole(ctx context.Context, serverID, userID, roleID string) error {
-	_, err := db.Pool.Exec(ctx,
-		`INSERT INTO member_roles (server_id, user_id, role_id) VALUES ($1, $2::uuid, $3)
-		 ON CONFLICT DO NOTHING`,
+	result, err := db.Pool.Exec(ctx,
+		`INSERT INTO member_roles (server_id, user_id, role_id)
+		 SELECT role.server_id, member.user_id, role.id
+		 FROM roles role
+		 JOIN server_members member ON member.server_id = role.server_id AND member.user_id = $2::uuid
+		 WHERE role.server_id = $1::uuid AND role.id = $3::uuid AND role.is_default = FALSE
+		 ON CONFLICT (server_id, user_id, role_id)
+		 DO UPDATE SET role_id = EXCLUDED.role_id`,
 		serverID, userID, roleID)
-	return err
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("role or target member not found in server")
+	}
+	return nil
 }
 
 // UnassignRole removes a role from a member.
 func (db *DB) UnassignRole(ctx context.Context, serverID, userID, roleID string) error {
-	_, err := db.Pool.Exec(ctx,
-		`DELETE FROM member_roles WHERE server_id = $1 AND user_id = $2::uuid AND role_id = $3`,
+	result, err := db.Pool.Exec(ctx,
+		`DELETE FROM member_roles assignment
+		 USING roles role
+		 WHERE assignment.server_id = $1::uuid AND assignment.user_id = $2::uuid
+		   AND assignment.role_id = $3::uuid
+		   AND role.server_id = assignment.server_id AND role.id = assignment.role_id`,
 		serverID, userID, roleID)
-	return err
+	if err != nil {
+		return err
+	}
+	if result.RowsAffected() != 1 {
+		return errors.New("role assignment not found in server")
+	}
+	return nil
 }
 
 // ─── Channels ────────────────────────────────────────
@@ -450,6 +632,27 @@ func (db *DB) GetServerChannels(ctx context.Context, serverID string) ([]Channel
 		out = append(out, c)
 	}
 	return out, rows.Err()
+}
+
+// GetVisibleServerChannels returns only channels whose effective overwrite
+// result grants VIEW_CHANNEL to the requester. Authorization errors are
+// propagated so callers fail closed instead of leaking a partial channel tree.
+func (db *DB) GetVisibleServerChannels(ctx context.Context, serverID, userID string) ([]Channel, error) {
+	channels, err := db.GetServerChannels(ctx, serverID)
+	if err != nil {
+		return nil, err
+	}
+	visible := make([]Channel, 0, len(channels))
+	for _, channel := range channels {
+		allowed, err := db.HasAllChannelPermissions(ctx, channel.ID, userID, PermViewChannel)
+		if err != nil {
+			return nil, err
+		}
+		if allowed {
+			visible = append(visible, channel)
+		}
+	}
+	return visible, nil
 }
 
 // CreateChannel creates a new text/voice/category channel. For text, also creates a backing conversation.
@@ -564,139 +767,363 @@ func (db *DB) GetChannel(ctx context.Context, channelID string) (*Channel, error
 
 // ─── Invites ─────────────────────────────────────────
 
-// generateInviteCode produces an 8-char URL-safe code.
-func generateInviteCode() string {
-	b := make([]byte, 6)
-	_, _ = rand.Read(b)
-	return base64.RawURLEncoding.EncodeToString(b)
+const veilLinkTokenBytes = 32
+
+var veilLinkHashDomain = []byte("veil-link-v1\x00")
+
+func generateVeilLinkToken() (string, error) {
+	return generateVeilLinkTokenFrom(rand.Reader)
 }
 
-// CreateInvite creates a new invite for a server.
-func (db *DB) CreateInvite(ctx context.Context, serverID, createdBy string, maxUses int32, expiresAt *time.Time) (*Invite, error) {
-	// Try a few times in case of unlikely collision
+func generateVeilLinkTokenFrom(reader io.Reader) (string, error) {
+	b := make([]byte, veilLinkTokenBytes)
+	if _, err := io.ReadFull(reader, b); err != nil {
+		return "", fmt.Errorf("generate Veil Link token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+func hashVeilLinkSecret(secret string) ([]byte, error) {
+	raw, err := base64.RawURLEncoding.DecodeString(secret)
+	if err != nil || len(raw) != veilLinkTokenBytes || base64.RawURLEncoding.EncodeToString(raw) != secret {
+		return nil, errors.New("invalid Veil Link secret")
+	}
+	hashInput := make([]byte, 0, len(veilLinkHashDomain)+len(raw))
+	hashInput = append(hashInput, veilLinkHashDomain...)
+	hashInput = append(hashInput, raw...)
+	hash := sha256.Sum256(hashInput)
+	return hash[:], nil
+}
+
+// CreateInvite creates a bounded Veil Link and returns its raw secret exactly
+// once. Only the domain-separated hash is stored.
+func (db *DB) CreateInvite(ctx context.Context, serverID, createdBy string, maxUses int32, lifetime time.Duration) (*CreatedInvite, error) {
+	createdAt := time.Now()
+	expiresAt := createdAt.Add(lifetime)
+	secret, err := generateVeilLinkToken()
+	if err != nil {
+		return nil, err
+	}
+	secretHash, err := hashVeilLinkSecret(secret)
+	if err != nil {
+		return nil, err
+	}
 	for i := 0; i < 5; i++ {
-		code := generateInviteCode()
+		selector, tokenErr := generateVeilLinkToken()
+		if tokenErr != nil {
+			return nil, tokenErr
+		}
+		tx, txErr := db.Pool.Begin(ctx)
+		if txErr != nil {
+			return nil, txErr
+		}
 		var inv Invite
-		err := db.Pool.QueryRow(ctx,
-			`INSERT INTO server_invites (code, server_id, created_by, max_uses, expires_at)
-			 VALUES ($1, $2, $3::uuid, $4, $5)
-			 RETURNING code, server_id, created_by, max_uses, uses, expires_at, created_at`,
-			code, serverID, createdBy, maxUses, expiresAt,
-		).Scan(&inv.Code, &inv.ServerID, &inv.CreatedBy, &inv.MaxUses, &inv.Uses, &inv.ExpiresAt, &inv.CreatedAt)
+		err = tx.QueryRow(ctx,
+			`INSERT INTO server_invites
+			 (public_selector, secret_hash, server_id, created_by, max_uses, expires_at, created_at)
+			 VALUES ($1, $2, $3::uuid, $4::uuid, $5, $6, $7)
+			 RETURNING id, public_selector, version, link_type, server_id, created_by,
+			           max_uses, uses, expires_at, revoked_at, created_at`,
+			selector, secretHash, serverID, createdBy, maxUses, expiresAt, createdAt,
+		).Scan(
+			&inv.ID, &inv.PublicSelector, &inv.Version, &inv.LinkType,
+			&inv.ServerID, &inv.CreatedBy, &inv.MaxUses, &inv.Uses,
+			&inv.ExpiresAt, &inv.RevokedAt, &inv.CreatedAt,
+		)
 		if err == nil {
-			return &inv, nil
+			if err = insertVeilLinkEvent(ctx, tx, inv.ServerID, &inv.ID, createdBy, "created"); err != nil {
+				_ = tx.Rollback(ctx)
+				return nil, err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return nil, err
+			}
+			return &CreatedInvite{Invite: inv, Secret: secret}, nil
+		}
+		_ = tx.Rollback(ctx)
+		if !errors.Is(err, pgx.ErrNoRows) {
+			// A selector collision is the only expected retryable failure. Other
+			// constraint/connection errors must fail closed.
+			var pgErr interface{ SQLState() string }
+			if !errors.As(err, &pgErr) || pgErr.SQLState() != "23505" {
+				return nil, err
+			}
 		}
 	}
-	return nil, errors.New("failed to generate unique invite code")
+	return nil, errors.New("failed to generate unique Veil Link selector")
 }
 
-// GetInvite looks up an invite by code, returns server info if valid.
-func (db *DB) GetInvite(ctx context.Context, code string) (*Invite, error) {
+type veilLinkEventExecutor interface {
+	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
+}
+
+func insertVeilLinkEvent(
+	ctx context.Context,
+	executor veilLinkEventExecutor,
+	serverID string,
+	linkID *string,
+	actorID string,
+	eventType string,
+) error {
+	_, err := executor.Exec(ctx,
+		`INSERT INTO veil_link_events (server_id, link_id, actor_id, event_type)
+		 VALUES ($1::uuid, $2::uuid, $3::uuid, $4)`,
+		serverID, linkID, actorID, eventType,
+	)
+	return err
+}
+
+type inviteRowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanInvite(row inviteRowScanner, includeSecretHash bool) (*Invite, error) {
 	var inv Invite
-	err := db.Pool.QueryRow(ctx,
-		`SELECT code, server_id, created_by, max_uses, uses, expires_at, created_at
-		 FROM server_invites WHERE code = $1`, code,
-	).Scan(&inv.Code, &inv.ServerID, &inv.CreatedBy, &inv.MaxUses, &inv.Uses, &inv.ExpiresAt, &inv.CreatedAt)
+	var err error
+	if includeSecretHash {
+		err = row.Scan(
+			&inv.ID, &inv.PublicSelector, &inv.SecretHash, &inv.Version, &inv.LinkType,
+			&inv.ServerID, &inv.CreatedBy, &inv.MaxUses, &inv.Uses,
+			&inv.ExpiresAt, &inv.RevokedAt, &inv.CreatedAt,
+		)
+	} else {
+		err = row.Scan(
+			&inv.ID, &inv.PublicSelector, &inv.Version, &inv.LinkType,
+			&inv.ServerID, &inv.CreatedBy, &inv.MaxUses, &inv.Uses,
+			&inv.ExpiresAt, &inv.RevokedAt, &inv.CreatedAt,
+		)
+	}
 	if err != nil {
 		return nil, err
 	}
 	return &inv, nil
 }
 
-// UseInvite atomically validates and consumes an invite, joining the user to the server.
-// Returns the joined server.
-func (db *DB) UseInvite(ctx context.Context, code, userID string) (*Server, error) {
+// GetInvite resolves only the public selector. Callers must independently
+// enforce active/bounded state; this method never authenticates admission.
+func (db *DB) GetInvite(ctx context.Context, selector string) (*Invite, error) {
+	return scanInvite(db.Pool.QueryRow(ctx,
+		`SELECT id, public_selector, version, link_type, server_id, created_by,
+		        max_uses, uses, expires_at, revoked_at, created_at
+		 FROM server_invites WHERE public_selector = $1`, selector,
+	), false)
+}
+
+func (db *DB) AuthenticateInvite(ctx context.Context, selector, secret string) (*Invite, error) {
+	providedHash, err := hashVeilLinkSecret(secret)
+	if err != nil {
+		return nil, errors.New("veil link unavailable")
+	}
+	inv, err := scanInvite(db.Pool.QueryRow(ctx,
+		`SELECT id, public_selector, secret_hash, version, link_type, server_id,
+		        created_by, max_uses, uses, expires_at, revoked_at, created_at
+		 FROM server_invites WHERE public_selector=$1`, selector,
+	), true)
+	if err != nil || inv.Version != 1 || inv.LinkType != "space" || inv.RevokedAt != nil ||
+		time.Now().After(inv.ExpiresAt) ||
+		subtle.ConstantTimeCompare(providedHash, inv.SecretHash) != 1 {
+		return nil, errors.New("veil link unavailable")
+	}
+	inv.SecretHash = nil
+	return inv, nil
+}
+
+// UseInvite validates and consumes a Veil Link in one transaction. Ban, use
+// counter and roster changes are linearized by the locked capability row.
+func (db *DB) UseInvite(ctx context.Context, selector, secret, userID string) (*Server, bool, error) {
+	providedHash, err := hashVeilLinkSecret(secret)
+	if err != nil {
+		return nil, false, errors.New("veil link unavailable")
+	}
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	defer tx.Rollback(ctx)
 
-	var inv Invite
-	err = tx.QueryRow(ctx,
-		`SELECT code, server_id, created_by, max_uses, uses, expires_at, created_at
-		 FROM server_invites WHERE code = $1 FOR UPDATE`, code,
-	).Scan(&inv.Code, &inv.ServerID, &inv.CreatedBy, &inv.MaxUses, &inv.Uses, &inv.ExpiresAt, &inv.CreatedAt)
-	if err != nil {
-		return nil, errors.New("invite not found")
-	}
-	if inv.ExpiresAt != nil && time.Now().After(*inv.ExpiresAt) {
-		return nil, errors.New("invite expired")
-	}
-	if inv.MaxUses > 0 && inv.Uses >= inv.MaxUses {
-		return nil, errors.New("invite usage limit reached")
+	inv, err := scanInvite(tx.QueryRow(ctx,
+		`SELECT invite.id, invite.public_selector, invite.secret_hash, invite.version,
+		        invite.link_type, invite.server_id, invite.created_by, invite.max_uses,
+		        invite.uses, invite.expires_at, invite.revoked_at, invite.created_at
+		 FROM server_invites invite
+		 JOIN servers server ON server.id = invite.server_id AND server.deleted_at IS NULL
+		 WHERE invite.public_selector = $1
+		 FOR UPDATE OF invite`, selector,
+	), true)
+	if err != nil || inv.Version != 1 || inv.LinkType != "space" || inv.RevokedAt != nil ||
+		time.Now().After(inv.ExpiresAt) ||
+		subtle.ConstantTimeCompare(providedHash, inv.SecretHash) != 1 {
+		return nil, false, errors.New("veil link unavailable")
 	}
 
-	// Check if user already in server
+	var banned bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM server_bans WHERE server_id=$1 AND user_id=$2::uuid)`,
+		inv.ServerID, userID,
+	).Scan(&banned); err != nil {
+		return nil, false, err
+	}
+	if banned {
+		return nil, false, errors.New("veil link unavailable")
+	}
+
 	var alreadyMember bool
-	err = tx.QueryRow(ctx,
-		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id = $1 AND user_id = $2::uuid)`,
-		inv.ServerID, userID).Scan(&alreadyMember)
-	if err != nil {
-		return nil, err
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM server_members WHERE server_id=$1 AND user_id=$2::uuid)`,
+		inv.ServerID, userID,
+	).Scan(&alreadyMember); err != nil {
+		return nil, false, err
+	}
+	if !alreadyMember && inv.Uses >= inv.MaxUses {
+		return nil, false, errors.New("veil link unavailable")
 	}
 
 	if !alreadyMember {
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2::uuid)
-			 ON CONFLICT DO NOTHING`,
-			inv.ServerID, userID); err != nil {
-			return nil, fmt.Errorf("join server: %w", err)
+			`INSERT INTO server_members (server_id, user_id) VALUES ($1, $2::uuid)`,
+			inv.ServerID, userID,
+		); err != nil {
+			return nil, false, fmt.Errorf("join Space: %w", err)
 		}
-		// Add to all text channels in this server
+
+		rows, err := tx.Query(ctx,
+			`SELECT id::text, conversation_id::text FROM channels
+			 WHERE server_id=$1 AND channel_type=0 AND conversation_id IS NOT NULL`,
+			inv.ServerID,
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		type roomConversation struct{ roomID, conversationID string }
+		rooms := make([]roomConversation, 0)
+		for rows.Next() {
+			var room roomConversation
+			if err := rows.Scan(&room.roomID, &room.conversationID); err != nil {
+				rows.Close()
+				return nil, false, err
+			}
+			rooms = append(rooms, room)
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return nil, false, err
+		}
+		rows.Close()
+		for _, room := range rooms {
+			permissions, err := getChannelPermissions(ctx, tx, room.roomID, userID)
+			if err != nil {
+				return nil, false, err
+			}
+			if permissions&PermViewChannel == 0 {
+				continue
+			}
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO conversation_members (conversation_id, user_id, role)
+				 VALUES ($1::uuid, $2::uuid, 0) ON CONFLICT DO NOTHING`,
+				room.conversationID, userID,
+			); err != nil {
+				return nil, false, fmt.Errorf("join Room roster: %w", err)
+			}
+		}
+
 		if _, err := tx.Exec(ctx,
-			`INSERT INTO conversation_members (conversation_id, user_id, role)
-			 SELECT conversation_id, $2::uuid, 0 FROM channels
-			 WHERE server_id = $1 AND channel_type = 0 AND conversation_id IS NOT NULL
-			 ON CONFLICT DO NOTHING`,
-			inv.ServerID, userID); err != nil {
-			return nil, fmt.Errorf("add to channels: %w", err)
+			`UPDATE server_invites SET uses=uses+1 WHERE id=$1::uuid`, inv.ID,
+		); err != nil {
+			return nil, false, err
+		}
+		if err := insertVeilLinkEvent(ctx, tx, inv.ServerID, &inv.ID, userID, "joined"); err != nil {
+			return nil, false, err
 		}
 	}
 
-	// Increment uses
-	if _, err := tx.Exec(ctx,
-		`UPDATE server_invites SET uses = uses + 1 WHERE code = $1`, code); err != nil {
-		return nil, err
+	var server Server
+	if err := tx.QueryRow(ctx,
+		`SELECT id, name, description, owner_id, created_at
+		 FROM servers WHERE id=$1 AND deleted_at IS NULL`, inv.ServerID,
+	).Scan(&server.ID, &server.Name, &server.Description, &server.OwnerID, &server.CreatedAt); err != nil {
+		return nil, false, err
 	}
-
-	var s Server
-	err = tx.QueryRow(ctx,
-		`SELECT id, name, description, icon_url, owner_id, created_at FROM servers WHERE id = $1`,
-		inv.ServerID,
-	).Scan(&s.ID, &s.Name, &s.Description, &s.IconURL, &s.OwnerID, &s.CreatedAt)
-	if err != nil {
-		return nil, err
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
 	}
-
-	return &s, tx.Commit(ctx)
+	return &server, !alreadyMember, nil
 }
 
-// GetServerInvites lists all invites for a server.
 func (db *DB) GetServerInvites(ctx context.Context, serverID string) ([]Invite, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT code, server_id, created_by, max_uses, uses, expires_at, created_at
-		 FROM server_invites WHERE server_id = $1 ORDER BY created_at DESC`,
-		serverID)
+		`SELECT id, public_selector, version, link_type, server_id, created_by,
+		        max_uses, uses, expires_at, revoked_at, created_at
+		 FROM server_invites WHERE server_id=$1 ORDER BY created_at DESC`, serverID,
+	)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Invite
+	out := make([]Invite, 0)
 	for rows.Next() {
-		var inv Invite
-		if err := rows.Scan(&inv.Code, &inv.ServerID, &inv.CreatedBy, &inv.MaxUses, &inv.Uses, &inv.ExpiresAt, &inv.CreatedAt); err != nil {
+		inv, err := scanInvite(rows, false)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, inv)
+		out = append(out, *inv)
 	}
 	return out, rows.Err()
 }
 
-// RevokeInvite deletes an invite code.
-func (db *DB) RevokeInvite(ctx context.Context, code string) error {
-	_, err := db.Pool.Exec(ctx, `DELETE FROM server_invites WHERE code = $1`, code)
-	return err
+func (db *DB) RevokeInvite(ctx context.Context, serverID, inviteID, actorID string) error {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	var revokedID string
+	err = tx.QueryRow(ctx,
+		`UPDATE server_invites SET revoked_at=now()
+		 WHERE id=$1::uuid AND server_id=$2::uuid AND revoked_at IS NULL
+		 RETURNING id::text`, inviteID, serverID,
+	).Scan(&revokedID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var exists bool
+		if checkErr := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM server_invites WHERE id=$1::uuid AND server_id=$2::uuid)`,
+			inviteID, serverID,
+		).Scan(&exists); checkErr != nil {
+			return checkErr
+		}
+		if !exists {
+			return errors.New("veil link not found")
+		}
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if err := insertVeilLinkEvent(ctx, tx, serverID, &revokedID, actorID, "revoked"); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+func (db *DB) RevokeAllInvites(ctx context.Context, serverID, actorID string) error {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	command, err := tx.Exec(ctx,
+		`UPDATE server_invites SET revoked_at=COALESCE(revoked_at, now())
+		 WHERE server_id=$1::uuid AND revoked_at IS NULL`, serverID,
+	)
+	if err != nil {
+		return err
+	}
+	if command.RowsAffected() > 0 {
+		if err := insertVeilLinkEvent(ctx, tx, serverID, nil, actorID, "revoked_all"); err != nil {
+			return err
+		}
+	}
+	return tx.Commit(ctx)
 }
 
 // ─── Audit log ───────────────────────────────────────

@@ -2,7 +2,11 @@
 name = "veil-client"
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
 description = "Protocol engine for Veil messenger — WebSocket, Protobuf, session management"
 
 [dependencies]
@@ -11,9 +15,10 @@ veil-store = { path = "../veil-store" }
 veil-search = { path = "../veil-search" }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 futures-util = "0.3"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
@@ -21,7 +26,10 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 hex = "0.4"
 rand = "0.8"
-zeroize = "1"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+sha2 = "0.10"
+base64 = "0.22"
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"] }

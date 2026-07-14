@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow">
+  <meta name="theme-color" content="#090d18">
+  <title>Veil Link &middot; {{.Name}}</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+      background: #070b14;
+      color: #f2f6ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      min-height: 100svh;
+      overflow-x: hidden;
+      background: #070b14;
+    }
+    body::before,
+    body::after {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+    }
+    body::before {
+      z-index: 0;
+      background:
+        linear-gradient(105deg, rgba(4, 9, 18, .88) 0%, rgba(6, 12, 24, .47) 50%, rgba(19, 20, 52, .62) 100%),
+        url('/assets/veil-link-bg-v1-38824a5f41228389.jpg') center / cover no-repeat;
+      opacity: .82;
+      transform: scale(1.015);
+    }
+    body::after {
+      z-index: 1;
+      background:
+        radial-gradient(circle at 14% 12%, rgba(70, 160, 224, .22), transparent 36%),
+        radial-gradient(circle at 88% 86%, rgba(111, 76, 226, .24), transparent 42%),
+        linear-gradient(180deg, rgba(5, 9, 17, .14), rgba(5, 9, 17, .72));
+    }
+    .shell {
+      position: relative;
+      z-index: 2;
+      min-height: 100vh;
+      min-height: 100svh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      padding: 30px clamp(22px, 5vw, 72px);
+    }
+    .top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 11px;
+      font-size: 12px;
+      font-weight: 750;
+      letter-spacing: .22em;
+    }
+    .brandmark {
+      width: 32px;
+      height: 32px;
+      border-radius: 10px;
+      display: grid;
+      place-items: center;
+      color: #f7fbff;
+      background: linear-gradient(145deg, #55b5fa, #7359f1);
+      box-shadow: 0 8px 28px rgba(63, 140, 255, .28), inset 0 1px rgba(255, 255, 255, .17);
+    }
+    .brandmark svg { width: 19px; height: 19px; }
+    .native { color: #91a3c1; font-size: 11px; }
+    .stage { display: grid; place-items: center; padding: 48px 0; }
+    .ticket {
+      position: relative;
+      width: min(930px, 100%);
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(310px, .8fr);
+      overflow: hidden;
+      border: 1px solid rgba(105, 147, 202, .34);
+      border-radius: 28px;
+      background: linear-gradient(135deg, rgba(18, 29, 49, .94), rgba(10, 16, 29, .96));
+      box-shadow: 0 42px 120px rgba(0, 0, 0, .68), 0 0 90px rgba(55, 120, 188, .12);
+      backdrop-filter: blur(18px) saturate(112%);
+    }
+    .ticket::before,
+    .ticket::after {
+      content: "";
+      position: absolute;
+      left: calc(60% - 15px);
+      z-index: 2;
+      width: 30px;
+      height: 30px;
+      border-radius: 50%;
+      background: #07101d;
+      border: 1px solid #31496c;
+    }
+    .ticket::before { top: -16px; }
+    .ticket::after { bottom: -16px; }
+    .hero {
+      min-width: 0;
+      min-height: 500px;
+      padding: 58px;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      background: radial-gradient(circle at 25% 20%, rgba(45, 101, 146, .48), rgba(22, 36, 59, .18) 42%, transparent 70%);
+    }
+    .eyebrow {
+      color: #80c9f7;
+      font-size: 11px;
+      font-weight: 750;
+      letter-spacing: .22em;
+      text-transform: uppercase;
+    }
+    .mark {
+      width: 86px;
+      height: 86px;
+      margin: 27px 0 25px;
+      border-radius: 27px;
+      display: grid;
+      place-items: center;
+      background: linear-gradient(145deg, #193a5b, #20284c);
+      border: 1px solid #3e6387;
+      box-shadow: inset 0 1px rgba(255, 255, 255, .075), 0 18px 45px rgba(0, 0, 0, .38);
+    }
+    .space-mark { width: 64px; height: 64px; transform: rotate(-8deg); }
+    h1 {
+      margin: 0;
+      max-width: 560px;
+      font-size: clamp(34px, 5vw, 58px);
+      line-height: 1.02;
+      letter-spacing: -.045em;
+      overflow-wrap: anywhere;
+    }
+    .description {
+      max-width: 520px;
+      margin: 20px 0 0;
+      color: #c0cce0;
+      font-size: 15px;
+      line-height: 1.7;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+    .side {
+      position: relative;
+      min-width: 0;
+      padding: 48px 42px;
+      border-left: 1px dashed #314360;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .label {
+      color: #8295b4;
+      font-size: 10px;
+      font-weight: 750;
+      letter-spacing: .15em;
+      text-transform: uppercase;
+    }
+    .origin {
+      margin: 8px 0 25px;
+      color: #d4def0;
+      font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+    .facts { display: grid; gap: 10px; margin: 0 0 28px; }
+    .fact {
+      padding: 13px 14px;
+      border-radius: 13px;
+      background: rgba(5, 13, 25, .66);
+      border: 1px solid #263b59;
+    }
+    .fact b {
+      display: block;
+      margin-bottom: 5px;
+      color: #8295b4;
+      font-size: 9px;
+      letter-spacing: .14em;
+      text-transform: uppercase;
+    }
+    .fact span { font-size: 12px; color: #d6e0f1; }
+    .fingerprint {
+      color: #7688a6;
+      font: 9px ui-monospace, SFMono-Regular, Consolas, monospace;
+      letter-spacing: .08em;
+      margin-top: 10px;
+    }
+    #open {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      gap: 9px;
+      min-height: 50px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #67b9f5, #7964f4);
+      color: #07101f;
+      text-decoration: none;
+      font-weight: 800;
+      box-shadow: 0 14px 34px rgba(74, 115, 216, .27);
+      transition: transform .18s ease, filter .18s ease;
+    }
+    #open::after { content: "\2192"; font-size: 18px; }
+    #open:hover { transform: translateY(-2px); filter: brightness(1.07); }
+    #open[aria-disabled="true"] { pointer-events: none; opacity: .45; }
+    .note {
+      font-size: 10.5px;
+      line-height: 1.55;
+      color: #7b8eac;
+      text-align: center;
+      margin: 15px 4px 0;
+    }
+    .foot {
+      display: flex;
+      justify-content: center;
+      color: #91a3c1;
+      font-size: 11px;
+      letter-spacing: .04em;
+    }
+    .foot span { color: #91a0ba; }
+    :focus-visible { outline: 3px solid #76c8ff; outline-offset: 4px; }
+    @media (max-width: 760px) {
+      .shell { padding: 22px 16px; }
+      .native { display: none; }
+      .stage { padding: 28px 0; }
+      .ticket { grid-template-columns: 1fr; border-radius: 22px; }
+      .ticket::before, .ticket::after { display: none; }
+      .hero { min-height: auto; padding: 38px 28px 34px; }
+      .mark { width: 72px; height: 72px; border-radius: 22px; }
+      .space-mark { width: 54px; height: 54px; }
+      .side { padding: 30px 28px 34px; border-left: 0; border-top: 1px dashed #314360; }
+      h1 { font-size: 38px; }
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .ticket { animation: enter .38s cubic-bezier(.2, .8, .2, 1); }
+      @keyframes enter {
+        from { opacity: 0; transform: translateY(12px) scale(.99); }
+        to { opacity: 1; transform: none; }
+      }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      #open { transition: none; }
+      #open:hover { transform: none; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="top">
+      <div class="brand">
+        <span class="brandmark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor">
+            <path d="M4 4H8V11.8L4 13ZM4 16L8 14.8V20H4ZM10 2H14V10.5L10 11.7ZM10 14.7L14 13.5V22H10ZM16 5H20V8.2L16 9.4ZM16 12.4L20 11.2V19H16Z"/>
+          </svg>
+        </span>
+        VEIL
+      </div>
+      <div class="native">Native, private, origin-bound</div>
+    </header>
+    <main class="stage">
+      <article class="ticket">
+        <section class="hero">
+          <div class="eyebrow">A Veil Link for a private Space</div>
+          <div class="mark" aria-hidden="true">
+            <svg class="space-mark" data-seed="{{.MarkSeed}}" viewBox="0 0 36 36"></svg>
+          </div>
+          <h1>{{.Name}}</h1>
+          <p class="description">{{.Description}}</p>
+        </section>
+        <aside class="side">
+          <div class="label">Exact Veil Node</div>
+          <div class="origin">{{.Origin}}</div>
+          <div class="facts">
+            <div class="fact"><b>Invitation expires</b><span>{{.Expires}}</span></div>
+            <div class="fact"><b>Admission</b><span>Review in Veil, then confirm</span></div>
+          </div>
+          <a id="open" aria-disabled="true">Open in Veil</a>
+          <p id="status" class="note" role="status">The native app verifies the exact Node and your active identity before anything changes.</p>
+          <div class="fingerprint">LINK REF &middot; {{.MarkRef}}</div>
+        </aside>
+      </article>
+    </main>
+    <footer class="foot">A Veil Link is an invitation, <span>&nbsp;not identity verification.</span></footer>
+  </div>
+  <script nonce="{{.Nonce}}">
+    (() => {
+      const open = document.getElementById('open');
+      const status = document.getElementById('status');
+      const mark = document.querySelector('.space-mark');
+      const seed = mark && mark.dataset.seed;
+      if (/^[A-Za-z0-9_-]{43}$/.test(seed || '')) {
+        try {
+          const raw = atob(seed.replace(/-/g, '+').replace(/_/g, '/') + '=');
+          if (raw.length === 32) {
+            const bytes = Uint8Array.from(raw, (character) => character.charCodeAt(0));
+            const hue = 188 + (bytes[0] % 74);
+            const namespace = 'http://www.w3.org/2000/svg';
+            const addRect = (x, y, width, height, radius, fill) => {
+              const rect = document.createElementNS(namespace, 'rect');
+              rect.setAttribute('x', String(x));
+              rect.setAttribute('y', String(y));
+              rect.setAttribute('width', String(width));
+              rect.setAttribute('height', String(height));
+              rect.setAttribute('rx', String(radius));
+              rect.setAttribute('fill', fill);
+              mark.appendChild(rect);
+            };
+            addRect(0, 0, 36, 36, 12, `hsl(${hue} 48% 16%)`);
+            for (let index = 0; index < 15; index += 1) {
+              const value = bytes[index + 1];
+              if ((value & 3) === 0) continue;
+              const row = Math.floor(index / 3);
+              const column = index % 3;
+              const x = 6 + (column * 5);
+              const mirrorX = 26 - (column * 5);
+              const y = 6 + (row * 5);
+              const tone = value & 1;
+              const color = `hsl(${hue + (tone ? 34 : 0)} 76% ${tone ? 72 : 62}%)`;
+              addRect(x, y, 4, 4, 1.2, color);
+              if (mirrorX !== x) addRect(mirrorX, y, 4, 4, 1.2, color);
+            }
+          }
+        } catch {
+          // The server emits a canonical fixed-width seed. Keep a neutral tile
+          // if a browser cannot decode it; this mark is decorative, not proof.
+        }
+      }
+      const path = location.pathname.split('/');
+      const selector = path[path.length - 1];
+      const secret = new URLSearchParams(location.hash.slice(1)).get('s');
+      if (!/^[A-Za-z0-9_-]{43}$/.test(selector) || !/^[A-Za-z0-9_-]{43}$/.test(secret || '')) {
+        status.textContent = 'This Veil Link is incomplete or unavailable.';
+        return;
+      }
+      open.href = 'veil://join/v1/' + selector + '?origin=' + encodeURIComponent(location.origin) + '#s=' + secret;
+      open.removeAttribute('aria-disabled');
+    })();
+  </script>
+</body>
+</html>

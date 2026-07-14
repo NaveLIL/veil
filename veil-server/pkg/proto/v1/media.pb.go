@@ -156,7 +156,7 @@ const file_veil_v1_media_proto_rawDesc = "" +
 	"\n" +
 	"upload_url\x18\x02 \x01(\tR\tuploadUrl\x12\x1d\n" +
 	"\n" +
-	"expires_at\x18\x03 \x01(\x04R\texpiresAtB.Z,github.com/AegisSec/veil-server/pkg/proto/v1b\x06proto3"
+	"expires_at\x18\x03 \x01(\x04R\texpiresAtB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_media_proto_rawDescOnce sync.Once

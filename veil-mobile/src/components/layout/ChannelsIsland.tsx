@@ -3,6 +3,7 @@ import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
 import { Island } from "../ui/Island";
 import { colors, radii, spacing } from "../../lib/theme";
 import { DM_HOME_ID, useChatStore } from "../../stores/chat";
+import { UserAvatar } from "../identity/UserAvatar";
 
 interface Props {
   onSelect: () => void;
@@ -48,16 +49,23 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
                       pressed && { opacity: 0.7 },
                     ]}
                   >
-                    <View
-                      style={[
-                        styles.avatar,
-                        { backgroundColor: dm.color + "33", borderColor: dm.color + "55" },
-                      ]}
-                    >
-                      <Text style={[styles.avatarText, { color: dm.color }]}>
-                        {dm.isGroup ? "👥" : dm.name.charAt(0)}
-                      </Text>
-                    </View>
+                    {dm.isGroup || !dm.avatarIdentity ? (
+                      <View
+                        accessibilityLabel="Group conversation"
+                        accessibilityRole="image"
+                        style={[styles.groupAvatar, { borderColor: `${dm.color}55` }]}
+                      >
+                        <Text style={[styles.groupAvatarText, { color: dm.color }]}>◇</Text>
+                      </View>
+                    ) : (
+                      <UserAvatar
+                        canonicalServerOrigin={dm.avatarIdentity.canonicalServerOrigin}
+                        userId={dm.avatarIdentity.userId}
+                        identityKey={dm.avatarIdentity.identityKey}
+                        technicalUsername={dm.avatarIdentity.username}
+                        size={44}
+                      />
+                    )}
                     <View style={styles.dmMeta}>
                       <View style={styles.dmHead}>
                         <Text numberOfLines={1} style={styles.dmName}>
@@ -152,15 +160,16 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
     borderRadius: radii.lg,
   },
-  avatar: {
+  groupAvatar: {
     width: 44,
     height: 44,
-    borderRadius: radii.pill,
+    borderRadius: radii.lg,
     alignItems: "center",
     justifyContent: "center",
     borderWidth: 1,
+    backgroundColor: "rgba(124,107,245,0.10)",
   },
-  avatarText: { fontSize: 16, fontWeight: "700" },
+  groupAvatarText: { fontSize: 22, fontWeight: "700" },
   dmMeta: { flex: 1, minWidth: 0 },
   dmHead: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
   dmName: { color: colors.textHi, fontSize: 14, fontWeight: "600", flex: 1 },

@@ -1,7 +1,7 @@
 syntax = "proto3";
 package veil.v1;
 
-option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+option go_package = "github.com/NaveLIL/veil/veil-server/pkg/proto/v1";
 
 // ===================== Messages =====================
 
@@ -26,6 +26,11 @@ message SendMessage {
 
   // Для sealed sender: ciphertext содержит sender info внутри
   bool sealed = 8;
+
+  // Required for Sender-Key group/channel traffic. The gateway accepts the
+  // ciphertext only for the exact current ready device roster.
+  uint64 roster_version = 9;
+  bytes roster_commitment = 10; // SHA-256, 32 bytes
 }
 
 message EncryptedAttachment {
@@ -41,6 +46,11 @@ message MessageAck {
   string message_id = 1;
   uint64 server_timestamp = 2;
   uint64 ref_seq = 3;
+  bytes target_device_id = 4;       // Exact 16-byte device receiving an SKDM
+  optional string conversation_id = 5;
+  optional uint32 sender_key_generation = 6;
+  optional uint64 roster_version = 7;
+  optional bytes envelope_commitment = 8; // SHA-256 of the retained SKDM
 }
 
 // Сервер → клиент: сообщение доставлено получателю
@@ -97,6 +107,18 @@ message MessageEvent {
 
   // Для EDITED — ID оригинального сообщения:
   optional uint64 edit_timestamp = 14;
+
+  // Present for device-routed Sender-Key group/channel traffic.
+  uint64 roster_version = 15;
+  bytes roster_commitment = 16;
+  bytes sender_device_id = 17;
+  bytes target_device_id = 18;
+
+  // Persisted security context for NEW group/channel ciphertext. Empty/zero
+  // means an explicitly legacy/unknown row, never an inferred downgrade.
+  string crypto_profile = 19;        // "sender_key_v5"
+  uint64 crypto_era = 20;            // profile-era version, currently 1
+  uint64 sender_binding_version = 21;
 }
 
 // Клиент → сервер: добавить/убрать реакцию
@@ -140,5 +162,36 @@ message SenderKeyDistribution {
   string conversation_id = 1;      // Group/channel ID
   bytes sender_key_message = 2;    // Encrypted sender key для каждого участника
   uint32 generation = 3;           // Key generation counter
-  bytes target_identity_key = 4;   // Для кого зашифрован данный sender key
+  bytes target_identity_key = 4;   // Target account X25519 key (membership locator)
+  bytes target_device_id = 5;      // Exact 16-byte recipient device ID
+  bytes target_device_identity_key = 6; // Recipient device X25519 key
+  bytes sender_device_id = 7;      // Authenticated 16-byte sender device ID
+  uint64 roster_version = 8;
+  bytes roster_commitment = 9;     // SHA-256, 32 bytes
+  uint64 sender_binding_version = 10;
+  uint64 target_binding_version = 11;
+
+  // Exact historical account-authorized sender-device binding. Retained SKDM
+  // restore includes this proof even after the sender account/device left the
+  // conversation, so a recipient can first-install without trusting current
+  // directory membership or accepting a compatibility fallback.
+  bytes sender_account_identity_key = 12;
+  bytes sender_account_signing_key = 13;
+  bytes sender_device_identity_key = 14;
+  bytes sender_device_signing_key = 15;
+  uint64 sender_device_capabilities = 16;
+  uint32 sender_device_binding_status = 17;
+  bytes sender_account_signature = 18;
+}
+
+// Recipient -> server acknowledgement after the exact device installed one
+// retained Sender-Key distribution. The immutable stream head is preserved;
+// only the matching pending row is collected.
+message SenderKeyReceipt {
+  string conversation_id = 1;
+  bytes owner_device_id = 2;
+  bytes target_device_id = 3;
+  uint32 generation = 4;
+  uint64 roster_version = 5;
+  bytes envelope_commitment = 6;
 }

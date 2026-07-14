@@ -1,0 +1,73 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      rust:
+        patterns: ["*"]
+
+  - package-ecosystem: gomod
+    directory: /veil-server
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      go:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /veil-desktop
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      desktop:
+        patterns: ["*"]
+
+  - package-ecosystem: npm
+    directory: /veil-mobile
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      mobile:
+        patterns: ["*"]
+
+  - package-ecosystem: docker
+    directory: /veil-server
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      gateway-image:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      development-images:
+        patterns: ["*"]
+
+  - package-ecosystem: docker-compose
+    directory: /deploy
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      deployment-images:
+        patterns: ["*"]

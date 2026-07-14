@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/AegisSec/veil-server/internal/authmw"
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/authmw"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
+	"github.com/NaveLIL/veil/veil-server/internal/publicerr"
 )
 
 // Handler provides REST endpoints for the auth service.
@@ -45,11 +47,13 @@ func (s *Service) SigningKeyLookup() authmw.UserKeyLookup {
 // RegisterRoutes registers auth REST endpoints on the given mux.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	signed := func(f http.HandlerFunc) http.HandlerFunc {
-		if h.mw != nil {
-			f = h.mw.RequireSigned(f)
-		}
 		if h.rl != nil {
 			f = h.rl.Wrap(f)
+		}
+		if h.mw != nil {
+			// Signature verification must be the outermost middleware so the
+			// limiter sees only an authenticated principal context.
+			f = h.mw.RequireSigned(f)
 		}
 		return f
 	}
@@ -58,6 +62,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/prekeys/{identityKey}", signed(h.GetPreKeyBundle))
 	mux.HandleFunc("GET /v1/prekeys/{identityKey}/count", signed(h.GetOPKCount))
 	mux.HandleFunc("GET /v1/devices/{userID}", signed(h.ListDevices))
+	mux.HandleFunc("GET /v1/device-bindings/{deviceKey}", signed(h.GetDeviceBinding))
+	mux.HandleFunc("PUT /v1/device-bindings/{deviceKey}", signed(h.PutDeviceBinding))
 	mux.HandleFunc("GET /v1/users/search", signed(h.SearchUser))
 	mux.HandleFunc("GET /v1/users/{identityKey}", signed(h.LookupUser))
 }
@@ -72,11 +78,22 @@ type UploadPreKeysRequest struct {
 }
 
 type PreKeyJSON struct {
-	PublicKey string `json:"public_key"` // base64
-	Signature string `json:"signature"`  // base64, only for signed prekeys
+	KeyID     *uint32 `json:"key_id"`     // device-local protocol key id
+	PublicKey string  `json:"public_key"` // base64
+	Signature string  `json:"signature"`  // base64, only for signed prekeys
 }
 
+const x3dhSignedPreKeyDomain = "veil-x3dh-spk-v1\x00"
+
+var ErrPreKeyAccessDenied = errors.New("prekey access requires a shared conversation")
+
 func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
+	requesterID := r.Header.Get("X-User-ID")
+	if requesterID == "" {
+		writeJSON(w, http.StatusUnauthorized, errorResp("authenticated user required"))
+		return
+	}
+
 	var req UploadPreKeysRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResp("invalid JSON"))
@@ -85,6 +102,10 @@ func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
 
 	if req.DeviceID == "" {
 		writeJSON(w, http.StatusBadRequest, errorResp("device_id required"))
+		return
+	}
+	if len(req.OneTimeKeys) > 1000 {
+		writeJSON(w, http.StatusBadRequest, errorResp("too many one_time_prekeys (maximum 1000)"))
 		return
 	}
 
@@ -100,22 +121,38 @@ func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, errorResp("device not found"))
 		return
 	}
+	if !deviceBelongsToUser(device, requesterID) {
+		writeJSON(w, http.StatusForbidden, errorResp("device does not belong to authenticated user"))
+		return
+	}
 
 	var prekeys []preKeyInput
+	var signedPreKey *preKeyInput
 	if req.SignedPreKey != nil {
 		pk, err := decodePreKey(req.SignedPreKey, 0)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResp("invalid signed_prekey: "+err.Error()))
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_signed_prekey", "invalid signed_prekey", err,
+			))
 			return
 		}
 		prekeys = append(prekeys, pk)
+		signedPreKey = &prekeys[len(prekeys)-1]
 	}
+	seenOPKIDs := make(map[uint32]struct{}, len(req.OneTimeKeys))
 	for _, otk := range req.OneTimeKeys {
 		pk, err := decodePreKey(&otk, 1)
 		if err != nil {
-			writeJSON(w, http.StatusBadRequest, errorResp("invalid one_time_prekey: "+err.Error()))
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_one_time_prekey", "invalid one_time_prekey", err,
+			))
 			return
 		}
+		if _, duplicate := seenOPKIDs[pk.protocolKeyID]; duplicate {
+			writeJSON(w, http.StatusBadRequest, errorResp("duplicate one_time_prekey key_id"))
+			return
+		}
+		seenOPKIDs[pk.protocolKeyID] = struct{}{}
 		prekeys = append(prekeys, pk)
 	}
 
@@ -124,18 +161,34 @@ func (h *Handler) UploadPreKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if signedPreKey != nil {
+		owner, err := h.svc.db.FindUserByID(r.Context(), requesterID)
+		if err != nil {
+			log.Printf("prekey owner lookup error: class=%s", logsafe.ErrorClass(err))
+			writeJSON(w, http.StatusUnauthorized, errorResp("authenticated user not found"))
+			return
+		}
+		if err := validateSignedPreKey(owner, signedPreKey); err != nil {
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_signed_prekey", "signed prekey validation failed", err,
+			))
+			return
+		}
+	}
+
 	// Convert to db.PreKey slice
 	var dbKeys []dbPreKeyAdapter
 	for _, pk := range prekeys {
 		dbKeys = append(dbKeys, dbPreKeyAdapter{
-			KeyType:   pk.keyType,
-			PublicKey: pk.publicKey,
-			Signature: pk.signature,
+			KeyType:       pk.keyType,
+			ProtocolKeyID: pk.protocolKeyID,
+			PublicKey:     pk.publicKey,
+			Signature:     pk.signature,
 		})
 	}
 
 	if err := h.svc.StorePreKeys(r.Context(), device.ID, dbKeys); err != nil {
-		log.Printf("store prekeys error: %v", err)
+		log.Printf("store prekeys error: class=%s", logsafe.ErrorClass(err))
 		writeJSON(w, http.StatusInternalServerError, errorResp("failed to store prekeys"))
 		return
 	}
@@ -157,9 +210,21 @@ func (h *Handler) GetPreKeyBundle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	bundle, err := h.svc.GetPreKeyBundle(r.Context(), identityKey)
+	requesterID := r.Header.Get("X-User-ID")
+	if requesterID == "" {
+		writeJSON(w, http.StatusUnauthorized, errorResp("authenticated user required"))
+		return
+	}
+
+	bundle, err := h.svc.GetPreKeyBundle(r.Context(), requesterID, identityKey)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, errorResp(err.Error()))
+		if errors.Is(err, ErrPreKeyAccessDenied) {
+			publicerr.Write(w, http.StatusForbidden, publicerr.New(
+				http.StatusForbidden, "prekey_access_denied", "prekey access requires a shared conversation", err,
+			))
+			return
+		}
+		publicerr.Write(w, http.StatusNotFound, err)
 		return
 	}
 
@@ -169,6 +234,12 @@ func (h *Handler) GetPreKeyBundle(w http.ResponseWriter, r *http.Request) {
 // --- OPK Count ---
 
 func (h *Handler) GetOPKCount(w http.ResponseWriter, r *http.Request) {
+	requesterID := r.Header.Get("X-User-ID")
+	if requesterID == "" {
+		writeJSON(w, http.StatusUnauthorized, errorResp("authenticated user required"))
+		return
+	}
+
 	identityKeyHex := r.PathValue("identityKey")
 	identityKey, err := hex.DecodeString(identityKeyHex)
 	if err != nil || len(identityKey) != 32 {
@@ -179,6 +250,10 @@ func (h *Handler) GetOPKCount(w http.ResponseWriter, r *http.Request) {
 	user, err := h.svc.db.FindUserByIdentityKey(r.Context(), identityKey)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, errorResp("user not found"))
+		return
+	}
+	if user.ID != requesterID {
+		writeJSON(w, http.StatusForbidden, errorResp("one-time prekey counts are private to their owner"))
 		return
 	}
 
@@ -207,9 +282,19 @@ func (h *Handler) GetOPKCount(w http.ResponseWriter, r *http.Request) {
 // --- Device List ---
 
 func (h *Handler) ListDevices(w http.ResponseWriter, r *http.Request) {
+	requesterID := r.Header.Get("X-User-ID")
+	if requesterID == "" {
+		writeJSON(w, http.StatusUnauthorized, errorResp("authenticated user required"))
+		return
+	}
+
 	userID := r.PathValue("userID")
 	if userID == "" {
 		writeJSON(w, http.StatusBadRequest, errorResp("user_id required"))
+		return
+	}
+	if userID != requesterID {
+		writeJSON(w, http.StatusForbidden, errorResp("device list is private to its owner"))
 		return
 	}
 
@@ -273,25 +358,39 @@ func (s *Service) StorePreKeys(ctx context.Context, deviceID string, keys []dbPr
 	var dbKeys []db.PreKey
 	for _, k := range keys {
 		dbKeys = append(dbKeys, db.PreKey{
-			KeyType:   k.KeyType,
-			PublicKey: k.PublicKey,
-			Signature: k.Signature,
+			KeyType:       k.KeyType,
+			ProtocolKeyID: k.ProtocolKeyID,
+			PublicKey:     k.PublicKey,
+			Signature:     k.Signature,
 		})
 	}
 	return s.db.StorePreKeys(ctx, deviceID, dbKeys)
 }
 
 // GetPreKeyBundle fetches a prekey bundle for X3DH session establishment.
-func (s *Service) GetPreKeyBundle(ctx context.Context, targetIdentityKey []byte) (map[string]any, error) {
+func (s *Service) GetPreKeyBundle(ctx context.Context, requesterID string, targetIdentityKey []byte) (map[string]any, error) {
 	user, err := s.db.FindUserByIdentityKey(ctx, targetIdentityKey)
 	if err != nil {
 		return nil, errors.New("user not found")
+	}
+	if requesterID == "" {
+		return nil, ErrPreKeyAccessDenied
+	}
+	if requesterID != user.ID {
+		allowed, relationErr := s.db.UsersShareConversation(ctx, requesterID, user.ID)
+		if relationErr != nil || !allowed {
+			return nil, ErrPreKeyAccessDenied
+		}
 	}
 
 	devices, err := s.db.GetDevicesByUser(ctx, user.ID)
 	if err != nil || len(devices) == 0 {
 		return nil, errors.New("no devices registered")
 	}
+	// Known limitation: a bundle currently represents only the most recently
+	// seen device. Safely returning all devices requires a versioned client
+	// protocol with per-device sessions and fan-out; do not silently combine
+	// device keys into this single-device response.
 	device := devices[0]
 
 	spk, err := s.db.GetSignedPreKey(ctx, device.ID)
@@ -304,13 +403,13 @@ func (s *Service) GetPreKeyBundle(ctx context.Context, targetIdentityKey []byte)
 		"signing_key":             base64.StdEncoding.EncodeToString(user.SigningKey),
 		"signed_prekey":           base64.StdEncoding.EncodeToString(spk.PublicKey),
 		"signed_prekey_signature": base64.StdEncoding.EncodeToString(spk.Signature),
-		"signed_prekey_id":        spk.ID,
+		"signed_prekey_id":        spk.ProtocolKeyID,
 	}
 
 	opk, err := s.db.ClaimOneTimePreKey(ctx, device.ID)
 	if err == nil && opk != nil {
 		bundle["one_time_prekey"] = base64.StdEncoding.EncodeToString(opk.PublicKey)
-		bundle["one_time_prekey_id"] = opk.ID
+		bundle["one_time_prekey_id"] = opk.ProtocolKeyID
 	}
 
 	remaining, _ := s.db.CountUnusedOPKs(ctx, device.ID)
@@ -325,18 +424,23 @@ func (s *Service) GetPreKeyBundle(ctx context.Context, targetIdentityKey []byte)
 // --- Internal helpers ---
 
 type preKeyInput struct {
-	keyType   int16
-	publicKey []byte
-	signature []byte
+	keyType       int16
+	protocolKeyID uint32
+	publicKey     []byte
+	signature     []byte
 }
 
 type dbPreKeyAdapter struct {
-	KeyType   int16
-	PublicKey []byte
-	Signature []byte
+	KeyType       int16
+	ProtocolKeyID uint32
+	PublicKey     []byte
+	Signature     []byte
 }
 
 func decodePreKey(pk *PreKeyJSON, keyType int16) (preKeyInput, error) {
+	if pk.KeyID == nil {
+		return preKeyInput{}, errors.New("key_id required")
+	}
 	pubKey, err := base64.StdEncoding.DecodeString(strings.TrimSpace(pk.PublicKey))
 	if err != nil {
 		return preKeyInput{}, errors.New("invalid base64 public_key")
@@ -346,14 +450,58 @@ func decodePreKey(pk *PreKeyJSON, keyType int16) (preKeyInput, error) {
 	}
 
 	var sig []byte
+	if keyType == 0 && pk.Signature == "" {
+		return preKeyInput{}, errors.New("signature required for signed prekey")
+	}
+	if keyType == 1 && pk.Signature != "" {
+		return preKeyInput{}, errors.New("signature is not allowed for one-time prekey")
+	}
 	if pk.Signature != "" {
 		sig, err = base64.StdEncoding.DecodeString(strings.TrimSpace(pk.Signature))
 		if err != nil {
 			return preKeyInput{}, errors.New("invalid base64 signature")
 		}
+		if len(sig) != ed25519.SignatureSize {
+			return preKeyInput{}, errors.New("signature must be 64 bytes")
+		}
 	}
 
-	return preKeyInput{keyType: keyType, publicKey: pubKey, signature: sig}, nil
+	return preKeyInput{keyType: keyType, protocolKeyID: *pk.KeyID, publicKey: pubKey, signature: sig}, nil
+}
+
+func validateSignedPreKey(owner *db.User, prekey *preKeyInput) error {
+	if owner == nil || len(owner.SigningKey) != ed25519.PublicKeySize {
+		return errors.New("registered signing key is invalid")
+	}
+	if prekey == nil || prekey.keyType != 0 || len(prekey.signature) != ed25519.SignatureSize {
+		return errors.New("signed prekey signature is invalid")
+	}
+	message, err := SignedPreKeySigningMessage(prekey.publicKey)
+	if err != nil {
+		return err
+	}
+	if !ed25519.Verify(ed25519.PublicKey(owner.SigningKey), message, prekey.signature) {
+		return errors.New("signed prekey signature verification failed")
+	}
+	return nil
+}
+
+// SignedPreKeySigningMessage returns the exact bytes an identity signs when
+// publishing an X3DH signed prekey:
+//
+//	"veil-x3dh-spk-v1\0" || x25519_signed_prekey_public_32
+func SignedPreKeySigningMessage(publicKey []byte) ([]byte, error) {
+	if len(publicKey) != 32 {
+		return nil, errors.New("signed prekey public key must be 32 bytes")
+	}
+	message := make([]byte, 0, len(x3dhSignedPreKeyDomain)+32)
+	message = append(message, x3dhSignedPreKeyDomain...)
+	message = append(message, publicKey...)
+	return message, nil
+}
+
+func deviceBelongsToUser(device *db.Device, authenticatedUserID string) bool {
+	return device != nil && authenticatedUserID != "" && device.UserID == authenticatedUserID
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

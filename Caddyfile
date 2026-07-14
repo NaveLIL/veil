@@ -3,7 +3,7 @@
 # профиль `proxy` (см. docker-compose.yml).
 #
 # Запуск с публичным TLS:
-#   VEIL_PUBLIC_HOST=secret.erez.pro VEIL_TLS_EMAIL=admin@example.com \
+#   VEIL_PUBLIC_HOST=veil.erez.pro VEIL_TLS_EMAIL=admin@example.com \
 #     docker compose --profile proxy up -d
 #
 # Локальная разработка без TLS — используйте gateway напрямую

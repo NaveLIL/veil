@@ -1,9 +1,37 @@
-# Roadmap & engineering notes (post Phase-4A hardening sprint)
+# Security & infrastructure notes (historical companion)
 
-> Last updated: 2026-04-22. Tracks what's done in the security/observability
-> sprint and what's queued next. Memory snapshots live under
-> `/memories/repo/` (deploy-vps, observability, http-middleware-gotchas,
-> phase4a-groups, tauri-ui-notes).
+> Status refreshed: 2026-07-12. The canonical product/integration roadmap is
+> [`INTEGRATION_ROADMAP.md`](INTEGRATION_ROADMAP.md). This file preserves the
+> April hardening notes and design rationale; its old “Next candidates” order
+> is historical and must not override the canonical roadmap.
+
+## Current status of the W-items
+
+| Item | Status on 2026-07-12 |
+|---|---|
+| W1 — single-process Hub | open; sharding/distributed broker deferred until measured load requires it |
+| W2 — handler coverage | original gap closed with unit/security/integration suites; coverage threshold still open |
+| W3 — `allowUnsigned` bypass | closed; branch/parameter removed and signed REST enforced |
+| W4 — public metrics | closed; metrics use the internal listener |
+| W5 — frontend tests | partial; desktop Vitest/Playwright/a11y/visual harness is active, live-gateway E2E and Android remain |
+| W6 — single-host deploy | open; redundancy, remote backup and restore drill required before public scale |
+| W7 — permissive WS Origin | closed in code/Compose with fail-closed configuration |
+| W8 — Sender-Key rotation | exact-device rotation, retention, durable receipts and scoped quarantine implemented; transparency/manual-device UX remain |
+| W9 — raw user IDs in logs | closed; HMAC refs, bounded error classes and safe tusd logging are enforced |
+| W10 — WS message rate limit | closed; abuse alerting/auto-disconnect remain optional follow-ups |
+| W11 — profile/avatar privacy boundary | closed in Phase 4D; presentation metadata is server-visible and avatars use a separate sanitized pipeline |
+| W12 — internal errors in client responses | closed; fail-closed `publicerr` HTTP/WS/tusd boundary plus AST regression |
+
+The sections below are retained as an engineering journal. Statements such as
+“chat/servers have zero tests”, “allowUnsigned=true” or “Origin defaults to *”
+describe the old audit state and are superseded by the table above.
+
+Phase 4D and its passed completion gate are defined in
+[`INTEGRATION_ROADMAP.md`](INTEGRATION_ROADMAP.md) and
+[`docs/reviews/phase-4d-completion-gate.md`](docs/reviews/phase-4d-completion-gate.md).
+Public display names, about text and avatars are instance-scoped server-visible
+metadata, not cryptographic identity and not E2EE message content. Avatar
+images use a separate sanitized pipeline and never reuse arbitrary remote URLs.
 
 ## Recently shipped
 
@@ -95,7 +123,11 @@
   refill restoring access, per-user isolation, per-kind isolation,
   empty-userID bypass, default-limit fallback.
 
-## Recently shipped
+## Historical pre-enforcement snapshot (superseded)
+
+The signed-REST/origin/metrics statements in this subsection describe the
+intermediate migration state before W3/W4/W7 were closed. They are retained
+only to explain the implementation sequence.
 
 ### Security / signed REST
 - Ed25519 request signing across `auth/`, `chat/`, `servers/` handlers via
@@ -146,15 +178,18 @@
   `veil_*` series. WS flood (80 conns from one IP) → 64 ok / 16 refused
   with `veil_ws_refused_total{reason="ip_cap"}` incremented.
 
-## Next candidates (no fixed order — pick by impact)
+## Historical candidate list (April 2026 — partially shipped)
 
-1. **Tests for `chat/` and `servers/` handlers.** `auth/` is covered;
-   chat/servers handlers are not. Highest ROI for catching regressions
-   in the most-touched code.
+Current execution order lives in `INTEGRATION_ROADMAP.md`. Status annotations
+below prevent completed April work from being mistaken for the next sprint.
 
-2. **Flip `allowUnsigned=false`** once Tauri + mobile clients are
-   verified to send the signed-request triplet end-to-end. After flip,
-   delete the legacy bypass branch in `authmw/signed.go`.
+1. **DONE — tests for `chat/` and `servers/` handlers.** Unit, security and
+   testcontainers integration suites now cover auth/ACL/roles/invites/members.
+   A blocking percentage-based coverage gate is still pending.
+
+2. **DONE — remove unsigned REST.** The legacy branch and constructor flag are
+   gone; signed middleware is mandatory. Mobile must implement the same signed
+   contract before it can connect to production.
 
 3. **Wire `httpmw` into `cmd/auth/main.go` and `cmd/chat/main.go`** for
    parity with `cmd/gateway`. These standalone binaries are not in the
@@ -183,19 +218,19 @@
    `net.core.somaxconn`, `tcp_max_syn_backlog`, `nofile=1048576`). Cheap,
    needed before any real load test.
 
-9. **Sender-Key rotation policy + UX surface** (Phase-4B). Currently
-   keys are minted on first message; document when they rotate
-   (member leave / configurable interval) and surface "encryption updated"
-   notices in the chat island.
+9. **PARTIAL — Sender-Key rotation UX.** Runtime rotation and fail-closed send
+   blocking exist. Document the exact guarantees and surface “encryption
+   updated/rotation pending” in desktop and Android.
 
-10. **Coverage**: `cargo tarpaulin` already produces output under
-    `target/tarpaulin/coverage.json`; wire a CI step that fails on
-    coverage drop for `veil-crypto` (the highest-stakes crate).
+10. **PARTIAL — coverage**: CI generates and uploads the report. Add a trusted
+    baseline and fail on meaningful `veil-crypto` regression without making
+    platform-specific Tauri coverage flaky.
 
-## Known weak spots (audited 2026-04-22) and ideal fixes
+## Historical weak-spot audit (2026-04-22) and ideal fixes
 
-Honest list of architectural and quality gaps observed in the current
-codebase, paired with the *ideal* (not minimal) remediation. "Ideal"
+Honest list of architectural and quality gaps observed in the April
+codebase, paired with the *ideal* (not minimal) remediation. The current W-item
+status table at the top supersedes stale symptom text below. "Ideal"
 here means: the fix that would not need to be redone when the next
 scaling or compliance milestone hits.
 
@@ -216,30 +251,17 @@ scaling or compliance milestone hits.
      subject. Goal: stateless gateway nodes behind a TCP load
      balancer (Hetzner/AWS NLB), zero-downtime rolling deploys.
 
-### W2. Test coverage uneven across packages
-- **Symptom**: `veil-crypto` is well-tested (X3DH, ratchet, sender
-  keys, AEAD round-trips). `authmw`/`httpmw`/`gateway` have focused
-  unit tests. **`chat/` and `servers/` have zero handler tests**, and
-  these are the most-edited packages with the most business logic
-  (permissions, history pagination, role checks).
-- **Ideal fix**: in-process integration test harness. Spin up an
-  ephemeral Postgres (testcontainers-go), apply `migrations/`, mount
-  the full mux including `authmw`, drive it with the real
-  signed-request helper. One file per handler exercising: happy path,
-  unauthorised user, missing permission, malformed body, body too
-  large, replay rejection. Target ≥80% line coverage on
-  `internal/{chat,servers,auth}` and gate it in CI.
+### W2. Handler coverage — **ORIGINAL GAP CLOSED**
+- Unit/security tests and a testcontainers integration harness now exercise
+  auth, chat, servers, ACL, roles, invites and membership transitions.
+- Remaining work: measure stable per-package coverage and introduce a useful
+  regression gate without incentivising low-value assertion counting.
 
-### W3. `allowUnsigned=true` still in production
-- **Symptom**: the legacy bypass in `authmw/signed.go` is a backdoor
-  by design. Until it's flipped, the entire signed-request
-  infrastructure is *opt-in* per request, not enforced.
-- **Ideal fix**: not just flip the boolean — **delete the branch and
-  the `allowUnsigned` parameter entirely**. Add a CI lint that fails
-  if `X-User-ID` is read without a prior signed-request verification
-  on the same handler. Verification end-to-end: drive both Tauri and
-  React-Native through a smoke suite that asserts every REST call
-  carries the X-Veil-{User,Timestamp,Signature} triplet.
+### W3. Unsigned REST bypass — **DONE**
+- The bypass branch and constructor parameter were deleted; REST handlers use
+  the signed middleware and CI lint protects the contract.
+- Remaining work is client parity: the future Android smoke suite must assert
+  the `X-Veil-{User,Timestamp,Signature}` triplet on every REST command.
 
 ### W4. `/metrics` exposed without auth — **DONE 2026-04-23**
 - See "W4 — `/metrics` moved to internal-only listener" above. The
@@ -247,12 +269,12 @@ scaling or compliance milestone hits.
   get lockdown automatically; `/debug/pprof/*` is the obvious next
   thing to register on the same internal mux when needed.
 
-### W5. No frontend tests (desktop or mobile)
-- **Symptom**: state is non-trivial (optimistic message inserts,
-  reconnect with replay, sender-key distribution timing, presence
-  fan-in). Right now any regression is caught by the user.
-- **Ideal fix**: **Vitest + React Testing Library** for store logic
-  and pure components, **Playwright** for end-to-end flows running
+### W5. Frontend test coverage — **PARTIAL**
+- Desktop now has Vitest component/security regressions and Playwright visual,
+  geometry, wallpaper-scroll, keyboard, breakpoint and contrast matrices.
+  The 800×600/125% PIN path and draft/send composer geometry are blocking gates,
+  so those regressions are no longer delegated to the user.
+- Remaining: Playwright end-to-end flows running
   against a disposable gateway (`docker compose -f
   docker-compose.test.yml up`). Target the four flows that hurt most
   on regression: onboarding (mnemonic → keychain → first connect),
@@ -270,36 +292,38 @@ scaling or compliance milestone hits.
   restore drill. Until then: at minimum, an automated nightly
   `pg_dump` to a separate region.
 
-### W7. WS `CheckOrigin` allow-all by default in production
-- **Symptom**: code path is *implemented* (`VEIL_WS_ORIGINS`), but
-  the env var isn't set on the VPS — falls back to `*`. A malicious
-  third-party web page could open a WS to the gateway from any
-  user's browser.
-- **Ideal fix**: make the empty default **deny browser origins**
-  (still allow native clients with no `Origin`). Gateway main
-  refuses to start without an explicit `VEIL_WS_ORIGINS` *or* an
-  explicit `VEIL_WS_ORIGINS=*` opt-out flag — fail-closed pattern.
+### W7. WS Origin policy — **DONE IN CODE/COMPOSE**
+- Empty configuration is fail-closed for browser origins; native clients with
+  no Origin remain supported. Compose provides an explicit value.
+- Deployment smoke tests must continue to verify the production environment
+  before each gateway rollout.
 
-### W8. Sender-Key rotation not surfaced
-- **Symptom**: keys are minted on first message and never explicitly
-  rotated on member departure. Forward secrecy for groups is weaker
-  than the protocol allows.
-- **Ideal fix**: rotate sender-key on every group membership change
-  (add/remove), and additionally on a configurable interval (e.g.
-  24h or 1000 messages, whichever first). Surface a non-intrusive
-  "encryption updated" pill in the chat island. Document the
-  guarantee in `VEIL_DESIGN.md`.
+### W8. Sender-Key rotation UX — **CORE DONE / PRODUCT PARTIAL**
+- Exact-device roster revisions/commitments, immutable retry envelopes,
+  multi-generation retention, durable exact receipts and rollback-resistant
+  binding history are implemented and tested across Go/Rust/SQLCipher.
+- Outgoing replacement/cache invalidation and retained conversation recovery
+  are transactional. A bad conversation quarantines only itself; other DM/group
+  traffic remains usable and the draft stays local.
+- Remaining product/security work: key transparency beyond service-mediated
+  TOFU, manual physical multi-device evidence, device remediation UX and global
+  retention budget/compaction.
 
-### W9. Logging may leak high-cardinality user data
-- **Symptom**: `httpmw.AccessLog` writes `user=<userID>` on every
-  request. In high volume that's a per-user activity ledger sitting
-  in `docker logs`. For a privacy-first messenger that's an
-  uncomfortable artifact.
-- **Ideal fix**: log a per-process **HMAC of the userID** (key
-  derived from a server-side secret rotated daily). Operators can
-  still correlate within a day's worth of logs; an attacker
-  exfiltrating logs cannot tie entries back to user accounts.
-  Configure log retention at 7 days max in compose / journald.
+### W9. Logging may leak high-cardinality user data — **DONE 2026-07-12**
+- Access/runtime logs use short-lived HMAC refs for account, IP, device,
+  conversation, message, file and push endpoint values.
+- Unknown database/network/filesystem causes are logged only as bounded
+  `error_class`; tusd's raw path/upload logger is disabled behind the safe outer
+  route-template access log.
+- Remaining ops policy: reverse proxy/Postgres must disable raw URI and bind-
+  parameter/error-detail logs; production retention stays a deployment concern.
+
+### W12. Internal error disclosure — **DONE 2026-07-12**
+- Shared `publicerr` maps known domain failures to stable safe status/code/message
+  and converts unknown causes to generic responses without changing status.
+- HTTP, WebSocket auth/chat/servers/MLS/push/uploads and tusd 5xx bodies use the
+  boundary. Canary tests include SQL constraints, UUIDs, Windows paths and secret
+  URLs; an AST test forbids `.Error()` calls in transport writers.
 
 ### W10. No rate-limit on WS message types — **DONE 2026-04-23**
 - See "W10 — Per-(user, kind) WS message rate limiting" above.

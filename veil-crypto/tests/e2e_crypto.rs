@@ -26,10 +26,19 @@ fn test_full_messaging_lifecycle() {
     assert_eq!(alice.ed25519_public_bytes(), alice2.ed25519_public_bytes());
 
     // === Phase 2: Fingerprint Verification ===
-    let (emoji_ab, hex_ab) =
-        fingerprint::generate(&alice.x25519_public_bytes(), &bob.x25519_public_bytes());
-    let (emoji_ba, hex_ba) =
-        fingerprint::generate(&bob.x25519_public_bytes(), &alice.x25519_public_bytes());
+    let origin = "https://chat.example.test:443";
+    let alice_account = fingerprint::AccountFingerprintTuple {
+        user_id: "550e8400-e29b-41d4-a716-446655440001",
+        identity_key: &alice.x25519_public_bytes(),
+        signing_key: &alice.ed25519_public_bytes(),
+    };
+    let bob_account = fingerprint::AccountFingerprintTuple {
+        user_id: "550e8400-e29b-41d4-a716-446655440002",
+        identity_key: &bob.x25519_public_bytes(),
+        signing_key: &bob.ed25519_public_bytes(),
+    };
+    let (emoji_ab, hex_ab) = fingerprint::generate_account_v2(origin, alice_account, bob_account);
+    let (emoji_ba, hex_ba) = fingerprint::generate_account_v2(origin, bob_account, alice_account);
     assert_eq!(emoji_ab, emoji_ba, "Fingerprint must be symmetric");
     assert_eq!(hex_ab, hex_ba);
 

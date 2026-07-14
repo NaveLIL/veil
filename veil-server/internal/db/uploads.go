@@ -2,9 +2,14 @@ package db
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+var ErrTusQuotaExceeded = errors.New("upload quota exceeded")
 
 // TusUpload mirrors one row in the tus_uploads table. The server is
 // E2EE-blind: only opaque size/timing metadata is recorded here, the
@@ -33,6 +38,46 @@ func (db *DB) CreateTusUpload(ctx context.Context, fileID, userID string, sizeBy
 		fileID, userID, sizeBytes, backend, expiresAt)
 	if err != nil {
 		return fmt.Errorf("create tus upload: %w", err)
+	}
+	return nil
+}
+
+// ReserveTusUpload atomically checks the caller's rolling byte budget and
+// creates the authorization row. The per-user advisory lock closes the race
+// where concurrent tus POSTs each observe the same pre-reservation SUM.
+func (db *DB) ReserveTusUpload(ctx context.Context, fileID, userID string, sizeBytes int64, backend string, expiresAt, since time.Time, maxBytes int64) error {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin tus reservation: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 47))`,
+		userID,
+	); err != nil {
+		return fmt.Errorf("lock tus quota: %w", err)
+	}
+	var used int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(SUM(size_bytes), 0)
+		 FROM tus_uploads
+		 WHERE user_id = $1::uuid AND created_at >= $2`,
+		userID, since,
+	).Scan(&used); err != nil {
+		return fmt.Errorf("sum tus reservation: %w", err)
+	}
+	if sizeBytes <= 0 || maxBytes < sizeBytes || used > maxBytes-sizeBytes {
+		return ErrTusQuotaExceeded
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO tus_uploads (file_id, user_id, size_bytes, backend, expires_at)
+		 VALUES ($1, $2::uuid, $3, $4, $5)`,
+		fileID, userID, sizeBytes, backend, expiresAt,
+	); err != nil {
+		return fmt.Errorf("reserve tus upload: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit tus reservation: %w", err)
 	}
 	return nil
 }
@@ -96,6 +141,85 @@ func (db *DB) GetTusUpload(ctx context.Context, fileID string) (*TusUpload, erro
 		return nil, err
 	}
 	return &u, nil
+}
+
+// CanDownloadTusUpload authorizes the uploader or a current member of a live
+// conversation message that references the blob. Channel recipients must
+// still hold both VIEW_CHANNEL and READ_MESSAGE_HISTORY at download time.
+func (db *DB) CanDownloadTusUpload(ctx context.Context, fileID, userID string) (bool, error) {
+	tx, err := db.Pool.BeginTx(ctx, pgx.TxOptions{
+		IsoLevel:   pgx.RepeatableRead,
+		AccessMode: pgx.ReadOnly,
+	})
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	var upload TusUpload
+	err = tx.QueryRow(ctx,
+		`SELECT file_id, user_id, size_bytes, received_bytes, backend,
+		        created_at, finished_at, expires_at
+		 FROM tus_uploads WHERE file_id = $1`, fileID,
+	).Scan(
+		&upload.ID, &upload.UserID, &upload.SizeBytes, &upload.ReceivedBytes,
+		&upload.Backend, &upload.CreatedAt, &upload.FinishedAt, &upload.ExpiresAt,
+	)
+	if err != nil {
+		return false, err
+	}
+	if upload.FinishedAt == nil || upload.ReceivedBytes != upload.SizeBytes || !upload.ExpiresAt.After(time.Now()) {
+		return false, nil
+	}
+	if upload.UserID == userID {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	rows, err := tx.Query(ctx,
+		`SELECT DISTINCT message.conversation_id::text
+		 FROM message_attachments attachment
+		 JOIN messages message ON message.id = attachment.message_id
+		 WHERE attachment.file_id = $1
+		   AND message.is_deleted = FALSE
+		   AND (message.expires_at IS NULL OR message.expires_at > now())`,
+		fileID,
+	)
+	if err != nil {
+		return false, err
+	}
+	conversationIDs := make([]string, 0)
+	for rows.Next() {
+		var conversationID string
+		if err := rows.Scan(&conversationID); err != nil {
+			rows.Close()
+			return false, err
+		}
+		conversationIDs = append(conversationIDs, conversationID)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return false, err
+	}
+	rows.Close()
+	for _, conversationID := range conversationIDs {
+		allowed, err := canAccessConversationWithQuery(
+			ctx, tx, conversationID, userID, ChannelReadPermissions,
+		)
+		if err != nil {
+			return false, err
+		}
+		if allowed {
+			if err := tx.Commit(ctx); err != nil {
+				return false, err
+			}
+			return true, nil
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return false, nil
 }
 
 // ListExpiredTusUploads returns rows whose expires_at has passed. The

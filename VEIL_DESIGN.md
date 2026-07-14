@@ -1,5 +1,18 @@
 # VEIL — заметки по архитектуре
 
+> **Исторический документ.** Актуальная схема компонентов находится в
+> [`docs/architecture.md`](docs/architecture.md), а фактический статус — в
+> [`INTEGRATION_ROADMAP.md`](INTEGRATION_ROADMAP.md). Ниже сохранены исходные
+> решения и целевые идеи; они не должны восприниматься как обещание уже
+> реализованной функции.
+
+> **Статус реализации:** документ объединяет реализованный код и целевую
+> архитектуру. Сейчас desktop использует TLS с системными CA и fail-closed
+> workflow для Authenticode-подписанных Windows-релизов. Certificate pinning и
+> автообновление не включены, пока нет инфраструктуры ротации pin/update-ключей.
+> Recovery phrase попадает в WebView только при onboarding или после повторной
+> PIN-аутентификации; операции с производными приватными ключами остаются в Rust.
+
 > Рабочее название: **Veil**
 > Альтернативы которые рассматривал: Bastion, Aegis, Citadel, Phantom — остановился на Veil
 
@@ -28,26 +41,26 @@
 
 | Проблема Web-клиента | Как решает Native |
 |---|---|
-| **XSS** — инъекция скриптов крадёт ключи из JS heap | Ключи живут в Rust памяти, JS к ним не обращается |
+| **XSS** — инъекция скриптов крадёт ключи из JS heap | Приватные ключи живут в Rust, но XSS всё ещё может читать показанный plaintext и вызывать разрешённые IPC-команды |
 | **Расширения браузера** — могут читать DOM, LocalStorage | Нет расширений, нет DOM с секретами |
-| **DevTools** — любой может сделать memory dump | Процесс защищён ОС, mlock() для страниц с ключами |
+| **DevTools** — любой может сделать memory dump | Release CSP и узкие Tauri capabilities уменьшают поверхность; защита от локального дампа процесса не заявляется |
 | **WASM overhead** — 3-5x медленнее native Rust | Прямой FFI, нулевой overhead |
 | **LocalStorage** — единственное хранилище, нет encryption at rest | OS Keychain (macOS Keychain, Android Keystore, Linux Secret Service) |
-| **CDN/MITM** — серверу доверяем при загрузке JS | Бинарник подписан, certificate pinning, reproducible builds |
+| **CDN/MITM** — серверу доверяем при загрузке JS | UI поставляется внутри бинарника; Windows release workflow требует Authenticode, TLS использует системные CA |
 | **Service Worker** — ненадёжный offline | SQLite на клиенте, полный offline |
 | **Нет push** — только pull через WS | Нативный FCM/APNs, фоновый сервис |
 
 ### Принципы
 
 1. **Native-only клиенты**: Desktop (Tauri v2) + Mobile (React Native). Никакого web-клиента
-2. **Крипто = Rust, везде**: один crate, прямой FFI (не WASM), ключи никогда не покидают Rust boundary
+2. **Крипто = Rust, везде**: один crate, прямой FFI (не WASM); производные приватные ключи не покидают Rust, recovery phrase показывается только в явных recovery-flow
 3. **Zero JS crypto**: TypeScript/React только для UI рендеринга, вся криптография — Rust native
 4. **OS Keychain**: seed/ключи хранятся в защищённом хранилище ОС, не в файлах
-5. **Certificate pinning**: клиент проверяет TLS сертификат сервера, MITM невозможен
-6. **Memory protection**: mlock() для страниц с ключами, zeroize on drop
-7. **Sealed sender**: сервер не знает, кто отправил сообщение (метаданные минимальны)
+5. **TLS**: production endpoint только `https://`/`wss://`, проверка через системное хранилище CA; pinning — отдельная будущая работа
+6. **Memory protection**: `zeroize` для собственного key material; `mlock()` пока не реализован и не заявляется
+7. **Metadata honesty**: sealed sender пока не реализован; сервер знает отправителя, участников и маршрут доставки
 8. **Protocol-first**: Protobuf контракт, затем реализация
-9. **Offline-first**: клиент работает без сети, локальная SQLite БД
+9. **Local-first history**: история доступна из SQLCipher без сети; надёжный reconnect/resend для всех операций ещё требует отдельного протокола
 10. **Единственное исключение для Web**: Share Viewer — легковесная страница для просмотра secure links
 
 ---
@@ -84,7 +97,7 @@
 │  └─────────┬──────────┘          └───────────┬─────────────┘     │
 │            │                                 │                    │
 │            └──────────┬──────────────────────┘                    │
-│                       │ TLS 1.3 + Certificate Pinning             │
+│                       │ TLS + системная проверка CA               │
 │                       │ Protobuf over WebSocket                   │
 └───────────────────────┼──────────────────────────────────────────┘
                         │
@@ -117,7 +130,7 @@
 
 ### 3.1 Rust Core: Три Crate'а
 
-Вся клиентская логика (крипто, протокол, хранилище) живёт в Rust. UI-слой лишь вызывает Rust-функции через FFI. **Ключи никогда не покидают Rust memory boundary.**
+Вся клиентская логика (крипто, протокол, хранилище) живёт в Rust. UI-слой вызывает Rust-функции через FFI. **Производные приватные ключи не покидают Rust memory boundary; recovery phrase является явно указанным исключением для onboarding/recovery UI.**
 
 #### `veil-crypto` — Криптографический движок
 
@@ -134,7 +147,8 @@
 | Random | `rand` + `getrandom` | CSPRNG |
 | Zeroize | `zeroize` | **Стирание ключей из памяти при drop** |
 
-**Защита памяти (native-only преимущество):**
+**Целевой эскиз защиты памяти:** сейчас реализован `zeroize`; часть с
+`mlock`/`VirtualLock` ниже ещё не подключена.
 ```rust
 use zeroize::Zeroize;
 use memsec::mlock;  // Запрет swap для страниц с ключами
@@ -155,7 +169,7 @@ unsafe { mlock(keys_ptr, keys_size); }
 
 #### `veil-client` — Протокольный движок
 
-Полностью на Rust. Управляет WebSocket-соединением, Protobuf сериализацией, очередью отправки, offline-буфером. UI-слой не знает о протоколе.
+Полностью на Rust. Управляет WebSocket-соединением, Protobuf-сериализацией и текущей очередью отправки. История хранится локально, но полноценный автоматический reconnect/resend ещё не считается завершённым.
 
 ```rust
 // Пример API для UI-слоя
@@ -196,7 +210,7 @@ Rust Core (shared across all platforms):
 ├── veil-client/        # Протокольный движок
 │   ├── src/
 │   │   ├── lib.rs
-│   │   ├── connection.rs   # WebSocket + TLS + cert pinning
+│   │   ├── connection.rs   # WebSocket + TLS через native OS CA roots
 │   │   ├── protocol.rs     # Protobuf encode/decode
 │   │   ├── sync.rs         # Offline queue, message ordering
 │   │   ├── sessions.rs     # Ratchet session management
@@ -244,7 +258,7 @@ desktop/
 │   │   ├── main.rs         # Window lifecycle
 │   │   ├── commands.rs     # Tauri IPC commands (thin wrappers over veil-client)
 │   │   ├── tray.rs         # System tray
-│   │   ├── pinning.rs      # TLS certificate pinning
+│   │   ├── lib.rs          # IPC/lifecycle; TLS pinning не реализован
 │   │   └── updater.rs      # Auto-update (Ed25519-signed)
 │   └── tauri.conf.json
 │
@@ -272,7 +286,7 @@ desktop/
       → Return message_id to React
 ```
 
-**Ключи никогда не проходят через IPC.** React не видит ключей, nonce, ciphertext. Только plaintext и метаданные.
+**Производные приватные ключи не проходят через IPC.** Renderer видит plaintext и метаданные, а recovery phrase — только во время onboarding или после повторной PIN-проверки.
 
 **Функции Desktop:**
 - Системный трей (свернуть, quick reply)
@@ -526,7 +540,7 @@ Bob начинает сессию:
 Аналогичен реализации в EREZ `core/ratchet.js`, но:
 - **На Rust** — нет GC пауз, предсказуемое время выполнения
 - **XChaCha20-Poly1305** вместо XSalsa20 — больше nonce (24 байта, безопасны как random)
-- **Header encryption** — скрываем ratchet public key от сервера
+- **Header authentication** — ratchet header входит в AEAD associated data; его public key виден серверу и относится к незакрытым метаданным
 - **Out-of-order tolerance** — буфер до 1000 пропущенных сообщений (vs потенциальные проблемы в EREZ)
 
 ### 4.4 Группы: Sender Keys (улучшенные)
@@ -543,6 +557,7 @@ Bob начинает сессию:
 ```
 
 - Каждый участник имеет свой Sender Key
+- Wire v5 подписывает каждое групповое сообщение Ed25519-ключом владельца до изменения ratchet state; знание общего chain key больше не позволяет участнику подделать автора
 - При join/leave — Sender Key Rotation (новый ключ для каждого оставшегося)
 - **Отличие от EREZ**: MLS (Messaging Layer Security) в будущем для групп >50 участников
 
@@ -568,7 +583,7 @@ Bob начинает сессию:
 **Улучшения vs EREZ:**
 - Argon2id вместо PBKDF2 для пароля
 - Серверная rate-limit на попытки ввода пароля (anti-brute-force)
-- Поддержка файлов до 100MB (потоковое шифрование)
+- Текущий one-shot upload/download adapter ограничен 64 MiB; каждый chunk аутентифицирован, а plaintext-файл публикуется атомарно только после полной проверки
 - QR-код для мобильного доступа
 
 ---
@@ -760,7 +775,7 @@ veil/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs
-│       ├── connection.rs       # WebSocket + TLS pinning
+│       ├── connection.rs       # WebSocket + TLS через native OS CA roots
 │       ├── protocol.rs         # Protobuf codec
 │       ├── sync.rs             # Offline queue
 │       ├── sessions.rs         # Ratchet session mgmt
@@ -787,7 +802,7 @@ veil/
 │   │   │   ├── main.rs
 │   │   │   ├── commands.rs     # IPC bridge (thin wrappers)
 │   │   │   ├── tray.rs
-│   │   │   ├── pinning.rs      # TLS cert pinning
+│   │   │   ├── lib.rs          # IPC/lifecycle; TLS pinning не реализован
 │   │   │   └── updater.rs      # Ed25519-signed auto-update
 │   │   └── tauri.conf.json
 │   ├── src/                    # UI (React/Solid inside WebView)
@@ -871,15 +886,16 @@ veil/
 - [x] Создать monorepo, Cargo workspace (crypto + client + store + ffi)
 - [x] `veil-crypto`: keys (BIP39, Argon2id), AEAD (XChaCha20), signatures (Ed25519)
 - [x] `veil-crypto`: тесты + RFC test vectors
-- [x] `veil-crypto`: zeroize on drop, mlock для key material
+- [x] `veil-crypto`: zeroize для собственного key material
+- [ ] `veil-crypto`: mlock/VirtualLock для чувствительных страниц памяти
 - [x] `proto/`: Protobuf definitions (envelope, auth, chat, presence)
 - [x] `veil-store`: SQLCipher wrapper, keychain integration (keyring crate)
 - [x] CI: GitHub Actions (cargo test, clippy, fmt, cargo-audit)
 
 ### Phase 1: Protocol + Server MVP (2-3 недели) ✅ DONE
 - [x] `veil-crypto`: Double Ratchet + X3DH + тесты
-- [x] `veil-client`: WebSocket + TLS cert pinning + Protobuf codec
-- [x] `veil-client`: offline queue, reconnect logic
+- [x] `veil-client`: WebSocket + системная TLS-валидация + Protobuf codec
+- [ ] `veil-client`: полноценная durable offline queue и автоматический reconnect/resend
 - [x] `server/cmd/gateway`: Go WebSocket server
 - [x] `server/cmd/auth`: Ed25519 challenge-response
 - [x] `server/cmd/chat`: store-and-forward DM delivery
@@ -961,24 +977,24 @@ veil/
 
 | Атака | Web-клиент (EREZ) | Native (Veil) |
 |---|---|---|
-| **XSS** → кража ключей | ⚠️ Уязвим: ключи в JS heap | ✅ Невозможно: ключи в Rust, нет DOM |
+| **XSS** → кража ключей | ⚠️ Уязвим: ключи в JS heap | ⚠️ Приватные ключи в Rust, но renderer видит plaintext и имеет ограниченный IPC |
 | **Расширение браузера** → сниффинг | ⚠️ Читает DOM, localStorage | ✅ Нет расширений |
-| **DevTools memory dump** | ⚠️ Любой пользователь ПК | ✅ Process memory protected, mlock |
-| **CDN compromise** → подмена JS | ⚠️ Серверу доверяем при каждом открытии | ✅ Бинарник подписан Ed25519, reproducible builds |
-| **MITM при загрузке** | ⚠️ HSTS помогает, но не 100% | ✅ Certificate pinning, TLS 1.3 only |
-| **Cold boot attack** | ⚠️ Ключи в JS heap (не зануляются) | ✅ zeroize-on-drop + mlock |
-| **Скриншот/screen capture** | ⚠️ Нет защиты | ✅ FLAG_SECURE (Android), нет скриншотов |
-| **Clipboard sniffing** | ⚠️ document.execCommand доступен | ✅ Native clipboard с таймером |
-| **Keylogger в браузере** | ⚠️ JS keylogger в расширении | ✅ Нативный ввод, нет JS доступа |
+| **DevTools memory dump** | ⚠️ Любой пользователь ПК | ⚠️ Локальный администратор/отладчик остаётся вне модели доверия; mlock не реализован |
+| **CDN compromise** → подмена JS | ⚠️ Серверу доверяем при каждом открытии | ✅ UI встроен в бинарник; официальный Windows workflow fail-closed требует Authenticode-секреты |
+| **MITM при загрузке** | ⚠️ HSTS помогает, но не 100% | ⚠️ Системная TLS-проверка CA; certificate pinning и принудительный TLS 1.3 не заявляются |
+| **Cold boot attack** | ⚠️ Ключи в JS heap (не зануляются) | ⚠️ Собственные буферы зануляются, но полной защиты RAM/свопа нет |
+| **Скриншот/screen capture** | ⚠️ Нет защиты | ⚠️ Для desktop специальная защита не реализована |
+| **Clipboard sniffing** | ⚠️ document.execCommand доступен | ⚠️ Системный clipboard остаётся риском для обычного текста; встроенное копирование recovery phrase отключено из-за Windows Clipboard History/cloud sync |
+| **Keylogger в браузере** | ⚠️ JS keylogger в расширении | ⚠️ Расширений нет, но вредоносный renderer/ОС всё ещё может наблюдать ввод |
 
 ### Атаки, от которых защищаемся на уровне протокола
 
 | Атака | Защита |
 |---|---|
-| **Compromised server** | Zero-knowledge: сервер не видит plaintext |
-| **Сompromised device** | Forward secrecy: Double Ratchet обновляет ключи каждое сообщение |
-| **Future key compromise** | Post-compromise security: новый DH ratchet step после компрометации |
-| **Metadata analysis** | Sealed sender: сервер не знает отправителя |
+| **Compromised server** | Сервер не получает plaintext, но управляет маршрутизацией/директорией и видит метаданные; fingerprints нужно сверять вне канала |
+| **Сompromised device** | Double Ratchet ограничивает раскрытие прошлых DM; Sender Key раскрывает текущую групповую генерацию |
+| **Future key compromise** | DM восстанавливает безопасность после успешного нового DH-ratchet шага; для групп нужна ротация Sender Key |
+| **Metadata analysis** | Не закрыта: sealed sender пока отсутствует |
 | **Replay attack** | Sequence numbers + message keys used once |
 | **Key impersonation** | Ed25519 подписи + emoji fingerprint verification |
 
@@ -1035,7 +1051,7 @@ volumes:
 | Шифрование сообщения | ~5ms (JS NaCl) | < 0.05ms (Rust ChaCha20 native) |
 | Double Ratchet step | ~10ms (JS) | < 0.3ms (Rust native) |
 | Key storage | localStorage (plaintext!) | OS Keychain + SQLCipher |
-| Memory protection | Нет (JS GC) | mlock + zeroize-on-drop |
+| Memory protection | Нет (JS GC) | zeroize для собственных буферов; mlock/VirtualLock запланирован |
 | Attack surface (client) | XSS, extensions, devtools | Native binary only |
 | WebSocket типов | 68 (string JSON) | ~25 (binary protobuf, Rust codec) |
 | Backend LOC | 22,600 (monolith) | ~2,000 per Go service |
@@ -1050,7 +1066,9 @@ volumes:
 ## 12. Открытые Вопросы
 
 1. **Название**: Veil? Bastion? Aegis? Phantom? Твой вариант?
-2. **Лицензия**: MIT (максимальная свобода) или AGPL (защита от закрытых форков)?
+2. **Лицензия (решено 14 июля 2026):** весь монорепозиторий распространяется
+   как `AGPL-3.0-or-later`; правообладатель — NaveLIL. Название Veil и логотип
+   Phase Shift регулируются отдельно в `TRADEMARKS.md`.
 3. **Desktop UI framework**: Revolt fork (Solid.js) или custom React/Svelte?
 4. **Федерация**: Планируется ли общение между разными серверами?
 5. **Монетизация**: Self-hosted only или будет managed SaaS?

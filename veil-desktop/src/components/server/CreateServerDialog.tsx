@@ -1,6 +1,6 @@
-import { Component, createSignal, Show } from "solid-js";
+import { Component, createEffect, createSignal, Show } from "solid-js";
 import { Plus, ArrowRight, Loader2 } from "lucide-solid";
-import { appStore } from "@/stores/app";
+import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
 import { IslandDialog, dlgStyles as ds } from "@/components/ui/IslandDialog";
 
 interface Props {
@@ -16,19 +16,31 @@ export const CreateServerDialog: Component<Props> = (props) => {
   const reset = () => { setName(""); setError(""); };
   const close = () => { if (loading()) return; reset(); props.onClose(); };
 
+  createEffect(() => {
+    if (!props.open) {
+      reset();
+      setLoading(false);
+    }
+  });
+
   const handleCreate = async () => {
     const n = name().trim();
     if (!n) return;
+    const sessionEpoch = captureUiSessionEpoch();
     setLoading(true); setError("");
     try {
       const created = await appStore.createServer(n);
+      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       if (created) {
         appStore.selectServer(created.id);
         reset();
         props.onClose();
-      } else setError("Failed to create server");
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
+      } else setError("Failed to create Space");
+    } catch (e) {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setError(String(e));
+    } finally {
+      if (isUiSessionEpochCurrent(sessionEpoch)) setLoading(false);
+    }
   };
 
   const onKey = (e: KeyboardEvent) => {
@@ -41,17 +53,17 @@ export const CreateServerDialog: Component<Props> = (props) => {
     <IslandDialog
       open={props.open}
       onClose={close}
-      title="Create Server"
+      title="Create Space"
       icon={<Plus size={15} />}
-      accent="#34d399"
+      accent="var(--veil-success)"
       closeDisabled={loading()}
     >
       <div style={ds.fieldGroup}>
         <div>
-          <label style={ds.label}>Server name</label>
+          <label style={ds.label}>Space name</label>
           <input
             style={ds.input(!!error())}
-            placeholder="My Awesome Server"
+            placeholder="My Space"
             value={name()}
             onInput={(e) => { setName(e.currentTarget.value); setError(""); }}
             onKeyDown={onKey}
@@ -65,11 +77,11 @@ export const CreateServerDialog: Component<Props> = (props) => {
         </Show>
 
         <button
-          style={ds.primaryBtn(enabled(), "#34d399")}
+          style={ds.primaryBtn(enabled(), "var(--veil-success)")}
           onClick={handleCreate}
           disabled={!enabled()}
         >
-          <Show when={loading()} fallback={<>Create Server <ArrowRight size={14} /></>}>
+          <Show when={loading()} fallback={<>Create Space <ArrowRight size={14} /></>}>
             <Loader2 size={14} class="animate-spin" /> Creating…
           </Show>
         </button>

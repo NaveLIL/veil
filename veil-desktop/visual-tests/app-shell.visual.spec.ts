@@ -1,0 +1,484 @@
+import { expect, test, type Page } from "@playwright/test";
+
+async function openFixture(
+  page: Page,
+  state: "wallpaper" | "members" | "identity" | "identity-avatar" | "focus" | "lock" | "veil-link-long",
+) {
+  await page.goto(`/visual.html?state=${state}`, { waitUntil: "networkidle" });
+  await expect(page.getByTestId("app-shell")).toHaveAttribute("data-visual-state", state);
+  await expect(page.locator("#root")).toHaveAttribute("data-fixture-ready", "true");
+  const sheets = page.locator(".veil-island-sheet");
+  if (await sheets.count()) {
+    // Geometry assertions describe the settled layout. During the intentional
+    // 220 ms entrance, the fixed sheet is translated 24 px beyond the viewport
+    // and must not be mistaken for persistent document overflow.
+    await sheets.evaluateAll(async (elements) => {
+      await Promise.all(elements.flatMap((element) =>
+        element.getAnimations().map((animation) => animation.finished.catch(() => undefined))
+      ));
+    });
+  }
+}
+
+async function enterLockPinWithKeyboard(page: Page) {
+  const input = page.getByTestId("lock-pin-input");
+  const progress = page.getByRole("progressbar", { name: "PIN length" });
+  await input.focus();
+  await page.keyboard.type("1234");
+  await expect(input).toHaveValue("1234");
+  await expect(progress).toHaveAttribute("aria-valuenow", "4");
+  await expect(progress).toHaveAttribute("aria-valuemax", "12");
+  await expect(progress.locator(":scope > div")).toHaveCount(12);
+
+  await page.keyboard.type("56");
+  await page.keyboard.press("Backspace");
+  await expect(input).toHaveValue("12345");
+  await page.keyboard.type("678901");
+  await expect(input).toHaveValue("12345678901");
+  await expect(progress).toHaveAttribute("aria-valuenow", "11");
+}
+
+async function expectLockScreenGeometry(page: Page, expectedKeySize: number) {
+  await expectNoDocumentOverflow(page);
+  const screen = page.getByTestId("lock-screen");
+  const island = page.getByTestId("lock-island");
+  const progress = page.getByTestId("lock-pin-progress");
+  const numpad = page.getByTestId("lock-numpad");
+  const unlock = page.getByRole("button", { name: "Unlock", exact: true });
+  const errorStatus = page.locator("#pin-error-status");
+  await expect(island).toHaveCSS("opacity", "1");
+  await expect(unlock).toBeVisible();
+
+  const [screenBox, islandBox, progressBox, numpadBox, unlockBox, errorBox, keyBox] = await Promise.all([
+    screen.boundingBox(),
+    island.boundingBox(),
+    progress.boundingBox(),
+    numpad.boundingBox(),
+    unlock.boundingBox(),
+    errorStatus.boundingBox(),
+    page.getByRole("button", { name: "Digit 1" }).boundingBox(),
+  ]);
+  for (const box of [screenBox, islandBox, progressBox, numpadBox, unlockBox, errorBox, keyBox]) {
+    expect(box).not.toBeNull();
+  }
+  if (!screenBox || !islandBox || !progressBox || !numpadBox || !unlockBox || !errorBox || !keyBox) return;
+
+  const screenBottom = screenBox.y + screenBox.height;
+  const islandBottom = islandBox.y + islandBox.height;
+  expect(islandBox.y).toBeGreaterThanOrEqual(screenBox.y + 7);
+  expect(islandBottom).toBeLessThanOrEqual(screenBottom - 7);
+  expect(progressBox.y).toBeGreaterThanOrEqual(islandBox.y);
+  expect(numpadBox.y).toBeGreaterThan(progressBox.y + progressBox.height - 1);
+  expect(unlockBox.y).toBeGreaterThan(numpadBox.y + numpadBox.height - 1);
+  expect(errorBox.y + errorBox.height).toBeLessThanOrEqual(islandBottom + 1);
+  expect(Math.abs(keyBox.width - expectedKeySize)).toBeLessThanOrEqual(1);
+  expect(Math.abs(keyBox.height - expectedKeySize)).toBeLessThanOrEqual(1);
+
+  const overflow = await island.evaluate((element) => ({
+    horizontal: element.scrollWidth - element.clientWidth,
+    vertical: element.scrollHeight - element.clientHeight,
+  }));
+  expect(overflow.horizontal).toBeLessThanOrEqual(1);
+  expect(overflow.vertical).toBeLessThanOrEqual(1);
+}
+
+async function expectNoDocumentOverflow(page: Page) {
+  const metrics = await page.evaluate(() => ({
+    documentClientWidth: document.documentElement.clientWidth,
+    documentScrollWidth: document.documentElement.scrollWidth,
+    documentClientHeight: document.documentElement.clientHeight,
+    documentScrollHeight: document.documentElement.scrollHeight,
+    bodyClientWidth: document.body.clientWidth,
+    bodyScrollWidth: document.body.scrollWidth,
+    bodyClientHeight: document.body.clientHeight,
+    bodyScrollHeight: document.body.scrollHeight,
+  }));
+
+  expect(metrics.documentScrollWidth - metrics.documentClientWidth).toBeLessThanOrEqual(1);
+  expect(metrics.documentScrollHeight - metrics.documentClientHeight).toBeLessThanOrEqual(1);
+  expect(metrics.bodyScrollWidth - metrics.bodyClientWidth).toBeLessThanOrEqual(1);
+  expect(metrics.bodyScrollHeight - metrics.bodyClientHeight).toBeLessThanOrEqual(1);
+}
+
+async function expectComposerGeometry(page: Page) {
+  const composer = page.getByTestId("composer");
+  const input = page.getByTestId("composer-input");
+  const send = page.getByTestId("composer-send");
+  const chat = page.getByTestId("chat-island");
+  const [composerBox, inputBox, sendBox, chatBox] = await Promise.all([
+    composer.boundingBox(),
+    input.boundingBox(),
+    send.boundingBox(),
+    chat.boundingBox(),
+  ]);
+
+  expect(composerBox).not.toBeNull();
+  expect(inputBox).not.toBeNull();
+  expect(sendBox).not.toBeNull();
+  expect(chatBox).not.toBeNull();
+  if (!composerBox || !inputBox || !sendBox || !chatBox) return;
+
+  const composerRight = composerBox.x + composerBox.width;
+  const chatRight = chatBox.x + chatBox.width;
+  const composerBottom = composerBox.y + composerBox.height;
+  const chatBottom = chatBox.y + chatBox.height;
+  const composerCenter = composerBox.y + composerBox.height / 2;
+  const inputCenter = inputBox.y + inputBox.height / 2;
+  const inputBottom = inputBox.y + inputBox.height;
+  const sendBottom = sendBox.y + sendBox.height;
+
+  expect(composerBox.x - chatBox.x).toBeGreaterThanOrEqual(18);
+  expect(chatRight - composerRight).toBeGreaterThanOrEqual(18);
+  expect(chatBottom - composerBottom).toBeGreaterThanOrEqual(18);
+  expect(chatBottom - composerBottom).toBeLessThanOrEqual(22);
+  // A one-line textarea is visually centered while the action buttons retain
+  // their lower inset for predictable multiline growth.
+  expect(Math.abs(composerCenter - inputCenter)).toBeLessThanOrEqual(1);
+  expect(composerBottom - sendBottom).toBeGreaterThanOrEqual(11);
+  expect(composerBottom - sendBottom).toBeLessThanOrEqual(13);
+  expect(inputBox.y).toBeGreaterThanOrEqual(composerBox.y);
+  expect(inputBottom).toBeLessThanOrEqual(composerBottom);
+  expect(composerBox.height).toBeGreaterThanOrEqual(44);
+  expect(composerBox.width).toBeGreaterThan(260);
+}
+
+function parseCssColor(value: string) {
+  const hex = value.trim().match(/^#([0-9a-f]{6})$/i)?.[1];
+  if (hex) return hex.match(/../g)!.map((channel) => Number.parseInt(channel, 16));
+  const rgb = value.match(/rgba?\(\s*([\d.]+)[, ]+\s*([\d.]+)[, ]+\s*([\d.]+)/i);
+  if (!rgb) throw new Error(`Unsupported CSS color: ${value}`);
+  return rgb.slice(1, 4).map(Number);
+}
+
+function contrastRatio(first: string, second: string) {
+  const luminance = (color: string) => {
+    const [red, green, blue] = parseCssColor(color)
+      .map((channel) => channel / 255)
+      .map((channel) => channel <= 0.03928 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * red + 0.7152 * green + 0.0722 * blue;
+  };
+  const a = luminance(first);
+  const b = luminance(second);
+  return (Math.max(a, b) + 0.05) / (Math.min(a, b) + 0.05);
+}
+
+test("local wallpaper covers the AppShell without shifting its islands", async ({ page }) => {
+  await openFixture(page, "wallpaper");
+  await expectNoDocumentOverflow(page);
+  await expectComposerGeometry(page);
+
+  const wallpaper = page.getByTestId("wallpaper-layer");
+  const wallpaperStyle = await wallpaper.evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      backgroundImage: style.backgroundImage,
+      backgroundSize: style.backgroundSize,
+      backgroundPosition: style.backgroundPosition,
+    };
+  });
+  expect(wallpaperStyle.backgroundImage).toContain("wallpaper.svg");
+  expect(wallpaperStyle.backgroundSize).toBe("cover");
+  expect(wallpaperStyle.backgroundPosition).toBe("50% 50%");
+
+  const hostBox = await page.getByTestId("wallpaper-host").boundingBox();
+  const viewport = page.viewportSize();
+  expect(hostBox).not.toBeNull();
+  expect(viewport).not.toBeNull();
+  if (hostBox && viewport) {
+    expect(Math.abs(hostBox.width - viewport.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(hostBox.height - viewport.height)).toBeLessThanOrEqual(1);
+  }
+
+  await expect(page).toHaveScreenshot("app-shell-wallpaper.png");
+});
+
+test("sending with a wallpaper scrolls only the message viewport", async ({ page }) => {
+  await openFixture(page, "wallpaper");
+  const composer = page.getByTestId("composer");
+  const input = page.getByTestId("composer-input");
+  const chat = page.getByTestId("chat-island");
+  const before = await Promise.all([composer.boundingBox(), chat.boundingBox()]);
+
+  await input.fill("Viewport regression message");
+  await page.getByRole("button", { name: "Send message" }).click();
+
+  await expect(page.getByText("Viewport regression message")).toBeVisible();
+  await expect(input).toHaveValue("");
+  await expectNoDocumentOverflow(page);
+  await expectComposerGeometry(page);
+
+  const after = await Promise.all([composer.boundingBox(), chat.boundingBox()]);
+  expect(after).toEqual(before);
+  const scrollState = await page.evaluate(() => ({
+    windowX: window.scrollX,
+    windowY: window.scrollY,
+    documentTop: document.documentElement.scrollTop,
+    bodyTop: document.body.scrollTop,
+  }));
+  expect(scrollState).toEqual({ windowX: 0, windowY: 0, documentTop: 0, bodyTop: 0 });
+});
+
+test("multiline composer grows while its actions stay bottom aligned", async ({ page }) => {
+  await openFixture(page, "wallpaper");
+  const composer = page.getByTestId("composer");
+  const input = page.getByTestId("composer-input");
+  const send = page.getByTestId("composer-send");
+  const initialComposer = await composer.boundingBox();
+
+  await input.fill("First line\nSecond line\nThird line");
+  await expect.poll(async () => (await composer.boundingBox())?.height ?? 0)
+    .toBeGreaterThan(initialComposer?.height ?? 0);
+  const [composerBox, inputBox, sendBox] = await Promise.all([
+    composer.boundingBox(),
+    input.boundingBox(),
+    send.boundingBox(),
+  ]);
+
+  expect(initialComposer).not.toBeNull();
+  expect(composerBox).not.toBeNull();
+  expect(inputBox).not.toBeNull();
+  expect(sendBox).not.toBeNull();
+  if (!initialComposer || !composerBox || !inputBox || !sendBox) return;
+
+  const composerBottom = composerBox.y + composerBox.height;
+  const inputBottom = inputBox.y + inputBox.height;
+  const sendBottom = sendBox.y + sendBox.height;
+  expect(composerBox.height).toBeGreaterThan(initialComposer.height);
+  expect(inputBox.height).toBeGreaterThan(32);
+  expect(Math.abs(inputBottom - sendBottom)).toBeLessThanOrEqual(1);
+  expect(composerBottom - sendBottom).toBeGreaterThanOrEqual(11);
+  expect(composerBottom - sendBottom).toBeLessThanOrEqual(13);
+  await expectNoDocumentOverflow(page);
+});
+
+test("theme tokens preserve readable small text and accent labels", async ({ page }) => {
+  await openFixture(page, "wallpaper");
+  for (const theme of [null, "midnight", "ocean", "forest", "oled"] as const) {
+    const tokens = await page.evaluate((selectedTheme) => {
+      if (selectedTheme) document.documentElement.dataset.veilTheme = selectedTheme;
+      else delete document.documentElement.dataset.veilTheme;
+      const style = getComputedStyle(document.documentElement);
+      const read = (name: string) => style.getPropertyValue(name).trim();
+      return {
+        faint: read("--veil-text-faint"),
+        muted: read("--veil-text-muted"),
+        onAccent: read("--veil-on-accent"),
+        accent: read("--veil-accent"),
+        surfaces: [
+          read("--veil-window"),
+          read("--veil-island"),
+          read("--veil-surface-raised"),
+          read("--veil-composer"),
+          read("--veil-control"),
+        ],
+      };
+    }, theme);
+
+    for (const surface of tokens.surfaces) {
+      expect(contrastRatio(tokens.faint, surface), `${theme ?? "veil"}: faint`).toBeGreaterThanOrEqual(4.5);
+      expect(contrastRatio(tokens.muted, surface), `${theme ?? "veil"}: muted`).toBeGreaterThanOrEqual(4.5);
+    }
+    expect(contrastRatio(tokens.onAccent, tokens.accent), `${theme ?? "veil"}: on-accent`).toBeGreaterThanOrEqual(4.5);
+  }
+});
+
+test("members island becomes a focus-trapped sheet below the four-column breakpoint", async ({ page }) => {
+  await openFixture(page, "members");
+  await expectNoDocumentOverflow(page);
+  await expectComposerGeometry(page);
+
+  const identityPhaseprints = page.locator("[data-phaseprint-seed-kind='identity-key']");
+  expect(await identityPhaseprints.count()).toBeGreaterThanOrEqual(7);
+  await expect(identityPhaseprints.first()).toBeVisible();
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  if (viewport && viewport.width <= 1080) {
+    const sheet = page.getByRole("dialog", { name: /Members/ });
+    await expect(sheet).toBeVisible();
+    const sheetBox = await sheet.boundingBox();
+    expect(sheetBox).not.toBeNull();
+    if (sheetBox) expect(Math.abs(sheetBox.x + sheetBox.width - viewport.width)).toBeLessThanOrEqual(1);
+    await page.keyboard.press("Tab");
+    expect(await sheet.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+  } else {
+    const wrapper = page.getByRole("complementary", { name: "Conversation members" });
+    await expect(wrapper).toHaveAttribute("aria-hidden", "false");
+    const [chatBox, membersBox] = await Promise.all([
+      page.getByTestId("chat-island").boundingBox(),
+      wrapper.boundingBox(),
+    ]);
+    expect(chatBox).not.toBeNull();
+    expect(membersBox).not.toBeNull();
+    if (chatBox && membersBox) {
+      expect(Math.abs(membersBox.width - 240)).toBeLessThanOrEqual(1);
+      expect(membersBox.x - (chatBox.x + chatBox.width)).toBeGreaterThanOrEqual(7);
+    }
+  }
+
+  await expect(page).toHaveScreenshot("app-shell-members.png");
+});
+
+test("identity island keeps proof language and responsive geometry calm", async ({ page }) => {
+  await openFixture(page, "identity");
+  await expectNoDocumentOverflow(page);
+  await expectComposerGeometry(page);
+  await expect(page.getByRole("heading", { name: "Person" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Context" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Identity Proof" })).toBeVisible();
+  await expect(page.getByText("Not compared")).toBeVisible();
+  await expect(page.getByText(/^Verified$/i)).toHaveCount(0);
+
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  if (viewport && viewport.width <= 1080) {
+    await expect(page.getByRole("dialog", { name: "Identity" })).toBeVisible();
+  } else {
+    const island = page.getByRole("complementary", { name: "Identity" });
+    const box = await island.boundingBox();
+    expect(box).not.toBeNull();
+    if (box) expect(Math.abs(box.width - 288)).toBeLessThanOrEqual(1);
+  }
+
+  await expect(page).toHaveScreenshot("app-shell-identity.png");
+});
+
+test("a single avatar action fills its row without leaving a dead column", async ({ page }) => {
+  await openFixture(page, "identity-avatar");
+  const changeAvatar = page.getByRole("button", { name: "Change avatar" });
+  const actions = page.locator(".veil-identity-avatar-actions");
+  const personBody = page.locator(".veil-identity-person-body");
+  await expect(changeAvatar).toBeVisible();
+  await expect(actions.getByRole("button")).toHaveCount(1);
+  const [personBodyBox, actionsBox, buttonBox] = await Promise.all([
+    personBody.boundingBox(),
+    actions.boundingBox(),
+    changeAvatar.boundingBox(),
+  ]);
+  expect(personBodyBox).not.toBeNull();
+  expect(actionsBox).not.toBeNull();
+  expect(buttonBox).not.toBeNull();
+  if (personBodyBox && actionsBox && buttonBox) {
+    expect(Math.abs(personBodyBox.width - actionsBox.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(personBodyBox.x - actionsBox.x)).toBeLessThanOrEqual(1);
+    expect(Math.abs(actionsBox.width - buttonBox.width)).toBeLessThanOrEqual(1);
+    expect(Math.abs(actionsBox.x - buttonBox.x)).toBeLessThanOrEqual(1);
+  }
+  await expectNoDocumentOverflow(page);
+});
+
+test("composer focus ring follows the full composer geometry", async ({ page }) => {
+  await openFixture(page, "focus");
+  const input = page.getByTestId("composer-input");
+  await input.focus();
+  await expect(input).toBeFocused();
+  await expectNoDocumentOverflow(page);
+  await expectComposerGeometry(page);
+
+  const focusStyle = await page.getByTestId("composer").evaluate((element) => {
+    const style = getComputedStyle(element);
+    return {
+      outlineColor: style.outlineColor,
+      outlineStyle: style.outlineStyle,
+      outlineWidth: style.outlineWidth,
+    };
+  });
+  expect(focusStyle.outlineStyle).toBe("solid");
+  expect(Number.parseFloat(focusStyle.outlineWidth)).toBeGreaterThanOrEqual(2);
+  expect(focusStyle.outlineColor).not.toBe("rgba(0, 0, 0, 0)");
+
+  await expect(page).toHaveScreenshot("app-shell-composer-focus.png");
+});
+
+test("production Veil Link dialog contains exact-boundary text without trapping its actions", async ({ page }) => {
+  await openFixture(page, "veil-link-long");
+
+  const dialog = page.getByRole("dialog", { name: "Veil Link" });
+  const details = page.getByRole("region", { name: "Veil Link invitation details" });
+  const actions = page.getByRole("group", { name: "Veil Link actions" });
+  const cancel = page.getByRole("button", { name: "Cancel", exact: true });
+  const join = page.getByRole("button", { name: "Join Space", exact: true });
+  const close = page.getByRole("button", { name: "Close Veil Link", exact: true });
+
+  await expect(dialog).toBeVisible();
+  await expect(details).toBeVisible();
+  await expect(actions).toBeVisible();
+  await expect(cancel).toBeVisible();
+  await expect(join).toBeVisible();
+  await expect(join).toBeEnabled();
+  await expect(page.getByText("https://visual.veil.test:443", { exact: true })).toBeVisible();
+  await expect(page.getByText(`Capability ref ${"cd".repeat(6)}`, { exact: true })).toBeVisible();
+  expect(await dialog.evaluate((element) => element.closest("#island-portal") !== null)).toBe(true);
+
+  await dialog.evaluate(async (element) => {
+    await Promise.all(element.getAnimations().map((animation) => animation.finished.catch(() => undefined)));
+  });
+  await expectNoDocumentOverflow(page);
+
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  const [dialogBox, detailsBox, actionsBox, cancelBox, joinBox] = await Promise.all([
+    dialog.boundingBox(),
+    details.boundingBox(),
+    actions.boundingBox(),
+    cancel.boundingBox(),
+    join.boundingBox(),
+  ]);
+  for (const box of [dialogBox, detailsBox, actionsBox, cancelBox, joinBox]) expect(box).not.toBeNull();
+  if (viewport && dialogBox && detailsBox && actionsBox && cancelBox && joinBox) {
+    for (const box of [dialogBox, actionsBox, cancelBox, joinBox]) {
+      expect(box.x).toBeGreaterThanOrEqual(-1);
+      expect(box.y).toBeGreaterThanOrEqual(-1);
+      expect(box.x + box.width).toBeLessThanOrEqual(viewport.width + 1);
+      expect(box.y + box.height).toBeLessThanOrEqual(viewport.height + 1);
+    }
+    const detailsBottom = detailsBox.y + detailsBox.height;
+    expect(actionsBox.y).toBeGreaterThanOrEqual(detailsBottom - 1);
+    expect(cancelBox.y).toBeGreaterThanOrEqual(detailsBottom - 1);
+    expect(joinBox.y).toBeGreaterThanOrEqual(detailsBottom - 1);
+  }
+
+  const detailsOverflow = await details.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+  }));
+  expect(detailsOverflow.scrollWidth - detailsOverflow.clientWidth).toBeLessThanOrEqual(1);
+  expect(detailsOverflow.scrollHeight).toBeGreaterThan(detailsOverflow.clientHeight);
+
+  await details.focus();
+  await expect(details).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(cancel).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(join).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(close).toBeFocused();
+  expect(await dialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+  await page.keyboard.press("Shift+Tab");
+  await expect(join).toBeFocused();
+});
+
+test.describe("LockScreen minimum-window geometry", () => {
+  test.beforeEach(async ({}, testInfo) => {
+    test.skip(
+      testInfo.project.name !== "app-shell-800x600",
+      "The two explicit LockScreen viewports run once in the minimum-window project.",
+    );
+  });
+
+  test("fits the 800x600 native minimum after the titlebar", async ({ page }) => {
+    await openFixture(page, "lock");
+    await enterLockPinWithKeyboard(page);
+    await expectLockScreenGeometry(page, 48);
+    await expect(page).toHaveScreenshot("lock-screen-800x600.png");
+  });
+
+  test("fits the 125-percent equivalent viewport without internal scrolling", async ({ page }) => {
+    await page.setViewportSize({ width: 640, height: 480 });
+    await openFixture(page, "lock");
+    await enterLockPinWithKeyboard(page);
+    await expectLockScreenGeometry(page, 38);
+    await expect(page).toHaveScreenshot("lock-screen-125-percent.png");
+  });
+});

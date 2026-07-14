@@ -2,6 +2,7 @@ use argon2::{self, Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
+use zeroize::Zeroize;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -138,7 +139,7 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
 /// and rotate explicitly. Compromise of `K_push` reveals only push
 /// previews, never live ratchet state.
 pub fn derive_push_key(root_key: &[u8; 32], conversation_id: &[u8]) -> [u8; 32] {
-    let okm = hkdf_sha256(
+    let mut okm = hkdf_sha256(
         b"veil/push/v1/salt",
         root_key,
         &[b"veil/push/v1/info|", conversation_id].concat(),
@@ -146,6 +147,7 @@ pub fn derive_push_key(root_key: &[u8; 32], conversation_id: &[u8]) -> [u8; 32] 
     );
     let mut out = [0u8; 32];
     out.copy_from_slice(&okm);
+    okm.zeroize();
     out
 }
 
@@ -222,7 +224,10 @@ mod tests {
         let k_a2 = derive_push_key(&root, b"conv-A");
         let k_b = derive_push_key(&root, b"conv-B");
         assert_eq!(k_a, k_a2, "same (root, conv) must produce same K_push");
-        assert_ne!(k_a, k_b, "different conversation_id must produce different K_push");
+        assert_ne!(
+            k_a, k_b,
+            "different conversation_id must produce different K_push"
+        );
         // Domain separation: derive_push_key must not equal a plain
         // hkdf_sha256 with no domain prefix.
         let plain = hkdf_sha256(&[], &root, b"conv-A", 32);

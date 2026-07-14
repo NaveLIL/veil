@@ -1,4 +1,5 @@
 package uploads
+
 import (
 	"context"
 	"errors"
@@ -6,28 +7,60 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/AegisSec/veil-server/internal/db"
+	"github.com/NaveLIL/veil/veil-server/internal/db"
 	tusd "github.com/tus/tusd/v2/pkg/handler"
 )
 
 // fakeStore is an in-memory implementation of Store used by hook tests.
 type fakeStore struct {
-	mu      sync.Mutex
-	rows    map[string]*db.TusUpload
-	failSum bool
+	mu              sync.Mutex
+	rows            map[string]*db.TusUpload
+	downloadAllowed map[string]map[string]bool
+	failSum         bool
+	failFinish      bool
 }
 
-func newFakeStore() *fakeStore { return &fakeStore{rows: map[string]*db.TusUpload{}} }
+func newFakeStore() *fakeStore {
+	return &fakeStore{
+		rows:            map[string]*db.TusUpload{},
+		downloadAllowed: map[string]map[string]bool{},
+	}
+}
 
 func (f *fakeStore) CreateTusUpload(_ context.Context, fileID, userID string, sz int64, backend string, exp time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if _, ok := f.rows[fileID]; ok {
+		return errors.New("duplicate")
+	}
+	f.rows[fileID] = &db.TusUpload{
+		ID: fileID, UserID: userID, SizeBytes: sz, Backend: backend,
+		CreatedAt: time.Now(), ExpiresAt: exp,
+	}
+	return nil
+}
+func (f *fakeStore) ReserveTusUpload(_ context.Context, fileID, userID string, sz int64, backend string, exp, _ time.Time, maxBytes int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failSum {
+		return errors.New("boom")
+	}
+	var used int64
+	for _, row := range f.rows {
+		if row.UserID == userID {
+			used += row.SizeBytes
+		}
+	}
+	if sz <= 0 || maxBytes < sz || used > maxBytes-sz {
+		return db.ErrTusQuotaExceeded
+	}
+	if _, exists := f.rows[fileID]; exists {
 		return errors.New("duplicate")
 	}
 	f.rows[fileID] = &db.TusUpload{
@@ -47,6 +80,9 @@ func (f *fakeStore) BumpTusReceivedBytes(_ context.Context, fileID string, n int
 func (f *fakeStore) FinishTusUpload(_ context.Context, fileID string, retainUntil time.Time) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.failFinish {
+		return errors.New("finish failed")
+	}
 	r, ok := f.rows[fileID]
 	if !ok {
 		return errors.New("not found")
@@ -79,6 +115,15 @@ func (f *fakeStore) GetTusUpload(_ context.Context, fileID string) (*db.TusUploa
 		return nil, errors.New("not found")
 	}
 	return r, nil
+}
+func (f *fakeStore) CanDownloadTusUpload(_ context.Context, fileID, userID string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	r := f.rows[fileID]
+	if r == nil {
+		return false, errors.New("not found")
+	}
+	return r.UserID == userID || f.downloadAllowed[fileID][userID], nil
 }
 func (f *fakeStore) ListExpiredTusUploads(_ context.Context, before time.Time, _ int) ([]db.TusUpload, error) {
 	f.mu.Lock()
@@ -120,8 +165,8 @@ func defaultCfg() Config {
 		LocalDir:             "/tmp/veil-tests",
 		BasePath:             "/v1/uploads/files/",
 		MaxUploadSize:        10 * 1024 * 1024,
-		QuotaWindow:           time.Hour,
-		UserDailyQuota:        1024 * 1024,
+		QuotaWindow:          time.Hour,
+		UserDailyQuota:       1024 * 1024,
 		RetentionAfterFinish: time.Hour,
 		AbortAfterIdle:       10 * time.Minute,
 		SweepInterval:        time.Minute,
@@ -165,6 +210,39 @@ func TestPreCreate_QuotaGate(t *testing.T) {
 	}
 }
 
+func TestPreCreate_QuotaReservationIsAtomic(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.UserDailyQuota = 1000
+	store := newFakeStore()
+	h := newHooks(store, cfg)
+	start := make(chan struct{})
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _, err := h.PreCreate(newHookEvent("alice", 600))
+			errs <- err
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	accepted, rejected := 0, 0
+	for err := range errs {
+		if err == nil {
+			accepted++
+		} else {
+			rejected++
+		}
+	}
+	if accepted != 1 || rejected != 1 {
+		t.Fatalf("atomic quota results accepted=%d rejected=%d", accepted, rejected)
+	}
+}
+
 func TestPreCreate_RejectsOversize(t *testing.T) {
 	cfg := defaultCfg()
 	cfg.MaxUploadSize = 500
@@ -192,6 +270,20 @@ func TestPreFinish_PromotesRetention(t *testing.T) {
 	}
 	if row.ReceivedBytes != row.SizeBytes {
 		t.Fatalf("received != size after finish: %d vs %d", row.ReceivedBytes, row.SizeBytes)
+	}
+}
+
+func TestPreFinish_FailsClosedWhenBookkeepingFails(t *testing.T) {
+	store := newFakeStore()
+	store.failFinish = true
+	h := newHooks(store, defaultCfg())
+	_, err := h.PreFinish(tusd.HookEvent{Upload: tusd.FileInfo{ID: strings.Repeat("a", 32)}})
+	if err == nil {
+		t.Fatal("finish bookkeeping failure was acknowledged")
+	}
+	var tusErr tusd.Error
+	if !errors.As(err, &tusErr) || tusErr.HTTPResponse.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("finish error = %#v, want tus 500", err)
 	}
 }
 
@@ -268,5 +360,107 @@ func TestBearerMiddlewareRejectsBadToken(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("want 401, got %d", rec.Code)
+	}
+}
+
+func TestTusMutationRequiresUploadOwner(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.LocalDir = t.TempDir()
+	key, _ := keyFromString("0123456789abcdef0123456789abcdef")
+	store := newFakeStore()
+	fileID := strings.Repeat("a", 32)
+	store.rows[fileID] = &db.TusUpload{
+		ID: fileID, UserID: "alice", SizeBytes: 16,
+		CreatedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+	}
+	svc, err := New(cfg, key, store, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	svc.RegisterRoutes(mux, nil, nil)
+	bobToken, _, err := IssueToken(key, "bob", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, method := range []string{http.MethodHead, http.MethodPatch, http.MethodDelete} {
+		req := httptest.NewRequest(method, cfg.BasePath+fileID, nil)
+		req.Header.Set("Authorization", "Bearer "+bobToken)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s foreign upload status = %d, want 403", method, rec.Code)
+		}
+	}
+	concat := httptest.NewRequest(http.MethodPost, cfg.BasePath, nil)
+	concat.Header.Set("Authorization", "Bearer "+bobToken)
+	concat.Header.Set("Tus-Resumable", "1.0.0")
+	concat.Header.Set("Upload-Concat", "final;"+cfg.BasePath+fileID)
+	concatResponse := httptest.NewRecorder()
+	mux.ServeHTTP(concatResponse, concat)
+	if concatResponse.Code == http.StatusCreated {
+		t.Fatalf("disabled concatenation cloned a foreign upload: status=%d body=%q", concatResponse.Code, concatResponse.Body.String())
+	}
+	store.mu.Lock()
+	rowCount := len(store.rows)
+	store.mu.Unlock()
+	if rowCount != 1 {
+		t.Fatalf("concatenation created an authorization row: count=%d", rowCount)
+	}
+}
+
+func TestDownloadAllowsAuthorizedRecipientAndRejectsExpiredBlob(t *testing.T) {
+	cfg := defaultCfg()
+	cfg.LocalDir = t.TempDir()
+	key, _ := keyFromString("0123456789abcdef0123456789abcdef")
+	store := newFakeStore()
+	fileID := strings.Repeat("b", 32)
+	now := time.Now()
+	store.rows[fileID] = &db.TusUpload{
+		ID: fileID, UserID: "alice", SizeBytes: 10, ReceivedBytes: 10,
+		CreatedAt: now, FinishedAt: &now, ExpiresAt: now.Add(time.Hour),
+	}
+	store.downloadAllowed[fileID] = map[string]bool{"bob": true}
+	if err := os.WriteFile(cfg.LocalDir+string(os.PathSeparator)+fileID, []byte("ciphertext"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	svc, err := New(cfg, key, store, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	svc.RegisterRoutes(mux, nil, nil)
+	ownerToken, _, err := IssueToken(key, "alice", time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tusRequest := httptest.NewRequest(http.MethodGet, cfg.BasePath+fileID, nil)
+	tusRequest.Header.Set("Authorization", "Bearer "+ownerToken)
+	tusResponse := httptest.NewRecorder()
+	mux.ServeHTTP(tusResponse, tusRequest)
+	if tusResponse.Code == http.StatusOK || tusResponse.Body.String() == "ciphertext" {
+		t.Fatalf("stock tus GET bypassed blob ACL: status=%d body=%q", tusResponse.Code, tusResponse.Body.String())
+	}
+
+	request := func(user string) *httptest.ResponseRecorder {
+		token, _, issueErr := IssueToken(key, user, time.Hour)
+		if issueErr != nil {
+			t.Fatal(issueErr)
+		}
+		req := httptest.NewRequest(http.MethodGet, "/v1/uploads/blob/"+fileID, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := request("bob"); rec.Code != http.StatusOK || rec.Body.String() != "ciphertext" {
+		t.Fatalf("authorized recipient status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if rec := request("mallory"); rec.Code != http.StatusForbidden {
+		t.Fatalf("unrelated caller status=%d, want 403", rec.Code)
+	}
+	store.rows[fileID].ExpiresAt = time.Now().Add(-time.Second)
+	if rec := request("alice"); rec.Code != http.StatusNotFound {
+		t.Fatalf("expired uploader download status=%d, want 404", rec.Code)
 	}
 }

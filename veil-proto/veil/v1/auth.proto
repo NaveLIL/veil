@@ -1,7 +1,7 @@
 syntax = "proto3";
 package veil.v1;
 
-option go_package = "github.com/AegisSec/veil-server/pkg/proto/v1";
+option go_package = "github.com/NaveLIL/veil/veil-server/pkg/proto/v1";
 
 // Сервер отправляет challenge при подключении
 message AuthChallenge {
@@ -16,6 +16,8 @@ message AuthResponse {
   bytes device_id = 4;       // Unique device ID (16 bytes UUID)
   string device_name = 5;    // Human-readable: "Pixel 9", "MacBook Pro"
   string client_version = 6; // "veil-desktop/1.0.0"
+  DeviceBindingV1 device_binding = 7; // Present only for cryptographic per-device auth.
+  bytes device_signature = 8;         // Ed25519 signature over veil-device-auth-v1 preimage.
 }
 
 // Результат аутентификации
@@ -23,6 +25,60 @@ message AuthResult {
   bool success = 1;
   optional string user_id = 2;
   optional string error_message = 3;
+  bool per_device_secure = 4;
+  uint64 device_binding_version = 5;
+  DeviceBindingStatus device_binding_status = 6;
+}
+
+// Bit values carried in DeviceBindingV1.capabilities. Values may be ORed.
+enum DeviceCapability {
+  DEVICE_CAPABILITY_UNSPECIFIED = 0;
+  DEVICE_CAPABILITY_SENDER_KEY_V5 = 1;
+  DEVICE_CAPABILITY_SEALED_SKDM_V3 = 2;
+}
+
+enum DeviceBindingStatus {
+  DEVICE_BINDING_STATUS_UNSPECIFIED = 0;
+  DEVICE_BINDING_STATUS_ACTIVE = 1;
+  DEVICE_BINDING_STATUS_EXCLUDED = 2;
+  DEVICE_BINDING_STATUS_REVOKED = 3;
+  // Response-only transitional state. It is never a valid signed binding.
+  DEVICE_BINDING_STATUS_LEGACY_UNBOUND = 4;
+}
+
+// Account-authorized immutable version of one cryptographic device binding.
+// device_id is the existing stable 16-byte device identifier. Key replacement
+// requires a new device_id; later versions may change only capabilities/status.
+message DeviceBindingV1 {
+  bytes device_id = 1;           // 16 bytes
+  bytes device_identity_key = 2; // X25519 public key, 32 bytes
+  bytes device_signing_key = 3;  // Ed25519 public key, 32 bytes
+  uint64 version = 4;            // 1..2^63-1; advances exactly by one
+  uint64 capabilities = 5;       // DeviceCapability mask; bit 63 is reserved
+  DeviceBindingStatus status = 6;
+  bytes account_signature = 7;   // Account Ed25519 signature, 64 bytes
+}
+
+message DeviceDirectoryEntry {
+  string user_id = 1;
+  string username = 2;
+  bytes device_id = 3;
+  optional DeviceBindingV1 binding = 4;
+  bool eligible = 5;
+  optional string exclusion_reason = 6;
+  bytes account_identity_key = 7; // Account X25519 public key, 32 bytes
+  bytes account_signing_key = 8;  // Account Ed25519 public key, 32 bytes
+}
+
+message ConversationDeviceDirectory {
+  string conversation_id = 1;
+  uint64 roster_version = 2;
+  bytes roster_commitment = 3;
+  bool ready = 4;
+  optional string reason = 5;
+  uint64 required_capabilities = 6;
+  repeated string member_user_ids = 7;
+  repeated DeviceDirectoryEntry devices = 8;
 }
 
 // Регистрация нового устройства (link existing account)

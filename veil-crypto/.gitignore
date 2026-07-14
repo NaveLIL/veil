@@ -1,1 +1,3 @@
-target/\n*.swp\n.DS_Store
+target/
+*.swp
+.DS_Store

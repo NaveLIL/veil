@@ -22,7 +22,7 @@ export const Island: Component<IslandProps> = (inProps) => {
       class={cn(
         "bg-island rounded-xl overflow-hidden flex flex-col",
         "border border-white/[0.04]",
-        "shadow-[inset_0_1px_0_rgba(255,255,255,0.03)]",
+        "shadow-[inset_0_1px_0_var(--veil-contrast-03)]",
         local.class,
       )}
       {...rest}
