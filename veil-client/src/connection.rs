@@ -35,6 +35,10 @@ const MAX_EVENT_ID_BYTES: usize = 256;
 const MAX_EVENT_CIPHERTEXT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_HEADER_BYTES: usize = 512;
 
+fn client_version(device_name: &str) -> String {
+    format!("{device_name}/{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// Configuration for the WebSocket connection.
 pub struct ConnectionConfig {
     pub server_url: String,
@@ -439,7 +443,7 @@ impl Connection {
                     signature: sig.to_vec(),
                     device_id: binding.device_id.to_vec(),
                     device_name: device_name.to_string(),
-                    client_version: "veil-desktop/0.1.0".to_string(),
+                    client_version: client_version(device_name),
                     device_binding: Some(proto::DeviceBindingV1 {
                         device_id: binding.device_id.to_vec(),
                         device_identity_key: binding.device_identity_key.to_vec(),
@@ -679,14 +683,22 @@ impl Drop for Connection {
 #[allow(clippy::items_after_test_module)]
 mod url_policy_tests {
     use super::{
-        signal_disconnected, validate_per_device_auth_result, validate_websocket_url,
-        websocket_auth_signature, Connection, ConnectionEvent,
+        client_version, signal_disconnected, validate_per_device_auth_result,
+        validate_websocket_url, websocket_auth_signature, Connection, ConnectionEvent,
     };
     use crate::device_identity::{
         DeviceBindingPublicV1, DEVICE_BINDING_STATUS_ACTIVE, REQUIRED_DEVICE_CAPABILITIES,
     };
     use crate::protocol::proto;
     use veil_crypto::keys::IdentityKeyPair;
+
+    #[test]
+    fn client_version_tracks_the_compiled_engine_version() {
+        assert_eq!(
+            client_version("veil-desktop"),
+            concat!("veil-desktop/", env!("CARGO_PKG_VERSION"))
+        );
+    }
 
     #[test]
     fn permits_secure_and_loopback_websocket_urls() {

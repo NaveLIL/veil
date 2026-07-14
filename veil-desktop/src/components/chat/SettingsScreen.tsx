@@ -58,7 +58,7 @@ export const SettingsScreen: Component = () => {
   const [section, setSection] = createSignal<Section>("profile");
   const [entering, setEntering] = createSignal(true);
   const [copied, setCopied] = createSignal("");
-  const [appVersion, setAppVersion] = createSignal("0.1.0");
+  const [appVersion, setAppVersion] = createSignal("unavailable");
   const [repositoryError, setRepositoryError] = createSignal("");
   const timers = new Set<ReturnType<typeof setTimeout>>();
   let closing = false;

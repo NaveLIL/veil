@@ -56,7 +56,8 @@ jobs:
           package_version="$(jq -r .version veil-desktop/package.json)"
           tauri_version="$(jq -r .version veil-desktop/src-tauri/tauri.conf.json)"
           cargo_version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' veil-desktop/src-tauri/Cargo.toml | head -n 1)"
-          for actual in "$package_version" "$tauri_version" "$cargo_version"; do
+          client_version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' veil-client/Cargo.toml | head -n 1)"
+          for actual in "$package_version" "$tauri_version" "$cargo_version" "$client_version"; do
             if [[ "$actual" != "$version" ]]; then
               echo "Tag version $version does not match desktop version $actual" >&2
               exit 1
@@ -82,8 +83,16 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
             librsvg2-dev \
-            pkg-config \
-            protobuf-compiler
+            pkg-config
+
+      - name: Set up pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Protocol Buffers compiler
+        run: protoc --version
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -163,8 +172,16 @@ jobs:
             librsvg2-dev \
             patchelf \
             pkg-config \
-            protobuf-compiler \
             wget
+
+      - name: Set up pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Protocol Buffers compiler
+        run: protoc --version
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -285,6 +302,15 @@ jobs:
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Protocol Buffers compiler
+        run: protoc --version
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
