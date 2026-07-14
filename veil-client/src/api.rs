@@ -1833,7 +1833,21 @@ impl VeilClient {
         plaintext: &str,
         reply_to_id: Option<&str>,
     ) -> Result<u64, String> {
-        if plaintext.is_empty() {
+        self.send_message_with_attachments(conversation_id, plaintext, reply_to_id, Vec::new())
+            .await
+    }
+
+    /// Send text and zero or more already-uploaded encrypted attachments.
+    /// Attachment keys and private metadata are sealed into the same E2EE
+    /// payload; the gateway receives only descriptor commitments.
+    pub async fn send_message_with_attachments(
+        &mut self,
+        conversation_id: &str,
+        plaintext: &str,
+        reply_to_id: Option<&str>,
+        attachments: Vec<crate::attachments::OutgoingAttachmentV1>,
+    ) -> Result<u64, String> {
+        if plaintext.is_empty() && attachments.is_empty() {
             return Err("message plaintext must not be empty".to_string());
         }
         if plaintext.len() > MAX_PLAINTEXT_BYTES {
@@ -1844,6 +1858,28 @@ impl VeilClient {
         if self.connection.is_none() {
             return Err("not connected".to_string());
         }
+        let (encrypted_plaintext, wire_attachments, stored_attachments) =
+            if attachments.is_empty() {
+                (
+                    Zeroizing::new(plaintext.to_string()),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            } else {
+                let (payload, wire, stored) =
+                    crate::attachments::build_outgoing_attachment_message_v1(
+                        conversation_id,
+                        plaintext,
+                        attachments,
+                    )?;
+                (
+                    Zeroizing::new(String::from_utf8(payload.to_vec()).map_err(|_| {
+                        "attachment payload is not valid protocol UTF-8".to_string()
+                    })?),
+                    wire,
+                    stored,
+                )
+            };
         let seq = self
             .connection
             .as_ref()
@@ -1852,7 +1888,8 @@ impl VeilClient {
             .await;
 
         // Encrypt first (needs mutable borrow)
-        let (ciphertext, header_bytes) = self.encrypt_outgoing(conversation_id, plaintext)?;
+        let (ciphertext, header_bytes) =
+            self.encrypt_outgoing(conversation_id, &encrypted_plaintext)?;
         let initial_peer = (header_bytes.first() == Some(&HEADER_INITIAL))
             .then(|| self.dm_conversations.get(conversation_id).copied())
             .flatten();
@@ -1866,12 +1903,13 @@ impl VeilClient {
             .map_err(|_| "local message timestamp exceeds i64".to_string())?;
 
         if let Some(db) = self.db.as_ref() {
-            db.insert_outgoing_pending_message(
+            db.insert_outgoing_pending_message_with_attachments(
                 &local_message_id,
                 conversation_id,
                 &our_key,
                 plaintext,
                 reply_to_id,
+                &stored_attachments,
             )?;
             match db.resolve_account_by_conversation_sender(conversation_id, &our_key) {
                 Ok(Some(author_snapshot)) => {
@@ -1897,19 +1935,21 @@ impl VeilClient {
                 }
             }
         }
-        if let Some(indexer) = self.indexer.as_ref() {
-            if let Err(error) = indexer.index_message(
-                &local_message_id,
-                conversation_id,
-                &hex::encode(our_key),
-                plaintext,
-                local_timestamp,
-            ) {
-                if let Some(db) = self.db.as_ref() {
-                    db.mark_outgoing_message_failed(&local_message_id)?;
+        if !plaintext.is_empty() {
+            if let Some(indexer) = self.indexer.as_ref() {
+                if let Err(error) = indexer.index_message(
+                    &local_message_id,
+                    conversation_id,
+                    &hex::encode(our_key),
+                    plaintext,
+                    local_timestamp,
+                ) {
+                    if let Some(db) = self.db.as_ref() {
+                        db.mark_outgoing_message_failed(&local_message_id)?;
+                    }
+                    let _ = indexer.delete(&local_message_id);
+                    return Err(format!("index pending outgoing message: {error}"));
                 }
-                let _ = indexer.delete(&local_message_id);
-                return Err(format!("index pending outgoing message: {error}"));
             }
         }
 
@@ -1926,10 +1966,23 @@ impl VeilClient {
             conversation_id: conversation_id.to_string(),
             ciphertext,
             header: header_bytes,
-            msg_type: proto::MessageType::Text.into(),
+            msg_type: if wire_attachments.is_empty() {
+                proto::MessageType::Text.into()
+            } else {
+                proto::MessageType::File.into()
+            },
             reply_to_id: reply_to_id.map(|s| s.to_string()),
             ttl_seconds: None,
-            attachments: vec![],
+            attachments: wire_attachments
+                .into_iter()
+                .map(|attachment| proto::EncryptedAttachment {
+                    media_id: attachment.media_id,
+                    encrypted_key: attachment.encrypted_key,
+                    nonce: attachment.nonce,
+                    size: attachment.size,
+                    content_type: attachment.content_type,
+                })
+                .collect(),
             sealed: false,
             // Populated by the per-device roster integration. Zero/empty is
             // valid only for DMs; the gateway rejects Sender-Key traffic that
@@ -3782,8 +3835,7 @@ impl VeilClient {
         reply_to_id: Option<&str>,
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
     ) -> Result<ReceiveMessageResult, String> {
-        self.require_currently_authorized_sender(conversation_id, sender_identity_key)?;
-        self.receive_and_persist_message(
+        self.receive_and_persist_live_message_with_attachments(
             message_id,
             conversation_id,
             sender_identity_key,
@@ -3796,6 +3848,44 @@ impl VeilClient {
             ciphertext,
             server_timestamp,
             reply_to_id,
+            &[],
+            remote_metadata,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_and_persist_live_message_with_attachments(
+        &mut self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
+        author_context: Option<MessageAuthorContext>,
+        sender_key_mode: bool,
+        security_context: Option<&MessageSecurityContextV1>,
+        fallback_conversation_name: Option<&str>,
+        header: &[u8],
+        ciphertext: &[u8],
+        server_timestamp: Option<i64>,
+        reply_to_id: Option<&str>,
+        attachments: &[crate::attachments::WireAttachmentV1],
+        remote_metadata: Option<&RemoteMessageMetadata<'_>>,
+    ) -> Result<ReceiveMessageResult, String> {
+        self.require_currently_authorized_sender(conversation_id, sender_identity_key)?;
+        self.receive_and_persist_message_with_attachments(
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            author_snapshot,
+            author_context,
+            sender_key_mode,
+            security_context,
+            fallback_conversation_name,
+            header,
+            ciphertext,
+            server_timestamp,
+            reply_to_id,
+            attachments,
             remote_metadata,
         )
     }
@@ -3818,6 +3908,42 @@ impl VeilClient {
         ciphertext: &[u8],
         server_timestamp: Option<i64>,
         reply_to_id: Option<&str>,
+        remote_metadata: Option<&RemoteMessageMetadata<'_>>,
+    ) -> Result<ReceiveMessageResult, String> {
+        self.receive_and_persist_message_with_attachments(
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            author_snapshot,
+            author_context,
+            sender_key_mode,
+            security_context,
+            fallback_conversation_name,
+            header,
+            ciphertext,
+            server_timestamp,
+            reply_to_id,
+            &[],
+            remote_metadata,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn receive_and_persist_message_with_attachments(
+        &mut self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
+        author_context: Option<MessageAuthorContext>,
+        sender_key_mode: bool,
+        security_context: Option<&MessageSecurityContextV1>,
+        fallback_conversation_name: Option<&str>,
+        header: &[u8],
+        ciphertext: &[u8],
+        server_timestamp: Option<i64>,
+        reply_to_id: Option<&str>,
+        attachments: &[crate::attachments::WireAttachmentV1],
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
     ) -> Result<ReceiveMessageResult, String> {
         if message_id.is_empty() || conversation_id.is_empty() {
@@ -3892,20 +4018,38 @@ impl VeilClient {
                     fallback_conversation_name,
                 )?;
 
-            let plaintext = match self.decrypt_from_with_security_context(
+            let decrypted = match self.decrypt_from_with_security_context(
                 sender_identity_key,
                 conversation_id,
                 header,
                 ciphertext,
                 security_context,
             )? {
-                DecryptedPayload::Text(plaintext) => String::from_utf8(plaintext)
-                    .map_err(|_| "inbound plaintext is not valid UTF-8".to_string())?,
+                DecryptedPayload::Text(plaintext) => plaintext,
                 DecryptedPayload::Control => {
                     return Err(
                         "control frame is not valid on the chat message receive path".to_string(),
                     );
                 }
+            };
+            let (plaintext, private_attachments) = if attachments.is_empty() {
+                if crate::attachments::is_attachment_payload_v1(&decrypted) {
+                    return Err(
+                        "attachment payload has no authenticated public descriptors".to_string()
+                    );
+                }
+                (
+                    String::from_utf8(decrypted)
+                        .map_err(|_| "inbound plaintext is not valid UTF-8".to_string())?,
+                    Vec::new(),
+                )
+            } else {
+                let opened = crate::attachments::open_attachment_message_v1(
+                    conversation_id,
+                    &decrypted,
+                    attachments,
+                )?;
+                (opened.text, opened.attachments)
             };
             if !sender_key_mode {
                 // Successful authenticated ratchet decryption is the first
@@ -3926,6 +4070,10 @@ impl VeilClient {
                     server_timestamp,
                     reply_to_id,
                 )?;
+            self.db
+                .as_ref()
+                .ok_or("database not initialized")?
+                .insert_message_attachments(message_id, &private_attachments)?;
             if let (Some(author_snapshot), Some(author_context)) = (author_snapshot, author_context)
             {
                 self.db
@@ -6653,6 +6801,7 @@ mod tests {
             header: vec![HEADER_SENDER_KEY],
             server_timestamp: 1,
             reply_to_id: None,
+            attachments: Vec::new(),
             security_context: None,
         };
         let report = recipient

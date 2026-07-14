@@ -10,6 +10,7 @@
 //! This crate provides the public API that UI layers (Tauri/RN) call.
 
 pub mod api;
+pub mod attachments;
 pub mod connection;
 mod device_identity;
 pub mod protocol;

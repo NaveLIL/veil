@@ -184,13 +184,23 @@ Attachment теперь привязан к сообщению/разговор�
 которому разрешена история этого разговора. Сервер всё равно хранит только
 ciphertext и не получает ключ файла.
 
-**Phase 3B — Attachment Experience (отложено):**
-- Tauri команды + drag-drop UI + file bubble компонент
-- EXIF strip (клиентская сторона, до шифрования; `kamadak-exif` или ре-энкод через `image`)
+**Phase 3B — Attachment Experience (в работе, foundation 2026-07-14):**
+
+Готово: security/schema review, versioned E2EE attachment payload, descriptor
+commitment, O(1) XChaCha20 key wrapping внутри текущего Double Ratchet/Sender-Key
+roster, атомарные private metadata/key rows в SQLCipher, live/offline receive,
+нативный picker, bounded-memory upload/download, file bubble и безопасный Save.
+Изображения JPEG/PNG/WebP декодируются и ре-энкодятся в PNG до шифрования, что
+удаляет EXIF/container metadata. Сервер видит только ciphertext size, media id и
+`application/octet-stream`; MIME и filename остаются в E2EE payload.
+
+Осталось до закрытия:
+- OS drag-drop через нативный одноразовый capability, без IPC-команды с произвольным path
 - `veilfile://` custom protocol для range-decrypt видео в `<video>` теге
-- безопасный K-wrapping для больших roster; он не должен блокировать базовые
-  вложения в DM/маленьких группах, но обязан следовать принятой Phase 4C модели
-- Streaming uploader API (сейчас `encrypt_file_to_chunks` материализует весь список чанков в памяти; нужен async stream когда начнём пушить 2 ГБ видео)
+- physical two-device upload/download/tamper/resume matrix
+
+Streaming uploader уже использует bounded-memory chunk pipeline до 2 ГиБ;
+старый one-shot adapter не используется desktop attachment path.
 
 Важные грабли, которые надо помнить:
 - MIME spoofing: не доверять client-declared MIME. Ре-деривить на стороне получателя через `infer` crate перед рендером

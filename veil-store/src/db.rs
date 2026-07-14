@@ -1134,6 +1134,29 @@ impl VeilDb {
             CREATE INDEX IF NOT EXISTS idx_messages_conv
                 ON messages(conversation_id, server_timestamp);
 
+            -- Attachment secrets and private metadata live only in SQLCipher.
+            -- The authoritative message UUID may replace a local optimistic
+            -- UUID, so the FK follows ON UPDATE as well as ON DELETE.
+            CREATE TABLE IF NOT EXISTS message_attachments_v1 (
+                message_id TEXT NOT NULL
+                    REFERENCES messages(id) ON UPDATE CASCADE ON DELETE CASCADE,
+                ordinal INTEGER NOT NULL CHECK(ordinal BETWEEN 0 AND 15),
+                media_id TEXT NOT NULL
+                    CHECK(length(media_id) = 32 AND media_id = lower(media_id)),
+                file_name TEXT NOT NULL
+                    CHECK(length(CAST(file_name AS BLOB)) BETWEEN 1 AND 1024),
+                detected_mime TEXT NOT NULL
+                    CHECK(length(CAST(detected_mime AS BLOB)) BETWEEN 1 AND 255),
+                format_version INTEGER NOT NULL CHECK(format_version BETWEEN 1 AND 255),
+                nonce_prefix BLOB NOT NULL CHECK(length(nonce_prefix) = 16),
+                chunk_count INTEGER NOT NULL CHECK(chunk_count BETWEEN 1 AND 32769),
+                plaintext_size INTEGER NOT NULL CHECK(plaintext_size BETWEEN 0 AND 2147483648),
+                ciphertext_size INTEGER NOT NULL CHECK(ciphertext_size BETWEEN 16 AND 2148007952),
+                content_key BLOB NOT NULL CHECK(length(content_key) = 32),
+                PRIMARY KEY (message_id, ordinal),
+                UNIQUE (message_id, media_id)
+            );
+
             -- Origin-scoped, authoritative account directory. Account and
             -- signing keys are immutable continuity bindings; only
             -- presentation metadata can advance under the merge policy in
@@ -3170,6 +3193,180 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Persist private attachment state inside the caller's current
+    /// transaction/savepoint. The message row must already exist.
+    pub fn insert_message_attachments(
+        &self,
+        message_id: &str,
+        attachments: &[crate::models::MessageAttachment],
+    ) -> Result<(), String> {
+        if message_id.is_empty() || attachments.len() > 16 {
+            return Err("invalid attachment message binding".to_string());
+        }
+        let mut media_ids = std::collections::HashSet::new();
+        for (expected_ordinal, attachment) in attachments.iter().enumerate() {
+            if usize::from(attachment.ordinal) != expected_ordinal
+                || attachment.file_name.is_empty()
+                || attachment.file_name.len() > 1024
+                || attachment.detected_mime.is_empty()
+                || attachment.detected_mime.len() > 255
+                || attachment.format_version == 0
+                || attachment.chunk_count == 0
+                || attachment.chunk_count > 32_769
+                || attachment.plaintext_size > 2 * 1024 * 1024 * 1024
+                || attachment.ciphertext_size < 16
+                || attachment.ciphertext_size > 2_148_007_952
+                || attachment.media_id.len() != 32
+                || !attachment
+                    .media_id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                || !media_ids.insert(attachment.media_id.as_str())
+            {
+                return Err("invalid private attachment record".to_string());
+            }
+            let chunk_count = i64::try_from(attachment.chunk_count)
+                .map_err(|_| "attachment chunk count exceeds SQLCipher integer".to_string())?;
+            let plaintext_size = i64::try_from(attachment.plaintext_size)
+                .map_err(|_| "attachment plaintext size exceeds SQLCipher integer".to_string())?;
+            let ciphertext_size = i64::try_from(attachment.ciphertext_size)
+                .map_err(|_| "attachment ciphertext size exceeds SQLCipher integer".to_string())?;
+            self.conn
+                .execute(
+                    "INSERT INTO message_attachments_v1
+                       (message_id, ordinal, media_id, file_name, detected_mime,
+                        format_version, nonce_prefix, chunk_count, plaintext_size,
+                        ciphertext_size, content_key)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    rusqlite::params![
+                        message_id,
+                        attachment.ordinal,
+                        attachment.media_id,
+                        attachment.file_name,
+                        attachment.detected_mime,
+                        attachment.format_version,
+                        attachment.nonce_prefix.as_slice(),
+                        chunk_count,
+                        plaintext_size,
+                        ciphertext_size,
+                        attachment.content_key.as_slice(),
+                    ],
+                )
+                .map_err(|error| format!("insert private attachment state: {error}"))?;
+        }
+        Ok(())
+    }
+
+    pub fn get_message_attachments(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<crate::models::MessageAttachment>, String> {
+        let mut statement = self
+            .conn
+            .prepare(
+                "SELECT ordinal, media_id, file_name, detected_mime, format_version,
+                        nonce_prefix, chunk_count, plaintext_size, ciphertext_size,
+                        content_key
+                 FROM message_attachments_v1
+                 WHERE message_id = ?1
+                 ORDER BY ordinal",
+            )
+            .map_err(|error| format!("prepare private attachment query: {error}"))?;
+        let rows = statement
+            .query_map(rusqlite::params![message_id], |row| {
+                Ok((
+                    row.get::<_, u8>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, u8>(4)?,
+                    row.get::<_, Vec<u8>>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                ))
+            })
+            .map_err(|error| format!("query private attachments: {error}"))?;
+        let mut attachments = Vec::new();
+        for row in rows {
+            let (
+                ordinal,
+                media_id,
+                file_name,
+                detected_mime,
+                format_version,
+                nonce_prefix,
+                chunk_count,
+                plaintext_size,
+                ciphertext_size,
+                content_key,
+            ) = row.map_err(|error| format!("read private attachment: {error}"))?;
+            attachments.push(crate::models::MessageAttachment {
+                ordinal,
+                media_id,
+                file_name,
+                detected_mime,
+                format_version,
+                nonce_prefix: fixed_bytes("attachment nonce prefix", nonce_prefix)?,
+                chunk_count: u64::try_from(chunk_count)
+                    .map_err(|_| "negative attachment chunk count".to_string())?,
+                plaintext_size: u64::try_from(plaintext_size)
+                    .map_err(|_| "negative attachment plaintext size".to_string())?,
+                ciphertext_size: u64::try_from(ciphertext_size)
+                    .map_err(|_| "negative attachment ciphertext size".to_string())?,
+                content_key: fixed_bytes("attachment content key", content_key)?,
+            });
+        }
+        // Reuse the insert-side structural validator without writing: exact
+        // ordinal continuity and duplicate checks are invariants on read too.
+        for (expected, attachment) in attachments.iter().enumerate() {
+            if usize::from(attachment.ordinal) != expected {
+                return Err("persisted attachment ordinals are not contiguous".to_string());
+            }
+        }
+        Ok(attachments)
+    }
+
+    pub fn insert_outgoing_pending_message_with_attachments(
+        &self,
+        id: &str,
+        conversation_id: &str,
+        sender_key: &[u8; 32],
+        plaintext: &str,
+        reply_to_id: Option<&str>,
+        attachments: &[crate::models::MessageAttachment],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin attachment message transaction: {error}"))?;
+        tx.execute(
+            "INSERT INTO messages
+               (id, conversation_id, sender_key, plaintext, is_outgoing, status, reply_to_id, msg_type)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6)",
+            rusqlite::params![
+                id,
+                conversation_id,
+                sender_key.as_slice(),
+                plaintext,
+                reply_to_id,
+                if attachments.is_empty() { 0u8 } else { 2u8 },
+            ],
+        )
+        .map_err(|error| format!("insert pending attachment message: {error}"))?;
+        // `unchecked_transaction` is active on the same connection; helper
+        // writes participate in it and cannot publish attachment keys alone.
+        self.insert_message_attachments(id, attachments)?;
+        tx.execute(
+            "UPDATE conversations SET last_message_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![conversation_id],
+        )
+        .map_err(|error| format!("update attachment conversation timestamp: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit pending attachment message: {error}"))
+    }
+
     /// Whether an authoritative server message UUID is already present.
     /// Offline sync checks this before decrypting so a replay cannot advance a
     /// Double Ratchet or Sender Key state twice.
@@ -3755,6 +3952,7 @@ impl VeilDb {
                         created_at: row.get(10)?,
                         author: None,
                         author_context: None,
+                        attachments: Vec::new(),
                     },
                     raw_account_snapshot_from_row(row, 13)?,
                     row.get::<_, Option<u8>>(23)?,
@@ -3773,6 +3971,7 @@ impl VeilDb {
                         .ok_or_else(|| "invalid persisted message author context".to_string())
                 })
                 .transpose()?;
+            message.attachments = self.get_message_attachments(&message.id)?;
             messages.push(message);
         }
         Ok(messages)
@@ -3832,6 +4031,7 @@ impl VeilDb {
                             created_at: row.get(10)?,
                             author: None,
                             author_context: None,
+                            attachments: Vec::new(),
                         },
                         raw_account_snapshot_from_row(row, 11)?,
                         row.get::<_, Option<u8>>(21)?,
@@ -7366,6 +7566,56 @@ mod tests {
         assert!(db
             .acknowledge_outgoing_message("local-id", "different-server-id", 1235)
             .is_err());
+    }
+
+    #[test]
+    fn attachment_secrets_follow_ack_and_delete_atomically() {
+        let db = VeilDb::open_memory(&[0x71u8; 32]).unwrap();
+        db.insert_conversation("attachment-conversation", 1, Some("Circle"), None, None)
+            .unwrap();
+        let attachment = crate::models::MessageAttachment {
+            ordinal: 0,
+            media_id: "0123456789abcdef0123456789abcdef".to_string(),
+            file_name: "safe.txt".to_string(),
+            detected_mime: "text/plain".to_string(),
+            format_version: 2,
+            nonce_prefix: [3u8; 16],
+            chunk_count: 1,
+            plaintext_size: 5,
+            ciphertext_size: 21,
+            content_key: [4u8; 32],
+        };
+        db.insert_outgoing_pending_message_with_attachments(
+            "local-attachment",
+            "attachment-conversation",
+            &[5u8; 32],
+            "caption",
+            None,
+            &[attachment],
+        )
+        .unwrap();
+        assert_eq!(
+            db.get_messages("attachment-conversation", 10).unwrap()[0].attachments[0].content_key,
+            [4u8; 32]
+        );
+
+        db.acknowledge_outgoing_message("local-attachment", "server-attachment", 1234)
+            .unwrap();
+        assert!(db
+            .get_message_attachments("local-attachment")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            db.get_message_attachments("server-attachment").unwrap()[0].file_name,
+            "safe.txt"
+        );
+
+        db.delete_message_scoped("server-attachment", "attachment-conversation")
+            .unwrap();
+        assert!(db
+            .get_message_attachments("server-attachment")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

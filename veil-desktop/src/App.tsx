@@ -62,8 +62,15 @@ import { alertDecision, confirmDecision, promptDecision } from "@/lib/decisionDi
 import {
   Users, UserPlus, UserMinus, Settings, Lock,
   ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
-  MessageSquare, Eye, Shield, Send,
+  MessageSquare, Eye, Shield, Send, Paperclip, Download, FileText,
 } from "lucide-solid";
+
+const formatAttachmentBytes = (bytes: number): string => {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KiB`;
+  if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
+  return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+};
 
 type RightIslandRoute =
   | { kind: "closed" }
@@ -194,6 +201,7 @@ const DisclaimerScreen: Component = () => {
 const App: Component = () => {
   const [inputText, setInputText] = createSignal("");
   const [sendBusy, setSendBusy] = createSignal(false);
+  const [attachmentSaving, setAttachmentSaving] = createSignal<string | null>(null);
   const [sendNotice, setSendNotice] = createSignal<"" | "security" | "error">("");
   const [search, setSearch] = createSignal("");
   const [showNewGroup, setShowNewGroup] = createSignal(false);
@@ -1138,6 +1146,50 @@ const App: Component = () => {
         activeSendToken = null;
         setSendBusy(false);
       }
+    }
+  };
+
+  const handleAttach = async () => {
+    const conversation = conv();
+    if (!conversation || sendBusy() || transportMutationUnavailable() || cryptoGate().blocked) return;
+    const conversationId = conversation.id;
+    const reply = replyingTo();
+    const caption = inputText().trim();
+    setSendBusy(true);
+    setSendNotice("");
+    try {
+      const sent = await appStore.sendAttachments(caption, reply?.id);
+      if (sent && appStore.activeConversationId() === conversationId) {
+        setInputText("");
+        setReplyingTo(null);
+        if (inputRef) inputRef.style.height = "21px";
+      }
+    } catch (reason) {
+      if (appStore.activeConversationId() !== conversationId) return;
+      const detail = String(reason);
+      if (/sender[- ]key|distribution|rotation/i.test(detail)) {
+        setSendNotice("security");
+        toast.warning("Encryption update pending", "Files were not published; your caption remains in the composer.");
+      } else {
+        setSendNotice("error");
+        toast.error("Attachment not sent", detail);
+      }
+    } finally {
+      setSendBusy(false);
+    }
+  };
+
+  const handleSaveAttachment = async (message: Message, ordinal: number, fileName: string) => {
+    const operation = `${message.id}:${ordinal}`;
+    if (attachmentSaving()) return;
+    setAttachmentSaving(operation);
+    try {
+      const actualMime = await appStore.saveAttachment(message.id, ordinal);
+      if (actualMime) toast.success("Attachment saved", `${fileName} · ${actualMime}`);
+    } catch (reason) {
+      toast.error("Attachment not saved", String(reason));
+    } finally {
+      if (attachmentSaving() === operation) setAttachmentSaving(null);
     }
   };
 
@@ -2752,6 +2804,54 @@ const App: Component = () => {
                                           >Esc</button>
                                         </div>
                                       </Show>
+                                      <Show when={(msg.attachments?.length ?? 0) > 0}>
+                                        <div style={{ display: "grid", gap: "7px", "margin-top": msg.text ? "8px" : "2px", "max-width": "420px" }}>
+                                          <For each={msg.attachments ?? []}>
+                                            {(attachment) => {
+                                              const operation = () => `${msg.id}:${attachment.ordinal}`;
+                                              const saving = () => attachmentSaving() === operation();
+                                              return (
+                                                <button
+                                                  type="button"
+                                                  disabled={!!attachmentSaving() || msg.pending || msg.failed || msg.deliveryUnknown}
+                                                  onClick={() => void handleSaveAttachment(msg, attachment.ordinal, attachment.fileName)}
+                                                  aria-label={`Save encrypted attachment ${attachment.fileName}`}
+                                                  style={{
+                                                    display: "grid",
+                                                    "grid-template-columns": "36px minmax(0, 1fr) 28px",
+                                                    "align-items": "center",
+                                                    gap: "10px",
+                                                    width: "100%",
+                                                    padding: "9px 10px",
+                                                    border: "1px solid var(--veil-border)",
+                                                    "border-radius": "10px",
+                                                    background: "rgba(var(--veil-accent-rgb),0.055)",
+                                                    color: "var(--veil-text)",
+                                                    cursor: saving() ? "wait" : "pointer",
+                                                    "text-align": "left",
+                                                    transition: "border-color 160ms ease, background 160ms ease, transform 160ms ease",
+                                                  }}
+                                                >
+                                                  <span style={{ width: "36px", height: "36px", display: "grid", "place-items": "center", "border-radius": "9px", background: "rgba(var(--veil-accent-rgb),0.13)", color: "var(--veil-accent)" }}>
+                                                    <FileText size={17} strokeWidth={1.9} />
+                                                  </span>
+                                                  <span style={{ "min-width": "0" }}>
+                                                    <span style={{ display: "block", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "font-size": "12px", "font-weight": "650" }}>
+                                                      {attachment.fileName}
+                                                    </span>
+                                                    <span style={{ display: "block", "margin-top": "2px", color: "var(--veil-text-faint)", "font-size": "10px" }}>
+                                                      {formatAttachmentBytes(attachment.plaintextSize)} · encrypted file
+                                                    </span>
+                                                  </span>
+                                                  <span style={{ width: "28px", height: "28px", display: "grid", "place-items": "center", color: "var(--veil-text-muted)" }}>
+                                                    <Download size={15} strokeWidth={2} />
+                                                  </span>
+                                                </button>
+                                              );
+                                            }}
+                                          </For>
+                                        </div>
+                                      </Show>
                                       <Show when={msg.pending}>
                                         <div style={{ "font-size": "10px", color: "var(--veil-text-subtle)", "margin-top": "2px" }}>Sending…</div>
                                       </Show>
@@ -3015,6 +3115,22 @@ const App: Component = () => {
                         )}
                       </Show>
                       <div class="veil-message-composer" style={S.inputBar}>
+                        <button
+                          type="button"
+                          style={{
+                            width: "32px", height: "32px", display: "grid", "place-items": "center",
+                            "flex-shrink": "0", border: "none", "border-radius": "9px",
+                            background: "transparent", color: "var(--veil-text-muted)",
+                            cursor: sendBusy() || cryptoGate().blocked || transportMutationUnavailable() ? "not-allowed" : "pointer",
+                            transition: "color 160ms ease, background 160ms ease, transform 160ms ease",
+                          }}
+                          disabled={sendBusy() || cryptoGate().blocked || transportMutationUnavailable()}
+                          aria-label="Attach encrypted files"
+                          title="Attach encrypted files"
+                          onClick={() => void handleAttach()}
+                        >
+                          <Paperclip size={16} strokeWidth={2} />
+                        </button>
                         <textarea
                           class="veil-message-composer-input"
                           ref={inputRef}

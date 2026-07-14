@@ -1704,6 +1704,19 @@ fn get_messages(
                     .or(author.username.as_ref())
                     .cloned()
             });
+            let attachments = m
+                .attachments
+                .iter()
+                .map(|attachment| {
+                    serde_json::json!({
+                        "ordinal": attachment.ordinal,
+                        "mediaId": attachment.media_id,
+                        "fileName": attachment.file_name,
+                        "detectedMime": attachment.detected_mime,
+                        "plaintextSize": attachment.plaintext_size,
+                    })
+                })
+                .collect::<Vec<_>>();
             serde_json::json!({
                 "id": m.id,
                 "conversationId": m.conversation_id,
@@ -1723,6 +1736,7 @@ fn get_messages(
                 "timestamp": m.server_timestamp.unwrap_or(0),
                 "createdAt": m.created_at,
                 "replyToId": m.reply_to_id,
+                "attachments": attachments,
             })
         })
         .collect();
@@ -2387,6 +2401,18 @@ fn validate_canonical_base64_bytes(
         ));
     }
     Ok(())
+}
+
+fn decode_canonical_base64_bounded(
+    field: &str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    validate_canonical_base64_bytes(field, value, max_bytes)?;
+    base64::engine::general_purpose::STANDARD
+        .decode(value)
+        .map_err(|_| format!("{field} must be canonical standard base64"))
 }
 
 fn parse_decimal_u63(field: &str, value: &str, allow_zero: bool) -> Result<u64, String> {
@@ -3820,6 +3846,28 @@ fn sync_conversation_messages(
                     false,
                 )?;
             }
+            let wire_attachments: Vec<veil_client::attachments::WireAttachmentV1> = message
+                .attachments
+                .iter()
+                .map(|attachment| {
+                    Ok(veil_client::attachments::WireAttachmentV1 {
+                        media_id: attachment.media_id.clone(),
+                        encrypted_key: decode_canonical_base64_bounded(
+                            "message attachment encrypted_key",
+                            &attachment.encrypted_key,
+                            MAX_SYNC_ATTACHMENT_KEY_BYTES,
+                        )?,
+                        nonce: decode_canonical_base64_bounded(
+                            "message attachment nonce",
+                            &attachment.nonce,
+                            MAX_SYNC_ATTACHMENT_NONCE_BYTES,
+                        )?,
+                        size: u64::try_from(attachment.size)
+                            .map_err(|_| "message attachment size is negative".to_string())?,
+                        content_type: attachment.content_type.clone(),
+                    })
+                })
+                .collect::<Result<_, String>>()?;
             if message.conversation_id != conversation_id {
                 return Err(format!(
                     "message {} escaped its authenticated conversation scope",
@@ -4193,7 +4241,7 @@ fn sync_conversation_messages(
                 .ok_or("active reconciliation action has no encrypted wire")?;
             match action {
                 veil_client::api::RemoteReconcileAction::NeedsInitialCiphertext => {
-                    match client.receive_and_persist_message(
+                    match client.receive_and_persist_message_with_attachments(
                         &message.id,
                         conversation_id,
                         &response_identity,
@@ -4206,6 +4254,7 @@ fn sync_conversation_messages(
                         ciphertext,
                         Some(message.server_timestamp),
                         message.reply_to_id.as_deref(),
+                        &wire_attachments,
                         Some(&metadata),
                     )? {
                         veil_client::api::ReceiveMessageResult::Stored { .. } => {
@@ -4217,6 +4266,12 @@ fn sync_conversation_messages(
                     }
                 }
                 veil_client::api::RemoteReconcileAction::NeedsEncryptedEdit => {
+                    if !wire_attachments.is_empty() {
+                        return Err(format!(
+                            "attachment message {} cannot use the text-only edit protocol",
+                            message.id
+                        ));
+                    }
                     client.receive_and_persist_edit(
                         &message.id,
                         conversation_id,
@@ -4732,6 +4787,7 @@ fn connect_to_server(
                             header,
                             server_timestamp,
                             reply_to_id,
+                            attachments,
                             security_context,
                         } => {
                             if !live_conversation_origin_is_current(
@@ -4891,21 +4947,23 @@ fn connect_to_server(
                                 .unwrap_or("Unknown author")
                                 .to_string();
                             let ts_ms = (server_timestamp / 1_000_000) as i64;
-                            let text = match client.receive_and_persist_live_message(
-                                &message_id,
-                                &conversation_id,
-                                &sender_key,
-                                Some(&author_snapshot),
-                                Some(MessageAuthorContext::DirectoryMemberAtObservation),
-                                sender_key_mode,
-                                security_context.as_ref(),
-                                Some(&authoritative_sender_name),
-                                &header,
-                                &ciphertext,
-                                Some(ts_ms),
-                                reply_to_id.as_deref(),
-                                None,
-                            ) {
+                            let text = match client
+                                .receive_and_persist_live_message_with_attachments(
+                                    &message_id,
+                                    &conversation_id,
+                                    &sender_key,
+                                    Some(&author_snapshot),
+                                    Some(MessageAuthorContext::DirectoryMemberAtObservation),
+                                    sender_key_mode,
+                                    security_context.as_ref(),
+                                    Some(&authoritative_sender_name),
+                                    &header,
+                                    &ciphertext,
+                                    Some(ts_ms),
+                                    reply_to_id.as_deref(),
+                                    &attachments,
+                                    None,
+                                ) {
                                 Ok(veil_client::api::ReceiveMessageResult::Stored {
                                     plaintext,
                                 }) => plaintext,
@@ -4963,6 +5021,21 @@ fn connect_to_server(
                             let conversation_peer_user_id = conversation_context
                                 .as_ref()
                                 .and_then(|conversation| conversation.peer_user_id.as_deref());
+                            let rendered_attachments = client
+                                .db()
+                                .and_then(|db| db.get_message_attachments(&message_id).ok())
+                                .unwrap_or_default()
+                                .into_iter()
+                                .map(|attachment| {
+                                    serde_json::json!({
+                                        "ordinal": attachment.ordinal,
+                                        "mediaId": attachment.media_id,
+                                        "fileName": attachment.file_name,
+                                        "detectedMime": attachment.detected_mime,
+                                        "plaintextSize": attachment.plaintext_size,
+                                    })
+                                })
+                                .collect::<Vec<_>>();
                             drop(client); // Release lock before emitting
 
                             let _ = app_handle.emit(
@@ -4984,6 +5057,7 @@ fn connect_to_server(
                                     "text": text,
                                     "timestamp": server_timestamp / 1_000_000,
                                     "replyToId": reply_to_id,
+                                    "attachments": rendered_attachments,
                                 }),
                             );
 
@@ -5976,6 +6050,302 @@ fn send_message(
         .block_on(client.send_message(&conversation_id, &text, reply_to_id.as_deref()))
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UploadTokenResponse {
+    token: String,
+    expires_at: String,
+    base_path: String,
+}
+
+struct PreparedLocalAttachment {
+    source_path: PathBuf,
+    file_name: String,
+    detected_mime: String,
+    _sanitized_file: Option<tempfile::NamedTempFile>,
+}
+
+fn prepare_local_attachment(path: PathBuf) -> Result<PreparedLocalAttachment, String> {
+    use image::GenericImageView;
+    use std::io::BufWriter;
+
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .ok_or("attachment filename is not valid UTF-8")?
+        .to_string();
+    if file_name.len() > 1024
+        || file_name.chars().any(char::is_control)
+        || file_name.contains('/')
+        || file_name.contains('\\')
+    {
+        return Err("attachment filename is invalid".to_string());
+    }
+    let detected =
+        infer::get_from_path(&path).map_err(|error| format!("inspect attachment type: {error}"))?;
+    let detected_mime = detected
+        .as_ref()
+        .map_or("application/octet-stream", |kind| kind.mime_type())
+        .to_string();
+    let supported_raster = matches!(
+        detected_mime.as_str(),
+        "image/jpeg" | "image/png" | "image/webp"
+    );
+    if !supported_raster {
+        return Ok(PreparedLocalAttachment {
+            source_path: path,
+            file_name,
+            detected_mime,
+            _sanitized_file: None,
+        });
+    }
+
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(16_384);
+    limits.max_image_height = Some(16_384);
+    limits.max_alloc = Some(512 * 1024 * 1024);
+    let mut reader = image::ImageReader::open(&path)
+        .map_err(|error| format!("open image attachment: {error}"))?
+        .with_guessed_format()
+        .map_err(|error| format!("detect image attachment format: {error}"))?;
+    reader.limits(limits);
+    let decoded = reader
+        .decode()
+        .map_err(|_| "image attachment failed native decoding".to_string())?;
+    let (width, height) = decoded.dimensions();
+    if width == 0 || height == 0 {
+        return Err("image attachment has invalid dimensions".to_string());
+    }
+    let mut sanitized = tempfile::Builder::new()
+        .prefix("veil-attachment-")
+        .suffix(".png")
+        .tempfile()
+        .map_err(|error| format!("create sanitized attachment: {error}"))?;
+    decoded
+        .write_to(
+            &mut BufWriter::new(sanitized.as_file_mut()),
+            image::ImageFormat::Png,
+        )
+        .map_err(|error| format!("sanitize image attachment: {error}"))?;
+    let source_path = sanitized.path().to_path_buf();
+    Ok(PreparedLocalAttachment {
+        source_path,
+        file_name,
+        detected_mime: "image/png".to_string(),
+        _sanitized_file: Some(sanitized),
+    })
+}
+
+/// Native-only attachment picker and bounded streaming uploader. Renderer code
+/// never supplies an arbitrary filesystem path to a privileged command.
+#[tauri::command]
+async fn send_attachment_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    text: String,
+    reply_to_id: Option<String>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Option<u64>, String> {
+    use rand::RngCore;
+
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    require_conversation_crypto_available(&state, &conversation_id)?;
+    {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+        if let Some(reply_to_id) = reply_to_id.as_deref() {
+            require_persisted_message_conversation(&client, reply_to_id, &conversation_id)?;
+        }
+    }
+
+    let Some(files) = rfd::AsyncFileDialog::new()
+        .set_title("Attach encrypted files")
+        .pick_files()
+        .await
+    else {
+        return Ok(None);
+    };
+    if files.is_empty() || files.len() > veil_client::attachments::MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(format!(
+            "select between 1 and {} attachments",
+            veil_client::attachments::MAX_ATTACHMENTS_PER_MESSAGE
+        ));
+    }
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+
+    let mut prepared = Vec::with_capacity(files.len());
+    for file in files {
+        let path = file.path().to_path_buf();
+        prepared.push(
+            tauri::async_runtime::spawn_blocking(move || prepare_local_attachment(path))
+                .await
+                .map_err(|error| format!("prepare attachment task failed: {error}"))??,
+        );
+    }
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+
+    let server_http_url = live_action_binding.origin.canonical_server_origin();
+    let authenticated_user_id = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        client.authenticated_user_id()?.to_string()
+    };
+    let token_value = rest_send_json_for_binding(
+        &state,
+        reqwest::Method::POST,
+        rest_api_url(&server_http_url, &["v1", "uploads", "token"])?,
+        &authenticated_user_id,
+        None,
+        &live_action_binding,
+    )
+    .await?;
+    let token: UploadTokenResponse = serde_json::from_value(token_value)
+        .map_err(|error| format!("invalid upload token response: {error}"))?;
+    if token.token.is_empty()
+        || token.base_path != "/v1/uploads/files/"
+        || chrono::DateTime::parse_from_rfc3339(&token.expires_at).is_err()
+    {
+        return Err("upload token response violates the protocol".to_string());
+    }
+    let tus = veil_uploads::TusClient::new(&server_http_url, token.token)
+        .map_err(|error| format!("initialize encrypted uploader: {error}"))?;
+    let mut outgoing = Vec::with_capacity(prepared.len());
+    for local in &prepared {
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        let mut content_key = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(content_key.as_mut());
+        let plan = veil_uploads::prepare_streaming_upload(&content_key, &local.source_path)
+            .await
+            .map_err(|error| format!("prepare encrypted upload: {error}"))?;
+        let handle = tus
+            .create_streaming_upload(&content_key, &plan, &veil_uploads::TusUploadInit::default())
+            .await
+            .map_err(|error| format!("create encrypted upload: {error}"))?;
+        tus.upload_file_streaming(&handle, &content_key, &plan, &local.source_path, &mut ())
+            .await
+            .map_err(|error| format!("stream encrypted upload: {error}"))?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        outgoing.push(veil_client::attachments::OutgoingAttachmentV1 {
+            media_id: handle.file_id,
+            file_name: local.file_name.clone(),
+            detected_mime: local.detected_mime.clone(),
+            format_version: plan.metadata.format_version,
+            nonce_prefix: plan.metadata.nonce_prefix,
+            chunk_count: plan.metadata.chunk_count,
+            plaintext_size: plan.metadata.plaintext_size,
+            ciphertext_size: plan.metadata.ciphertext_size,
+            content_key: *content_key,
+        });
+    }
+
+    let mut client = state.client.lock().map_err(|error| error.to_string())?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    state
+        .runtime
+        .block_on(client.send_message_with_attachments(
+            &conversation_id,
+            &text,
+            reply_to_id.as_deref(),
+            outgoing,
+        ))
+        .map(Some)
+}
+
+#[tauri::command]
+async fn save_message_attachment(
+    state: State<'_, AppState>,
+    message_id: String,
+    ordinal: u8,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Option<String>, String> {
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let (attachment, authenticated_user_id) = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        let db = client.db().ok_or("database not initialized")?;
+        let conversation_id = db
+            .get_message_binding(&message_id)?
+            .map(|binding| binding.0)
+            .ok_or("attachment message is absent from encrypted local storage")?;
+        require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+        let attachment = db
+            .get_message_attachments(&message_id)?
+            .into_iter()
+            .find(|attachment| attachment.ordinal == ordinal)
+            .ok_or("attachment is absent from encrypted local storage")?;
+        (attachment, client.authenticated_user_id()?.to_string())
+    };
+    let Some(destination) = rfd::AsyncFileDialog::new()
+        .set_title("Save decrypted attachment")
+        .set_file_name(&attachment.file_name)
+        .save_file()
+        .await
+    else {
+        return Ok(None);
+    };
+    let destination = destination.path().to_path_buf();
+    if destination.exists() {
+        return Err("choose a new destination; secure save never overwrites a file".to_string());
+    }
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    let server_http_url = live_action_binding.origin.canonical_server_origin();
+    let token_value = rest_send_json_for_binding(
+        &state,
+        reqwest::Method::POST,
+        rest_api_url(&server_http_url, &["v1", "uploads", "token"])?,
+        &authenticated_user_id,
+        None,
+        &live_action_binding,
+    )
+    .await?;
+    let token: UploadTokenResponse = serde_json::from_value(token_value)
+        .map_err(|error| format!("invalid download token response: {error}"))?;
+    if token.token.is_empty()
+        || token.base_path != "/v1/uploads/files/"
+        || chrono::DateTime::parse_from_rfc3339(&token.expires_at).is_err()
+    {
+        return Err("download token response violates the protocol".to_string());
+    }
+    let tus = veil_uploads::TusClient::new(&server_http_url, token.token)
+        .map_err(|error| format!("initialize encrypted download: {error}"))?;
+    let metadata = veil_uploads::EncryptedFileMeta {
+        format_version: attachment.format_version,
+        nonce_prefix: attachment.nonce_prefix,
+        chunk_count: attachment.chunk_count,
+        plaintext_size: attachment.plaintext_size,
+        ciphertext_size: attachment.ciphertext_size,
+    };
+    tus.download_file_streaming(
+        &attachment.media_id,
+        &attachment.content_key,
+        &metadata,
+        &destination,
+        &mut (),
+    )
+    .await
+    .map_err(|error| format!("download and authenticate attachment: {error}"))?;
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    let actual_mime = infer::get_from_path(&destination)
+        .map_err(|error| format!("inspect decrypted attachment type: {error}"))?
+        .map_or("application/octet-stream", |kind| kind.mime_type())
+        .to_string();
+    Ok(Some(actual_mime))
+}
+
 #[tauri::command]
 fn discard_failed_outgoing_message(
     state: State<'_, AppState>,
@@ -6021,6 +6391,17 @@ fn edit_message(
     require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     require_persisted_message_conversation(&client, &message_id, &conversation_id)?;
+    if !client
+        .db()
+        .ok_or("database not initialized")?
+        .get_message_attachments(&message_id)?
+        .is_empty()
+    {
+        return Err(
+            "editing attachment messages is disabled until the exact attachment-edit protocol is implemented"
+                .to_string(),
+        );
+    }
     if client.is_channel_conversation(&conversation_id) {
         return Err(
             "editing encrypted group/channel messages is unavailable until the exact-device edit protocol is implemented"
@@ -10029,6 +10410,8 @@ pub fn run() {
             connect_to_server,
             confirm_authenticated_session_scope,
             send_message,
+            send_attachment_message,
+            save_message_attachment,
             discard_failed_outgoing_message,
             edit_message,
             delete_message,
@@ -10906,6 +11289,7 @@ mod e2ee_rest_tests {
             created_at: "2026-07-13T12:00:00Z".to_string(),
             author: Some(author),
             author_context: Some(MessageAuthorContext::FormerMemberAtObservation),
+            attachments: Vec::new(),
         };
         let hit = SearchHit {
             id: stored.id.clone(),

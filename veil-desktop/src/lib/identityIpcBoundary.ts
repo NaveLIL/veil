@@ -27,6 +27,15 @@ export interface StoredMessageDto {
   timestamp: number;
   createdAt: string;
   replyToId?: string;
+  attachments: MessageAttachmentDto[];
+}
+
+export interface MessageAttachmentDto {
+  ordinal: number;
+  mediaId: string;
+  fileName: string;
+  detectedMime: string;
+  plaintextSize: number;
 }
 
 export interface LiveMessageDto {
@@ -46,6 +55,7 @@ export interface LiveMessageDto {
   text: string;
   timestamp: number;
   replyToId?: string;
+  attachments: MessageAttachmentDto[];
 }
 
 export interface SearchAuthorDto {
@@ -92,6 +102,47 @@ function boundedString(value: unknown, label: string, max: number): string {
     throw new Error(`${label} is not a bounded string`);
   }
   return value;
+}
+
+function boundedText(value: unknown, label: string, max: number): string {
+  if (typeof value !== "string" || value.length > max) {
+    throw new Error(`${label} is not bounded text`);
+  }
+  return value;
+}
+
+function attachmentList(value: unknown, label: string): MessageAttachmentDto[] {
+  if (!Array.isArray(value) || value.length > 8) {
+    throw new Error(`${label} exceeded its attachment budget`);
+  }
+  const mediaIds = new Set<string>();
+  return value.map((entry, expectedOrdinal) => {
+    const candidate = record(entry, `${label} attachment`);
+    const ordinal = candidate.ordinal;
+    const mediaId = boundedString(candidate.mediaId, `${label} media id`, 32);
+    const plaintextSize = candidate.plaintextSize;
+    const detectedMime = boundedString(candidate.detectedMime, `${label} MIME`, 255);
+    if (
+      !Number.isSafeInteger(ordinal)
+      || ordinal !== expectedOrdinal
+      || !/^[0-9a-f]{32}$/.test(mediaId)
+      || mediaIds.has(mediaId)
+      || !Number.isSafeInteger(plaintextSize)
+      || (plaintextSize as number) < 0
+      || (plaintextSize as number) > 2 * 1024 * 1024 * 1024
+      || !/^[\x21-\x7e]+$/.test(detectedMime)
+    ) {
+      throw new Error(`${label} attachment metadata is invalid`);
+    }
+    mediaIds.add(mediaId);
+    return {
+      ordinal: ordinal as number,
+      mediaId,
+      fileName: boundedString(candidate.fileName, `${label} filename`, 1024),
+      detectedMime,
+      plaintextSize: plaintextSize as number,
+    };
+  });
 }
 
 function optionalBoundedString(
@@ -240,7 +291,7 @@ function storedMessage(
     senderProfileOrigin,
     senderOrigin,
     senderAuthorContext: authorContext(candidate.senderAuthorContext, "stored message author context"),
-    text: boundedString(candidate.text, "stored message text", MAX_MESSAGE_TEXT_UNITS),
+    text: boundedText(candidate.text, "stored message text", MAX_MESSAGE_TEXT_UNITS),
     isOwn: candidate.isOwn,
     pending,
     failed,
@@ -248,6 +299,7 @@ function storedMessage(
     timestamp: safeTimestamp(candidate.timestamp, "stored message timestamp"),
     createdAt: boundedString(candidate.createdAt, "stored message creation time", MAX_DATE_UNITS),
     replyToId: optionalId(candidate.replyToId, "stored message reply id"),
+    attachments: attachmentList(candidate.attachments, "stored message"),
   };
 }
 
@@ -321,9 +373,10 @@ export function validatedLiveMessage(
     senderProfileOrigin,
     senderOrigin,
     senderAuthorContext: context,
-    text: boundedString(candidate.text, "live message text", MAX_MESSAGE_TEXT_UNITS),
+    text: boundedText(candidate.text, "live message text", MAX_MESSAGE_TEXT_UNITS),
     timestamp: safeTimestamp(candidate.timestamp, "live message timestamp"),
     replyToId: optionalId(candidate.replyToId, "live message reply id"),
+    attachments: attachmentList(candidate.attachments, "live message"),
   };
 }
 

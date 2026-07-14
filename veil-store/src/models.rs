@@ -188,6 +188,31 @@ pub struct Message {
     pub created_at: String,
     pub author: Option<AccountSnapshot>,
     pub author_context: Option<MessageAuthorContext>,
+    pub attachments: Vec<MessageAttachment>,
+}
+
+/// Private attachment state. The renderer receives only presentation fields;
+/// content keys stay in native memory and SQLCipher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessageAttachment {
+    pub ordinal: u8,
+    pub media_id: String,
+    pub file_name: String,
+    pub detected_mime: String,
+    pub format_version: u8,
+    pub nonce_prefix: [u8; 16],
+    pub chunk_count: u64,
+    pub plaintext_size: u64,
+    pub ciphertext_size: u64,
+    #[serde(skip)]
+    pub content_key: [u8; 32],
+}
+
+impl Drop for MessageAttachment {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.content_key.zeroize();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

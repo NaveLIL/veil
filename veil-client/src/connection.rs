@@ -182,6 +182,7 @@ pub enum ConnectionEvent {
         header: Vec<u8>,
         server_timestamp: u64,
         reply_to_id: Option<String>,
+        attachments: Vec<crate::attachments::WireAttachmentV1>,
         security_context: Option<crate::api::MessageSecurityContextV1>,
     },
     /// A message was edited by its sender.
@@ -1013,12 +1014,16 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
                     .header
                     .as_ref()
                     .is_some_and(|value| value.len() > MAX_EVENT_HEADER_BYTES)
+                || me.attachments.len() > crate::attachments::MAX_ATTACHMENTS_PER_MESSAGE
             {
                 return None;
             }
             let security_context = message_security_context_from_proto(&me)?;
             let event_type = proto::message_event::EventType::try_from(me.event_type).ok()?;
             match event_type {
+                proto::message_event::EventType::Edited if !me.attachments.is_empty() => {
+                    return None;
+                }
                 proto::message_event::EventType::Edited => ConnectionEvent::MessageEdited {
                     message_id: me.message_id,
                     conversation_id: me.conversation_id,
@@ -1027,6 +1032,9 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
                     header: me.header.unwrap_or_default(),
                     edit_timestamp: me.edit_timestamp.unwrap_or(me.server_timestamp),
                 },
+                proto::message_event::EventType::Deleted if !me.attachments.is_empty() => {
+                    return None;
+                }
                 proto::message_event::EventType::Deleted => ConnectionEvent::MessageDeleted {
                     message_id: me.message_id,
                     conversation_id: me.conversation_id,
@@ -1042,6 +1050,17 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
                     header: me.header.unwrap_or_default(),
                     server_timestamp: me.server_timestamp,
                     reply_to_id: me.reply_to_id,
+                    attachments: me
+                        .attachments
+                        .into_iter()
+                        .map(|attachment| crate::attachments::WireAttachmentV1 {
+                            media_id: attachment.media_id,
+                            encrypted_key: attachment.encrypted_key,
+                            nonce: attachment.nonce,
+                            size: attachment.size,
+                            content_type: attachment.content_type,
+                        })
+                        .collect(),
                     security_context,
                 },
             }

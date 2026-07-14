@@ -93,6 +93,15 @@ export interface Message {
   failed?: boolean;
   deliveryUnknown?: boolean;
   replyToId?: string;
+  attachments?: MessageAttachment[];
+}
+
+export interface MessageAttachment {
+  ordinal: number;
+  mediaId: string;
+  fileName: string;
+  detectedMime: string;
+  plaintextSize: number;
 }
 
 export interface ServerBan {
@@ -1374,6 +1383,53 @@ export const appStore = {
     }
   },
 
+  /** Pick, sanitize, stream-encrypt, and send files through native code. */
+  sendAttachments: async (text: string, replyToId?: string): Promise<boolean> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const convId = activeConversationId();
+    if (!convId) return false;
+    const mutationScope = requirePublishedMutationScope();
+    const quarantine = conversationCryptoDiagnostics()[convId];
+    if (quarantine) {
+      throw new Error(
+        `Conversation cryptography is unavailable (${quarantine.code}): ${quarantine.detail}`,
+      );
+    }
+    try {
+      const conversation = appStore.activeConversation();
+      if (conversation?.type === "group" || conversation?.type === "channel") {
+        await appStore.distributeSenderKey(convId);
+        requireCurrentMutationScope(sessionEpoch, mutationScope);
+      }
+      const sequence = await invoke<number | null>("send_attachment_message", {
+        conversationId: convId,
+        text,
+        replyToId: replyToId ?? null,
+        ...authenticatedMutationScopeArgs(mutationScope),
+      });
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
+      if (sequence === null) return false;
+      await appStore.loadMessages(convId);
+      return true;
+    } catch (error) {
+      rethrowIfStale(error);
+      await appStore.loadMessages(convId);
+      throw error;
+    }
+  },
+
+  saveAttachment: async (messageId: string, ordinal: number): Promise<string | null> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const result = await invoke<string | null>("save_message_attachment", {
+      messageId,
+      ordinal,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return result;
+  },
+
   discardFailedMessage: async (localMessageId: string) => {
     const sessionEpoch = captureUiSessionEpoch();
     const mutationScope = requirePublishedMutationScope();
@@ -1940,6 +1996,7 @@ export const appStore = {
             replyToId: m.replyToId
               ? acknowledgedOutgoingMessageIds.get(m.replyToId) ?? m.replyToId
               : undefined,
+            attachments: m.attachments,
           };
         });
       let merged: Message[] = [];
@@ -3131,6 +3188,7 @@ export const appStore = {
           timestamp: d.timestamp,
           isOwn,
           replyToId: d.replyToId ?? undefined,
+          attachments: d.attachments,
         });
 
         // Only the native, origin-scoped directory may choose a conversation

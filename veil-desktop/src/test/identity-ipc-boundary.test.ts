@@ -32,6 +32,7 @@ const storedMessage = {
   timestamp: 1_789_000_000_000,
   createdAt: "2026-07-13T10:00:00Z",
   replyToId: null,
+  attachments: [],
 };
 
 const liveMessage = {
@@ -53,6 +54,7 @@ const liveMessage = {
   text: "hello",
   timestamp: 1_789_000_000_000,
   replyToId: null,
+  attachments: [],
 };
 
 const searchHit = {
