@@ -225,6 +225,17 @@ struct MediaSessionSnapshot {
     native_session_epoch: u64,
 }
 
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PushSubscriptionView {
+    id: String,
+    endpoint_hint: String,
+    device_label: Option<String>,
+    kind: String,
+    created_at: String,
+    last_used: Option<String>,
+}
+
 impl Drop for MediaSessionSnapshot {
     fn drop(&mut self) {
         self.content_key.zeroize();
@@ -8300,6 +8311,196 @@ async fn rest_send_json_with_expected_binding(
     Ok(json)
 }
 
+fn parse_push_subscription_views(
+    value: &serde_json::Value,
+) -> Result<Vec<PushSubscriptionView>, String> {
+    let rows = value
+        .get("subscriptions")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("push subscription response is malformed")?;
+    if rows.len() > 16 {
+        return Err("push subscription response exceeds the device limit".to_string());
+    }
+    rows.iter()
+        .map(|row| {
+            let id = row
+                .get("id")
+                .and_then(serde_json::Value::as_i64)
+                .filter(|id| *id > 0)
+                .ok_or("push subscription id is invalid")?;
+            let endpoint = row
+                .get("endpoint")
+                .and_then(serde_json::Value::as_str)
+                .filter(|endpoint| !endpoint.is_empty() && endpoint.len() <= 2048)
+                .ok_or("push subscription endpoint is invalid")?;
+            let parsed_endpoint = reqwest::Url::parse(endpoint)
+                .map_err(|_| "push subscription endpoint is invalid")?;
+            let host = parsed_endpoint
+                .host_str()
+                .filter(|host| !host.is_empty())
+                .ok_or("push subscription endpoint host is invalid")?;
+            let kind = row
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .filter(|kind| *kind == "unifiedpush")
+                .ok_or("push subscription kind is unsupported")?;
+            let created_at = row
+                .get("created_at")
+                .and_then(serde_json::Value::as_str)
+                .filter(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).is_ok())
+                .ok_or("push subscription creation time is invalid")?;
+            let last_used = row
+                .get("last_used")
+                .and_then(serde_json::Value::as_str)
+                .map(|timestamp| {
+                    if chrono::DateTime::parse_from_rfc3339(timestamp).is_err() {
+                        Err("push subscription last-used time is invalid")
+                    } else {
+                        Ok(timestamp.to_string())
+                    }
+                })
+                .transpose()?;
+            let device_label = row
+                .get("device_label")
+                .and_then(serde_json::Value::as_str)
+                .filter(|label| !label.is_empty())
+                .map(|label| {
+                    if label.len() > 128 {
+                        Err("push subscription device label is invalid")
+                    } else {
+                        Ok(label.to_string())
+                    }
+                })
+                .transpose()?;
+            Ok(PushSubscriptionView {
+                id: id.to_string(),
+                endpoint_hint: format!("{host} · endpoint secret hidden"),
+                device_label,
+                kind: kind.to_string(),
+                created_at: created_at.to_string(),
+                last_used,
+            })
+        })
+        .collect()
+}
+
+#[tauri::command]
+fn list_push_subscriptions(
+    state: State<'_, AppState>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Vec<PushSubscriptionView>, String> {
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let user_id = state
+        .client
+        .lock()
+        .map_err(|error| error.to_string())?
+        .authenticated_user_id()?
+        .to_string();
+    let value = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::GET,
+        rest_api_url(
+            &binding.origin.canonical_server_origin(),
+            &["v1", "push", "subscriptions"],
+        )?,
+        &user_id,
+        None,
+        &binding,
+    ))?;
+    parse_push_subscription_views(&value)
+}
+
+#[tauri::command]
+fn create_push_subscription(
+    state: State<'_, AppState>,
+    endpoint: String,
+    device_label: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty()
+        || endpoint.len() > 2048
+        || endpoint.chars().any(char::is_control)
+        || endpoint.chars().any(char::is_whitespace)
+    {
+        return Err("UnifiedPush endpoint is invalid".to_string());
+    }
+    let device_label = device_label.trim();
+    if device_label.len() > 128 || device_label.chars().any(char::is_control) {
+        return Err("device label is invalid".to_string());
+    }
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let user_id = state
+        .client
+        .lock()
+        .map_err(|error| error.to_string())?
+        .authenticated_user_id()?
+        .to_string();
+    state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::POST,
+        rest_api_url(
+            &binding.origin.canonical_server_origin(),
+            &["v1", "push", "subscriptions"],
+        )?,
+        &user_id,
+        Some(serde_json::json!({
+            "endpoint": endpoint,
+            "device_label": device_label,
+            "kind": "unifiedpush",
+        })),
+        &binding,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_push_subscription(
+    state: State<'_, AppState>,
+    subscription_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    let id = subscription_id
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0 && id.to_string() == subscription_id)
+        .ok_or("push subscription id is invalid")?;
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let user_id = state
+        .client
+        .lock()
+        .map_err(|error| error.to_string())?
+        .authenticated_user_id()?
+        .to_string();
+    state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::DELETE,
+        rest_api_url(
+            &binding.origin.canonical_server_origin(),
+            &["v1", "push", "subscriptions", &id.to_string()],
+        )?,
+        &user_id,
+        None,
+        &binding,
+    ))?;
+    Ok(())
+}
+
 fn pause_server_sender_keys(
     state: &AppState,
     app: &AuthenticatedEventAppHandle,
@@ -10966,6 +11167,9 @@ pub fn run() {
             send_attachment_message,
             save_message_attachment,
             create_attachment_media_source,
+            list_push_subscriptions,
+            create_push_subscription,
+            delete_push_subscription,
             discard_failed_outgoing_message,
             edit_message,
             delete_message,
@@ -11048,11 +11252,11 @@ mod e2ee_rest_tests {
         invalidate_disconnected_binding, offline_sync_url, parse_device_directory,
         parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
         parse_message_crypto_context, parse_network_profile_response, parse_pending_veil_link,
-        parse_prekey_bundle, pending_veil_link_view, preserve_created_group_outcome,
-        proves_future_only_sender_key_history, publish_unlocked_session,
-        require_matching_identity_fingerprint, resolve_auto_lock_seconds, rest_api_url,
-        rest_authority, rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
-        valid_unlock_pin, validate_authenticated_binding_commit,
+        parse_prekey_bundle, parse_push_subscription_views, pending_veil_link_view,
+        preserve_created_group_outcome, proves_future_only_sender_key_history,
+        publish_unlocked_session, require_matching_identity_fingerprint, resolve_auto_lock_seconds,
+        rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
+        valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
         validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
         validate_expected_live_action_binding, validate_expected_rest_binding,
         validate_live_action_rest_origin, validate_live_message_security_context,
@@ -11109,6 +11313,38 @@ mod e2ee_rest_tests {
 
         let (_, end) = parse_media_plaintext_range(None, MAX_MEDIA_RANGE_BYTES * 2).unwrap();
         assert_eq!(end, MAX_MEDIA_RANGE_BYTES - 1);
+    }
+
+    #[test]
+    fn push_subscription_projection_never_exposes_endpoint_secrets() {
+        let value = serde_json::json!({
+            "subscriptions": [{
+                "id": 7,
+                "endpoint": "https://push.example.test/topic/secret-token",
+                "device_label": "Pixel",
+                "kind": "unifiedpush",
+                "created_at": "2026-07-14T01:02:03Z",
+                "last_used": "2026-07-14T02:03:04Z"
+            }]
+        });
+        let views = parse_push_subscription_views(&value).unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].id, "7");
+        assert_eq!(
+            views[0].endpoint_hint,
+            "push.example.test · endpoint secret hidden"
+        );
+        assert!(!views[0].endpoint_hint.contains("secret-token"));
+
+        let unsupported = serde_json::json!({
+            "subscriptions": [{
+                "id": 1,
+                "endpoint": "https://push.example.test/topic",
+                "kind": "webpush",
+                "created_at": "2026-07-14T01:02:03Z"
+            }]
+        });
+        assert!(parse_push_subscription_views(&unsupported).is_err());
     }
 
     fn historical_account_snapshot(identity_key: u8, signing_key: u8) -> AccountSnapshot {

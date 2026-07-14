@@ -47,7 +47,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 1 | Kobalte — headless UI | закрыто: composite controls/focus/keyboard/ARIA унифицированы |
 | 2 | Tantivy — локальный поиск | готово, индекс теперь только в RAM |
 | 3 | tus.io — загрузка файлов | core закрыт; 3B desktop attachment client реализован, physical matrix остаётся gate |
-| 4 | UnifiedPush / ntfy | transport core закрыт; device clients вынесены в 4P |
+| 4 | UnifiedPush / ntfy | transport core и desktop subscription management закрыты; mobile receiver привязан к native Phase 5A |
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
@@ -246,13 +246,21 @@ Envelope: JSON с короткими именами полей, padding до р�
 - Только `KindMessage`. `KindCall` / `KindMention` зарезервированы, реализую в Phase 7 и когда дойдём до @-mentions
 - Inner preview ciphertext пока не заполняется сервером — клиент получает wakeup и синкит по `/v1/messages`. K_push cache на стороне sender device откладывается на мобильный клиент
 
-**Phase 4P — Device Push Clients (отложено):**
-- Android: `react-native-unifiedpush-connector` в `veil-mobile/`, distributor picker, notification listener с K_push из keychain
+**Phase 4P — Device Push Clients (desktop management готов 2026-07-14; mobile runtime pending):**
+- Desktop: list/add/delete subscriptions реализованы через origin/session-bound
+  Tauri commands. Full endpoint secret принимается только для create и не
+  возвращается в renderer при list; UI показывает безопасный host hint.
+- Android: официальный Kotlin connector или проверенный Expo adapter,
+  distributor picker и generic notification listener подключаются вместе с
+  production native crypto/auth/background-sync runtime в Phase 5A.
 - iOS: ntfy iOS app как APNS bridge, App Group для shared keychain между extension и основным приложением
-- Desktop: settings panel с list/add/delete subscriptions (Tauri команды + Kobalte Dialog)
 - Продуктовое решение для Android: UnifiedPush-only либо опциональный FCM wake-up
   с полностью зашифрованным/нейтральным payload. Транспорт не должен получать
   текст сообщения, имя отправителя или ключи.
+
+Security disposition и причины, по которым общий server transport key нельзя
+встраивать в клиенты, зафиксированы в
+[`docs/reviews/phase-4p-device-push-client-review.md`](docs/reviews/phase-4p-device-push-client-review.md).
 
 Грабли:
 - iOS App Group keychain: main app + extension обязаны использовать один access group. Без этого extension не расшифрует и будет вечно показывать "New message"

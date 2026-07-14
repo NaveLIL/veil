@@ -104,6 +104,15 @@ export interface MessageAttachment {
   plaintextSize: number;
 }
 
+export interface PushSubscription {
+  id: string;
+  endpointHint: string;
+  deviceLabel?: string;
+  kind: "unifiedpush";
+  createdAt: string;
+  lastUsed?: string;
+}
+
 export interface ServerBan {
   userId: string;
   username: string;
@@ -1448,6 +1457,37 @@ export const appStore = {
       throw new Error("native media source violated its capability contract");
     }
     return result;
+  },
+
+  listPushSubscriptions: async (): Promise<PushSubscription[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const result = await invoke<PushSubscription[]>("list_push_subscriptions", {
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return result;
+  },
+
+  createPushSubscription: async (endpoint: string, deviceLabel: string): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("create_push_subscription", {
+      endpoint,
+      deviceLabel,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
+  deletePushSubscription: async (subscriptionId: string): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("delete_push_subscription", {
+      subscriptionId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
   },
 
   discardFailedMessage: async (localMessageId: string) => {

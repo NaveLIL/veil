@@ -1,9 +1,9 @@
 import { Component, createEffect, createSignal, Show, For, Switch, Match, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getVersion } from "@tauri-apps/api/app";
-import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
+import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent, type PushSubscription } from "@/stores/app";
 import { appearanceStore, THEME_OPTIONS, UI_SCALE_OPTIONS } from "@/stores/appearance";
-import { promptDecision } from "@/lib/decisionDialog";
+import { confirmDecision, promptDecision } from "@/lib/decisionDialog";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { IslandSelect } from "@/components/ui/IslandSelect";
 import { Switch as VeilSwitch } from "@/components/ui/switch";
@@ -20,6 +20,8 @@ import {
   Network,
   Palette,
   Shield,
+  Trash2,
+  RefreshCw,
   UserRound,
   type LucideIcon,
 } from "lucide-solid";
@@ -84,6 +86,15 @@ export const SettingsScreen: Component = () => {
   const [networkError, setNetworkError] = createSignal("");
   const [networkSaving, setNetworkSaving] = createSignal(false);
 
+  // UnifiedPush endpoint management. Endpoint secrets are accepted once by
+  // native code but are never returned to renderer state after registration.
+  const [pushSubscriptions, setPushSubscriptions] = createSignal<PushSubscription[]>([]);
+  const [pushEndpoint, setPushEndpoint] = createSignal("");
+  const [pushDeviceLabel, setPushDeviceLabel] = createSignal("");
+  const [pushBusy, setPushBusy] = createSignal(false);
+  const [pushError, setPushError] = createSignal("");
+  let pushLoadKey = "";
+
   // Auto-lock
   const autoLockMin = () => appStore.autoLockSeconds() / 60;
   const [autoLockSaving, setAutoLockSaving] = createSignal(false);
@@ -139,6 +150,68 @@ export const SettingsScreen: Component = () => {
 
   createEffect(() => {
     if (appStore.bindingTransitioning()) setRecoveryLoading(false);
+  });
+
+  const loadPushSubscriptions = async () => {
+    if (pushBusy() || !appStore.connected()) return;
+    setPushBusy(true);
+    setPushError("");
+    try {
+      setPushSubscriptions(await appStore.listPushSubscriptions());
+    } catch (error) {
+      setPushError(String(error));
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  const addPushSubscription = async () => {
+    if (pushBusy() || !pushEndpoint().trim()) return;
+    setPushBusy(true);
+    setPushError("");
+    try {
+      await appStore.createPushSubscription(pushEndpoint(), pushDeviceLabel());
+      // A distributor endpoint is a bearer capability. Remove it from the DOM
+      // and renderer memory immediately after the native request succeeds.
+      setPushEndpoint("");
+      setPushDeviceLabel("");
+      setPushSubscriptions(await appStore.listPushSubscriptions());
+    } catch (error) {
+      setPushError(String(error));
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  const removePushSubscription = async (subscription: PushSubscription) => {
+    const confirmed = await confirmDecision({
+      title: "Remove push device",
+      message: `Stop offline wake-ups for ${subscription.deviceLabel || "this device"}? Other devices are unaffected.`,
+      confirmLabel: "Remove",
+      cancelLabel: "Cancel",
+      danger: true,
+    });
+    if (!confirmed || pushBusy()) return;
+    setPushBusy(true);
+    setPushError("");
+    try {
+      await appStore.deletePushSubscription(subscription.id);
+      setPushSubscriptions((current) => current.filter((item) => item.id !== subscription.id));
+    } catch (error) {
+      setPushError(String(error));
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
+  createEffect(() => {
+    if (section() !== "notifications" || !appStore.connected() || appStore.bindingTransitioning()) {
+      return;
+    }
+    const key = `${appStore.serverHttpUrl()}|${appStore.userId()}`;
+    if (key === pushLoadKey) return;
+    pushLoadKey = key;
+    void loadPushSubscriptions();
   });
 
   const confirmRecoveryReveal = () => {
@@ -204,6 +277,9 @@ export const SettingsScreen: Component = () => {
     setPinInput("");
     setPinConfirm("");
     setCurrentPin("");
+    setPushEndpoint("");
+    setPushDeviceLabel("");
+    setPushSubscriptions([]);
     document.removeEventListener("keydown", handleKey);
   });
 
@@ -1127,6 +1203,57 @@ export const SettingsScreen: Component = () => {
           </div>
           <span style={S.badge("var(--veil-success)")}>Content hidden</span>
         </div>
+      </div>
+
+      <div style={S.card}>
+        <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", gap: "12px", "margin-bottom": "12px" }}>
+          <div>
+            <div style={{ ...S.cardTitle, "margin-bottom": "3px" }}>Offline push devices</div>
+            <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "line-height": "1.5" }}>
+              Manage distributor endpoints for this account. Veil sends only fixed-size generic wake-ups; message text and sender names never enter the push transport.
+            </div>
+          </div>
+          <button type="button" style={{ ...S.btnSecondary, padding: "7px 9px" }} disabled={pushBusy() || !appStore.connected()} onClick={() => void loadPushSubscriptions()} aria-label="Refresh push devices">
+            <RefreshCw size={14} strokeWidth={2} />
+          </button>
+        </div>
+
+        <Show when={pushSubscriptions().length > 0} fallback={
+          <div style={{ ...S.paragraph, padding: "10px 0" }}>
+            {pushBusy() ? "Loading devices…" : "No offline push devices are registered."}
+          </div>
+        }>
+          <div style={{ display: "grid", gap: "8px", "margin-bottom": "16px" }}>
+            <For each={pushSubscriptions()}>
+              {(subscription) => (
+                <div style={{ display: "grid", "grid-template-columns": "minmax(0, 1fr) auto", gap: "12px", "align-items": "center", padding: "11px 12px", border: "1px solid var(--veil-border)", "border-radius": "10px", background: "var(--veil-contrast-02)" }}>
+                  <div style={{ "min-width": "0" }}>
+                    <div style={{ "font-size": "13px", "font-weight": "650", color: "var(--veil-text)" }}>{subscription.deviceLabel || "Unnamed device"}</div>
+                    <div style={{ "font-size": "10px", color: "var(--veil-text-faint)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "margin-top": "3px" }}>{subscription.endpointHint}</div>
+                    <div style={{ "font-size": "10px", color: "var(--veil-text-subtle)", "margin-top": "2px" }}>Added {new Date(subscription.createdAt).toLocaleString()}</div>
+                  </div>
+                  <button type="button" style={{ ...S.btnSecondary, padding: "7px 9px", color: "var(--veil-danger)" }} disabled={pushBusy()} onClick={() => void removePushSubscription(subscription)} aria-label={`Remove push device ${subscription.deviceLabel || "unnamed"}`}>
+                    <Trash2 size={14} strokeWidth={2} />
+                  </button>
+                </div>
+              )}
+            </For>
+          </div>
+        </Show>
+
+        <div style={{ display: "grid", gap: "9px", "padding-top": "14px", "border-top": "1px solid var(--veil-border)" }}>
+          <input type="password" autocomplete="off" spellcheck={false} style={S.input} value={pushEndpoint()} onInput={(event) => setPushEndpoint(event.currentTarget.value)} placeholder="UnifiedPush distributor endpoint" aria-label="UnifiedPush distributor endpoint" />
+          <div style={{ display: "flex", gap: "9px" }}>
+            <input style={{ ...S.input, flex: "1" }} maxlength={128} value={pushDeviceLabel()} onInput={(event) => setPushDeviceLabel(event.currentTarget.value)} placeholder="Device label (optional)" aria-label="Push device label" />
+            <button type="button" style={S.btnPrimary} disabled={pushBusy() || !appStore.connected() || !pushEndpoint().trim()} onClick={() => void addPushSubscription()}>
+              Add endpoint
+            </button>
+          </div>
+          <div style={{ "font-size": "10px", color: "var(--veil-warning)", "line-height": "1.5" }}>
+            Treat the endpoint like a password. Veil clears it after registration and never returns its secret path to the interface.
+          </div>
+        </div>
+        <Show when={pushError()}><div style={S.errorMsg} role="alert">{pushError()}</div></Show>
       </div>
 
       <div style={S.card}>
