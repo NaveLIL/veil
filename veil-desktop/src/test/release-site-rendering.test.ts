@@ -14,7 +14,16 @@ function releaseFile(
   return { platform, kind, filename, size: 10, sha256, ...(signature ? { signature } : {}) };
 }
 
-async function renderReleaseSite(files: ReturnType<typeof releaseFile>[]) {
+type FetchStub = () => Promise<{
+  ok: boolean;
+  status?: number;
+  json: () => Promise<unknown>;
+}>;
+
+async function renderReleaseSite(
+  files: ReturnType<typeof releaseFile>[],
+  fetchStub?: FetchStub,
+) {
   const siteDocument = new DOMParser().parseFromString(siteHtml, "text/html");
   const manifest = {
     version: "0.1.1",
@@ -33,10 +42,19 @@ async function renderReleaseSite(files: ReturnType<typeof releaseFile>[]) {
   runReleaseScript(
     siteDocument,
     { platform: "Win32", userAgent: "Windows" },
-    async () => ({ ok: true, json: async () => manifest }),
+    fetchStub ?? (async () => ({ ok: true, status: 200, json: async () => manifest })),
   );
   await new Promise<void>((resolveRender) => setTimeout(resolveRender, 0));
   return siteDocument;
+}
+
+function expectDownloadsHidden(siteDocument: Document) {
+  expect(siteDocument.querySelectorAll("#release-grid a")).toHaveLength(0);
+  expect(siteDocument.querySelector("#release-checksums")?.hasAttribute("hidden")).toBe(true);
+  expect(siteDocument.querySelector("#release-checksums")?.hasAttribute("href")).toBe(false);
+  expect(siteDocument.querySelector("#release-source")?.hasAttribute("hidden")).toBe(true);
+  expect(siteDocument.querySelector("#release-source")?.hasAttribute("href")).toBe(false);
+  expect(siteDocument.querySelector("#release-status")?.getAttribute("aria-live")).toBe("polite");
 }
 
 describe("release download site", () => {
@@ -63,8 +81,52 @@ describe("release download site", () => {
       releaseFile("linux", "appimage", "Veil-linux-x86_64.AppImage"),
     ]);
 
-    expect(siteDocument.querySelectorAll("#release-grid a")).toHaveLength(0);
+    expectDownloadsHidden(siteDocument);
+    expect(siteDocument.querySelector("#release-status")?.textContent).toContain("не прошли проверку");
     expect(siteDocument.querySelector("#package-release-status")?.textContent).not.toContain("доступны Linux и Windows");
-    expect(siteDocument.querySelector("#release-checksums")?.hasAttribute("hidden")).toBe(true);
+  });
+
+  it("keeps the honest no-release fallback for a missing manifest", async () => {
+    const siteDocument = await renderReleaseSite([], async () => ({
+      ok: false,
+      status: 404,
+      json: async () => null,
+    }));
+
+    expectDownloadsHidden(siteDocument);
+    expect(siteDocument.querySelector("#release-status")?.textContent).toContain("Проверенных preview-сборок пока нет");
+  });
+
+  it("reports a temporary outage for a non-404 response", async () => {
+    const siteDocument = await renderReleaseSite([], async () => ({
+      ok: false,
+      status: 503,
+      json: async () => null,
+    }));
+
+    expectDownloadsHidden(siteDocument);
+    expect(siteDocument.querySelector("#release-status")?.textContent).toContain("временно недоступен");
+  });
+
+  it("reports a temporary outage when the manifest request fails", async () => {
+    const siteDocument = await renderReleaseSite([], async () => {
+      throw new TypeError("network unavailable");
+    });
+
+    expectDownloadsHidden(siteDocument);
+    expect(siteDocument.querySelector("#release-status")?.textContent).toContain("временно недоступен");
+  });
+
+  it("rejects invalid JSON as untrusted release data", async () => {
+    const siteDocument = await renderReleaseSite([], async () => ({
+      ok: true,
+      status: 200,
+      json: async () => {
+        throw new SyntaxError("invalid JSON");
+      },
+    }));
+
+    expectDownloadsHidden(siteDocument);
+    expect(siteDocument.querySelector("#release-status")?.textContent).toContain("не прошли проверку");
   });
 });
