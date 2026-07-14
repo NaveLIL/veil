@@ -2,6 +2,7 @@ import type { Component } from "solid-js";
 import { For } from "solid-js";
 import { MessageCircle, Plus, Users } from "lucide-solid";
 import type { Conversation, Server } from "@/stores/app";
+import { SpaceMark } from "@/components/spaces/SpaceMark";
 
 type CircleSummary = Pick<Conversation, "id" | "name" | "unreadCount">;
 
@@ -15,6 +16,7 @@ export interface ServerRailProps {
   circles: readonly CircleSummary[];
   spaces: readonly Server[];
   visible: boolean;
+  canonicalOrigin?: string;
   onSelectHome: () => void;
   onSelectCircle: (circleId: string) => void;
   onSelectSpace: (spaceId: string) => void;
@@ -140,7 +142,7 @@ export const ServerRail: Component<ServerRailProps> = (props) => (
                 }}
                 title={`${space.name} · Space`}
               >
-                <span aria-hidden="true">{space.name.charAt(0).toUpperCase()}</span>
+                <span aria-hidden="true"><SpaceMark canonicalOrigin={props.canonicalOrigin ?? ""} spaceId={space.id} size={34} /></span>
               </button>
             );
           }}

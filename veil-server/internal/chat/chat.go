@@ -418,6 +418,29 @@ func (s *Service) CreateGroup(ctx context.Context, name string, creatorUserID st
 	return s.db.CreateGroup(ctx, name, creatorUserID)
 }
 
+func (s *Service) CreateCircle(ctx context.Context, name, creatorUserID string, members []db.GroupMemberLocator) (string, error) {
+	if name == "" {
+		return "", errors.New("Circle name required")
+	}
+	if len(name) > 100 {
+		return "", errors.New("Circle name too long")
+	}
+	if len(members) < 1 || len(members) > 32 {
+		return "", errors.New("Circle requires between 1 and 32 selected members")
+	}
+	seen := map[string]struct{}{creatorUserID: {}}
+	for _, member := range members {
+		if member.UserID == "" || len(member.IdentityKey) != 32 {
+			return "", errors.New("invalid initial Circle member locator")
+		}
+		if _, exists := seen[member.UserID]; exists {
+			return "", errors.New("duplicate initial Circle member")
+		}
+		seen[member.UserID] = struct{}{}
+	}
+	return s.db.CreateGroupWithMembers(ctx, name, creatorUserID, members)
+}
+
 // AddGroupMember adds a user to a group. Only admins/owners can add.
 func (s *Service) AddGroupMember(ctx context.Context, convID, requesterID, targetUserID string) error {
 	conversationType, err := s.db.GetConversationType(ctx, convID)

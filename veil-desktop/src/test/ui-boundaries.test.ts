@@ -43,7 +43,7 @@ describe("desktop interaction boundaries", () => {
     expect(store).toMatch(/conversationType\s*===\s*["']group["']/);
   });
 
-  it("fails closed for UUID-only Add Me links", () => {
+  it("hard-cuts UUID-only Add Me deep links", () => {
     const normalized = Object.entries(interactiveSources).map(([path, source]) => [
       path.replaceAll("\\", "/"),
       source,
@@ -51,7 +51,8 @@ describe("desktop interaction boundaries", () => {
     const store = normalized.find(([path]) => path.endsWith("/stores/app.ts"))?.[1];
     const settings = normalized.find(([path]) => path.endsWith("/components/chat/SettingsScreen.tsx"))?.[1];
 
-    expect(store).toContain("Legacy Add Me link blocked");
+    expect(store).not.toContain("deep-link://new-url");
+    expect(store).not.toContain("addUserId");
     expect(store).not.toMatch(/createDm\s*\(\s*addUserId\s*\)/);
     expect(settings).toContain("Unavailable until origin-scoped profile links are supported");
   });
@@ -63,5 +64,21 @@ describe("desktop interaction boundaries", () => {
     expect(store).toBeTypeOf("string");
     expect(store).not.toMatch(/cache_(?:load|save|delete)_(?:servers|channels|roles|server_members|server|channel)/);
     expect(store).not.toContain("resolve_cached_channel_context");
+  });
+
+  it("hard-cuts legacy join and remote Space artwork surfaces", () => {
+    const normalized = Object.entries(interactiveSources).map(([path, source]) => [
+      path.replaceAll("\\", "/"),
+      source,
+    ] as const);
+    const app = normalized.find(([path]) => path.endsWith("/App.tsx"))?.[1];
+    const store = normalized.find(([path]) => path.endsWith("/stores/app.ts"))?.[1];
+    const settings = normalized.find(([path]) => path.endsWith("/components/server/ServerSettingsScreen.tsx"))?.[1];
+
+    expect(app).not.toContain("JoinServerDialog");
+    expect(store).not.toContain("iconUrl");
+    expect(store).not.toContain("icon_url");
+    expect(settings).not.toMatch(/remote\s+(?:image|icon)\s+url[^\n]*(?:input|placeholder)/i);
+    expect(settings).toContain("deterministic Space mark");
   });
 });

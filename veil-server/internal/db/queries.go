@@ -995,8 +995,20 @@ type GroupMember struct {
 	JoinedAt    time.Time
 }
 
+type GroupMemberLocator struct {
+	UserID      string
+	IdentityKey []byte
+}
+
 // CreateGroup creates a group conversation and adds the creator as owner.
 func (db *DB) CreateGroup(ctx context.Context, name string, creatorUserID string) (string, error) {
+	return db.CreateGroupWithMembers(ctx, name, creatorUserID, nil)
+}
+
+// CreateGroupWithMembers commits the Circle and its complete initial roster as
+// one transaction. Every selected account is pinned by user ID + identity key;
+// a stale or cross-origin locator aborts instead of creating an orphan Circle.
+func (db *DB) CreateGroupWithMembers(ctx context.Context, name string, creatorUserID string, members []GroupMemberLocator) (string, error) {
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
 		return "", err
@@ -1018,6 +1030,24 @@ func (db *DB) CreateGroup(ctx context.Context, name string, creatorUserID string
 		convID, creatorUserID)
 	if err != nil {
 		return "", fmt.Errorf("add group owner: %w", err)
+	}
+	for _, member := range members {
+		var exists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM users WHERE id=$1::uuid AND identity_key=$2)`,
+			member.UserID, member.IdentityKey,
+		).Scan(&exists); err != nil {
+			return "", fmt.Errorf("validate initial Circle member: %w", err)
+		}
+		if !exists {
+			return "", errors.New("initial Circle member locator is not authoritative")
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO conversation_members (conversation_id, user_id, role)
+			 VALUES ($1, $2::uuid, 0)`, convID, member.UserID,
+		); err != nil {
+			return "", fmt.Errorf("add initial Circle member: %w", err)
+		}
 	}
 
 	return convID, tx.Commit(ctx)

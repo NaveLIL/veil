@@ -16,12 +16,13 @@ import { LockScreen } from "@/components/chat/LockScreen";
 import { SettingsScreen } from "@/components/chat/SettingsScreen";
 import { ServerSettingsScreen } from "@/components/server/ServerSettingsScreen";
 import { CreateServerDialog } from "@/components/server/CreateServerDialog";
-import { JoinServerDialog } from "@/components/server/JoinServerDialog";
 import { CreateChannelDialog } from "@/components/server/CreateChannelDialog";
 import { CreateInviteDialog } from "@/components/server/CreateInviteDialog";
 import { RightIsland } from "@/components/layout/RightIsland";
 import { ServerRail } from "@/components/layout/ServerRail";
 import { SpaceCreateMenu } from "@/components/spaces/SpaceCreateMenu";
+import { VeilLinkJoinDialog } from "@/components/spaces/VeilLinkJoinDialog";
+import { SpaceMark } from "@/components/spaces/SpaceMark";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 import { conversationCryptoUiState } from "@/security/conversationCrypto";
 
@@ -57,11 +58,11 @@ import {
 import { toast, ToastViewport } from "@/components/ui/toast";
 import { CommandPalette, useCommandPaletteHotkey } from "@/components/ui/CommandPalette";
 import { DecisionDialogHost } from "@/components/ui/DecisionDialogHost";
-import { confirmDecision, promptDecision } from "@/lib/decisionDialog";
+import { alertDecision, confirmDecision, promptDecision } from "@/lib/decisionDialog";
 import {
   Users, UserPlus, UserMinus, Settings, Lock,
   ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
-  Volume2, MessageSquare, Eye, Shield, Send,
+  MessageSquare, Eye, Shield, Send,
 } from "lucide-solid";
 
 type RightIslandRoute =
@@ -108,7 +109,7 @@ const TIPS = [
   },
   {
     icon: "eye",
-    text: "Encryption protects message contents, not all metadata.\nThe server still routes accounts and conversations.",
+    text: "Encryption protects message contents, not all metadata.\nYour Veil Node still routes accounts and conversations.",
     sub: "Privacy is more than message encryption.",
   },
   {
@@ -199,6 +200,9 @@ const App: Component = () => {
   const [creatingGroup, setCreatingGroup] = createSignal(false);
   const [groupCreateError, setGroupCreateError] = createSignal("");
   const [newGroupName, setNewGroupName] = createSignal("");
+  const [circleMemberQuery, setCircleMemberQuery] = createSignal("");
+  const [circleMemberSearching, setCircleMemberSearching] = createSignal(false);
+  const [circleMember, setCircleMember] = createSignal<{ userId: string; username: string; identityKey: string } | null>(null);
   const [rightIslandRoute, setRightIslandRoute] = createSignal<RightIslandRoute>({ kind: "closed" });
   const [identityMessageBusy, setIdentityMessageBusy] = createSignal(false);
   const [identityProfileLoading, setIdentityProfileLoading] = createSignal(false);
@@ -715,8 +719,8 @@ const App: Component = () => {
     if (cryptoGate().headerLabel) return cryptoGate().headerLabel!;
     if (!conversation || conversation.type === "dm") return "End-to-end encryption enforced on send";
     const status = appStore.senderKeyStatus()[conversation.id] ?? "checking";
-    const kind = conversation.type === "channel" ? "channel" : "group";
-    if (status === "ready") return `Encrypted ${conversation.type === "channel" ? "server channel" : "group"}`;
+    const kind = conversation.type === "channel" ? "Room" : "group";
+    if (status === "ready") return `Encrypted ${conversation.type === "channel" ? "Room" : "group"}`;
     if (status === "pending") return `${kind[0].toUpperCase()}${kind.slice(1)} key update queued · sending blocked`;
     if (status === "error") return "Encryption check failed · sending blocked";
     return `Checking ${kind} encryption…`;
@@ -883,18 +887,10 @@ const App: Component = () => {
     (conversation) => conversation.type === "group",
   );
 
-  const activeCircle = () => {
-    if (appStore.activeServerId()) return null;
-    const conversationId = appStore.activeConversationId();
-    if (!conversationId) return null;
-    return circles().find((circle) => circle.id === conversationId) ?? null;
-  };
-
   const railRoute = () => {
-    const spaceId = appStore.activeServerId();
-    if (spaceId) return { kind: "space" as const, spaceId };
-    const circle = activeCircle();
-    if (circle) return { kind: "circle" as const, circleId: circle.id };
+    const route = appStore.workspaceRoute();
+    if (route.kind === "space") return { kind: "space" as const, spaceId: route.spaceId };
+    if (route.kind === "circle") return { kind: "circle" as const, circleId: route.circleId };
     return { kind: "home" as const };
   };
 
@@ -1187,15 +1183,18 @@ const App: Component = () => {
 
   const handleNewGroup = async () => {
     const name = newGroupName().trim();
-    if (!name || creatingGroup()) return;
+    const member = circleMember();
+    if (!name || !member || creatingGroup()) return;
     const sessionEpoch = captureUiSessionEpoch();
     setCreatingGroup(true);
     setGroupCreateError("");
     try {
-      const conversationId = await appStore.createGroup(name);
+      const conversationId = await appStore.createGroup(name, member);
       if (!isUiSessionEpochCurrent(sessionEpoch)) return;
-      if (!conversationId) throw new Error("The server did not confirm group creation");
+      if (!conversationId) throw new Error("The Veil Node did not confirm Circle creation");
       setNewGroupName("");
+      setCircleMemberQuery("");
+      setCircleMember(null);
       setShowNewGroup(false);
       openConversation(conversationId);
     } catch (reason) {
@@ -1207,6 +1206,27 @@ const App: Component = () => {
       // A late completion belongs only to its captured renderer session,
       // never to a create flow on the next origin.
       if (isUiSessionEpochCurrent(sessionEpoch)) setCreatingGroup(false);
+    }
+  };
+
+  const findInitialCircleMember = async () => {
+    const query = circleMemberQuery().trim();
+    if (!query || circleMemberSearching()) return;
+    setCircleMemberSearching(true);
+    setGroupCreateError("");
+    try {
+      const result = await appStore.searchUser(query);
+      if (!result || result.userId === appStore.userId()) {
+        setCircleMember(null);
+        setGroupCreateError(result ? "Choose another account for this Circle" : "No exact account found on this Veil Node");
+        return;
+      }
+      setCircleMember(result);
+    } catch (error) {
+      setCircleMember(null);
+      setGroupCreateError(String(error).replace(/^Error:\s*/, ""));
+    } finally {
+      setCircleMemberSearching(false);
     }
   };
 
@@ -1299,7 +1319,7 @@ const App: Component = () => {
     const resolution = selectedIdentityDmResolution();
     const { targetOrigin, targetUserId, targetIdentityKey } = resolution;
     if (!targetOrigin || !targetUserId) {
-      toast.error("Conversation not created", "The selected identity has no exact account locator on this server.");
+      toast.error("Conversation not created", "The selected identity has no exact account locator on this Veil Node.");
       return;
     }
     if (!targetIdentityKey && !identityAllowsKeylessDmResolution(profile)) {
@@ -1318,11 +1338,11 @@ const App: Component = () => {
       return;
     }
     if (!selectedIdentityAccountCanMessage()) {
-      toast.error("Conversation not opened", "This identity is not an exact non-self account in the current authenticated server scope.");
+      toast.error("Conversation not opened", "This identity is not an exact non-self account in the current authenticated Node scope.");
       return;
     }
     if (!selectedIdentityCanCreateDm()) {
-      toast.error("Conversation not created", "Connect to the current Veil server before creating this encrypted conversation.");
+      toast.error("Conversation not created", "Connect to the current Veil Node before creating this encrypted conversation.");
       return;
     }
 
@@ -1375,7 +1395,7 @@ const App: Component = () => {
       || appStore.bindingTransitioning()
       || appStore.originTransitioning()
     ) {
-      toast.error("Conversation not created", "This member does not have an exact non-self identity in the current authenticated server scope.");
+      toast.error("Conversation not created", "This member does not have an exact non-self identity in the current authenticated Node scope.");
       return;
     }
     const routeKey = route.kind === "identity"
@@ -1419,7 +1439,7 @@ const App: Component = () => {
       if (!(appStore.channelsByServer()[channel.serverId] ?? []).some(
         (candidate) => candidate.id === channel.channelId,
       )) {
-        toast.error("Channel unavailable", "Its cached context is stale or you no longer have access.");
+        toast.error("Room unavailable", "Its cached context is stale or you no longer have access.");
         return;
       }
       selectServerContext(channel.serverId, false);
@@ -1527,7 +1547,6 @@ const App: Component = () => {
   };
 
   const [showCreateServer, setShowCreateServer] = createSignal(false);
-  const [showJoinServer, setShowJoinServer] = createSignal(false);
   const [showSpaceCreateMenu, setShowSpaceCreateMenu] = createSignal(false);
   const [showCreateChannel, setShowCreateChannel] = createSignal(false);
   const [showCreateInvite, setShowCreateInvite] = createSignal(false);
@@ -1554,7 +1573,6 @@ const App: Component = () => {
     setShowNewGroup(false);
     setCmdkOpen(false);
     setShowCreateServer(false);
-    setShowJoinServer(false);
     setShowSpaceCreateMenu(false);
     setShowCreateChannel(false);
     setShowCreateInvite(false);
@@ -1575,7 +1593,6 @@ const App: Component = () => {
     setDeletingIds(new Set<string>());
     setCmdkOpen(false);
     setShowCreateServer(false);
-    setShowJoinServer(false);
     setShowSpaceCreateMenu(false);
     setShowCreateChannel(false);
     setShowCreateInvite(false);
@@ -1685,6 +1702,7 @@ const App: Component = () => {
               activeRoute={railRoute()}
               circles={circles()}
               spaces={appStore.servers()}
+              canonicalOrigin={appStore.authenticatedServerScope()?.canonicalServerOrigin}
               visible={island1Vis()}
               onSelectHome={() => selectServerContext(null)}
               onSelectCircle={openConversation}
@@ -1695,7 +1713,7 @@ const App: Component = () => {
             {/* ISLAND 2 — Sidebar */}
             <aside
               class="veil-sidebar-island"
-              aria-label={appStore.activeServerId() ? "Server channels" : "Conversations"}
+              aria-label={appStore.activeServerId() ? "Space Rooms" : "Conversations"}
               aria-hidden={circleContextOpen() ? "true" : undefined}
               inert={circleContextOpen()}
               style={{
@@ -1717,7 +1735,6 @@ const App: Component = () => {
                     .sort((a, b) => a.position - b.position);
                   const isOwner = () => server()?.ownerId === appStore.userId();
                   const channelIcon = (type: number) => {
-                    if (type === 1) return <Volume2 size={13} strokeWidth={2} style={{ color: "var(--veil-text-faint)" }} />;
                     if (type === 2) return <ChevronDown size={12} strokeWidth={2.5} style={{ color: "var(--veil-text-faint)" }} />;
                     return <span style={{ color: "var(--veil-text-faint)" }}>#</span>;
                   };
@@ -1739,18 +1756,16 @@ const App: Component = () => {
                         display: "flex", "align-items": "center", gap: "8px",
                         "flex-shrink": "0",
                       }}>
-                        <div style={{
-                          width: "30px", height: "30px", "border-radius": "9px",
-                          background: "rgba(var(--veil-accent-rgb),0.15)",
-                          color: "var(--veil-accent)",
-                          display: "flex", "align-items": "center", "justify-content": "center",
-                          "font-size": "13px", "font-weight": "700", "flex-shrink": "0",
-                        }}>{(server()?.name ?? "?").charAt(0).toUpperCase()}</div>
+                        <SpaceMark
+                          canonicalOrigin={appStore.authenticatedServerScope()?.canonicalServerOrigin ?? "unbound"}
+                          spaceId={sid()}
+                          size={30}
+                        />
                         <div style={{ flex: "1", "min-width": "0" }}>
                           <div style={{
                             "font-size": "13px", "font-weight": "700", color: "var(--veil-text-strong)",
                             "white-space": "nowrap", overflow: "hidden", "text-overflow": "ellipsis",
-                          }}>{server()?.name ?? "Server"}</div>
+                          }}>{server()?.name ?? "Space"}</div>
                           <div style={{ "font-size": "10px", color: "var(--veil-text-faint)" }}>
                             {(appStore.serverMembers()[sid()] ?? []).length} members
                           </div>
@@ -1759,7 +1774,7 @@ const App: Component = () => {
                           type="button"
                           style={headerBtn(rightIslandOpen())}
                           title="Members"
-                          aria-label="Show server members"
+                          aria-label="Show Space members"
                           onClick={async (event) => {
                             const opener = event.currentTarget;
                             if (memberPanelOpen()) {
@@ -1777,8 +1792,8 @@ const App: Component = () => {
                         <button
                           type="button"
                           style={headerBtn(false)}
-                          title="Invite people"
-                          aria-label="Invite people"
+                          title="Create Veil Link"
+                          aria-label="Create Veil Link"
                           onClick={() => setShowCreateInvite(true)}
                         >
                           <UserPlus size={14} strokeWidth={1.8} />
@@ -1787,8 +1802,8 @@ const App: Component = () => {
                           <button
                             type="button"
                             style={headerBtn(false)}
-                            title="Server settings"
-                            aria-label="Open server settings"
+                            title="Space settings"
+                            aria-label="Open Space settings"
                             onClick={() => appStore.openServerSettings(sid())}
                           >
                             <Settings size={14} strokeWidth={1.8} />
@@ -1805,7 +1820,7 @@ const App: Component = () => {
                           <span style={{
                             "font-size": "10px", "font-weight": "700", color: "var(--veil-text-faint)",
                             "letter-spacing": "0.08em", "text-transform": "uppercase",
-                          }}>Channels</span>
+                          }}>Rooms</span>
                           <Show when={isOwner()}>
                             <button
                               style={{
@@ -1816,19 +1831,19 @@ const App: Component = () => {
                                 "line-height": "1",
                               }}
                               onClick={() => setShowCreateChannel(true)}
-                              title="Create channel"
+                              title="Create Room"
                             >+</button>
                           </Show>
                         </div>
                         <Show when={channels().length > 0} fallback={
                           <div style={{ "text-align": "center", color: "var(--veil-text-faint)", "font-size": "12px", padding: "20px 12px" }}>
-                            No channels yet
+                            No Rooms yet
                             <Show when={isOwner()}>
                               <div style={{ "margin-top": "8px" }}>
                                 <button
                                   style={{ background: "none", border: "none", color: "var(--veil-accent)", "font-size": "12px", cursor: "pointer" }}
                                   onClick={() => setShowCreateChannel(true)}
-                                >Create channel {"\u2192"}</button>
+                                >Create Room {"\u2192"}</button>
                               </div>
                             </Show>
                           </div>
@@ -1978,14 +1993,14 @@ const App: Component = () => {
                                     <ContextMenuContent>
                                       <ContextMenuItem onSelect={() => navigator.clipboard?.writeText(ch.id)}>
                                         <ContextMenuIcon><Copy size={14} strokeWidth={2} /></ContextMenuIcon>
-                                        Copy channel ID
+                                        Copy Room ID
                                       </ContextMenuItem>
                                       <Show when={isOwner()}>
                                         <ContextMenuSeparator />
                                         <ContextMenuItem onSelect={() => {
                                           void (async () => {
                                             const next = await promptDecision({
-                                              title: "Rename channel",
+                                              title: "Rename Room",
                                               message: `Choose a new name for #${ch.name}.`,
                                               confirmLabel: "Rename",
                                               initialValue: ch.name,
@@ -1994,7 +2009,7 @@ const App: Component = () => {
                                               const sid = appStore.activeServerId();
                                               if (sid) await appStore.updateChannel(sid, ch.id, { name: next.trim() });
                                             }
-                                          })().catch((error) => toast.error("Channel not renamed", String(error)));
+                                          })().catch((error) => toast.error("Room not renamed", String(error)));
                                         }}>
                                           <ContextMenuIcon><Pencil size={14} strokeWidth={2} /></ContextMenuIcon>
                                           Rename
@@ -2003,15 +2018,15 @@ const App: Component = () => {
                                           onSelect={() => {
                                             void (async () => {
                                               const confirmed = await confirmDecision({
-                                                title: "Delete channel?",
+                                                title: "Delete Room?",
                                                 message: `Delete #${ch.name}? This cannot be undone.`,
-                                                confirmLabel: "Delete channel",
+                                                confirmLabel: "Delete Room",
                                                 danger: true,
                                               });
                                               if (!confirmed) return;
                                               const sid = appStore.activeServerId();
                                               if (sid) await appStore.deleteChannel(sid, ch.id);
-                                            })().catch((error) => toast.error("Channel not deleted", String(error)));
+                                            })().catch((error) => toast.error("Room not deleted", String(error)));
                                           }}
                                         >
                                           <ContextMenuIcon><Trash2 size={14} strokeWidth={2} /></ContextMenuIcon>
@@ -2085,8 +2100,8 @@ const App: Component = () => {
                                           <Show when={isOwner()}>
                                             <button
                                               type="button"
-                                              aria-label={`Create channel in ${g.cat.name}`}
-                                              title="Create channel in category"
+                                              aria-label={`Create Room in ${g.cat.name}`}
+                                              title="Create Room in category"
                                               onClick={() => {
                                                 // TODO: prefill category in CreateChannelDialog when category prop is supported.
                                                 setShowCreateChannel(true);
@@ -2197,7 +2212,7 @@ const App: Component = () => {
               <Show when={showNewGroup()}>
                 <div style={{ margin: "8px 12px 5px", padding: "12px", "border-radius": "10px", background: "rgba(var(--veil-accent-rgb),0.07)", border: "1px solid rgba(var(--veil-accent-rgb),0.18)" }}>
                   <div style={{ color: "var(--veil-text-strong)", "font-size": "12px", "font-weight": "650", "margin-bottom": "8px" }}>Create Circle</div>
-                  <div style={{ display: "flex", gap: "7px" }}>
+                  <div style={{ display: "flex", gap: "7px", "margin-bottom": "7px" }}>
                     <input
                       ref={newGroupInputRef}
                       aria-label="Circle name"
@@ -2206,16 +2221,47 @@ const App: Component = () => {
                       value={newGroupName()}
                       disabled={creatingGroup()}
                       onInput={(event) => { setNewGroupName(event.currentTarget.value); setGroupCreateError(""); }}
-                      onKeyDown={(event) => event.key === "Enter" && void handleNewGroup()}
+                      onKeyDown={(event) => event.key === "Enter" && circleMember() && void handleNewGroup()}
                     />
                     <button
                       type="button"
                       aria-label="Create Circle"
-                      disabled={creatingGroup() || !newGroupName().trim()}
-                      style={{ width: "36px", height: "34px", "border-radius": "8px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", cursor: creatingGroup() ? "wait" : "pointer", opacity: creatingGroup() || !newGroupName().trim() ? "0.5" : "1" }}
+                      disabled={creatingGroup() || !newGroupName().trim() || !circleMember()}
+                      style={{ width: "36px", height: "34px", "border-radius": "8px", background: "var(--veil-accent)", border: "none", color: "var(--veil-on-accent)", cursor: creatingGroup() ? "wait" : "pointer", opacity: creatingGroup() || !newGroupName().trim() || !circleMember() ? "0.5" : "1" }}
                       onClick={() => void handleNewGroup()}
                     >→</button>
                   </div>
+                  <Show
+                    when={circleMember()}
+                    fallback={
+                      <div style={{ display: "flex", gap: "7px", "margin-bottom": "7px" }}>
+                        <input
+                          aria-label="Find initial Circle member"
+                          style={{ ...S.searchBox, flex: "1", "min-width": "0" }}
+                          placeholder="Exact username"
+                          value={circleMemberQuery()}
+                          disabled={creatingGroup() || circleMemberSearching()}
+                          onInput={(event) => { setCircleMemberQuery(event.currentTarget.value); setGroupCreateError(""); }}
+                          onKeyDown={(event) => event.key === "Enter" && void findInitialCircleMember()}
+                        />
+                        <button
+                          type="button"
+                          aria-label="Find Circle member"
+                          disabled={circleMemberSearching() || !circleMemberQuery().trim()}
+                          style={{ width: "58px", height: "34px", "border-radius": "8px", background: "var(--veil-control)", border: "1px solid var(--veil-contrast-08)", color: "var(--veil-text)", cursor: circleMemberSearching() ? "wait" : "pointer", opacity: !circleMemberQuery().trim() ? "0.5" : "1", "font-size": "11px" }}
+                          onClick={() => void findInitialCircleMember()}
+                        >{circleMemberSearching() ? "…" : "Find"}</button>
+                      </div>
+                    }
+                  >
+                    {(member) => (
+                      <div style={{ display: "flex", "align-items": "center", gap: "8px", padding: "7px 9px", "border-radius": "8px", background: "var(--veil-contrast-04)", "margin-bottom": "7px" }}>
+                        <UserAvatar identityKey={member().identityKey} canonicalServerOrigin={appStore.authenticatedServerScope()?.canonicalServerOrigin} userId={member().userId} technicalUsername={member().username} size={24} />
+                        <span style={{ flex: "1", "min-width": "0", overflow: "hidden", "text-overflow": "ellipsis", "font-size": "12px" }}>{member().username}</span>
+                        <button type="button" aria-label="Remove initial Circle member" style={{ background: "none", border: "none", color: "var(--veil-text-faint)", cursor: "pointer" }} onClick={() => setCircleMember(null)}>×</button>
+                      </div>
+                    )}
+                  </Show>
                   <Show when={groupCreateError()}>
                     <div role="alert" style={{ "margin-top": "7px", color: "var(--veil-danger)", "font-size": "10px", "line-height": "1.35" }}>{groupCreateError()}</div>
                   </Show>
@@ -2904,7 +2950,7 @@ const App: Component = () => {
                           >
                             {notice() === "security" ? <Lock size={12} strokeWidth={2} /> : <Shield size={12} strokeWidth={2} />}
                             {notice() === "security"
-                              ? `The ${c().type === "channel" ? "channel" : "group"} key update is being durably queued for the current roster. Your draft is safe; try Send again shortly.`
+                              ? `The ${c().type === "channel" ? "Room" : "group"} key update is being durably queued for the current roster. Your draft is safe; try Send again shortly.`
                               : "Message not sent. Your draft was kept; check the connection and try again."}
                           </div>
                         )}
@@ -3109,8 +3155,8 @@ const App: Component = () => {
               onKickMember={(serverId, userId, username) => {
                 void (async () => {
                   const confirmed = await confirmDecision({
-                    title: "Remove server member?",
-                    message: `Kick ${username} from the server?`,
+                    title: "Remove Space member?",
+                    message: `Kick ${username} from the Space?`,
                     confirmLabel: "Kick member",
                     danger: true,
                   });
@@ -3133,13 +3179,20 @@ const App: Component = () => {
           requestAnimationFrame(() => newGroupInputRef?.focus());
         }}
         onCreateSpace={() => setShowCreateServer(true)}
-        onJoinSpace={() => setShowJoinServer(true)}
-        joinAvailable={false}
+        onJoinSpace={() => {
+          void appStore.refreshPendingVeilLink().then((pending) => {
+            if (!pending) return alertDecision({
+              title: "Open a Veil Link first",
+              message: "Use the invitation portal and choose Open in Veil. The capability secret stays only in native volatile memory.",
+            });
+          });
+        }}
+        joinAvailable
       />
+      <VeilLinkJoinDialog />
 
       {/* Protocol names remain server/channel internally; product language is Space/Room. */}
       <CreateServerDialog open={showCreateServer()} onClose={() => setShowCreateServer(false)} />
-      <JoinServerDialog open={showJoinServer()} onClose={() => setShowJoinServer(false)} />
       <Show when={appStore.activeServerId()}>
         {(sid) => (
           <>

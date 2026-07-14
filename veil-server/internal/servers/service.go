@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
-	"net/url"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,8 +25,10 @@ type Service struct {
 }
 
 const (
-	maxInviteUses       int32 = 1_000_000
-	maxInviteExpirySecs int64 = 365 * 24 * 60 * 60
+	minInviteUses       int32 = 1
+	maxInviteUses       int32 = 100
+	minInviteExpirySecs int64 = 5 * 60
+	maxInviteExpirySecs int64 = 7 * 24 * 60 * 60
 	maxKickReasonBytes        = 512
 )
 
@@ -128,7 +129,7 @@ func (s *Service) UpdateServer(ctx context.Context, serverID, requesterID string
 	if err := validateServerMetadata(name, description, iconURL); err != nil {
 		return err
 	}
-	if err := s.db.UpdateServer(ctx, serverID, name, description, iconURL); err != nil {
+	if err := s.db.UpdateServer(ctx, serverID, name, description); err != nil {
 		return err
 	}
 	srv, _ := s.db.GetServer(ctx, serverID)
@@ -233,6 +234,77 @@ func (s *Service) KickMember(ctx context.Context, serverID, requesterID, targetI
 	return nil
 }
 
+// BanMember atomically persists an admission denial and removes the member
+// from every current Space/Room roster. It does not change cryptographic trust
+// state; the existing authoritative roster event drives Sender-Key rotation.
+func (s *Service) BanMember(ctx context.Context, serverID, requesterID, targetID string, reason *string) error {
+	normalizedReason, err := normalizeKickReason(reason)
+	if err != nil {
+		return err
+	}
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermBanMembers)
+	if err != nil || !can {
+		return errors.New("insufficient permissions")
+	}
+	if requesterID == targetID {
+		return errors.New("cannot ban yourself")
+	}
+	owner, _ := s.db.IsServerOwner(ctx, serverID, targetID)
+	if owner {
+		return errors.New("cannot ban the owner")
+	}
+	targetMember, err := s.db.IsServerMember(ctx, serverID, targetID)
+	if err != nil || !targetMember {
+		return errors.New("target is not a server member")
+	}
+	requesterOwner, err := s.db.IsServerOwner(ctx, serverID, requesterID)
+	if err != nil {
+		return errors.New("server not found")
+	}
+	if !requesterOwner {
+		requesterHighest, requesterErr := s.db.GetHighestRolePosition(ctx, serverID, requesterID)
+		targetHighest, targetErr := s.db.GetHighestRolePosition(ctx, serverID, targetID)
+		if requesterErr != nil || targetErr != nil || requesterHighest <= targetHighest {
+			return errors.New("target member is outside the requester's role hierarchy")
+		}
+	}
+	user, _ := s.db.FindUserByID(ctx, targetID)
+	memberIDs := s.memberIDs(ctx, serverID)
+	if err := s.db.BanServerMember(ctx, serverID, targetID, requesterID, normalizedReason); err != nil {
+		return err
+	}
+	if user != nil {
+		s.bcast.BroadcastToUsers(memberIDs, &pb.Envelope{
+			Payload: &pb.Envelope_ServerEvent{ServerEvent: &pb.ServerEvent{
+				EventType: pb.ServerEvent_MEMBER_BANNED,
+				ServerId:  serverID,
+				MemberInfo: &pb.MemberInfo{
+					IdentityKey: user.IdentityKey,
+					Username:    user.Username,
+					Reason:      normalizedReason,
+				},
+			}},
+		})
+	}
+	return nil
+}
+
+func (s *Service) ListBans(ctx context.Context, serverID, requesterID string) ([]db.ServerBan, error) {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermBanMembers)
+	if err != nil || !can {
+		return nil, errors.New("insufficient permissions")
+	}
+	return s.db.GetServerBans(ctx, serverID)
+}
+
+func (s *Service) UnbanMember(ctx context.Context, serverID, requesterID, targetID string) error {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermBanMembers)
+	if err != nil || !can {
+		return errors.New("insufficient permissions")
+	}
+	return s.db.UnbanServerMember(ctx, serverID, targetID)
+}
+
 // ─── Members ─────────────────────────────────────────
 
 func (s *Service) ListMembers(ctx context.Context, serverID, requesterID string) ([]db.ServerMember, error) {
@@ -262,8 +334,8 @@ func (s *Service) CreateChannel(ctx context.Context, serverID, requesterID, name
 	if err != nil || !can {
 		return nil, errors.New("insufficient permissions")
 	}
-	if channelType < 0 || channelType > 2 {
-		return nil, errors.New("invalid channel type")
+	if channelType != 0 && channelType != 2 {
+		return nil, errors.New("Room type is not active in this release")
 	}
 	if err := validateChannelMetadata(&name, topic); err != nil {
 		return nil, err
@@ -314,16 +386,8 @@ func validateServerMetadata(name, description, iconURL *string) error {
 	if description != nil && (!utf8.ValidString(*description) || len(*description) > 2000) {
 		return errors.New("server description must be valid UTF-8 up to 2000 bytes")
 	}
-	if iconURL == nil || *iconURL == "" {
-		return nil
-	}
-	if !utf8.ValidString(*iconURL) || len(*iconURL) > 2048 {
-		return errors.New("server icon URL is too long or invalid")
-	}
-	parsed, err := url.Parse(*iconURL)
-	if err != nil || parsed == nil || !parsed.IsAbs() || parsed.Opaque != "" ||
-		parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil || parsed.Fragment != "" {
-		return errors.New("server icon URL must be an absolute HTTPS URL without credentials or fragment")
+	if iconURL != nil {
+		return errors.New("remote Space icons are not supported")
 	}
 	return nil
 }
@@ -697,7 +761,7 @@ func (s *Service) UnassignRole(ctx context.Context, serverID, requesterID, targe
 
 // ─── Invites ─────────────────────────────────────────
 
-func (s *Service) CreateInvite(ctx context.Context, serverID, requesterID string, maxUses int32, expiresInSecs int64) (*db.Invite, error) {
+func (s *Service) CreateInvite(ctx context.Context, serverID, requesterID string, maxUses int32, expiresInSecs int64) (*db.CreatedInvite, error) {
 	if err := validateInviteInput(maxUses, expiresInSecs); err != nil {
 		return nil, err
 	}
@@ -705,16 +769,12 @@ func (s *Service) CreateInvite(ctx context.Context, serverID, requesterID string
 	if err != nil || !can {
 		return nil, errors.New("insufficient permissions")
 	}
-	var expiresAt *time.Time
-	if expiresInSecs > 0 {
-		t := time.Now().Add(time.Duration(expiresInSecs) * time.Second)
-		expiresAt = &t
-	}
-	return s.db.CreateInvite(ctx, serverID, requesterID, maxUses, expiresAt)
+	return s.db.CreateInvite(ctx, serverID, requesterID, maxUses, time.Duration(expiresInSecs)*time.Second)
 }
 
 func validateInviteInput(maxUses int32, expiresInSecs int64) error {
-	if maxUses < 0 || maxUses > maxInviteUses || expiresInSecs < 0 || expiresInSecs > maxInviteExpirySecs {
+	if maxUses < minInviteUses || maxUses > maxInviteUses ||
+		expiresInSecs < minInviteExpirySecs || expiresInSecs > maxInviteExpirySecs {
 		return ErrInvalidInviteInput
 	}
 	return nil
@@ -745,21 +805,25 @@ func (s *Service) ListInvites(ctx context.Context, serverID, requesterID string)
 	return s.db.GetServerInvites(ctx, serverID)
 }
 
-func (s *Service) RevokeInvite(ctx context.Context, code, requesterID string) error {
-	inv, err := s.db.GetInvite(ctx, code)
-	if err != nil {
-		return errors.New("invite not found")
-	}
-	can, err := s.db.HasPermission(ctx, inv.ServerID, requesterID, db.PermManageServer)
+func (s *Service) RevokeInvite(ctx context.Context, serverID, inviteID, requesterID string) error {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageServer)
 	if err != nil || !can {
 		return errors.New("insufficient permissions")
 	}
-	return s.db.RevokeInvite(ctx, code)
+	return s.db.RevokeInvite(ctx, serverID, inviteID, requesterID)
+}
+
+func (s *Service) RevokeAllInvites(ctx context.Context, serverID, requesterID string) error {
+	can, err := s.db.HasPermission(ctx, serverID, requesterID, db.PermManageServer)
+	if err != nil || !can {
+		return errors.New("insufficient permissions")
+	}
+	return s.db.RevokeAllInvites(ctx, serverID, requesterID)
 }
 
 // UseInvite joins the requester to the server; returns the joined server.
-func (s *Service) UseInvite(ctx context.Context, code, userID string) (*db.Server, error) {
-	srv, joined, err := s.db.UseInvite(ctx, code, userID)
+func (s *Service) UseInvite(ctx context.Context, selector, secret, userID string) (*db.Server, error) {
+	srv, joined, err := s.db.UseInvite(ctx, selector, secret, userID)
 	if err != nil {
 		return nil, err
 	}
@@ -775,14 +839,30 @@ func (s *Service) UseInvite(ctx context.Context, code, userID string) (*db.Serve
 }
 
 // PreviewInvite returns server info for an invite without joining.
-func (s *Service) PreviewInvite(ctx context.Context, code string) (*db.Server, *db.Invite, error) {
-	inv, err := s.db.GetInvite(ctx, code)
+func (s *Service) PreviewInvite(ctx context.Context, selector string) (*db.Server, *db.Invite, error) {
+	inv, err := s.db.GetInvite(ctx, selector)
 	if err != nil {
-		return nil, nil, errors.New("invite not found")
+		return nil, nil, errors.New("Veil Link unavailable")
+	}
+	if inv.Version != 1 || inv.LinkType != "space" || inv.RevokedAt != nil ||
+		time.Now().After(inv.ExpiresAt) || inv.Uses >= inv.MaxUses {
+		return nil, nil, errors.New("Veil Link unavailable")
 	}
 	srv, err := s.db.GetServer(ctx, inv.ServerID)
 	if err != nil {
-		return nil, nil, errors.New("server not found")
+		return nil, nil, errors.New("Veil Link unavailable")
+	}
+	return srv, inv, nil
+}
+
+func (s *Service) AuthenticatedPreviewInvite(ctx context.Context, selector, secret string) (*db.Server, *db.Invite, error) {
+	inv, err := s.db.AuthenticateInvite(ctx, selector, secret)
+	if err != nil {
+		return nil, nil, err
+	}
+	srv, err := s.db.GetServer(ctx, inv.ServerID)
+	if err != nil {
+		return nil, nil, errors.New("Veil Link unavailable")
 	}
 	return srv, inv, nil
 }

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -161,6 +161,9 @@ struct AppState {
     /// Native, process-local brute-force and concurrency guard shared by
     /// every command that verifies the application PIN.
     pin_throttle: Mutex<PinThrottle>,
+    /// At most one OS-delivered Veil Link capability. The raw secret never
+    /// enters renderer state, config, SQLCipher, logs, or Tauri IPC output.
+    pending_veil_link: Mutex<Option<PendingVeilLink>>,
     runtime: tokio::runtime::Runtime,
     /// Validated auto-lock policy loaded once from secure storage. Runtime
     /// expiry checks must never perform blocking keychain I/O.
@@ -175,6 +178,23 @@ struct AppState {
     /// SQLCipher database after unlock and cleared before key material drops.
     indexer: Arc<Indexer>,
 }
+
+struct PendingVeilLink {
+    canonical_origin: String,
+    selector: String,
+    secret: Zeroizing<String>,
+    expires_at: Instant,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingVeilLinkView {
+    canonical_origin: String,
+    selector_ref: String,
+    expires_in_seconds: u64,
+}
+
+const PENDING_VEIL_LINK_TTL: Duration = Duration::from_secs(5 * 60);
 
 const KEYCHAIN_ACCOUNT: &str = "veil-default";
 const PIN_MATERIAL_ACCOUNT: &str = "veil-pin-material-v2";
@@ -1020,6 +1040,7 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
         .lock()
         .map_err(|e| e.to_string())?
         .clear();
+    *state.pending_veil_link.lock().map_err(|e| e.to_string())? = None;
     // The client mutex is the linearization point: operations already holding
     // it finish first; every later operation observes an empty client.
     *state.client.lock().map_err(|e| e.to_string())? = VeilClient::new();
@@ -3305,16 +3326,156 @@ fn rest_api_url(server_http_url: &str, segments: &[&str]) -> Result<String, Stri
     Ok(url.to_string())
 }
 
-fn validate_invite_code(code: &str) -> Result<(), String> {
-    if code.len() == 8
-        && code
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+fn validate_veil_link_token(token: &str) -> Result<(), String> {
+    use base64::Engine;
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| "Veil Link token is not canonical base64url".to_string())?;
+    if decoded.len() != 32
+        || base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(decoded) != token
     {
-        Ok(())
-    } else {
-        Err("invite code must be 8 URL-safe characters".to_string())
+        return Err("Veil Link token must encode exactly 256 bits".to_string());
     }
+    Ok(())
+}
+
+fn canonical_veil_link_origin(raw: &str) -> Result<String, String> {
+    let url = reqwest::Url::parse(raw).map_err(|_| "Veil Link origin is invalid".to_string())?;
+    if !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !(url.path().is_empty() || url.path() == "/")
+    {
+        return Err("Veil Link origin must contain only an authority".to_string());
+    }
+    match url.scheme() {
+        "https" => {}
+        "http" => {
+            let host = url
+                .host_str()
+                .ok_or_else(|| "Veil Link origin has no host".to_string())?;
+            let loopback = host.eq_ignore_ascii_case("localhost")
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+            if !loopback {
+                return Err("plaintext Veil Link origins are restricted to loopback".to_string());
+            }
+        }
+        _ => return Err("Veil Link origin must use HTTPS".to_string()),
+    }
+    Ok(url.origin().ascii_serialization())
+}
+
+fn parse_pending_veil_link(raw: &str, now: Instant) -> Result<PendingVeilLink, String> {
+    let url = reqwest::Url::parse(raw).map_err(|_| "Veil Link is malformed".to_string())?;
+    let (canonical_origin, selector) = match url.scheme() {
+        "https" | "http" => {
+            if url.query().is_some() {
+                return Err("Veil Link contains an unexpected query".to_string());
+            }
+            let path: Vec<_> = url
+                .path_segments()
+                .ok_or_else(|| "Veil Link path is invalid".to_string())?
+                .collect();
+            if path.len() != 3 || path[0] != "join" || path[1] != "v1" {
+                return Err("Veil Link path is unsupported".to_string());
+            }
+            let mut origin = url.clone();
+            origin.set_path("");
+            origin.set_fragment(None);
+            (
+                canonical_veil_link_origin(origin.as_str())?,
+                path[2].to_string(),
+            )
+        }
+        "veil" => {
+            if url.host_str() != Some("join") {
+                return Err("custom Veil Link transport is unsupported".to_string());
+            }
+            let path: Vec<_> = url
+                .path_segments()
+                .ok_or_else(|| "Veil Link path is invalid".to_string())?
+                .collect();
+            if path.len() != 2 || path[0] != "v1" {
+                return Err("Veil Link path is unsupported".to_string());
+            }
+            let query: Vec<_> = url.query_pairs().collect();
+            if query.len() != 1 || query[0].0 != "origin" {
+                return Err("custom Veil Link transport has no exact origin".to_string());
+            }
+            (
+                canonical_veil_link_origin(&query[0].1)?,
+                path[1].to_string(),
+            )
+        }
+        _ => return Err("unsupported Veil Link transport".to_string()),
+    };
+    validate_veil_link_token(&selector)?;
+    let fragment = url
+        .fragment()
+        .and_then(|value| value.strip_prefix("s="))
+        .filter(|value| !value.contains('&'))
+        .ok_or_else(|| "Veil Link secret is missing".to_string())?;
+    validate_veil_link_token(fragment)?;
+    Ok(PendingVeilLink {
+        canonical_origin,
+        selector,
+        secret: Zeroizing::new(fragment.to_string()),
+        expires_at: now + PENDING_VEIL_LINK_TTL,
+    })
+}
+
+fn pending_veil_link_view(link: &PendingVeilLink, now: Instant) -> PendingVeilLinkView {
+    use sha2::{Digest, Sha256};
+    let selector_hash = Sha256::digest(link.selector.as_bytes());
+    PendingVeilLinkView {
+        canonical_origin: link.canonical_origin.clone(),
+        selector_ref: hex::encode(&selector_hash[..6]),
+        expires_in_seconds: link.expires_at.saturating_duration_since(now).as_secs(),
+    }
+}
+
+fn stage_pending_veil_link(state: &AppState, raw: &str) -> Result<PendingVeilLinkView, String> {
+    let now = Instant::now();
+    let parsed = parse_pending_veil_link(raw, now)?;
+    let view = pending_veil_link_view(&parsed, now);
+    *state.pending_veil_link.lock().map_err(|e| e.to_string())? = Some(parsed);
+    Ok(view)
+}
+
+fn clear_expired_pending_veil_link(state: &AppState, now: Instant) -> Result<(), String> {
+    let mut pending = state.pending_veil_link.lock().map_err(|e| e.to_string())?;
+    if pending
+        .as_ref()
+        .map(|link| link.expires_at <= now)
+        .unwrap_or(false)
+    {
+        *pending = None;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn get_pending_veil_link(
+    state: State<'_, AppState>,
+) -> Result<Option<PendingVeilLinkView>, String> {
+    let now = Instant::now();
+    clear_expired_pending_veil_link(&state, now)?;
+    Ok(state
+        .pending_veil_link
+        .lock()
+        .map_err(|e| e.to_string())?
+        .as_ref()
+        .map(|link| pending_veil_link_view(link, now)))
+}
+
+#[tauri::command]
+fn cancel_pending_veil_link(state: State<'_, AppState>) -> Result<(), String> {
+    *state.pending_veil_link.lock().map_err(|e| e.to_string())? = None;
+    Ok(())
 }
 
 fn offline_sync_url(
@@ -4335,6 +4496,16 @@ fn connect_to_server(
         reqwest::Url::parse(&server_http_url).map_err(|e| format!("invalid REST URL: {e}"))?;
     let requested_rest_origin = rest_origin(&requested_rest_url)?;
     let canonical_server_origin = requested_rest_origin.canonical_server_origin();
+    {
+        let mut pending = state.pending_veil_link.lock().map_err(|e| e.to_string())?;
+        if pending
+            .as_ref()
+            .map(|link| link.canonical_origin != canonical_server_origin)
+            .unwrap_or(false)
+        {
+            *pending = None;
+        }
+    }
     let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
     require_unlocked(&state)?;
     let previous_generation = state
@@ -5598,7 +5769,6 @@ fn connect_to_server(
                                     "serverInfo": server_info.map(|si| serde_json::json!({
                                         "id": si.id,
                                         "name": si.name,
-                                        "iconUrl": si.icon_url,
                                         "ownerIdentityKey": hex::encode(&si.owner_identity_key),
                                     })),
                                     "memberInfo": member_info.map(|mi| serde_json::json!({
@@ -6193,6 +6363,8 @@ fn create_group(
     server_http_url: String,
     user_id: String,
     name: String,
+    member_user_id: String,
+    member_identity_key: String,
 ) -> Result<String, String> {
     require_live_transport_ready(&state)?;
     let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
@@ -6208,12 +6380,24 @@ fn create_group(
     if user_id != authenticated_user_id {
         return Err("group creator does not match the authenticated session".to_string());
     }
+    decode_canonical_uuid("initial Circle member user_id", &member_user_id)?;
+    if member_user_id == authenticated_user_id {
+        return Err("a Circle requires at least one other account".to_string());
+    }
+    let member_key =
+        decode_lower_hex_fixed::<32>("initial Circle member identity_key", &member_identity_key)?;
     let resp = state.runtime.block_on(rest_send_json(
         &state,
         reqwest::Method::POST,
         rest_api_url(&server_http_url, &["v1", "groups"])?,
         &authenticated_user_id,
-        Some(serde_json::json!({ "name": name })),
+        Some(serde_json::json!({
+            "name": name,
+            "members": [{
+                "user_id": member_user_id,
+                "identity_key": hex::encode(member_key),
+            }],
+        })),
     ))?;
 
     let conv_id = resp["conversation_id"]
@@ -7970,7 +8154,6 @@ fn update_server(
     server_id: String,
     name: Option<String>,
     description: Option<String>,
-    icon_url: Option<String>,
 ) -> Result<(), String> {
     let mut body = serde_json::Map::new();
     if let Some(v) = name {
@@ -7978,9 +8161,6 @@ fn update_server(
     }
     if let Some(v) = description {
         body.insert("description".into(), v.into());
-    }
-    if let Some(v) = icon_url {
-        body.insert("icon_url".into(), v.into());
     }
     state.runtime.block_on(rest_send_json(
         &state,
@@ -8139,6 +8319,107 @@ fn kick_server_member(
         request_url,
         &user_id,
         body,
+        &event_app.binding,
+    ));
+    emit_server_membership_refresh_required(&event_app, &server_id);
+    result.map(|_| ())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn ban_server_member(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    target_user_id: String,
+    reason: Option<String>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    let body = reason.map(|value| serde_json::json!({ "reason": value }));
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "bans", &target_user_id],
+    )?;
+    let event_app = prepare_server_authorization_change(
+        &state,
+        &app,
+        &request_url,
+        &server_id,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let result = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::PUT,
+        request_url,
+        &user_id,
+        body,
+        &event_app.binding,
+    ));
+    emit_server_membership_refresh_required(&event_app, &server_id);
+    result.map(|_| ())
+}
+
+#[tauri::command]
+fn list_server_bans(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(&server_http_url, &["v1", "servers", &server_id, "bans"])?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    let response = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::GET,
+        request_url,
+        &user_id,
+        None,
+        &binding,
+    ))?;
+    Ok(response["bans"].as_array().cloned().unwrap_or_default())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn unban_server_member(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    target_user_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "bans", &target_user_id],
+    )?;
+    let event_app = prepare_server_authorization_change(
+        &state,
+        &app,
+        &request_url,
+        &server_id,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let result = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::DELETE,
+        request_url,
+        &user_id,
+        None,
         &event_app.binding,
     ));
     emit_server_membership_refresh_required(&event_app, &server_id);
@@ -8650,24 +8931,43 @@ fn unassign_role(
     result.map(|_| ())
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CreateVeilLinkOptions {
+    max_uses: i32,
+    expires_in_secs: i64,
+}
+
 #[tauri::command]
 fn create_invite(
     state: State<'_, AppState>,
     server_http_url: String,
     user_id: String,
     server_id: String,
-    max_uses: i32,
-    expires_in_secs: i64,
+    options: CreateVeilLinkOptions,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<serde_json::Value, String> {
-    state.runtime.block_on(rest_send_json(
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "veil-links"],
+    )?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::POST,
-        rest_api_url(&server_http_url, &["v1", "servers", &server_id, "invites"])?,
+        request_url,
         &user_id,
         Some(serde_json::json!({
-            "max_uses": max_uses,
-            "expires_in_secs": expires_in_secs,
+            "max_uses": options.max_uses,
+            "expires_in_secs": options.expires_in_secs,
         })),
+        &binding,
     ))
 }
 
@@ -8677,13 +8977,26 @@ fn list_invites(
     server_http_url: String,
     user_id: String,
     server_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let resp = state.runtime.block_on(rest_send_json(
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "veil-links"],
+    )?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    let resp = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::GET,
-        rest_api_url(&server_http_url, &["v1", "servers", &server_id, "invites"])?,
+        request_url,
         &user_id,
         None,
+        &binding,
     ))?;
     Ok(resp["invites"].as_array().cloned().unwrap_or_default())
 }
@@ -8693,15 +9006,137 @@ fn revoke_invite(
     state: State<'_, AppState>,
     server_http_url: String,
     user_id: String,
-    code: String,
+    server_id: String,
+    invite_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<(), String> {
-    validate_invite_code(&code)?;
-    state.runtime.block_on(rest_send_json(
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "veil-links", &invite_id],
+    )?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::DELETE,
-        rest_api_url(&server_http_url, &["v1", "invites", &code])?,
+        request_url,
         &user_id,
         None,
+        &binding,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn revoke_all_invites(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    server_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "servers", &server_id, "veil-links"],
+    )?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::DELETE,
+        request_url,
+        &user_id,
+        None,
+        &binding,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn list_channel_overwrites(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    channel_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    decode_canonical_uuid("Room id", &channel_id)?;
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "channels", &channel_id, "overwrites"],
+    )?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    let response = state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::GET,
+        request_url,
+        &user_id,
+        None,
+        &binding,
+    ))?;
+    Ok(response["overwrites"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
+}
+
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+fn upsert_channel_overwrite(
+    state: State<'_, AppState>,
+    server_http_url: String,
+    user_id: String,
+    channel_id: String,
+    target_id: String,
+    target_type: i16,
+    allow: u64,
+    deny: u64,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    decode_canonical_uuid("Room id", &channel_id)?;
+    decode_canonical_uuid("Room access target id", &target_id)?;
+    if !(0..=1).contains(&target_type) || allow & deny != 0 {
+        return Err("invalid Room access rule".into());
+    }
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let request_url = rest_api_url(
+        &server_http_url,
+        &["v1", "channels", &channel_id, "overwrites"],
+    )?;
+    validate_live_action_rest_origin(&binding, &request_url)?;
+    state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::PUT,
+        request_url,
+        &user_id,
+        Some(serde_json::json!({
+            "target_id": target_id,
+            "target_type": target_type,
+            "allow": allow,
+            "deny": deny,
+        })),
+        &binding,
     ))?;
     Ok(())
 }
@@ -8709,64 +9144,81 @@ fn revoke_invite(
 #[tauri::command]
 fn preview_invite(
     state: State<'_, AppState>,
-    server_http_url: String,
-    code: String,
+    user_id: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<serde_json::Value, String> {
-    require_unlocked(&state)?;
-    validate_invite_code(&code)?;
-    let mut url = reqwest::Url::parse(server_http_url.trim_end_matches('/'))
-        .map_err(|e| format!("invalid invite server URL: {e}"))?;
-    let rest_binding = require_authenticated_rest_origin(&state, &url)?;
-    if url.query().is_some() || url.fragment().is_some() || !url.path().trim_matches('/').is_empty()
-    {
-        return Err(
-            "invite server URL must be an exact origin without a path or query".to_string(),
-        );
-    }
-    url.path_segments_mut()
-        .map_err(|()| "invite server URL cannot be a base URL".to_string())?
-        .pop_if_empty()
-        .extend(["v1", "invites", code.as_str()]);
-
-    state.runtime.block_on(async {
-        let resp = state
-            .http
-            .get(url.clone())
-            .send()
-            .await
-            .map_err(|e| format!("preview: {e}"))?;
-        let (status, body) = read_bounded_response(resp).await?;
-        require_unlocked(&state)?;
-        require_same_rest_binding(&state, &url, &rest_binding)?;
-        let json: serde_json::Value = if body.is_empty() {
-            serde_json::Value::Null
-        } else {
-            serde_json::from_slice(&body)
-                .map_err(|e| format!("invalid invite preview response: {e}"))?
-        };
-        require_session_still_unlocked(&state)?;
-        require_same_rest_binding(&state, &url, &rest_binding)?;
-        if !status.is_success() {
-            return Err(rest_err(&json, &format!("HTTP {}", status.as_u16())));
-        }
-        Ok(json)
-    })
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let (selector, secret) = pending_veil_link_material(&state, &binding)?;
+    state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::POST,
+        rest_api_url(
+            &binding.origin.canonical_server_origin(),
+            &["v1", "veil-links", &selector, "preview"],
+        )?,
+        &user_id,
+        Some(serde_json::json!({ "secret": secret.as_str() })),
+        &binding,
+    ))
 }
 
 #[tauri::command]
 fn use_invite(
     state: State<'_, AppState>,
-    server_http_url: String,
     user_id: String,
-    code: String,
+    expected_server_origin: String,
+    expected_binding_generation: String,
 ) -> Result<serde_json::Value, String> {
-    validate_invite_code(&code)?;
-    state.runtime.block_on(rest_send_json(
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let (selector, secret) = pending_veil_link_material(&state, &binding)?;
+    let server_http_url = binding.origin.canonical_server_origin();
+    let response = state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::POST,
-        rest_api_url(&server_http_url, &["v1", "invites", &code, "use"])?,
+        rest_api_url(&server_http_url, &["v1", "veil-links", &selector, "join"])?,
         &user_id,
-        None,
+        Some(serde_json::json!({ "secret": secret.as_str() })),
+        &binding,
+    ))?;
+    let mut pending = state.pending_veil_link.lock().map_err(|e| e.to_string())?;
+    if pending
+        .as_ref()
+        .map(|link| {
+            link.canonical_origin == binding.origin.canonical_server_origin()
+                && link.selector == selector
+        })
+        .unwrap_or(false)
+    {
+        *pending = None;
+    }
+    Ok(response)
+}
+
+fn pending_veil_link_material(
+    state: &AppState,
+    binding: &RestBinding,
+) -> Result<(String, Zeroizing<String>), String> {
+    let now = Instant::now();
+    clear_expired_pending_veil_link(state, now)?;
+    let pending = state.pending_veil_link.lock().map_err(|e| e.to_string())?;
+    let link = pending
+        .as_ref()
+        .ok_or_else(|| "no pending Veil Link".to_string())?;
+    if link.canonical_origin != binding.origin.canonical_server_origin() {
+        return Err("Veil Link belongs to another Veil Node".to_string());
+    }
+    Ok((
+        link.selector.clone(),
+        Zeroizing::new(link.secret.as_str().to_string()),
     ))
 }
 
@@ -9366,16 +9818,22 @@ fn ensure_search_backfill(state: State<'_, AppState>) -> Result<usize, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // A second instance tried to start — focus the existing window instead.
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.set_focus();
                 let _ = win.unminimize();
             }
+            let state = app.state::<AppState>();
+            for raw in argv {
+                if let Ok(view) = stage_pending_veil_link(&state, &raw) {
+                    let _ = app.emit("veil://pending-link", view);
+                    break;
+                }
+            }
         }))
         .plugin(tauri_plugin_os::init())
-        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let data_dir = app
@@ -9411,6 +9869,7 @@ pub fn run() {
                 unavailable_conversations: Mutex::new(std::collections::HashMap::new()),
                 lock_event_pending: AtomicBool::new(false),
                 pin_throttle: Mutex::new(PinThrottle::default()),
+                pending_veil_link: Mutex::new(None),
                 runtime: tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
                 auto_lock_seconds: AtomicU64::new(auto_lock_seconds),
                 last_activity: Mutex::new(Instant::now()),
@@ -9428,6 +9887,13 @@ pub fn run() {
                     .expect("reqwest client"),
                 indexer,
             });
+            let state = app.state::<AppState>();
+            for raw in std::env::args().skip(1) {
+                if let Ok(view) = stage_pending_veil_link(&state, &raw) {
+                    let _ = app.emit("veil://pending-link", view);
+                    break;
+                }
+            }
             let watchdog_app = app.handle().clone();
             std::thread::spawn(move || loop {
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -9604,6 +10070,9 @@ pub fn run() {
             leave_server,
             list_server_members,
             kick_server_member,
+            ban_server_member,
+            list_server_bans,
+            unban_server_member,
             list_channels,
             create_channel,
             update_channel,
@@ -9618,6 +10087,11 @@ pub fn run() {
             create_invite,
             list_invites,
             revoke_invite,
+            revoke_all_invites,
+            list_channel_overwrites,
+            upsert_channel_overwrite,
+            get_pending_veil_link,
+            cancel_pending_veil_link,
             preview_invite,
             use_invite,
             mark_channel_conversation,
@@ -9636,7 +10110,8 @@ mod e2ee_rest_tests {
         current_target_admission_evidence, exact_confirmed_live_action_binding,
         invalidate_disconnected_binding, offline_sync_url, parse_device_directory,
         parse_expected_dm_peer_identity_key, parse_message_crypto_context,
-        parse_network_profile_response, parse_prekey_bundle, preserve_created_group_outcome,
+        parse_network_profile_response, parse_pending_veil_link, parse_prekey_bundle,
+        pending_veil_link_view, preserve_created_group_outcome,
         proves_future_only_sender_key_history, publish_unlocked_session,
         require_matching_identity_fingerprint, resolve_auto_lock_seconds, rest_api_url,
         rest_authority, rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
@@ -11425,5 +11900,55 @@ mod e2ee_rest_tests {
         );
         assert!(require_matching_identity_fingerprint(&expected, &"41".repeat(31)).is_err());
         assert!(require_matching_identity_fingerprint(&expected, &"AA".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn veil_link_parser_binds_exact_origin_and_keeps_secret_out_of_view() {
+        let selector = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x31; 32]);
+        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x52; 32]);
+        let now = std::time::Instant::now();
+        let parsed = parse_pending_veil_link(
+            &format!("https://veil.example/join/v1/{selector}#s={secret}"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(parsed.canonical_origin, "https://veil.example");
+        assert_eq!(parsed.selector, selector);
+        assert_eq!(parsed.secret.as_str(), secret);
+        let serialized = serde_json::to_string(&pending_veil_link_view(&parsed, now)).unwrap();
+        assert!(!serialized.contains(&secret));
+        assert!(!serialized.contains(&selector));
+
+        let transported = parse_pending_veil_link(
+            &format!("veil://join/v1/{selector}?origin=https%3A%2F%2Fveil.example#s={secret}"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(transported.canonical_origin, parsed.canonical_origin);
+    }
+
+    #[test]
+    fn veil_link_parser_rejects_plaintext_remote_and_ambiguous_payloads() {
+        let selector = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x11; 32]);
+        let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x22; 32]);
+        let now = std::time::Instant::now();
+        for raw in [
+            format!("http://veil.example/join/v1/{selector}#s={secret}"),
+            format!("https://user@veil.example/join/v1/{selector}#s={secret}"),
+            format!("https://veil.example/join/v1/{selector}?next=evil#s={secret}"),
+            format!("https://veil.example/join/v2/{selector}#s={secret}"),
+            format!("https://veil.example/join/v1/{selector}#s=short"),
+            format!("veil://join/v1/{selector}?origin=http%3A%2F%2Fveil.example#s={secret}"),
+        ] {
+            assert!(
+                parse_pending_veil_link(&raw, now).is_err(),
+                "accepted {raw}"
+            );
+        }
+        assert!(parse_pending_veil_link(
+            &format!("http://127.0.0.1:9080/join/v1/{selector}#s={secret}"),
+            now,
+        )
+        .is_ok());
     }
 }

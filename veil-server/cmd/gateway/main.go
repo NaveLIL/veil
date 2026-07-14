@@ -126,6 +126,11 @@ func main() {
 	chatHandler.RegisterRoutes(mux)
 
 	serversHandler := servers.NewHandler(serversSvc, signedMw, rl)
+	veilPreviewRL := authmw.NewRateLimit(30, time.Minute)
+	defer veilPreviewRL.Close()
+	veilJoinRL := authmw.NewRateLimit(10, time.Minute)
+	defer veilJoinRL.Close()
+	serversHandler.SetVeilLinkRateLimits(veilPreviewRL, veilJoinRL)
 	serversHandler.RegisterRoutes(mux)
 
 	// Phase 4 — UnifiedPush + ntfy. The push notifier wires into the

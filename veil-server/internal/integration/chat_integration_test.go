@@ -6,7 +6,9 @@ package integration
 
 import (
 	"context"
+	"encoding/hex"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -163,11 +165,14 @@ func TestChat_GetMessagesEmptyForNewConversation(t *testing.T) {
 func TestChat_CreateGroupAndAddMember(t *testing.T) {
 	h := New(t)
 	owner := h.CreateUser("owner")
-	mate := h.CreateUser("mate")
+	initialMate := h.CreateUser("initial-mate")
+	lateMate := h.CreateUser("late-mate")
 
 	status, _, body := h.Do(owner, http.MethodPost, "/v1/groups", map[string]any{
-		"name":    "Squad",
-		"members": []string{},
+		"name": "Squad",
+		"members": []map[string]string{{
+			"user_id": initialMate.ID, "identity_key": hex.EncodeToString(initialMate.IdentityKey),
+		}},
 	})
 	if status != http.StatusCreated {
 		t.Fatalf("create group: status=%d body=%v", status, body)
@@ -178,7 +183,7 @@ func TestChat_CreateGroupAndAddMember(t *testing.T) {
 	}
 
 	status, _, addBody := h.Do(owner, http.MethodPost, "/v1/groups/"+groupID+"/members", map[string]string{
-		"user_id": mate.ID,
+		"user_id": lateMate.ID,
 	})
 	if status != http.StatusOK {
 		t.Fatalf("add member: status=%d body=%v", status, addBody)
@@ -189,8 +194,8 @@ func TestChat_CreateGroupAndAddMember(t *testing.T) {
 		t.Fatalf("list members: status=%d body=%v", status, listBody)
 	}
 	members, _ := listBody["members"].([]any)
-	if len(members) < 2 {
-		t.Fatalf("list members: want >=2 (owner + mate), got %d (%v)", len(members), listBody)
+	if len(members) != 3 {
+		t.Fatalf("list members: want 3 (owner + atomic member + later member), got %d (%v)", len(members), listBody)
 	}
 	for _, raw := range members {
 		member, _ := raw.(map[string]any)
@@ -216,7 +221,12 @@ func TestChat_AddGroupMember_NonMemberCannotAdd(t *testing.T) {
 	mate := h.CreateUser("mate")
 	intruder := h.CreateUser("intruder")
 
-	_, _, body := h.Do(owner, http.MethodPost, "/v1/groups", map[string]any{"name": "Closed"})
+	_, _, body := h.Do(owner, http.MethodPost, "/v1/groups", map[string]any{
+		"name": "Closed",
+		"members": []map[string]string{{
+			"user_id": mate.ID, "identity_key": hex.EncodeToString(mate.IdentityKey),
+		}},
+	})
 	groupID := body["conversation_id"].(string)
 
 	status, _, errBody := h.Do(intruder, http.MethodPost, "/v1/groups/"+groupID+"/members", map[string]string{
@@ -227,5 +237,37 @@ func TestChat_AddGroupMember_NonMemberCannotAdd(t *testing.T) {
 	}
 	if status != http.StatusForbidden && status != http.StatusUnauthorized {
 		t.Fatalf("want 401/403 for non-member add, got %d (%v)", status, errBody)
+	}
+}
+
+func TestCircleCreateRejectsOrphanAndStaleLocatorAtomically(t *testing.T) {
+	h := New(t)
+	owner := h.CreateUser("circle-atomic-owner")
+	target := h.CreateUser("circle-atomic-target")
+	var before int
+	if err := h.DB.Pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations WHERE conv_type=1`).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	for name, members := range map[string]any{
+		"orphan": []map[string]string{},
+		"stale identity": []map[string]string{{
+			"user_id": target.ID, "identity_key": strings.Repeat("00", 32),
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			status, _, _ := h.Do(owner, http.MethodPost, "/v1/groups", map[string]any{
+				"name": "Must not persist", "members": members,
+			})
+			if status != http.StatusBadRequest {
+				t.Fatalf("invalid Circle create status=%d", status)
+			}
+		})
+	}
+	var after int
+	if err := h.DB.Pool.QueryRow(t.Context(), `SELECT count(*) FROM conversations WHERE conv_type=1`).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != before {
+		t.Fatalf("failed Circle create left orphan rows: before=%d after=%d", before, after)
 	}
 }

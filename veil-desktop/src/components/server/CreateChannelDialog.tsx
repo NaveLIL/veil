@@ -1,5 +1,5 @@
 import { Component, createEffect, createSignal, Show, For } from "solid-js";
-import { Hash, Volume2, Folder, ArrowRight, Loader2 } from "lucide-solid";
+import { Hash, Folder, ArrowRight, Loader2 } from "lucide-solid";
 import { appStore, captureUiSessionEpoch, isUiSessionEpochCurrent } from "@/stores/app";
 import { IslandDialog, dlgStyles as ds } from "@/components/ui/IslandDialog";
 
@@ -9,17 +9,16 @@ interface Props {
   onClose: () => void;
 }
 
-type ChannelType = 0 | 1 | 2;
+type ChannelType = 0 | 2;
 
 const TYPES: Array<{ value: ChannelType; label: string; icon: any; description: string }> = [
-  { value: 0, label: "Text", icon: Hash, description: "Send messages, images, files" },
-  { value: 1, label: "Voice", icon: Volume2, description: "Hang out together with voice" },
-  { value: 2, label: "Category", icon: Folder, description: "Group channels together" },
+  { value: 0, label: "Text Room", icon: Hash, description: "A separate encrypted Sender Keys security domain" },
+  { value: 2, label: "Category", icon: Folder, description: "Organize Rooms without creating another conversation" },
 ];
 
 function normalizeName(s: string, type: ChannelType): string {
   const trimmed = s.trim();
-  if (type === 1 || type === 2) return trimmed;
+  if (type === 2) return trimmed;
   return trimmed.toLowerCase().replace(/\s+/g, "-").replace(/[^a-z0-9-_]/g, "");
 }
 
@@ -80,14 +79,14 @@ export const CreateChannelDialog: Component<Props> = (props) => {
     <IslandDialog
       open={props.open}
       onClose={close}
-      title="Create Channel"
+      title="Create Room"
       icon={<Hash size={15} />}
       accent="var(--veil-success)"
       closeDisabled={loading()}
     >
       <div style={ds.fieldGroup}>
         <div>
-          <label style={ds.label}>Channel type</label>
+          <label style={ds.label}>Room type</label>
           <div style={{ display: "flex", "flex-direction": "column", gap: "6px" }}>
             <For each={TYPES}>
               {(t) => (
@@ -104,7 +103,7 @@ export const CreateChannelDialog: Component<Props> = (props) => {
         </div>
 
         <div>
-          <label style={ds.label}>Channel name</label>
+          <label style={ds.label}>Room name</label>
           <div style={{ position: "relative" }}>
             <Show when={type() === 0}>
               <span style={{
@@ -115,7 +114,7 @@ export const CreateChannelDialog: Component<Props> = (props) => {
             </Show>
             <input
               style={{ ...ds.input(!!error()), "padding-left": type() === 0 ? "24px" : "12px" }}
-              placeholder={type() === 0 ? "new-channel" : type() === 1 ? "Voice Channel" : "CATEGORY NAME"}
+              placeholder={type() === 0 ? "new-room" : "CATEGORY NAME"}
               value={name()}
               onInput={(e) => { setName(e.currentTarget.value); setError(""); }}
               onKeyDown={onKey}
@@ -134,7 +133,7 @@ export const CreateChannelDialog: Component<Props> = (props) => {
           onClick={handleCreate}
           disabled={loading() || !finalName()}
         >
-          <Show when={loading()} fallback={<>Create Channel <ArrowRight size={14} /></>}>
+          <Show when={loading()} fallback={<>Create Room <ArrowRight size={14} /></>}>
             <Loader2 size={14} class="animate-spin" /> Creating…
           </Show>
         </button>

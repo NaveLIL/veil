@@ -897,7 +897,11 @@ authenticated origin/generation, а открытый Identity Island refetch-и�
 
 ## Phase 4E — Veil Spaces Experience
 
-**Статус:** запланировано. Фаза превращает уже закрытый access/crypto core 4A/4C
+**Статус 2026-07-14:** implementation complete; automated completion gate зелёный.
+Формальное закрытие ожидает только ручную физическую desktop↔desktop матрицу,
+которую нельзя честно заменить двумя процессами на одном компьютере. Evidence:
+[`phase-4e-completion-gate.md`](docs/reviews/phase-4e-completion-gate.md).
+Фаза превращает уже закрытый access/crypto core 4A/4C
 в одну законченную продуктовую модель, но не меняет ciphertext, Double Ratchet,
 Sender Keys v5 либо rotation contract. Authoritative ACL остаётся единственным
 источником доступа; 4E лишь ужесточает invite defaults и не вводит параллельную

@@ -1,6 +1,6 @@
 import { createSignal } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { alertDecision, decisionDialog } from "@/lib/decisionDialog";
+import { decisionDialog } from "@/lib/decisionDialog";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   validatedLiveMessage,
@@ -37,7 +37,6 @@ export interface Server {
   id: string;
   name: string;
   description?: string;
-  iconUrl?: string;
   ownerId: string;
 }
 
@@ -96,11 +95,61 @@ export interface Message {
   replyToId?: string;
 }
 
+export interface ServerBan {
+  userId: string;
+  username: string;
+  bannedBy: string;
+  reason?: string;
+  createdAt: string;
+}
+
+export interface RoomAccessRule {
+  targetId: string;
+  targetType: 0 | 1;
+  allow: number;
+  deny: number;
+}
+
+export interface VeilLinkRecord {
+  id: string;
+  public_selector: string;
+  version: 1;
+  type: "space";
+  space_id: string;
+  max_uses: number;
+  uses: number;
+  expires_at: string;
+  revoked_at?: string;
+  created_at: string;
+}
+
+export interface CreatedVeilLink extends VeilLinkRecord {
+  secret: string;
+  share_url: string;
+}
+
+export interface PendingVeilLink {
+  canonicalOrigin: string;
+  selectorRef: string;
+  expiresInSeconds: number;
+}
+
 export interface ConversationCryptoDiagnostic {
   conversationId: string;
   code: string;
   detail: string;
 }
+
+export type WorkspaceRouteScope = {
+  canonicalServerOrigin: string;
+  bindingGeneration: string;
+};
+
+export type WorkspaceRoute =
+  | { kind: "home"; view: "overview" | "friends" | "requests"; scope: WorkspaceRouteScope | null }
+  | { kind: "direct"; directId: string; scope: WorkspaceRouteScope }
+  | { kind: "circle"; circleId: string; scope: WorkspaceRouteScope }
+  | { kind: "space"; spaceId: string; roomId?: string; scope: WorkspaceRouteScope };
 
 // ─── Global App State ────────────────────────────────
 
@@ -108,7 +157,11 @@ const [screen, setScreenRaw] = createSignal<Screen>("onboarding");
 const [identity, setIdentity] = createSignal<string | null>(null);
 const [userId, setUserId] = createSignal<string | null>(null);
 const [conversations, setConversations] = createSignal<Conversation[]>([]);
-const [activeConversationId, setActiveConversationId] = createSignal<string | null>(null);
+const [workspaceRoute, setWorkspaceRouteRaw] = createSignal<WorkspaceRoute>({
+  kind: "home",
+  view: "overview",
+  scope: null,
+});
 const [messages, setMessages] = createSignal<Message[]>([]);
 const [isSidebarCollapsed, setSidebarCollapsed] = createSignal(false);
 const [connected, setConnected] = createSignal(false);
@@ -272,9 +325,105 @@ function setServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpointChang
   return { originChanged, transportChanged };
 }
 const [servers, setServers] = createSignal<Server[]>([]);
-const [activeServerId, setActiveServerId] = createSignal<string | null>(null);
 const [channelsByServer, setChannelsByServer] = createSignal<Record<string, Channel[]>>({});
-const [activeChannelId, setActiveChannelId] = createSignal<string | null>(null);
+
+function currentWorkspaceScope(): WorkspaceRouteScope | null {
+  const scope = authenticatedServerScope();
+  return scope ? {
+    canonicalServerOrigin: scope.canonicalServerOrigin,
+    bindingGeneration: scope.bindingGeneration,
+  } : null;
+}
+
+function navigationWorkspaceScope(): WorkspaceRouteScope | null {
+  const live = currentWorkspaceScope();
+  if (live) return live;
+  if (bindingTransitioning() && !originTransitioning()) return workspaceRoute().scope;
+  return null;
+}
+
+export function workspaceRouteMatchesScope(
+  route: WorkspaceRoute,
+  scope: WorkspaceRouteScope | null,
+): boolean {
+  if (route.kind === "home" && route.scope === null) return scope === null;
+  return !!route.scope && !!scope
+    && route.scope.canonicalServerOrigin === scope.canonicalServerOrigin
+    && route.scope.bindingGeneration === scope.bindingGeneration;
+}
+
+function liveWorkspaceRoute(): WorkspaceRoute {
+  const route = workspaceRoute();
+  const scope = currentWorkspaceScope();
+  if (workspaceRouteMatchesScope(route, scope)) return route;
+  // A same-origin binding refresh may keep local reading, selection and draft
+  // state visible while every network mutation remains unpublished and fails
+  // closed. A real origin transition never receives this exception.
+  if (!scope && bindingTransitioning() && !originTransitioning() && route.scope) return route;
+  return { kind: "home", view: "overview", scope };
+}
+
+const activeServerId = () => {
+  const route = liveWorkspaceRoute();
+  return route.kind === "space" ? route.spaceId : null;
+};
+const activeChannelId = () => {
+  const route = liveWorkspaceRoute();
+  return route.kind === "space" ? route.roomId ?? null : null;
+};
+const activeConversationId = () => {
+  const route = liveWorkspaceRoute();
+  if (route.kind === "direct") return route.directId;
+  if (route.kind === "circle") return route.circleId;
+  if (route.kind !== "space" || !route.roomId) return null;
+  return (channelsByServer()[route.spaceId] ?? [])
+    .find((room) => room.id === route.roomId)?.conversationId ?? null;
+};
+
+function setActiveServerId(serverId: string | null): void {
+  const scope = navigationWorkspaceScope();
+  if (!serverId || !scope) {
+    setWorkspaceRouteRaw({ kind: "home", view: "overview", scope });
+    return;
+  }
+  const previous = liveWorkspaceRoute();
+  setWorkspaceRouteRaw({
+    kind: "space",
+    spaceId: serverId,
+    roomId: previous.kind === "space" && previous.spaceId === serverId ? previous.roomId : undefined,
+    scope,
+  });
+}
+
+function setActiveChannelId(roomId: string | null): void {
+  const route = liveWorkspaceRoute();
+  const scope = navigationWorkspaceScope();
+  if (route.kind !== "space" || !scope) return;
+  setWorkspaceRouteRaw({ kind: "space", spaceId: route.spaceId, roomId: roomId ?? undefined, scope });
+}
+
+function setActiveConversationId(conversationId: string | null): void {
+  const route = liveWorkspaceRoute();
+  const scope = navigationWorkspaceScope();
+  if (!conversationId) {
+    if (route.kind === "direct" || route.kind === "circle") {
+      setWorkspaceRouteRaw({ kind: "home", view: "overview", scope });
+    }
+    return;
+  }
+  if (!scope) return;
+  if (route.kind === "space") {
+    const room = (channelsByServer()[route.spaceId] ?? [])
+      .find((candidate) => candidate.conversationId === conversationId);
+    if (room) setWorkspaceRouteRaw({ ...route, roomId: room.id, scope });
+    return;
+  }
+  const conversation = conversations().find((candidate) => candidate.id === conversationId);
+  setWorkspaceRouteRaw(conversation?.type === "group"
+    ? { kind: "circle", circleId: conversationId, scope }
+    : { kind: "direct", directId: conversationId, scope });
+}
+
 export type SenderKeyStatus = "checking" | "pending" | "ready" | "error";
 const [senderKeyStatus, setSenderKeyStatus] = createSignal<Record<string, SenderKeyStatus>>({});
 const [conversationCryptoDiagnostics, setConversationCryptoDiagnostics] = createSignal<
@@ -282,6 +431,7 @@ const [conversationCryptoDiagnostics, setConversationCryptoDiagnostics] = create
 >({});
 const [serverMembers, setServerMembers] = createSignal<Record<string, ServerMember[]>>({});
 const [serverRoles, setServerRoles] = createSignal<Record<string, Role[]>>({});
+const [pendingVeilLink, setPendingVeilLink] = createSignal<PendingVeilLink | null>(null);
 // Currently-open server settings overlay; null = closed.
 const [serverSettingsId, setServerSettingsId] = createSignal<string | null>(null);
 // Typing indicators: conversationId → Set of identityKeys currently typing
@@ -811,6 +961,7 @@ function clearSensitiveUi(): void {
   uiSessionActive = false;
   setScreen("locked");
   setIdentity(null);
+  setPendingVeilLink(null);
   setAuthenticatedServerScope(null);
   setPendingAuthenticatedServerScope(null);
   setBindingTransitioning(false);
@@ -827,7 +978,6 @@ function serverFromJSON(v: any): Server {
     id: v.id,
     name: v.name,
     description: v.description ?? undefined,
-    iconUrl: v.icon_url ?? undefined,
     ownerId: v.owner_id,
   };
 }
@@ -914,6 +1064,7 @@ export const appStore = {
   setUserId,
   conversations,
   setConversations,
+  workspaceRoute: liveWorkspaceRoute,
   activeConversationId,
   setActiveConversationId,
   messages,
@@ -947,6 +1098,7 @@ export const appStore = {
   },
   serverMembers,
   serverRoles,
+  pendingVeilLink,
   serverSettingsId,
   typingUsers,
   reactions,
@@ -1092,6 +1244,12 @@ export const appStore = {
 
         replaceConversationCryptoDiagnostics(diagnostics);
         setAuthenticatedServerScope(scope);
+        if (!workspaceRouteMatchesScope(workspaceRoute(), scope)) {
+          setWorkspaceRouteRaw({ kind: "home", view: "overview", scope: {
+            canonicalServerOrigin: scope.canonicalServerOrigin,
+            bindingGeneration: scope.bindingGeneration,
+          } });
+        }
         setPendingAuthenticatedServerScope(null);
         publishedServerScopesByOrigin.set(scope.canonicalServerOrigin, scope);
         setOriginTransitioning(false);
@@ -1819,7 +1977,10 @@ export const appStore = {
   // ─── Groups ─────────────────────────────────────────
 
   /** Create a group only after the server confirms its authenticated roster. */
-  createGroup: async (name: string): Promise<string | null> => {
+  createGroup: async (
+    name: string,
+    initialMember: { userId: string; identityKey: string },
+  ): Promise<string | null> => {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid || !connected()) {
@@ -1830,6 +1991,8 @@ export const appStore = {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         name,
+        memberUserId: initialMember.userId,
+        memberIdentityKey: initialMember.identityKey,
       });
       requireCurrentUiSession(sessionEpoch);
       try {
@@ -2508,19 +2671,20 @@ export const appStore = {
     serverId: string,
     maxUses: number,
     expiresInSecs: number,
-  ): Promise<{ code: string } | null> => {
+  ): Promise<CreatedVeilLink | null> => {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
+    const mutationScope = requirePublishedMutationScope();
     try {
-      const inv = await invoke<{ code: string }>("create_invite", {
+      const inv = await invoke<CreatedVeilLink>("create_invite", {
         serverHttpUrl: serverHttpUrl(),
         userId: uid,
         serverId,
-        maxUses,
-        expiresInSecs,
+        options: { maxUses, expiresInSecs },
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       return inv;
     } catch (e) {
       rethrowIfStale(e);
@@ -2529,29 +2693,47 @@ export const appStore = {
     }
   },
 
-  previewInvite: async (code: string): Promise<any> => {
+  refreshPendingVeilLink: async (): Promise<PendingVeilLink | null> => {
+    const pending = await invoke<PendingVeilLink | null>("get_pending_veil_link");
+    setPendingVeilLink(pending);
+    return pending;
+  },
+
+  cancelPendingVeilLink: async () => {
+    await invoke("cancel_pending_veil_link");
+    setPendingVeilLink(null);
+  },
+
+  previewInvite: async (): Promise<any> => {
     const sessionEpoch = captureUiSessionEpoch();
-    const preview = await invoke("preview_invite", { serverHttpUrl: serverHttpUrl(), code });
-    requireCurrentUiSession(sessionEpoch);
+    const uid = userId();
+    if (!uid) throw new Error("No authenticated account for this Veil Node");
+    const mutationScope = requirePublishedMutationScope();
+    const preview = await invoke("preview_invite", {
+      userId: uid,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     return preview;
   },
 
-  useInvite: async (code: string): Promise<Server | null> => {
+  useInvite: async (): Promise<Server | null> => {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
+    const mutationScope = requirePublishedMutationScope();
     try {
       const s = await invoke<any>("use_invite", {
-        serverHttpUrl: serverHttpUrl(),
         userId: uid,
-        code,
+        ...authenticatedMutationScopeArgs(mutationScope),
       });
-      requireCurrentUiSession(sessionEpoch);
+      requireCurrentMutationScope(sessionEpoch, mutationScope);
       const joined = serverFromJSON(s);
       setServers((prev) => {
         if (prev.some((p) => p.id === joined.id)) return prev;
         return [...prev, joined];
       });
+      setPendingVeilLink(null);
       return joined;
     } catch (e) {
       rethrowIfStale(e);
@@ -2584,7 +2766,7 @@ export const appStore = {
 
   updateServer: async (
     serverId: string,
-    patch: { name?: string; description?: string; iconUrl?: string },
+    patch: { name?: string; description?: string },
   ) => {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
@@ -2595,7 +2777,6 @@ export const appStore = {
       serverId,
       name: patch.name ?? null,
       description: patch.description ?? null,
-      iconUrl: patch.iconUrl ?? null,
     });
     requireCurrentUiSession(sessionEpoch);
     setServers((prev) =>
@@ -2605,7 +2786,6 @@ export const appStore = {
               ...s,
               name: patch.name ?? s.name,
               description: patch.description ?? s.description,
-              iconUrl: patch.iconUrl ?? s.iconUrl,
             }
           : s,
       ),
@@ -2853,23 +3033,30 @@ export const appStore = {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
     const invs = await invoke<any[]>("list_invites", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
       serverId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
-    requireCurrentUiSession(sessionEpoch);
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
     return invs;
   },
 
-  revokeInvite: async (code: string) => {
+  revokeInvite: async (serverId: string, inviteId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
     await invoke("revoke_invite", {
       serverHttpUrl: serverHttpUrl(),
       userId: uid,
-      code,
+      serverId,
+      inviteId,
+      ...authenticatedMutationScopeArgs(mutationScope),
     });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
   },
 
   /** Set up Tauri event listeners for incoming server events. */
@@ -3331,7 +3518,7 @@ export const appStore = {
       await register<{
       eventType: number;
       serverId: string;
-      serverInfo?: { id: string; name: string; iconUrl?: string; ownerIdentityKey: string };
+      serverInfo?: { id: string; name: string; ownerIdentityKey: string };
       memberInfo?: { identityKey: string; username: string; roleIds: string[]; reason?: string };
       roleInfo?: { id: string; name: string; permissions: number; position: number; color?: number };
     }>("veil://server-event", (event) => {
@@ -3403,32 +3590,17 @@ export const appStore = {
       }
     });
 
-    // Deep links are untrusted OS input. UUID-only Add Me links predate the
-    // canonical (origin, user, identity-key) locator and are ambiguous across
-    // self-hosted instances, so they fail closed until a versioned format has
-    // its own schema/privacy/security review.
-      await register<string[]>("deep-link://new-url", async (event) => {
-      if (!acceptsSensitiveEvent()) return;
-      const urls = event.payload;
-      for (const raw of urls) {
-        try {
-          const url = new URL(raw);
-          const parts = url.pathname.replace(/^\/+/, "").split("/");
-          const addUserId = url.hostname === "add" ? parts[0] : parts[0] === "add" ? parts[1] : "";
-          const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-          if (url.protocol === "veil:" && addUserId && canonicalUuid.test(addUserId)) {
-            await alertDecision({
-              title: "Legacy Add Me link blocked",
-              message: "This link contains only a user ID and cannot distinguish self-hosted Veil servers. Ask the sender for an origin-scoped link after that format is available.",
-              confirmLabel: "Close",
-            });
-          }
-          // veil://share/{id} — future
-        } catch {
-          // ignore malformed
-        }
-      }
+      await register<PendingVeilLink>("veil://pending-link", (event) => {
+        const value = event.payload;
+        if (
+          !value
+          || typeof value.canonicalOrigin !== "string"
+          || typeof value.selectorRef !== "string"
+          || typeof value.expiresInSeconds !== "number"
+        ) return;
+        setPendingVeilLink(value);
       });
+      setPendingVeilLink(await invoke<PendingVeilLink | null>("get_pending_veil_link"));
       eventListenersInitialized = true;
     } catch (error) {
       for (const unlisten of registered.reverse()) {
@@ -3448,6 +3620,114 @@ export const appStore = {
         eventListenersInitialization = null;
       }
     });
+  },
+
+  listRoomAccessRules: async (channelId: string): Promise<RoomAccessRule[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
+    const rows = await invoke<Array<any>>("list_channel_overwrites", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      channelId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return rows.map((row) => ({
+      targetId: row.target_id,
+      targetType: row.target_type,
+      allow: row.allow,
+      deny: row.deny,
+    }));
+  },
+
+  upsertRoomAccessRule: async (channelId: string, rule: RoomAccessRule) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("upsert_channel_overwrite", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      channelId,
+      targetId: rule.targetId,
+      targetType: rule.targetType,
+      allow: rule.allow,
+      deny: rule.deny,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
+  banMember: async (serverId: string, targetUserId: string, reason?: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("ban_server_member", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      targetUserId,
+      reason: reason ?? null,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    setServerMembers((previous) => ({
+      ...previous,
+      [serverId]: (previous[serverId] ?? []).filter((member) => member.userId !== targetUserId),
+    }));
+  },
+
+  listBans: async (serverId: string): Promise<ServerBan[]> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return [];
+    const mutationScope = requirePublishedMutationScope();
+    const rows = await invoke<Array<any>>("list_server_bans", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return rows.map((row) => ({
+      userId: row.user_id,
+      username: row.username,
+      bannedBy: row.banned_by,
+      reason: row.reason ?? undefined,
+      createdAt: row.created_at,
+    }));
+  },
+
+  unbanMember: async (serverId: string, targetUserId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("unban_server_member", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      targetUserId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
+  revokeAllInvites: async (serverId: string) => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const uid = userId();
+    if (!uid) return;
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("revoke_all_invites", {
+      serverHttpUrl: serverHttpUrl(),
+      userId: uid,
+      serverId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
   },
 
   // ─── Phase 6: OpenMLS orchestration ────────────────

@@ -721,18 +721,90 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		requireMigrationError(t, err, "23514", "users_avatar_upload_quota_state")
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 022", func(t *testing.T) {
+	t.Run("023 hard-cuts plaintext invites and adds bounded Veil Links and bans", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_023")
+		applyMigrationsBefore(t, pool, migrations, 23)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var ownerID, targetID, spaceID string
+		for _, fixture := range []struct {
+			name string
+			mark byte
+			out  *string
+		}{{"link-owner", 0x31, &ownerID}, {"link-target", 0x41, &targetID}} {
+			if err := pool.QueryRow(ctx, `INSERT INTO users(identity_key, signing_key, username)
+				VALUES ($1,$2,$3) RETURNING id::text`, bytes.Repeat([]byte{fixture.mark}, 32),
+				bytes.Repeat([]byte{fixture.mark + 1}, 32), fixture.name).Scan(fixture.out); err != nil {
+				t.Fatal(err)
+			}
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if err := tx.QueryRow(ctx, `INSERT INTO servers(name, icon_url, owner_id)
+			VALUES ('Link Space','https://legacy.invalid/space.png',$1::uuid) RETURNING id::text`, ownerID).Scan(&spaceID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `INSERT INTO roles(server_id,name,permissions,position,is_default)
+			VALUES ($1::uuid,'@everyone',1799,0,TRUE)`, spaceID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO server_invites(code,server_id,created_by,max_uses)
+			VALUES ('plaintext',$1::uuid,$2::uuid,0)`, spaceID, ownerID); err != nil {
+			t.Fatal(err)
+		}
+		if err := execMigration(t, pool, migrations, 23); err != nil {
+			t.Fatalf("migration 023: %v", err)
+		}
+		var legacyRows, defaultPermissions int64
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM server_invites`).Scan(&legacyRows); err != nil || legacyRows != 0 {
+			t.Fatalf("legacy invite rows=%d err=%v", legacyRows, err)
+		}
+		if err := pool.QueryRow(ctx, `SELECT permissions FROM roles WHERE server_id=$1::uuid AND is_default`, spaceID).Scan(&defaultPermissions); err != nil || defaultPermissions&256 != 0 {
+			t.Fatalf("default invite permission=%d err=%v", defaultPermissions, err)
+		}
+		var iconColumns int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM information_schema.columns
+			WHERE table_schema=current_schema() AND table_name='servers' AND column_name='icon_url'`).Scan(&iconColumns); err != nil || iconColumns != 0 {
+			t.Fatalf("legacy remote Space icon column count=%d err=%v", iconColumns, err)
+		}
+		_, err = pool.Exec(ctx, `UPDATE servers SET icon_url='https://remote.invalid/space.png' WHERE id=$1::uuid`, spaceID)
+		requireMigrationError(t, err, "42703", "icon_url")
+		selector := strings.Repeat("A", 43)
+		if _, err := pool.Exec(ctx, `INSERT INTO server_invites
+			(public_selector,secret_hash,server_id,created_by,max_uses,expires_at)
+			VALUES ($1,$2,$3::uuid,$4::uuid,1,now()+interval '1 day')`, selector,
+			bytes.Repeat([]byte{0x55}, 32), spaceID, ownerID); err != nil {
+			t.Fatalf("insert bounded Veil Link: %v", err)
+		}
+		_, err = pool.Exec(ctx, `INSERT INTO server_invites
+			(public_selector,secret_hash,server_id,created_by,max_uses,expires_at)
+			VALUES ($1,$2,$3::uuid,$4::uuid,0,now()+interval '1 day')`, strings.Repeat("B", 43),
+			bytes.Repeat([]byte{0x66}, 32), spaceID, ownerID)
+		requireMigrationError(t, err, "23514", "server_invites_bounded_uses")
+		if _, err := pool.Exec(ctx, `INSERT INTO server_bans(server_id,user_id,banned_by,reason)
+			VALUES ($1::uuid,$2::uuid,$3::uuid,'raid')`, spaceID, targetID, ownerID); err != nil {
+			t.Fatalf("insert authoritative ban: %v", err)
+		}
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 023", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 22; number++ {
+		for number := 1; number <= 23; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 23)
+		applyMigrationsBefore(t, pool, migrations, 24)
 	})
 }
 

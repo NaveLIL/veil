@@ -6,6 +6,8 @@ import {
   type Channel,
   type IdentityVerificationView,
   type Role,
+  type RoomAccessRule,
+  type ServerBan,
   type ServerMember,
 } from "@/stores/app";
 import { IslandSelect } from "@/components/ui/IslandSelect";
@@ -34,7 +36,6 @@ import {
 import {
   AlertTriangle,
   ArrowLeft,
-  FileText,
   Hash,
   Mail,
   Settings,
@@ -54,33 +55,32 @@ type Section =
   | "roles"
   | "members"
   | "invites"
-  | "audit"
   | "danger";
 
 const SECTIONS: { id: Section; label: string; icon: LucideIcon; ownerOnly?: boolean }[] = [
   { id: "overview", label: "Overview", icon: Settings },
-  { id: "channels", label: "Channels", icon: Hash },
+  { id: "channels", label: "Rooms", icon: Hash },
   { id: "roles", label: "Roles", icon: Shield },
   { id: "members", label: "Members", icon: Users },
-  { id: "invites", label: "Invites", icon: Mail },
-  { id: "audit", label: "Audit Log", icon: FileText },
+  { id: "invites", label: "Veil Links", icon: Mail },
   { id: "danger", label: "Danger Zone", icon: AlertTriangle },
 ];
 
-// Forward-looking permission bits. Backend stores `permissions u64`;
-// we define a stable set here so future server upgrades can expand without
-// breaking the UI.
+// Exact low-order permission contract from the authoritative server. The
+// u64 Administrator bit is deliberately not toggled with JavaScript bitwise
+// operators; Space ownership remains the explicit full-control path in 4E.
 const PERMISSIONS: { bit: number; label: string; desc: string }[] = [
-  { bit: 1 << 0, label: "Administrator", desc: "Full access. Bypasses all permission checks." },
-  { bit: 1 << 1, label: "Manage Server", desc: "Edit server name, description, icon." },
-  { bit: 1 << 2, label: "Manage Channels", desc: "Create, edit and delete channels." },
-  { bit: 1 << 3, label: "Manage Roles", desc: "Create, edit and assign roles below their own." },
-  { bit: 1 << 4, label: "Manage Invites", desc: "Create and revoke invite codes." },
-  { bit: 1 << 5, label: "Kick Members", desc: "Remove members from this server." },
-  { bit: 1 << 6, label: "Ban Members", desc: "Permanently ban members from rejoining." },
-  { bit: 1 << 7, label: "View Channels", desc: "See text and voice channels." },
-  { bit: 1 << 8, label: "Send Messages", desc: "Send messages in text channels." },
-  { bit: 1 << 9, label: "Manage Messages", desc: "Delete or pin other users' messages." },
+  { bit: 1 << 0, label: "View Rooms", desc: "See Space-wide Rooms and allowed Restricted Rooms." },
+  { bit: 1 << 1, label: "Send Messages", desc: "Send encrypted messages in accessible text Rooms." },
+  { bit: 1 << 2, label: "Manage Messages", desc: "Moderate messages in accessible Rooms." },
+  { bit: 1 << 3, label: "Mention Everyone", desc: "Notify all eligible Room members." },
+  { bit: 1 << 4, label: "Manage Rooms", desc: "Create, edit, reorder and delete Rooms." },
+  { bit: 1 << 5, label: "Manage Roles", desc: "Create, edit and assign lower roles." },
+  { bit: 1 << 6, label: "Remove Members", desc: "Remove members without blocking later admission." },
+  { bit: 1 << 7, label: "Ban Members", desc: "Block an account from Veil Link admission." },
+  { bit: 1 << 8, label: "Create Veil Links", desc: "Create bounded Space admission capabilities." },
+  { bit: 1 << 9, label: "Manage Space", desc: "Edit Space metadata and revoke Veil Links." },
+  { bit: 1 << 10, label: "Read Future History", desc: "Receive keys for messages available under Room history policy." },
 ];
 
 const portalHost = () =>
@@ -222,6 +222,7 @@ export const ServerSettingsScreen: Component = () => {
       appStore.loadChannels(id),
     ]).catch(() => {});
     refreshInvites();
+    void refreshBans();
   }));
 
   const goBack = () => {
@@ -539,7 +540,6 @@ export const ServerSettingsScreen: Component = () => {
   // ─── OVERVIEW ──────────────────────────────────────
   const [ovName, setOvName] = createSignal("");
   const [ovDesc, setOvDesc] = createSignal("");
-  const [ovIcon, setOvIcon] = createSignal("");
   const [ovSaved, setOvSaved] = createSignal(false);
   const [ovError, setOvError] = createSignal("");
 
@@ -547,7 +547,6 @@ export const ServerSettingsScreen: Component = () => {
     if (!s) return;
     setOvName(s.name);
     setOvDesc(s.description ?? "");
-    setOvIcon(s.iconUrl ?? "");
   }));
 
   const saveOverview = async () => {
@@ -555,10 +554,9 @@ export const ServerSettingsScreen: Component = () => {
     if (!srv) return;
     setOvError("");
     try {
-      const patch: { name?: string; description?: string; iconUrl?: string } = {};
+      const patch: { name?: string; description?: string } = {};
       if (ovName().trim() && ovName() !== srv.name) patch.name = ovName().trim();
       if (ovDesc() !== (srv.description ?? "")) patch.description = ovDesc();
-      if (ovIcon() !== (srv.iconUrl ?? "")) patch.iconUrl = ovIcon();
       if (Object.keys(patch).length === 0) return;
       await appStore.updateServer(srv.id, patch);
       setOvSaved(true);
@@ -571,13 +569,13 @@ export const ServerSettingsScreen: Component = () => {
   const OverviewSection = () => (
     <>
       <div style={S.heading}>Overview</div>
-      <div style={S.subHeading}>Basic information about your server</div>
+      <div style={S.subHeading}>Basic information about this Space</div>
 
       <div style={S.card}>
-        <div style={S.cardTitle}>Server Profile</div>
+        <div style={S.cardTitle}>Space Profile</div>
 
         <div style={{ "margin-bottom": "14px" }}>
-          <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-bottom": "6px" }}>Server Name</div>
+          <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-bottom": "6px" }}>Space Name</div>
           <input
             style={{ ...S.input, "font-family": "inherit" }}
             value={ovName()}
@@ -595,19 +593,13 @@ export const ServerSettingsScreen: Component = () => {
             onInput={(e) => setOvDesc(e.currentTarget.value)}
             disabled={!isOwner()}
             maxLength={256}
-            placeholder="Tell people what this server is about…"
+            placeholder="Tell people what this Space is about…"
           />
         </div>
 
-        <div style={{ "margin-bottom": "18px" }}>
-          <div style={{ "font-size": "12px", color: "var(--veil-text-faint)", "margin-bottom": "6px" }}>Icon URL</div>
-          <input
-            style={S.input}
-            value={ovIcon()}
-            onInput={(e) => setOvIcon(e.currentTarget.value)}
-            disabled={!isOwner()}
-            placeholder="https://…"
-          />
+        <div style={{ ...S.paragraph, "margin-bottom": "18px" }}>
+          Veil renders an origin-scoped deterministic Space mark. Remote image URLs are not
+          accepted until a separate image-decoder, privacy, and same-origin ingest review.
         </div>
 
         <Show when={isOwner()}>
@@ -620,7 +612,7 @@ export const ServerSettingsScreen: Component = () => {
         </Show>
         <Show when={!isOwner()}>
           <div style={{ "font-size": "11px", color: "var(--veil-text-faint)" }}>
-            You need <strong>Manage Server</strong> permission to edit these fields.
+            You need <strong>Manage Space</strong> permission to edit these fields.
           </div>
         </Show>
         <Show when={ovError()}>
@@ -629,9 +621,9 @@ export const ServerSettingsScreen: Component = () => {
       </div>
 
       <div style={S.card}>
-        <div style={S.cardTitle}>Server Metadata</div>
+        <div style={S.cardTitle}>Space Metadata</div>
         <div style={S.field}>
-          <span style={S.fieldLabel}>Server ID</span>
+          <span style={S.fieldLabel}>Space ID</span>
           <div style={{ display: "flex", "align-items": "center", gap: "8px" }}>
             <span style={S.fieldValue}>{server()?.id ?? "—"}</span>
             <button
@@ -661,12 +653,94 @@ export const ServerSettingsScreen: Component = () => {
   const [chName, setChName] = createSignal("");
   const [chTopic, setChTopic] = createSignal("");
   const [chError, setChError] = createSignal("");
+  const [roomAccessRules, setRoomAccessRules] = createSignal<RoomAccessRule[]>([]);
+  const [roomAccessBusy, setRoomAccessBusy] = createSignal(false);
 
-  const startEditChannel = (c: Channel) => {
+  const startEditChannel = async (c: Channel) => {
     setEditingChannel(c.id);
     setChName(c.name);
     setChTopic(c.topic ?? "");
     setChError("");
+    setRoomAccessRules([]);
+    if (c.channelType !== 0) return;
+    setRoomAccessBusy(true);
+    try {
+      setRoomAccessRules(await appStore.listRoomAccessRules(c.id));
+    } catch (error) {
+      setChError(String(error));
+    } finally {
+      setRoomAccessBusy(false);
+    }
+  };
+
+  const viewRoomPermission = 1 << 0;
+  const accessRule = (targetId: string, targetType: 0 | 1) =>
+    roomAccessRules().find((rule) => rule.targetId === targetId && rule.targetType === targetType);
+  const roomIsRestricted = () => {
+    const defaultRole = roles().find((role) => role.isDefault);
+    return !!defaultRole && (((accessRule(defaultRole.id, 0)?.deny ?? 0) & viewRoomPermission) !== 0);
+  };
+  const saveRoomAccessRule = async (channelId: string, next: RoomAccessRule) => {
+    setRoomAccessBusy(true);
+    setChError("");
+    try {
+      await appStore.upsertRoomAccessRule(channelId, next);
+      setRoomAccessRules((previous) => [
+        ...previous.filter((rule) => !(rule.targetId === next.targetId && rule.targetType === next.targetType)),
+        next,
+      ]);
+    } catch (error) {
+      setChError(String(error));
+      throw error;
+    } finally {
+      setRoomAccessBusy(false);
+    }
+  };
+  const setRoomRestricted = async (channelId: string, restricted: boolean) => {
+    const defaultRole = roles().find((role) => role.isDefault);
+    if (!defaultRole) {
+      setChError("This Space has no authoritative default role; access changes are blocked.");
+      return;
+    }
+    const currentDefault = accessRule(defaultRole.id, 0) ?? {
+      targetId: defaultRole.id,
+      targetType: 0 as const,
+      allow: 0,
+      deny: 0,
+    };
+    if (restricted) {
+      await saveRoomAccessRule(channelId, {
+        ...currentDefault,
+        allow: currentDefault.allow & ~viewRoomPermission,
+        deny: currentDefault.deny | viewRoomPermission,
+      });
+      return;
+    }
+
+    // Widening is explicit. Remove every VIEW deny before granting the
+    // default Space role; any failed request leaves a more restrictive state.
+    for (const rule of roomAccessRules().filter((item) => item.deny & viewRoomPermission)) {
+      await saveRoomAccessRule(channelId, { ...rule, deny: rule.deny & ~viewRoomPermission });
+    }
+    const refreshedDefault = accessRule(defaultRole.id, 0) ?? currentDefault;
+    await saveRoomAccessRule(channelId, {
+      ...refreshedDefault,
+      allow: refreshedDefault.allow | viewRoomPermission,
+      deny: refreshedDefault.deny & ~viewRoomPermission,
+    });
+  };
+  const setRoomTargetAllowed = async (
+    channelId: string,
+    targetId: string,
+    targetType: 0 | 1,
+    allowed: boolean,
+  ) => {
+    const current = accessRule(targetId, targetType) ?? { targetId, targetType, allow: 0, deny: 0 };
+    await saveRoomAccessRule(channelId, {
+      ...current,
+      allow: allowed ? current.allow | viewRoomPermission : current.allow & ~viewRoomPermission,
+      deny: current.deny & ~viewRoomPermission,
+    });
   };
   const saveChannelEdit = async () => {
     const srv = server();
@@ -683,33 +757,33 @@ export const ServerSettingsScreen: Component = () => {
     const srv = server();
     if (!srv) return;
     if (!await confirmDecision({
-      title: "Delete channel?",
+      title: "Delete Room?",
       message: `Delete #${c.name}? This cannot be undone.`,
-      confirmLabel: "Delete channel",
+      confirmLabel: "Delete Room",
       danger: true,
     })) return;
     try {
       await appStore.deleteChannel(srv.id, c.id);
     } catch (e) {
-      await alertDecision({ title: "Channel not deleted", message: String(e) });
+      await alertDecision({ title: "Room not deleted", message: String(e) });
     }
   };
 
   const channelTypeLabel = (t: number) =>
-    t === 0 ? "Text" : t === 1 ? "Voice" : t === 2 ? "Category" : `Type ${t}`;
+    t === 0 ? "Text Room" : t === 2 ? "Category" : "Unavailable type";
   const channelTypeColor = (t: number) =>
-    t === 0 ? "var(--veil-accent)" : t === 1 ? "var(--veil-success)" : "var(--veil-text-muted)";
+    t === 0 ? "var(--veil-accent)" : "var(--veil-text-muted)";
 
   const ChannelsSection = () => (
     <>
-      <div style={S.heading}>Channels</div>
-      <div style={S.subHeading}>Organize text and voice channels for your server</div>
+      <div style={S.heading}>Rooms</div>
+      <div style={S.subHeading}>Organize encrypted Text Rooms and their categories</div>
 
       <div style={S.card}>
-        <div style={S.cardTitle}>All Channels — {channels().length}</div>
+        <div style={S.cardTitle}>All Rooms and Categories — {channels().length}</div>
         <Show
           when={channels().length > 0}
-          fallback={<div style={S.paragraph}>No channels yet.</div>}
+          fallback={<div style={S.paragraph}>No Rooms yet.</div>}
         >
           <For each={channels()}>
             {(c) => (
@@ -730,7 +804,7 @@ export const ServerSettingsScreen: Component = () => {
                         </Show>
                       </div>
                       <Show when={isOwner()}>
-                        <button style={S.btnGhostSm} onClick={() => startEditChannel(c)}>Edit</button>
+                        <button style={S.btnGhostSm} onClick={() => void startEditChannel(c)}>Edit</button>
                         <button style={S.btnDangerSm} onClick={() => removeChannel(c)}>Delete</button>
                       </Show>
                     </>
@@ -742,7 +816,7 @@ export const ServerSettingsScreen: Component = () => {
                       value={chName()}
                       onInput={(e) => setChName(e.currentTarget.value)}
                       maxLength={64}
-                      placeholder="channel-name"
+                      placeholder="room-name"
                     />
                     <input
                       style={{ ...S.input, height: "32px", "font-family": "inherit" }}
@@ -751,6 +825,61 @@ export const ServerSettingsScreen: Component = () => {
                       maxLength={256}
                       placeholder="Topic (optional)"
                     />
+                    <Show when={c.channelType === 0}>
+                      <div style={{ padding: "10px", "border-radius": "10px", background: "var(--veil-contrast-03)", border: "1px solid var(--veil-contrast-04)" }}>
+                        <div style={{ "font-size": "11px", color: "var(--veil-text-muted)", "margin-bottom": "8px" }}>Access policy</div>
+                        <div style={{ display: "flex", gap: "8px", "margin-bottom": "10px" }}>
+                          <button
+                            type="button"
+                            style={roomIsRestricted() ? S.btnSecondary : S.btnPrimary}
+                            disabled={roomAccessBusy()}
+                            onClick={() => void setRoomRestricted(c.id, false).catch(() => {})}
+                          >Space-wide</button>
+                          <button
+                            type="button"
+                            style={roomIsRestricted() ? S.btnPrimary : S.btnSecondary}
+                            disabled={roomAccessBusy()}
+                            onClick={() => void setRoomRestricted(c.id, true).catch(() => {})}
+                          >Restricted</button>
+                        </div>
+                        <div style={S.paragraph}>
+                          {roomIsRestricted()
+                            ? "Only explicitly allowed roles and members can discover this encrypted Room."
+                            : "Every current Space member can discover this encrypted Room."}
+                          {" "}History is future-only for newly admitted members in both modes.
+                        </div>
+                        <Show when={roomIsRestricted()}>
+                          <div style={{ "margin-top": "10px", display: "flex", "flex-direction": "column", gap: "6px" }}>
+                            <For each={roles().filter((role) => !role.isDefault)}>
+                              {(role) => (
+                                <label style={{ display: "flex", "align-items": "center", gap: "8px", "font-size": "11px", color: "var(--veil-text-muted)" }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={((accessRule(role.id, 0)?.allow ?? 0) & viewRoomPermission) !== 0}
+                                    disabled={roomAccessBusy()}
+                                    onChange={(event) => void setRoomTargetAllowed(c.id, role.id, 0, event.currentTarget.checked).catch(() => {})}
+                                  />
+                                  Role · {role.name}
+                                </label>
+                              )}
+                            </For>
+                            <For each={members().filter((member) => member.userId !== server()?.ownerId)}>
+                              {(member) => (
+                                <label style={{ display: "flex", "align-items": "center", gap: "8px", "font-size": "11px", color: "var(--veil-text-muted)" }}>
+                                  <input
+                                    type="checkbox"
+                                    checked={((accessRule(member.userId, 1)?.allow ?? 0) & viewRoomPermission) !== 0}
+                                    disabled={roomAccessBusy()}
+                                    onChange={(event) => void setRoomTargetAllowed(c.id, member.userId, 1, event.currentTarget.checked).catch(() => {})}
+                                  />
+                                  Member · {member.nickname || member.username}
+                                </label>
+                              )}
+                            </For>
+                          </div>
+                        </Show>
+                      </div>
+                    </Show>
                     <Show when={chError()}><div style={S.errorMsg}>{chError()}</div></Show>
                   </div>
                   <button style={S.btnGhostSm} onClick={() => setEditingChannel(null)}>Cancel</button>
@@ -765,6 +894,15 @@ export const ServerSettingsScreen: Component = () => {
             )}
           </For>
         </Show>
+      </div>
+      <div style={S.card}>
+        <div style={S.cardTitle}>Room security and history</div>
+        <div style={S.paragraph}>
+          Every Text Room is a separate Sender Keys v5 security domain. Space-wide and
+          Restricted Rooms remain end-to-end encrypted. A newly admitted member receives
+          only fresh key material after the authoritative roster is revalidated; a Veil Link
+          never grants earlier Room keys or access to a Restricted Room.
+        </div>
       </div>
     </>
   );
@@ -805,7 +943,7 @@ export const ServerSettingsScreen: Component = () => {
     if (r.isDefault) {
       await alertDecision({
         title: "Role cannot be deleted",
-        message: "The default @everyone role is required by every server.",
+        message: "The default @everyone role is required by every Space.",
       });
       return;
     }
@@ -1028,6 +1166,8 @@ export const ServerSettingsScreen: Component = () => {
 
   // ─── MEMBERS ───────────────────────────────────────
   const [memberSearch, setMemberSearch] = createSignal("");
+	const [bans, setBans] = createSignal<ServerBan[]>([]);
+	const [bansLoading, setBansLoading] = createSignal(false);
   const filteredMembers = createMemo(() => {
     const q = memberSearch().trim().toLowerCase();
     const list = members();
@@ -1343,8 +1483,8 @@ export const ServerSettingsScreen: Component = () => {
     const srv = server();
     if (!srv) return;
     const reason = await promptDecision({
-      title: "Remove server member?",
-      message: `Kick ${m.nickname || m.username} from this server? You may add an optional reason.`,
+      title: "Remove Space member?",
+      message: `Kick ${m.nickname || m.username} from this Space? You may add an optional reason.`,
       placeholder: "Optional reason",
       confirmLabel: "Kick member",
       danger: true,
@@ -1354,6 +1494,52 @@ export const ServerSettingsScreen: Component = () => {
       await appStore.kickMember(srv.id, m.userId, reason || undefined);
     } catch (e) {
       await alertDecision({ title: "Member not removed", message: String(e) });
+    }
+  };
+  const refreshBans = async () => {
+    const srv = server();
+    if (!srv || !isOwner()) return;
+    setBansLoading(true);
+    try {
+      setBans(await appStore.listBans(srv.id));
+    } catch (error) {
+      await alertDecision({ title: "Ban list unavailable", message: String(error) });
+    } finally {
+      setBansLoading(false);
+    }
+  };
+  const banMember = async (m: ServerMember) => {
+    const srv = server();
+    if (!srv) return;
+    const reason = await promptDecision({
+      title: "Ban Space member?",
+      message: `Ban ${m.nickname || m.username}? Their current Room access is removed atomically and Veil Links cannot admit this account again.`,
+      placeholder: "Optional reason",
+      confirmLabel: "Ban member",
+      danger: true,
+    });
+    if (reason === null) return;
+    try {
+      await appStore.banMember(srv.id, m.userId, reason || undefined);
+      await refreshBans();
+    } catch (error) {
+      await alertDecision({ title: "Member not banned", message: String(error) });
+    }
+  };
+  const unbanMember = async (ban: ServerBan) => {
+    const srv = server();
+    if (!srv) return;
+    const confirmed = await confirmDecision({
+      title: "Remove admission ban?",
+      message: `${ban.username} may use a new valid Veil Link after this. They are not automatically re-added.`,
+      confirmLabel: "Unban",
+    });
+    if (!confirmed) return;
+    try {
+      await appStore.unbanMember(srv.id, ban.userId);
+      setBans((previous) => previous.filter((row) => row.userId !== ban.userId));
+    } catch (error) {
+      await alertDecision({ title: "Account not unbanned", message: String(error) });
     }
   };
   const toggleMemberRole = async (m: ServerMember, r: Role) => {
@@ -1373,7 +1559,7 @@ export const ServerSettingsScreen: Component = () => {
   const MembersSection = () => (
     <>
       <div style={S.heading}>Members</div>
-      <div style={S.subHeading}>Manage who has access and what roles they hold</div>
+      <div style={S.subHeading}>Manage who can enter this Space and which Rooms they can access</div>
 
       <div style={S.card}>
         <div style={S.cardTitle}>All Members — {members().length}</div>
@@ -1409,8 +1595,8 @@ export const ServerSettingsScreen: Component = () => {
                   displayName: m.nickname || m.username,
                   nickname: m.nickname,
                   contextKind: "server-member",
-                  contextLabel: isServerOwner() ? "Server owner" : "Server member",
-                  contextDetail: server()?.name ? `Server · ${server()!.name}` : "Server settings",
+                  contextLabel: isServerOwner() ? "Space owner" : "Space member",
+                  contextDetail: server()?.name ? `Space · ${server()!.name}` : "Space settings",
                   joinedAt: m.joinedAt,
                   isOwner: isServerOwner(),
                   selfIdentity: authenticatedIdentityLocator(),
@@ -1522,7 +1708,8 @@ export const ServerSettingsScreen: Component = () => {
                         </KPopover.Content>
                       </KPopover.Portal>
                     </KPopover>
-                    <button style={S.btnDangerSm} onClick={() => kickMember(m)}>Kick</button>
+                    <button style={S.btnGhostSm} onClick={() => kickMember(m)}>Remove</button>
+                    <button style={S.btnDangerSm} onClick={() => banMember(m)}>Ban</button>
                   </Show>
                 </div>
               );
@@ -1545,13 +1732,42 @@ export const ServerSettingsScreen: Component = () => {
           </Show>
         </Show>
       </div>
+
+      <Show when={isOwner()}>
+        <div style={{ ...S.card, "margin-top": "16px" }}>
+          <div style={{ display: "flex", "align-items": "center", "justify-content": "space-between", gap: "12px" }}>
+            <div>
+              <div style={S.cardTitle}>Admission bans — {bans().length}</div>
+              <div style={S.paragraph}>Bans are account-scoped and enforced in the same transaction as Veil Link admission.</div>
+            </div>
+            <button style={S.btnSecondary} disabled={bansLoading()} onClick={() => void refreshBans()}>
+              {bansLoading() ? "Loading…" : "Refresh"}
+            </button>
+          </div>
+          <Show when={bans().length > 0} fallback={<div style={S.paragraph}>No accounts are banned.</div>}>
+            <For each={bans()}>
+              {(ban) => (
+                <div style={S.listRow}>
+                  <div style={{ flex: "1", "min-width": "0" }}>
+                    <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600" }}>{ban.username}</div>
+                    <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "font-family": "monospace" }}>{ban.userId}</div>
+                    <Show when={ban.reason}><div style={{ ...S.paragraph, "margin-top": "4px" }}>{ban.reason}</div></Show>
+                  </div>
+                  <button style={S.btnSecondary} onClick={() => void unbanMember(ban)}>Unban</button>
+                </div>
+              )}
+            </For>
+          </Show>
+        </div>
+      </Show>
     </>
   );
 
   // ─── INVITES ───────────────────────────────────────
   const [invites, setInvites] = createSignal<any[]>([]);
-  const [invMaxUses, setInvMaxUses] = createSignal(0);
+  const [invMaxUses, setInvMaxUses] = createSignal(1);
   const [invExpires, setInvExpires] = createSignal(86400);
+  const [revealedVeilLink, setRevealedVeilLink] = createSignal("");
   const [invError, setInvError] = createSignal("");
   const [invLoading, setInvLoading] = createSignal(false);
 
@@ -1575,7 +1791,6 @@ export const ServerSettingsScreen: Component = () => {
     { value: 21600, label: "6 hours" },
     { value: 86400, label: "1 day" },
     { value: 604800, label: "7 days" },
-    { value: 0, label: "Never" },
   ];
   const usesOptions = [
     { value: 1, label: "1 use" },
@@ -1583,7 +1798,6 @@ export const ServerSettingsScreen: Component = () => {
     { value: 10, label: "10 uses" },
     { value: 25, label: "25 uses" },
     { value: 100, label: "100 uses" },
-    { value: 0, label: "Unlimited" },
   ];
 
   const createInvite = async () => {
@@ -1591,35 +1805,55 @@ export const ServerSettingsScreen: Component = () => {
     if (!srv) return;
     setInvError("");
     try {
-      await appStore.createInvite(srv.id, invMaxUses(), invExpires());
+      const created = await appStore.createInvite(srv.id, invMaxUses(), invExpires());
+      setRevealedVeilLink(created?.share_url ?? "");
       await refreshInvites();
     } catch (e) {
       setInvError(String(e));
     }
   };
-  const revokeInvite = async (code: string) => {
+  const revokeInvite = async (inviteId: string) => {
     if (!await confirmDecision({
-      title: "Revoke invite?",
-      message: `Revoke invite ${code}? Anyone who has not used it will no longer be able to join.`,
-      confirmLabel: "Revoke invite",
+      title: "Revoke Veil Link?",
+      message: "Revoke this Veil Link? Anyone who has not used it will no longer be able to join.",
+      confirmLabel: "Revoke Link",
       danger: true,
     })) return;
     try {
-      await appStore.revokeInvite(code);
+      const spaceId = sid();
+      if (!spaceId) return;
+      await appStore.revokeInvite(spaceId, inviteId);
       await refreshInvites();
     } catch (e) {
-      await alertDecision({ title: "Invite not revoked", message: String(e) });
+      await alertDecision({ title: "Veil Link not revoked", message: String(e) });
+    }
+  };
+  const revokeAllInvites = async () => {
+    if (!await confirmDecision({
+      title: "Revoke every active Veil Link?",
+      message: "All unconsumed admission links for this Space will stop working immediately.",
+      confirmLabel: "Revoke all Links",
+      danger: true,
+    })) return;
+    try {
+      const spaceId = sid();
+      if (!spaceId) return;
+      await appStore.revokeAllInvites(spaceId);
+      setRevealedVeilLink("");
+      await refreshInvites();
+    } catch (e) {
+      await alertDecision({ title: "Veil Links not revoked", message: String(e) });
     }
   };
 
   const InvitesSection = () => (
     <>
-      <div style={S.heading}>Invites</div>
-      <div style={S.subHeading}>Generate and manage invite codes for this server</div>
+      <div style={S.heading}>Veil Links</div>
+      <div style={S.subHeading}>Create bounded, revocable admission links for this Space</div>
 
       <Show when={isOwner()}>
         <div style={S.card}>
-          <div style={S.cardTitle}>Create Invite</div>
+          <div style={S.cardTitle}>Create Veil Link</div>
 
           <div style={S.field}>
             <span style={S.fieldLabel}>Max uses</span>
@@ -1645,9 +1879,21 @@ export const ServerSettingsScreen: Component = () => {
           </div>
 
           <div style={{ "margin-top": "16px", display: "flex", "align-items": "center", gap: "12px" }}>
-            <button style={S.btnPrimary} onClick={createInvite}>Generate Invite</button>
+            <button style={S.btnPrimary} onClick={createInvite}>Create Veil Link</button>
             <button style={S.btnSecondary} onClick={refreshInvites}>Refresh</button>
+            <button style={S.btnDangerSm} onClick={revokeAllInvites}>Revoke all</button>
           </div>
+          <Show when={revealedVeilLink()}>
+            <div style={{ ...S.listRow, "margin-top": "12px" }}>
+              <div style={{ flex: "1", "min-width": "0" }}>
+                <div style={{ "font-size": "11px", color: "var(--veil-warning)", "margin-bottom": "4px" }}>Shown once — store or share it now</div>
+                <div style={{ "font-size": "11px", color: "var(--veil-text-muted)", "font-family": "monospace", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>{revealedVeilLink()}</div>
+              </div>
+              <button style={S.copyBtn(copied() === "new-veil-link")} onClick={() => copyText(revealedVeilLink(), "new-veil-link")}>
+                {copied() === "new-veil-link" ? "✓ Copied" : "Copy"}
+              </button>
+            </div>
+          </Show>
           <Show when={invError()}>
             <div style={S.errorMsg}>{invError()}</div>
           </Show>
@@ -1655,40 +1901,38 @@ export const ServerSettingsScreen: Component = () => {
       </Show>
 
       <div style={S.card}>
-        <div style={S.cardTitle}>Active Invites — {invites().length}</div>
+        <div style={S.cardTitle}>Veil Links — {invites().length}</div>
         <Show when={invLoading()}>
           <div style={S.paragraph}>Loading…</div>
         </Show>
         <Show
           when={!invLoading() && invites().length === 0}
         >
-          <div style={S.paragraph}>No active invites.</div>
+          <div style={S.paragraph}>No Veil Links.</div>
         </Show>
         <For each={invites()}>
           {(inv) => {
-            const code = inv.code as string;
+            const inviteId = inv.id as string;
             const uses = inv.uses as number;
             const maxUses = inv.max_uses as number;
             const expiresAt = inv.expires_at as string | null | undefined;
+            const revokedAt = inv.revoked_at as string | null | undefined;
+            const expired = !!expiresAt && Date.parse(expiresAt) <= Date.now();
+            const exhausted = uses >= maxUses;
             return (
               <div style={S.listRow}>
                 <div style={{ flex: "1", "min-width": "0" }}>
                   <div style={{ "font-size": "13px", color: "var(--veil-contrast-85)", "font-weight": "600", "font-family": "monospace" }}>
-                    {code}
+                    Link {inviteId.slice(0, 8)}
                   </div>
                   <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "margin-top": "2px" }}>
-                    Uses: {uses}{maxUses > 0 ? ` / ${maxUses}` : " (unlimited)"}
-                    {expiresAt ? ` · Expires ${new Date(expiresAt).toLocaleString()}` : " · Never expires"}
+                    {revokedAt ? "Revoked" : expired ? "Expired" : exhausted ? "Exhausted" : "Active"}
+                    {` · Uses: ${uses} / ${maxUses}`}
+                    {expiresAt ? ` · Expires ${new Date(expiresAt).toLocaleString()}` : ""}
                   </div>
                 </div>
-                <button
-                  style={S.copyBtn(copied() === `inv-${code}`)}
-                  onClick={() => copyText(code, `inv-${code}`)}
-                >
-                  {copied() === `inv-${code}` ? "\u2713 Copied" : "Copy"}
-                </button>
-                <Show when={isOwner()}>
-                  <button style={S.btnDangerSm} onClick={() => revokeInvite(code)}>Revoke</button>
+                <Show when={isOwner() && !revokedAt}>
+                  <button style={S.btnDangerSm} onClick={() => revokeInvite(inviteId)}>Revoke</button>
                 </Show>
               </div>
             );
@@ -1698,50 +1942,31 @@ export const ServerSettingsScreen: Component = () => {
     </>
   );
 
-  // ─── AUDIT (placeholder, future-proof) ─────────────
-  const AuditSection = () => (
-    <>
-      <div style={S.heading}>Audit Log</div>
-      <div style={S.subHeading}>Track administrative actions taken on this server</div>
-
-      <div style={S.card}>
-        <div style={{ display: "flex", "align-items": "center", gap: "10px", "margin-bottom": "12px" }}>
-          <span style={S.badge("var(--veil-text-muted)")}>Coming soon</span>
-        </div>
-        <div style={S.paragraph}>
-          The audit log will record server-altering actions — channel/role/member changes,
-          invite usage, kicks and bans — with full attribution and timestamps. The backend
-          schema is in place; a UI surface will land in a follow-up release.
-        </div>
-      </div>
-    </>
-  );
-
   // ─── DANGER ────────────────────────────────────────
   const handleLeave = async () => {
     const srv = server();
     if (!srv) return;
     if (!await confirmDecision({
-      title: "Leave server?",
-      message: `Leave “${srv.name}”? You will need a new invite to rejoin.`,
-      confirmLabel: "Leave server",
+      title: "Leave Space?",
+      message: `Leave “${srv.name}”? You will need a new Veil Link to rejoin.`,
+      confirmLabel: "Leave Space",
       danger: true,
     })) return;
     try {
       await appStore.leaveServer(srv.id);
       goBack();
     } catch (e) {
-      await alertDecision({ title: "Could not leave server", message: String(e) });
+      await alertDecision({ title: "Could not leave Space", message: String(e) });
     }
   };
   const handleDelete = async () => {
     const srv = server();
     if (!srv) return;
     const confirmation = await promptDecision({
-      title: "Delete server permanently?",
-      message: `This permanently deletes “${srv.name}”, all channels, and all messages for every member.`,
+      title: "Delete Space permanently?",
+      message: `This permanently deletes “${srv.name}”, all Rooms, and all messages for every member.`,
       requiredValue: srv.name,
-      confirmLabel: "Delete server",
+      confirmLabel: "Delete Space",
       danger: true,
     });
     if (confirmation !== srv.name) return;
@@ -1749,7 +1974,7 @@ export const ServerSettingsScreen: Component = () => {
       await appStore.deleteServer(srv.id);
       goBack();
     } catch (e) {
-      await alertDecision({ title: "Server not deleted", message: String(e) });
+      await alertDecision({ title: "Space not deleted", message: String(e) });
     }
   };
 
@@ -1760,21 +1985,21 @@ export const ServerSettingsScreen: Component = () => {
 
       <Show when={!isOwner()}>
         <div style={S.card}>
-          <div style={S.cardTitle}>Leave Server</div>
+          <div style={S.cardTitle}>Leave Space</div>
           <div style={S.paragraph}>
-            You will lose access to all channels and messages in <strong style={{ color: "var(--veil-contrast-70)" }}>{server()?.name}</strong>. You can rejoin later only if someone gives you a new invite.
+            You will lose access to all Rooms and messages in <strong style={{ color: "var(--veil-contrast-70)" }}>{server()?.name}</strong>. You can rejoin later only with a new valid Veil Link.
           </div>
-          <button style={S.btnDanger} onClick={handleLeave}>Leave Server</button>
+          <button style={S.btnDanger} onClick={handleLeave}>Leave Space</button>
         </div>
       </Show>
 
       <Show when={isOwner()}>
         <div style={S.card}>
-          <div style={S.cardTitle}>Delete Server</div>
+          <div style={S.cardTitle}>Delete Space</div>
           <div style={S.paragraph}>
-            Permanently delete <strong style={{ color: "var(--veil-danger)" }}>{server()?.name}</strong>, all its channels, and all messages within. This action <strong style={{ color: "var(--veil-danger)" }}>cannot be undone</strong> and will affect every member.
+            Permanently delete <strong style={{ color: "var(--veil-danger)" }}>{server()?.name}</strong>, all its Rooms, and all messages within. This action <strong style={{ color: "var(--veil-danger)" }}>cannot be undone</strong> and will affect every member.
           </div>
-          <button style={S.btnDanger} onClick={handleDelete}>Delete Server Permanently</button>
+          <button style={S.btnDanger} onClick={handleDelete}>Delete Space Permanently</button>
         </div>
       </Show>
     </>
@@ -1785,7 +2010,7 @@ export const ServerSettingsScreen: Component = () => {
     <>
       <Show when={server()} fallback={
         <div style={{ ...S.overlay, ...animStyle(), "align-items": "center", "justify-content": "center" }}>
-          <div style={{ color: "var(--veil-text-muted)", "font-size": "13px" }}>Server not found.</div>
+          <div style={{ color: "var(--veil-text-muted)", "font-size": "13px" }}>Space not found.</div>
           <button type="button" style={{ ...S.backBtn, position: "absolute" as const }} onClick={goBack} title="Back to chat" aria-label="Back to chat"><ArrowLeft size={17} strokeWidth={1.8} /></button>
         </div>
       }>
@@ -1804,8 +2029,8 @@ export const ServerSettingsScreen: Component = () => {
         </button>
 
         {/* Sidebar navigation */}
-        <nav style={S.sidebar} aria-label="Server settings">
-          <div style={S.sidebarTitle}>Server</div>
+        <nav style={S.sidebar} aria-label="Space settings">
+          <div style={S.sidebarTitle}>Space</div>
           <div style={S.sidebarServerName}>{server()?.name}</div>
           <For each={SECTIONS}>
             {(s) => (
@@ -1834,7 +2059,6 @@ export const ServerSettingsScreen: Component = () => {
             <Match when={section() === "roles"}><RolesSection /></Match>
             <Match when={section() === "members"}><MembersSection /></Match>
             <Match when={section() === "invites"}><InvitesSection /></Match>
-            <Match when={section() === "audit"}><AuditSection /></Match>
             <Match when={section() === "danger"}><DangerSection /></Match>
           </Switch>
         </main>
@@ -1845,7 +2069,7 @@ export const ServerSettingsScreen: Component = () => {
         profile={selectedIdentity() ?? {
           displayName: "Unknown account",
           contextKind: "server-member",
-          contextLabel: "Server member",
+          contextLabel: "Space member",
         }}
         canMessage={selectedIdentityCanMessage()}
         messageBusy={identityMessageBusy()}

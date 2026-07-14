@@ -41,7 +41,6 @@ describe("origin-local App cleanup", () => {
       "setShowFriendsPanel(false)",
       "setShowNewGroup(false)",
       "setShowCreateServer(false)",
-      "setShowJoinServer(false)",
       "setShowSpaceCreateMenu(false)",
       "setShowCreateChannel(false)",
       "setShowCreateInvite(false)",

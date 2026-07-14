@@ -1,11 +1,17 @@
 package servers
 
 import (
+	"bytes"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"html/template"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"time"
 
@@ -15,11 +21,13 @@ import (
 	"github.com/google/uuid"
 )
 
-// Handler exposes REST endpoints for servers/channels/roles/invites.
+// Handler exposes REST endpoints for Spaces/Rooms/roles/Veil Links.
 type Handler struct {
-	svc *Service
-	mw  *authmw.Middleware
-	rl  *authmw.RateLimit
+	svc           *Service
+	mw            *authmw.Middleware
+	rl            *authmw.RateLimit
+	veilPreviewRL *authmw.RateLimit
+	veilJoinRL    *authmw.RateLimit
 }
 
 // NewHandler builds a handler. The middleware and rate limiter may be nil; in
@@ -27,6 +35,14 @@ type Handler struct {
 // by tests and the all-in-one binary's local mode.
 func NewHandler(svc *Service, mw *authmw.Middleware, rl *authmw.RateLimit) *Handler {
 	return &Handler{svc: svc, mw: mw, rl: rl}
+}
+
+// SetVeilLinkRateLimits installs quotas that are intentionally independent of
+// ordinary REST traffic. Ownership remains with the caller, which must close
+// the limiters during shutdown.
+func (h *Handler) SetVeilLinkRateLimits(preview, join *authmw.RateLimit) {
+	h.veilPreviewRL = preview
+	h.veilJoinRL = join
 }
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
@@ -37,6 +53,21 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		if h.mw != nil {
 			// Verify first; the limiter keys from verified principal context.
 			f = h.mw.RequireSigned(f)
+		}
+		return f
+	}
+	signedWith := func(f http.HandlerFunc, limiter *authmw.RateLimit) http.HandlerFunc {
+		if limiter != nil {
+			f = limiter.Wrap(f)
+		}
+		if h.mw != nil {
+			f = h.mw.RequireSigned(f)
+		}
+		return f
+	}
+	publicWith := func(f http.HandlerFunc, limiter *authmw.RateLimit) http.HandlerFunc {
+		if limiter != nil {
+			return limiter.Wrap(f)
 		}
 		return f
 	}
@@ -52,6 +83,9 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	// Members
 	mux.HandleFunc("GET /v1/servers/{serverID}/members", signed(h.ListMembers))
 	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}", signed(h.KickMember))
+	mux.HandleFunc("GET /v1/servers/{serverID}/bans", signed(h.ListBans))
+	mux.HandleFunc("PUT /v1/servers/{serverID}/bans/{userID}", signed(h.BanMember))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/bans/{userID}", signed(h.UnbanMember))
 
 	// Channels
 	mux.HandleFunc("GET /v1/servers/{serverID}/channels", signed(h.ListChannels))
@@ -71,12 +105,16 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("PUT /v1/servers/{serverID}/members/{userID}/roles/{roleID}", signed(h.AssignRole))
 	mux.HandleFunc("DELETE /v1/servers/{serverID}/members/{userID}/roles/{roleID}", signed(h.UnassignRole))
 
-	// Invites — preview is intentionally NOT signed (pre-join lookup), but creating/listing/revoking and using are.
-	mux.HandleFunc("POST /v1/servers/{serverID}/invites", signed(h.CreateInvite))
-	mux.HandleFunc("GET /v1/servers/{serverID}/invites", signed(h.ListInvites))
-	mux.HandleFunc("DELETE /v1/invites/{code}", signed(h.RevokeInvite))
-	mux.HandleFunc("GET /v1/invites/{code}", h.PreviewInvite)
-	mux.HandleFunc("POST /v1/invites/{code}/use", signed(h.UseInvite))
+	// Veil Link v1. Public preview sees selector-only metadata; secret-bearing
+	// preview/join and all management operations are request-signed.
+	mux.HandleFunc("POST /v1/servers/{serverID}/veil-links", signed(h.CreateInvite))
+	mux.HandleFunc("GET /v1/servers/{serverID}/veil-links", signed(h.ListInvites))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/veil-links/{inviteID}", signed(h.RevokeInvite))
+	mux.HandleFunc("DELETE /v1/servers/{serverID}/veil-links", signed(h.RevokeAllInvites))
+	mux.HandleFunc("GET /v1/veil-links/{selector}", publicWith(h.PreviewInvite, h.veilPreviewRL))
+	mux.HandleFunc("GET /join/v1/{selector}", publicWith(h.VeilLinkPortal, h.veilPreviewRL))
+	mux.HandleFunc("POST /v1/veil-links/{selector}/preview", signedWith(h.AuthenticatedPreviewInvite, h.veilPreviewRL))
+	mux.HandleFunc("POST /v1/veil-links/{selector}/join", signedWith(h.UseInvite, h.veilJoinRL))
 }
 
 // ─── Helpers ─────────────────────────────────────────
@@ -100,14 +138,14 @@ func requireUser(w http.ResponseWriter, r *http.Request) string {
 // ─── Servers ─────────────────────────────────────────
 
 type createServerReq struct {
-	Name string `json:"name"`
+	Name    string  `json:"name"`
+	IconURL *string `json:"icon_url,omitempty"`
 }
 
 type serverJSON struct {
 	ID          string  `json:"id"`
 	Name        string  `json:"name"`
 	Description *string `json:"description,omitempty"`
-	IconURL     *string `json:"icon_url,omitempty"`
 	OwnerID     string  `json:"owner_id"`
 	CreatedAt   string  `json:"created_at"`
 }
@@ -120,6 +158,10 @@ func (h *Handler) CreateServer(w http.ResponseWriter, r *http.Request) {
 	var req createServerReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errResp("invalid JSON"))
+		return
+	}
+	if req.IconURL != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("remote Space icons are not supported"))
 		return
 	}
 	srv, err := h.svc.CreateServer(r.Context(), req.Name, uid)
@@ -174,6 +216,10 @@ func (h *Handler) UpdateServer(w http.ResponseWriter, r *http.Request) {
 	var req updateServerReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errResp("invalid JSON"))
+		return
+	}
+	if req.IconURL != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("remote Space icons are not supported"))
 		return
 	}
 	if err := h.svc.UpdateServer(r.Context(), r.PathValue("serverID"), uid, req.Name, req.Description, req.IconURL); err != nil {
@@ -277,6 +323,68 @@ func (h *Handler) KickMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "kicked"})
+}
+
+func (h *Handler) BanMember(w http.ResponseWriter, r *http.Request) {
+	uid := requireUser(w, r)
+	if uid == "" {
+		return
+	}
+	var req kickReq
+	if err := decodeRequestJSON(r, &req, true); err != nil {
+		writeJSON(w, http.StatusBadRequest, errResp("invalid JSON"))
+		return
+	}
+	if err := h.svc.BanMember(r.Context(), r.PathValue("serverID"), uid, r.PathValue("userID"), req.Reason); err != nil {
+		if errors.Is(err, ErrInvalidKickReason) {
+			publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+				http.StatusBadRequest, "invalid_ban_reason", "invalid ban reason", err,
+			))
+			return
+		}
+		publicerr.Write(w, http.StatusForbidden, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "banned"})
+}
+
+func (h *Handler) ListBans(w http.ResponseWriter, r *http.Request) {
+	uid := requireUser(w, r)
+	if uid == "" {
+		return
+	}
+	bans, err := h.svc.ListBans(r.Context(), r.PathValue("serverID"), uid)
+	if err != nil {
+		publicerr.Write(w, http.StatusForbidden, err)
+		return
+	}
+	type banJSON struct {
+		UserID    string  `json:"user_id"`
+		Username  string  `json:"username"`
+		BannedBy  string  `json:"banned_by"`
+		Reason    *string `json:"reason,omitempty"`
+		CreatedAt string  `json:"created_at"`
+	}
+	out := make([]banJSON, len(bans))
+	for i, ban := range bans {
+		out[i] = banJSON{
+			UserID: ban.UserID, Username: ban.Username, BannedBy: ban.BannedBy,
+			Reason: ban.Reason, CreatedAt: ban.CreatedAt.Format(time.RFC3339),
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"bans": out})
+}
+
+func (h *Handler) UnbanMember(w http.ResponseWriter, r *http.Request) {
+	uid := requireUser(w, r)
+	if uid == "" {
+		return
+	}
+	if err := h.svc.UnbanMember(r.Context(), r.PathValue("serverID"), uid, r.PathValue("userID")); err != nil {
+		publicerr.Write(w, http.StatusForbidden, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "unbanned"})
 }
 
 // ─── Channels ────────────────────────────────────────
@@ -644,13 +752,48 @@ type createInviteReq struct {
 }
 
 type inviteJSON struct {
-	Code      string  `json:"code"`
-	ServerID  string  `json:"server_id"`
-	CreatedBy string  `json:"created_by"`
-	MaxUses   int32   `json:"max_uses"`
-	Uses      int32   `json:"uses"`
-	ExpiresAt *string `json:"expires_at,omitempty"`
-	CreatedAt string  `json:"created_at"`
+	ID             string  `json:"id"`
+	PublicSelector string  `json:"public_selector"`
+	Version        int16   `json:"version"`
+	LinkType       string  `json:"type"`
+	ServerID       string  `json:"space_id"`
+	MaxUses        int32   `json:"max_uses"`
+	Uses           int32   `json:"uses"`
+	ExpiresAt      string  `json:"expires_at"`
+	RevokedAt      *string `json:"revoked_at,omitempty"`
+	CreatedAt      string  `json:"created_at"`
+	Secret         string  `json:"secret,omitempty"`
+	ShareURL       string  `json:"share_url,omitempty"`
+}
+
+func inviteDTO(inv db.Invite) inviteJSON {
+	out := inviteJSON{
+		ID: inv.ID, PublicSelector: inv.PublicSelector, Version: inv.Version,
+		LinkType: inv.LinkType, ServerID: inv.ServerID, MaxUses: inv.MaxUses,
+		Uses: inv.Uses, ExpiresAt: inv.ExpiresAt.Format(time.RFC3339),
+		CreatedAt: inv.CreatedAt.Format(time.RFC3339),
+	}
+	if inv.RevokedAt != nil {
+		revokedAt := inv.RevokedAt.Format(time.RFC3339)
+		out.RevokedAt = &revokedAt
+	}
+	return out
+}
+
+func veilLinkShareURL(r *http.Request, selector, secret string) string {
+	u := url.URL{Scheme: requestScheme(r), Host: r.Host, Path: "/join/v1/" + selector}
+	return u.String() + "#s=" + secret
+}
+
+func requestScheme(r *http.Request) string {
+	if r.TLS != nil {
+		return "https"
+	}
+	return "http"
+}
+
+func requestOrigin(r *http.Request) string {
+	return (&url.URL{Scheme: requestScheme(r), Host: r.Host}).String()
 }
 
 func (h *Handler) CreateInvite(w http.ResponseWriter, r *http.Request) {
@@ -680,14 +823,11 @@ func (h *Handler) CreateInvite(w http.ResponseWriter, r *http.Request) {
 		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
-	out := inviteJSON{
-		Code: inv.Code, ServerID: inv.ServerID, CreatedBy: inv.CreatedBy,
-		MaxUses: inv.MaxUses, Uses: inv.Uses, CreatedAt: inv.CreatedAt.Format(time.RFC3339),
-	}
-	if inv.ExpiresAt != nil {
-		s := inv.ExpiresAt.Format(time.RFC3339)
-		out.ExpiresAt = &s
-	}
+	out := inviteDTO(inv.Invite)
+	out.Secret = inv.Secret
+	out.ShareURL = veilLinkShareURL(r, inv.PublicSelector, inv.Secret)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
 	writeJSON(w, http.StatusCreated, out)
 }
 
@@ -721,15 +861,7 @@ func (h *Handler) ListInvites(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]inviteJSON, len(invs))
 	for i, inv := range invs {
-		ij := inviteJSON{
-			Code: inv.Code, ServerID: inv.ServerID, CreatedBy: inv.CreatedBy,
-			MaxUses: inv.MaxUses, Uses: inv.Uses, CreatedAt: inv.CreatedAt.Format(time.RFC3339),
-		}
-		if inv.ExpiresAt != nil {
-			s := inv.ExpiresAt.Format(time.RFC3339)
-			ij.ExpiresAt = &s
-		}
-		out[i] = ij
+		out[i] = inviteDTO(inv)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"invites": out})
 }
@@ -739,27 +871,149 @@ func (h *Handler) RevokeInvite(w http.ResponseWriter, r *http.Request) {
 	if uid == "" {
 		return
 	}
-	if err := h.svc.RevokeInvite(r.Context(), r.PathValue("code"), uid); err != nil {
+	if err := h.svc.RevokeInvite(r.Context(), r.PathValue("serverID"), r.PathValue("inviteID"), uid); err != nil {
 		publicerr.Write(w, http.StatusForbidden, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
 }
 
-func (h *Handler) PreviewInvite(w http.ResponseWriter, r *http.Request) {
-	srv, inv, err := h.svc.PreviewInvite(r.Context(), r.PathValue("code"))
-	if err != nil {
-		publicerr.Write(w, http.StatusNotFound, err)
+func (h *Handler) RevokeAllInvites(w http.ResponseWriter, r *http.Request) {
+	uid := requireUser(w, r)
+	if uid == "" {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"server": serverDTO(srv),
-		"invite": map[string]any{
-			"code":     inv.Code,
-			"uses":     inv.Uses,
-			"max_uses": inv.MaxUses,
+	if err := h.svc.RevokeAllInvites(r.Context(), r.PathValue("serverID"), uid); err != nil {
+		publicerr.Write(w, http.StatusForbidden, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "revoked"})
+}
+
+func setVeilLinkPrivacyHeaders(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+}
+
+func validVeilLinkToken(token string) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(token)
+	return err == nil && len(raw) == 32 && base64.RawURLEncoding.EncodeToString(raw) == token
+}
+
+func publicSpaceMarkSeed(canonicalOrigin, spaceID string) string {
+	material := []byte("veil-space-mark-v1\x00" + canonicalOrigin + "\x00" + spaceID)
+	hash := sha256.Sum256(material)
+	return base64.RawURLEncoding.EncodeToString(hash[:])
+}
+
+func publicVeilLinkPreview(canonicalOrigin string, srv *db.Server, inv *db.Invite) map[string]any {
+	description := ""
+	if srv.Description != nil {
+		description = *srv.Description
+	}
+	return map[string]any{
+		"version": 1,
+		"type":    "space",
+		"space": map[string]any{
+			"name":        srv.Name,
+			"description": description,
+			"mark_seed":   publicSpaceMarkSeed(canonicalOrigin, srv.ID),
 		},
-	})
+		"expires_at":  inv.ExpiresAt.Format(time.RFC3339),
+		"join_policy": "immediate_after_native_confirmation",
+	}
+}
+
+func (h *Handler) PreviewInvite(w http.ResponseWriter, r *http.Request) {
+	setVeilLinkPrivacyHeaders(w)
+	selector := r.PathValue("selector")
+	if !validVeilLinkToken(selector) {
+		publicerr.Write(w, http.StatusNotFound, errors.New("Veil Link unavailable"))
+		return
+	}
+	srv, inv, err := h.svc.PreviewInvite(r.Context(), selector)
+	if err != nil {
+		publicerr.Write(w, http.StatusNotFound, errors.New("Veil Link unavailable"))
+		return
+	}
+	writeJSON(w, http.StatusOK, publicVeilLinkPreview(requestOrigin(r), srv, inv))
+}
+
+var veilLinkPortalTemplate = template.Must(template.New("veil-link-portal").Parse(`<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow"><title>Veil Link</title>
+<style>
+:root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,sans-serif;background:#090d18;color:#eef3ff}*{box-sizing:border-box}body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;background:radial-gradient(circle at 50% 20%,#172641 0,#090d18 48%)}main{width:min(560px,100%);border:1px solid #263652;border-radius:24px;background:#101827;padding:32px;box-shadow:0 28px 80px #0009}.brand{letter-spacing:.2em;font-size:12px;color:#91a4c8}.mark{width:78px;height:78px;margin:30px auto 20px;border-radius:25px;display:grid;place-items:center;background:#182842;border:1px solid #34527a;color:#7dd3fc;font:700 12px ui-monospace;word-break:break-all;padding:12px}h1{text-align:center;margin:0;font-size:28px}.origin{text-align:center;color:#8fa2c4;font:12px ui-monospace;margin:8px 0 24px}.description{color:#bdc9dc;line-height:1.6;text-align:center;white-space:pre-wrap}.facts{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:24px 0}.fact{padding:12px;border-radius:12px;background:#0b1322;border:1px solid #1e2d46}.fact b{display:block;font-size:10px;letter-spacing:.09em;color:#7185aa;text-transform:uppercase;margin-bottom:5px}.fact span{font-size:12px}a{display:flex;justify-content:center;align-items:center;min-height:48px;border-radius:14px;background:#5d8df5;color:#07101f;text-decoration:none;font-weight:750}a[aria-disabled=true]{pointer-events:none;opacity:.45}.note{font-size:11px;line-height:1.55;color:#7185aa;text-align:center;margin:16px 0 0}:focus-visible{outline:3px solid #7dd3fc;outline-offset:3px}@media(prefers-reduced-motion:no-preference){main{animation:enter .22s ease-out}@keyframes enter{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}}
+</style></head><body><main><div class="brand">VEIL LINK · SPACE</div><div class="mark" aria-hidden="true">{{.Mark}}</div><h1>{{.Name}}</h1><div class="origin">{{.Origin}}</div><p class="description">{{.Description}}</p><div class="facts"><div class="fact"><b>Expires</b><span>{{.Expires}}</span></div><div class="fact"><b>Join policy</b><span>Explicit confirmation</span></div></div><a id="open" aria-disabled="true">Open in Veil</a><p id="status" class="note" role="status">This invitation opens only in the native Veil app. It is not identity verification.</p></main><script nonce="{{.Nonce}}">(()=>{const a=document.getElementById('open'),s=document.getElementById('status'),p=location.pathname.split('/'),x=p[p.length-1],q=new URLSearchParams(location.hash.slice(1)).get('s');if(!/^[A-Za-z0-9_-]{43}$/.test(x)||!/^[A-Za-z0-9_-]{43}$/.test(q||'')){s.textContent='This Veil Link is incomplete or unavailable.';return}a.href='veil://join/v1/'+x+'?origin='+encodeURIComponent(location.origin)+'#s='+q;a.removeAttribute('aria-disabled')})()</script></body></html>`))
+
+func (h *Handler) VeilLinkPortal(w http.ResponseWriter, r *http.Request) {
+	setVeilLinkPrivacyHeaders(w)
+	w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+	selector := r.PathValue("selector")
+	if !validVeilLinkToken(selector) {
+		h.writeUnavailableVeilLinkPortal(w, http.StatusNotFound)
+		return
+	}
+	srv, inv, err := h.svc.PreviewInvite(r.Context(), selector)
+	if err != nil {
+		h.writeUnavailableVeilLinkPortal(w, http.StatusNotFound)
+		return
+	}
+	nonceBytes := make([]byte, 18)
+	if _, err := io.ReadFull(rand.Reader, nonceBytes); err != nil {
+		h.writeUnavailableVeilLinkPortal(w, http.StatusInternalServerError)
+		return
+	}
+	nonce := base64.RawStdEncoding.EncodeToString(nonceBytes)
+	description := "A private Space on Veil"
+	if srv.Description != nil && *srv.Description != "" {
+		description = *srv.Description
+	}
+	var output bytes.Buffer
+	if err := veilLinkPortalTemplate.Execute(&output, map[string]string{
+		"Mark": publicSpaceMarkSeed(requestOrigin(r), srv.ID)[:12], "Name": srv.Name,
+		"Origin": requestOrigin(r), "Description": description,
+		"Expires": inv.ExpiresAt.Format(time.RFC3339), "Nonce": nonce,
+	}); err != nil {
+		h.writeUnavailableVeilLinkPortal(w, http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-"+nonce+"'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'none'; img-src 'none'")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(output.Bytes())
+}
+
+func (h *Handler) writeUnavailableVeilLinkPortal(w http.ResponseWriter, status int) {
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; frame-ancestors 'none'")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = io.WriteString(w, `<!doctype html><meta charset="utf-8"><meta name="robots" content="noindex,nofollow"><title>Veil Link unavailable</title><style>body{color-scheme:dark;background:#090d18;color:#d7e2f5;font:16px system-ui;min-height:100vh;display:grid;place-items:center;margin:0}main{text-align:center}</style><main><h1>Veil Link unavailable</h1><p>Ask the sender for a new invitation.</p></main>`)
+}
+
+type veilLinkSecretReq struct {
+	Secret string `json:"secret"`
+}
+
+func (h *Handler) AuthenticatedPreviewInvite(w http.ResponseWriter, r *http.Request) {
+	if requireUser(w, r) == "" {
+		return
+	}
+	var req veilLinkSecretReq
+	selector := r.PathValue("selector")
+	if err := decodeRequestJSON(r, &req, false); err != nil ||
+		!validVeilLinkToken(selector) || !validVeilLinkToken(req.Secret) {
+		publicerr.Write(w, http.StatusBadRequest, errors.New("Veil Link unavailable"))
+		return
+	}
+	setVeilLinkPrivacyHeaders(w)
+	srv, inv, err := h.svc.AuthenticatedPreviewInvite(r.Context(), selector, req.Secret)
+	if err != nil {
+		publicerr.Write(w, http.StatusNotFound, errors.New("Veil Link unavailable"))
+		return
+	}
+	writeJSON(w, http.StatusOK, publicVeilLinkPreview(requestOrigin(r), srv, inv))
 }
 
 func (h *Handler) UseInvite(w http.ResponseWriter, r *http.Request) {
@@ -767,9 +1021,17 @@ func (h *Handler) UseInvite(w http.ResponseWriter, r *http.Request) {
 	if uid == "" {
 		return
 	}
-	srv, err := h.svc.UseInvite(r.Context(), r.PathValue("code"), uid)
+	var req veilLinkSecretReq
+	selector := r.PathValue("selector")
+	if err := decodeRequestJSON(r, &req, false); err != nil ||
+		!validVeilLinkToken(selector) || !validVeilLinkToken(req.Secret) {
+		publicerr.Write(w, http.StatusBadRequest, errors.New("Veil Link unavailable"))
+		return
+	}
+	setVeilLinkPrivacyHeaders(w)
+	srv, err := h.svc.UseInvite(r.Context(), selector, req.Secret, uid)
 	if err != nil {
-		publicerr.Write(w, http.StatusBadRequest, err)
+		publicerr.Write(w, http.StatusBadRequest, errors.New("Veil Link unavailable"))
 		return
 	}
 	writeJSON(w, http.StatusOK, serverDTO(srv))
@@ -782,7 +1044,7 @@ func serverDTO(s *db.Server) serverJSON {
 	}
 	return serverJSON{
 		ID: s.ID, Name: s.Name, OwnerID: s.OwnerID,
-		Description: s.Description, IconURL: s.IconURL,
-		CreatedAt: s.CreatedAt.Format(time.RFC3339),
+		Description: s.Description,
+		CreatedAt:   s.CreatedAt.Format(time.RFC3339),
 	}
 }

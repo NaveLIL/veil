@@ -8,6 +8,7 @@ package integration
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 )
 
@@ -28,27 +29,38 @@ func mkServer(t *testing.T, h *Harness, owner *User, name string) string {
 // helper: owner mints an invite, returns code.
 func mkInviteCode(t *testing.T, h *Harness, owner *User, srvID string) string {
 	t.Helper()
-	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers/"+srvID+"/invites", map[string]any{
-		"max_uses":        0,
-		"expires_in_secs": 0,
+	status, _, body := h.Do(owner, http.MethodPost, "/v1/servers/"+srvID+"/veil-links", map[string]any{
+		"max_uses":        100,
+		"expires_in_secs": 24 * 60 * 60,
 	})
 	if status != http.StatusCreated {
 		t.Fatalf("create invite: status=%d body=%v", status, body)
 	}
-	code, _ := body["code"].(string)
-	if code == "" {
-		t.Fatalf("create invite: missing code (%v)", body)
+	selector, _ := body["public_selector"].(string)
+	secret, _ := body["secret"].(string)
+	if selector == "" || secret == "" {
+		t.Fatalf("create Veil Link: missing capability (%v)", body)
 	}
-	return code
+	return selector + "." + secret
 }
 
 // helper: user joins the given server via invite code.
 func joinViaInvite(t *testing.T, h *Harness, joiner *User, code string) {
 	t.Helper()
-	status, _, body := h.Do(joiner, http.MethodPost, "/v1/invites/"+code+"/use", nil)
+	selector, secret := splitInviteCode(t, code)
+	status, _, body := h.Do(joiner, http.MethodPost, "/v1/veil-links/"+selector+"/join", map[string]string{"secret": secret})
 	if status != http.StatusOK {
 		t.Fatalf("use invite: status=%d body=%v", status, body)
 	}
+}
+
+func splitInviteCode(t *testing.T, code string) (string, string) {
+	t.Helper()
+	parts := strings.Split(code, ".")
+	if len(parts) != 2 || len(parts[0]) != 43 || len(parts[1]) != 43 {
+		t.Fatalf("invalid test Veil Link capability")
+	}
+	return parts[0], parts[1]
 }
 
 func TestRoles_OwnerCreatesAndLists(t *testing.T) {

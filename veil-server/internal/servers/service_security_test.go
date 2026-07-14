@@ -24,7 +24,7 @@ func TestRoleManagerCannotGrantPermissionsOutsideOwnSet(t *testing.T) {
 	}
 }
 
-func TestServerMetadataBoundsAndSafeIconURL(t *testing.T) {
+func TestServerMetadataBoundsAndRemoteIconHardCut(t *testing.T) {
 	empty := "   "
 	if err := validateServerName(empty); err == nil {
 		t.Fatal("blank server name accepted")
@@ -35,21 +35,13 @@ func TestServerMetadataBoundsAndSafeIconURL(t *testing.T) {
 	}
 	validName := "Veil team"
 	validDescription := strings.Repeat("d", 2000)
-	validIcon := "https://cdn.example/icon.png?version=2"
-	if err := validateServerMetadata(&validName, &validDescription, &validIcon); err != nil {
+	if err := validateServerMetadata(&validName, &validDescription, nil); err != nil {
 		t.Fatalf("valid metadata rejected: %v", err)
 	}
-	for _, raw := range []string{
-		"http://cdn.example/icon.png",
-		"javascript:alert(1)",
-		"data:image/svg+xml,evil",
-		"https://user:password@cdn.example/icon.png",
-		"https://cdn.example/icon.png#fragment",
-		"/relative/icon.png",
-	} {
+	for _, raw := range []string{"", "https://cdn.example/icon.png", "data:image/svg+xml,evil"} {
 		t.Run(raw, func(t *testing.T) {
 			if err := validateServerMetadata(nil, nil, &raw); err == nil {
-				t.Fatalf("unsafe icon URL accepted: %q", raw)
+				t.Fatalf("remote icon field accepted: %q", raw)
 			}
 		})
 	}
@@ -85,12 +77,12 @@ func TestInviteInputBounds(t *testing.T) {
 		expiry  int64
 		valid   bool
 	}{
-		{0, 0, true},
+		{minInviteUses, minInviteExpirySecs, true},
 		{maxInviteUses, maxInviteExpirySecs, true},
-		{-1, 0, false},
-		{maxInviteUses + 1, 0, false},
-		{0, -1, false},
-		{0, maxInviteExpirySecs + 1, false},
+		{0, minInviteExpirySecs, false},
+		{maxInviteUses + 1, minInviteExpirySecs, false},
+		{minInviteUses, minInviteExpirySecs - 1, false},
+		{minInviteUses, maxInviteExpirySecs + 1, false},
 	} {
 		err := validateInviteInput(test.maxUses, test.expiry)
 		if (err == nil) != test.valid {

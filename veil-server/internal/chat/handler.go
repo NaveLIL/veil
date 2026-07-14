@@ -674,7 +674,11 @@ func decodePageCursor(raw, expectedKind, expectedScope string) (pageCursor, erro
 // --- Group Handlers ---
 
 type CreateGroupRequest struct {
-	Name string `json:"name"`
+	Name    string `json:"name"`
+	Members []struct {
+		UserID      string `json:"user_id"`
+		IdentityKey string `json:"identity_key"`
+	} `json:"members"`
 }
 
 func (h *Handler) CreateGroup(w http.ResponseWriter, r *http.Request) {
@@ -685,12 +689,27 @@ func (h *Handler) CreateGroup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req CreateGroupRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, errorResp("invalid JSON"))
 		return
 	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, errorResp("invalid JSON"))
+		return
+	}
+	members := make([]db.GroupMemberLocator, 0, len(req.Members))
+	for _, member := range req.Members {
+		identityKey, err := hex.DecodeString(member.IdentityKey)
+		if err != nil || len(identityKey) != ed25519.PublicKeySize {
+			writeJSON(w, http.StatusBadRequest, errorResp("invalid initial Circle member locator"))
+			return
+		}
+		members = append(members, db.GroupMemberLocator{UserID: member.UserID, IdentityKey: identityKey})
+	}
 
-	convID, err := h.svc.CreateGroup(r.Context(), req.Name, userID)
+	convID, err := h.svc.CreateCircle(r.Context(), req.Name, userID, members)
 	if err != nil {
 		log.Printf("create group error: class=%s", logsafe.ErrorClass(err))
 		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
