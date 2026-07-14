@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	_ "embed"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -107,6 +108,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 
 	// Veil Link v1. Public preview sees selector-only metadata; secret-bearing
 	// preview/join and all management operations are request-signed.
+	mux.HandleFunc("GET /assets/veil-link-bg-v1-38824a5f41228389.jpg", h.VeilLinkBackground)
 	mux.HandleFunc("POST /v1/servers/{serverID}/veil-links", signed(h.CreateInvite))
 	mux.HandleFunc("GET /v1/servers/{serverID}/veil-links", signed(h.ListInvites))
 	mux.HandleFunc("DELETE /v1/servers/{serverID}/veil-links/{inviteID}", signed(h.RevokeInvite))
@@ -896,6 +898,25 @@ func setVeilLinkPrivacyHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 }
 
+const veilLinkBackgroundPath = "/assets/veil-link-bg-v1-38824a5f41228389.jpg"
+
+//go:embed assets/veil-link-bg-v1-38824a5f41228389.jpg
+var veilLinkBackground []byte
+
+// VeilLinkBackground serves one audited, content-hashed visual asset. It is
+// deliberately outside the invitation preview limiter: a browser subresource
+// must never consume the selector's privacy quota. No runtime path or remote
+// image URL can reach this handler.
+func (h *Handler) VeilLinkBackground(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Content-Type", "image/jpeg")
+	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+	w.Header().Set("ETag", `"38824a5f41228389"`)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(veilLinkBackground)
+}
+
 func validVeilLinkToken(token string) bool {
 	raw, err := base64.RawURLEncoding.DecodeString(token)
 	return err == nil && len(raw) == 32 && base64.RawURLEncoding.EncodeToString(raw) == token
@@ -940,12 +961,12 @@ func (h *Handler) PreviewInvite(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, publicVeilLinkPreview(requestOrigin(r), srv, inv))
 }
 
-var veilLinkPortalTemplate = template.Must(template.New("veil-link-portal").Parse(`<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#090d18"><title>Veil Link · {{.Name}}</title>
-<style>
-:root{color-scheme:dark;font-family:Inter,ui-sans-serif,system-ui,-apple-system,sans-serif;background:#070b14;color:#f2f6ff}*{box-sizing:border-box}body{margin:0;min-height:100vh;overflow-x:hidden;background:#070b14}body:before,body:after{content:"";position:fixed;inset:auto;border-radius:50%;filter:blur(1px);pointer-events:none}body:before{width:52vw;height:52vw;left:-18vw;top:-22vw;background:radial-gradient(circle,#235f8f55 0,#235f8f00 68%)}body:after{width:45vw;height:45vw;right:-14vw;bottom:-22vw;background:radial-gradient(circle,#6a55d455 0,#6a55d400 68%)}.shell{position:relative;min-height:100vh;display:grid;grid-template-rows:auto 1fr auto;padding:30px clamp(22px,5vw,72px)}.top{display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:11px;font-size:12px;font-weight:750;letter-spacing:.22em}.brandmark{width:32px;height:32px;border-radius:10px;display:grid;place-items:center;background:linear-gradient(145deg,#60baff,#7559f5);box-shadow:0 8px 28px #3f8cff48}.brandmark i{width:13px;height:17px;border-left:3px solid #fff;border-right:3px solid #fff;transform:skewY(-16deg);opacity:.92}.native{color:#8290ad;font-size:11px}.stage{display:grid;place-items:center;padding:48px 0}.ticket{position:relative;width:min(930px,100%);display:grid;grid-template-columns:minmax(0,1.2fr) minmax(310px,.8fr);overflow:hidden;border:1px solid #2a3b5d;border-radius:28px;background:linear-gradient(135deg,#121d31f5,#0e1525f8);box-shadow:0 42px 120px #000b,0 0 80px #3778bc14}.ticket:before,.ticket:after{content:"";position:absolute;left:calc(60% - 15px);z-index:2;width:30px;height:30px;border-radius:50%;background:#070b14;border:1px solid #2a3b5d}.ticket:before{top:-16px}.ticket:after{bottom:-16px}.hero{min-height:500px;padding:58px;display:flex;flex-direction:column;justify-content:center;background:radial-gradient(circle at 25% 20%,#24477088 0,#16243b33 42%,transparent 70%)}.eyebrow{color:#7abdf0;font-size:11px;font-weight:750;letter-spacing:.22em;text-transform:uppercase}.mark{width:86px;height:86px;margin:27px 0 25px;border-radius:27px;display:grid;place-items:center;background:linear-gradient(145deg,#193a5b,#20284c);border:1px solid #3e6387;box-shadow:inset 0 1px #ffffff13,0 18px 45px #0006}.glyph{display:grid;grid-template-columns:repeat(3,8px);gap:5px;transform:rotate(-8deg)}.glyph i{width:8px;height:8px;border-radius:3px;background:#7bd4f5;box-shadow:0 0 12px #63c7ef66}.glyph i:nth-child(2),.glyph i:nth-child(4),.glyph i:nth-child(8){background:#a98af8}.glyph i:nth-child(3),.glyph i:nth-child(7){opacity:.28}h1{margin:0;max-width:560px;font-size:clamp(34px,5vw,58px);line-height:1.02;letter-spacing:-.045em}.description{max-width:520px;margin:20px 0 0;color:#b8c5dc;font-size:15px;line-height:1.7;white-space:pre-wrap}.side{position:relative;padding:48px 42px;border-left:1px dashed #314360;display:flex;flex-direction:column;justify-content:center}.label{color:#6f819f;font-size:10px;font-weight:750;letter-spacing:.15em;text-transform:uppercase}.origin{margin:8px 0 25px;color:#d4def0;font:11px/1.5 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere}.facts{display:grid;gap:10px;margin:0 0 28px}.fact{padding:13px 14px;border-radius:13px;background:#09122199;border:1px solid #223451}.fact b{display:block;margin-bottom:5px;color:#6f819f;font-size:9px;letter-spacing:.14em;text-transform:uppercase}.fact span{font-size:12px;color:#d6e0f1}.fingerprint{color:#6f819f;font:9px ui-monospace;letter-spacing:.08em;margin-top:10px}a{display:flex;justify-content:center;align-items:center;gap:9px;min-height:50px;border-radius:14px;background:linear-gradient(135deg,#67b9f5,#7964f4);color:#07101f;text-decoration:none;font-weight:800;box-shadow:0 14px 34px #4a73d844;transition:transform .18s ease,filter .18s ease}a:after{content:"→";font-size:18px}a:hover{transform:translateY(-2px);filter:brightness(1.07)}a[aria-disabled=true]{pointer-events:none;opacity:.45}.note{font-size:10.5px;line-height:1.55;color:#6f819f;text-align:center;margin:15px 4px 0}.foot{display:flex;justify-content:center;color:#52627c;font-size:10px;letter-spacing:.04em}.foot span{color:#7e8da7}@media(max-width:760px){.shell{padding:22px 16px}.native{display:none}.stage{padding:28px 0}.ticket{grid-template-columns:1fr;border-radius:22px}.ticket:before,.ticket:after{display:none}.hero{min-height:auto;padding:38px 28px 34px}.mark{width:72px;height:72px;border-radius:22px}.side{padding:30px 28px 34px;border-left:0;border-top:1px dashed #314360}h1{font-size:38px}}:focus-visible{outline:3px solid #76c8ff;outline-offset:4px}@media(prefers-reduced-motion:no-preference){.ticket{animation:enter .38s cubic-bezier(.2,.8,.2,1)}@keyframes enter{from{opacity:0;transform:translateY(12px) scale(.99)}to{opacity:1;transform:none}}}
-</style></head><body><div class="shell"><header class="top"><div class="brand"><span class="brandmark" aria-hidden="true"><i></i></span>VEIL</div><div class="native">Native, private, origin-bound</div></header><main class="stage"><article class="ticket"><section class="hero"><div class="eyebrow">A Veil Link for a private Space</div><div class="mark" aria-hidden="true"><span class="glyph"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span></div><h1>{{.Name}}</h1><p class="description">{{.Description}}</p></section><aside class="side"><div class="label">Exact Veil Node</div><div class="origin">{{.Origin}}</div><div class="facts"><div class="fact"><b>Invitation expires</b><span>{{.Expires}}</span></div><div class="fact"><b>Admission</b><span>Review in Veil, then confirm</span></div></div><a id="open" aria-disabled="true">Open in Veil</a><p id="status" class="note" role="status">The native app verifies the exact Node and your active identity before anything changes.</p><div class="fingerprint">LINK REF · {{.Mark}}</div></aside></article></main><footer class="foot">A Veil Link is an invitation, <span>&nbsp;not identity verification.</span></footer></div><script nonce="{{.Nonce}}">(()=>{const a=document.getElementById('open'),s=document.getElementById('status'),p=location.pathname.split('/'),x=p[p.length-1],q=new URLSearchParams(location.hash.slice(1)).get('s');if(!/^[A-Za-z0-9_-]{43}$/.test(x)||!/^[A-Za-z0-9_-]{43}$/.test(q||'')){s.textContent='This Veil Link is incomplete or unavailable.';return}a.href='veil://join/v1/'+x+'?origin='+encodeURIComponent(location.origin)+'#s='+q;a.removeAttribute('aria-disabled')})()</script></body></html>`))
+//go:embed assets/veil-link-portal.html
+var veilLinkPortalHTML string
+
+var veilLinkPortalTemplate = template.Must(
+	template.New("veil-link-portal").Parse(veilLinkPortalHTML),
+)
 
 func (h *Handler) VeilLinkPortal(w http.ResponseWriter, r *http.Request) {
 	setVeilLinkPrivacyHeaders(w)
@@ -970,16 +991,17 @@ func (h *Handler) VeilLinkPortal(w http.ResponseWriter, r *http.Request) {
 	if srv.Description != nil && *srv.Description != "" {
 		description = *srv.Description
 	}
+	markSeed := publicSpaceMarkSeed(requestOrigin(r), srv.ID)
 	var output bytes.Buffer
 	if err := veilLinkPortalTemplate.Execute(&output, map[string]string{
-		"Mark": publicSpaceMarkSeed(requestOrigin(r), srv.ID)[:12], "Name": srv.Name,
+		"MarkSeed": markSeed, "MarkRef": markSeed[:12], "Name": srv.Name,
 		"Origin": requestOrigin(r), "Description": description,
 		"Expires": inv.ExpiresAt.UTC().Format("02 Jan 2006 · 15:04 UTC"), "Nonce": nonce,
 	}); err != nil {
 		h.writeUnavailableVeilLinkPortal(w, http.StatusInternalServerError)
 		return
 	}
-	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-"+nonce+"'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'none'; img-src 'none'")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-"+nonce+"'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'none'; img-src 'self'")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(output.Bytes())

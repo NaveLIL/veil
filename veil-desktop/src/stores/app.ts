@@ -1422,7 +1422,7 @@ export const appStore = {
         text,
         replyToId: replyToId ?? null,
         dropCapability: dropCapability ?? null,
-        ...authenticatedMutationScopeArgs(mutationScope),
+        expectedBinding: authenticatedMutationScopeArgs(mutationScope),
       });
       requireCurrentMutationScope(sessionEpoch, mutationScope);
       if (sequence === null) return false;

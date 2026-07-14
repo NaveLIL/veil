@@ -69,11 +69,13 @@ const [error, setError] = createSignal("");
 let initialized = false;
 let privacyLocked = true;
 let activeBlobUrl: string | null = null;
+const retiredBlobUrls = new Set<string>();
 let wallpaperLoadGeneration = 0;
 let lastPersisted: AppearanceSettings = { ...DEFAULT_APPEARANCE };
 let saveTimer: ReturnType<typeof setTimeout> | undefined;
 let saveGeneration = 0;
 let persistChain: Promise<void> = Promise.resolve();
+let lastRequestedUiScale: number | null = null;
 
 function clampSettings(value: AppearanceSettings): AppearanceSettings {
   const validTheme = THEME_OPTIONS.some((theme) => theme.id === value.themeId)
@@ -105,20 +107,30 @@ function applyToDocument(value: AppearanceSettings) {
   root.dataset.uiScale = String(value.uiScale);
   root.style.setProperty("--veil-wallpaper-dim", String(value.wallpaperDim / 100));
   root.style.setProperty("--veil-wallpaper-blur", `${value.wallpaperBlur}px`);
+  root.style.setProperty(
+    "--veil-wallpaper-filter",
+    value.wallpaperBlur === 0 ? "none" : `blur(${value.wallpaperBlur}px)`,
+  );
   root.style.setProperty("--veil-wallpaper-x", `${value.wallpaperPositionX}%`);
   root.style.setProperty("--veil-wallpaper-y", `${value.wallpaperPositionY}%`);
-  void getCurrentWebview().setZoom(value.uiScale / 100).catch(() => {
-    // Browser-based visual/a11y fixtures do not expose the Tauri webview IPC.
-    // The persisted value remains authoritative and is applied on native load.
-  });
+  if (lastRequestedUiScale !== value.uiScale) {
+    lastRequestedUiScale = value.uiScale;
+    void getCurrentWebview().setZoom(value.uiScale / 100).catch(() => {
+      // Browser-based visual/a11y fixtures do not expose the Tauri webview IPC.
+      // The persisted value remains authoritative and is applied on native load.
+    });
+  }
 }
 
 function revokeWallpaper() {
   wallpaperLoadGeneration += 1;
-  if (activeBlobUrl) URL.revokeObjectURL(activeBlobUrl);
+  const previous = activeBlobUrl;
   activeBlobUrl = null;
   setWallpaperUrl(null);
   setWallpaperSize(null);
+  if (previous) URL.revokeObjectURL(previous);
+  for (const retired of retiredBlobUrls) URL.revokeObjectURL(retired);
+  retiredBlobUrls.clear();
 }
 
 function applyLocalSettings(value: AppearanceSettings) {
@@ -127,16 +139,70 @@ function applyLocalSettings(value: AppearanceSettings) {
   if (privacyLocked && !value.showOnLockScreen) revokeWallpaper();
 }
 
-function payloadToBlobUrl(payload: WallpaperPayload) {
+function payloadBlobUrl(payload: WallpaperPayload) {
   const binary = atob(payload.dataBase64);
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
     bytes[index] = binary.charCodeAt(index);
   }
-  revokeWallpaper();
-  activeBlobUrl = URL.createObjectURL(new Blob([bytes], { type: payload.mimeType }));
-  setWallpaperUrl(activeBlobUrl);
+  return URL.createObjectURL(new Blob([bytes], { type: payload.mimeType }));
+}
+
+async function decodeWallpaper(url: string) {
+  const image = new Image();
+  if (typeof image.decode === "function") {
+    image.src = url;
+    await image.decode();
+    return;
+  }
+  await new Promise<void>((resolve, reject) => {
+    image.onload = () => resolve();
+    image.onerror = () => reject(new Error("wallpaper image failed local decoding"));
+    image.src = url;
+  });
+}
+
+function revokeAfterWallpaperSwap(url: string) {
+  retiredBlobUrls.add(url);
+  const revoke = () => {
+    if (!retiredBlobUrls.delete(url)) return;
+    URL.revokeObjectURL(url);
+  };
+  if (typeof requestAnimationFrame === "function") {
+    requestAnimationFrame(revoke);
+  } else {
+    setTimeout(revoke, 0);
+  }
+}
+
+async function decodeAndPublishWallpaper(
+  payload: WallpaperPayload,
+  generation: number,
+  expectedAssetId: string,
+) {
+  const candidate = payloadBlobUrl(payload);
+  try {
+    await decodeWallpaper(candidate);
+  } catch {
+    URL.revokeObjectURL(candidate);
+    throw new Error("wallpaper image failed local decoding");
+  }
+  const current = settings();
+  if (
+    generation !== wallpaperLoadGeneration
+    || current.wallpaperAssetId !== expectedAssetId
+    || payload.assetId !== expectedAssetId
+    || (privacyLocked && !current.showOnLockScreen)
+  ) {
+    URL.revokeObjectURL(candidate);
+    return false;
+  }
+  const previous = activeBlobUrl;
+  activeBlobUrl = candidate;
+  setWallpaperUrl(candidate);
   setWallpaperSize({ width: payload.width, height: payload.height });
+  if (previous && previous !== candidate) revokeAfterWallpaperSwap(previous);
+  return true;
 }
 
 async function loadWallpaper() {
@@ -157,7 +223,7 @@ async function loadWallpaper() {
     ) {
       return;
     }
-    payloadToBlobUrl(payload);
+    await decodeAndPublishWallpaper(payload, generation, assetId);
     setError("");
   } catch (reason) {
     if (generation !== wallpaperLoadGeneration) return;
@@ -257,7 +323,12 @@ async function chooseWallpaper() {
     saveGeneration += 1;
     applyLocalSettings(validated);
     if (!privacyLocked || validated.showOnLockScreen) {
-      payloadToBlobUrl(selection.wallpaper);
+      const generation = ++wallpaperLoadGeneration;
+      await decodeAndPublishWallpaper(
+        selection.wallpaper,
+        generation,
+        selection.wallpaper.assetId,
+      );
     } else {
       revokeWallpaper();
     }

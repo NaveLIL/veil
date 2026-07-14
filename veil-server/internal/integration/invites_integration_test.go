@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -73,6 +74,14 @@ func TestVeilLinks_CreateListPreviewAndJoin(t *testing.T) {
 	if strings.Contains(string(raw), spaceID) || strings.Contains(string(raw), owner.ID) || strings.Contains(string(raw), secret) {
 		t.Fatalf("public preview disclosed private identifiers: %s", raw)
 	}
+	var publicPreview struct {
+		Space struct {
+			MarkSeed string `json:"mark_seed"`
+		} `json:"space"`
+	}
+	if err := json.Unmarshal(raw, &publicPreview); err != nil || len(publicPreview.Space.MarkSeed) != 43 {
+		t.Fatalf("public preview mark seed contract failed: err=%v body=%s", err, raw)
+	}
 
 	portal, err := http.Get(h.Server.URL + "/join/v1/" + selector)
 	if err != nil {
@@ -80,11 +89,16 @@ func TestVeilLinks_CreateListPreviewAndJoin(t *testing.T) {
 	}
 	defer portal.Body.Close()
 	portalBody, _ := io.ReadAll(portal.Body)
+	portalCSP := portal.Header.Get("Content-Security-Policy")
+	exactPortalCSP := regexp.MustCompile(`^default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-[A-Za-z0-9+/]{24}'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'; connect-src 'none'; img-src 'self'$`)
 	if portal.StatusCode != http.StatusOK ||
-		!strings.Contains(portal.Header.Get("Content-Security-Policy"), "default-src 'none'") ||
+		!exactPortalCSP.MatchString(portalCSP) ||
 		portal.Header.Get("Referrer-Policy") != "no-referrer" ||
 		!strings.Contains(string(portalBody), "A Veil Link for a private Space") ||
 		!strings.Contains(string(portalBody), "Review in Veil, then confirm") ||
+		!strings.Contains(string(portalBody), "/assets/veil-link-bg-v1-38824a5f41228389.jpg") ||
+		!strings.Contains(string(portalBody), "M4 4H8V11.8L4 13ZM4 16L8 14.8V20H4ZM10 2H14V10.5L10 11.7ZM10 14.7L14 13.5V22H10ZM16 5H20V8.2L16 9.4ZM16 12.4L20 11.2V19H16Z") ||
+		!strings.Contains(string(portalBody), `data-seed="`+publicPreview.Space.MarkSeed+`"`) ||
 		strings.Contains(string(portalBody), secret) || strings.Contains(string(portalBody), owner.ID) {
 		t.Fatalf("unsafe Veil Link portal status=%d headers=%v body=%s", portal.StatusCode, portal.Header, portalBody)
 	}

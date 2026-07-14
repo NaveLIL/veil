@@ -75,6 +75,7 @@
   --veil-z-toast: 80;
   --veil-wallpaper-dim: 0.52;
   --veil-wallpaper-blur: 0px;
+  --veil-wallpaper-filter: none;
   --veil-wallpaper-x: 50%;
   --veil-wallpaper-y: 50%;
 }
@@ -387,7 +388,7 @@ select:focus-visible,
   background-position: var(--veil-wallpaper-x) var(--veil-wallpaper-y);
   background-repeat: no-repeat;
   background-size: cover;
-  filter: blur(var(--veil-wallpaper-blur));
+  filter: var(--veil-wallpaper-filter);
   transform: scale(1.045);
 }
 

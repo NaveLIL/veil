@@ -127,12 +127,19 @@ membership or keys; a later explicit link join is required.
 
 The portal is same-origin, script-minimal and contains no third-party resources.
 It renders only the public DTO as escaped text and a deterministic Space mark.
+The reviewed visual amendment permits one repository-owned, content-hashed JPEG
+embedded in the gateway binary and served from the fixed
+`/assets/veil-link-bg-v1-38824a5f41228389.jpg` path. The asset request never
+contains a selector or secret, is not charged to the preview limiter, and is
+protected by `Cross-Origin-Resource-Policy: same-origin` and immutable caching.
+This does not authorize remote, user-provided, profile-derived or runtime
+filesystem image URLs.
 It sets:
 
 ```text
 Cache-Control: no-store
 Referrer-Policy: no-referrer
-Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-<per-response>'; img-src 'none'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-<per-response>'; img-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'
 X-Content-Type-Options: nosniff
 ```
 
@@ -166,6 +173,9 @@ the user to open the original link in Veil, but cannot join in the browser.
   transactionally tested;
 - ban/rejoin/unban proves rejected joins have no roster/use side effects;
 - generic public errors and mandatory privacy headers are integration-tested;
+- the sole embedded background has a pinned digest, a fixed same-origin route,
+  no selector-bearing URL, strict MIME/CORP headers and no preview-rate-limit
+  side effect;
 - native parser rejects origin confusion, redirects, malformed base64url,
   query/userinfo/path variants and stale binding/account transitions;
 - logs and browser requests contain no raw secret.

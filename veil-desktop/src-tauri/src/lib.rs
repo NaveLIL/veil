@@ -6218,6 +6218,13 @@ struct UploadTokenResponse {
     base_path: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedLiveActionBindingRequest {
+    expected_server_origin: String,
+    expected_binding_generation: String,
+}
+
 struct PreparedLocalAttachment {
     source_path: PathBuf,
     file_name: String,
@@ -6317,25 +6324,41 @@ async fn prepare_local_attachments(
     Ok(prepared)
 }
 
+/// Run a blocking native operation away from Tauri's async executor.
+///
+/// `AppState::runtime` deliberately owns the client transport runtime. Calling
+/// `Runtime::block_on` directly from an async Tauri command panics because that
+/// command is already executing on Tokio. Keep the bridge explicit so the
+/// client mutex is never held across such a nested-runtime panic.
+async fn run_blocking_native_task<T, F>(context: &'static str, task: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, String> + Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(task)
+        .await
+        .map_err(|_| format!("{context} task failed; restart Veil before retrying"))?
+}
+
 /// Native-only attachment picker and bounded streaming uploader. Renderer code
 /// never supplies an arbitrary filesystem path to a privileged command.
 #[tauri::command]
 async fn send_attachment_message(
+    app: AppHandle,
     state: State<'_, AppState>,
     conversation_id: String,
     text: String,
     reply_to_id: Option<String>,
     drop_capability: Option<String>,
-    expected_server_origin: String,
-    expected_binding_generation: String,
+    expected_binding: ExpectedLiveActionBindingRequest,
 ) -> Result<Option<u64>, String> {
     use rand::RngCore;
 
     let live_action_binding = capture_confirmed_live_action_binding(&state)?;
     validate_expected_live_action_binding(
         &live_action_binding,
-        &expected_server_origin,
-        &expected_binding_generation,
+        &expected_binding.expected_server_origin,
+        &expected_binding.expected_binding_generation,
     )?;
     require_conversation_crypto_available(&state, &conversation_id)?;
     {
@@ -6419,18 +6442,26 @@ async fn send_attachment_message(
         });
     }
 
-    let mut client = state.client.lock().map_err(|error| error.to_string())?;
-    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
-    state
-        .runtime
-        .block_on(client.send_message_with_attachments(
+    let app_handle = app.clone();
+    let sequence = run_blocking_native_task("finalize encrypted attachment message", move || {
+        let state = app_handle.state::<AppState>();
+        let mut client = state.client.lock().map_err(|error| error.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+        // Live quarantine writers take this same client mutex before publishing
+        // their diagnostic. Rechecking here linearizes the completed upload
+        // with that fail-closed transition without holding the diagnostic lock
+        // across transport I/O.
+        require_conversation_crypto_available(&state, &conversation_id)?;
+        state.runtime.block_on(client.send_message_with_attachments(
             &conversation_id,
             &text,
             reply_to_id.as_deref(),
             outgoing,
         ))
-        .map(Some)
+    })
+    .await?;
+    Ok(Some(sequence))
 }
 
 #[tauri::command]
@@ -11406,16 +11437,17 @@ mod e2ee_rest_tests {
         preserve_created_group_outcome, proves_future_only_sender_key_history,
         publish_unlocked_session, require_matching_identity_fingerprint, resolve_auto_lock_seconds,
         rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
-        valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
-        validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
-        validate_expected_live_action_binding, validate_expected_rest_binding,
-        validate_live_action_rest_origin, validate_live_message_security_context,
-        validate_next_cursor, validate_persisted_message_conversation,
-        validate_pinned_directory_self, validate_profile_avatar_jpeg, validate_rest_url,
-        validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_hit_dto,
-        verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
-        CurrentTargetAdmissionEvidence, ParsedMessageCryptoContext, PinnedDirectoryMember,
-        RestBinding, RestOrigin, DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES,
+        run_blocking_native_task, valid_auto_lock_seconds, valid_unlock_pin,
+        validate_authenticated_binding_commit, validate_created_dm_account_directory,
+        validate_expected_dm_peer_identity_key, validate_expected_live_action_binding,
+        validate_expected_rest_binding, validate_live_action_rest_origin,
+        validate_live_message_security_context, validate_next_cursor,
+        validate_persisted_message_conversation, validate_pinned_directory_self,
+        validate_profile_avatar_jpeg, validate_rest_url, validate_server_endpoint_pair,
+        validate_utc_rfc3339_nano, validated_search_hit_dto, verify_device_directory_account_keys,
+        AuthenticatedSessionScope, ConversationSyncIsolation, CurrentTargetAdmissionEvidence,
+        ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
+        DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES,
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -11440,6 +11472,26 @@ mod e2ee_rest_tests {
         SigningKey::from_bytes(&[seed; 32])
             .verifying_key()
             .to_bytes()
+    }
+
+    #[test]
+    fn blocking_native_bridge_can_drive_the_dedicated_client_runtime() {
+        let client_state = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let task_client_state = std::sync::Arc::clone(&client_state);
+        let tauri_runtime = tokio::runtime::Runtime::new().expect("outer Tauri-like runtime");
+        let result = tauri_runtime
+            .block_on(run_blocking_native_task("regression", move || {
+                let mut client_guard = task_client_state.lock().expect("client lock");
+                let client_runtime = tokio::runtime::Runtime::new()
+                    .map_err(|error| format!("create client runtime: {error}"))?;
+                let value = client_runtime.block_on(async { 42_u8 });
+                *client_guard = true;
+                Ok(value)
+            }))
+            .expect("blocking bridge must prevent nested-runtime panic");
+        assert_eq!(result, 42);
+        assert!(!client_state.is_poisoned());
+        assert!(*client_state.lock().expect("healthy client lock"));
     }
 
     #[test]
