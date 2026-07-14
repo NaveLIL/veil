@@ -1384,7 +1384,11 @@ export const appStore = {
   },
 
   /** Pick, sanitize, stream-encrypt, and send files through native code. */
-  sendAttachments: async (text: string, replyToId?: string): Promise<boolean> => {
+  sendAttachments: async (
+    text: string,
+    replyToId?: string,
+    dropCapability?: string,
+  ): Promise<boolean> => {
     const sessionEpoch = captureUiSessionEpoch();
     const convId = activeConversationId();
     if (!convId) return false;
@@ -1405,6 +1409,7 @@ export const appStore = {
         conversationId: convId,
         text,
         replyToId: replyToId ?? null,
+        dropCapability: dropCapability ?? null,
         ...authenticatedMutationScopeArgs(mutationScope),
       });
       requireCurrentMutationScope(sessionEpoch, mutationScope);
@@ -1427,6 +1432,21 @@ export const appStore = {
       ...authenticatedMutationScopeArgs(mutationScope),
     });
     requireCurrentMutationScope(sessionEpoch, mutationScope);
+    return result;
+  },
+
+  createAttachmentMediaSource: async (messageId: string, ordinal: number): Promise<string> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    const result = await invoke<string>("create_attachment_media_source", {
+      messageId,
+      ordinal,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+    if (!/^(?:veilfile:\/\/localhost|http:\/\/veilfile\.localhost)\/[0-9a-f]{64}$/.test(result)) {
+      throw new Error("native media source violated its capability contract");
+    }
     return result;
   },
 

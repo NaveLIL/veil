@@ -1,6 +1,7 @@
 import { Component, Show, Switch, Match, For, createSignal, createEffect, onMount, onCleanup, untrack } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { listen } from "@tauri-apps/api/event";
 import {
   appStore,
   captureUiSessionEpoch,
@@ -25,6 +26,7 @@ import { VeilLinkJoinDialog } from "@/components/spaces/VeilLinkJoinDialog";
 import { SpaceMark } from "@/components/spaces/SpaceMark";
 import { WindowTitlebar } from "@/components/layout/WindowTitlebar";
 import { conversationCryptoUiState } from "@/security/conversationCrypto";
+import { Z } from "@/lib/zIndex";
 
 /** Detect emoji-only messages (1-3 emoji, no other text). */
 const EMOJI_ONLY_RE = /^(?:\p{Emoji_Presentation}|\p{Extended_Pictographic}(?:\u{FE0F})?(?:\u{200D}\p{Extended_Pictographic}(?:\u{FE0F})?)*){1,3}$/u;
@@ -62,7 +64,7 @@ import { alertDecision, confirmDecision, promptDecision } from "@/lib/decisionDi
 import {
   Users, UserPlus, UserMinus, Settings, Lock,
   ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
-  MessageSquare, Eye, Shield, Send, Paperclip, Download, FileText,
+  MessageSquare, Eye, Shield, Send, Paperclip, Download, FileText, Play,
 } from "lucide-solid";
 
 const formatAttachmentBytes = (bytes: number): string => {
@@ -202,6 +204,10 @@ const App: Component = () => {
   const [inputText, setInputText] = createSignal("");
   const [sendBusy, setSendBusy] = createSignal(false);
   const [attachmentSaving, setAttachmentSaving] = createSignal<string | null>(null);
+  const [attachmentPreviewBusy, setAttachmentPreviewBusy] = createSignal<string | null>(null);
+  const [attachmentMediaSources, setAttachmentMediaSources] = createSignal<Record<string, string>>({});
+  const [attachmentDragActive, setAttachmentDragActive] = createSignal(false);
+  const [attachmentDragCount, setAttachmentDragCount] = createSignal(0);
   const [sendNotice, setSendNotice] = createSignal<"" | "security" | "error">("");
   const [search, setSearch] = createSignal("");
   const [showNewGroup, setShowNewGroup] = createSignal(false);
@@ -1149,7 +1155,7 @@ const App: Component = () => {
     }
   };
 
-  const handleAttach = async () => {
+  const handleAttach = async (dropCapability?: string) => {
     const conversation = conv();
     if (!conversation || sendBusy() || transportMutationUnavailable() || cryptoGate().blocked) return;
     const conversationId = conversation.id;
@@ -1158,7 +1164,7 @@ const App: Component = () => {
     setSendBusy(true);
     setSendNotice("");
     try {
-      const sent = await appStore.sendAttachments(caption, reply?.id);
+      const sent = await appStore.sendAttachments(caption, reply?.id, dropCapability);
       if (sent && appStore.activeConversationId() === conversationId) {
         setInputText("");
         setReplyingTo(null);
@@ -1190,6 +1196,28 @@ const App: Component = () => {
       toast.error("Attachment not saved", String(reason));
     } finally {
       if (attachmentSaving() === operation) setAttachmentSaving(null);
+    }
+  };
+
+  const handlePreviewAttachment = async (message: Message, ordinal: number) => {
+    const operation = `${message.id}:${ordinal}`;
+    if (attachmentPreviewBusy()) return;
+    if (attachmentMediaSources()[operation]) {
+      setAttachmentMediaSources((previous) => {
+        const next = { ...previous };
+        delete next[operation];
+        return next;
+      });
+      return;
+    }
+    setAttachmentPreviewBusy(operation);
+    try {
+      const source = await appStore.createAttachmentMediaSource(message.id, ordinal);
+      setAttachmentMediaSources((previous) => ({ ...previous, [operation]: source }));
+    } catch (reason) {
+      toast.error("Preview unavailable", String(reason));
+    } finally {
+      if (attachmentPreviewBusy() === operation) setAttachmentPreviewBusy(null);
     }
   };
 
@@ -1510,6 +1538,36 @@ const App: Component = () => {
     document.addEventListener("contextmenu", (e) => e.preventDefault(), { capture: true });
     await appearanceStore.initialize();
 
+    const stopDragState = await listen<{ active: boolean; fileCount: number }>(
+      "veil://attachment-drag-state",
+      (event) => {
+        const payload = event.payload;
+        const active = payload?.active === true;
+        const count = Number.isSafeInteger(payload?.fileCount) ? payload.fileCount : 0;
+        setAttachmentDragActive(active && count > 0 && count <= 8);
+        setAttachmentDragCount(count);
+      },
+    );
+    const stopDrop = await listen<{ capability: string; fileCount: number }>(
+      "veil://attachment-drop",
+      (event) => {
+        const payload = event.payload;
+        setAttachmentDragActive(false);
+        if (
+          appStore.screen() !== "chat"
+          || !conv()
+          || typeof payload?.capability !== "string"
+          || !/^[0-9a-f]{64}$/.test(payload.capability)
+          || !Number.isSafeInteger(payload.fileCount)
+          || payload.fileCount < 1
+          || payload.fileCount > 8
+        ) return;
+        void handleAttach(payload.capability);
+      },
+    );
+    stopAttachmentDragStateListener = stopDragState;
+    stopAttachmentDropListener = stopDrop;
+
     try {
       // Install the complete listener set before any path can create a native
       // transport. A fast connect→disconnect must never fall into a gap where
@@ -1540,6 +1598,8 @@ const App: Component = () => {
     appStore.startAutoLock();
   });
 
+  let stopAttachmentDragStateListener: (() => void) | undefined;
+  let stopAttachmentDropListener: (() => void) | undefined;
   let stopWindowResizeListener: (() => void) | undefined;
   let windowListenerDisposed = false;
   onMount(() => {
@@ -1554,6 +1614,8 @@ const App: Component = () => {
   onCleanup(() => {
     windowListenerDisposed = true;
     stopWindowResizeListener?.();
+    stopAttachmentDragStateListener?.();
+    stopAttachmentDropListener?.();
     if (messagesScrollFrame !== undefined) cancelAnimationFrame(messagesScrollFrame);
     cancelRightIslandAnimationFrame();
   });
@@ -1611,6 +1673,10 @@ const App: Component = () => {
     setInputText("");
     setSendNotice("");
     setSendBusy(false);
+    setAttachmentDragActive(false);
+    setAttachmentDragCount(0);
+    setAttachmentPreviewBusy(null);
+    setAttachmentMediaSources({});
     setSearch("");
     setNewGroupName("");
     setCreatingGroup(false);
@@ -1726,6 +1792,34 @@ const App: Component = () => {
             <div class="veil-wallpaper-scrim" aria-hidden="true" />
           </div>
         )}
+      </Show>
+      <Show when={attachmentDragActive() && appStore.screen() === "chat" && !!conv()}>
+        <div
+          role="status"
+          aria-live="polite"
+          style={{
+            position: "fixed",
+            inset: "48px 10px 10px",
+            "z-index": Z.DRAG,
+            display: "grid",
+            "place-items": "center",
+            background: "rgba(var(--veil-surface-rgb),0.72)",
+            "backdrop-filter": "blur(12px)",
+            border: "1px solid rgba(var(--veil-accent-rgb),0.55)",
+            "border-radius": "14px",
+            "pointer-events": "none",
+          }}
+        >
+          <div style={{ display: "grid", "place-items": "center", gap: "10px", color: "var(--veil-text)" }}>
+            <span style={{ width: "52px", height: "52px", display: "grid", "place-items": "center", "border-radius": "16px", background: "rgba(var(--veil-accent-rgb),0.15)", color: "var(--veil-accent)" }}>
+              <Paperclip size={23} strokeWidth={1.8} />
+            </span>
+            <strong style={{ "font-size": "15px" }}>Drop to encrypt and send</strong>
+            <span style={{ color: "var(--veil-text-muted)", "font-size": "11px" }}>
+              {attachmentDragCount()} {attachmentDragCount() === 1 ? "file" : "files"} · names and MIME stay end-to-end encrypted
+            </span>
+          </div>
+        </div>
       </Show>
 
       {/* ── TITLEBAR ── */}
@@ -2810,43 +2904,44 @@ const App: Component = () => {
                                             {(attachment) => {
                                               const operation = () => `${msg.id}:${attachment.ordinal}`;
                                               const saving = () => attachmentSaving() === operation();
+                                              const previewing = () => attachmentPreviewBusy() === operation();
+                                              const source = () => attachmentMediaSources()[operation()];
+                                              const isVideo = () => attachment.detectedMime.startsWith("video/");
+                                              const canPreview = () => isVideo() || attachment.detectedMime.startsWith("audio/");
                                               return (
-                                                <button
-                                                  type="button"
-                                                  disabled={!!attachmentSaving() || msg.pending || msg.failed || msg.deliveryUnknown}
-                                                  onClick={() => void handleSaveAttachment(msg, attachment.ordinal, attachment.fileName)}
-                                                  aria-label={`Save encrypted attachment ${attachment.fileName}`}
-                                                  style={{
-                                                    display: "grid",
-                                                    "grid-template-columns": "36px minmax(0, 1fr) 28px",
-                                                    "align-items": "center",
-                                                    gap: "10px",
-                                                    width: "100%",
-                                                    padding: "9px 10px",
-                                                    border: "1px solid var(--veil-border)",
-                                                    "border-radius": "10px",
-                                                    background: "rgba(var(--veil-accent-rgb),0.055)",
-                                                    color: "var(--veil-text)",
-                                                    cursor: saving() ? "wait" : "pointer",
-                                                    "text-align": "left",
-                                                    transition: "border-color 160ms ease, background 160ms ease, transform 160ms ease",
-                                                  }}
-                                                >
-                                                  <span style={{ width: "36px", height: "36px", display: "grid", "place-items": "center", "border-radius": "9px", background: "rgba(var(--veil-accent-rgb),0.13)", color: "var(--veil-accent)" }}>
-                                                    <FileText size={17} strokeWidth={1.9} />
-                                                  </span>
-                                                  <span style={{ "min-width": "0" }}>
-                                                    <span style={{ display: "block", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "font-size": "12px", "font-weight": "650" }}>
-                                                      {attachment.fileName}
+                                                <div style={{ display: "grid", gap: "6px" }}>
+                                                  <Show when={source()}>
+                                                    {(mediaSource) => (
+                                                      <div style={{ overflow: "hidden", "border-radius": "10px", border: "1px solid var(--veil-border)", background: "var(--veil-control)" }}>
+                                                        <Show
+                                                          when={isVideo()}
+                                                          fallback={<audio controls preload="metadata" src={mediaSource()} style={{ width: "100%", display: "block" }} />}
+                                                        >
+                                                          <video controls preload="metadata" src={mediaSource()} style={{ width: "100%", "max-height": "260px", display: "block", background: "#000" }} />
+                                                        </Show>
+                                                      </div>
+                                                    )}
+                                                  </Show>
+                                                  <div style={{ display: "grid", "grid-template-columns": "36px minmax(0, 1fr) auto", "align-items": "center", gap: "10px", width: "100%", padding: "9px 10px", border: "1px solid var(--veil-border)", "border-radius": "10px", background: "rgba(var(--veil-accent-rgb),0.055)", color: "var(--veil-text)" }}>
+                                                    <span style={{ width: "36px", height: "36px", display: "grid", "place-items": "center", "border-radius": "9px", background: "rgba(var(--veil-accent-rgb),0.13)", color: "var(--veil-accent)" }}>
+                                                      <FileText size={17} strokeWidth={1.9} />
                                                     </span>
-                                                    <span style={{ display: "block", "margin-top": "2px", color: "var(--veil-text-faint)", "font-size": "10px" }}>
-                                                      {formatAttachmentBytes(attachment.plaintextSize)} · encrypted file
+                                                    <span style={{ "min-width": "0" }}>
+                                                      <span style={{ display: "block", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "font-size": "12px", "font-weight": "650" }}>{attachment.fileName}</span>
+                                                      <span style={{ display: "block", "margin-top": "2px", color: "var(--veil-text-faint)", "font-size": "10px" }}>{formatAttachmentBytes(attachment.plaintextSize)} · encrypted file</span>
                                                     </span>
-                                                  </span>
-                                                  <span style={{ width: "28px", height: "28px", display: "grid", "place-items": "center", color: "var(--veil-text-muted)" }}>
-                                                    <Download size={15} strokeWidth={2} />
-                                                  </span>
-                                                </button>
+                                                    <span style={{ display: "flex", gap: "4px" }}>
+                                                      <Show when={canPreview()}>
+                                                        <button type="button" disabled={previewing() || msg.pending || msg.failed || msg.deliveryUnknown} onClick={() => void handlePreviewAttachment(msg, attachment.ordinal)} aria-label={`${source() ? "Close" : "Preview"} encrypted media ${attachment.fileName}`} style={{ width: "28px", height: "28px", display: "grid", "place-items": "center", border: "none", "border-radius": "7px", background: source() ? "rgba(var(--veil-accent-rgb),0.18)" : "transparent", color: "var(--veil-accent)", cursor: previewing() ? "wait" : "pointer" }}>
+                                                          {source() ? <X size={14} strokeWidth={2} /> : <Play size={14} strokeWidth={2} />}
+                                                        </button>
+                                                      </Show>
+                                                      <button type="button" disabled={!!attachmentSaving() || msg.pending || msg.failed || msg.deliveryUnknown} onClick={() => void handleSaveAttachment(msg, attachment.ordinal, attachment.fileName)} aria-label={`Save encrypted attachment ${attachment.fileName}`} style={{ width: "28px", height: "28px", display: "grid", "place-items": "center", border: "none", "border-radius": "7px", background: "transparent", color: "var(--veil-text-muted)", cursor: saving() ? "wait" : "pointer" }}>
+                                                        <Download size={15} strokeWidth={2} />
+                                                      </button>
+                                                    </span>
+                                                  </div>
+                                                </div>
                                               );
                                             }}
                                           </For>

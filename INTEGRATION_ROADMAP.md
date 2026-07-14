@@ -46,7 +46,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 |---|------|--|
 | 1 | Kobalte — headless UI | закрыто: composite controls/focus/keyboard/ARIA унифицированы |
 | 2 | Tantivy — локальный поиск | готово, индекс теперь только в RAM |
-| 3 | tus.io — загрузка файлов | core закрыт; desktop/2 GiB streaming UX вынесен в 3B |
+| 3 | tus.io — загрузка файлов | core закрыт; 3B desktop attachment client реализован, physical matrix остаётся gate |
 | 4 | UnifiedPush / ntfy | transport core закрыт; device clients вынесены в 4P |
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
@@ -184,20 +184,27 @@ Attachment теперь привязан к сообщению/разговор�
 которому разрешена история этого разговора. Сервер всё равно хранит только
 ciphertext и не получает ключ файла.
 
-**Phase 3B — Attachment Experience (в работе, foundation 2026-07-14):**
+**Phase 3B — Attachment Experience (implementation complete 2026-07-14; physical gate pending):**
 
 Готово: security/schema review, versioned E2EE attachment payload, descriptor
 commitment, O(1) XChaCha20 key wrapping внутри текущего Double Ratchet/Sender-Key
 roster, атомарные private metadata/key rows в SQLCipher, live/offline receive,
-нативный picker, bounded-memory upload/download, file bubble и безопасный Save.
+нативный picker и drag-and-drop через одноразовый process-only capability,
+bounded-memory upload/download, file bubble и безопасный Save.
 Изображения JPEG/PNG/WebP декодируются и ре-энкодятся в PNG до шифрования, что
 удаляет EXIF/container metadata. Сервер видит только ciphertext size, media id и
 `application/octet-stream`; MIME и filename остаются в E2EE payload.
 
-Осталось до закрытия:
-- OS drag-drop через нативный одноразовый capability, без IPC-команды с произвольным path
-- `veilfile://` custom protocol для range-decrypt видео в `<video>` теге
-- physical two-device upload/download/tamper/resume matrix
+Аудио/видео preview использует отдельный `veilfile://` protocol. Нативный слой
+повторно выводит MIME из аутентифицированного plaintext, принимает только
+audio/video signatures и отдаёт WebView не более 8 MiB за range. Каждый range
+расшифровывается только целыми AEAD chunks; plaintext не кэшируется на диске.
+Capability привязан к текущим origin/session epoch, живёт не более 10 минут и
+уничтожается вместе с ключом при lock/account switch.
+
+Осталось до формального закрытия только внешнее доказательство, которое нельзя
+честно заменить unit/integration тестом:
+- physical two-device upload/download/tamper/resume/media-seek matrix.
 
 Streaming uploader уже использует bounded-memory chunk pipeline до 2 ГиБ;
 старый one-shot adapter не используется desktop attachment path.

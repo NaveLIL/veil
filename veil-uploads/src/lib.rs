@@ -47,9 +47,10 @@ pub use stream::{
     decrypt_stream_to_file, encrypt_file_to_chunks, EncryptedChunk, EncryptedFileMeta, StreamError,
 };
 pub use streaming::{
-    ciphertext_resume_position, decrypt_file_streaming, decrypt_reader_to_file,
-    geometry_for_plaintext, prepare_streaming_upload, prepare_streaming_upload_with_control,
-    validate_streaming_metadata, ResumePosition, StreamingError, StreamingGeometry,
-    StreamingUploadPlan, StreamingUploadResult, TransferControl, TransferProgress, TransferStage,
+    ciphertext_range_for_plaintext, ciphertext_resume_position, decrypt_fetched_plaintext_range,
+    decrypt_file_streaming, decrypt_reader_to_file, geometry_for_plaintext,
+    prepare_streaming_upload, prepare_streaming_upload_with_control, validate_streaming_metadata,
+    PlaintextRangePlan, ResumePosition, StreamingError, StreamingGeometry, StreamingUploadPlan,
+    StreamingUploadResult, TransferControl, TransferProgress, TransferStage,
     MAX_STREAM_PLAINTEXT_BYTES,
 };

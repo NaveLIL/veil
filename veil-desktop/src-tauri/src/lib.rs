@@ -164,6 +164,12 @@ struct AppState {
     /// At most one OS-delivered Veil Link capability. The raw secret never
     /// enters renderer state, config, SQLCipher, logs, or Tauri IPC output.
     pending_veil_link: Mutex<Option<PendingVeilLink>>,
+    /// OS drag-and-drop paths never cross IPC. The renderer receives only a
+    /// short-lived random capability that can consume this exact path set.
+    pending_attachment_drop: Mutex<Option<PendingAttachmentDrop>>,
+    /// Short-lived native-only media capabilities used by `veilfile://`.
+    /// Decrypted media is produced per authenticated range and never cached on disk.
+    media_sessions: Mutex<std::collections::HashMap<String, MediaSession>>,
     runtime: tokio::runtime::Runtime,
     /// Validated auto-lock policy loaded once from secure storage. Runtime
     /// expiry checks must never perform blocking keychain I/O.
@@ -186,6 +192,52 @@ struct PendingVeilLink {
     expires_at: Instant,
 }
 
+struct PendingAttachmentDrop {
+    capability: String,
+    paths: Vec<PathBuf>,
+    expires_at: Instant,
+}
+
+struct MediaSession {
+    media_id: String,
+    metadata: veil_uploads::EncryptedFileMeta,
+    content_key: [u8; 32],
+    actual_mime: String,
+    server_origin: String,
+    bearer: Zeroizing<String>,
+    native_session_epoch: u64,
+    expires_at: Instant,
+}
+
+impl Drop for MediaSession {
+    fn drop(&mut self) {
+        self.content_key.zeroize();
+    }
+}
+
+struct MediaSessionSnapshot {
+    media_id: String,
+    metadata: veil_uploads::EncryptedFileMeta,
+    content_key: [u8; 32],
+    actual_mime: String,
+    server_origin: String,
+    bearer: Zeroizing<String>,
+    native_session_epoch: u64,
+}
+
+impl Drop for MediaSessionSnapshot {
+    fn drop(&mut self) {
+        self.content_key.zeroize();
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingAttachmentDropView {
+    capability: String,
+    file_count: usize,
+}
+
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingVeilLinkView {
@@ -195,6 +247,9 @@ struct PendingVeilLinkView {
 }
 
 const PENDING_VEIL_LINK_TTL: Duration = Duration::from_secs(5 * 60);
+const PENDING_ATTACHMENT_DROP_TTL: Duration = Duration::from_secs(60);
+const MEDIA_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
+const MAX_MEDIA_RANGE_BYTES: u64 = 8 * 1024 * 1024;
 
 const KEYCHAIN_ACCOUNT: &str = "veil-default";
 const PIN_MATERIAL_ACCOUNT: &str = "veil-pin-material-v2";
@@ -213,6 +268,78 @@ const MAX_AVATAR_RESPONSE_BYTES: usize = 256 * 1024;
 const PROJECT_REPOSITORY_URL: &str = "https://github.com/NaveLIL/veil";
 const LEGACY_MIN_PIN_LEN: usize = 4;
 const MAX_PIN_LEN: usize = 12;
+
+fn stage_attachment_drop(
+    state: &AppState,
+    paths: &[PathBuf],
+) -> Result<PendingAttachmentDropView, String> {
+    use rand::RngCore;
+
+    if paths.is_empty() || paths.len() > veil_client::attachments::MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err("dropped attachment count is outside the protocol limit".to_string());
+    }
+    let mut exact_paths = Vec::with_capacity(paths.len());
+    for path in paths {
+        if !path.is_absolute()
+            || !std::fs::metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false)
+        {
+            return Err("dropped attachment is not a readable regular file".to_string());
+        }
+        exact_paths.push(path.clone());
+    }
+    let mut capability_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut capability_bytes);
+    let capability = hex::encode(capability_bytes);
+    capability_bytes.zeroize();
+    *state
+        .pending_attachment_drop
+        .lock()
+        .map_err(|error| error.to_string())? = Some(PendingAttachmentDrop {
+        capability: capability.clone(),
+        paths: exact_paths,
+        expires_at: Instant::now() + PENDING_ATTACHMENT_DROP_TTL,
+    });
+    Ok(PendingAttachmentDropView {
+        capability,
+        file_count: paths.len(),
+    })
+}
+
+fn consume_attachment_drop(state: &AppState, capability: &str) -> Result<Vec<PathBuf>, String> {
+    if capability.len() != 64
+        || !capability
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("attachment drop capability is invalid".to_string());
+    }
+    let mut pending = state
+        .pending_attachment_drop
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if pending
+        .as_ref()
+        .is_some_and(|drop| drop.expires_at <= Instant::now())
+    {
+        pending.take();
+        return Err("attachment drop capability expired".to_string());
+    }
+    let matches = pending.as_ref().is_some_and(|drop| {
+        drop.capability
+            .as_bytes()
+            .ct_eq(capability.as_bytes())
+            .into()
+    });
+    if !matches {
+        return Err("attachment drop capability is unavailable".to_string());
+    }
+    Ok(pending
+        .take()
+        .ok_or("attachment drop capability is unavailable")?
+        .paths)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct RestOrigin {
@@ -1031,6 +1158,11 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
         .authenticated_rest_origin
         .lock()
         .map_err(|e| e.to_string())? = None;
+    state
+        .media_sessions
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clear();
     *state
         .renderer_confirmed_rest_binding
         .lock()
@@ -1041,6 +1173,10 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
         .map_err(|e| e.to_string())?
         .clear();
     *state.pending_veil_link.lock().map_err(|e| e.to_string())? = None;
+    *state
+        .pending_attachment_drop
+        .lock()
+        .map_err(|e| e.to_string())? = None;
     // The client mutex is the linearization point: operations already holding
     // it finish first; every later operation observes an empty client.
     *state.client.lock().map_err(|e| e.to_string())? = VeilClient::new();
@@ -6137,6 +6273,26 @@ fn prepare_local_attachment(path: PathBuf) -> Result<PreparedLocalAttachment, St
     })
 }
 
+async fn prepare_local_attachments(
+    paths: Vec<PathBuf>,
+) -> Result<Vec<PreparedLocalAttachment>, String> {
+    if paths.is_empty() || paths.len() > veil_client::attachments::MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(format!(
+            "select between 1 and {} attachments",
+            veil_client::attachments::MAX_ATTACHMENTS_PER_MESSAGE
+        ));
+    }
+    let mut prepared = Vec::with_capacity(paths.len());
+    for path in paths {
+        prepared.push(
+            tauri::async_runtime::spawn_blocking(move || prepare_local_attachment(path))
+                .await
+                .map_err(|error| format!("prepare attachment task failed: {error}"))??,
+        );
+    }
+    Ok(prepared)
+}
+
 /// Native-only attachment picker and bounded streaming uploader. Renderer code
 /// never supplies an arbitrary filesystem path to a privileged command.
 #[tauri::command]
@@ -6145,6 +6301,7 @@ async fn send_attachment_message(
     conversation_id: String,
     text: String,
     reply_to_id: Option<String>,
+    drop_capability: Option<String>,
     expected_server_origin: String,
     expected_binding_generation: String,
 ) -> Result<Option<u64>, String> {
@@ -6166,30 +6323,23 @@ async fn send_attachment_message(
         }
     }
 
-    let Some(files) = rfd::AsyncFileDialog::new()
-        .set_title("Attach encrypted files")
-        .pick_files()
-        .await
-    else {
-        return Ok(None);
+    let paths = if let Some(capability) = drop_capability.as_deref() {
+        consume_attachment_drop(&state, capability)?
+    } else {
+        let Some(files) = rfd::AsyncFileDialog::new()
+            .set_title("Attach encrypted files")
+            .pick_files()
+            .await
+        else {
+            return Ok(None);
+        };
+        files
+            .into_iter()
+            .map(|file| file.path().to_path_buf())
+            .collect()
     };
-    if files.is_empty() || files.len() > veil_client::attachments::MAX_ATTACHMENTS_PER_MESSAGE {
-        return Err(format!(
-            "select between 1 and {} attachments",
-            veil_client::attachments::MAX_ATTACHMENTS_PER_MESSAGE
-        ));
-    }
     require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
-
-    let mut prepared = Vec::with_capacity(files.len());
-    for file in files {
-        let path = file.path().to_path_buf();
-        prepared.push(
-            tauri::async_runtime::spawn_blocking(move || prepare_local_attachment(path))
-                .await
-                .map_err(|error| format!("prepare attachment task failed: {error}"))??,
-        );
-    }
+    let prepared = prepare_local_attachments(paths).await?;
     require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
 
     let server_http_url = live_action_binding.origin.canonical_server_origin();
@@ -6344,6 +6494,355 @@ async fn save_message_attachment(
         .map_or("application/octet-stream", |kind| kind.mime_type())
         .to_string();
     Ok(Some(actual_mime))
+}
+
+async fn fetch_authenticated_ciphertext_range(
+    state: &AppState,
+    server_origin: &str,
+    media_id: &str,
+    bearer: &str,
+    total_ciphertext_size: u64,
+    start: u64,
+    end_inclusive: u64,
+) -> Result<Vec<u8>, String> {
+    if start > end_inclusive || end_inclusive >= total_ciphertext_size {
+        return Err("encrypted media range is invalid".to_string());
+    }
+    let expected_length = end_inclusive
+        .checked_sub(start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or("encrypted media range length overflow")?;
+    let response = state
+        .http
+        .get(rest_api_url(
+            server_origin,
+            &["v1", "uploads", "blob", media_id],
+        )?)
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"))
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes={start}-{end_inclusive}"),
+        )
+        .send()
+        .await
+        .map_err(|error| format!("fetch encrypted media range: {error}"))?;
+    if response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Err(format!(
+            "encrypted media range returned HTTP {}",
+            response.status().as_u16()
+        ));
+    }
+    let expected_content_range = format!("bytes {start}-{end_inclusive}/{total_ciphertext_size}");
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        != Some(expected_content_range.as_str())
+        || response.content_length() != Some(expected_length)
+    {
+        return Err("encrypted media server returned a mismatched range".to_string());
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("read encrypted media range: {error}"))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != expected_length {
+        return Err("encrypted media range body length mismatch".to_string());
+    }
+    Ok(bytes.to_vec())
+}
+
+#[tauri::command]
+async fn create_attachment_media_source(
+    state: State<'_, AppState>,
+    message_id: String,
+    ordinal: u8,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<String, String> {
+    use rand::RngCore;
+
+    let live_action_binding = capture_confirmed_live_action_binding(&state)?;
+    validate_expected_live_action_binding(
+        &live_action_binding,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let (attachment, authenticated_user_id) = {
+        let client = state.client.lock().map_err(|error| error.to_string())?;
+        require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+        let db = client.db().ok_or("database not initialized")?;
+        let conversation_id = db
+            .get_message_binding(&message_id)?
+            .map(|binding| binding.0)
+            .ok_or("media message is absent from encrypted local storage")?;
+        require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+        let attachment = db
+            .get_message_attachments(&message_id)?
+            .into_iter()
+            .find(|attachment| attachment.ordinal == ordinal)
+            .ok_or("media attachment is absent from encrypted local storage")?;
+        (attachment, client.authenticated_user_id()?.to_string())
+    };
+    let server_origin = live_action_binding.origin.canonical_server_origin();
+    let token_value = rest_send_json_for_binding(
+        &state,
+        reqwest::Method::POST,
+        rest_api_url(&server_origin, &["v1", "uploads", "token"])?,
+        &authenticated_user_id,
+        None,
+        &live_action_binding,
+    )
+    .await?;
+    let token: UploadTokenResponse = serde_json::from_value(token_value)
+        .map_err(|error| format!("invalid media token response: {error}"))?;
+    if token.token.is_empty()
+        || token.base_path != "/v1/uploads/files/"
+        || chrono::DateTime::parse_from_rfc3339(&token.expires_at).is_err()
+    {
+        return Err("media token response violates the protocol".to_string());
+    }
+    let metadata = veil_uploads::EncryptedFileMeta {
+        format_version: attachment.format_version,
+        nonce_prefix: attachment.nonce_prefix,
+        chunk_count: attachment.chunk_count,
+        plaintext_size: attachment.plaintext_size,
+        ciphertext_size: attachment.ciphertext_size,
+    };
+    veil_uploads::validate_streaming_metadata(&metadata)
+        .map_err(|error| format!("invalid encrypted media metadata: {error}"))?;
+    if metadata.plaintext_size == 0 {
+        return Err("empty attachment cannot be previewed as media".to_string());
+    }
+    let sniff_end = metadata.plaintext_size.saturating_sub(1).min(4095);
+    let plan = veil_uploads::ciphertext_range_for_plaintext(&metadata, 0, sniff_end)
+        .map_err(|error| format!("plan media type probe: {error}"))?;
+    let ciphertext = fetch_authenticated_ciphertext_range(
+        &state,
+        &server_origin,
+        &attachment.media_id,
+        &token.token,
+        metadata.ciphertext_size,
+        plan.ciphertext_start,
+        plan.ciphertext_end_inclusive,
+    )
+    .await?;
+    let plaintext = veil_uploads::decrypt_fetched_plaintext_range(
+        &attachment.content_key,
+        &metadata,
+        &plan,
+        &ciphertext,
+    )
+    .map_err(|error| format!("authenticate media type probe: {error}"))?;
+    let actual_mime = infer::get(&plaintext)
+        .map(|kind| kind.mime_type().to_string())
+        .ok_or("decrypted attachment has no recognized media signature")?;
+    if !actual_mime.starts_with("video/") && !actual_mime.starts_with("audio/") {
+        return Err("decrypted attachment is not supported audio or video".to_string());
+    }
+    require_confirmed_live_action_binding_current(&state, &live_action_binding)?;
+    let mut capability_bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut capability_bytes);
+    let capability = hex::encode(capability_bytes);
+    capability_bytes.zeroize();
+    let native_session_epoch = state.session_epoch.load(Ordering::Acquire);
+    let mut sessions = state
+        .media_sessions
+        .lock()
+        .map_err(|error| error.to_string())?;
+    sessions.retain(|_, session| session.expires_at > Instant::now());
+    sessions.insert(
+        capability.clone(),
+        MediaSession {
+            media_id: attachment.media_id.clone(),
+            metadata,
+            content_key: attachment.content_key,
+            actual_mime,
+            server_origin,
+            bearer: Zeroizing::new(token.token),
+            native_session_epoch,
+            expires_at: Instant::now() + MEDIA_SESSION_TTL,
+        },
+    );
+    Ok(format!("veilfile://localhost/{capability}"))
+}
+
+fn media_session_snapshot(
+    state: &AppState,
+    capability: &str,
+) -> Result<MediaSessionSnapshot, String> {
+    if !state.unlocked.load(Ordering::Acquire)
+        || capability.len() != 64
+        || !capability
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err("media capability is unavailable".to_string());
+    }
+    let current_epoch = state.session_epoch.load(Ordering::Acquire);
+    let mut sessions = state
+        .media_sessions
+        .lock()
+        .map_err(|error| error.to_string())?;
+    sessions.retain(|_, session| {
+        session.expires_at > Instant::now() && session.native_session_epoch == current_epoch
+    });
+    let session = sessions
+        .get(capability)
+        .ok_or("media capability is unavailable")?;
+    let current_origin = authenticated_rest_binding(state)?
+        .origin
+        .canonical_server_origin();
+    if current_origin != session.server_origin {
+        return Err("media capability origin is no longer active".to_string());
+    }
+    Ok(MediaSessionSnapshot {
+        media_id: session.media_id.clone(),
+        metadata: session.metadata.clone(),
+        content_key: session.content_key,
+        actual_mime: session.actual_mime.clone(),
+        server_origin: session.server_origin.clone(),
+        bearer: Zeroizing::new(session.bearer.to_string()),
+        native_session_epoch: session.native_session_epoch,
+    })
+}
+
+fn parse_media_plaintext_range(value: Option<&str>, total: u64) -> Result<(u64, u64), String> {
+    if total == 0 {
+        return Err("empty media has no byte range".to_string());
+    }
+    let Some(raw) = value else {
+        return Ok((0, total.saturating_sub(1).min(MAX_MEDIA_RANGE_BYTES - 1)));
+    };
+    let range = raw
+        .strip_prefix("bytes=")
+        .filter(|value| !value.contains(','))
+        .ok_or("only one canonical bytes range is supported")?;
+    let (start_raw, end_raw) = range
+        .split_once('-')
+        .ok_or("media byte range is malformed")?;
+    let (start, requested_end) = if start_raw.is_empty() {
+        let suffix = end_raw
+            .parse::<u64>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or("media suffix range is malformed")?;
+        (total.saturating_sub(suffix.min(total)), total - 1)
+    } else {
+        if start_raw.len() > 1 && start_raw.starts_with('0') {
+            return Err("media range is not canonical".to_string());
+        }
+        let start = start_raw
+            .parse::<u64>()
+            .map_err(|_| "media range start is malformed")?;
+        let end = if end_raw.is_empty() {
+            total - 1
+        } else {
+            if end_raw.len() > 1 && end_raw.starts_with('0') {
+                return Err("media range is not canonical".to_string());
+            }
+            end_raw
+                .parse::<u64>()
+                .map_err(|_| "media range end is malformed")?
+        };
+        (start, end)
+    };
+    if start >= total || requested_end < start {
+        return Err("media range is outside the attachment".to_string());
+    }
+    let end = requested_end
+        .min(total - 1)
+        .min(start.saturating_add(MAX_MEDIA_RANGE_BYTES - 1));
+    Ok((start, end))
+}
+
+async fn serve_veilfile_request(
+    state: &AppState,
+    request: tauri::http::Request<Vec<u8>>,
+) -> tauri::http::Response<Vec<u8>> {
+    let failure = |status: tauri::http::StatusCode| {
+        tauri::http::Response::builder()
+            .status(status)
+            .header("Cache-Control", "no-store")
+            .header("X-Content-Type-Options", "nosniff")
+            .body(Vec::new())
+            .unwrap_or_else(|_| tauri::http::Response::new(Vec::new()))
+    };
+    if request.method() != tauri::http::Method::GET && request.method() != tauri::http::Method::HEAD
+    {
+        return failure(tauri::http::StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let capability = request.uri().path().trim_start_matches('/');
+    let session = match media_session_snapshot(state, capability) {
+        Ok(session) => session,
+        Err(_) => return failure(tauri::http::StatusCode::NOT_FOUND),
+    };
+    let total = session.metadata.plaintext_size;
+    if request.method() == tauri::http::Method::HEAD {
+        return tauri::http::Response::builder()
+            .status(tauri::http::StatusCode::OK)
+            .header("Accept-Ranges", "bytes")
+            .header("Content-Length", total.to_string())
+            .header("Content-Type", &session.actual_mime)
+            .header("Cache-Control", "no-store")
+            .header("X-Content-Type-Options", "nosniff")
+            .body(Vec::new())
+            .unwrap_or_else(|_| failure(tauri::http::StatusCode::INTERNAL_SERVER_ERROR));
+    }
+    let range_header = request
+        .headers()
+        .get(tauri::http::header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    let (start, end) = match parse_media_plaintext_range(range_header, total) {
+        Ok(range) => range,
+        Err(_) => return failure(tauri::http::StatusCode::RANGE_NOT_SATISFIABLE),
+    };
+    let plan = match veil_uploads::ciphertext_range_for_plaintext(&session.metadata, start, end) {
+        Ok(plan) => plan,
+        Err(_) => return failure(tauri::http::StatusCode::RANGE_NOT_SATISFIABLE),
+    };
+    let ciphertext = match fetch_authenticated_ciphertext_range(
+        state,
+        &session.server_origin,
+        &session.media_id,
+        &session.bearer,
+        session.metadata.ciphertext_size,
+        plan.ciphertext_start,
+        plan.ciphertext_end_inclusive,
+    )
+    .await
+    {
+        Ok(ciphertext) => ciphertext,
+        Err(_) => return failure(tauri::http::StatusCode::BAD_GATEWAY),
+    };
+    let plaintext = match veil_uploads::decrypt_fetched_plaintext_range(
+        &session.content_key,
+        &session.metadata,
+        &plan,
+        &ciphertext,
+    ) {
+        Ok(plaintext) => plaintext,
+        Err(_) => return failure(tauri::http::StatusCode::UNPROCESSABLE_ENTITY),
+    };
+    // The network request may outlive a lock, account switch, or origin
+    // transition. Revalidate the native-only capability after authentication
+    // and before releasing any plaintext to the webview.
+    if !state.unlocked.load(Ordering::Acquire)
+        || state.session_epoch.load(Ordering::Acquire) != session.native_session_epoch
+        || media_session_snapshot(state, capability).is_err()
+    {
+        return failure(tauri::http::StatusCode::NOT_FOUND);
+    }
+    tauri::http::Response::builder()
+        .status(tauri::http::StatusCode::PARTIAL_CONTENT)
+        .header("Accept-Ranges", "bytes")
+        .header("Content-Range", format!("bytes {start}-{end}/{total}"))
+        .header("Content-Length", plaintext.len().to_string())
+        .header("Content-Type", session.actual_mime.clone())
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .body(plaintext)
+        .unwrap_or_else(|_| failure(tauri::http::StatusCode::INTERNAL_SERVER_ERROR))
 }
 
 #[tauri::command]
@@ -10199,6 +10698,16 @@ fn ensure_search_backfill(state: State<'_, AppState>) -> Result<usize, String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .register_asynchronous_uri_scheme_protocol("veilfile", |context, request, responder| {
+            let app = context.app_handle().clone();
+            std::thread::spawn(move || {
+                let state = app.state::<AppState>();
+                let response = state
+                    .runtime
+                    .block_on(serve_veilfile_request(&state, request));
+                responder.respond(response);
+            });
+        })
         .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             // A second instance tried to start — focus the existing window instead.
             if let Some(win) = app.get_webview_window("main") {
@@ -10216,6 +10725,48 @@ pub fn run() {
         }))
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_notification::init())
+        .on_webview_event(|webview, event| {
+            let app = webview.app_handle();
+            match event {
+                tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Enter { paths, .. }) => {
+                    let _ = app.emit(
+                        "veil://attachment-drag-state",
+                        serde_json::json!({
+                            "active": true,
+                            "fileCount": paths.len(),
+                        }),
+                    );
+                }
+                tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) => {
+                    let state = app.state::<AppState>();
+                    match stage_attachment_drop(&state, paths) {
+                        Ok(view) => {
+                            let _ = app.emit("veil://attachment-drop", view);
+                        }
+                        Err(error) => {
+                            let _ = app.emit(
+                                "veil://error",
+                                serde_json::json!({
+                                    "code": 4006,
+                                    "message": error,
+                                }),
+                            );
+                        }
+                    }
+                    let _ = app.emit(
+                        "veil://attachment-drag-state",
+                        serde_json::json!({ "active": false, "fileCount": 0 }),
+                    );
+                }
+                tauri::WebviewEvent::DragDrop(tauri::DragDropEvent::Leave) => {
+                    let _ = app.emit(
+                        "veil://attachment-drag-state",
+                        serde_json::json!({ "active": false, "fileCount": 0 }),
+                    );
+                }
+                _ => {}
+            }
+        })
         .setup(|app| {
             let data_dir = app
                 .path()
@@ -10251,6 +10802,8 @@ pub fn run() {
                 lock_event_pending: AtomicBool::new(false),
                 pin_throttle: Mutex::new(PinThrottle::default()),
                 pending_veil_link: Mutex::new(None),
+                pending_attachment_drop: Mutex::new(None),
+                media_sessions: Mutex::new(std::collections::HashMap::new()),
                 runtime: tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
                 auto_lock_seconds: AtomicU64::new(auto_lock_seconds),
                 last_activity: Mutex::new(Instant::now()),
@@ -10412,6 +10965,7 @@ pub fn run() {
             send_message,
             send_attachment_message,
             save_message_attachment,
+            create_attachment_media_source,
             discard_failed_outgoing_message,
             edit_message,
             delete_message,
@@ -10492,9 +11046,9 @@ mod e2ee_rest_tests {
         authenticated_event_payload, canonical_profile_version, consume_pending_lock_event,
         current_target_admission_evidence, exact_confirmed_live_action_binding,
         invalidate_disconnected_binding, offline_sync_url, parse_device_directory,
-        parse_expected_dm_peer_identity_key, parse_message_crypto_context,
-        parse_network_profile_response, parse_pending_veil_link, parse_prekey_bundle,
-        pending_veil_link_view, preserve_created_group_outcome,
+        parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
+        parse_message_crypto_context, parse_network_profile_response, parse_pending_veil_link,
+        parse_prekey_bundle, pending_veil_link_view, preserve_created_group_outcome,
         proves_future_only_sender_key_history, publish_unlocked_session,
         require_matching_identity_fingerprint, resolve_auto_lock_seconds, rest_api_url,
         rest_authority, rest_canonical, rest_origin, rest_request_target, valid_auto_lock_seconds,
@@ -10507,7 +11061,7 @@ mod e2ee_rest_tests {
         validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_hit_dto,
         verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
         CurrentTargetAdmissionEvidence, ParsedMessageCryptoContext, PinnedDirectoryMember,
-        RestBinding, RestOrigin, DEFAULT_AUTO_LOCK_SECONDS,
+        RestBinding, RestOrigin, DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES,
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -10532,6 +11086,29 @@ mod e2ee_rest_tests {
         SigningKey::from_bytes(&[seed; 32])
             .verifying_key()
             .to_bytes()
+    }
+
+    #[test]
+    fn media_ranges_are_bounded_and_canonical() {
+        assert_eq!(
+            parse_media_plaintext_range(Some("bytes=5-9"), 20),
+            Ok((5, 9))
+        );
+        assert_eq!(
+            parse_media_plaintext_range(Some("bytes=-4"), 20),
+            Ok((16, 19))
+        );
+        assert_eq!(
+            parse_media_plaintext_range(Some("bytes=18-"), 20),
+            Ok((18, 19))
+        );
+        assert!(parse_media_plaintext_range(Some("bytes=01-2"), 20).is_err());
+        assert!(parse_media_plaintext_range(Some("bytes=2-1"), 20).is_err());
+        assert!(parse_media_plaintext_range(Some("bytes=1-2,4-5"), 20).is_err());
+        assert!(parse_media_plaintext_range(None, 0).is_err());
+
+        let (_, end) = parse_media_plaintext_range(None, MAX_MEDIA_RANGE_BYTES * 2).unwrap();
+        assert_eq!(end, MAX_MEDIA_RANGE_BYTES - 1);
     }
 
     fn historical_account_snapshot(identity_key: u8, signing_key: u8) -> AccountSnapshot {

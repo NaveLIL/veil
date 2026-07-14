@@ -114,6 +114,16 @@ pub struct ResumePosition {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlaintextRangePlan {
+    pub plaintext_start: u64,
+    pub plaintext_end_inclusive: u64,
+    pub first_chunk: u64,
+    pub last_chunk: u64,
+    pub ciphertext_start: u64,
+    pub ciphertext_end_inclusive: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferStage {
     Preparing,
     Verifying,
@@ -289,6 +299,118 @@ pub fn ciphertext_resume_position(
         confirmed_plaintext,
         complete: false,
     })
+}
+
+/// Map one inclusive plaintext HTTP range to the minimum complete encrypted
+/// chunks required to authenticate it. Callers must fetch the exact returned
+/// ciphertext range; partial AEAD chunks are never decrypted.
+pub fn ciphertext_range_for_plaintext(
+    metadata: &EncryptedFileMeta,
+    plaintext_start: u64,
+    plaintext_end_inclusive: u64,
+) -> Result<PlaintextRangePlan, StreamingError> {
+    let geometry = validate_streaming_metadata(metadata)?;
+    if geometry.plaintext_size == 0
+        || plaintext_start > plaintext_end_inclusive
+        || plaintext_end_inclusive >= geometry.plaintext_size
+    {
+        return Err(StreamingError::InvalidMetadata(
+            "plaintext range is outside the attachment".to_string(),
+        ));
+    }
+    let chunk_size = u64::try_from(CHUNK_PLAINTEXT_SIZE).expect("chunk size fits u64");
+    let full_ciphertext =
+        u64::try_from(FULL_CHUNK_CIPHERTEXT_SIZE).expect("full ciphertext chunk size fits u64");
+    let first_chunk = plaintext_start / chunk_size;
+    let last_chunk = plaintext_end_inclusive / chunk_size;
+    let ciphertext_start = first_chunk
+        .checked_mul(full_ciphertext)
+        .ok_or_else(|| StreamingError::InvalidMetadata("range offset overflow".to_string()))?;
+    let last_offset = last_chunk
+        .checked_mul(full_ciphertext)
+        .ok_or_else(|| StreamingError::InvalidMetadata("range offset overflow".to_string()))?;
+    let last_length = u64::try_from(geometry.chunk_ciphertext_size(last_chunk)?)
+        .expect("ciphertext chunk size fits u64");
+    let ciphertext_end_inclusive = last_offset
+        .checked_add(last_length)
+        .and_then(|exclusive| exclusive.checked_sub(1))
+        .ok_or_else(|| StreamingError::InvalidMetadata("range end overflow".to_string()))?;
+    Ok(PlaintextRangePlan {
+        plaintext_start,
+        plaintext_end_inclusive,
+        first_chunk,
+        last_chunk,
+        ciphertext_start,
+        ciphertext_end_inclusive,
+    })
+}
+
+/// Authenticate complete fetched chunks and return only the requested
+/// plaintext slice. This never writes decrypted media to disk.
+pub fn decrypt_fetched_plaintext_range(
+    key: &[u8; 32],
+    metadata: &EncryptedFileMeta,
+    plan: &PlaintextRangePlan,
+    fetched_ciphertext: &[u8],
+) -> Result<Vec<u8>, StreamingError> {
+    let geometry = validate_streaming_metadata(metadata)?;
+    let expected = plan
+        .ciphertext_end_inclusive
+        .checked_sub(plan.ciphertext_start)
+        .and_then(|length| length.checked_add(1))
+        .ok_or_else(|| StreamingError::InvalidMetadata("range length overflow".to_string()))?;
+    if u64::try_from(fetched_ciphertext.len()).unwrap_or(u64::MAX) != expected {
+        return Err(StreamingError::CiphertextLength);
+    }
+    let chunk_size = u64::try_from(CHUNK_PLAINTEXT_SIZE).expect("chunk size fits u64");
+    let mut decrypted = Zeroizing::new(Vec::new());
+    let mut cursor = 0usize;
+    for chunk_index in plan.first_chunk..=plan.last_chunk {
+        let ciphertext_length = geometry.chunk_ciphertext_size(chunk_index)?;
+        let next = cursor
+            .checked_add(ciphertext_length)
+            .ok_or_else(|| StreamingError::InvalidMetadata("chunk cursor overflow".to_string()))?;
+        if next > fetched_ciphertext.len() {
+            return Err(StreamingError::CiphertextLength);
+        }
+        let is_final = chunk_index + 1 == geometry.chunk_count;
+        let plaintext = open_chunk(
+            key,
+            &metadata.nonce_prefix,
+            chunk_index,
+            is_final,
+            &fetched_ciphertext[cursor..next],
+        )?;
+        decrypted.extend_from_slice(&plaintext);
+        cursor = next;
+    }
+    if cursor != fetched_ciphertext.len() {
+        return Err(StreamingError::CiphertextLength);
+    }
+    let fetched_plaintext_start = plan
+        .first_chunk
+        .checked_mul(chunk_size)
+        .ok_or_else(|| StreamingError::InvalidMetadata("plaintext offset overflow".to_string()))?;
+    let relative_start = usize::try_from(
+        plan.plaintext_start
+            .checked_sub(fetched_plaintext_start)
+            .ok_or_else(|| StreamingError::InvalidMetadata("range start underflow".to_string()))?,
+    )
+    .map_err(|_| StreamingError::InvalidMetadata("range start overflow".to_string()))?;
+    let output_length = usize::try_from(
+        plan.plaintext_end_inclusive
+            .checked_sub(plan.plaintext_start)
+            .and_then(|length| length.checked_add(1))
+            .ok_or_else(|| StreamingError::InvalidMetadata("range output overflow".to_string()))?,
+    )
+    .map_err(|_| StreamingError::InvalidMetadata("range output overflow".to_string()))?;
+    let relative_end = relative_start
+        .checked_add(output_length)
+        .ok_or_else(|| StreamingError::InvalidMetadata("range slice overflow".to_string()))?;
+    if relative_end > decrypted.len() {
+        return Err(StreamingError::CiphertextLength);
+    }
+    Ok(decrypted[relative_start..relative_end].to_vec())
 }
 
 pub async fn prepare_streaming_upload(
@@ -743,6 +865,42 @@ async fn create_temporary_destination(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plaintext_range_fetches_complete_chunks_and_authenticates_before_slicing() {
+        let key = [0x31u8; 32];
+        let prefix = [0x42u8; 16];
+        let mut plaintext = vec![0x55u8; CHUNK_PLAINTEXT_SIZE + 23];
+        for (index, byte) in plaintext.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let first =
+            seal_chunk(&key, &prefix, 0, false, &plaintext[..CHUNK_PLAINTEXT_SIZE]).unwrap();
+        let second =
+            seal_chunk(&key, &prefix, 1, true, &plaintext[CHUNK_PLAINTEXT_SIZE..]).unwrap();
+        let mut ciphertext = first;
+        ciphertext.extend_from_slice(&second);
+        let metadata = EncryptedFileMeta {
+            format_version: CHUNK_FORMAT_VERSION,
+            nonce_prefix: prefix,
+            chunk_count: 2,
+            plaintext_size: plaintext.len() as u64,
+            ciphertext_size: ciphertext.len() as u64,
+        };
+        let start = (CHUNK_PLAINTEXT_SIZE - 7) as u64;
+        let end = (CHUNK_PLAINTEXT_SIZE + 9) as u64;
+        let plan = ciphertext_range_for_plaintext(&metadata, start, end).unwrap();
+        assert_eq!(plan.first_chunk, 0);
+        assert_eq!(plan.last_chunk, 1);
+        let fetched =
+            &ciphertext[plan.ciphertext_start as usize..=plan.ciphertext_end_inclusive as usize];
+        let opened = decrypt_fetched_plaintext_range(&key, &metadata, &plan, fetched).unwrap();
+        assert_eq!(opened, plaintext[start as usize..=end as usize]);
+
+        let mut tampered = fetched.to_vec();
+        tampered[3] ^= 1;
+        assert!(decrypt_fetched_plaintext_range(&key, &metadata, &plan, &tampered).is_err());
+    }
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
