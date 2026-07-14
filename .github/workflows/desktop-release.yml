@@ -498,8 +498,10 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --verify-tag \
               --draft \
+              --prerelease \
+              --latest=false \
               --generate-notes \
-              --title "Veil $RELEASE_VERSION"
+              --title "Veil $RELEASE_VERSION Preview"
           fi
           gh release upload "$tag" release-assets/* \
             --repo "$GITHUB_REPOSITORY" \
@@ -588,4 +590,5 @@ jobs:
           gh release edit "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --draft=false \
-            --latest
+            --prerelease \
+            --latest=false
