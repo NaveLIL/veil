@@ -739,7 +739,7 @@
           <span class="status-pill progress">Ещё в работе</span>
           <h3>Чего пока нет в stable-качестве</h3>
           <ul class="status-list">
-            <li id="package-release-status" aria-live="polite"><strong>Публичные пакеты:</strong> актуальная доступность preview-сборок автоматически отображается в разделе загрузок; Windows-пакеты требуют подпись.</li>
+            <li id="package-release-status" aria-live="polite"><strong>Публичные пакеты:</strong> актуальная доступность и статус подписи preview-сборок автоматически отображаются в разделе загрузок.</li>
             <li><strong>Mobile:</strong> Android пока foundation/prototype; production messaging, iOS и macOS-релизы не готовы.</li>
             <li><strong>Звонки:</strong> голос и видео ещё не реализованы как пользовательская функция.</li>
             <li><strong>Физические матрицы:</strong> multi-device и полный upload/download/tamper/resume gate ещё закрываются.</li>
@@ -936,7 +936,7 @@
           <span class="wip-badge">нет preview</span>
           <div class="plat-icon">🪟</div>
           <div class="plat-name">Windows</div>
-          <div class="plat-sub">подписанный installer · x64</div>
+          <div class="plat-sub">preview installer · статус подписи появится из манифеста</div>
         </div>
 
         <div class="platform-card wip">
@@ -962,6 +962,8 @@
             Это тестовые сборки, а не stable-релиз. CI формирует SHA-256 хеши рядом с бинарями.
             <a id="release-checksums" href="/downloads/SHA256SUMS" style="color: var(--primary);" hidden>Проверить SHA256SUMS.</a>
             <a id="release-source" href="/source" style="color: var(--primary);" hidden>Скачать точные исходники.</a>
+            Неподписанный Windows Preview может вызвать предупреждение SmartScreen или блокировку Smart App Control:
+            скачивайте его только с этого HTTPS-сайта и сверяйте SHA-256; не отключайте защиту Windows ради установки.
             До stable сохраняйте recovery phrase офлайн; macOS и Android появятся только после подписи и отдельной проверки платформы.
           </p>
         </div>
@@ -1034,10 +1036,12 @@
         card.setAttribute("download", "");
 
         const badge = document.createElement("span");
-        badge.className = "ready-badge";
-        badge.textContent = isRecommended
-          ? `${descriptor.badge} · preview · рекомендуется`
-          : `${descriptor.badge} · preview`;
+        const isUnsignedWindows = descriptor.platform === "windows" && file.signature === "unsigned";
+        badge.className = isUnsignedWindows ? "wip-badge" : "ready-badge";
+        const signatureLabel = descriptor.platform === "windows"
+          ? file.signature === "authenticode" ? " · Authenticode" : " · БЕЗ ПОДПИСИ"
+          : "";
+        badge.textContent = `${descriptor.badge} · preview${signatureLabel}${isRecommended && !isUnsignedWindows ? " · рекомендуется" : ""}`;
         const icon = document.createElement("div");
         icon.className = "plat-icon";
         icon.textContent = descriptor.icon;
@@ -1046,7 +1050,7 @@
         name.textContent = descriptor.name;
         const detail = document.createElement("div");
         detail.className = "plat-sub";
-        detail.textContent = `${file.filename} · ${formatBytes(file.size)}`;
+        detail.textContent = `${file.filename} · ${formatBytes(file.size)}${isUnsignedWindows ? " · сверяйте SHA-256" : ""}`;
         card.append(badge, icon, name, detail);
         return card;
       };
@@ -1092,7 +1096,42 @@
           ) {
             throw new Error("invalid release manifest");
           }
-          const files = manifest.files.filter((file) => file && filenamePattern.test(file.filename));
+          const files = manifest.files.filter((file) =>
+            file
+            && filenamePattern.test(file.filename)
+            && sha256Pattern.test(file.sha256)
+            && Number.isSafeInteger(file.size)
+            && file.size > 0
+            && (
+              file.platform !== "windows"
+              || file.signature === "authenticode"
+              || file.signature === "unsigned"
+            )
+          );
+          const requiredFileKeys = new Set([
+            "linux:deb",
+            "linux:appimage",
+            "windows:exe",
+            "windows:msi",
+          ]);
+          const requiredFiles = new Map();
+          for (const file of files) {
+            const key = `${file.platform}:${file.kind}`;
+            if (!requiredFileKeys.has(key)) continue;
+            if (requiredFiles.has(key)) throw new Error("duplicate required release file");
+            requiredFiles.set(key, file);
+          }
+          if ([...requiredFileKeys].some((key) => !requiredFiles.has(key))) {
+            throw new Error("incomplete desktop release manifest");
+          }
+          const windowsSigningModes = new Set([
+            requiredFiles.get("windows:exe").signature,
+            requiredFiles.get("windows:msi").signature,
+          ]);
+          if (windowsSigningModes.size !== 1) {
+            throw new Error("inconsistent Windows signing metadata");
+          }
+          const windowsSigningMode = [...windowsSigningModes][0];
           let available = 0;
           let recommendationAssigned = false;
           const cards = orderedDescriptors.map((descriptor) => {
@@ -1106,13 +1145,14 @@
             return releaseCard(descriptor, file, isRecommended);
           });
           if (available === 0) throw new Error("release has no supported files");
+          const windowsUnsigned = windowsSigningMode === "unsigned";
           grid.replaceChildren(...cards);
           status.textContent = `Veil Preview ${manifest.version}. Это тестовая сборка; карточки обновляются автоматически после release gate.`;
           const packageLabel = document.createElement("strong");
           packageLabel.textContent = "Публичные пакеты:";
           packageStatus.replaceChildren(
             packageLabel,
-            ` Veil Preview ${manifest.version} прошёл release gate; доступные форматы перечислены в разделе загрузок. Windows-пакеты требуют подпись.`
+            ` Veil Preview ${manifest.version} прошёл release gate; доступны Linux и Windows.${windowsUnsigned ? " Windows Preview пока без Authenticode — проверьте SHA-256 и ожидайте предупреждение SmartScreen." : " Windows-пакеты подписаны Authenticode."}`
           );
           checksums.hidden = false;
           sourceLink.href = `/downloads/${encodeURIComponent(manifest.source.filename)}`;

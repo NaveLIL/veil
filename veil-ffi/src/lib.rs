@@ -191,7 +191,11 @@ impl VeilMobileSession {
         })?;
         let user_id = self
             .runtime
-            .block_on(client.connect_with_device_name(&websocket_url, "veil-android"))
+            .block_on(client.connect_with_client_metadata(
+                &websocket_url,
+                "veil-android",
+                "veil-android",
+            ))
             .map_err(|msg| VeilError::Session { msg })?;
         require_canonical_user_id("authenticated mobile user ID", &user_id)?;
         let identity_key = client

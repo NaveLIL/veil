@@ -1242,7 +1242,7 @@ impl VeilClient {
     /// Performs Ed25519 challenge-response authentication.
     /// Returns the server-assigned user_id (UUID).
     pub async fn connect(&mut self, server_url: &str) -> Result<String, String> {
-        self.connect_with_device_name(server_url, "veil-desktop")
+        self.connect_with_client_metadata(server_url, "veil-desktop", "veil-desktop")
             .await
     }
 
@@ -1253,6 +1253,19 @@ impl VeilClient {
         server_url: &str,
         device_name: &str,
     ) -> Result<String, String> {
+        self.connect_with_client_metadata(server_url, device_name, "veil-desktop")
+            .await
+    }
+
+    /// Connect with separate human-readable device and stable product labels.
+    /// The client id becomes part of the protocol-level version string and
+    /// must never be derived from a user-editable device name.
+    pub async fn connect_with_client_metadata(
+        &mut self,
+        server_url: &str,
+        device_name: &str,
+        client_id: &str,
+    ) -> Result<String, String> {
         if device_name.is_empty()
             || device_name.len() > 128
             || device_name.chars().any(|character| {
@@ -1260,6 +1273,14 @@ impl VeilClient {
             })
         {
             return Err("device name is invalid".to_string());
+        }
+        if client_id.is_empty()
+            || client_id.len() > 64
+            || !client_id
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        {
+            return Err("client id is invalid".to_string());
         }
         let identity = self.identity.as_ref().ok_or("not initialized")?;
         let device_identity = self
@@ -1270,7 +1291,8 @@ impl VeilClient {
             server_url: server_url.to_string(),
         };
 
-        let mut conn = Connection::connect(&config, identity, device_identity, device_name).await?;
+        let mut conn =
+            Connection::connect(&config, identity, device_identity, device_name, client_id).await?;
 
         // Drain the Authenticated event to get user_id
         let user_id = match conn.events.try_recv() {

@@ -52,6 +52,15 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      - name: Set up pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Protocol Buffers compiler
+        run: protoc --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
@@ -77,25 +86,7 @@ jobs:
             libayatana-appindicator3-dev \
             libsecret-1-dev \
             libwebkit2gtk-4.1-dev \
-            librsvg2-dev \
-            protobuf-compiler
-          protoc --version
-
-      - name: Install system deps (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install protobuf
-          protoc --version
-
-      - name: Install system deps (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
-            choco install protoc --yes --no-progress
-            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          }
-          protoc --version
+            librsvg2-dev
 
       - name: Check formatting
         run: cargo fmt --all -- --check

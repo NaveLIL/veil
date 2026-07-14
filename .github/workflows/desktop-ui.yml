@@ -15,6 +15,7 @@ on:
       - "veil-desktop/visual.html"
       - "veil-desktop/visual-tests/**"
       - "veil-desktop/public/visual/**"
+      - "veil-server/cmd/gateway/web/index.html"
       - ".github/workflows/desktop-ui.yml"
   pull_request:
     branches: [master, main]
@@ -30,6 +31,7 @@ on:
       - "veil-desktop/visual.html"
       - "veil-desktop/visual-tests/**"
       - "veil-desktop/public/visual/**"
+      - "veil-server/cmd/gateway/web/index.html"
       - ".github/workflows/desktop-ui.yml"
 
 permissions:

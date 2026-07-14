@@ -56,7 +56,8 @@ jobs:
           package_version="$(jq -r .version veil-desktop/package.json)"
           tauri_version="$(jq -r .version veil-desktop/src-tauri/tauri.conf.json)"
           cargo_version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' veil-desktop/src-tauri/Cargo.toml | head -n 1)"
-          for actual in "$package_version" "$tauri_version" "$cargo_version"; do
+          client_version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' veil-client/Cargo.toml | head -n 1)"
+          for actual in "$package_version" "$tauri_version" "$cargo_version" "$client_version"; do
             if [[ "$actual" != "$version" ]]; then
               echo "Tag version $version does not match desktop version $actual" >&2
               exit 1
@@ -82,8 +83,16 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libxdo-dev \
             librsvg2-dev \
-            pkg-config \
-            protobuf-compiler
+            pkg-config
+
+      - name: Set up pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Protocol Buffers compiler
+        run: protoc --version
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -163,8 +172,16 @@ jobs:
             librsvg2-dev \
             patchelf \
             pkg-config \
-            protobuf-compiler \
             wget
+
+      - name: Set up pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Protocol Buffers compiler
+        run: protoc --version
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -274,17 +291,53 @@ jobs:
           retention-days: 14
 
   windows:
-    name: Windows (signed NSIS + MSI)
+    name: Windows Preview (NSIS + MSI)
     needs: [validate, quality]
-    if: ${{ vars.VEIL_ENABLE_WINDOWS_RELEASE == 'true' }}
-    runs-on: windows-latest
+    runs-on: windows-2022
+    outputs:
+      signing_mode: ${{ steps.signing_mode.outputs.mode }}
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}\target
       RELEASE_VERSION: ${{ needs.validate.outputs.version }}
-      WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
-      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Select Windows signing mode
+        id: signing_mode
+        shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+          REQUIRE_WINDOWS_SIGNING: ${{ vars.VEIL_REQUIRE_WINDOWS_SIGNING }}
+        run: |
+          $hasPfx = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX)
+          $hasPassword = -not [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)
+          if ($hasPfx -xor $hasPassword) {
+            throw "Both Windows signing secrets must be set, or neither"
+          }
+
+          $requireSigning = ([string]$env:REQUIRE_WINDOWS_SIGNING).Trim().ToLowerInvariant()
+          if ($requireSigning -notin @("", "false", "true")) {
+            throw "VEIL_REQUIRE_WINDOWS_SIGNING must be true or false"
+          }
+          if ($requireSigning -eq "true" -and -not ($hasPfx -and $hasPassword)) {
+            throw "Windows signing is required but signing credentials are absent"
+          }
+
+          $mode = if ($hasPfx -and $hasPassword) { "authenticode" } else { "unsigned" }
+          if ($mode -eq "unsigned") {
+            Write-Warning "Publishing unsigned Windows Preview installers; SmartScreen may warn or block"
+          }
+          "mode=$mode" >> $env:GITHUB_OUTPUT
+
+      - name: Set up pinned Protocol Buffers compiler
+        uses: arduino/setup-protoc@f4d5893b897028ff5739576ea0409746887fa536 # v3.0.0
+        with:
+          version: "34.1"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Protocol Buffers compiler
+        run: protoc --version
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -304,17 +357,13 @@ jobs:
           cache: pnpm
           cache-dependency-path: veil-desktop/pnpm-lock.yaml
 
-      - name: Require signing credentials
-        shell: pwsh
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PFX) -or
-              [string]::IsNullOrWhiteSpace($env:WINDOWS_CERTIFICATE_PASSWORD)) {
-            throw "WINDOWS_CERTIFICATE_PFX and WINDOWS_CERTIFICATE_PASSWORD secrets are required when VEIL_ENABLE_WINDOWS_RELEASE=true"
-          }
-
       - name: Import Authenticode certificate
         id: certificate
+        if: ${{ steps.signing_mode.outputs.mode == 'authenticode' }}
         shell: pwsh
+        env:
+          WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
         run: |
           $pfxPath = Join-Path $env:RUNNER_TEMP "veil-signing.pfx"
           try {
@@ -328,10 +377,11 @@ jobs:
             Remove-Item -LiteralPath $pfxPath -Force -ErrorAction SilentlyContinue
           }
 
-      - name: Generate signed release-only Tauri config
+      - name: Generate release-only Tauri config
         working-directory: veil-desktop
         shell: pwsh
         env:
+          WINDOWS_SIGNING_MODE: ${{ steps.signing_mode.outputs.mode }}
           CERT_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
         run: |
           $config = Get-Content src-tauri\tauri.conf.json -Raw | ConvertFrom-Json
@@ -339,38 +389,62 @@ jobs:
           if ($null -eq $config.bundle.windows) {
             $config.bundle | Add-Member -NotePropertyName windows -NotePropertyValue ([pscustomobject]@{})
           }
-          $config.bundle.windows | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $env:CERT_THUMBPRINT -Force
-          $config.bundle.windows | Add-Member -NotePropertyName digestAlgorithm -NotePropertyValue "sha256" -Force
-          $config.bundle.windows | Add-Member -NotePropertyName timestampUrl -NotePropertyValue "http://timestamp.digicert.com" -Force
+          foreach ($property in @("certificateThumbprint", "digestAlgorithm", "timestampUrl", "tsp", "signCommand")) {
+            $config.bundle.windows.PSObject.Properties.Remove($property)
+          }
+          if ($env:WINDOWS_SIGNING_MODE -eq "authenticode") {
+            if ([string]::IsNullOrWhiteSpace($env:CERT_THUMBPRINT)) {
+              throw "The signing certificate thumbprint is unavailable"
+            }
+            $config.bundle.windows | Add-Member -NotePropertyName certificateThumbprint -NotePropertyValue $env:CERT_THUMBPRINT -Force
+            $config.bundle.windows | Add-Member -NotePropertyName digestAlgorithm -NotePropertyValue "sha256" -Force
+            $config.bundle.windows | Add-Member -NotePropertyName timestampUrl -NotePropertyValue "http://timestamp.digicert.com" -Force
+            $config.bundle.windows | Add-Member -NotePropertyName tsp -NotePropertyValue $true -Force
+          }
           $config | ConvertTo-Json -Depth 100 | Set-Content src-tauri\tauri.release.conf.json -Encoding utf8
 
       - name: Install locked frontend dependencies
         working-directory: veil-desktop
         run: pnpm install --frozen-lockfile
 
-      - name: Build signed Windows installers
+      - name: Build Windows installers
         working-directory: veil-desktop
         run: pnpm tauri build --ci --bundles "nsis,msi" --config src-tauri/tauri.release.conf.json
 
-      - name: Verify signatures and normalize Windows asset names
+      - name: Verify Windows artifacts and normalize asset names
         shell: pwsh
+        env:
+          WINDOWS_SIGNING_MODE: ${{ steps.signing_mode.outputs.mode }}
         run: |
           $bundleRoot = Join-Path $env:CARGO_TARGET_DIR "release\bundle"
           $nsis = @(Get-ChildItem (Join-Path $bundleRoot "nsis") -Filter *.exe -File)
           $msi = @(Get-ChildItem (Join-Path $bundleRoot "msi") -Filter *.msi -File)
           if ($nsis.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($nsis.Count)" }
           if ($msi.Count -ne 1) { throw "Expected exactly one MSI installer, found $($msi.Count)" }
-          $artifacts = @($nsis[0], $msi[0])
+          $app = Get-Item (Join-Path $env:CARGO_TARGET_DIR "release\veil-desktop.exe")
+          $artifacts = @($app, $nsis[0], $msi[0])
           foreach ($artifact in $artifacts) {
+            if ($artifact.Length -le 0) { throw "Empty Windows artifact: $($artifact.FullName)" }
             $signature = Get-AuthenticodeSignature -LiteralPath $artifact.FullName
-            if ($signature.Status -ne "Valid") {
-              throw "Invalid Authenticode signature on $($artifact.FullName): $($signature.Status)"
+            $expectedStatus = if ($env:WINDOWS_SIGNING_MODE -eq "authenticode") { "Valid" } else { "NotSigned" }
+            if ($signature.Status.ToString() -ne $expectedStatus) {
+              throw "Unexpected Authenticode status on $($artifact.FullName): expected $expectedStatus, got $($signature.Status)"
+            }
+            if ($env:WINDOWS_SIGNING_MODE -eq "authenticode" -and $null -eq $signature.TimeStamperCertificate) {
+              throw "Missing RFC 3161 timestamp on signed artifact: $($artifact.FullName)"
             }
           }
           New-Item -ItemType Directory -Path release-assets -Force | Out-Null
           Copy-Item -LiteralPath $nsis[0].FullName -Destination release-assets\Veil-windows-x64-setup.exe
           Copy-Item -LiteralPath $msi[0].FullName -Destination release-assets\Veil-windows-x64.msi
           Copy-Item -LiteralPath veil-desktop\src-tauri\resources\THIRD_PARTY_NOTICES.txt -Destination release-assets\Veil-windows-THIRD_PARTY_NOTICES.txt
+
+      - name: Remove imported Authenticode certificate
+        if: ${{ always() && steps.signing_mode.outputs.mode == 'authenticode' && steps.certificate.outputs.thumbprint != '' }}
+        shell: pwsh
+        env:
+          CERT_THUMBPRINT: ${{ steps.certificate.outputs.thumbprint }}
+        run: Remove-Item -LiteralPath "Cert:\CurrentUser\My\$env:CERT_THUMBPRINT" -Force -ErrorAction Stop
 
       - name: Upload Windows release assets
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -387,12 +461,13 @@ jobs:
       ${{ always()
           && needs.validate.result == 'success'
           && needs.linux.result == 'success'
-          && (needs.windows.result == 'success' || needs.windows.result == 'skipped') }}
+          && needs.windows.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     env:
       RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+      WINDOWS_SIGNING_MODE: ${{ needs.windows.outputs.signing_mode }}
     steps:
       - name: Check out exact release source
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -406,7 +481,6 @@ jobs:
           path: release-assets
 
       - name: Download Windows assets
-        if: ${{ needs.windows.result == 'success' }}
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           name: veil-windows-release
@@ -444,14 +518,14 @@ jobs:
             Veil-linux-amd64.deb
             Veil-linux-x86_64.AppImage
             Veil-linux-THIRD_PARTY_NOTICES.txt
+            Veil-windows-x64-setup.exe
+            Veil-windows-x64.msi
+            Veil-windows-THIRD_PARTY_NOTICES.txt
             "$source_filename"
           )
-          if [[ -f Veil-windows-x64-setup.exe || -f Veil-windows-x64.msi ]]; then
-            expected+=(
-              Veil-windows-x64-setup.exe
-              Veil-windows-x64.msi
-              Veil-windows-THIRD_PARTY_NOTICES.txt
-            )
+          if [[ "$WINDOWS_SIGNING_MODE" != "authenticode" && "$WINDOWS_SIGNING_MODE" != "unsigned" ]]; then
+            echo "Unexpected Windows signing mode: $WINDOWS_SIGNING_MODE" >&2
+            exit 1
           fi
           for filename in "${expected[@]}"; do
             if [[ ! -s "$filename" ]]; then
@@ -468,6 +542,7 @@ jobs:
             local kind="$2"
             local label="$3"
             local filename="$4"
+            local signature="${5:-}"
             local size sha
             size="$(stat -c '%s' "$filename")"
             sha="$(sha256sum "$filename" | awk '{print $1}')"
@@ -478,16 +553,17 @@ jobs:
                 --arg kind "$kind" \
                 --arg label "$label" \
                 --arg filename "$filename" \
+                --arg signature "$signature" \
                 --argjson size "$size" \
                 --arg sha256 "$sha" \
-                '. + [{
+                '. + [({
                   platform: $platform,
                   kind: $kind,
                   label: $label,
                   filename: $filename,
                   size: $size,
                   sha256: $sha256
-                }]' <<< "$files"
+                } + (if $signature == "" then {} else {signature: $signature} end))]' <<< "$files"
             )"
           }
 
@@ -516,11 +592,9 @@ jobs:
           add_file linux deb "Linux Debian/Ubuntu (x86_64)" Veil-linux-amd64.deb
           add_file linux appimage "Linux AppImage (x86_64)" Veil-linux-x86_64.AppImage
           add_notice linux Veil-linux-THIRD_PARTY_NOTICES.txt
-          if [[ -f Veil-windows-x64-setup.exe ]]; then
-            add_file windows exe "Windows installer (x64)" Veil-windows-x64-setup.exe
-            add_file windows msi "Windows MSI (x64)" Veil-windows-x64.msi
-            add_notice windows Veil-windows-THIRD_PARTY_NOTICES.txt
-          fi
+          add_file windows exe "Windows installer (x64)" Veil-windows-x64-setup.exe "$WINDOWS_SIGNING_MODE"
+          add_file windows msi "Windows MSI (x64)" Veil-windows-x64.msi "$WINDOWS_SIGNING_MODE"
+          add_notice windows Veil-windows-THIRD_PARTY_NOTICES.txt
 
           source_size="$(stat -c '%s' "$source_filename")"
           source_sha256="$(sha256sum "$source_filename" | awk '{print $1}')"
@@ -563,13 +637,20 @@ jobs:
               and (.source.filename | test("^Veil-[0-9]+\\.[0-9]+\\.[0-9]+-source\\.tar\\.gz$"))
               and (.source.sha256 | test("^[0-9a-f]{64}$"))
               and (.source.size > 0)
-              and (.notices | length) >= 1
+              and (.notices | length) == 2
               and all(.notices[];
                 (.platform == "linux" or .platform == "windows")
                 and (.filename | test("^Veil-(linux|windows)-THIRD_PARTY_NOTICES\\.txt$"))
                 and (.sha256 | test("^[0-9a-f]{64}$"))
                 and (.size > 0))
-              and (.files | length) >= 2' \
+              and (.files | length) == 4
+              and ([.files[] | select(.platform == "linux")] | length) == 2
+              and ([.files[] | select(.platform == "windows")] | length) == 2
+              and all(.files[];
+                (.sha256 | test("^[0-9a-f]{64}$"))
+                and (.size > 0))
+              and all(.files[] | select(.platform == "windows");
+                .signature == "authenticode" or .signature == "unsigned")' \
             latest.json > /dev/null
           cat SHA256SUMS
           jq . latest.json
