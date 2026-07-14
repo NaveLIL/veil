@@ -34,20 +34,24 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
    [`docs/reviews/phase-4d-completion-gate.md`](docs/reviews/phase-4d-completion-gate.md).
 3. Phase 4E implementation и automated gate выполнены; physical Veil Link /
    two-device matrix остаётся release evidence и не переоткрывает baselines 4A–4D.
-4. Phase 3B desktop implementation выполнена; physical attachment matrix и
-   mobile часть 4P остаются явными product scopes до beta.
-5. На стабильном desktop/profile фундаменте начать Android foundation (5A),
+4. Phase 2 product hardening закрыт: hard budget для rebuild/live mutation,
+   exact SQLCipher navigation, независимый security review и полная проверочная
+   матрица опубликованы в completion gate.
+5. Phase 3B и 4P сохраняются отдельными незакрытыми product scopes: имеющийся
+   desktop/transport foundation не заменяет physical attachment и native mobile
+   push device matrices.
+6. На стабильном desktop/profile фундаменте продолжить Android foundation (5A),
    после per-device модели подключить боевые сообщения Android (5B).
-6. Затем довести MLS runtime, звонки и release polish.
+7. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
 
 | # | Фаза | |
 |---|------|--|
 | 1 | Kobalte — headless UI | закрыто: composite controls/focus/keyboard/ARIA унифицированы |
-| 2 | Tantivy — локальный поиск | готово, индекс теперь только в RAM |
-| 3 | tus.io — загрузка файлов | core закрыт; 3B desktop attachment client реализован, physical matrix остаётся gate |
-| 4 | UnifiedPush / ntfy | transport core и desktop subscription management закрыты; mobile receiver привязан к native Phase 5A |
+| 2 | Tantivy — локальный поиск | закрыто: RAM-only exact-origin index, bounded coverage и точная SQLCipher navigation |
+| 3 | tus.io — загрузка файлов | protocol core закрыт; 3B product gate открыт до physical attachment matrix |
+| 4 | UnifiedPush / ntfy | transport core готов; 4P device-client gate открыт до native mobile runtime и physical matrix |
 | 4A | Группы, серверы, роли | access/crypto core закрыт; product IA/settings вынесены в 4E |
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
@@ -79,12 +83,20 @@ origin, identity, границы доступа и фактический crypto
 | **Room** | функциональный контекст внутри Space | text Room сейчас соответствует `channel` и отдельной conversation/security domain |
 | **Veil Node** | self-hosted инфраструктура и canonical origin аккаунта | exact `(scheme, host, effective port)` origin |
 | **Veil Link** | versioned приглашение в Space | scoped capability, не browser session и не identity proof |
+| **Community** *(future)* | публикационное совместное пространство с постами, комментариями, реакциями и опросами | отдельный будущий product/schema/privacy/security contract; runtime отсутствует |
 
 `Home`, `Direct`, `Circle`, `Space`, `Room`, `Veil Link` и `Veil Node` являются
 продуктовым языком. Внутренние `dm/group/server/channel` в PostgreSQL, REST,
 protobuf и Rust/Go не переименовываются механически: это точные protocol/storage
 сущности, а не обязательство поддерживать старую информационную архитектуру.
 Ни один UI-термин не меняет crypto mode, ACL, roster или history policy.
+
+Community не является автоматической мутацией Circle и не выдаётся за готовую
+часть Space runtime. Возможная будущая модель переиспользует общие identity,
+origin и access invariants, но вводит новые content/history/moderation contracts
+только после отдельного review. Браузерная версия мессенджера не входит ни в эту
+модель, ни в будущий Community: web остаётся статическим product/docs/download
+surface и узкими Veil Link/Share capability flows без account session и keys.
 
 Один discriminated navigation state развивается до
 `home(overview | friends | requests | direct(direct_id)) | circle(circle_id) |
@@ -136,8 +148,9 @@ keyboard navigation тестируются. Простые нативные `<bu
 
 ## Phase 2 — Tantivy локальный поиск
 
-**Статус product hardening 2026-07-14: закрыто автоматизированными проверками.**
-Completion evidence и границы RAM-only индекса зафиксированы в
+**Статус product hardening 2026-07-14: закрыто.** Независимый security re-review
+завершён с `P0=0, P1=0, P2=0`; полная Rust/Go/Docker/frontend/visual/Windows
+матрица зелёная. Контракт и фактические completion evidence зафиксированы в
 [`phase-2-search-product-gate.md`](docs/reviews/phase-2-search-product-gate.md).
 
 Полнотекстовый поиск по расшифрованным сообщениям. Индекс живёт только на
@@ -151,7 +164,8 @@ Windows ACL для search-директории и `search/v1`/`search/v2` бол
 Схема индекса: `id (STORED)`, `conversation_id (STORED + INDEXED)`, `sender_id (STORED + INDEXED)`, `body (TEXT)`, `timestamp (STORED + FAST для сортировки)`. Токенайзер — стандартный с lowercaser. Для кириллицы в v1 достаточно; multi-language остаётся отдельным улучшением.
 
 Tauri команды: `search_messages`, `rebuild_search_index`,
-`cancel_search_rebuild`, `clear_search_index`, `ensure_search_backfill`.
+`cancel_search_rebuild`, `clear_search_index`, `ensure_search_backfill`,
+`get_search_coverage`, `get_search_result_context`.
 Origin-scoped backfill выполняется после authenticated offline sync и может быть
 безопасно повторён. Ручной rebuild отменяем; кандидат публикуется одной атомарной
 заменой, поэтому поиск видит либо предыдущий полный индекс, либо новый полный
@@ -164,18 +178,41 @@ Origin-scoped backfill выполняется после authenticated offline s
   новейших непустых сообщений одного exact origin. Это bounded input для
   Tantivy, а не обещание, что allocator/index overhead равен ровно 64 MiB. При
   достижении границы UI честно сообщает частичное покрытие старой истории.
+- Эти же hard bounds применяются внутри `veil-search` к live insert/edit/delete,
+  а не только к rebuild projection. При переполнении сохраняется непрерывный
+  newest slice; truncation остаётся видимой до полной очистки/rebuild.
 - Rebuild читает SQLCipher newest-first через keyset pagination без старого
-  молчаливого лимита 100 000 сообщений на conversation. Lock, смена account/
-  origin, новый rebuild или явная Cancel инвалидируют candidate до публикации.
+  молчаливого лимита 100 000 сообщений на conversation. Порядок
+  `(effective timestamp, canonical message UUID)` совпадает с live budget;
+  edit сохраняет исходную recency и не реинсертит старое сообщение как новое.
+  Lock, смена account/origin, новый rebuild или явная Cancel инвалидируют
+  candidate до публикации.
+- Live mutation имеет monotonic mutation generation. Prepared rebuild не может
+  затереть insert/edit/delete, случившийся во время SQLCipher extraction или
+  Tantivy build: stale candidate отклоняется до swap, а текущий complete index
+  остаётся опубликованным.
+- Выбор результата повторно открывает exact `message_id + conversation_id +
+  canonical_server_origin` из SQLCipher и публикует не более 200 сообщений
+  вокруг цели. Native возвращает authoritative `dm | group | channel` и для
+  Room — exact `server_id`; renderer не выводит тип контекста из одного UUID и
+  не подменяет недоступный Room личным диалогом.
+- Coverage опубликованного snapshot хранится рядом с RAM index в process state,
+  выводится из того же committed Tantivy state и привязывается к exact native
+  session/account/origin publication. Она очищается при lock/account/origin
+  transition и отображается также после автоматического backfill. Устаревшие
+  search/navigation ответы отсеиваются по query generation, UI session epoch и
+  authenticated binding generation.
 - Воспроизводимый release-profile test на 100 000 synthetic документов прошёл
-  за 0.192 s на текущей Windows-машине 2026-07-14. Это evidence регрессии и
+  за 0.410 s на текущей Windows-машине 2026-07-14. Это evidence регрессии и
   bounded pipeline, а не универсальная гарантия времени для любого устройства.
 - Смена схемы означает полный rebuild из SQLCipher; миграция отдельного search-файла не требуется.
 
-Что сделано: crate `veil-search`, подключён в `veil-client::api` в шести местах
+Что закрыто: crate `veil-search`, подключённый в `veil-client::api`
 (outgoing + incoming: insert, edit, delete). UI: `CommandPalette` на Kobalte
 Dialog + Cmd/Ctrl+K, debounce, inline `<mark>` highlight, клавиатурная навигация,
-доступная отмена rebuild и валидируемый bounded completion report.
+доступная отмена rebuild, отдельные loading/error/empty состояния, точный
+переход с центрированием найденного сообщения и валидируемые bounded
+completion/coverage reports.
 
 ---
 
@@ -205,7 +242,7 @@ Attachment теперь привязан к сообщению/разговор�
 которому разрешена история этого разговора. Сервер всё равно хранит только
 ciphertext и не получает ключ файла.
 
-**Phase 3B — Attachment Experience (implementation complete 2026-07-14; physical gate pending):**
+**Phase 3B — Attachment Experience (implementation checkpoint есть; product gate pending):**
 
 Готово: security/schema review, versioned E2EE attachment payload, descriptor
 commitment, O(1) XChaCha20 key wrapping внутри текущего Double Ratchet/Sender-Key
@@ -223,7 +260,7 @@ audio/video signatures и отдаёт WebView не более 8 MiB за range.
 Capability привязан к текущим origin/session epoch, живёт не более 10 минут и
 уничтожается вместе с ключом при lock/account switch.
 
-Осталось до формального закрытия только внешнее доказательство, которое нельзя
+Формальное закрытие не объявляется без внешнего доказательства, которое нельзя
 честно заменить unit/integration тестом:
 - physical two-device upload/download/tamper/resume/media-seek matrix.
 
@@ -243,7 +280,8 @@ Streaming uploader уже использует bounded-memory chunk pipeline д�
 ## Phase 4 — UnifiedPush / ntfy push-уведомления
 
 **Статус transport core 2026-07-14: исправлен и закрыт автоматическими
-проверками.** Повторный аудит актуальной UnifiedPush specification выявил, что
+проверками; Phase 4P device-client gate остаётся открытым.** Повторный аудит
+актуальной UnifiedPush specification выявил, что
 прежний endpoint-only custom envelope не совместим с Android connector.
 Migration 025 удаляет эти pre-release bindings и переводит транспорт на RFC 8291
 Web Push (`aes128gcm`) с обязательными `p256dh`/`auth` и RFC 8292 VAPID.
@@ -494,7 +532,7 @@ smoke:
 | Предыдущая фаза | Gate | Scope disposition |
 |---|---|---|
 | 1 | пройден | composite controls/focus/keyboard закрыты; простые semantic HTML controls допустимы |
-| 2 | пройден | RAM-only поиск и rebuild из SQLCipher работают; memory budget остаётся release hardening |
+| 2 | пройден | RAM-only поиск и rebuild из SQLCipher работают; memory budget был entry-gate hardening и закрыт Phase 2 product gate 2026-07-14 |
 | 3 | пройден | encrypted upload core закрыт; attachment UX/2 GiB streaming — Phase 3B |
 | 4 | пройден | encrypted transport core закрыт; device `K_push` clients — Phase 4P |
 | 4A | пройден | authoritative access/roster core закрыт; Veil Spaces IA/settings — Phase 4E |

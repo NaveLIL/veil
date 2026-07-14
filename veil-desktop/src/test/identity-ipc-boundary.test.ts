@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   validatedLiveMessage,
+  validatedSearchCoverage,
   validatedSearchHits,
+  validatedSearchResultContext,
   validatedStoredMessages,
 } from "@/lib/identityIpcBoundary";
 
@@ -10,6 +12,7 @@ const CONVERSATION_ID = "550e8400-e29b-41d4-a716-446655440010";
 const MESSAGE_ID = "550e8400-e29b-41d4-a716-446655440011";
 const USER_ID = "550e8400-e29b-41d4-a716-446655440012";
 const PEER_ID = "550e8400-e29b-41d4-a716-446655440013";
+const SERVER_ID = "550e8400-e29b-41d4-a716-446655440014";
 const IDENTITY_KEY = "41".repeat(32);
 const SIGNING_KEY = "42".repeat(32);
 
@@ -159,5 +162,51 @@ describe("identity IPC renderer boundary", () => {
       Array.from({ length: 31 }, () => searchHit),
       ORIGIN,
     )).toThrow();
+  });
+
+  it("requires an exact target-bearing search window and authoritative Room context", () => {
+    const context = validatedSearchResultContext({
+      targetMessageId: MESSAGE_ID,
+      conversationId: CONVERSATION_ID,
+      conversationType: "channel",
+      serverId: SERVER_ID,
+      messages: [storedMessage],
+    }, MESSAGE_ID, CONVERSATION_ID, ORIGIN);
+    expect(context.serverId).toBe(SERVER_ID);
+    expect(context.messages[0].id).toBe(MESSAGE_ID);
+
+    for (const invalid of [
+      { ...context, targetMessageId: PEER_ID },
+      { ...context, conversationId: PEER_ID },
+      { ...context, serverId: undefined },
+      { ...context, conversationType: "dm", serverId: SERVER_ID },
+      { ...context, messages: [] },
+      { ...context, messages: [storedMessage, storedMessage] },
+    ]) {
+      expect(() => validatedSearchResultContext(
+        invalid,
+        MESSAGE_ID,
+        CONVERSATION_ID,
+        ORIGIN,
+      )).toThrow();
+    }
+  });
+
+  it("validates the bounded published search coverage snapshot", () => {
+    expect(validatedSearchCoverage(null)).toBeNull();
+    expect(validatedSearchCoverage({
+      indexedMessages: 42,
+      indexedSourceBytes: 4096,
+      maxSourceBytes: 64 * 1024 * 1024,
+      truncated: true,
+    })?.truncated).toBe(true);
+    for (const invalid of [
+      { indexedMessages: -1, indexedSourceBytes: 0, maxSourceBytes: 64 * 1024 * 1024, truncated: false },
+      { indexedMessages: 250_001, indexedSourceBytes: 0, maxSourceBytes: 64 * 1024 * 1024, truncated: true },
+      { indexedMessages: 1, indexedSourceBytes: 1, maxSourceBytes: 1, truncated: false },
+      { indexedMessages: 1, indexedSourceBytes: 64 * 1024 * 1024 + 1, maxSourceBytes: 64 * 1024 * 1024, truncated: true },
+    ]) {
+      expect(() => validatedSearchCoverage(invalid)).toThrow();
+    }
   });
 });

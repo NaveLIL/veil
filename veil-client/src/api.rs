@@ -1698,7 +1698,7 @@ impl VeilClient {
     fn confirm_pending_mutation(
         &mut self,
         sequence: u64,
-        server_timestamp: u64,
+        _server_timestamp: u64,
     ) -> Result<Option<ConfirmedMutation>, String> {
         let Some(mutation) = self.pending_mutations.get(&sequence).cloned() else {
             return Ok(None);
@@ -1732,20 +1732,10 @@ impl VeilClient {
             match &mutation {
                 ConfirmedMutation::Edit {
                     message_id,
-                    conversation_id,
                     new_text,
+                    ..
                 } => {
-                    let sender_key = self.identity_key()?;
-                    let timestamp_ms = i64::try_from(server_timestamp / 1_000_000)
-                        .map_err(|_| "server mutation timestamp exceeds i64".to_string())?;
-                    let _ = indexer.delete(message_id);
-                    let _ = indexer.index_message(
-                        message_id,
-                        conversation_id,
-                        &hex::encode(sender_key),
-                        new_text,
-                        timestamp_ms,
-                    );
+                    let _ = indexer.update_message_body(message_id, new_text);
                 }
                 ConfirmedMutation::Delete { message_id, .. } => {
                     let _ = indexer.delete(message_id);
@@ -4472,22 +4462,7 @@ impl VeilClient {
             }
         };
         if let Some(indexer) = self.indexer.as_ref() {
-            let _ = indexer.delete(message_id);
-            let timestamp = remote_metadata
-                .map(|metadata| metadata.revision_ms)
-                .unwrap_or_else(|| {
-                    SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .map(|duration| duration.as_millis() as i64)
-                        .unwrap_or(0)
-                });
-            let _ = indexer.index_message(
-                message_id,
-                conversation_id,
-                &hex::encode(sender_identity_key),
-                &plaintext,
-                timestamp,
-            );
+            let _ = indexer.update_message_body(message_id, &plaintext);
         }
         Ok(plaintext)
     }
@@ -4723,20 +4698,18 @@ impl VeilClient {
     }
 
     /// Update a message in local DB (for incoming edits).
-    pub fn update_local_message(&self, message_id: &str, new_text: &str) {
-        if let Some(ref db) = self.db {
-            let _ = db.update_message_text(message_id, new_text);
-        }
+    pub fn update_local_message(&self, message_id: &str, new_text: &str) -> Result<(), String> {
+        self.db
+            .as_ref()
+            .ok_or("database not initialized")?
+            .update_message_text(message_id, new_text)?;
         if let Some(ref idx) = self.indexer {
-            // We don't know conversation/sender here without a DB read; the body
-            // change is what matters for FTS. Re-issue with empty fields — the
-            // next full re-index (rebuild) will restore metadata.
-            let ts = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            let _ = idx.index_message(message_id, "", "", new_text, ts);
+            // Preserve the original search recency and authoritative metadata;
+            // an edit outside the retained slice must not be reinserted as new.
+            idx.update_message_body(message_id, new_text)
+                .map_err(|error| format!("update local search projection: {error}"))?;
         }
+        Ok(())
     }
 
     /// Delete a message from local DB (for incoming deletes).

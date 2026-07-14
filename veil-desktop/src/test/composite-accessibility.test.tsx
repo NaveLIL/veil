@@ -175,13 +175,14 @@ describe("composite widget accessibility", () => {
 
   it("uses combobox/listbox semantics and restores focus after opening a result", async () => {
     invokeMock.mockImplementation(async (command: string) => {
-      if (command !== "search_messages") return 0;
+      if (command === "get_search_coverage") return null;
+      if (command !== "search_messages") return undefined;
       return [
         { id: "m1", conversationId: "c1", body: "first cipher result", ts: 1, score: 2 },
         { id: "m2", conversationId: "c2", body: "second cipher result", ts: 2, score: 1 },
       ];
     });
-    const navigate = vi.fn(async () => undefined);
+    const navigate = vi.fn(async () => true);
     const openIdentity = vi.fn();
     const Harness = () => {
       const [open, setOpen] = createSignal(false);
@@ -218,7 +219,10 @@ describe("composite widget accessibility", () => {
     expect(combobox).toHaveAttribute("aria-activedescendant", options[1].id);
     await user.keyboard("{Enter}");
 
-    await waitFor(() => expect(navigate).toHaveBeenCalledWith("c2"));
+    await waitFor(() => expect(navigate).toHaveBeenCalledWith(expect.objectContaining({
+      id: "m2",
+      conversationId: "c2",
+    })));
     await waitFor(() => expect(launcher).toHaveFocus());
   });
 
@@ -235,6 +239,7 @@ describe("composite widget accessibility", () => {
         return new Promise((resolve) => { finishRebuild = resolve; });
       }
       if (command === "cancel_search_rebuild") return undefined;
+      if (command === "get_search_coverage") return null;
       if (command === "search_messages") return [];
       return undefined;
     });
@@ -246,7 +251,7 @@ describe("composite widget accessibility", () => {
           <CommandPalette
             open={open()}
             onClose={() => setOpen(false)}
-            onNavigate={() => undefined}
+            onNavigate={async () => true}
             onOpenIdentity={() => undefined}
           />
           <div id="island-portal" />
@@ -274,7 +279,8 @@ describe("composite widget accessibility", () => {
 
   it("opens only an exact origin-scoped author identity from message search", async () => {
     invokeMock.mockImplementation(async (command: string) => {
-      if (command !== "search_messages") return 0;
+      if (command === "get_search_coverage") return null;
+      if (command !== "search_messages") return undefined;
       return [{
         id: "m1",
         conversationId: "c1",
@@ -293,7 +299,7 @@ describe("composite widget accessibility", () => {
         },
       }];
     });
-    const navigate = vi.fn(async () => undefined);
+    const navigate = vi.fn(async () => true);
     const openIdentity = vi.fn();
     const Harness = () => {
       const [open, setOpen] = createSignal(false);

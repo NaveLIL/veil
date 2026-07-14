@@ -59,6 +59,7 @@ import {
 } from "@/components/identity/identityProfile";
 import { toast, ToastViewport } from "@/components/ui/toast";
 import { CommandPalette, useCommandPaletteHotkey } from "@/components/ui/CommandPalette";
+import type { SearchHitDto, SearchResultContextDto } from "@/lib/identityIpcBoundary";
 import { DecisionDialogHost } from "@/components/ui/DecisionDialogHost";
 import { alertDecision, confirmDecision, promptDecision } from "@/lib/decisionDialog";
 import {
@@ -83,6 +84,163 @@ type RightIslandRoute =
       backToMembers: boolean;
       opener: HTMLElement | null;
     };
+
+type ExactSearchRouteStore = {
+  conversations: () => Conversation[];
+  loadConversations: () => Promise<void>;
+  servers: () => Array<{ id: string }>;
+  loadServers: () => Promise<boolean>;
+  channelsByServer: () => Record<string, Array<{
+    id: string;
+    serverId: string;
+    conversationId?: string;
+  }>>;
+  loadChannels: (serverId: string, autoSelectFirst: boolean) => Promise<boolean>;
+  activeServerId: () => string | null;
+  activeChannelId: () => string | null;
+  activeConversationId: () => string | null;
+  selectServer: (serverId: string | null, autoSelect?: boolean) => void;
+  selectChannel: (channelId: string | null) => void;
+};
+
+type ExactSearchRouteDependencies = {
+  store: ExactSearchRouteStore;
+  requireCurrentAction: () => void;
+  prepareConversationView: () => void;
+  openConversation: (conversationId: string, preserveSearchNavigation: boolean) => void;
+};
+
+/**
+ * Publish only the exact SQLCipher-authenticated route returned for a search
+ * hit. This deliberately has no fallback from a missing Room to Direct.
+ */
+export async function publishExactSearchRoute(
+  hit: Pick<SearchHitDto, "conversationId">,
+  context: Pick<SearchResultContextDto, "conversationType" | "serverId">,
+  dependencies: ExactSearchRouteDependencies,
+): Promise<void> {
+  const { store, requireCurrentAction } = dependencies;
+  if (context.conversationType === "channel") {
+    if (!context.serverId) {
+      throw new Error("The encrypted search context did not identify its Space.");
+    }
+    const serversRefreshed = await store.loadServers();
+    requireCurrentAction();
+    if (
+      !serversRefreshed
+      || !store.servers().some((server) => server.id === context.serverId)
+    ) {
+      throw new Error("This Space is unavailable or the current identity no longer has access.");
+    }
+    const roomsRefreshed = await store.loadChannels(context.serverId, false);
+    requireCurrentAction();
+    if (!roomsRefreshed) {
+      throw new Error("The Room directory could not be refreshed safely.");
+    }
+    const room = (store.channelsByServer()[context.serverId] ?? []).find(
+      (candidate) => candidate.serverId === context.serverId
+        && candidate.conversationId === hit.conversationId,
+    );
+    if (!room) {
+      throw new Error("This Room is unavailable or the current identity no longer has access.");
+    }
+    dependencies.prepareConversationView();
+    store.selectServer(context.serverId, false);
+    store.selectChannel(room.id);
+    if (
+      store.activeServerId() !== context.serverId
+      || store.activeChannelId() !== room.id
+      || store.activeConversationId() !== hit.conversationId
+    ) {
+      throw new Error("Veil refused to publish the selected Room in the current identity scope.");
+    }
+    return;
+  }
+
+  let conversation = store.conversations().find(
+    (candidate) => candidate.id === hit.conversationId,
+  );
+  if (!conversation) {
+    await store.loadConversations();
+    requireCurrentAction();
+    conversation = store.conversations().find(
+      (candidate) => candidate.id === hit.conversationId,
+    );
+  }
+  if (!conversation || conversation.type !== context.conversationType) {
+    throw new Error("The selected conversation is unavailable in this identity scope.");
+  }
+  dependencies.openConversation(hit.conversationId, true);
+  if (store.activeConversationId() !== hit.conversationId) {
+    throw new Error("Veil refused to publish the selected conversation.");
+  }
+}
+
+export function shouldLoadConversationHistory(
+  conversationId: string | null,
+  pendingSearchConversationId: string | null,
+): boolean {
+  // loadSearchResultContext has already published one bounded, authenticated
+  // window. Do not start any ordinary history load until its route is either
+  // committed or explicitly rolled back; an older conversation response must
+  // never overwrite the exact target window in flight.
+  return !!conversationId && pendingSearchConversationId === null;
+}
+
+export function renderedExactSearchTarget(
+  viewport: HTMLDivElement | undefined,
+  activeConversationId: string | null,
+  expectedConversationId: string,
+  messageId: string,
+): HTMLElement | null {
+  if (!viewport?.isConnected || activeConversationId !== expectedConversationId) return null;
+  const target = document.getElementById(`msg-${messageId}`);
+  return target instanceof HTMLElement && viewport.contains(target) ? target : null;
+}
+
+export async function waitForRenderedExactSearchTarget(
+  getViewport: () => HTMLDivElement | undefined,
+  getActiveConversationId: () => string | null,
+  expectedConversationId: string,
+  messageId: string,
+  actionStillCurrent: () => boolean,
+  maxFrames = 6,
+): Promise<HTMLElement> {
+  for (let frame = 0; frame <= maxFrames; frame += 1) {
+    if (!actionStillCurrent()) {
+      throw new Error("Search navigation was cancelled because the active Veil identity changed.");
+    }
+    const target = renderedExactSearchTarget(
+      getViewport(),
+      getActiveConversationId(),
+      expectedConversationId,
+      messageId,
+    );
+    if (target) return target;
+    if (frame < maxFrames) {
+      await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    }
+  }
+  throw new Error("The exact message was not rendered in its authenticated conversation.");
+}
+
+export function centerAndFocusExactSearchTarget(
+  viewport: HTMLDivElement,
+  target: HTMLElement,
+  reduceMotion: boolean,
+): void {
+  const viewportRect = viewport.getBoundingClientRect();
+  const targetRect = target.getBoundingClientRect();
+  const targetTop = viewport.scrollTop
+    + targetRect.top
+    - viewportRect.top
+    - Math.max(0, (viewport.clientHeight - targetRect.height) / 2);
+  viewport.scrollTo({
+    top: Math.max(0, targetTop),
+    behavior: reduceMotion ? "auto" : "smooth",
+  });
+  target.focus({ preventScroll: true });
+}
 
 const appWindow = getCurrentWindow();
 
@@ -234,6 +392,7 @@ const App: Component = () => {
     Record<string, { text: string; reply: Message | null; token: number }>
   >({});
   const [deletingIds, setDeletingIds] = createSignal<Set<string>>(new Set());
+  const [highlightedMessageId, setHighlightedMessageId] = createSignal<string | null>(null);
   const [showFriendsPanel, setShowFriendsPanel] = createSignal(false);
   const MAX_MSG_LEN = 4000;
   // Staggered island entrance
@@ -244,6 +403,16 @@ const App: Component = () => {
   const [island4Vis, setIsland4Vis] = createSignal(false);
   let messagesViewport: HTMLDivElement | undefined;
   let messagesScrollFrame: number | undefined;
+  let highlightedMessageTimer: number | undefined;
+  let searchNavigationToken = 0;
+  let pendingSearchHistoryConversationId: string | null = null;
+  let pendingSearchScrollTarget: {
+    messageId: string;
+    conversationId: string;
+    token: number;
+    readyForPaletteClose: boolean;
+    renderedTarget: HTMLElement | null;
+  } | null = null;
   let inputRef: HTMLTextAreaElement | undefined;
   let newGroupInputRef: HTMLInputElement | undefined;
   let sendTokenCounter = 0;
@@ -975,12 +1144,54 @@ const App: Component = () => {
   createEffect(() => {
     const conversationId = conv()?.id;
     msgs();
+    const paletteOpen = cmdkOpen();
 
     if (messagesScrollFrame !== undefined) cancelAnimationFrame(messagesScrollFrame);
     messagesScrollFrame = requestAnimationFrame(() => {
       messagesScrollFrame = undefined;
       const viewport = messagesViewport;
       if (!viewport?.isConnected || conv()?.id !== conversationId) return;
+
+      const searchTarget = pendingSearchScrollTarget;
+      if (searchTarget) {
+        // Publishing the bounded target window can happen before navigation.
+        // Do not disturb the conversation currently on screen while the exact
+        // Room/direct context is still being resolved. The palette remains
+        // modal until the exact node exists; final focus is intentionally one
+        // frame after it closes so Kobalte's focus restoration cannot win.
+        if (
+          searchTarget.conversationId !== conversationId
+          || !searchTarget.readyForPaletteClose
+          || paletteOpen
+        ) return;
+        const target = searchTarget.renderedTarget;
+        if (
+          !(target instanceof HTMLElement)
+          || !target.isConnected
+          || target.id !== `msg-${searchTarget.messageId}`
+          || !viewport.contains(target)
+        ) {
+          if (pendingSearchScrollTarget?.token === searchTarget.token) {
+            pendingSearchScrollTarget = null;
+          }
+          return;
+        }
+        const reduceMotion = (window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false)
+          || document.documentElement.dataset.reduceMotion === "true";
+        centerAndFocusExactSearchTarget(viewport, target, reduceMotion);
+        setHighlightedMessageId(searchTarget.messageId);
+        if (highlightedMessageTimer !== undefined) window.clearTimeout(highlightedMessageTimer);
+        highlightedMessageTimer = window.setTimeout(() => {
+          highlightedMessageTimer = undefined;
+          setHighlightedMessageId((current) => (
+            current === searchTarget.messageId ? null : current
+          ));
+        }, reduceMotion ? 1200 : 2600);
+        if (pendingSearchScrollTarget?.token === searchTarget.token) {
+          pendingSearchScrollTarget = null;
+        }
+        return;
+      }
 
       // scrollIntoView() walks every scrollable ancestor. A scaled wallpaper
       // gives the app shell a small scroll range, so using it here could move
@@ -1032,7 +1243,11 @@ const App: Component = () => {
       closeRightIsland();
       setEditingMessage(null);
     }
-    if (id) untrack(() => void appStore.loadMessages(id));
+    if (id && pendingSearchHistoryConversationId === id) {
+      pendingSearchHistoryConversationId = null;
+    } else if (id && shouldLoadConversationHistory(id, pendingSearchHistoryConversationId)) {
+      untrack(() => void appStore.loadMessages(id));
+    }
   });
 
   // Trigger staggered entrance when chat screen appears
@@ -1052,6 +1267,14 @@ const App: Component = () => {
       setGroupCreateError("");
       activeSendToken = null;
       setSendBusy(false);
+      searchNavigationToken += 1;
+      pendingSearchHistoryConversationId = null;
+      pendingSearchScrollTarget = null;
+      setHighlightedMessageId(null);
+      if (highlightedMessageTimer !== undefined) {
+        window.clearTimeout(highlightedMessageTimer);
+        highlightedMessageTimer = undefined;
+      }
       clearAvatarRegistry();
     }
 
@@ -1360,14 +1583,27 @@ const App: Component = () => {
     setGroupCreateError("");
   };
 
+  const cancelPendingSearchNavigation = () => {
+    searchNavigationToken += 1;
+    pendingSearchHistoryConversationId = null;
+    pendingSearchScrollTarget = null;
+    setHighlightedMessageId(null);
+    if (highlightedMessageTimer !== undefined) {
+      window.clearTimeout(highlightedMessageTimer);
+      highlightedMessageTimer = undefined;
+    }
+  };
+
   const openFriends = () => {
+    cancelPendingSearchNavigation();
     closeHomeTransientUi();
     setShowFriendsPanel(true);
     appStore.setActiveConversationId(null);
   };
 
 
-  const openConversation = (id: string) => {
+  const openConversation = (id: string, preserveSearchNavigation = false) => {
+    if (!preserveSearchNavigation) cancelPendingSearchNavigation();
     const alreadyActive = appStore.activeConversationId() === id;
     closeHomeTransientUi();
     setShowFriendsPanel(false);
@@ -1382,6 +1618,7 @@ const App: Component = () => {
   };
 
   const openRetainedLocalDm = (id: string): boolean => {
+    cancelPendingSearchNavigation();
     const alreadyActive = appStore.activeConversationId() === id;
     closeHomeTransientUi();
     setShowFriendsPanel(false);
@@ -1505,32 +1742,95 @@ const App: Component = () => {
   };
 
   const selectServerContext = (serverId: string | null, autoSelect = true) => {
+    cancelPendingSearchNavigation();
     closeHomeTransientUi();
     setShowFriendsPanel(false);
     appStore.selectServer(serverId, autoSelect);
   };
 
-  const openSearchResult = async (conversationId: string) => {
-    const channel = await appStore.resolveChannelContext(conversationId);
-    if (channel) {
-      const loaded = appStore.channelsByServer()[channel.serverId] ?? [];
-      if (!loaded.some((candidate) => candidate.id === channel.channelId)) {
-        await appStore.loadChannels(channel.serverId);
-      }
-      if (!(appStore.channelsByServer()[channel.serverId] ?? []).some(
-        (candidate) => candidate.id === channel.channelId,
-      )) {
-        toast.error("Room unavailable", "Its cached context is stale or you no longer have access.");
-        return;
-      }
-      selectServerContext(channel.serverId, false);
-      appStore.selectChannel(channel.channelId);
-      return;
+  const openSearchResult = async (hit: SearchHitDto): Promise<boolean> => {
+    const expectedScope = appStore.authenticatedServerScope();
+    if (!expectedScope) {
+      throw new Error("Unlock and connect this Veil identity before opening a search result.");
     }
-    if (appStore.conversations().some((conversation) => conversation.id === conversationId)) {
-      openConversation(conversationId);
-    } else {
-      toast.error("Conversation unavailable", "The search result no longer has a readable local context.");
+    const sessionEpoch = captureUiSessionEpoch();
+    const actionToken = ++searchNavigationToken;
+    const actionStillCurrent = () => {
+      const currentScope = appStore.authenticatedServerScope();
+      return actionToken === searchNavigationToken
+        && isUiSessionEpochCurrent(sessionEpoch)
+        && currentScope?.canonicalServerOrigin === expectedScope.canonicalServerOrigin
+        && currentScope.userId === expectedScope.userId
+        && currentScope.bindingGeneration === expectedScope.bindingGeneration;
+    };
+    const requireCurrentAction = () => {
+      if (!actionStillCurrent()) {
+        throw new Error("Search navigation was cancelled because the active Veil identity changed.");
+      }
+    };
+
+    pendingSearchHistoryConversationId = hit.conversationId;
+    pendingSearchScrollTarget = {
+      messageId: hit.id,
+      conversationId: hit.conversationId,
+      token: actionToken,
+      readyForPaletteClose: false,
+      renderedTarget: null,
+    };
+
+    try {
+      const context = await appStore.loadSearchResultContext(hit.id, hit.conversationId);
+      requireCurrentAction();
+      const alreadyActive = appStore.activeConversationId() === hit.conversationId;
+      await publishExactSearchRoute(hit, context, {
+        store: appStore,
+        requireCurrentAction,
+        prepareConversationView: () => {
+          closeHomeTransientUi();
+          setShowFriendsPanel(false);
+        },
+        openConversation,
+      });
+      requireCurrentAction();
+
+      if (alreadyActive) pendingSearchHistoryConversationId = null;
+      const renderedTarget = await waitForRenderedExactSearchTarget(
+        () => messagesViewport,
+        appStore.activeConversationId,
+        hit.conversationId,
+        hit.id,
+        actionStillCurrent,
+      );
+      requireCurrentAction();
+      if (pendingSearchScrollTarget?.token !== actionToken) {
+        throw new Error("Search navigation was cancelled before the exact message was rendered.");
+      }
+      pendingSearchScrollTarget = {
+        ...pendingSearchScrollTarget,
+        readyForPaletteClose: true,
+        renderedTarget,
+      };
+      return true;
+    } catch (error) {
+      if (pendingSearchScrollTarget?.token === actionToken) {
+        pendingSearchScrollTarget = null;
+      }
+      if (actionToken === searchNavigationToken) {
+        pendingSearchHistoryConversationId = null;
+      }
+      if (actionStillCurrent()) {
+        const activeConversationId = appStore.activeConversationId();
+        if (activeConversationId) {
+          try {
+            await appStore.loadMessages(activeConversationId);
+          } catch {
+            // Preserve the exact navigation error. The ordinary history load
+            // has its own fail-closed/session validation and may legitimately
+            // be unavailable during a transition.
+          }
+        }
+      }
+      throw error;
     }
   };
 
@@ -1615,6 +1915,7 @@ const App: Component = () => {
     stopAttachmentDragStateListener?.();
     stopAttachmentDropListener?.();
     if (messagesScrollFrame !== undefined) cancelAnimationFrame(messagesScrollFrame);
+    if (highlightedMessageTimer !== undefined) window.clearTimeout(highlightedMessageTimer);
     cancelRightIslandAnimationFrame();
   });
 
@@ -2803,7 +3104,21 @@ const App: Component = () => {
                                     id={`msg-${msg.id}`}
                                     tabIndex={-1}
                                     aria-label={`Message from ${msg.senderName}`}
-                                    style={{ display: "flex", gap: "12px", padding: "4px 8px", "margin-top": gap() ? "16px" : "2px", "border-radius": "8px", transition: "background 0.3s" }}
+                                    data-search-highlight={highlightedMessageId() === msg.id ? "true" : undefined}
+                                    style={{
+                                      display: "flex",
+                                      gap: "12px",
+                                      padding: "4px 8px",
+                                      "margin-top": gap() ? "16px" : "2px",
+                                      "border-radius": "8px",
+                                      background: highlightedMessageId() === msg.id
+                                        ? "rgba(var(--veil-accent-rgb), 0.18)"
+                                        : "transparent",
+                                      "box-shadow": highlightedMessageId() === msg.id
+                                        ? "inset 2px 0 0 var(--veil-accent)"
+                                        : "inset 0 0 0 transparent",
+                                      transition: "background 0.3s ease, box-shadow 0.3s ease",
+                                    }}
                                   >
                                     <Show when={gap()} fallback={<div style={{ width: "36px", "flex-shrink": "0" }} />}>
                                       <IdentityTrigger

@@ -25,28 +25,27 @@ import {
 } from "@/components/identity/identityProfile";
 import { Z } from "@/lib/zIndex";
 import {
+  validatedSearchCoverage,
   validatedSearchHits,
+  type SearchCoverageDto as SearchCoverage,
   type SearchHitDto as SearchHit,
 } from "@/lib/identityIpcBoundary";
 import {
   appStore,
   captureUiSessionEpoch,
   isUiSessionEpochCurrent,
+  type AuthenticatedServerScope,
   type Conversation,
 } from "@/stores/app";
 
 interface Props {
   open: boolean;
   onClose: () => void;
-  onNavigate: (conversationId: string) => void | Promise<void>;
+  onNavigate: (hit: SearchHit) => Promise<boolean>;
   onOpenIdentity: (profile: IdentityIslandProfile, returnFocusTo: HTMLElement | null) => void;
 }
 
-interface SearchRebuildReport {
-  indexedMessages: number;
-  indexedSourceBytes: number;
-  maxSourceBytes: number;
-  truncated: boolean;
+interface SearchRebuildReport extends SearchCoverage {
   cancelled: boolean;
 }
 
@@ -56,6 +55,20 @@ const portalHost = () =>
 const DEBOUNCE_MS = 120;
 const SEARCH_MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const SEARCH_MAX_DOCUMENTS = 250_000;
+
+function validatedSearchCoverageSnapshot(value: unknown): SearchCoverage | null {
+  const coverage = validatedSearchCoverage(value);
+  if (
+    coverage
+    && (
+      coverage.indexedMessages > SEARCH_MAX_DOCUMENTS
+      || coverage.maxSourceBytes !== SEARCH_MAX_SOURCE_BYTES
+    )
+  ) {
+    throw new Error("search coverage exceeds the renderer budget");
+  }
+  return coverage;
+}
 
 function validatedSearchRebuildReport(value: unknown): SearchRebuildReport {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -106,11 +119,26 @@ function convIcon(conv: Conversation | undefined) {
   return <MessageCircle size={14} />;
 }
 
+function authenticatedScopeMatches(
+  expected: AuthenticatedServerScope,
+  current: AuthenticatedServerScope | null,
+): boolean {
+  return !!current
+    && current.canonicalServerOrigin === expected.canonicalServerOrigin
+    && current.userId === expected.userId
+    && current.bindingGeneration === expected.bindingGeneration;
+}
+
 export const CommandPalette: Component<Props> = (props) => {
   const [query, setQuery] = createSignal("");
   const [hits, setHits] = createSignal<SearchHit[]>([]);
   const [active, setActive] = createSignal(0);
   const [loading, setLoading] = createSignal(false);
+  const [searchError, setSearchError] = createSignal<string | null>(null);
+  const [coverage, setCoverage] = createSignal<SearchCoverage | null>(null);
+  const [coverageError, setCoverageError] = createSignal<string | null>(null);
+  const [openingHitId, setOpeningHitId] = createSignal<string | null>(null);
+  const [navigationError, setNavigationError] = createSignal<string | null>(null);
   const [rebuilding, setRebuilding] = createSignal(false);
   const [cancelingRebuild, setCancelingRebuild] = createSignal(false);
   const [rebuildMsg, setRebuildMsg] = createSignal<string | null>(null);
@@ -122,6 +150,10 @@ export const CommandPalette: Component<Props> = (props) => {
   let previouslyFocused: HTMLElement | null = null;
   let wasOpen = false;
   let focusEpoch = 0;
+  let searchRequestGeneration = 0;
+  let coverageRequestGeneration = 0;
+  let navigationGeneration = 0;
+  let rebuildGeneration = 0;
 
   const captureFocus = () => {
     if (previouslyFocused) return;
@@ -158,48 +190,128 @@ export const CommandPalette: Component<Props> = (props) => {
     wasOpen = open;
   });
 
-  const runSearch = async (q: string) => {
+  onMount(() => {
+    const blockPaletteToggleDuringNavigation = (event: KeyboardEvent) => {
+      if (
+        openingHitId()
+        && (event.metaKey || event.ctrlKey)
+        && event.code === "KeyK"
+      ) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    };
+    window.addEventListener("keydown", blockPaletteToggleDuringNavigation, true);
+    onCleanup(() => {
+      window.removeEventListener("keydown", blockPaletteToggleDuringNavigation, true);
+    });
+  });
+
+  const searchRequestIsCurrent = (
+    generation: number,
+    q: string,
+    sessionEpoch: number,
+    expectedScope: AuthenticatedServerScope,
+  ) => generation === searchRequestGeneration
+    && props.open
+    && query() === q
+    && isUiSessionEpochCurrent(sessionEpoch)
+    && authenticatedScopeMatches(expectedScope, appStore.authenticatedServerScope());
+
+  const runSearch = async (q: string, generation: number) => {
     if (!q.trim()) {
-      setHits([]);
-      setLoading(false);
+      if (generation === searchRequestGeneration) {
+        setHits([]);
+        setSearchError(null);
+        setLoading(false);
+      }
       return;
     }
     const sessionEpoch = captureUiSessionEpoch();
     const expectedScope = appStore.authenticatedServerScope();
     if (!expectedScope) {
-      setHits([]);
-      setLoading(false);
+      if (generation === searchRequestGeneration) {
+        setHits([]);
+        setLoading(false);
+        setSearchError("Search is unavailable until the secure session is ready.");
+      }
       return;
     }
-    setLoading(true);
     try {
       const response = await invoke<unknown>("search_messages", {
         query: q, conversationId: null, limit: 30,
       });
-      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
-      const currentScope = appStore.authenticatedServerScope();
-      if (
-        !currentScope
-        || currentScope.canonicalServerOrigin !== expectedScope.canonicalServerOrigin
-        || currentScope.userId !== expectedScope.userId
-        || currentScope.bindingGeneration !== expectedScope.bindingGeneration
-      ) return;
+      if (!searchRequestIsCurrent(generation, q, sessionEpoch, expectedScope)) return;
       setHits(validatedSearchHits(response, expectedScope.canonicalServerOrigin));
+      setSearchError(null);
       setActive(0);
     } catch (err) {
-      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+      if (!searchRequestIsCurrent(generation, q, sessionEpoch, expectedScope)) return;
       console.error("search_messages failed", err);
       setHits([]);
+      setSearchError("Search failed. Your local index was not changed.");
     } finally {
-      if (isUiSessionEpochCurrent(sessionEpoch)) setLoading(false);
+      if (searchRequestIsCurrent(generation, q, sessionEpoch, expectedScope)) {
+        setLoading(false);
+      }
     }
   };
 
   createEffect(() => {
     const q = query();
+    const generation = ++searchRequestGeneration;
     if (timer) window.clearTimeout(timer);
-    timer = window.setTimeout(() => runSearch(q), DEBOUNCE_MS);
+    timer = undefined;
+    setSearchError(null);
+    setNavigationError(null);
+    setHits([]);
+    setActive(0);
+    if (!q.trim()) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
+    timer = window.setTimeout(() => {
+      timer = undefined;
+      void runSearch(q, generation);
+    }, DEBOUNCE_MS);
   });
+
+  const loadCoverage = async () => {
+    const generation = ++coverageRequestGeneration;
+    const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = appStore.authenticatedServerScope();
+    if (!expectedScope) return;
+    try {
+      const response = await invoke<unknown>("get_search_coverage");
+      if (
+        generation !== coverageRequestGeneration
+        || !props.open
+        || !isUiSessionEpochCurrent(sessionEpoch)
+        || !authenticatedScopeMatches(expectedScope, appStore.authenticatedServerScope())
+      ) return;
+      const snapshot = validatedSearchCoverageSnapshot(response);
+      setCoverage(snapshot);
+      setCoverageError(snapshot
+        ? null
+        : "Search completeness is unknown because this session has no published index snapshot.");
+    } catch (err) {
+      if (
+        generation !== coverageRequestGeneration
+        || !props.open
+        || !isUiSessionEpochCurrent(sessionEpoch)
+        || !authenticatedScopeMatches(expectedScope, appStore.authenticatedServerScope())
+      ) return;
+      // Preserve the last authoritative snapshot instead of replacing it with
+      // an unknown state after a transient IPC failure.
+      console.error("get_search_coverage failed", err);
+      if (!coverage()) {
+        setCoverageError(
+          "Search completeness is unknown because Veil could not read the local index coverage.",
+        );
+      }
+    }
+  };
 
   createEffect(() => {
     if (props.open) {
@@ -207,6 +319,11 @@ export const CommandPalette: Component<Props> = (props) => {
       setHits([]);
       setActive(0);
       setRebuildMsg(null);
+      setSearchError(null);
+      setNavigationError(null);
+      setCoverageError(null);
+      setOpeningHitId(null);
+      void loadCoverage();
     }
   });
 
@@ -220,10 +337,19 @@ export const CommandPalette: Component<Props> = (props) => {
     ) return;
     lastClearedOriginEpoch = currentOriginEpoch;
     if (timer) window.clearTimeout(timer);
+    searchRequestGeneration += 1;
+    coverageRequestGeneration += 1;
+    navigationGeneration += 1;
+    rebuildGeneration += 1;
     setQuery("");
     setHits([]);
     setActive(0);
     setLoading(false);
+    setSearchError(null);
+    setCoverage(null);
+    setCoverageError(null);
+    setOpeningHitId(null);
+    setNavigationError(null);
     setRebuilding(false);
     setCancelingRebuild(false);
     setRebuildMsg(null);
@@ -233,6 +359,10 @@ export const CommandPalette: Component<Props> = (props) => {
   onCleanup(() => {
     if (timer) window.clearTimeout(timer);
     if (identityOpenTimer) window.clearTimeout(identityOpenTimer);
+    searchRequestGeneration += 1;
+    coverageRequestGeneration += 1;
+    navigationGeneration += 1;
+    rebuildGeneration += 1;
     if (wasOpen) restoreFocus();
   });
 
@@ -243,8 +373,56 @@ export const CommandPalette: Component<Props> = (props) => {
   });
 
   const openHit = async (h: SearchHit) => {
-    await props.onNavigate(h.conversationId);
-    props.onClose();
+    if (openingHitId()) return;
+    const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = appStore.authenticatedServerScope();
+    if (!expectedScope) {
+      setNavigationError("That message cannot be opened until the secure session is ready.");
+      return;
+    }
+    const generation = ++navigationGeneration;
+    let refocusInput = false;
+    setOpeningHitId(h.id);
+    setNavigationError(null);
+    try {
+      const opened = await props.onNavigate(h);
+      if (
+        generation !== navigationGeneration
+        || !props.open
+        || !isUiSessionEpochCurrent(sessionEpoch)
+        || !authenticatedScopeMatches(expectedScope, appStore.authenticatedServerScope())
+      ) return;
+      if (!opened) {
+        setNavigationError("Could not open that exact message. It may no longer be available.");
+        refocusInput = true;
+        return;
+      }
+      props.onClose();
+    } catch (err) {
+      if (
+        generation !== navigationGeneration
+        || !props.open
+        || !isUiSessionEpochCurrent(sessionEpoch)
+        || !authenticatedScopeMatches(expectedScope, appStore.authenticatedServerScope())
+      ) return;
+      console.error("message search navigation failed", err);
+      setNavigationError("Could not open that exact message. It may no longer be available.");
+      refocusInput = true;
+    } finally {
+      if (generation === navigationGeneration) {
+        setOpeningHitId(null);
+        if (refocusInput) {
+          queueMicrotask(() => {
+            if (
+              generation === navigationGeneration
+              && props.open
+              && inputRef?.isConnected
+              && !inputRef.disabled
+            ) inputRef.focus({ preventScroll: true });
+          });
+        }
+      }
+    }
   };
 
   const identityProfileForHit = (
@@ -317,30 +495,48 @@ export const CommandPalette: Component<Props> = (props) => {
   const rebuild = async () => {
     if (rebuilding()) return;
     const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = appStore.authenticatedServerScope();
+    if (!expectedScope) {
+      setRebuildMsg("Rebuild is unavailable until the secure session is ready.");
+      return;
+    }
+    const generation = ++rebuildGeneration;
+    const rebuildIsCurrent = () => generation === rebuildGeneration
+      && isUiSessionEpochCurrent(sessionEpoch)
+      && authenticatedScopeMatches(expectedScope, appStore.authenticatedServerScope());
     setRebuilding(true);
     setRebuildMsg(null);
     try {
       const report = validatedSearchRebuildReport(await invoke<unknown>("rebuild_search_index"));
-      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+      if (!rebuildIsCurrent()) return;
       if (report.cancelled) {
         setRebuildMsg("Rebuild cancelled. The previous complete index was kept.");
       } else if (report.truncated) {
         const limitMiB = Math.round(report.maxSourceBytes / (1024 * 1024));
+        setCoverage(report);
+        setCoverageError(null);
         setRebuildMsg(
           `Indexed the newest ${report.indexedMessages.toLocaleString()} messages · ${limitMiB} MiB local limit; older history omitted.`,
         );
       } else {
+        setCoverage(report);
+        setCoverageError(null);
         setRebuildMsg(
           `Indexed ${report.indexedMessages.toLocaleString()} message${report.indexedMessages === 1 ? "" : "s"}.`,
         );
       }
-      if (query().trim()) await runSearch(query());
+      const currentQuery = query();
+      if (props.open && currentQuery.trim()) {
+        const searchGeneration = ++searchRequestGeneration;
+        setLoading(true);
+        await runSearch(currentQuery, searchGeneration);
+      }
     } catch (err) {
-      if (!isUiSessionEpochCurrent(sessionEpoch)) return;
+      if (!rebuildIsCurrent()) return;
       console.error("rebuild_search_index failed", err);
-      setRebuildMsg("Rebuild failed — see console.");
+      setRebuildMsg("Rebuild failed. The previous complete index was kept.");
     } finally {
-      if (isUiSessionEpochCurrent(sessionEpoch)) {
+      if (rebuildIsCurrent()) {
         setRebuilding(false);
         setCancelingRebuild(false);
       }
@@ -349,11 +545,19 @@ export const CommandPalette: Component<Props> = (props) => {
 
   const cancelRebuild = async () => {
     if (!rebuilding() || cancelingRebuild()) return;
+    const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = appStore.authenticatedServerScope();
+    const expectedGeneration = rebuildGeneration;
+    const cancellationIsCurrent = () => expectedGeneration === rebuildGeneration
+      && isUiSessionEpochCurrent(sessionEpoch)
+      && !!expectedScope
+      && authenticatedScopeMatches(expectedScope, appStore.authenticatedServerScope());
     setCancelingRebuild(true);
-    setRebuildMsg("Cancelling rebuild…");
+    setRebuildMsg("Cancelling rebuild...");
     try {
       await invoke("cancel_search_rebuild");
     } catch (err) {
+      if (!cancellationIsCurrent()) return;
       console.error("cancel_search_rebuild failed", err);
       setRebuildMsg("Could not cancel the rebuild.");
       setCancelingRebuild(false);
@@ -368,6 +572,10 @@ export const CommandPalette: Component<Props> = (props) => {
   };
 
   const onKeyDown = (e: KeyboardEvent) => {
+    if (e.key === "Enter" && openingHitId()) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === "ArrowDown") {
       e.preventDefault();
       focusOption(Math.min(active() + 1, Math.max(0, hits().length - 1)));
@@ -396,7 +604,13 @@ export const CommandPalette: Component<Props> = (props) => {
   };
 
   return (
-    <KDialog open={props.open} onOpenChange={(o) => { if (!o) props.onClose(); }} modal>
+    <KDialog
+      open={props.open}
+      onOpenChange={(open) => {
+        if (!open && !openingHitId()) props.onClose();
+      }}
+      modal
+    >
       <KDialog.Portal mount={portalHost()}>
         <KDialog.Overlay
           style={{
@@ -413,6 +627,12 @@ export const CommandPalette: Component<Props> = (props) => {
           "padding-top": "12vh", "pointer-events": "none",
         }}>
           <KDialog.Content
+            onEscapeKeyDown={(event) => {
+              if (openingHitId()) event.preventDefault();
+            }}
+            onPointerDownOutside={(event) => {
+              if (openingHitId()) event.preventDefault();
+            }}
             onOpenAutoFocus={(event) => {
               captureFocus();
               event.preventDefault();
@@ -490,6 +710,7 @@ export const CommandPalette: Component<Props> = (props) => {
                 aria-expanded={hits().length > 0}
                 aria-activedescendant={hits().length > 0 ? `${listboxId}-option-${active()}` : undefined}
                 value={query()}
+                disabled={openingHitId() !== null}
                 onInput={(e) => setQuery(e.currentTarget.value)}
                 onKeyDown={onKeyDown}
                 placeholder="Search messages…"
@@ -514,10 +735,67 @@ export const CommandPalette: Component<Props> = (props) => {
               >
                 {loading()
                   ? "Searching messages"
+                  : searchError()
+                    ? "Message search failed"
                   : query().trim()
                     ? `${hits().length} search result${hits().length === 1 ? "" : "s"}`
                     : ""}
               </span>
+              <Show when={coverage()?.truncated ? coverage() : null} keyed>
+                {(snapshot) => (
+                  <div
+                    role="note"
+                    data-testid="search-coverage-warning"
+                    style={{
+                      display: "flex", "align-items": "center", gap: "7px",
+                      "margin-top": "11px", padding: "8px 10px", "border-radius": "9px",
+                      background: "color-mix(in srgb, var(--veil-warning) 9%, transparent)",
+                      border: "1px solid color-mix(in srgb, var(--veil-warning) 22%, transparent)",
+                      color: "var(--veil-text-muted)", "font-size": "11px", "line-height": "1.45",
+                    }}
+                  >
+                    <span aria-hidden="true" style={{ color: "var(--veil-warning)" }}>●</span>
+                    <span>
+                      Search covers the newest {snapshot.indexedMessages.toLocaleString()} messages
+                      {` (${Math.round(snapshot.maxSourceBytes / (1024 * 1024))} MiB local limit)`}.
+                      Older local history is omitted.
+                    </span>
+                  </div>
+                )}
+              </Show>
+              <Show when={!coverage() ? coverageError() : null} keyed>
+                {(message) => (
+                  <div
+                    role="note"
+                    data-testid="search-coverage-unknown"
+                    style={{
+                      display: "flex", "align-items": "center", gap: "7px",
+                      "margin-top": "11px", padding: "8px 10px", "border-radius": "9px",
+                      background: "color-mix(in srgb, var(--veil-warning) 9%, transparent)",
+                      border: "1px solid color-mix(in srgb, var(--veil-warning) 22%, transparent)",
+                      color: "var(--veil-text-muted)", "font-size": "11px", "line-height": "1.45",
+                    }}
+                  >
+                    <span aria-hidden="true" style={{ color: "var(--veil-warning)" }}>●</span>
+                    <span>{message} Search itself remains available.</span>
+                  </div>
+                )}
+              </Show>
+              <Show when={navigationError()} keyed>
+                {(message) => (
+                  <div
+                    role="alert"
+                    style={{
+                      "margin-top": "11px", padding: "8px 10px", "border-radius": "9px",
+                      background: "color-mix(in srgb, var(--veil-danger) 10%, transparent)",
+                      border: "1px solid color-mix(in srgb, var(--veil-danger) 24%, transparent)",
+                      color: "var(--veil-danger)", "font-size": "11px", "line-height": "1.45",
+                    }}
+                  >
+                    {message}
+                  </div>
+                )}
+              </Show>
             </div>
 
             {/* Results / empty state */}
@@ -555,10 +833,14 @@ export const CommandPalette: Component<Props> = (props) => {
                           aria-selected={active() === i()}
                           onMouseDown={(event) => event.preventDefault()}
                           onClick={() => void openHit(h)}
+                          disabled={openingHitId() !== null}
                           style={{
                             flex: "1", "min-width": "0", "text-align": "left",
                             padding: "10px 18px", border: "none", background: "transparent",
-                            color: "var(--veil-text)", cursor: "pointer", "font-family": "inherit",
+                            color: "var(--veil-text)",
+                            cursor: openingHitId() ? "wait" : "pointer",
+                            opacity: openingHitId() && openingHitId() !== h.id ? "0.58" : "1",
+                            "font-family": "inherit",
                           }}
                         >
                           <div style={{
@@ -567,6 +849,13 @@ export const CommandPalette: Component<Props> = (props) => {
                           }}>
                             {convIcon(conv())}
                             <span style={{ color: "var(--veil-text)", "font-weight": "500" }}>{title()}</span>
+                            <Show when={openingHitId() === h.id}>
+                              <RefreshCw
+                                size={12}
+                                aria-label="Opening exact message"
+                                style={{ animation: "spin .8s linear infinite", color: "var(--veil-accent)" }}
+                              />
+                            </Show>
                             <span style={{ "margin-left": "auto", "font-size": "11px" }}>
                               {new Date(h.ts).toLocaleString()}
                             </span>
@@ -602,16 +891,53 @@ export const CommandPalette: Component<Props> = (props) => {
                           }}><Search size={20} strokeWidth={1.8} /></span>
                           <span style={{ color: "var(--veil-text)", "font-weight": "620" }}>Start with a word or phrase</span>
                           <span style={{ "font-size": "11px", opacity: "0.72", "max-width": "360px", "line-height": "1.55" }}>
-                            Veil searches the decrypted index stored on this device. Your query and results never reach the Node.
+                            Veil searches a decrypted index held only in memory for this unlocked session.
+                            It is cleared on lock and never written to disk.
                           </span>
                         </>
                       }
                     >
-                      <span>No matches for «{query().trim()}».</span>
-                      <span style={{ "font-size": "11px", opacity: "0.7" }}>
-                        If you expected hits, the index may be empty or stale.
-                      </span>
-                      <button
+                      <Show
+                        when={!loading()}
+                        fallback={
+                          <>
+                            <RefreshCw
+                              size={20}
+                              aria-hidden="true"
+                              style={{ animation: "spin .8s linear infinite", color: "var(--veil-accent)" }}
+                            />
+                            <span style={{ color: "var(--veil-text)", "font-weight": "620" }}>
+                              Searching this device...
+                            </span>
+                          </>
+                        }
+                      >
+                        <Show
+                          when={searchError()}
+                          keyed
+                          fallback={
+                            <>
+                              <span>No matches for «{query().trim()}».</span>
+                              <span style={{ "font-size": "11px", opacity: "0.7" }}>
+                                If you expected hits, the index may be empty or stale.
+                              </span>
+                            </>
+                          }
+                        >
+                          {(message) => (
+                            <>
+                              <span style={{ color: "var(--veil-danger)", "font-weight": "620" }}>
+                                Search unavailable
+                              </span>
+                              <span role="alert" style={{ "font-size": "11px", "max-width": "360px", "line-height": "1.55" }}>
+                                {message}
+                              </span>
+                            </>
+                          )}
+                        </Show>
+                      </Show>
+                      <Show when={!loading()}>
+                        <button
                         type="button"
                         onClick={() => void (rebuilding() ? cancelRebuild() : rebuild())}
                         disabled={cancelingRebuild()}
@@ -634,15 +960,16 @@ export const CommandPalette: Component<Props> = (props) => {
                         onMouseLeave={(e) => {
                           (e.currentTarget as HTMLElement).style.background = "color-mix(in srgb, var(--veil-accent) 15%, transparent)";
                         }}
-                      >
-                        <RefreshCw
+                        >
+                          <RefreshCw
                           size={13}
                           style={rebuilding() ? { animation: "spin 1s linear infinite" } : undefined}
-                        />
-                        {rebuilding()
-                          ? cancelingRebuild() ? "Cancelling…" : "Cancel rebuild"
-                          : "Rebuild index"}
-                      </button>
+                          />
+                          {rebuilding()
+                            ? cancelingRebuild() ? "Cancelling…" : "Cancel rebuild"
+                            : searchError() ? "Retry by rebuilding index" : "Rebuild index"}
+                        </button>
+                      </Show>
                     </Show>
                   </div>
               </Show>

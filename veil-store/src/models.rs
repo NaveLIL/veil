@@ -198,12 +198,20 @@ pub struct Message {
 /// and must never be persisted outside the encrypted database.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchIndexDocument {
-    pub local_order: i64,
     pub id: String,
     pub conversation_id: String,
     pub sender_key: Vec<u8>,
     pub plaintext: String,
     pub timestamp: i64,
+}
+
+/// Stable keyset cursor for the same `(timestamp, message_id)` recency order
+/// used by the live RAM index. The message ID is the deterministic tie-break
+/// when multiple rows share one server timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchIndexCursor {
+    pub timestamp: i64,
+    pub message_id: String,
 }
 
 /// Private attachment state. The renderer receives only presentation fields;

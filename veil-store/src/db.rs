@@ -45,6 +45,19 @@ pub type MessageBinding = (String, Vec<u8>, bool, Option<i64>);
 pub type TrustedSigningKeyBinding = ([u8; 32], [u8; 32]);
 pub type StoredSenderKey = (Vec<u8>, Vec<u8>, bool);
 type StoredSenderKeyMaterial = ([u8; 32], Zeroizing<Vec<u8>>);
+
+/// Exact-origin SQLCipher context for one current search result.
+///
+/// The native layer serializes these messages through the same renderer
+/// mapper as `get_messages`; this storage type deliberately contains no
+/// search-index data or navigation authority.
+#[derive(Debug, Clone)]
+pub struct SearchResultContext {
+    pub conversation_type: crate::models::ConversationType,
+    pub server_id: Option<String>,
+    pub messages: Vec<Message>,
+}
+
 const MAX_RETAINED_SENDER_KEY_GENERATIONS_PER_SENDER: usize = 128;
 const MAX_CANONICAL_SERVER_ORIGIN_BYTES: usize = 512;
 const MAX_PROFILE_ORIGIN_BYTES: usize = 512;
@@ -3979,51 +3992,67 @@ impl VeilDb {
 
     /// Read one newest-first page for an origin-scoped in-memory search rebuild.
     ///
-    /// `local_order` is the SQLite rowid cursor. It gives stable, gap-tolerant
-    /// keyset pagination without OFFSET scans. Callers hold decrypted rows only
+    /// The cursor follows the same `(effective_timestamp, message_id)` order as
+    /// the live RAM index. This keeps budget eviction and restart rebuilds on
+    /// one deterministic definition of the newest continuous slice, including
+    /// rows inserted out of timestamp order. Callers hold decrypted rows only
     /// in process memory and apply their own global memory/document budget.
     pub fn get_search_index_page(
         &self,
         canonical_server_origin: &str,
-        before_local_order: Option<i64>,
+        before: Option<&crate::models::SearchIndexCursor>,
         limit: u32,
     ) -> Result<Vec<crate::models::SearchIndexDocument>, String> {
         validate_canonical_server_origin(canonical_server_origin)?;
         if limit == 0 || limit > 2_048 {
             return Err("search rebuild page limit must be between 1 and 2048".to_string());
         }
-        if before_local_order.is_some_and(|cursor| cursor <= 0) {
-            return Err("search rebuild cursor must be positive".to_string());
+        if let Some(cursor) = before {
+            validate_canonical_uuid("search rebuild cursor message id", &cursor.message_id)?;
         }
 
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT m.rowid, m.id, m.conversation_id, m.sender_key, m.plaintext,
-                        COALESCE(
-                          m.server_timestamp,
-                          CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
-                        ) AS effective_timestamp
-                 FROM messages AS m
-                 INNER JOIN conversations AS c ON c.id = m.conversation_id
-                 WHERE c.server_origin = ?1
-                   AND (?2 IS NULL OR m.rowid < ?2)
-                   AND m.plaintext <> ''
-                 ORDER BY m.rowid DESC
-                 LIMIT ?3",
+                "WITH scoped AS (
+                   SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                          COALESCE(
+                            m.server_timestamp,
+                            CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+                          ) AS effective_timestamp
+                   FROM messages AS m
+                   INNER JOIN conversations AS c ON c.id = m.conversation_id
+                   WHERE c.server_origin = ?1
+                     AND m.plaintext <> ''
+                 )
+                 SELECT id, conversation_id, sender_key, plaintext,
+                        effective_timestamp
+                 FROM scoped
+                 WHERE ?2 IS NULL
+                    OR effective_timestamp < ?2
+                    OR (
+                      effective_timestamp = ?2
+                      AND id COLLATE BINARY < ?3 COLLATE BINARY
+                    )
+                 ORDER BY effective_timestamp DESC, id COLLATE BINARY DESC
+                 LIMIT ?4",
             )
             .map_err(|e| format!("prepare search rebuild page: {e}"))?;
         let rows = stmt
             .query_map(
-                rusqlite::params![canonical_server_origin, before_local_order, limit],
+                rusqlite::params![
+                    canonical_server_origin,
+                    before.map(|cursor| cursor.timestamp),
+                    before.map(|cursor| cursor.message_id.as_str()),
+                    limit
+                ],
                 |row| {
                     Ok(crate::models::SearchIndexDocument {
-                        local_order: row.get(0)?,
-                        id: row.get(1)?,
-                        conversation_id: row.get(2)?,
-                        sender_key: row.get(3)?,
-                        plaintext: row.get(4)?,
-                        timestamp: row.get(5)?,
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        sender_key: row.get(2)?,
+                        plaintext: row.get(3)?,
+                        timestamp: row.get(4)?,
                     })
                 },
             )
@@ -4106,6 +4135,178 @@ impl VeilDb {
             Ok(message)
         })
         .transpose()
+    }
+
+    /// Return a bounded chronological window centred on one current message.
+    ///
+    /// Both the conversation and target are re-read from SQLCipher for the
+    /// caller's exact authenticated origin. Missing/deleted targets return
+    /// `None`; malformed conversation, author, sender, or attachment rows fail
+    /// the whole lookup rather than exposing a partially trusted context.
+    pub fn get_search_result_context(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        canonical_server_origin: &str,
+    ) -> Result<Option<SearchResultContext>, String> {
+        if message_id.is_empty() || conversation_id.is_empty() {
+            return Err("search message and conversation ids must not be empty".to_string());
+        }
+        validate_canonical_server_origin(canonical_server_origin)?;
+
+        let conversation = self
+            .conn
+            .query_row(
+                "SELECT conv_type, server_id
+                 FROM conversations
+                 WHERE id = ?1 AND server_origin = ?2",
+                rusqlite::params![conversation_id, canonical_server_origin],
+                |row| Ok((row.get::<_, u8>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("load search result conversation: {error}"))?;
+        let Some((conversation_type, stored_server_id)) = conversation else {
+            return Ok(None);
+        };
+        let (conversation_type, server_id) = match conversation_type {
+            0 if stored_server_id.is_none() => (crate::models::ConversationType::DM, None),
+            1 if stored_server_id.is_none() => (crate::models::ConversationType::Group, None),
+            0 | 1 => {
+                return Err("non-channel search context contains a persisted server id".to_string())
+            }
+            2 => {
+                let server_id =
+                    stored_server_id.ok_or("channel search context has no persisted server id")?;
+                validate_canonical_uuid("channel search context server id", &server_id)?;
+                (crate::models::ConversationType::Channel, Some(server_id))
+            }
+            _ => return Err("search context has an invalid conversation type".to_string()),
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH ordered AS (
+                   SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                          m.msg_type, m.reply_to_id, m.is_outgoing, m.status,
+                          m.expires_at, m.server_timestamp, m.created_at,
+                          COALESCE(
+                            m.server_timestamp,
+                            CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+                          ) AS effective_timestamp,
+                          m.rowid AS local_order,
+                          ROW_NUMBER() OVER (
+                            ORDER BY COALESCE(
+                              m.server_timestamp,
+                              CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+                            ) ASC, m.rowid ASC
+                          ) AS message_rank,
+                          COUNT(*) OVER () AS total_count
+                   FROM messages AS m
+                   WHERE m.conversation_id = ?1
+                 ),
+                 target AS (
+                   SELECT message_rank, total_count
+                   FROM ordered
+                   WHERE id = ?2
+                 ),
+                 bounds AS (
+                   SELECT MAX(1, MIN(message_rank - 99, total_count - 199)) AS first_rank
+                   FROM target
+                 )
+                 SELECT m.id, m.conversation_id, m.sender_key, m.plaintext,
+                        m.msg_type, m.reply_to_id, m.is_outgoing, m.status,
+                        m.expires_at, m.server_timestamp, m.created_at,
+                        a.canonical_server_origin, a.user_id, a.identity_key,
+                        a.signing_key, a.username, a.display_name,
+                        a.profile_version, a.profile_origin, a.source, a.observed_at,
+                        a.author_context
+                 FROM ordered AS m
+                 CROSS JOIN bounds AS b
+                 LEFT JOIN message_author_snapshots_v1 AS a ON a.message_id = m.id
+                 WHERE m.message_rank BETWEEN b.first_rank AND b.first_rank + 199
+                 ORDER BY m.effective_timestamp ASC, m.local_order ASC",
+            )
+            .map_err(|error| format!("prepare search result context: {error}"))?;
+        let rows = stmt
+            .query_map(rusqlite::params![conversation_id, message_id], |row| {
+                Ok((
+                    Message {
+                        id: row.get(0)?,
+                        conversation_id: row.get(1)?,
+                        sender_key: row.get(2)?,
+                        plaintext: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                        msg_type: row.get(4)?,
+                        reply_to_id: row.get(5)?,
+                        is_outgoing: row.get::<_, u8>(6)? != 0,
+                        status: match row.get::<_, u8>(7)? {
+                            0 => crate::models::MessageStatus::Sending,
+                            1 => crate::models::MessageStatus::Sent,
+                            2 => crate::models::MessageStatus::Delivered,
+                            3 => crate::models::MessageStatus::Read,
+                            4 => crate::models::MessageStatus::Failed,
+                            5 => crate::models::MessageStatus::Unknown,
+                            value => {
+                                return Err(rusqlite::Error::IntegralValueOutOfRange(
+                                    7,
+                                    value as i64,
+                                ))
+                            }
+                        },
+                        expires_at: row.get(8)?,
+                        server_timestamp: row.get(9)?,
+                        created_at: row.get(10)?,
+                        author: None,
+                        author_context: None,
+                        attachments: Vec::new(),
+                    },
+                    raw_account_snapshot_from_row(row, 11)?,
+                    row.get::<_, Option<u8>>(21)?,
+                ))
+            })
+            .map_err(|error| format!("query search result context: {error}"))?;
+
+        let mut messages = Vec::new();
+        for row in rows {
+            let (mut message, author, author_context) =
+                row.map_err(|error| format!("collect search result context: {error}"))?;
+            if message.sender_key.len() != 32 {
+                return Err("search context contains an invalid sender key".to_string());
+            }
+            message.author = author.map(RawAccountSnapshot::decode).transpose()?;
+            if message.author.as_ref().is_some_and(|author| {
+                author.locator.canonical_server_origin != canonical_server_origin
+                    || author.locator.identity_key.as_slice() != message.sender_key.as_slice()
+            }) {
+                return Err(
+                    "search context contains a cross-origin or mismatched author".to_string(),
+                );
+            }
+            message.author_context = author_context
+                .map(|value| {
+                    MessageAuthorContext::from_u8(value).ok_or_else(|| {
+                        "invalid persisted search context author context".to_string()
+                    })
+                })
+                .transpose()?;
+            message.attachments = self.get_message_attachments(&message.id)?;
+            messages.push(message);
+        }
+        if messages.is_empty() {
+            return Ok(None);
+        }
+        if !messages.iter().any(|message| message.id == message_id) {
+            return Err("search context window omitted its target message".to_string());
+        }
+        if messages.len() > 200 {
+            return Err("search context exceeded its 200-message bound".to_string());
+        }
+
+        Ok(Some(SearchResultContext {
+            conversation_type,
+            server_id,
+            messages,
+        }))
     }
 
     /// Update the plaintext of an existing message (edit).
@@ -6578,6 +6779,12 @@ mod tests {
     #[test]
     fn search_rebuild_page_is_origin_scoped_and_keyset_paginated() {
         let db = VeilDb::open_memory(&[42u8; 32]).unwrap();
+        const A_1: &str = "550e8400-e29b-41d4-a716-446655440010";
+        const A_2: &str = "550e8400-e29b-41d4-a716-446655440020";
+        const A_3: &str = "550e8400-e29b-41d4-a716-446655440030";
+        const A_TIE: &str = "550e8400-e29b-41d4-a716-446655440031";
+        const A_EMPTY: &str = "550e8400-e29b-41d4-a716-446655440040";
+        const B_1: &str = "550e8400-e29b-41d4-a716-446655440050";
         db.upsert_directory_conversation(
             "search-a",
             1,
@@ -6602,44 +6809,46 @@ mod tests {
         .unwrap();
 
         db.insert_message(
-            "a-1",
+            A_3,
             "search-a",
             &[1u8; 32],
-            "oldest",
+            "newest lower tie",
             false,
-            Some(1),
+            Some(5),
             None,
         )
         .unwrap();
         db.insert_message(
-            "b-1",
+            B_1,
             "search-b",
             &[2u8; 32],
             "other origin",
             false,
-            Some(2),
+            Some(99),
             None,
         )
         .unwrap();
-        db.insert_message(
-            "a-2",
-            "search-a",
-            &[1u8; 32],
-            "middle",
-            false,
-            Some(3),
-            None,
-        )
-        .unwrap();
-        db.insert_message("a-empty", "search-a", &[1u8; 32], "", false, Some(4), None)
+        db.insert_message(A_1, "search-a", &[1u8; 32], "oldest", false, Some(1), None)
+            .unwrap();
+        db.insert_message(A_EMPTY, "search-a", &[1u8; 32], "", false, Some(100), None)
             .unwrap();
         db.insert_message(
-            "a-3",
+            A_TIE,
             "search-a",
             &[1u8; 32],
-            "newest",
+            "newest higher tie",
             false,
             Some(5),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            A_2,
+            "search-a",
+            &[1u8; 32],
+            "middle inserted last",
+            false,
+            Some(3),
             None,
         )
         .unwrap();
@@ -6647,15 +6856,264 @@ mod tests {
         let first = db.get_search_index_page(ORIGIN_A, None, 2).unwrap();
         assert_eq!(
             first.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
-            vec!["a-3", "a-2"]
+            vec![A_TIE, A_3]
         );
         assert!(first.iter().all(|row| row.conversation_id == "search-a"));
+        let cursor = crate::models::SearchIndexCursor {
+            timestamp: first[1].timestamp,
+            message_id: first[1].id.clone(),
+        };
         let second = db
-            .get_search_index_page(ORIGIN_A, Some(first[1].local_order), 2)
+            .get_search_index_page(ORIGIN_A, Some(&cursor), 2)
             .unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].id, "a-1");
-        assert_eq!(second[0].timestamp, 1);
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].id, A_2);
+        assert_eq!(second[1].id, A_1);
+        assert_eq!(second[1].timestamp, 1);
+    }
+
+    #[test]
+    fn search_result_context_is_origin_scoped_bounded_and_centred_on_target() {
+        let db = VeilDb::open_memory(&[43u8; 32]).unwrap();
+        db.upsert_directory_conversation(
+            "context-a",
+            1,
+            ORIGIN_A,
+            Some("Alpha"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        for index in 0..250 {
+            db.insert_message(
+                &format!("context-{index}"),
+                "context-a",
+                &[1u8; 32],
+                &format!("message {index}"),
+                false,
+                Some(index + 1),
+                None,
+            )
+            .unwrap();
+        }
+
+        let middle = db
+            .get_search_result_context("context-125", "context-a", ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            middle.conversation_type,
+            crate::models::ConversationType::Group
+        );
+        assert_eq!(middle.server_id, None);
+        assert_eq!(middle.messages.len(), 200);
+        assert_eq!(middle.messages.first().unwrap().id, "context-26");
+        assert_eq!(middle.messages.last().unwrap().id, "context-225");
+        assert!(middle
+            .messages
+            .iter()
+            .any(|message| message.id == "context-125"));
+
+        let first = db
+            .get_search_result_context("context-0", "context-a", ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.messages.first().unwrap().id, "context-0");
+        assert_eq!(first.messages.last().unwrap().id, "context-199");
+
+        let last = db
+            .get_search_result_context("context-249", "context-a", ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(last.messages.first().unwrap().id, "context-50");
+        assert_eq!(last.messages.last().unwrap().id, "context-249");
+
+        assert!(db
+            .get_search_result_context("context-125", "context-a", ORIGIN_B)
+            .unwrap()
+            .is_none());
+        assert!(db
+            .get_search_result_context("deleted", "context-a", ORIGIN_A)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn search_result_context_fails_closed_for_corrupt_message_or_channel_rows() {
+        let db = VeilDb::open_memory(&[44u8; 32]).unwrap();
+        db.upsert_directory_conversation(
+            "context-corrupt",
+            1,
+            ORIGIN_A,
+            Some("Corrupt"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "corrupt-message",
+            "context-corrupt",
+            &[2u8; 32],
+            "body",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "UPDATE messages SET sender_key = X'01' WHERE id = 'corrupt-message'",
+                [],
+            )
+            .unwrap();
+        assert!(db
+            .get_search_result_context("corrupt-message", "context-corrupt", ORIGIN_A)
+            .unwrap_err()
+            .contains("invalid sender key"));
+
+        db.conn
+            .execute(
+                "INSERT INTO conversations
+                   (id, conv_type, server_origin, name, created_at)
+                 VALUES ('channel-without-server', 2, ?1, 'general', '2026-07-14T00:00:00Z')",
+                rusqlite::params![ORIGIN_A],
+            )
+            .unwrap();
+        assert!(db
+            .get_search_result_context("missing", "channel-without-server", ORIGIN_A)
+            .unwrap_err()
+            .contains("no persisted server id"));
+
+        db.conn
+            .execute(
+                "UPDATE conversations SET server_id = ?1 WHERE id = 'context-corrupt'",
+                rusqlite::params!["550e8400-e29b-41d4-a716-446655440099"],
+            )
+            .unwrap();
+        assert!(db
+            .get_search_result_context("corrupt-message", "context-corrupt", ORIGIN_A)
+            .unwrap_err()
+            .contains("non-channel search context"));
+    }
+
+    #[test]
+    fn search_result_context_publishes_server_id_only_for_channels() {
+        let db = VeilDb::open_memory(&[45u8; 32]).unwrap();
+        let server_id = "550e8400-e29b-41d4-a716-446655440045";
+        db.upsert_directory_conversation(
+            "channel-context",
+            2,
+            ORIGIN_A,
+            Some("general"),
+            None,
+            None,
+            Some(server_id),
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        db.insert_message(
+            "channel-message",
+            "channel-context",
+            &[3u8; 32],
+            "channel body",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+
+        let context = db
+            .get_search_result_context("channel-message", "channel-context", ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            context.conversation_type,
+            crate::models::ConversationType::Channel
+        );
+        assert_eq!(context.server_id.as_deref(), Some(server_id));
+    }
+
+    #[test]
+    fn search_result_context_rehydrates_persisted_author_context_and_attachments() {
+        let db = VeilDb::open_memory(&[46u8; 32]).unwrap();
+        let conversation_id = "550e8400-e29b-41d4-a716-446655440046";
+        let message_id = "550e8400-e29b-41d4-a716-446655440047";
+        let author = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x46,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(7),
+        );
+        db.upsert_directory_conversation(
+            conversation_id,
+            1,
+            ORIGIN_A,
+            Some("Composition"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        let attachment = crate::models::MessageAttachment {
+            ordinal: 0,
+            media_id: "0123456789abcdef0123456789abcdef".to_string(),
+            file_name: "evidence.txt".to_string(),
+            detected_mime: "text/plain".to_string(),
+            format_version: 2,
+            nonce_prefix: [0x47; 16],
+            chunk_count: 1,
+            plaintext_size: 8,
+            ciphertext_size: 24,
+            content_key: [0x48; 32],
+        };
+        db.insert_outgoing_pending_message_with_attachments(
+            message_id,
+            conversation_id,
+            &author.locator.identity_key,
+            "search composition",
+            None,
+            std::slice::from_ref(&attachment),
+        )
+        .unwrap();
+        db.attach_message_author_with_context(
+            message_id,
+            &author,
+            MessageAuthorContext::DirectoryMemberAtObservation,
+        )
+        .unwrap();
+
+        let context = db
+            .get_search_result_context(message_id, conversation_id, ORIGIN_A)
+            .unwrap()
+            .unwrap();
+        assert_eq!(context.messages.len(), 1);
+        let hydrated = &context.messages[0];
+        assert_eq!(hydrated.author.as_ref(), Some(&author));
+        assert_eq!(
+            hydrated.author_context,
+            Some(MessageAuthorContext::DirectoryMemberAtObservation)
+        );
+        assert_eq!(hydrated.attachments.len(), 1);
+        assert_eq!(hydrated.attachments[0].file_name, attachment.file_name);
+        assert_eq!(hydrated.attachments[0].media_id, attachment.media_id);
+        assert_eq!(hydrated.attachments[0].content_key, attachment.content_key);
+
+        db.conn
+            .execute(
+                "UPDATE messages SET sender_key = ?1 WHERE id = ?2",
+                rusqlite::params![[0x49u8; 32].as_slice(), message_id],
+            )
+            .unwrap();
+        assert!(db
+            .get_search_result_context(message_id, conversation_id, ORIGIN_A)
+            .unwrap_err()
+            .contains("mismatched author"));
     }
 
     #[test]

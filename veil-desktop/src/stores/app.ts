@@ -4,8 +4,11 @@ import { decisionDialog } from "@/lib/decisionDialog";
 import { listen, type EventCallback, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   validatedLiveMessage,
+  validatedSearchResultContext,
   validatedStoredMessages,
   type MessageAuthorContextWire,
+  type SearchResultContextDto,
+  type StoredMessageDto,
 } from "@/lib/identityIpcBoundary";
 
 // ─── Types ───────────────────────────────────────────
@@ -515,6 +518,64 @@ function messagePreview(message: Message): string {
   if (message.deliveryUnknown) return `Delivery unknown: ${message.text}`;
   if (message.pending) return `Sending: ${message.text}`;
   return message.text;
+}
+
+function rendererMessagesFromStored(stored: StoredMessageDto[]): Message[] {
+  return stored
+    .filter((message) => !discardedOutgoingMessageIds.has(message.id))
+    .map((message) => {
+      const acknowledgedId = acknowledgedOutgoingMessageIds.get(message.id);
+      const rejected = rejectedOutgoingMessageIds.has(message.id);
+      return {
+        id: acknowledgedId ?? message.id,
+        conversationId: message.conversationId,
+        senderName: message.isOwn
+          ? "You"
+          : (message.senderName?.trim() || "Unknown author"),
+        senderUserId: message.senderUserId,
+        senderKey: message.senderKey,
+        senderSigningKey: message.senderSigningKey,
+        senderProfileVersion: message.senderProfileVersion,
+        senderProfileOrigin: message.senderProfileOrigin,
+        senderOrigin: message.senderOrigin,
+        senderAuthorContext: message.senderAuthorContext,
+        text: message.text,
+        timestamp: message.timestamp || new Date(message.createdAt).getTime(),
+        isOwn: message.isOwn,
+        pending: !acknowledgedId && !rejected && message.pending,
+        failed: !acknowledgedId && (message.failed || rejected),
+        deliveryUnknown: !acknowledgedId && !rejected && message.deliveryUnknown,
+        replyToId: message.replyToId
+          ? acknowledgedOutgoingMessageIds.get(message.replyToId) ?? message.replyToId
+          : undefined,
+        attachments: message.attachments,
+      } satisfies Message;
+    });
+}
+
+function publishConversationMessages(
+  conversationId: string,
+  loaded: Message[],
+): void {
+  let merged: Message[] = [];
+  setMessages((previous) => {
+    const loadedIds = new Set(loaded.map((message) => message.id));
+    // Preserve other histories and any optimistic item which has not reached
+    // SQLCipher yet. Exact search windows intentionally replace only the
+    // selected conversation's persisted projection.
+    const otherConversations = previous.filter(
+      (message) => message.conversationId !== conversationId,
+    );
+    const localOnly = previous.filter(
+      (message) => message.conversationId === conversationId
+        && message.pending
+        && !discardedOutgoingMessageIds.has(message.id)
+        && !loadedIds.has(message.id),
+    );
+    merged = [...otherConversations, ...loaded, ...localOnly];
+    return merged;
+  });
+  updateConversationPreview(conversationId, merged);
 }
 
 function updateConversationPreview(conversationId: string, snapshot = messages()): void {
@@ -2072,53 +2133,60 @@ export const appStore = {
         conversationId,
         expectedScope.canonicalServerOrigin,
       );
-      const loaded: Message[] = msgs
-        .filter((message) => !discardedOutgoingMessageIds.has(message.id))
-        .map(m => {
-          const acknowledgedId = acknowledgedOutgoingMessageIds.get(m.id);
-          const rejected = rejectedOutgoingMessageIds.has(m.id);
-          return {
-            id: acknowledgedId ?? m.id,
-            conversationId: m.conversationId,
-            senderName: m.isOwn ? "You" : (m.senderName?.trim() || "Unknown author"),
-            senderUserId: m.senderUserId,
-            senderKey: m.senderKey,
-            senderSigningKey: m.senderSigningKey,
-            senderProfileVersion: m.senderProfileVersion,
-            senderProfileOrigin: m.senderProfileOrigin,
-            senderOrigin: m.senderOrigin,
-            senderAuthorContext: m.senderAuthorContext,
-            text: m.text,
-            timestamp: m.timestamp || new Date(m.createdAt).getTime(),
-            isOwn: m.isOwn,
-            pending: !acknowledgedId && !rejected && m.pending,
-            failed: !acknowledgedId && (m.failed || rejected),
-            deliveryUnknown: !acknowledgedId && !rejected && m.deliveryUnknown,
-            replyToId: m.replyToId
-              ? acknowledgedOutgoingMessageIds.get(m.replyToId) ?? m.replyToId
-              : undefined,
-            attachments: m.attachments,
-          };
-        });
-      let merged: Message[] = [];
-      setMessages(prev => {
-        const loadedIds = new Set(loaded.map(m => m.id));
-        // Keep messages from OTHER conversations untouched. For the current
-        // conversation, keep only local optimistic items not yet in DB so we
-        // don't duplicate, and prepend the DB-loaded list.
-        const otherConvs = prev.filter(m => m.conversationId !== conversationId);
-        const localOnly = prev.filter(
-          m => m.conversationId === conversationId && m.pending &&
-            !discardedOutgoingMessageIds.has(m.id) && !loadedIds.has(m.id),
-        );
-        merged = [...otherConvs, ...loaded, ...localOnly];
-        return merged;
-      });
-      updateConversationPreview(conversationId, merged);
+      publishConversationMessages(conversationId, rendererMessagesFromStored(msgs));
     } catch (e) {
       if (e instanceof StaleUiSessionError) return;
       if (messageLoadGenerations.get(conversationId) !== generation) return;
       console.error("loadMessages failed:", e);
+    }
+  },
+
+  /**
+   * Publish a bounded SQLCipher history window containing one exact search
+   * hit. The caller receives authoritative route metadata so a Room can never
+   * be mistaken for a direct conversation by UUID alone.
+   */
+  loadSearchResultContext: async (
+    messageId: string,
+    conversationId: string,
+  ): Promise<Pick<SearchResultContextDto, "conversationType" | "serverId">> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const expectedScope = authenticatedServerScope();
+    if (!expectedScope) {
+      throw new Error("search result has no authenticated origin context");
+    }
+    const generation = nextMessageLoadGeneration(conversationId);
+    try {
+      const response = await invoke<unknown>("get_search_result_context", {
+        messageId,
+        conversationId,
+      });
+      requireCurrentUiSession(sessionEpoch);
+      if (!authenticatedScopesEqual(authenticatedServerScope(), expectedScope)) {
+        throw new StaleUiSessionError();
+      }
+      if (messageLoadGenerations.get(conversationId) !== generation) {
+        throw new StaleUiSessionError();
+      }
+      const context = validatedSearchResultContext(
+        response,
+        messageId,
+        conversationId,
+        expectedScope.canonicalServerOrigin,
+      );
+      publishConversationMessages(
+        conversationId,
+        rendererMessagesFromStored(context.messages),
+      );
+      return {
+        conversationType: context.conversationType,
+        serverId: context.serverId,
+      };
+    } catch (error) {
+      if (messageLoadGenerations.get(conversationId) !== generation) {
+        throw new StaleUiSessionError();
+      }
+      throw error;
     }
   },
 
@@ -2512,12 +2580,12 @@ export const appStore = {
   },
 
   /** Load server rows only from the currently authenticated REST namespace. */
-  loadServers: async () => {
+  loadServers: async (): Promise<boolean> => {
     const sessionEpoch = captureUiSessionEpoch();
     // The v1 desktop cache has bare UUID keys and no server origin. It stays
     // disabled until an origin-scoped schema can make collisions impossible.
     const uid = userId();
-    if (!uid) return;
+    if (!uid) return false;
     try {
       const fresh = await invoke<Array<any>>("list_servers", {
         serverHttpUrl: serverHttpUrl(),
@@ -2531,16 +2599,18 @@ export const appStore = {
         fresh.map((server: any) => appStore.loadServerMembers(server.id)),
       );
       requireCurrentUiSession(sessionEpoch);
+      return true;
     } catch (e) {
-      if (e instanceof StaleUiSessionError) return;
+      if (e instanceof StaleUiSessionError) return false;
       console.error("list_servers failed:", e);
+      return false;
     }
   },
 
-  loadChannels: async (serverId: string) => {
+  loadChannels: async (serverId: string, autoSelectFirst = true): Promise<boolean> => {
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
-    if (!uid) return;
+    if (!uid) return false;
     try {
       const mutationScope = requirePublishedMutationScope();
       const fresh = await invoke<Array<any>>("list_channels", {
@@ -2552,13 +2622,15 @@ export const appStore = {
       requireCurrentMutationScope(sessionEpoch, mutationScope);
       setChannelsByServer((prev) => ({ ...prev, [serverId]: fresh.map(channelFromJSON) }));
       // If active server but no active channel, pick first text channel
-      if (activeServerId() === serverId && !activeChannelId()) {
+      if (autoSelectFirst && activeServerId() === serverId && !activeChannelId()) {
         const firstText = fresh.find((c) => (c.channel_type ?? 0) === 0);
         if (firstText) appStore.selectChannel(firstText.id);
       }
+      return true;
     } catch (e) {
-      if (e instanceof StaleUiSessionError) return;
+      if (e instanceof StaleUiSessionError) return false;
       console.error("list_channels failed:", e);
+      return false;
     }
   },
 

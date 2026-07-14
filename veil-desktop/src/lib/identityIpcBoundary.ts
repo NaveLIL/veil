@@ -79,6 +79,21 @@ export interface SearchHitDto {
   author?: SearchAuthorDto | null;
 }
 
+export interface SearchResultContextDto {
+  targetMessageId: string;
+  conversationId: string;
+  conversationType: "dm" | "group" | "channel";
+  serverId?: string;
+  messages: StoredMessageDto[];
+}
+
+export interface SearchCoverageDto {
+  indexedMessages: number;
+  indexedSourceBytes: number;
+  maxSourceBytes: number;
+  truncated: boolean;
+}
+
 const MAX_MESSAGE_TEXT_UNITS = 64 * 1024;
 const MAX_ID_UNITS = 256;
 const MAX_NAME_UNITS = 512;
@@ -86,6 +101,8 @@ const MAX_ORIGIN_UNITS = 512;
 const MAX_DATE_UNITS = 64;
 const MAX_STORED_MESSAGES = 200;
 const MAX_SEARCH_HITS = 30;
+const MAX_SEARCH_INDEX_MESSAGES = 250_000;
+const SEARCH_MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const MAX_PROFILE_VERSION = 9223372036854775807n;
 
 type JsonRecord = Record<string, unknown>;
@@ -442,4 +459,94 @@ export function validatedSearchHits(
       author,
     };
   });
+}
+
+export function validatedSearchResultContext(
+  value: unknown,
+  expectedMessageId: string,
+  expectedConversationId: string,
+  expectedServerOrigin: string,
+): SearchResultContextDto {
+  const candidate = record(value, "search result context");
+  const targetMessageId = exactUserId(
+    candidate.targetMessageId,
+    "search result target message id",
+  );
+  const conversationId = exactUserId(
+    candidate.conversationId,
+    "search result conversation id",
+  );
+  if (
+    targetMessageId !== expectedMessageId
+    || conversationId !== expectedConversationId
+  ) {
+    throw new Error("search result context escaped the selected hit");
+  }
+
+  const conversationType = candidate.conversationType;
+  if (
+    conversationType !== "dm"
+    && conversationType !== "group"
+    && conversationType !== "channel"
+  ) {
+    throw new Error("search result context has an unknown conversation type");
+  }
+
+  let serverId: string | undefined;
+  if (conversationType === "channel") {
+    serverId = exactUserId(candidate.serverId, "search result server id");
+  } else if (candidate.serverId !== null && candidate.serverId !== undefined) {
+    throw new Error("non-channel search result carried server context");
+  }
+
+  const messages = validatedStoredMessages(
+    candidate.messages,
+    conversationId,
+    expectedServerOrigin,
+  );
+  const messageIds = new Set<string>();
+  let targetCount = 0;
+  for (const message of messages) {
+    if (messageIds.has(message.id)) {
+      throw new Error("search result context contains duplicate messages");
+    }
+    messageIds.add(message.id);
+    if (message.id === targetMessageId) targetCount += 1;
+  }
+  if (targetCount !== 1) {
+    throw new Error("search result context does not contain the selected message");
+  }
+
+  return {
+    targetMessageId,
+    conversationId,
+    conversationType,
+    serverId,
+    messages,
+  };
+}
+
+export function validatedSearchCoverage(value: unknown): SearchCoverageDto | null {
+  if (value === null) return null;
+  const candidate = record(value, "search coverage");
+  const fields = [
+    candidate.indexedMessages,
+    candidate.indexedSourceBytes,
+    candidate.maxSourceBytes,
+  ];
+  if (
+    fields.some((field) => !Number.isSafeInteger(field) || (field as number) < 0)
+    || typeof candidate.truncated !== "boolean"
+    || (candidate.indexedMessages as number) > MAX_SEARCH_INDEX_MESSAGES
+    || candidate.maxSourceBytes !== SEARCH_MAX_SOURCE_BYTES
+    || (candidate.indexedSourceBytes as number) > (candidate.maxSourceBytes as number)
+  ) {
+    throw new Error("search coverage is outside its schema or budget");
+  }
+  return {
+    indexedMessages: candidate.indexedMessages as number,
+    indexedSourceBytes: candidate.indexedSourceBytes as number,
+    maxSourceBytes: candidate.maxSourceBytes as number,
+    truncated: candidate.truncated,
+  };
 }

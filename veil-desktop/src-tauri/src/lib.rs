@@ -13,11 +13,15 @@ use veil_client::api::{
     VeilClient,
 };
 use veil_client::connection::ConnectionEvent;
-use veil_search::{Indexer, SearchDocument, SearchError, SearchHit};
+use veil_search::{
+    Indexer, SearchCoverageSnapshot, SearchDocument, SearchError, SearchHit, MAX_INDEXED_MESSAGES,
+    MAX_INDEX_SOURCE_BYTES,
+};
 use veil_store::keychain;
 use veil_store::models::{
-    AccountSnapshot, AccountSnapshotSource, HistoricalAccountContinuity, LocalIdentityVerification,
-    Message, MessageAuthorContext, NetworkProfile, ProfileLocator, SearchIndexDocument,
+    AccountSnapshot, AccountSnapshotSource, ConversationType, HistoricalAccountContinuity,
+    LocalIdentityVerification, Message, MessageAuthorContext, NetworkProfile, ProfileLocator,
+    SearchIndexCursor, SearchIndexDocument,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -187,6 +191,10 @@ struct AppState {
     /// locking, or changing origin invalidates the previous candidate without
     /// publishing a partial plaintext index.
     search_rebuild_generation: AtomicU64,
+    /// Exact binding/session coverage for the currently published RAM index.
+    /// This mutex is also the final publication linearization point shared by
+    /// rebuild, cancel, clear, lock, and origin replacement.
+    search_publication: Mutex<Option<PublishedSearchBinding>>,
 }
 
 struct PendingVeilLink {
@@ -1174,36 +1182,89 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
     state.unlocked.store(false, Ordering::SeqCst);
     state.offline_sync_ready.store(false, Ordering::SeqCst);
     state.lock_event_pending.store(true, Ordering::Release);
-    *state
-        .authenticated_rest_origin
-        .lock()
-        .map_err(|e| e.to_string())? = None;
-    state
-        .media_sessions
-        .lock()
-        .map_err(|error| error.to_string())?
-        .clear();
-    *state
-        .renderer_confirmed_rest_binding
-        .lock()
-        .map_err(|e| e.to_string())? = None;
-    state
-        .unavailable_conversations
-        .lock()
-        .map_err(|e| e.to_string())?
-        .clear();
-    *state.pending_veil_link.lock().map_err(|e| e.to_string())? = None;
-    *state
-        .pending_attachment_drop
-        .lock()
-        .map_err(|e| e.to_string())? = None;
+
+    // The search index contains decrypted message bodies, so destroy its old
+    // state before touching any other (possibly poisoned) mutex. `clear`
+    // drops the previous RAM snapshot before allocating its empty replacement;
+    // even an allocation error therefore leaves search unavailable rather than
+    // retaining plaintext after the lock boundary.
+    let search_clear_result = clear_published_search_snapshot_locked(state);
+
+    // A panic in an unrelated subsystem must not turn a later lock into a
+    // partial cleanup. Recover each poisoned mutex, overwrite the sensitive
+    // value with its locked default, and clear the poison only after that
+    // overwrite has completed.
+    {
+        let mut origin = state
+            .authenticated_rest_origin
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *origin = None;
+    }
+    state.authenticated_rest_origin.clear_poison();
+    {
+        let mut media_sessions = state
+            .media_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        media_sessions.clear();
+    }
+    state.media_sessions.clear_poison();
+    {
+        let mut renderer_binding = state
+            .renderer_confirmed_rest_binding
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *renderer_binding = None;
+    }
+    state.renderer_confirmed_rest_binding.clear_poison();
+    {
+        let mut unavailable = state
+            .unavailable_conversations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        unavailable.clear();
+    }
+    state.unavailable_conversations.clear_poison();
+    {
+        let mut pending_link = state
+            .pending_veil_link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending_link = None;
+    }
+    state.pending_veil_link.clear_poison();
+    {
+        let mut pending_drop = state
+            .pending_attachment_drop
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending_drop = None;
+    }
+    state.pending_attachment_drop.clear_poison();
     // The client mutex is the linearization point: operations already holding
     // it finish first; every later operation observes an empty client.
-    *state.client.lock().map_err(|e| e.to_string())? = VeilClient::new();
-    state
-        .search_rebuild_generation
-        .fetch_add(1, Ordering::SeqCst);
-    state.indexer.clear().map_err(|e| e.to_string())
+    {
+        let mut client = state
+            .client
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *client = VeilClient::new();
+    }
+    state.client.clear_poison();
+
+    // A command that acquired `client` before this lock transition may have
+    // completed one last live index mutation after the early clear. Replacing
+    // the client above is the quiescence point; clear once more afterwards so
+    // no pre-lock sender can repopulate plaintext behind the locked flag.
+    let final_search_clear_result = clear_published_search_snapshot_locked(state);
+    match (search_clear_result, final_search_clear_result) {
+        (_, Ok(())) => Ok(()),
+        (Ok(()), Err(final_error)) => Err(final_error),
+        (Err(first), Err(final_error)) => Err(format!(
+            "{first}; final search scrub after client quiescence failed: {final_error}"
+        )),
+    }
 }
 
 fn account_database_path(state: &AppState, mnemonic: &str) -> Result<PathBuf, String> {
@@ -1530,7 +1591,7 @@ async fn verify_pin(state: State<'_, AppState>, pin: String) -> Result<bool, Str
                 )),
             };
         }
-        if let Err(error) = state.indexer.clear().map_err(|e| e.to_string()) {
+        if let Err(error) = clear_published_search_snapshot_locked(&state) {
             let reset = reset_sensitive_state_locked(&state);
             return Err(reset.err().map_or(error.clone(), |reset_error| {
                 format!("{error}; unlock reset also failed: {reset_error}")
@@ -1842,6 +1903,70 @@ fn get_conversation_crypto_diagnostics(
 }
 
 /// Get persisted messages for a conversation.
+fn renderer_message_json(
+    message: Message,
+    canonical_server_origin: &str,
+) -> Result<serde_json::Value, String> {
+    decode_canonical_uuid("persisted renderer message id", &message.id)?;
+    decode_canonical_uuid(
+        "persisted renderer message conversation id",
+        &message.conversation_id,
+    )?;
+    if let Some(reply_to_id) = message.reply_to_id.as_deref() {
+        decode_canonical_uuid("persisted renderer message reply id", reply_to_id)?;
+    }
+    if message.sender_key.len() != 32 {
+        return Err("persisted message contains an invalid sender key".to_string());
+    }
+    if message.author.as_ref().is_some_and(|author| {
+        author.locator.canonical_server_origin != canonical_server_origin
+            || author.locator.identity_key.as_slice() != message.sender_key.as_slice()
+    }) {
+        return Err("persisted message contains a cross-origin or mismatched author".to_string());
+    }
+    let author_name = message.author.as_ref().and_then(|author| {
+        author
+            .display_name
+            .as_ref()
+            .or(author.username.as_ref())
+            .cloned()
+    });
+    let attachments = message
+        .attachments
+        .iter()
+        .map(|attachment| {
+            serde_json::json!({
+                "ordinal": attachment.ordinal,
+                "mediaId": attachment.media_id,
+                "fileName": attachment.file_name,
+                "detectedMime": attachment.detected_mime,
+                "plaintextSize": attachment.plaintext_size,
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "id": message.id,
+        "conversationId": message.conversation_id,
+        "senderKey": hex::encode(&message.sender_key),
+        "senderName": author_name,
+        "senderUserId": message.author.as_ref().map(|author| &author.locator.user_id),
+        "senderSigningKey": message.author.as_ref().map(|author| hex::encode(author.signing_key)),
+        "senderProfileVersion": message.author.as_ref().and_then(|author| author.profile_version.map(|version| version.to_string())),
+        "senderProfileOrigin": message.author.as_ref().map(|author| &author.profile_origin),
+        "senderOrigin": message.author.as_ref().map(|author| &author.locator.canonical_server_origin),
+        "senderAuthorContext": message.author_context.map(MessageAuthorContext::wire_label),
+        "text": message.plaintext,
+        "isOwn": message.is_outgoing,
+        "pending": message.is_outgoing && message.status == veil_store::models::MessageStatus::Sending,
+        "failed": message.is_outgoing && message.status == veil_store::models::MessageStatus::Failed,
+        "deliveryUnknown": message.is_outgoing && message.status == veil_store::models::MessageStatus::Unknown,
+        "timestamp": message.server_timestamp.unwrap_or(0),
+        "createdAt": message.created_at,
+        "replyToId": message.reply_to_id,
+        "attachments": attachments,
+    }))
+}
+
 #[tauri::command]
 fn get_messages(
     state: State<'_, AppState>,
@@ -1849,57 +1974,21 @@ fn get_messages(
     limit: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
     require_unlocked(&state)?;
+    let binding = authenticated_rest_binding(&state)?;
+    let canonical_server_origin = binding.origin.canonical_server_origin();
     let client = state.client.lock().map_err(|e| e.to_string())?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
     let db = client.db().ok_or("database not initialized")?;
     let msgs = db.get_messages(&conversation_id, limit.unwrap_or(200))?;
     let result = msgs
         .into_iter()
-        .map(|m| {
-            let author_name = m.author.as_ref().and_then(|author| {
-                author
-                    .display_name
-                    .as_ref()
-                    .or(author.username.as_ref())
-                    .cloned()
-            });
-            let attachments = m
-                .attachments
-                .iter()
-                .map(|attachment| {
-                    serde_json::json!({
-                        "ordinal": attachment.ordinal,
-                        "mediaId": attachment.media_id,
-                        "fileName": attachment.file_name,
-                        "detectedMime": attachment.detected_mime,
-                        "plaintextSize": attachment.plaintext_size,
-                    })
-                })
-                .collect::<Vec<_>>();
-            serde_json::json!({
-                "id": m.id,
-                "conversationId": m.conversation_id,
-                "senderKey": hex::encode(&m.sender_key),
-                "senderName": author_name,
-                "senderUserId": m.author.as_ref().map(|author| &author.locator.user_id),
-                "senderSigningKey": m.author.as_ref().map(|author| hex::encode(author.signing_key)),
-                "senderProfileVersion": m.author.as_ref().and_then(|author| author.profile_version.map(|version| version.to_string())),
-                "senderProfileOrigin": m.author.as_ref().map(|author| &author.profile_origin),
-                "senderOrigin": m.author.as_ref().map(|author| &author.locator.canonical_server_origin),
-                "senderAuthorContext": m.author_context.map(MessageAuthorContext::wire_label),
-                "text": m.plaintext,
-                "isOwn": m.is_outgoing,
-                "pending": m.is_outgoing && m.status == veil_store::models::MessageStatus::Sending,
-                "failed": m.is_outgoing && m.status == veil_store::models::MessageStatus::Failed,
-                "deliveryUnknown": m.is_outgoing && m.status == veil_store::models::MessageStatus::Unknown,
-                "timestamp": m.server_timestamp.unwrap_or(0),
-                "createdAt": m.created_at,
-                "replyToId": m.reply_to_id,
-                "attachments": attachments,
-            })
-        })
-        .collect();
+        .map(|message| renderer_message_json(message, &canonical_server_origin))
+        .collect::<Result<Vec<_>, _>>()?;
     require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    drop(client);
+    if authenticated_rest_binding(&state)? != binding {
+        return Err("authenticated server binding changed while loading messages".to_string());
+    }
     require_session_still_unlocked(&state)?;
     Ok(result)
 }
@@ -4784,10 +4873,7 @@ fn connect_to_server(
             .map_err(|e| e.to_string())? = None;
         // The index stores plaintext in process memory and has no origin
         // field. Erase it before authenticating another binding.
-        state
-            .search_rebuild_generation
-            .fetch_add(1, Ordering::SeqCst);
-        state.indexer.clear().map_err(|e| e.to_string())?;
+        clear_published_search_snapshot_locked(&state)?;
     }
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
     client.clear_known_user_identities();
@@ -4854,15 +4940,26 @@ fn connect_to_server(
             return Err(format!("authenticated offline sync failed: {error}"));
         }
     };
-    if let Err(error) = rebuild_search_index_for_current_origin(&state) {
-        let _ = state.indexer.clear();
-        let _ = requested_event_app.emit(
-            "veil://error",
-            serde_json::json!({
-                "code": 5001,
-                "message": format!("origin-scoped search backfill failed: {error}"),
-            }),
-        );
+    match ensure_search_backfill_for_current_origin(&state) {
+        Ok(report) if report.cancelled => {
+            let _ = requested_event_app.emit(
+                "veil://error",
+                serde_json::json!({
+                    "code": 5001,
+                    "message": "origin-scoped search backfill remained stale after bounded retries",
+                }),
+            );
+        }
+        Err(error) => {
+            let _ = requested_event_app.emit(
+                "veil://error",
+                serde_json::json!({
+                    "code": 5001,
+                    "message": format!("origin-scoped search backfill failed: {error}"),
+                }),
+            );
+        }
+        Ok(_) => {}
     }
     {
         // Publish readiness and its UI notification in the same ordered
@@ -10812,10 +10909,37 @@ struct SearchHitDto {
     author: Option<SearchAuthorDto>,
 }
 
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchResultContextDto {
+    target_message_id: String,
+    conversation_id: String,
+    conversation_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_id: Option<String>,
+    messages: Vec<serde_json::Value>,
+}
+
 const SEARCH_REBUILD_PAGE_SIZE: u32 = 512;
-const SEARCH_MAX_DOCUMENTS: usize = 250_000;
-const SEARCH_MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+const SEARCH_BACKFILL_MAX_ATTEMPTS: usize = 3;
+const SEARCH_MAX_DOCUMENTS: usize = MAX_INDEXED_MESSAGES;
+const SEARCH_MAX_SOURCE_BYTES: usize = MAX_INDEX_SOURCE_BYTES;
 const SEARCH_DOCUMENT_OVERHEAD_BYTES: usize = 64;
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchCoverage {
+    indexed_messages: usize,
+    indexed_source_bytes: usize,
+    max_source_bytes: usize,
+    truncated: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PublishedSearchBinding {
+    binding: RestBinding,
+    session_epoch: u64,
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -10825,6 +10949,67 @@ struct SearchRebuildReport {
     max_source_bytes: usize,
     truncated: bool,
     cancelled: bool,
+    /// Internal retry classification. Renderer DTOs deliberately never expose
+    /// scheduling details; only automatic backfill consumes this flag.
+    #[serde(skip_serializing)]
+    retryable: bool,
+}
+
+/// Clear the RAM index and its coverage while the caller holds
+/// `session_transition` (or during single-threaded setup). Coverage is erased
+/// before the fallible index allocation so no stale snapshot can be reported
+/// after a fail-closed lock/origin transition.
+fn clear_published_search_snapshot_locked(state: &AppState) -> Result<(), String> {
+    let mut publication = state
+        .search_publication
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state
+        .search_rebuild_generation
+        .fetch_add(1, Ordering::SeqCst);
+    *publication = None;
+    state.search_publication.clear_poison();
+    state.indexer.clear().map_err(|error| error.to_string())
+}
+
+fn validated_search_coverage(
+    published: Option<&PublishedSearchBinding>,
+    session_epoch: u64,
+    binding: &RestBinding,
+    snapshot: SearchCoverageSnapshot,
+) -> Result<Option<SearchCoverage>, String> {
+    let Some(published) = published else {
+        return Ok(None);
+    };
+    if published.session_epoch != session_epoch || published.binding != *binding {
+        return Err("published search coverage belongs to a stale native session".to_string());
+    }
+    Ok(Some(SearchCoverage {
+        indexed_messages: snapshot.indexed_messages,
+        indexed_source_bytes: snapshot.source_bytes,
+        max_source_bytes: SEARCH_MAX_SOURCE_BYTES,
+        truncated: snapshot.truncated,
+    }))
+}
+
+#[tauri::command]
+fn get_search_coverage(state: State<'_, AppState>) -> Result<Option<SearchCoverage>, String> {
+    require_unlocked(&state)?;
+    let binding = authenticated_rest_binding(&state)?;
+    let session_epoch = state.session_epoch.load(Ordering::Acquire);
+    let coverage = {
+        let publication = state
+            .search_publication
+            .lock()
+            .map_err(|error| error.to_string())?;
+        let snapshot = state
+            .indexer
+            .coverage_snapshot()
+            .map_err(|error| error.to_string())?;
+        validated_search_coverage(publication.as_ref(), session_epoch, &binding, snapshot)?
+    };
+    require_search_context_session_still_current(&state, session_epoch, &binding)?;
+    Ok(coverage)
 }
 
 fn validated_search_hit_dto(
@@ -10832,7 +11017,9 @@ fn validated_search_hit_dto(
     stored: Message,
     canonical_server_origin: &str,
 ) -> Option<SearchHitDto> {
-    if stored.id != hit.id
+    if decode_canonical_uuid("search hit message id", &hit.id).is_err()
+        || decode_canonical_uuid("search hit conversation id", &hit.conversation_id).is_err()
+        || stored.id != hit.id
         || stored.conversation_id != hit.conversation_id
         || stored.plaintext != hit.body
         || stored.sender_key.len() != 32
@@ -10841,24 +11028,27 @@ fn validated_search_hit_dto(
         return None;
     }
     let author_context = stored.author_context.map(MessageAuthorContext::wire_label);
-    let author = stored.author.and_then(|author| {
-        if author.locator.canonical_server_origin != canonical_server_origin
-            || author.locator.identity_key.as_slice() != stored.sender_key.as_slice()
-        {
-            return None;
+    let author = match stored.author {
+        Some(author) => {
+            if author.locator.canonical_server_origin != canonical_server_origin
+                || author.locator.identity_key.as_slice() != stored.sender_key.as_slice()
+            {
+                return None;
+            }
+            Some(SearchAuthorDto {
+                canonical_server_origin: author.locator.canonical_server_origin,
+                user_id: author.locator.user_id,
+                identity_key: hex::encode(author.locator.identity_key),
+                signing_key: hex::encode(author.signing_key),
+                username: author.username,
+                display_name: author.display_name,
+                profile_version: author.profile_version.map(|version| version.to_string()),
+                profile_origin: author.profile_origin,
+                context: author_context,
+            })
         }
-        Some(SearchAuthorDto {
-            canonical_server_origin: author.locator.canonical_server_origin,
-            user_id: author.locator.user_id,
-            identity_key: hex::encode(author.locator.identity_key),
-            signing_key: hex::encode(author.signing_key),
-            username: author.username,
-            display_name: author.display_name,
-            profile_version: author.profile_version.map(|version| version.to_string()),
-            profile_origin: author.profile_origin,
-            context: author_context,
-        })
-    });
+        None => None,
+    };
     Some(SearchHitDto {
         id: hit.id,
         conversation_id: hit.conversation_id,
@@ -10866,6 +11056,95 @@ fn validated_search_hit_dto(
         ts: hit.ts,
         score: hit.score,
         author,
+    })
+}
+
+fn validate_search_context_session(
+    unlocked: bool,
+    expected_session_epoch: u64,
+    current_session_epoch: u64,
+    expected_binding: &RestBinding,
+    current_binding: Option<&RestBinding>,
+) -> Result<(), String> {
+    if !unlocked || current_session_epoch != expected_session_epoch {
+        return Err("native session changed while loading search result context".to_string());
+    }
+    if current_binding != Some(expected_binding) {
+        return Err(
+            "authenticated server binding changed while loading search result context".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn require_search_context_session_still_current(
+    state: &AppState,
+    expected_session_epoch: u64,
+    expected_binding: &RestBinding,
+) -> Result<(), String> {
+    let current_binding = state
+        .authenticated_rest_origin
+        .lock()
+        .map_err(|error| error.to_string())?
+        .clone();
+    validate_search_context_session(
+        state.unlocked.load(Ordering::Acquire),
+        expected_session_epoch,
+        state.session_epoch.load(Ordering::Acquire),
+        expected_binding,
+        current_binding.as_ref(),
+    )
+}
+
+/// Hydrate a current search hit from its exact SQLCipher origin and return a
+/// bounded renderer-ready context. The RAM index is never navigation
+/// authority: deleted, moved, cross-origin, or corrupt targets fail closed.
+#[tauri::command]
+fn get_search_result_context(
+    state: State<'_, AppState>,
+    message_id: String,
+    conversation_id: String,
+) -> Result<SearchResultContextDto, String> {
+    require_unlocked(&state)?;
+    decode_canonical_uuid("search context message id", &message_id)?;
+    decode_canonical_uuid("search context conversation id", &conversation_id)?;
+    let binding = authenticated_rest_binding(&state)?;
+    let session_epoch = state.session_epoch.load(Ordering::Acquire);
+    let canonical_server_origin = binding.origin.canonical_server_origin();
+    require_search_context_session_still_current(&state, session_epoch, &binding)?;
+
+    let client = state.client.lock().map_err(|error| error.to_string())?;
+    require_authenticated_conversation_origin(&state, &client, &conversation_id)?;
+    let context = client
+        .db()
+        .ok_or("database not initialized")?
+        .get_search_result_context(&message_id, &conversation_id, &canonical_server_origin)?
+        .ok_or("search result is no longer available in this authenticated origin")?;
+    let conversation_type = match context.conversation_type {
+        ConversationType::DM => "dm",
+        ConversationType::Group => "group",
+        ConversationType::Channel => "channel",
+    };
+    if conversation_type == "channel" && context.server_id.is_none() {
+        return Err("channel search result has no authoritative server context".to_string());
+    }
+    if conversation_type != "channel" && context.server_id.is_some() {
+        return Err("non-channel search result contains server navigation context".to_string());
+    }
+    let messages = context
+        .messages
+        .into_iter()
+        .map(|message| renderer_message_json(message, &canonical_server_origin))
+        .collect::<Result<Vec<_>, _>>()?;
+    drop(client);
+
+    require_search_context_session_still_current(&state, session_epoch, &binding)?;
+    Ok(SearchResultContextDto {
+        target_message_id: message_id,
+        conversation_id,
+        conversation_type,
+        server_id: context.server_id,
+        messages,
     })
 }
 
@@ -10941,14 +11220,12 @@ fn search_messages(
 
 #[tauri::command]
 fn clear_search_index(state: State<'_, AppState>) -> Result<(), String> {
-    require_unlocked(&state)?;
-    state
-        .search_rebuild_generation
-        .fetch_add(1, Ordering::SeqCst);
-    state.indexer.clear().map_err(|e| e.to_string())
+    let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    require_unlocked_locked(&state)?;
+    clear_published_search_snapshot_locked(&state)
 }
 
-fn search_rebuild_is_current(
+fn search_rebuild_session_is_current(
     state: &AppState,
     generation: u64,
     session_epoch: u64,
@@ -10966,14 +11243,41 @@ fn search_rebuild_is_current(
             == Some(binding)
 }
 
-fn cancelled_search_rebuild_report() -> SearchRebuildReport {
+fn search_rebuild_is_current(
+    state: &AppState,
+    generation: u64,
+    session_epoch: u64,
+    binding: &RestBinding,
+    index_mutation_generation: u64,
+) -> bool {
+    search_rebuild_session_is_current(state, generation, session_epoch, binding)
+        && state.indexer.mutation_generation() == index_mutation_generation
+}
+
+fn cancelled_search_rebuild_report(retryable: bool) -> SearchRebuildReport {
     SearchRebuildReport {
         indexed_messages: 0,
         indexed_source_bytes: 0,
         max_source_bytes: SEARCH_MAX_SOURCE_BYTES,
         truncated: false,
         cancelled: true,
+        retryable,
     }
+}
+
+fn classify_cancelled_search_rebuild(
+    state: &AppState,
+    generation: u64,
+    session_epoch: u64,
+    binding: &RestBinding,
+    index_mutation_generation: u64,
+) -> SearchRebuildReport {
+    // Only a live index mutation is retryable. User Cancel, a newer rebuild,
+    // lock, account/origin replacement, or session change is a terminal
+    // cancellation for this automatic backfill invocation.
+    let retryable = search_rebuild_session_is_current(state, generation, session_epoch, binding)
+        && state.indexer.mutation_generation() != index_mutation_generation;
+    cancelled_search_rebuild_report(retryable)
 }
 
 fn append_bounded_search_document(
@@ -10983,6 +11287,8 @@ fn append_bounded_search_document(
     max_documents: usize,
     max_source_bytes: usize,
 ) -> Result<bool, String> {
+    decode_canonical_uuid("search rebuild message id", &row.id)?;
+    decode_canonical_uuid("search rebuild conversation id", &row.conversation_id)?;
     if row.sender_key.len() != 32 {
         return Err("search rebuild encountered an invalid sender key".to_string());
     }
@@ -11016,74 +11322,191 @@ fn rebuild_search_index_for_current_origin(
     let binding = authenticated_rest_binding(state)?;
     let canonical_server_origin = binding.origin.canonical_server_origin();
     let session_epoch = state.session_epoch.load(Ordering::Acquire);
-    let generation = state
-        .search_rebuild_generation
-        .fetch_add(1, Ordering::SeqCst)
-        .wrapping_add(1);
-    let client = state.client.lock().map_err(|e| e.to_string())?;
-    let db = client.db().ok_or("database not initialized")?;
-    let mut before_local_order = None;
-    let mut documents = Vec::new();
-    let mut indexed_source_bytes = 0usize;
-    let mut truncated = false;
+    // Linearize a new rebuild against the final index+coverage publication of
+    // an older one. Without this short publication guard, a newer rebuild
+    // could advance the generation after the older final check but before its
+    // swap, allowing the superseded candidate to become briefly visible.
+    let generation = {
+        let _publication = state
+            .search_publication
+            .lock()
+            .map_err(|error| error.to_string())?;
+        state
+            .search_rebuild_generation
+            .fetch_add(1, Ordering::SeqCst)
+            .wrapping_add(1)
+    };
+    // Live insert/edit/delete operations mutate the already-published index
+    // without taking the desktop publication mutex. Capture the index epoch
+    // before SQLCipher extraction so the final CAS can never overwrite one of
+    // those newer mutations with an older rebuild candidate.
+    let index_mutation_generation = state.indexer.mutation_generation();
+    // SQLCipher rows are copied into bounded owned documents inside this
+    // lexical scope. The client guard must be destroyed before Tantivy work
+    // and especially before the final `session_transition` acquisition:
+    // lock/sign-out use session_transition -> client, so retaining client here
+    // would introduce the reverse client -> session_transition order.
+    let (documents, truncated) = {
+        let client = state.client.lock().map_err(|e| e.to_string())?;
+        let db = client.db().ok_or("database not initialized")?;
+        let mut before = None;
+        let mut documents = Vec::new();
+        let mut indexed_source_bytes = 0usize;
+        let mut truncated = false;
 
-    loop {
-        if !search_rebuild_is_current(state, generation, session_epoch, &binding) {
-            return Ok(cancelled_search_rebuild_report());
-        }
-        let page = db.get_search_index_page(
-            &canonical_server_origin,
-            before_local_order,
-            SEARCH_REBUILD_PAGE_SIZE + 1,
-        )?;
-        if page.is_empty() {
-            break;
-        }
-        let has_more = page.len() > SEARCH_REBUILD_PAGE_SIZE as usize;
-        for row in page.into_iter().take(SEARCH_REBUILD_PAGE_SIZE as usize) {
-            let local_order = row.local_order;
-            if !append_bounded_search_document(
-                &mut documents,
-                &mut indexed_source_bytes,
-                row,
-                SEARCH_MAX_DOCUMENTS,
-                SEARCH_MAX_SOURCE_BYTES,
-            )? {
-                truncated = true;
+        loop {
+            if !search_rebuild_is_current(
+                state,
+                generation,
+                session_epoch,
+                &binding,
+                index_mutation_generation,
+            ) {
+                return Ok(classify_cancelled_search_rebuild(
+                    state,
+                    generation,
+                    session_epoch,
+                    &binding,
+                    index_mutation_generation,
+                ));
+            }
+            let page = db.get_search_index_page(
+                &canonical_server_origin,
+                before.as_ref(),
+                SEARCH_REBUILD_PAGE_SIZE + 1,
+            )?;
+            if page.is_empty() {
                 break;
             }
-            before_local_order = Some(local_order);
+            let has_more = page.len() > SEARCH_REBUILD_PAGE_SIZE as usize;
+            for row in page.into_iter().take(SEARCH_REBUILD_PAGE_SIZE as usize) {
+                let next_cursor = SearchIndexCursor {
+                    timestamp: row.timestamp,
+                    message_id: row.id.clone(),
+                };
+                if !append_bounded_search_document(
+                    &mut documents,
+                    &mut indexed_source_bytes,
+                    row,
+                    SEARCH_MAX_DOCUMENTS,
+                    SEARCH_MAX_SOURCE_BYTES,
+                )? {
+                    truncated = true;
+                    break;
+                }
+                before = Some(next_cursor);
+            }
+            if truncated || !has_more {
+                break;
+            }
         }
-        if truncated {
-            break;
-        }
-        if !has_more {
-            break;
-        }
-    }
+        (documents, truncated)
+    };
 
-    if !search_rebuild_is_current(state, generation, session_epoch, &binding) {
-        return Ok(cancelled_search_rebuild_report());
+    if !search_rebuild_is_current(
+        state,
+        generation,
+        session_epoch,
+        &binding,
+        index_mutation_generation,
+    ) {
+        return Ok(classify_cancelled_search_rebuild(
+            state,
+            generation,
+            session_epoch,
+            &binding,
+            index_mutation_generation,
+        ));
     }
-    match state
-        .indexer
-        .replace_all_in_memory_cancellable(&documents, || {
-            search_rebuild_is_current(state, generation, session_epoch, &binding)
-        }) {
-        Ok(()) => {}
-        Err(SearchError::Cancelled) => return Ok(cancelled_search_rebuild_report()),
-        Err(error) => return Err(format!("replace local search index: {error}")),
+    let candidate = match Indexer::prepare_replacement_cancellable(&documents, || {
+        search_rebuild_is_current(
+            state,
+            generation,
+            session_epoch,
+            &binding,
+            index_mutation_generation,
+        )
+    }) {
+        Ok(candidate) => candidate,
+        Err(SearchError::Cancelled) => {
+            return Ok(classify_cancelled_search_rebuild(
+                state,
+                generation,
+                session_epoch,
+                &binding,
+                index_mutation_generation,
+            ))
+        }
+        Err(error) => return Err(format!("prepare local search index: {error}")),
+    };
+    // Serialize the exact final swap with lock/origin transitions and search
+    // cancellation. The expensive candidate build above remains cancellable
+    // and does not hold either publication mutex.
+    let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    let mut publication = state
+        .search_publication
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if !search_rebuild_is_current(
+        state,
+        generation,
+        session_epoch,
+        &binding,
+        index_mutation_generation,
+    ) {
+        return Ok(classify_cancelled_search_rebuild(
+            state,
+            generation,
+            session_epoch,
+            &binding,
+            index_mutation_generation,
+        ));
     }
-    if !search_rebuild_is_current(state, generation, session_epoch, &binding) {
-        return Ok(cancelled_search_rebuild_report());
-    }
+    let coverage =
+        match state
+            .indexer
+            .publish_prepared(candidate, index_mutation_generation, truncated)
+        {
+            Ok(coverage) => coverage,
+            Err(SearchError::MutationConflict) => return Ok(cancelled_search_rebuild_report(true)),
+            Err(error) => return Err(format!("publish local search index: {error}")),
+        };
+    *publication = Some(PublishedSearchBinding {
+        binding,
+        session_epoch,
+    });
     Ok(SearchRebuildReport {
-        indexed_messages: documents.len(),
-        indexed_source_bytes,
+        indexed_messages: coverage.indexed_messages,
+        indexed_source_bytes: coverage.source_bytes,
         max_source_bytes: SEARCH_MAX_SOURCE_BYTES,
-        truncated,
+        truncated: coverage.truncated,
         cancelled: false,
+        retryable: false,
     })
+}
+
+fn run_bounded_search_backfill<F>(mut rebuild: F) -> Result<SearchRebuildReport, String>
+where
+    F: FnMut() -> Result<SearchRebuildReport, String>,
+{
+    let mut last_report = cancelled_search_rebuild_report(false);
+    for _ in 0..SEARCH_BACKFILL_MAX_ATTEMPTS {
+        let report = rebuild()?;
+        if !report.cancelled || !report.retryable {
+            return Ok(report);
+        }
+        last_report = report;
+    }
+    Ok(last_report)
+}
+
+/// Automatic backfill may race a live insert/edit/delete immediately after
+/// offline sync. Retry a small bounded number of complete atomic attempts;
+/// manual rebuild remains single-attempt so its explicit Cancel is final.
+fn ensure_search_backfill_for_current_origin(
+    state: &AppState,
+) -> Result<SearchRebuildReport, String> {
+    run_bounded_search_backfill(|| rebuild_search_index_for_current_origin(state))
 }
 
 #[tauri::command]
@@ -11095,12 +11518,16 @@ fn rebuild_search_index(state: State<'_, AppState>) -> Result<SearchRebuildRepor
 #[tauri::command]
 fn ensure_search_backfill(state: State<'_, AppState>) -> Result<SearchRebuildReport, String> {
     require_unlocked(&state)?;
-    rebuild_search_index_for_current_origin(&state)
+    ensure_search_backfill_for_current_origin(&state)
 }
 
 #[tauri::command]
 fn cancel_search_rebuild(state: State<'_, AppState>) -> Result<(), String> {
     require_unlocked(&state)?;
+    let _publication = state
+        .search_publication
+        .lock()
+        .map_err(|error| error.to_string())?;
     state
         .search_rebuild_generation
         .fetch_add(1, Ordering::SeqCst);
@@ -11235,6 +11662,7 @@ pub fn run() {
                     .expect("reqwest client"),
                 indexer,
                 search_rebuild_generation: AtomicU64::new(0),
+                search_publication: Mutex::new(None),
             });
             let state = app.state::<AppState>();
             for raw in std::env::args().skip(1) {
@@ -11393,6 +11821,8 @@ pub fn run() {
             create_dm,
             is_connected,
             search_messages,
+            get_search_result_context,
+            get_search_coverage,
             clear_search_index,
             rebuild_search_index,
             ensure_search_backfill,
@@ -11469,26 +11899,30 @@ mod e2ee_rest_tests {
         parse_message_crypto_context, parse_network_profile_response, parse_pending_veil_link,
         parse_prekey_bundle, parse_push_subscription_views, pending_veil_link_view,
         preserve_created_group_outcome, proves_future_only_sender_key_history,
-        publish_unlocked_session, require_matching_identity_fingerprint,
-        require_pending_veil_link_flow, resolve_auto_lock_seconds, rest_api_url, rest_authority,
-        rest_canonical, rest_origin, rest_request_target, run_blocking_native_task,
-        valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
+        publish_unlocked_session, renderer_message_json, require_matching_identity_fingerprint,
+        require_pending_veil_link_flow, reset_sensitive_state_locked, resolve_auto_lock_seconds,
+        rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
+        run_blocking_native_task, run_bounded_search_backfill, valid_auto_lock_seconds,
+        valid_unlock_pin, validate_authenticated_binding_commit,
         validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
         validate_expected_live_action_binding, validate_expected_rest_binding,
         validate_live_action_rest_origin, validate_live_message_security_context,
         validate_next_cursor, validate_persisted_message_conversation,
         validate_pinned_directory_self, validate_profile_avatar_jpeg, validate_rest_url,
-        validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_hit_dto,
-        verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
+        validate_search_context_session, validate_server_endpoint_pair, validate_utc_rfc3339_nano,
+        validated_search_coverage, validated_search_hit_dto, verify_device_directory_account_keys,
+        AppState, AuthenticatedSessionScope, ConversationSyncIsolation,
         CurrentTargetAdmissionEvidence, ParsedMessageCryptoContext, PinnedDirectoryMember,
-        RestBinding, RestOrigin, DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES,
+        PublishedSearchBinding, RestBinding, RestOrigin, SearchCoverage, SearchRebuildReport,
+        SearchResultContextDto, DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES,
+        SEARCH_MAX_SOURCE_BYTES,
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
-    use veil_search::{SearchDocument, SearchHit};
+    use veil_search::{SearchCoverageSnapshot, SearchDocument, SearchHit};
     use veil_store::models::{
-        AccountSnapshot, AccountSnapshotSource, Message, MessageAuthorContext, MessageStatus,
-        ProfileLocator, SearchIndexDocument,
+        AccountSnapshot, AccountSnapshotSource, Message, MessageAttachment, MessageAuthorContext,
+        MessageStatus, ProfileLocator, SearchIndexDocument,
     };
 
     fn authenticated_test_binding(host: &str, generation: u64) -> RestBinding {
@@ -12311,16 +12745,283 @@ mod e2ee_rest_tests {
     }
 
     #[test]
+    fn search_context_rejects_lock_epoch_and_exact_binding_replacement() {
+        let binding = authenticated_test_binding("chat.example.test", 7);
+        let replacement = authenticated_test_binding("chat.example.test", 8);
+        assert!(validate_search_context_session(true, 11, 11, &binding, Some(&binding)).is_ok());
+        assert!(validate_search_context_session(false, 11, 11, &binding, Some(&binding)).is_err());
+        assert!(validate_search_context_session(true, 11, 12, &binding, Some(&binding)).is_err());
+        assert!(
+            validate_search_context_session(true, 11, 11, &binding, Some(&replacement)).is_err()
+        );
+        assert!(validate_search_context_session(true, 11, 11, &binding, None).is_err());
+    }
+
+    #[test]
+    fn search_context_uses_the_standard_renderer_message_schema() {
+        let origin = "https://chat.example.test:443";
+        let identity_key = [0x21; 32];
+        let message = Message {
+            id: "00000000-0000-0000-0000-000000000101".into(),
+            conversation_id: "00000000-0000-0000-0000-000000000102".into(),
+            sender_key: identity_key.to_vec(),
+            plaintext: "context body".into(),
+            msg_type: 0,
+            reply_to_id: None,
+            is_outgoing: false,
+            status: MessageStatus::Delivered,
+            expires_at: None,
+            server_timestamp: Some(17),
+            created_at: "2026-07-14T00:00:00Z".into(),
+            author: Some(AccountSnapshot {
+                locator: ProfileLocator {
+                    canonical_server_origin: origin.to_string(),
+                    user_id: "550e8400-e29b-41d4-a716-446655440103".to_string(),
+                    identity_key,
+                },
+                signing_key: test_signing_key(0x22),
+                username: Some("alice".to_string()),
+                display_name: Some("Alice Search".to_string()),
+                profile_version: Some(7),
+                profile_origin: origin.to_string(),
+                source: AccountSnapshotSource::AuthenticatedHistory,
+                observed_at: "2026-07-14T00:00:00Z".to_string(),
+            }),
+            author_context: Some(MessageAuthorContext::DirectoryMemberAtObservation),
+            attachments: vec![MessageAttachment {
+                ordinal: 0,
+                media_id: "0123456789abcdef0123456789abcdef".to_string(),
+                file_name: "evidence.txt".to_string(),
+                detected_mime: "text/plain".to_string(),
+                format_version: 2,
+                nonce_prefix: [0x23; 16],
+                chunk_count: 1,
+                plaintext_size: 8,
+                ciphertext_size: 24,
+                content_key: [0x24; 32],
+            }],
+        };
+        let rendered = renderer_message_json(message, origin).unwrap();
+        let context = SearchResultContextDto {
+            target_message_id: "00000000-0000-0000-0000-000000000101".into(),
+            conversation_id: "00000000-0000-0000-0000-000000000102".into(),
+            conversation_type: "group",
+            server_id: None,
+            messages: vec![rendered.clone()],
+        };
+        let serialized = serde_json::to_value(context).unwrap();
+        assert_eq!(
+            serialized["targetMessageId"],
+            "00000000-0000-0000-0000-000000000101"
+        );
+        assert_eq!(serialized["conversationType"], "group");
+        assert!(serialized.get("serverId").is_none());
+        assert_eq!(serialized["messages"][0], rendered);
+        for field in [
+            "id",
+            "conversationId",
+            "senderKey",
+            "senderName",
+            "senderUserId",
+            "senderSigningKey",
+            "senderProfileVersion",
+            "senderProfileOrigin",
+            "senderOrigin",
+            "senderAuthorContext",
+            "text",
+            "isOwn",
+            "pending",
+            "failed",
+            "deliveryUnknown",
+            "timestamp",
+            "createdAt",
+            "replyToId",
+            "attachments",
+        ] {
+            assert!(serialized["messages"][0].get(field).is_some(), "{field}");
+        }
+        assert_eq!(serialized["messages"][0]["senderName"], "Alice Search");
+        assert_eq!(
+            serialized["messages"][0]["senderAuthorContext"],
+            "directory_member_at_observation"
+        );
+        assert_eq!(
+            serialized["messages"][0]["attachments"][0]["fileName"],
+            "evidence.txt"
+        );
+        assert!(serialized["messages"][0]["attachments"][0]
+            .get("contentKey")
+            .is_none());
+        assert!(serialized["messages"][0]["attachments"][0]
+            .get("noncePrefix")
+            .is_none());
+    }
+
+    #[test]
+    fn search_coverage_is_bound_to_the_exact_published_session() {
+        let binding = authenticated_test_binding("chat.example.test", 7);
+        let replacement = authenticated_test_binding("chat.example.test", 8);
+        let coverage = SearchCoverage {
+            indexed_messages: 41,
+            indexed_source_bytes: 4096,
+            max_source_bytes: SEARCH_MAX_SOURCE_BYTES,
+            truncated: true,
+        };
+        let published = PublishedSearchBinding {
+            binding: binding.clone(),
+            session_epoch: 9,
+        };
+        let snapshot = SearchCoverageSnapshot {
+            indexed_messages: 41,
+            source_bytes: 4096,
+            truncated: true,
+            mutation_generation: 7,
+        };
+        assert_eq!(
+            validated_search_coverage(Some(&published), 9, &binding, snapshot).unwrap(),
+            Some(coverage)
+        );
+        assert!(validated_search_coverage(Some(&published), 10, &binding, snapshot).is_err());
+        assert!(validated_search_coverage(Some(&published), 9, &replacement, snapshot).is_err());
+        assert_eq!(
+            validated_search_coverage(None, 9, &binding, snapshot).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn lock_reset_scrubs_a_live_index_mutation_that_started_before_client_quiescence() {
+        let indexer = std::sync::Arc::new(veil_search::Indexer::in_memory().unwrap());
+        indexer
+            .index_message("old", "conversation", "sender", "old plaintext", 1)
+            .unwrap();
+        let state = std::sync::Arc::new(AppState {
+            client: std::sync::Mutex::new(veil_client::api::VeilClient::new()),
+            session_transition: std::sync::Mutex::new(()),
+            session_epoch: std::sync::atomic::AtomicU64::new(1),
+            connect_transition: std::sync::Mutex::new(()),
+            authenticated_rest_origin: std::sync::Mutex::new(None),
+            renderer_confirmed_rest_binding: std::sync::Mutex::new(None),
+            rest_binding_generation: std::sync::atomic::AtomicU64::new(0),
+            unlocked: std::sync::atomic::AtomicBool::new(true),
+            pin_configured: std::sync::atomic::AtomicBool::new(true),
+            event_poller_started: std::sync::atomic::AtomicBool::new(false),
+            offline_sync_ready: std::sync::atomic::AtomicBool::new(true),
+            unavailable_conversations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            lock_event_pending: std::sync::atomic::AtomicBool::new(false),
+            pin_throttle: std::sync::Mutex::new(super::PinThrottle::default()),
+            pending_veil_link: std::sync::Mutex::new(None),
+            pending_attachment_drop: std::sync::Mutex::new(None),
+            media_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
+            runtime: tokio::runtime::Runtime::new().unwrap(),
+            auto_lock_seconds: std::sync::atomic::AtomicU64::new(DEFAULT_AUTO_LOCK_SECONDS),
+            last_activity: std::sync::Mutex::new(std::time::Instant::now()),
+            db_dir: std::path::PathBuf::from("."),
+            http: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap(),
+            indexer: std::sync::Arc::clone(&indexer),
+            search_rebuild_generation: std::sync::atomic::AtomicU64::new(0),
+            search_publication: std::sync::Mutex::new(None),
+        });
+        let client_held = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let allow_raced_mutation = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let mutation_state = std::sync::Arc::clone(&state);
+        let mutation_client_held = std::sync::Arc::clone(&client_held);
+        let mutation_allowed = std::sync::Arc::clone(&allow_raced_mutation);
+        let mutation = std::thread::spawn(move || {
+            let _client = mutation_state.client.lock().unwrap();
+            mutation_client_held.wait();
+            mutation_allowed.wait();
+            mutation_state
+                .indexer
+                .index_message("raced", "conversation", "sender", "raced plaintext", 2)
+                .unwrap();
+        });
+        client_held.wait();
+
+        let initial_generation = indexer.mutation_generation();
+        let reset_state = std::sync::Arc::clone(&state);
+        let reset = std::thread::spawn(move || {
+            let _transition = reset_state.session_transition.lock().unwrap();
+            reset_sensitive_state_locked(&reset_state)
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while indexer.mutation_generation() == initial_generation {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "early fail-closed search clear did not run"
+            );
+            std::thread::yield_now();
+        }
+        allow_raced_mutation.wait();
+        mutation.join().unwrap();
+        reset.join().unwrap().unwrap();
+
+        assert!(!state.unlocked.load(std::sync::atomic::Ordering::Acquire));
+        assert!(indexer.search("old", None, 10).unwrap().is_empty());
+        assert!(indexer.search("raced", None, 10).unwrap().is_empty());
+        let coverage = indexer.coverage_snapshot().unwrap();
+        assert_eq!(coverage.indexed_messages, 0);
+        assert_eq!(coverage.source_bytes, 0);
+        assert!(!coverage.truncated);
+    }
+
+    #[test]
+    fn automatic_search_backfill_retries_only_mutation_conflicts_and_is_bounded() {
+        let mut attempts = 0;
+        let completed = run_bounded_search_backfill(|| {
+            attempts += 1;
+            Ok(if attempts < 3 {
+                super::cancelled_search_rebuild_report(true)
+            } else {
+                SearchRebuildReport {
+                    indexed_messages: 7,
+                    indexed_source_bytes: 700,
+                    max_source_bytes: SEARCH_MAX_SOURCE_BYTES,
+                    truncated: false,
+                    cancelled: false,
+                    retryable: false,
+                }
+            })
+        })
+        .unwrap();
+        assert_eq!(attempts, 3);
+        assert!(!completed.cancelled);
+        assert_eq!(completed.indexed_messages, 7);
+
+        let mut cancelled_attempts = 0;
+        let cancelled = run_bounded_search_backfill(|| {
+            cancelled_attempts += 1;
+            Ok(super::cancelled_search_rebuild_report(true))
+        })
+        .unwrap();
+        assert_eq!(cancelled_attempts, 3);
+        assert!(cancelled.cancelled);
+
+        let mut terminal_attempts = 0;
+        let terminal = run_bounded_search_backfill(|| {
+            terminal_attempts += 1;
+            Ok(super::cancelled_search_rebuild_report(false))
+        })
+        .unwrap();
+        assert_eq!(terminal_attempts, 1);
+        assert!(terminal.cancelled);
+        assert!(!terminal.retryable);
+    }
+
+    #[test]
     fn search_rebuild_budget_never_publishes_an_oversized_document_set() {
         let row = SearchIndexDocument {
-            local_order: 7,
-            id: "m".into(),
-            conversation_id: "c".into(),
+            id: "550e8400-e29b-41d4-a716-446655440121".into(),
+            conversation_id: "550e8400-e29b-41d4-a716-446655440122".into(),
             sender_key: vec![0x11; 32],
             plaintext: "body".into(),
             timestamp: 9,
         };
-        let exact_cost = 1 + 1 + 32 + 4 + 64;
+        let exact_cost = row.id.len() + row.conversation_id.len() + 32 + 4 + 64;
         let mut documents: Vec<SearchDocument> = Vec::new();
         let mut bytes = 0;
         assert!(append_bounded_search_document(
@@ -12344,9 +13045,8 @@ mod e2ee_rest_tests {
         assert_eq!(documents.len(), 1);
 
         let invalid = SearchIndexDocument {
-            local_order: 8,
-            id: "bad".into(),
-            conversation_id: "c".into(),
+            id: "550e8400-e29b-41d4-a716-446655440123".into(),
+            conversation_id: "550e8400-e29b-41d4-a716-446655440124".into(),
             sender_key: vec![0x22; 31],
             plaintext: "body".into(),
             timestamp: 10,
@@ -12357,6 +13057,24 @@ mod e2ee_rest_tests {
             &mut invalid_documents,
             &mut invalid_bytes,
             invalid,
+            1,
+            1024,
+        )
+        .is_err());
+
+        let invalid_id = SearchIndexDocument {
+            id: "legacy-message-id".into(),
+            conversation_id: "550e8400-e29b-41d4-a716-446655440120".into(),
+            sender_key: vec![0x22; 32],
+            plaintext: "body".into(),
+            timestamp: 11,
+        };
+        let mut invalid_id_documents = Vec::new();
+        let mut invalid_id_bytes = 0;
+        assert!(append_bounded_search_document(
+            &mut invalid_id_documents,
+            &mut invalid_id_bytes,
+            invalid_id,
             1,
             1024,
         )
@@ -12382,8 +13100,8 @@ mod e2ee_rest_tests {
             observed_at: "2026-07-13T12:00:00Z".to_string(),
         };
         let stored = Message {
-            id: "message-1".to_string(),
-            conversation_id: "conversation-1".to_string(),
+            id: "550e8400-e29b-41d4-a716-446655440111".to_string(),
+            conversation_id: "550e8400-e29b-41d4-a716-446655440112".to_string(),
             sender_key: identity_key.to_vec(),
             plaintext: "exact search text".to_string(),
             msg_type: 0,
@@ -12423,7 +13141,28 @@ mod e2ee_rest_tests {
 
         let mut stale_body = hit;
         stale_body.body = "stale index plaintext".to_string();
-        assert!(validated_search_hit_dto(stale_body, stored, origin).is_none());
+        assert!(validated_search_hit_dto(stale_body, stored.clone(), origin).is_none());
+
+        let mut cross_origin_author = stored;
+        cross_origin_author
+            .author
+            .as_mut()
+            .expect("fixture author")
+            .locator
+            .canonical_server_origin = "https://other.example.test:443".to_string();
+        assert!(validated_search_hit_dto(
+            SearchHit {
+                id: cross_origin_author.id.clone(),
+                conversation_id: cross_origin_author.conversation_id.clone(),
+                sender: hex::encode(identity_key),
+                body: cross_origin_author.plaintext.clone(),
+                ts: 7,
+                score: 1.0,
+            },
+            cross_origin_author,
+            origin,
+        )
+        .is_none());
     }
 
     #[test]
