@@ -48,6 +48,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/push/subscriptions", signed(h.create))
 	mux.HandleFunc("GET /v1/push/subscriptions", signed(h.list))
 	mux.HandleFunc("DELETE /v1/push/subscriptions/{id}", signed(h.delete))
+	mux.HandleFunc("PATCH /v1/push/subscriptions/{id}/policy", signed(h.updatePolicy))
 }
 
 type createReq struct {
@@ -63,6 +64,8 @@ type subscriptionJSON struct {
 	Kind        string `json:"kind"`
 	CreatedAt   string `json:"created_at"`
 	LastUsed    string `json:"last_used,omitempty"`
+	Enabled     bool   `json:"enabled"`
+	MutedUntil  string `json:"muted_until,omitempty"`
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
@@ -138,13 +141,70 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 			DeviceLabel: r.DeviceLabel,
 			Kind:        r.PushKind,
 			CreatedAt:   r.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			Enabled:     r.Enabled,
 		}
 		if r.LastUsed != nil {
 			js.LastUsed = r.LastUsed.UTC().Format("2006-01-02T15:04:05Z")
 		}
+		if r.MutedUntil != nil {
+			js.MutedUntil = r.MutedUntil.UTC().Format("2006-01-02T15:04:05Z")
+		}
 		out = append(out, js)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": out})
+}
+
+type policyReq struct {
+	Enabled     *bool  `json:"enabled,omitempty"`
+	MuteSeconds *int64 `json:"mute_seconds,omitempty"`
+}
+
+const maxPushMuteSeconds int64 = 7 * 24 * 60 * 60
+
+func validatePolicyRequest(req *policyReq) error {
+	if req == nil || (req.Enabled == nil && req.MuteSeconds == nil) {
+		return errors.New("at least one policy field is required")
+	}
+	if req.MuteSeconds != nil && (*req.MuteSeconds < 0 || *req.MuteSeconds > maxPushMuteSeconds) {
+		return errors.New("mute_seconds is outside the supported range")
+	}
+	return nil
+}
+
+func (h *Handler) updatePolicy(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("X-Veil-User")
+	if userID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
+		return
+	}
+	var req policyReq
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if err := validatePolicyRequest(&req); err != nil {
+		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
+			http.StatusBadRequest, "invalid_push_policy", "invalid push policy", err,
+		))
+		return
+	}
+	ok, err := h.db.UpdatePushSubscriptionPolicy(r.Context(), userID, id, req.Enabled, req.MuteSeconds)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "update failed"})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {

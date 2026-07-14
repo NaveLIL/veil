@@ -111,6 +111,8 @@ export interface PushSubscription {
   kind: "unifiedpush";
   createdAt: string;
   lastUsed?: string;
+  enabled: boolean;
+  mutedUntil?: string;
 }
 
 export interface ServerBan {
@@ -1485,6 +1487,21 @@ export const appStore = {
     const mutationScope = requirePublishedMutationScope();
     await invoke("delete_push_subscription", {
       subscriptionId,
+      ...authenticatedMutationScopeArgs(mutationScope),
+    });
+    requireCurrentMutationScope(sessionEpoch, mutationScope);
+  },
+
+  updatePushSubscriptionPolicy: async (
+    subscriptionId: string,
+    policy: { enabled?: boolean; muteSeconds?: number },
+  ): Promise<void> => {
+    const sessionEpoch = captureUiSessionEpoch();
+    const mutationScope = requirePublishedMutationScope();
+    await invoke("update_push_subscription_policy", {
+      subscriptionId,
+      enabled: policy.enabled ?? null,
+      muteSeconds: policy.muteSeconds ?? null,
       ...authenticatedMutationScopeArgs(mutationScope),
     });
     requireCurrentMutationScope(sessionEpoch, mutationScope);

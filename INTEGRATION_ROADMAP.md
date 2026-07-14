@@ -250,6 +250,8 @@ Envelope: JSON с короткими именами полей, padding до р�
 - Desktop: list/add/delete subscriptions реализованы через origin/session-bound
   Tauri commands. Full endpoint secret принимается только для create и не
   возвращается в renderer при list; UI показывает безопасный host hint.
+  Enable/disable и DND на 1 час сохраняются сервером; dispatcher получает только
+  active/unmuted projection, поэтому muted endpoint не видит даже timing wake-up.
 - Android: официальный Kotlin connector или проверенный Expo adapter,
   distributor picker и generic notification listener подключаются вместе с
   production native crypto/auth/background-sync runtime в Phase 5A.
@@ -266,7 +268,7 @@ Security disposition и причины, по которым общий server tr
 - iOS App Group keychain: main app + extension обязаны использовать один access group. Без этого extension не расшифрует и будет вечно показывать "New message"
 - Stale endpoints: ntfy может вернуть 410. Dispatcher ловит и прунит строку — это сделано
 - Replay: в envelope есть `msg_id` + monotonic counter per-subscription для дедупликации
-- Mute/DND должны проверяться на сервере (не отправлять push) — пока не реализовано
+- Mute/DND проверяются SQL projection до dispatcher fan-out (migration 024)
 
 ---
 

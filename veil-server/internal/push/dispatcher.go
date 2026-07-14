@@ -35,7 +35,7 @@ type Subscription struct {
 // Store is the persistence surface the dispatcher needs. db.DB
 // satisfies this through a thin adapter (see db_adapter.go).
 type Store interface {
-	ListPushSubscriptions(ctx context.Context, userID string) ([]Subscription, error)
+	ListActivePushSubscriptions(ctx context.Context, userID string) ([]Subscription, error)
 	DeletePushSubscriptionByEndpoint(ctx context.Context, userID, endpointURL string) error
 	TouchPushSubscription(ctx context.Context, id int64) error
 }
@@ -143,7 +143,7 @@ func (d *Dispatcher) NotifyOffline(ctx context.Context, userID string, env *pb.E
 }
 
 func (d *Dispatcher) deliver(ctx context.Context, userID string, env *pb.Envelope) {
-	subs, err := d.store.ListPushSubscriptions(ctx, userID)
+	subs, err := d.store.ListActivePushSubscriptions(ctx, userID)
 	if err != nil {
 		d.log.Warn("push: list subscriptions failed", "user_ref", logsafe.Ref("user", userID), "error_class", logsafe.ErrorClass(err))
 		return

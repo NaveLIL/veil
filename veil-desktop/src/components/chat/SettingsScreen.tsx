@@ -204,6 +204,23 @@ export const SettingsScreen: Component = () => {
     }
   };
 
+  const updatePushPolicy = async (
+    subscription: PushSubscription,
+    policy: { enabled?: boolean; muteSeconds?: number },
+  ) => {
+    if (pushBusy()) return;
+    setPushBusy(true);
+    setPushError("");
+    try {
+      await appStore.updatePushSubscriptionPolicy(subscription.id, policy);
+      setPushSubscriptions(await appStore.listPushSubscriptions());
+    } catch (error) {
+      setPushError(String(error));
+    } finally {
+      setPushBusy(false);
+    }
+  };
+
   createEffect(() => {
     if (section() !== "notifications" || !appStore.connected() || appStore.bindingTransitioning()) {
       return;
@@ -1228,13 +1245,24 @@ export const SettingsScreen: Component = () => {
               {(subscription) => (
                 <div style={{ display: "grid", "grid-template-columns": "minmax(0, 1fr) auto", gap: "12px", "align-items": "center", padding: "11px 12px", border: "1px solid var(--veil-border)", "border-radius": "10px", background: "var(--veil-contrast-02)" }}>
                   <div style={{ "min-width": "0" }}>
-                    <div style={{ "font-size": "13px", "font-weight": "650", color: "var(--veil-text)" }}>{subscription.deviceLabel || "Unnamed device"}</div>
+                    <div style={{ display: "flex", "align-items": "center", gap: "7px", "flex-wrap": "wrap" }}>
+                      <div style={{ "font-size": "13px", "font-weight": "650", color: "var(--veil-text)" }}>{subscription.deviceLabel || "Unnamed device"}</div>
+                      <span style={S.badge(subscription.enabled ? "var(--veil-success)" : "var(--veil-text-subtle)")}>{subscription.enabled ? (subscription.mutedUntil && new Date(subscription.mutedUntil).getTime() > Date.now() ? "Muted" : "Active") : "Disabled"}</span>
+                    </div>
                     <div style={{ "font-size": "10px", color: "var(--veil-text-faint)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "margin-top": "3px" }}>{subscription.endpointHint}</div>
                     <div style={{ "font-size": "10px", color: "var(--veil-text-subtle)", "margin-top": "2px" }}>Added {new Date(subscription.createdAt).toLocaleString()}</div>
                   </div>
-                  <button type="button" style={{ ...S.btnSecondary, padding: "7px 9px", color: "var(--veil-danger)" }} disabled={pushBusy()} onClick={() => void removePushSubscription(subscription)} aria-label={`Remove push device ${subscription.deviceLabel || "unnamed"}`}>
-                    <Trash2 size={14} strokeWidth={2} />
-                  </button>
+                  <div style={{ display: "flex", gap: "5px", "align-items": "center" }}>
+                    <button type="button" style={{ ...S.btnSecondary, padding: "7px 9px" }} disabled={pushBusy()} onClick={() => void updatePushPolicy(subscription, { enabled: !subscription.enabled })}>
+                      {subscription.enabled ? "Disable" : "Enable"}
+                    </button>
+                    <button type="button" style={{ ...S.btnSecondary, padding: "7px 9px" }} disabled={pushBusy() || !subscription.enabled} onClick={() => void updatePushPolicy(subscription, { muteSeconds: subscription.mutedUntil && new Date(subscription.mutedUntil).getTime() > Date.now() ? 0 : 3600 })}>
+                      {subscription.mutedUntil && new Date(subscription.mutedUntil).getTime() > Date.now() ? "Unmute" : "Mute 1h"}
+                    </button>
+                    <button type="button" style={{ ...S.btnSecondary, padding: "7px 9px", color: "var(--veil-danger)" }} disabled={pushBusy()} onClick={() => void removePushSubscription(subscription)} aria-label={`Remove push device ${subscription.deviceLabel || "unnamed"}`}>
+                      <Trash2 size={14} strokeWidth={2} />
+                    </button>
+                  </div>
                 </div>
               )}
             </For>

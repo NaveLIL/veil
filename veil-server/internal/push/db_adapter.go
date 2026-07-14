@@ -17,8 +17,8 @@ func NewDBStore(database *db.DB) Store {
 	return &dbStore{db: database}
 }
 
-func (s *dbStore) ListPushSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
-	rows, err := s.db.ListPushSubscriptions(ctx, userID)
+func (s *dbStore) ListActivePushSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
+	rows, err := s.db.ListActivePushSubscriptions(ctx, userID)
 	if err != nil {
 		return nil, err
 	}

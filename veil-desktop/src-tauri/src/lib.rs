@@ -234,6 +234,8 @@ struct PushSubscriptionView {
     kind: String,
     created_at: String,
     last_used: Option<String>,
+    enabled: bool,
+    muted_until: Option<String>,
 }
 
 impl Drop for MediaSessionSnapshot {
@@ -8372,6 +8374,21 @@ fn parse_push_subscription_views(
                     }
                 })
                 .transpose()?;
+            let enabled = row
+                .get("enabled")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or("push subscription enabled state is invalid")?;
+            let muted_until = row
+                .get("muted_until")
+                .and_then(serde_json::Value::as_str)
+                .map(|timestamp| {
+                    if chrono::DateTime::parse_from_rfc3339(timestamp).is_err() {
+                        Err("push subscription mute time is invalid")
+                    } else {
+                        Ok(timestamp.to_string())
+                    }
+                })
+                .transpose()?;
             Ok(PushSubscriptionView {
                 id: id.to_string(),
                 endpoint_hint: format!("{host} · endpoint secret hidden"),
@@ -8379,6 +8396,8 @@ fn parse_push_subscription_views(
                 kind: kind.to_string(),
                 created_at: created_at.to_string(),
                 last_used,
+                enabled,
+                muted_until,
             })
         })
         .collect()
@@ -8496,6 +8515,58 @@ fn delete_push_subscription(
         )?,
         &user_id,
         None,
+        &binding,
+    ))?;
+    Ok(())
+}
+
+#[tauri::command]
+fn update_push_subscription_policy(
+    state: State<'_, AppState>,
+    subscription_id: String,
+    enabled: Option<bool>,
+    mute_seconds: Option<i64>,
+    expected_server_origin: String,
+    expected_binding_generation: String,
+) -> Result<(), String> {
+    let id = subscription_id
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0 && id.to_string() == subscription_id)
+        .ok_or("push subscription id is invalid")?;
+    if enabled.is_none() && mute_seconds.is_none() {
+        return Err("push policy has no changes".to_string());
+    }
+    if mute_seconds.is_some_and(|seconds| !(0..=7 * 24 * 60 * 60).contains(&seconds)) {
+        return Err("push mute duration is invalid".to_string());
+    }
+    let binding = capture_expected_live_action_binding(
+        &state,
+        &expected_server_origin,
+        &expected_binding_generation,
+    )?;
+    let user_id = state
+        .client
+        .lock()
+        .map_err(|error| error.to_string())?
+        .authenticated_user_id()?
+        .to_string();
+    let mut body = serde_json::Map::new();
+    if let Some(enabled) = enabled {
+        body.insert("enabled".to_string(), enabled.into());
+    }
+    if let Some(seconds) = mute_seconds {
+        body.insert("mute_seconds".to_string(), seconds.into());
+    }
+    state.runtime.block_on(rest_send_json_for_binding(
+        &state,
+        reqwest::Method::PATCH,
+        rest_api_url(
+            &binding.origin.canonical_server_origin(),
+            &["v1", "push", "subscriptions", &id.to_string(), "policy"],
+        )?,
+        &user_id,
+        Some(serde_json::Value::Object(body)),
         &binding,
     ))?;
     Ok(())
@@ -11170,6 +11241,7 @@ pub fn run() {
             list_push_subscriptions,
             create_push_subscription,
             delete_push_subscription,
+            update_push_subscription_policy,
             discard_failed_outgoing_message,
             edit_message,
             delete_message,
@@ -11324,7 +11396,8 @@ mod e2ee_rest_tests {
                 "device_label": "Pixel",
                 "kind": "unifiedpush",
                 "created_at": "2026-07-14T01:02:03Z",
-                "last_used": "2026-07-14T02:03:04Z"
+                "last_used": "2026-07-14T02:03:04Z",
+                "enabled": true
             }]
         });
         let views = parse_push_subscription_views(&value).unwrap();
@@ -11341,7 +11414,8 @@ mod e2ee_rest_tests {
                 "id": 1,
                 "endpoint": "https://push.example.test/topic",
                 "kind": "webpush",
-                "created_at": "2026-07-14T01:02:03Z"
+                "created_at": "2026-07-14T01:02:03Z",
+                "enabled": true
             }]
         });
         assert!(parse_push_subscription_views(&unsupported).is_err());

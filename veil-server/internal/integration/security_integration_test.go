@@ -1350,6 +1350,44 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 	})
 
+	t.Run("push delivery policy is owner scoped and enforced before fanout", func(t *testing.T) {
+		ctx := context.Background()
+		owner := h.CreateUser("security-push-policy-owner")
+		other := h.CreateUser("security-push-policy-other")
+		id, err := h.DB.CreatePushSubscription(ctx, owner.ID, "https://push.example/policy", "phone", "unifiedpush")
+		if err != nil {
+			t.Fatal(err)
+		}
+		disabled := false
+		if ok, err := h.DB.UpdatePushSubscriptionPolicy(ctx, other.ID, id, &disabled, nil); err != nil || ok {
+			t.Fatalf("cross-account policy update ok=%v err=%v", ok, err)
+		}
+		if ok, err := h.DB.UpdatePushSubscriptionPolicy(ctx, owner.ID, id, &disabled, nil); err != nil || !ok {
+			t.Fatalf("owner disable ok=%v err=%v", ok, err)
+		}
+		active, err := h.DB.ListActivePushSubscriptions(ctx, owner.ID)
+		if err != nil || len(active) != 0 {
+			t.Fatalf("disabled subscription reached dispatcher projection: rows=%d err=%v", len(active), err)
+		}
+		enabled := true
+		mute := int64(60)
+		if ok, err := h.DB.UpdatePushSubscriptionPolicy(ctx, owner.ID, id, &enabled, &mute); err != nil || !ok {
+			t.Fatalf("owner mute ok=%v err=%v", ok, err)
+		}
+		active, err = h.DB.ListActivePushSubscriptions(ctx, owner.ID)
+		if err != nil || len(active) != 0 {
+			t.Fatalf("muted subscription reached dispatcher projection: rows=%d err=%v", len(active), err)
+		}
+		clearMute := int64(0)
+		if ok, err := h.DB.UpdatePushSubscriptionPolicy(ctx, owner.ID, id, nil, &clearMute); err != nil || !ok {
+			t.Fatalf("owner unmute ok=%v err=%v", ok, err)
+		}
+		active, err = h.DB.ListActivePushSubscriptions(ctx, owner.ID)
+		if err != nil || len(active) != 1 || active[0].ID != id {
+			t.Fatalf("unmuted subscription missing: rows=%v err=%v", active, err)
+		}
+	})
+
 	t.Run("upload quota reservation is atomic under concurrency", func(t *testing.T) {
 		ctx := context.Background()
 		uploadUser := h.CreateUser("security-upload-quota")

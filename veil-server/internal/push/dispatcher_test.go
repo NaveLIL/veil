@@ -24,7 +24,7 @@ type fakeStore struct {
 	listErr error
 }
 
-func (f *fakeStore) ListPushSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
+func (f *fakeStore) ListActivePushSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.listErr != nil {

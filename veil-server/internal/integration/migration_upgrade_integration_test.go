@@ -793,18 +793,49 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 023", func(t *testing.T) {
+	t.Run("024 adds fail-closed push delivery policy defaults and index", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_024")
+		applyMigrationsBefore(t, pool, migrations, 24)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var userID string
+		if err := pool.QueryRow(ctx, `INSERT INTO users(identity_key, signing_key, username)
+			VALUES ($1,$2,'push-policy-upgrade') RETURNING id::text`,
+			bytes.Repeat([]byte{0x71}, 32), bytes.Repeat([]byte{0x72}, 32)).Scan(&userID); err != nil {
+			t.Fatal(err)
+		}
+		var subscriptionID int64
+		if err := pool.QueryRow(ctx, `INSERT INTO push_subscriptions(user_id, endpoint_url)
+			VALUES ($1::uuid,'https://push.example/legacy') RETURNING id`, userID).Scan(&subscriptionID); err != nil {
+			t.Fatal(err)
+		}
+		if err := execMigration(t, pool, migrations, 24); err != nil {
+			t.Fatalf("migration 024: %v", err)
+		}
+		var enabled bool
+		var mutedUntil *time.Time
+		if err := pool.QueryRow(ctx, `SELECT enabled, muted_until FROM push_subscriptions WHERE id=$1`, subscriptionID).Scan(&enabled, &mutedUntil); err != nil || !enabled || mutedUntil != nil {
+			t.Fatalf("legacy push policy defaults enabled=%v muted=%v err=%v", enabled, mutedUntil, err)
+		}
+		var indexes int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM pg_indexes
+			WHERE schemaname=current_schema() AND indexname='idx_push_subscriptions_delivery'`).Scan(&indexes); err != nil || indexes != 1 {
+			t.Fatalf("push delivery policy index=%d err=%v", indexes, err)
+		}
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 024", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 23; number++ {
+		for number := 1; number <= 24; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 24)
+		applyMigrationsBefore(t, pool, migrations, 25)
 	})
 }
 

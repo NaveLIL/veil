@@ -15,6 +15,9 @@ Phase 4P разделён по реальной границе runtime, а не 
   `origin + binding generation` и повторно проверяются после network await.
 - Push content остаётся generic: UI и OS notification не получают sender name,
   message text, identity keys или decrypted preview.
+- Migration 024 добавляет server-enforced enabled/muted-until policy. Dispatcher
+  читает только active/unmuted projection; отключённый endpoint не получает даже
+  wake-up timing metadata.
 
 ## Почему `K_push` preview не включён
 
@@ -60,4 +63,3 @@ preview или background decrypt.
    является security boundary.
 6. Lock/account switch удаляет in-memory push keys и отменяет background work.
 7. DND/mute применяется до dispatcher fan-out на сервере, а не только в UI.
-

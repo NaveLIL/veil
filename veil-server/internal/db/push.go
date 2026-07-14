@@ -25,6 +25,8 @@ type PushSubscription struct {
 	PushKind    string
 	CreatedAt   time.Time
 	LastUsed    *time.Time
+	Enabled     bool
+	MutedUntil  *time.Time
 }
 
 // CreatePushSubscription upserts a (user_id, endpoint_url) row and
@@ -104,7 +106,8 @@ func (db *DB) CreatePushSubscription(ctx context.Context, userID, endpointURL, d
 // given user. Order is creation time (oldest first) — stable for tests.
 func (db *DB) ListPushSubscriptions(ctx context.Context, userID string) ([]PushSubscription, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT id, user_id, endpoint_url, COALESCE(device_label, ''), push_kind, created_at, last_used
+		`SELECT id, user_id, endpoint_url, COALESCE(device_label, ''), push_kind, created_at, last_used,
+		        enabled, muted_until
 		 FROM push_subscriptions
 		 WHERE user_id = $1
 		 ORDER BY created_at ASC
@@ -117,12 +120,61 @@ func (db *DB) ListPushSubscriptions(ctx context.Context, userID string) ([]PushS
 	var out []PushSubscription
 	for rows.Next() {
 		var s PushSubscription
-		if err := rows.Scan(&s.ID, &s.UserID, &s.EndpointURL, &s.DeviceLabel, &s.PushKind, &s.CreatedAt, &s.LastUsed); err != nil {
+		if err := rows.Scan(&s.ID, &s.UserID, &s.EndpointURL, &s.DeviceLabel, &s.PushKind, &s.CreatedAt, &s.LastUsed, &s.Enabled, &s.MutedUntil); err != nil {
 			return nil, fmt.Errorf("scan push subscription: %w", err)
 		}
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// ListActivePushSubscriptions is the only dispatcher projection. Applying the
+// policy in SQL prevents disabled/muted endpoints from receiving even a
+// metadata-only wake-up or its timing signal.
+func (db *DB) ListActivePushSubscriptions(ctx context.Context, userID string) ([]PushSubscription, error) {
+	rows, err := db.Pool.Query(ctx,
+		`SELECT id, user_id, endpoint_url, COALESCE(device_label, ''), push_kind, created_at, last_used,
+		        enabled, muted_until
+		 FROM push_subscriptions
+		 WHERE user_id = $1
+		   AND enabled = TRUE
+		   AND (muted_until IS NULL OR muted_until <= now())
+		 ORDER BY created_at ASC
+		 LIMIT $2`, userID, MaxPushSubscriptionsPerUser)
+	if err != nil {
+		return nil, fmt.Errorf("list active push subscriptions: %w", err)
+	}
+	defer rows.Close()
+
+	var out []PushSubscription
+	for rows.Next() {
+		var s PushSubscription
+		if err := rows.Scan(&s.ID, &s.UserID, &s.EndpointURL, &s.DeviceLabel, &s.PushKind, &s.CreatedAt, &s.LastUsed, &s.Enabled, &s.MutedUntil); err != nil {
+			return nil, fmt.Errorf("scan active push subscription: %w", err)
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// UpdatePushSubscriptionPolicy changes only a subscription owned by userID.
+// muteSeconds=0 clears DND; positive values are converted using the database
+// clock so dispatcher and policy share one time source.
+func (db *DB) UpdatePushSubscriptionPolicy(ctx context.Context, userID string, id int64, enabled *bool, muteSeconds *int64) (bool, error) {
+	tag, err := db.Pool.Exec(ctx,
+		`UPDATE push_subscriptions
+		 SET enabled = CASE WHEN $3::boolean IS NULL THEN enabled ELSE $3 END,
+		     muted_until = CASE
+		       WHEN $4::bigint IS NULL THEN muted_until
+		       WHEN $4 = 0 THEN NULL
+		       ELSE now() + ($4 * interval '1 second')
+		     END
+		 WHERE id = $1 AND user_id = $2::uuid`,
+		id, userID, enabled, muteSeconds)
+	if err != nil {
+		return false, fmt.Errorf("update push subscription policy: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // DeletePushSubscription removes a subscription by ID, scoped to the

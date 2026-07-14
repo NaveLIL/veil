@@ -24,3 +24,21 @@ func TestValidateSubscriptionRequestStrictMetadata(t *testing.T) {
 		})
 	}
 }
+
+func TestValidatePolicyRequest(t *testing.T) {
+	enabled := false
+	zero := int64(0)
+	tooLong := maxPushMuteSeconds + 1
+	if err := validatePolicyRequest(&policyReq{Enabled: &enabled}); err != nil {
+		t.Fatalf("valid enabled policy rejected: %v", err)
+	}
+	if err := validatePolicyRequest(&policyReq{MuteSeconds: &zero}); err != nil {
+		t.Fatalf("valid mute clear rejected: %v", err)
+	}
+	if err := validatePolicyRequest(&policyReq{}); err == nil {
+		t.Fatal("empty policy accepted")
+	}
+	if err := validatePolicyRequest(&policyReq{MuteSeconds: &tooLong}); err == nil {
+		t.Fatal("oversize mute accepted")
+	}
+}
