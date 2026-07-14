@@ -610,12 +610,7 @@ func (h *Handler) ReorderChannels(w http.ResponseWriter, r *http.Request) {
 	}
 	items := make([]ReorderItem, 0, len(req.Items))
 	for _, it := range req.Items {
-		items = append(items, ReorderItem{
-			ChannelID:     it.ChannelID,
-			Position:      it.Position,
-			CategoryID:    it.CategoryID,
-			ClearCategory: it.ClearCategory,
-		})
+		items = append(items, ReorderItem(it))
 	}
 	if err := h.svc.ReorderChannels(r.Context(), r.PathValue("serverID"), uid, items); err != nil {
 		publicerr.Write(w, http.StatusForbidden, err)
@@ -950,12 +945,12 @@ func (h *Handler) PreviewInvite(w http.ResponseWriter, r *http.Request) {
 	setVeilLinkPrivacyHeaders(w)
 	selector := r.PathValue("selector")
 	if !validVeilLinkToken(selector) {
-		publicerr.Write(w, http.StatusNotFound, errors.New("Veil Link unavailable"))
+		publicerr.Write(w, http.StatusNotFound, errors.New("veil link unavailable"))
 		return
 	}
 	srv, inv, err := h.svc.PreviewInvite(r.Context(), selector)
 	if err != nil {
-		publicerr.Write(w, http.StatusNotFound, errors.New("Veil Link unavailable"))
+		publicerr.Write(w, http.StatusNotFound, errors.New("veil link unavailable"))
 		return
 	}
 	writeJSON(w, http.StatusOK, publicVeilLinkPreview(requestOrigin(r), srv, inv))
@@ -1027,13 +1022,13 @@ func (h *Handler) AuthenticatedPreviewInvite(w http.ResponseWriter, r *http.Requ
 	selector := r.PathValue("selector")
 	if err := decodeRequestJSON(r, &req, false); err != nil ||
 		!validVeilLinkToken(selector) || !validVeilLinkToken(req.Secret) {
-		publicerr.Write(w, http.StatusBadRequest, errors.New("Veil Link unavailable"))
+		publicerr.Write(w, http.StatusBadRequest, errors.New("veil link unavailable"))
 		return
 	}
 	setVeilLinkPrivacyHeaders(w)
 	srv, inv, alreadyMember, err := h.svc.AuthenticatedPreviewInvite(r.Context(), selector, req.Secret, uid)
 	if err != nil {
-		publicerr.Write(w, http.StatusNotFound, errors.New("Veil Link unavailable"))
+		publicerr.Write(w, http.StatusNotFound, errors.New("veil link unavailable"))
 		return
 	}
 	preview := publicVeilLinkPreview(requestOrigin(r), srv, inv)
@@ -1051,13 +1046,13 @@ func (h *Handler) UseInvite(w http.ResponseWriter, r *http.Request) {
 	selector := r.PathValue("selector")
 	if err := decodeRequestJSON(r, &req, false); err != nil ||
 		!validVeilLinkToken(selector) || !validVeilLinkToken(req.Secret) {
-		publicerr.Write(w, http.StatusBadRequest, errors.New("Veil Link unavailable"))
+		publicerr.Write(w, http.StatusBadRequest, errors.New("veil link unavailable"))
 		return
 	}
 	setVeilLinkPrivacyHeaders(w)
 	srv, err := h.svc.UseInvite(r.Context(), selector, req.Secret, uid)
 	if err != nil {
-		publicerr.Write(w, http.StatusBadRequest, errors.New("Veil Link unavailable"))
+		publicerr.Write(w, http.StatusBadRequest, errors.New("veil link unavailable"))
 		return
 	}
 	writeJSON(w, http.StatusOK, serverDTO(srv))

@@ -912,7 +912,7 @@ func (db *DB) GetInvite(ctx context.Context, selector string) (*Invite, error) {
 func (db *DB) AuthenticateInvite(ctx context.Context, selector, secret string) (*Invite, error) {
 	providedHash, err := hashVeilLinkSecret(secret)
 	if err != nil {
-		return nil, errors.New("Veil Link unavailable")
+		return nil, errors.New("veil link unavailable")
 	}
 	inv, err := scanInvite(db.Pool.QueryRow(ctx,
 		`SELECT id, public_selector, secret_hash, version, link_type, server_id,
@@ -922,7 +922,7 @@ func (db *DB) AuthenticateInvite(ctx context.Context, selector, secret string) (
 	if err != nil || inv.Version != 1 || inv.LinkType != "space" || inv.RevokedAt != nil ||
 		time.Now().After(inv.ExpiresAt) ||
 		subtle.ConstantTimeCompare(providedHash, inv.SecretHash) != 1 {
-		return nil, errors.New("Veil Link unavailable")
+		return nil, errors.New("veil link unavailable")
 	}
 	inv.SecretHash = nil
 	return inv, nil
@@ -933,7 +933,7 @@ func (db *DB) AuthenticateInvite(ctx context.Context, selector, secret string) (
 func (db *DB) UseInvite(ctx context.Context, selector, secret, userID string) (*Server, bool, error) {
 	providedHash, err := hashVeilLinkSecret(secret)
 	if err != nil {
-		return nil, false, errors.New("Veil Link unavailable")
+		return nil, false, errors.New("veil link unavailable")
 	}
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
@@ -953,7 +953,7 @@ func (db *DB) UseInvite(ctx context.Context, selector, secret, userID string) (*
 	if err != nil || inv.Version != 1 || inv.LinkType != "space" || inv.RevokedAt != nil ||
 		time.Now().After(inv.ExpiresAt) ||
 		subtle.ConstantTimeCompare(providedHash, inv.SecretHash) != 1 {
-		return nil, false, errors.New("Veil Link unavailable")
+		return nil, false, errors.New("veil link unavailable")
 	}
 
 	var banned bool
@@ -964,7 +964,7 @@ func (db *DB) UseInvite(ctx context.Context, selector, secret, userID string) (*
 		return nil, false, err
 	}
 	if banned {
-		return nil, false, errors.New("Veil Link unavailable")
+		return nil, false, errors.New("veil link unavailable")
 	}
 
 	var alreadyMember bool
@@ -975,7 +975,7 @@ func (db *DB) UseInvite(ctx context.Context, selector, secret, userID string) (*
 		return nil, false, err
 	}
 	if !alreadyMember && inv.Uses >= inv.MaxUses {
-		return nil, false, errors.New("Veil Link unavailable")
+		return nil, false, errors.New("veil link unavailable")
 	}
 
 	if !alreadyMember {
@@ -1092,7 +1092,7 @@ func (db *DB) RevokeInvite(ctx context.Context, serverID, inviteID, actorID stri
 			return checkErr
 		}
 		if !exists {
-			return errors.New("Veil Link not found")
+			return errors.New("veil link not found")
 		}
 		return tx.Commit(ctx)
 	}

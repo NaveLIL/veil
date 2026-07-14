@@ -335,7 +335,7 @@ func (s *Service) CreateChannel(ctx context.Context, serverID, requesterID, name
 		return nil, errors.New("insufficient permissions")
 	}
 	if channelType != 0 && channelType != 2 {
-		return nil, errors.New("Room type is not active in this release")
+		return nil, errors.New("room type is not active in this release")
 	}
 	if err := validateChannelMetadata(&name, topic); err != nil {
 		return nil, err
@@ -842,15 +842,15 @@ func (s *Service) UseInvite(ctx context.Context, selector, secret, userID string
 func (s *Service) PreviewInvite(ctx context.Context, selector string) (*db.Server, *db.Invite, error) {
 	inv, err := s.db.GetInvite(ctx, selector)
 	if err != nil {
-		return nil, nil, errors.New("Veil Link unavailable")
+		return nil, nil, errors.New("veil link unavailable")
 	}
 	if inv.Version != 1 || inv.LinkType != "space" || inv.RevokedAt != nil ||
 		time.Now().After(inv.ExpiresAt) || inv.Uses >= inv.MaxUses {
-		return nil, nil, errors.New("Veil Link unavailable")
+		return nil, nil, errors.New("veil link unavailable")
 	}
 	srv, err := s.db.GetServer(ctx, inv.ServerID)
 	if err != nil {
-		return nil, nil, errors.New("Veil Link unavailable")
+		return nil, nil, errors.New("veil link unavailable")
 	}
 	return srv, inv, nil
 }
@@ -862,16 +862,16 @@ func (s *Service) AuthenticatedPreviewInvite(ctx context.Context, selector, secr
 	}
 	alreadyMember, err := s.db.IsServerMember(ctx, inv.ServerID, userID)
 	if err != nil {
-		return nil, nil, false, errors.New("Veil Link unavailable")
+		return nil, nil, false, errors.New("veil link unavailable")
 	}
 	// A consumed link remains useful to an existing member as a safe route back
 	// to the Space, but it must never admit a new account beyond max_uses.
 	if !alreadyMember && inv.Uses >= inv.MaxUses {
-		return nil, nil, false, errors.New("Veil Link unavailable")
+		return nil, nil, false, errors.New("veil link unavailable")
 	}
 	srv, err := s.db.GetServer(ctx, inv.ServerID)
 	if err != nil {
-		return nil, nil, false, errors.New("Veil Link unavailable")
+		return nil, nil, false, errors.New("veil link unavailable")
 	}
 	return srv, inv, alreadyMember, nil
 }

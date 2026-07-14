@@ -121,7 +121,7 @@ impl Drop for RatchetSession {
         if let Some(ref mut ck) = self.receiving_chain_key {
             ck.zeroize();
         }
-        for (_, key) in self.skipped_keys.iter_mut() {
+        for key in self.skipped_keys.values_mut() {
             key.zeroize();
         }
     }

@@ -420,13 +420,13 @@ func (s *Service) CreateGroup(ctx context.Context, name string, creatorUserID st
 
 func (s *Service) CreateCircle(ctx context.Context, name, creatorUserID string, members []db.GroupMemberLocator) (string, error) {
 	if name == "" {
-		return "", errors.New("Circle name required")
+		return "", errors.New("circle name required")
 	}
 	if len(name) > 100 {
-		return "", errors.New("Circle name too long")
+		return "", errors.New("circle name too long")
 	}
 	if len(members) < 1 || len(members) > 32 {
-		return "", errors.New("Circle requires between 1 and 32 selected members")
+		return "", errors.New("circle requires between 1 and 32 selected members")
 	}
 	seen := map[string]struct{}{creatorUserID: {}}
 	for _, member := range members {
