@@ -56,8 +56,9 @@ migration failure prevents an unsafe partial deployment.
 
 ```bash
 export VEIL_UPLOAD_TOKEN_KEY="$(openssl rand -base64 32)"
-export VEIL_PUSH_TRANSPORT_KEY="$(openssl rand -base64 32)"
-export VEIL_PUSH_HASH_SALT="уникальное для деплоя значение"
+# Run `go run ./cmd/vapid-keygen` inside veil-server once, then persist its output.
+export VEIL_PUSH_VAPID_PRIVATE_KEY="<unpadded-base64url-private-scalar>"
+export VEIL_PUSH_VAPID_SUBJECT="mailto:admin@example.com"
 ```
 
 ## Публичный деплой с TLS
@@ -74,7 +75,7 @@ docker compose --profile proxy up -d
 
 ## Крипто
 
-XChaCha20-Poly1305 используется для содержимого. X3DH устанавливает сессию, Double Ratchet даёт forward secrecy в DM; ratchet-header аутентифицирован, но не скрыт от сервера. Группы и каналы используют Sender Keys v5: каждое сообщение дополнительно подписано Ed25519 владельцем ключа, состав привязан к обязательной ротации, а незавершённая раздача блокирует отправку. MLS остаётся отдельным экспериментальным crate и не включён в desktop runtime. Файлы — chunked AEAD с привязкой индекса/final и атомарной публикацией только после полной проверки; текущий one-shot adapter ограничен 64 MiB. Push-транспорт существует, но содержимое push-preview в desktop пока отключено до полного `K_push` workflow. SQLCipher работает с `cipher_memory_security = ON` и `synchronous = FULL`, seed хранится в OS Keychain. Копирование recovery phrase из UI отключено из-за Windows Clipboard History/cloud sync. На Linux `keyring` v3 собирается с `sync-secret-service` + `crypto-rust`. Сервер видит ciphertext и неизбежные метаданные (размер, тайминг, участники/маршрутизация).
+XChaCha20-Poly1305 используется для содержимого. X3DH устанавливает сессию, Double Ratchet даёт forward secrecy в DM; ratchet-header аутентифицирован, но не скрыт от сервера. Группы и каналы используют Sender Keys v5: каждое сообщение дополнительно подписано Ed25519 владельцем ключа, состав привязан к обязательной ротации, а незавершённая раздача блокирует отправку. MLS остаётся отдельным экспериментальным crate и не включён в desktop runtime. Файлы — chunked AEAD с привязкой индекса/final и атомарной публикацией только после полной проверки; текущий one-shot adapter ограничен 64 MiB. Push использует RFC 8291 `aes128gcm` + VAPID и несёт только фиксированный 2-КиБ generic wake-up без message metadata; preview отсутствует. SQLCipher работает с `cipher_memory_security = ON` и `synchronous = FULL`, seed хранится в OS Keychain. Копирование recovery phrase из UI отключено из-за Windows Clipboard History/cloud sync. На Linux `keyring` v3 собирается с `sync-secret-service` + `crypto-rust`. Сервер видит ciphertext и неизбежные метаданные (размер, тайминг, участники/маршрутизация).
 
 ## Где что сделано
 

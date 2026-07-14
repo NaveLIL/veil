@@ -25,6 +25,19 @@ import (
 	"golang.org/x/crypto/curve25519"
 )
 
+func integrationPushInput(endpoint, label string) db.NewPushSubscription {
+	tokenHash := sha256.Sum256([]byte(endpoint))
+	return db.NewPushSubscription{
+		EndpointURL:         endpoint,
+		PublicKey:           base64.RawURLEncoding.EncodeToString(append([]byte{4}, make([]byte, 64)...)),
+		AuthSecret:          base64.RawURLEncoding.EncodeToString(make([]byte, 16)),
+		DeviceLabel:         label,
+		PushKind:            "unifiedpush",
+		ValidationTokenHash: tokenHash[:],
+		ValidationExpiresAt: time.Now().Add(time.Hour),
+	}
+}
+
 // TestSecurityPrincipalBinding exercises the authorization boundaries that
 // previously allowed account/device takeover and cross-conversation access.
 // It intentionally uses one harness so the security suite only starts one
@@ -1310,7 +1323,7 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			go func(index int) {
 				defer wg.Done()
 				id, err := h.DB.CreatePushSubscription(ctx, pushUser.ID,
-					fmt.Sprintf("https://push.example/%d", index), "device", "unifiedpush")
+					integrationPushInput(fmt.Sprintf("https://push.example/%d", index), "device"))
 				results <- result{id: id, err: err}
 			}(i)
 		}
@@ -1344,7 +1357,7 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 				existing = row
 			}
 		}
-		id, err := h.DB.CreatePushSubscription(ctx, pushUser.ID, existing.EndpointURL, "renamed", "unifiedpush")
+		id, err := h.DB.CreatePushSubscription(ctx, pushUser.ID, integrationPushInput(existing.EndpointURL, "renamed"))
 		if err != nil || id != existingID {
 			t.Fatalf("idempotent upsert at cap id=%d err=%v, want %d", id, err, existingID)
 		}
@@ -1354,9 +1367,13 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		ctx := context.Background()
 		owner := h.CreateUser("security-push-policy-owner")
 		other := h.CreateUser("security-push-policy-other")
-		id, err := h.DB.CreatePushSubscription(ctx, owner.ID, "https://push.example/policy", "phone", "unifiedpush")
+		input := integrationPushInput("https://push.example/policy", "phone")
+		id, err := h.DB.CreatePushSubscription(ctx, owner.ID, input)
 		if err != nil {
 			t.Fatal(err)
+		}
+		if ok, err := h.DB.ConfirmPushSubscription(ctx, owner.ID, id, input.ValidationTokenHash); err != nil || !ok {
+			t.Fatalf("confirm push subscription ok=%v err=%v", ok, err)
 		}
 		disabled := false
 		if ok, err := h.DB.UpdatePushSubscriptionPolicy(ctx, other.ID, id, &disabled, nil); err != nil || ok {

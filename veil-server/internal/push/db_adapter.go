@@ -28,6 +28,8 @@ func (s *dbStore) ListActivePushSubscriptions(ctx context.Context, userID string
 			ID:          r.ID,
 			UserID:      r.UserID,
 			EndpointURL: r.EndpointURL,
+			PublicKey:   r.PublicKey,
+			AuthSecret:  r.AuthSecret,
 			PushKind:    r.PushKind,
 		})
 	}

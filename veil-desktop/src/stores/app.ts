@@ -113,6 +113,7 @@ export interface PushSubscription {
   lastUsed?: string;
   enabled: boolean;
   mutedUntil?: string;
+  validated: boolean;
 }
 
 export interface ServerBan {
@@ -1469,17 +1470,6 @@ export const appStore = {
     });
     requireCurrentMutationScope(sessionEpoch, mutationScope);
     return result;
-  },
-
-  createPushSubscription: async (endpoint: string, deviceLabel: string): Promise<void> => {
-    const sessionEpoch = captureUiSessionEpoch();
-    const mutationScope = requirePublishedMutationScope();
-    await invoke("create_push_subscription", {
-      endpoint,
-      deviceLabel,
-      ...authenticatedMutationScopeArgs(mutationScope),
-    });
-    requireCurrentMutationScope(sessionEpoch, mutationScope);
   },
 
   deletePushSubscription: async (subscriptionId: string): Promise<void> => {

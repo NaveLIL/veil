@@ -21,20 +21,33 @@ type PushSubscription struct {
 	ID          int64
 	UserID      string
 	EndpointURL string
+	PublicKey   string
+	AuthSecret  string
 	DeviceLabel string
 	PushKind    string
 	CreatedAt   time.Time
 	LastUsed    *time.Time
 	Enabled     bool
 	MutedUntil  *time.Time
+	ValidatedAt *time.Time
+}
+
+type NewPushSubscription struct {
+	EndpointURL         string
+	PublicKey           string
+	AuthSecret          string
+	DeviceLabel         string
+	PushKind            string
+	ValidationTokenHash []byte
+	ValidationExpiresAt time.Time
 }
 
 // CreatePushSubscription upserts a (user_id, endpoint_url) row and
 // returns the row ID. Duplicate endpoints for the same user are
 // idempotent — re-subscribing only refreshes the device_label/kind.
-func (db *DB) CreatePushSubscription(ctx context.Context, userID, endpointURL, deviceLabel, kind string) (int64, error) {
-	if kind == "" {
-		kind = "unifiedpush"
+func (db *DB) CreatePushSubscription(ctx context.Context, userID string, input NewPushSubscription) (int64, error) {
+	if input.PushKind == "" {
+		input.PushKind = "unifiedpush"
 	}
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
@@ -50,18 +63,28 @@ func (db *DB) CreatePushSubscription(ctx context.Context, userID, endpointURL, d
 	); err != nil {
 		return 0, fmt.Errorf("lock push subscriptions: %w", err)
 	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM push_subscriptions
+		 WHERE user_id = $1::uuid AND validated_at IS NULL
+		   AND validation_expires_at <= now()`, userID); err != nil {
+		return 0, fmt.Errorf("prune expired push validations: %w", err)
+	}
 	var existingID int64
 	err = tx.QueryRow(ctx,
 		`SELECT id FROM push_subscriptions
 		 WHERE user_id = $1::uuid AND endpoint_url = $2`,
-		userID, endpointURL,
+		userID, input.EndpointURL,
 	).Scan(&existingID)
 	if err == nil {
 		if _, err := tx.Exec(ctx,
 			`UPDATE push_subscriptions
-			 SET device_label = NULLIF($3, ''), push_kind = $4
+			 SET device_label = NULLIF($3, ''), push_kind = $4,
+			     webpush_public_key = $5, webpush_auth_secret = $6,
+			     validated_at = NULL, validation_token_hash = $7,
+			     validation_expires_at = $8
 			 WHERE id = $1 AND user_id = $2::uuid`,
-			existingID, userID, deviceLabel, kind,
+			existingID, userID, input.DeviceLabel, input.PushKind,
+			input.PublicKey, input.AuthSecret, input.ValidationTokenHash, input.ValidationExpiresAt,
 		); err != nil {
 			return 0, fmt.Errorf("update push subscription: %w", err)
 		}
@@ -85,13 +108,21 @@ func (db *DB) CreatePushSubscription(ctx context.Context, userID, endpointURL, d
 	}
 	var id int64
 	err = tx.QueryRow(ctx,
-		`INSERT INTO push_subscriptions (user_id, endpoint_url, device_label, push_kind)
-		 VALUES ($1, $2, NULLIF($3, ''), $4)
+		`INSERT INTO push_subscriptions
+		 (user_id, endpoint_url, device_label, push_kind, webpush_public_key,
+		  webpush_auth_secret, validation_token_hash, validation_expires_at)
+		 VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7, $8)
 		 ON CONFLICT (user_id, endpoint_url) DO UPDATE
 		 SET device_label = EXCLUDED.device_label,
-		     push_kind    = EXCLUDED.push_kind
+		     push_kind = EXCLUDED.push_kind,
+		     webpush_public_key = EXCLUDED.webpush_public_key,
+		     webpush_auth_secret = EXCLUDED.webpush_auth_secret,
+		     validated_at = NULL,
+		     validation_token_hash = EXCLUDED.validation_token_hash,
+		     validation_expires_at = EXCLUDED.validation_expires_at
 		 RETURNING id`,
-		userID, endpointURL, deviceLabel, kind,
+		userID, input.EndpointURL, input.DeviceLabel, input.PushKind,
+		input.PublicKey, input.AuthSecret, input.ValidationTokenHash, input.ValidationExpiresAt,
 	).Scan(&id)
 	if err != nil {
 		return 0, fmt.Errorf("create push subscription: %w", err)
@@ -106,8 +137,9 @@ func (db *DB) CreatePushSubscription(ctx context.Context, userID, endpointURL, d
 // given user. Order is creation time (oldest first) — stable for tests.
 func (db *DB) ListPushSubscriptions(ctx context.Context, userID string) ([]PushSubscription, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT id, user_id, endpoint_url, COALESCE(device_label, ''), push_kind, created_at, last_used,
-		        enabled, muted_until
+		`SELECT id, user_id, endpoint_url, webpush_public_key, webpush_auth_secret,
+		        COALESCE(device_label, ''), push_kind, created_at, last_used,
+		        enabled, muted_until, validated_at
 		 FROM push_subscriptions
 		 WHERE user_id = $1
 		 ORDER BY created_at ASC
@@ -120,7 +152,7 @@ func (db *DB) ListPushSubscriptions(ctx context.Context, userID string) ([]PushS
 	var out []PushSubscription
 	for rows.Next() {
 		var s PushSubscription
-		if err := rows.Scan(&s.ID, &s.UserID, &s.EndpointURL, &s.DeviceLabel, &s.PushKind, &s.CreatedAt, &s.LastUsed, &s.Enabled, &s.MutedUntil); err != nil {
+		if err := rows.Scan(&s.ID, &s.UserID, &s.EndpointURL, &s.PublicKey, &s.AuthSecret, &s.DeviceLabel, &s.PushKind, &s.CreatedAt, &s.LastUsed, &s.Enabled, &s.MutedUntil, &s.ValidatedAt); err != nil {
 			return nil, fmt.Errorf("scan push subscription: %w", err)
 		}
 		out = append(out, s)
@@ -133,11 +165,13 @@ func (db *DB) ListPushSubscriptions(ctx context.Context, userID string) ([]PushS
 // metadata-only wake-up or its timing signal.
 func (db *DB) ListActivePushSubscriptions(ctx context.Context, userID string) ([]PushSubscription, error) {
 	rows, err := db.Pool.Query(ctx,
-		`SELECT id, user_id, endpoint_url, COALESCE(device_label, ''), push_kind, created_at, last_used,
-		        enabled, muted_until
+		`SELECT id, user_id, endpoint_url, webpush_public_key, webpush_auth_secret,
+		        COALESCE(device_label, ''), push_kind, created_at, last_used,
+		        enabled, muted_until, validated_at
 		 FROM push_subscriptions
 		 WHERE user_id = $1
 		   AND enabled = TRUE
+		   AND validated_at IS NOT NULL
 		   AND (muted_until IS NULL OR muted_until <= now())
 		 ORDER BY created_at ASC
 		 LIMIT $2`, userID, MaxPushSubscriptionsPerUser)
@@ -149,12 +183,27 @@ func (db *DB) ListActivePushSubscriptions(ctx context.Context, userID string) ([
 	var out []PushSubscription
 	for rows.Next() {
 		var s PushSubscription
-		if err := rows.Scan(&s.ID, &s.UserID, &s.EndpointURL, &s.DeviceLabel, &s.PushKind, &s.CreatedAt, &s.LastUsed, &s.Enabled, &s.MutedUntil); err != nil {
+		if err := rows.Scan(&s.ID, &s.UserID, &s.EndpointURL, &s.PublicKey, &s.AuthSecret, &s.DeviceLabel, &s.PushKind, &s.CreatedAt, &s.LastUsed, &s.Enabled, &s.MutedUntil, &s.ValidatedAt); err != nil {
 			return nil, fmt.Errorf("scan active push subscription: %w", err)
 		}
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+func (db *DB) ConfirmPushSubscription(ctx context.Context, userID string, id int64, tokenHash []byte) (bool, error) {
+	tag, err := db.Pool.Exec(ctx,
+		`UPDATE push_subscriptions
+		 SET validated_at = now(), validation_token_hash = NULL, validation_expires_at = NULL
+		 WHERE id = $1 AND user_id = $2::uuid
+		   AND validated_at IS NULL
+		   AND validation_expires_at > now()
+		   AND validation_token_hash = $3`,
+		id, userID, tokenHash)
+	if err != nil {
+		return false, fmt.Errorf("confirm push subscription: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // UpdatePushSubscriptionPolicy changes only a subscription owned by userID.

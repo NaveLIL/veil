@@ -42,13 +42,11 @@ services:
       # Compose traffic may arrive through the bundled Caddy proxy. Outside
       # this topology the application default remains false/fail-closed.
       VEIL_TRUST_PROXY_HEADERS:  "${VEIL_TRUST_PROXY_HEADERS:-true}"
-      # Phase 4 — UnifiedPush + ntfy. Generate a 32-byte key with:
-      #   openssl rand -base64 32
-      # then set VEIL_PUSH_TRANSPORT_KEY in your .env so the dispatcher
-      # boots in enabled mode. Leaving it empty disables push delivery
-      # (subscribe/list/delete endpoints stay reachable).
-      VEIL_PUSH_TRANSPORT_KEY: "${VEIL_PUSH_TRANSPORT_KEY:-}"
-      VEIL_PUSH_HASH_SALT:     "${VEIL_PUSH_HASH_SALT:-veil/push/v1}"
+      # Phase 4P — RFC 8291 Web Push + VAPID. Generate the private key with:
+      #   cd veil-server && go run ./cmd/vapid-keygen
+      # Registration and delivery fail closed while either value is absent.
+      VEIL_PUSH_VAPID_PRIVATE_KEY: "${VEIL_PUSH_VAPID_PRIVATE_KEY:-}"
+      VEIL_PUSH_VAPID_SUBJECT:     "${VEIL_PUSH_VAPID_SUBJECT:-}"
       VEIL_PUSH_JITTER_MS:     "${VEIL_PUSH_JITTER_MS:-2000}"
       # Exact private origin only; paths under ntfy are allowed, neighboring
       # containers/private IPs remain blocked by the SSRF policy.
@@ -73,11 +71,11 @@ services:
         condition: service_completed_successfully
 
   # Self-hosted UnifiedPush distributor. Mobile clients can register
-  # against http://<your-host>:9081/<topic> and the gateway POSTs the
-  # encrypted envelope there. Operators who prefer ntfy.sh can drop
+  # against http://<your-host>:9081/<up-topic> and the gateway POSTs RFC 8291
+  # encrypted Web Push records there. Operators who prefer ntfy.sh can drop
   # this service and point clients at the public instance.
   ntfy:
-    image: binwiederhier/ntfy:v2.11.0
+    image: binwiederhier/ntfy:v2.23.0
     restart: unless-stopped
     command: serve
     ports:
@@ -87,6 +85,9 @@ services:
       NTFY_BEHIND_PROXY: "false"
       NTFY_AUTH_FILE: "/var/lib/ntfy/user.db"
       NTFY_AUTH_DEFAULT_ACCESS: "deny-all"
+      # UnifiedPush endpoints are random bearer capabilities under up*.
+      # Other ntfy topics remain private/denied.
+      NTFY_AUTH_ACCESS: "*:up*:rw"
       NTFY_CACHE_FILE: "/var/lib/ntfy/cache.db"
       NTFY_ATTACHMENT_CACHE_DIR: "/var/lib/ntfy/attachments"
     volumes:

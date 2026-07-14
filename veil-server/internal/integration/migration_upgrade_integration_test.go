@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"net/url"
 	"strconv"
@@ -824,18 +825,48 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 024", func(t *testing.T) {
+	t.Run("025 removes endpoint-only subscriptions and requires Web Push validation state", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_025")
+		applyMigrationsBefore(t, pool, migrations, 25)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		var userID string
+		if err := pool.QueryRow(ctx, `INSERT INTO users(identity_key, signing_key, username)
+			VALUES ($1,$2,'webpush-cutover') RETURNING id::text`,
+			bytes.Repeat([]byte{0x73}, 32), bytes.Repeat([]byte{0x74}, 32)).Scan(&userID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `INSERT INTO push_subscriptions(user_id, endpoint_url)
+			VALUES ($1::uuid,'https://push.example/obsolete')`, userID); err != nil {
+			t.Fatal(err)
+		}
+		if err := execMigration(t, pool, migrations, 25); err != nil {
+			t.Fatalf("migration 025: %v", err)
+		}
+		var count int
+		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM push_subscriptions`).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("obsolete subscriptions retained count=%d err=%v", count, err)
+		}
+		_, err := pool.Exec(ctx, `INSERT INTO push_subscriptions
+			(user_id,endpoint_url,webpush_public_key,webpush_auth_secret)
+			VALUES ($1::uuid,'https://push.example/incomplete',$2,$3)`, userID,
+			base64.RawURLEncoding.EncodeToString(append([]byte{4}, make([]byte, 64)...)),
+			base64.RawURLEncoding.EncodeToString(make([]byte, 16)))
+		requireMigrationError(t, err, "23514", "push_validation_state_consistent")
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 025", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 24; number++ {
+		for number := 1; number <= 25; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 25)
+		applyMigrationsBefore(t, pool, migrations, 26)
 	})
 }
 

@@ -133,13 +133,12 @@ func main() {
 	serversHandler.SetVeilLinkRateLimits(veilPreviewRL, veilJoinRL)
 	serversHandler.RegisterRoutes(mux)
 
-	// Phase 4 — UnifiedPush + ntfy. The push notifier wires into the
+	// Phase 4P — UnifiedPush over RFC 8291 Web Push. The notifier wires into the
 	// gateway's offline-fanout path: when sendToUser finds zero live
-	// WS sessions, the dispatcher POSTs an encrypted envelope to every
-	// distributor URL the recipient has registered. Boots in disabled
-	// mode when VEIL_PUSH_TRANSPORT_KEY is unset (subscribe/list/delete
-	// remain reachable but no traffic leaves the gateway).
-	pushKey, err := push.LoadTransportKey()
+	// WS sessions, the dispatcher POSTs a fixed-size encrypted wake-up to every
+	// validated distributor URL. New registration and delivery fail closed when
+	// VAPID is not configured; list/policy/delete remain available.
+	vapid, err := push.LoadVAPIDConfig()
 	if err != nil {
 		log.Fatalf("push: %v", err)
 	}
@@ -149,14 +148,14 @@ func main() {
 	}
 	pushDispatcher := push.New(push.Options{
 		Store:          push.NewDBStore(database),
-		TransportKey:   pushKey,
-		Salt:           push.LoadSalt(),
+		VAPID:          vapid,
 		EndpointPolicy: pushEndpointPolicy,
 		MaxJitter:      push.LoadJitter(),
 		Logger:         slog.Default(),
 	})
 	hub.SetPushNotifier(pushDispatcher)
 	pushHandler := push.NewHandlerWithEndpointPolicy(database, signedMw, rl, pushEndpointPolicy)
+	pushHandler.SetDispatcher(pushDispatcher)
 	pushHandler.RegisterRoutes(mux)
 	if pushDispatcher.Enabled() {
 		log.Printf("push dispatcher enabled (jitter=%s)", push.LoadJitter())

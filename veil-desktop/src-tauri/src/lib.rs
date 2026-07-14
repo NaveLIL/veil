@@ -240,6 +240,7 @@ struct PushSubscriptionView {
     last_used: Option<String>,
     enabled: bool,
     muted_until: Option<String>,
+    validated: bool,
 }
 
 impl Drop for MediaSessionSnapshot {
@@ -8341,7 +8342,7 @@ fn parse_push_subscription_views(
                 .filter(|id| *id > 0)
                 .ok_or("push subscription id is invalid")?;
             let endpoint = row
-                .get("endpoint")
+                .get("endpoint_origin")
                 .and_then(serde_json::Value::as_str)
                 .filter(|endpoint| !endpoint.is_empty() && endpoint.len() <= 2048)
                 .ok_or("push subscription endpoint is invalid")?;
@@ -8399,15 +8400,20 @@ fn parse_push_subscription_views(
                     }
                 })
                 .transpose()?;
+            let validated = row
+                .get("validated")
+                .and_then(serde_json::Value::as_bool)
+                .ok_or("push subscription validation state is invalid")?;
             Ok(PushSubscriptionView {
                 id: id.to_string(),
-                endpoint_hint: format!("{host} · endpoint secret hidden"),
+                endpoint_hint: format!("{host} · Web Push capability hidden"),
                 device_label,
                 kind: kind.to_string(),
                 created_at: created_at.to_string(),
                 last_used,
                 enabled,
                 muted_until,
+                validated,
             })
         })
         .collect()
@@ -8442,55 +8448,6 @@ fn list_push_subscriptions(
         &binding,
     ))?;
     parse_push_subscription_views(&value)
-}
-
-#[tauri::command]
-fn create_push_subscription(
-    state: State<'_, AppState>,
-    endpoint: String,
-    device_label: String,
-    expected_server_origin: String,
-    expected_binding_generation: String,
-) -> Result<(), String> {
-    let endpoint = endpoint.trim();
-    if endpoint.is_empty()
-        || endpoint.len() > 2048
-        || endpoint.chars().any(char::is_control)
-        || endpoint.chars().any(char::is_whitespace)
-    {
-        return Err("UnifiedPush endpoint is invalid".to_string());
-    }
-    let device_label = device_label.trim();
-    if device_label.len() > 128 || device_label.chars().any(char::is_control) {
-        return Err("device label is invalid".to_string());
-    }
-    let binding = capture_expected_live_action_binding(
-        &state,
-        &expected_server_origin,
-        &expected_binding_generation,
-    )?;
-    let user_id = state
-        .client
-        .lock()
-        .map_err(|error| error.to_string())?
-        .authenticated_user_id()?
-        .to_string();
-    state.runtime.block_on(rest_send_json_for_binding(
-        &state,
-        reqwest::Method::POST,
-        rest_api_url(
-            &binding.origin.canonical_server_origin(),
-            &["v1", "push", "subscriptions"],
-        )?,
-        &user_id,
-        Some(serde_json::json!({
-            "endpoint": endpoint,
-            "device_label": device_label,
-            "kind": "unifiedpush",
-        })),
-        &binding,
-    ))?;
-    Ok(())
 }
 
 #[tauri::command]
@@ -11360,7 +11317,6 @@ pub fn run() {
             save_message_attachment,
             create_attachment_media_source,
             list_push_subscriptions,
-            create_push_subscription,
             delete_push_subscription,
             update_push_subscription_policy,
             discard_failed_outgoing_message,
@@ -11514,12 +11470,13 @@ mod e2ee_rest_tests {
         let value = serde_json::json!({
             "subscriptions": [{
                 "id": 7,
-                "endpoint": "https://push.example.test/topic/secret-token",
+                "endpoint_origin": "https://push.example.test",
                 "device_label": "Pixel",
                 "kind": "unifiedpush",
                 "created_at": "2026-07-14T01:02:03Z",
                 "last_used": "2026-07-14T02:03:04Z",
-                "enabled": true
+                "enabled": true,
+                "validated": true
             }]
         });
         let views = parse_push_subscription_views(&value).unwrap();
@@ -11527,17 +11484,18 @@ mod e2ee_rest_tests {
         assert_eq!(views[0].id, "7");
         assert_eq!(
             views[0].endpoint_hint,
-            "push.example.test · endpoint secret hidden"
+            "push.example.test · Web Push capability hidden"
         );
         assert!(!views[0].endpoint_hint.contains("secret-token"));
 
         let unsupported = serde_json::json!({
             "subscriptions": [{
                 "id": 1,
-                "endpoint": "https://push.example.test/topic",
+                "endpoint_origin": "https://push.example.test",
                 "kind": "webpush",
                 "created_at": "2026-07-14T01:02:03Z",
-                "enabled": true
+                "enabled": true,
+                "validated": true
             }]
         });
         assert!(parse_push_subscription_views(&unsupported).is_err());

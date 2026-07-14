@@ -86,11 +86,9 @@ export const SettingsScreen: Component = () => {
   const [networkError, setNetworkError] = createSignal("");
   const [networkSaving, setNetworkSaving] = createSignal(false);
 
-  // UnifiedPush endpoint management. Endpoint secrets are accepted once by
-  // native code but are never returned to renderer state after registration.
+  // Mobile devices register through their native UnifiedPush connector.
+  // Desktop can review and revoke those account-scoped bindings.
   const [pushSubscriptions, setPushSubscriptions] = createSignal<PushSubscription[]>([]);
-  const [pushEndpoint, setPushEndpoint] = createSignal("");
-  const [pushDeviceLabel, setPushDeviceLabel] = createSignal("");
   const [pushBusy, setPushBusy] = createSignal(false);
   const [pushError, setPushError] = createSignal("");
   let pushLoadKey = "";
@@ -157,24 +155,6 @@ export const SettingsScreen: Component = () => {
     setPushBusy(true);
     setPushError("");
     try {
-      setPushSubscriptions(await appStore.listPushSubscriptions());
-    } catch (error) {
-      setPushError(String(error));
-    } finally {
-      setPushBusy(false);
-    }
-  };
-
-  const addPushSubscription = async () => {
-    if (pushBusy() || !pushEndpoint().trim()) return;
-    setPushBusy(true);
-    setPushError("");
-    try {
-      await appStore.createPushSubscription(pushEndpoint(), pushDeviceLabel());
-      // A distributor endpoint is a bearer capability. Remove it from the DOM
-      // and renderer memory immediately after the native request succeeds.
-      setPushEndpoint("");
-      setPushDeviceLabel("");
       setPushSubscriptions(await appStore.listPushSubscriptions());
     } catch (error) {
       setPushError(String(error));
@@ -294,8 +274,6 @@ export const SettingsScreen: Component = () => {
     setPinInput("");
     setPinConfirm("");
     setCurrentPin("");
-    setPushEndpoint("");
-    setPushDeviceLabel("");
     setPushSubscriptions([]);
     document.removeEventListener("keydown", handleKey);
   });
@@ -1227,7 +1205,7 @@ export const SettingsScreen: Component = () => {
           <div>
             <div style={{ ...S.cardTitle, "margin-bottom": "3px" }}>Offline push devices</div>
             <div style={{ "font-size": "11px", color: "var(--veil-text-faint)", "line-height": "1.5" }}>
-              Manage distributor endpoints for this account. Veil sends only fixed-size generic wake-ups; message text and sender names never enter the push transport.
+              Review mobile devices registered through Veil for Android. Veil sends RFC 8291 encrypted, fixed-size generic wake-ups; message text and sender names never enter the push transport.
             </div>
           </div>
           <button type="button" style={{ ...S.btnSecondary, padding: "7px 9px" }} disabled={pushBusy() || !appStore.connected()} onClick={() => void loadPushSubscriptions()} aria-label="Refresh push devices">
@@ -1247,7 +1225,7 @@ export const SettingsScreen: Component = () => {
                   <div style={{ "min-width": "0" }}>
                     <div style={{ display: "flex", "align-items": "center", gap: "7px", "flex-wrap": "wrap" }}>
                       <div style={{ "font-size": "13px", "font-weight": "650", color: "var(--veil-text)" }}>{subscription.deviceLabel || "Unnamed device"}</div>
-                      <span style={S.badge(subscription.enabled ? "var(--veil-success)" : "var(--veil-text-subtle)")}>{subscription.enabled ? (subscription.mutedUntil && new Date(subscription.mutedUntil).getTime() > Date.now() ? "Muted" : "Active") : "Disabled"}</span>
+                      <span style={S.badge(subscription.validated && subscription.enabled ? "var(--veil-success)" : "var(--veil-text-subtle)")}>{!subscription.validated ? "Pending validation" : subscription.enabled ? (subscription.mutedUntil && new Date(subscription.mutedUntil).getTime() > Date.now() ? "Muted" : "Active") : "Disabled"}</span>
                     </div>
                     <div style={{ "font-size": "10px", color: "var(--veil-text-faint)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap", "margin-top": "3px" }}>{subscription.endpointHint}</div>
                     <div style={{ "font-size": "10px", color: "var(--veil-text-subtle)", "margin-top": "2px" }}>Added {new Date(subscription.createdAt).toLocaleString()}</div>
@@ -1268,18 +1246,8 @@ export const SettingsScreen: Component = () => {
             </For>
           </div>
         </Show>
-
-        <div style={{ display: "grid", gap: "9px", "padding-top": "14px", "border-top": "1px solid var(--veil-border)" }}>
-          <input type="password" autocomplete="off" spellcheck={false} style={S.input} value={pushEndpoint()} onInput={(event) => setPushEndpoint(event.currentTarget.value)} placeholder="UnifiedPush distributor endpoint" aria-label="UnifiedPush distributor endpoint" />
-          <div style={{ display: "flex", gap: "9px" }}>
-            <input style={{ ...S.input, flex: "1" }} maxlength={128} value={pushDeviceLabel()} onInput={(event) => setPushDeviceLabel(event.currentTarget.value)} placeholder="Device label (optional)" aria-label="Push device label" />
-            <button type="button" style={S.btnPrimary} disabled={pushBusy() || !appStore.connected() || !pushEndpoint().trim()} onClick={() => void addPushSubscription()}>
-              Add endpoint
-            </button>
-          </div>
-          <div style={{ "font-size": "10px", color: "var(--veil-warning)", "line-height": "1.5" }}>
-            Treat the endpoint like a password. Veil clears it after registration and never returns its secret path to the interface.
-          </div>
+        <div style={{ "padding-top": "12px", "border-top": "1px solid var(--veil-border)", "font-size": "10px", color: "var(--veil-text-faint)", "line-height": "1.5" }}>
+          Registration happens only inside the authenticated Android runtime. Endpoint capabilities and Web Push key material are never exposed to this interface.
         </div>
         <Show when={pushError()}><div style={S.errorMsg} role="alert">{pushError()}</div></Show>
       </div>

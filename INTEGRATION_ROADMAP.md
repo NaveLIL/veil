@@ -242,54 +242,43 @@ Streaming uploader уже использует bounded-memory chunk pipeline д�
 
 ## Phase 4 — UnifiedPush / ntfy push-уведомления
 
-**Статус transport core 2026-07-12: закрыто.** Server transport и encrypted envelope готовы. Полноценного
-desktop/mobile `K_push` workflow ещё нет, поэтому UI не должен обещать
-расшифрованные preview. До готовности показывается только нейтральное
-«Новое сообщение» и выполняется sync после unlock.
+**Статус transport core 2026-07-14: исправлен и закрыт автоматическими
+проверками.** Повторный аудит актуальной UnifiedPush specification выявил, что
+прежний endpoint-only custom envelope не совместим с Android connector.
+Migration 025 удаляет эти pre-release bindings и переводит транспорт на RFC 8291
+Web Push (`aes128gcm`) с обязательными `p256dh`/`auth` и RFC 8292 VAPID.
 
-Фоновые push без FCM/APNS в data path. Сервер отправляет только зашифрованный blob; устройство расшифровывает в notification extension.
+Обычный push — только generic wake-up без sender/message/conversation metadata.
+Web Push record всегда 2048 bytes. Клиент после получения выполняет обычный
+authenticated E2E sync; plaintext preview и silent fallback отсутствуют.
 
-Флоу: gateway видит что получатель оффлайн → fanout через dispatcher → ntfy endpoint получателя → UnifiedPush distributor → приложение расшифровывает с `K_push`.
+**Серверный контракт:**
+- подписанный GET VAPID public key и POST полного UnifiedPush subscription;
+- random 256-bit challenge доставляется через новый канал и подтверждается
+  подписанным account/origin-bound запросом;
+- только validated + enabled + unmuted rows попадают в dispatcher projection;
+- endpoint policy повторно проверяет URL/DNS при каждой отправке, запрещает
+  redirects в private/reserved ranges и прунит 404/410;
+- endpoint path, `p256dh` и `auth` не возвращаются list API и не логируются;
+- если VAPID отсутствует, registration и delivery fail closed.
 
-`K_push` деривируется через HKDF-SHA256 из ratchet root с domain separator. Смысл: если push subsystem взломан — видны только превью, живой ratchet не затрагивается.
-
-Envelope: JSON с короткими именами полей, padding до ровно 2 КБ (XChaCha20-Poly1305 AEAD). Одинаковый размер всех пакетов чтобы ntfy-оператор не мог делать выводы по размеру.
-
-**Что сделано на серверной стороне:**
-- Migration `006_push.sql` — таблица `push_subscriptions`
-- `internal/push/`: `envelope.go` (padding до 2 КБ, AEAD), `dispatcher.go` (jitter [0, VEIL_PUSH_JITTER_MS), fan-out по всем подпискам пользователя, автопруниг при 410/404), `handler.go` (REST: POST/GET/DELETE subscriptions)
-- Gateway: `Hub.SetPushNotifier()` + `fanoutMessageEvent()`. Отправляет push только для новых сообщений, только если у получателя ноль живых WS-сессий. Редакты/удаления/реакции — без push, чтобы не спамить
-- ntfy в docker-compose на `9081:80`, deny-all ACL по умолчанию
-- `veil-crypto::kdf::derive_push_key(root_key, conversation_id)` — HKDF, domain-separated, детерминирован
-
-**Как отличается от изначальных планов:**
-- Нет WebPush ECDH (`p256dh`/`auth_secret`) — UnifiedPush передаёт raw bytes, WebPush envelope layer тут лишний
-- Только `KindMessage`. `KindCall` / `KindMention` зарезервированы, реализую в Phase 7 и когда дойдём до @-mentions
-- Inner preview ciphertext пока не заполняется сервером — клиент получает wakeup и синкит по `/v1/messages`. K_push cache на стороне sender device откладывается на мобильный клиент
-
-**Phase 4P — Device Push Clients (desktop management готов 2026-07-14; mobile runtime pending):**
-- Desktop: list/add/delete subscriptions реализованы через origin/session-bound
-  Tauri commands. Full endpoint secret принимается только для create и не
-  возвращается в renderer при list; UI показывает безопасный host hint.
-  Enable/disable и DND на 1 час сохраняются сервером; dispatcher получает только
-  active/unmuted projection, поэтому muted endpoint не видит даже timing wake-up.
-- Android: официальный Kotlin connector или проверенный Expo adapter,
-  distributor picker и generic notification listener подключаются вместе с
-  production native crypto/auth/background-sync runtime в Phase 5A.
-- iOS: ntfy iOS app как APNS bridge, App Group для shared keychain между extension и основным приложением
-- Продуктовое решение для Android: UnifiedPush-only либо опциональный FCM wake-up
-  с полностью зашифрованным/нейтральным payload. Транспорт не должен получать
-  текст сообщения, имя отправителя или ключи.
+**Phase 4P — Device Push Clients:**
+- Desktop management готов: list/policy/mute/delete; ручное добавление endpoint
+  удалено, потому что ключевой материал обязан создавать native connector.
+- Android receiver/register lifecycle выполняется после production native
+  crypto/auth/background-sync boundary Phase 5A. Expo dev mock push не получает.
+- iOS APNS extension и App Group остаются отдельным iOS foundation.
+- physical distributor/device matrix обязательна перед production release.
 
 Security disposition и причины, по которым общий server transport key нельзя
 встраивать в клиенты, зафиксированы в
 [`docs/reviews/phase-4p-device-push-client-review.md`](docs/reviews/phase-4p-device-push-client-review.md).
 
 Грабли:
-- iOS App Group keychain: main app + extension обязаны использовать один access group. Без этого extension не расшифрует и будет вечно показывать "New message"
-- Stale endpoints: ntfy может вернуть 410. Dispatcher ловит и прунит строку — это сделано
-- Replay: в envelope есть `msg_id` + monotonic counter per-subscription для дедупликации
-- Mute/DND проверяются SQL projection до dispatcher fan-out (migration 024)
+- VAPID private key должен быть постоянным для deployment и одинаковым на всех
+  gateway replicas; смена ключа требует явной перерегистрации устройств.
+- iOS App Group keychain требует один access group для app + extension.
+- Mute/DND и validation проверяются SQL projection до dispatcher fan-out.
 
 ---
 

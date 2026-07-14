@@ -1,11 +1,8 @@
 -- Phase 4 — UnifiedPush + ntfy push notifications.
 --
--- Each row binds a (user, distributor endpoint URL) pair to which the
--- delivery worker POSTs encrypted envelopes when the user has no live
--- WebSocket session. The endpoint is opaque to us — UnifiedPush spec —
--- so we never store WebPush ECDH material here. Encryption of the
--- payload happens *above* this layer (XChaCha20-Poly1305 with K_push
--- HKDF-derived from the conversation ratchet root, keyed per device).
+-- Historical initial subscription schema. Migration 025 performs the
+-- pre-release hard cutover to RFC 8291 Web Push key material and deletes every
+-- endpoint-only row; this file remains immutable in the ordered chain.
 --
 -- push_kind reserves room for future transports (raw 'webpush', 'apns')
 -- without another migration; the worker dispatches by kind.

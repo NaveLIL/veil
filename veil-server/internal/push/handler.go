@@ -1,24 +1,32 @@
 package push
 
 import (
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"net/url"
 	"strconv"
+	"time"
 	"unicode/utf8"
 
 	"github.com/AegisSec/veil-server/internal/authmw"
 	"github.com/AegisSec/veil-server/internal/db"
 	"github.com/AegisSec/veil-server/internal/publicerr"
+	webpush "github.com/ergochat/webpush-go/v2"
 )
 
 // Handler exposes the REST surface for managing push subscriptions.
 // All routes require a signed request (the existing X-Veil triplet).
 type Handler struct {
-	db     *db.DB
-	mw     *authmw.Middleware
-	rl     *authmw.RateLimit
-	policy *EndpointPolicy
+	db         *db.DB
+	mw         *authmw.Middleware
+	rl         *authmw.RateLimit
+	policy     *EndpointPolicy
+	dispatcher *Dispatcher
 }
 
 // NewHandler builds the handler. mw and rl may be nil to disable
@@ -47,6 +55,8 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	}
 	mux.HandleFunc("POST /v1/push/subscriptions", signed(h.create))
 	mux.HandleFunc("GET /v1/push/subscriptions", signed(h.list))
+	mux.HandleFunc("GET /v1/push/vapid-key", signed(h.vapidKey))
+	mux.HandleFunc("POST /v1/push/subscriptions/{id}/confirm", signed(h.confirm))
 	mux.HandleFunc("DELETE /v1/push/subscriptions/{id}", signed(h.delete))
 	mux.HandleFunc("PATCH /v1/push/subscriptions/{id}/policy", signed(h.updatePolicy))
 }
@@ -55,17 +65,30 @@ type createReq struct {
 	Endpoint    string `json:"endpoint"`
 	DeviceLabel string `json:"device_label,omitempty"`
 	Kind        string `json:"kind,omitempty"`
+	PublicKey   string `json:"p256dh"`
+	AuthSecret  string `json:"auth"`
 }
 
 type subscriptionJSON struct {
-	ID          int64  `json:"id"`
-	Endpoint    string `json:"endpoint"`
-	DeviceLabel string `json:"device_label,omitempty"`
-	Kind        string `json:"kind"`
-	CreatedAt   string `json:"created_at"`
-	LastUsed    string `json:"last_used,omitempty"`
-	Enabled     bool   `json:"enabled"`
-	MutedUntil  string `json:"muted_until,omitempty"`
+	ID             int64  `json:"id"`
+	EndpointOrigin string `json:"endpoint_origin"`
+	DeviceLabel    string `json:"device_label,omitempty"`
+	Kind           string `json:"kind"`
+	CreatedAt      string `json:"created_at"`
+	LastUsed       string `json:"last_used,omitempty"`
+	Enabled        bool   `json:"enabled"`
+	MutedUntil     string `json:"muted_until,omitempty"`
+	Validated      bool   `json:"validated"`
+}
+
+func (h *Handler) SetDispatcher(dispatcher *Dispatcher) { h.dispatcher = dispatcher }
+
+func (h *Handler) vapidKey(w http.ResponseWriter, _ *http.Request) {
+	if h.dispatcher == nil || !h.dispatcher.Enabled() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "push delivery is not configured"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"public_key": h.dispatcher.VAPIDPublicKey()})
 }
 
 func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
@@ -75,7 +98,7 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req createReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodePushJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
@@ -91,7 +114,22 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.Endpoint = endpoint.String()
-	id, err := h.db.CreatePushSubscription(r.Context(), userID, req.Endpoint, req.DeviceLabel, req.Kind)
+	if h.dispatcher == nil || !h.dispatcher.Enabled() {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "push delivery is not configured"})
+		return
+	}
+	tokenBytes := make([]byte, 32)
+	if _, err := rand.Read(tokenBytes); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "create failed"})
+		return
+	}
+	token := base64.RawURLEncoding.EncodeToString(tokenBytes)
+	tokenHash := sha256.Sum256(tokenBytes)
+	id, err := h.db.CreatePushSubscription(r.Context(), userID, db.NewPushSubscription{
+		EndpointURL: req.Endpoint, PublicKey: req.PublicKey, AuthSecret: req.AuthSecret,
+		DeviceLabel: req.DeviceLabel, PushKind: req.Kind,
+		ValidationTokenHash: tokenHash[:], ValidationExpiresAt: time.Now().Add(10 * time.Minute),
+	})
 	if err != nil {
 		if errors.Is(err, db.ErrPushSubscriptionLimit) {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": "push subscription limit reached"})
@@ -100,7 +138,14 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "create failed"})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": id})
+	challengeSub := Subscription{ID: id, UserID: userID, EndpointURL: req.Endpoint,
+		PublicKey: req.PublicKey, AuthSecret: req.AuthSecret, PushKind: req.Kind}
+	if err := h.dispatcher.SendValidationChallenge(r.Context(), challengeSub, token); err != nil {
+		_, _ = h.db.DeletePushSubscription(r.Context(), userID, id)
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": "push channel validation failed"})
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]any{"id": id, "validation_required": true})
 }
 
 func validateSubscriptionRequest(req *createReq) error {
@@ -119,6 +164,12 @@ func validateSubscriptionRequest(req *createReq) error {
 	if req.Kind != "unifiedpush" {
 		return errors.New("unsupported push kind")
 	}
+	if len(req.AuthSecret) != 22 || len(req.PublicKey) != 87 {
+		return errors.New("invalid Web Push key shape")
+	}
+	if _, err := webpush.DecodeSubscriptionKeys(req.AuthSecret, req.PublicKey); err != nil {
+		return errors.New("invalid Web Push subscription keys")
+	}
 	return nil
 }
 
@@ -135,13 +186,19 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	}
 	out := make([]subscriptionJSON, 0, len(rows))
 	for _, r := range rows {
+		endpoint, err := url.Parse(r.EndpointURL)
+		if err != nil || endpoint.Scheme == "" || endpoint.Host == "" {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "list failed"})
+			return
+		}
 		js := subscriptionJSON{
-			ID:          r.ID,
-			Endpoint:    r.EndpointURL,
-			DeviceLabel: r.DeviceLabel,
-			Kind:        r.PushKind,
-			CreatedAt:   r.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
-			Enabled:     r.Enabled,
+			ID:             r.ID,
+			EndpointOrigin: endpoint.Scheme + "://" + endpoint.Host,
+			DeviceLabel:    r.DeviceLabel,
+			Kind:           r.PushKind,
+			CreatedAt:      r.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			Enabled:        r.Enabled,
+			Validated:      r.ValidatedAt != nil,
 		}
 		if r.LastUsed != nil {
 			js.LastUsed = r.LastUsed.UTC().Format("2006-01-02T15:04:05Z")
@@ -152,6 +209,44 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 		out = append(out, js)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"subscriptions": out})
+}
+
+type confirmReq struct {
+	Token string `json:"token"`
+}
+
+func (h *Handler) confirm(w http.ResponseWriter, r *http.Request) {
+	userID := r.Header.Get("X-Veil-User")
+	if userID == "" {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthenticated"})
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid id"})
+		return
+	}
+	var req confirmReq
+	if err := decodePushJSON(w, r, &req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(req.Token)
+	if err != nil || len(raw) != 32 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid validation token"})
+		return
+	}
+	hash := sha256.Sum256(raw)
+	ok, err := h.db.ConfirmPushSubscription(r.Context(), userID, id, hash[:])
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "confirmation failed"})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "validation token rejected or expired"})
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 type policyReq struct {
@@ -183,9 +278,7 @@ func (h *Handler) updatePolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req policyReq
-	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&req); err != nil {
+	if err := decodePushJSON(w, r, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
 		return
 	}
@@ -235,4 +328,16 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+func decodePushJSON(w http.ResponseWriter, r *http.Request, destination any) error {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8<<10))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		return errors.New("request must contain exactly one JSON value")
+	}
+	return nil
 }

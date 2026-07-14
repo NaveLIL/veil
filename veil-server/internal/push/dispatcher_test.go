@@ -3,6 +3,9 @@ package push
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"log/slog"
 	"net/http"
@@ -14,6 +17,7 @@ import (
 	"time"
 
 	pb "github.com/AegisSec/veil-server/pkg/proto/v1"
+	webpush "github.com/ergochat/webpush-go/v2"
 )
 
 type fakeStore struct {
@@ -22,6 +26,30 @@ type fakeStore struct {
 	deleted []string
 	touched []int64
 	listErr error
+}
+
+func testVAPID(t *testing.T) VAPIDConfig {
+	t.Helper()
+	keys, err := webpush.GenerateVAPIDKeys()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return VAPIDConfig{Keys: keys, Subscriber: "mailto:test@veil.invalid"}
+}
+
+func testSubscription(t *testing.T, id int64, userID, endpoint string) Subscription {
+	t.Helper()
+	privateKey, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	auth := make([]byte, 16)
+	if _, err := rand.Read(auth); err != nil {
+		t.Fatal(err)
+	}
+	return Subscription{ID: id, UserID: userID, EndpointURL: endpoint,
+		PublicKey:  base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes()),
+		AuthSecret: base64.RawURLEncoding.EncodeToString(auth), PushKind: "unifiedpush"}
 }
 
 func (f *fakeStore) ListActivePushSubscriptions(ctx context.Context, userID string) ([]Subscription, error) {
@@ -49,7 +77,7 @@ func (f *fakeStore) TouchPushSubscription(ctx context.Context, id int64) error {
 	return nil
 }
 
-func TestDispatcher_DisabledWithoutKey(t *testing.T) {
+func TestDispatcher_DisabledWithoutVAPID(t *testing.T) {
 	d := New(Options{Store: &fakeStore{}})
 	if d.Enabled() {
 		t.Fatal("dispatcher must boot disabled without a transport key")
@@ -58,13 +86,34 @@ func TestDispatcher_DisabledWithoutKey(t *testing.T) {
 	d.NotifyOffline(context.Background(), "user", &pb.Envelope{})
 }
 
+func TestLoadVAPIDConfig_RoundTripAndRejectsPartialConfig(t *testing.T) {
+	privateKey, publicKey, err := GenerateVAPIDPrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("VEIL_PUSH_VAPID_PRIVATE_KEY", privateKey)
+	t.Setenv("VEIL_PUSH_VAPID_SUBJECT", "mailto:ops@veil.invalid")
+	config, err := LoadVAPIDConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Keys == nil || config.Keys.PublicKeyString() != publicKey {
+		t.Fatal("VAPID key changed during configuration roundtrip")
+	}
+
+	t.Setenv("VEIL_PUSH_VAPID_SUBJECT", "")
+	if _, err := LoadVAPIDConfig(); err == nil {
+		t.Fatal("partial VAPID configuration accepted")
+	}
+}
+
 func TestDispatcher_DispatchesToAllSubscriptions(t *testing.T) {
 	var hits atomic.Int32
 	var bodies atomic.Int32
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
-		if r.Header.Get("X-Veil-Push-Version") == "1" {
+		if r.Header.Get("Content-Encoding") == "aes128gcm" && r.Header.Get("Authorization") != "" && r.Header.Get("X-UnifiedPush") == "1" && r.ContentLength == int64(WebPushRecordSize) {
 			bodies.Add(1)
 		}
 		w.WriteHeader(http.StatusOK)
@@ -72,10 +121,7 @@ func TestDispatcher_DispatchesToAllSubscriptions(t *testing.T) {
 	defer srv.Close()
 
 	store := &fakeStore{
-		subs: []Subscription{
-			{ID: 1, UserID: "u1", EndpointURL: srv.URL + "/topic-a", PushKind: "unifiedpush"},
-			{ID: 2, UserID: "u1", EndpointURL: srv.URL + "/topic-b", PushKind: "unifiedpush"},
-		},
+		subs: []Subscription{testSubscription(t, 1, "u1", srv.URL+"/topic-a"), testSubscription(t, 2, "u1", srv.URL+"/topic-b")},
 	}
 	policy, err := NewEndpointPolicy(srv.URL)
 	if err != nil {
@@ -83,8 +129,7 @@ func TestDispatcher_DispatchesToAllSubscriptions(t *testing.T) {
 	}
 	d := New(Options{
 		Store:          store,
-		TransportKey:   make([]byte, MinTransportKeyLen),
-		Salt:           []byte("salt"),
+		VAPID:          testVAPID(t),
 		HTTPClient:     srv.Client(),
 		EndpointPolicy: policy,
 	})
@@ -133,9 +178,7 @@ func TestDispatcher_PrunesGoneEndpoints(t *testing.T) {
 	defer srv.Close()
 
 	store := &fakeStore{
-		subs: []Subscription{
-			{ID: 1, UserID: "u1", EndpointURL: srv.URL + "/dead", PushKind: "unifiedpush"},
-		},
+		subs: []Subscription{testSubscription(t, 1, "u1", srv.URL+"/dead")},
 	}
 	policy, err := NewEndpointPolicy(srv.URL)
 	if err != nil {
@@ -143,7 +186,7 @@ func TestDispatcher_PrunesGoneEndpoints(t *testing.T) {
 	}
 	d := New(Options{
 		Store:          store,
-		TransportKey:   make([]byte, MinTransportKeyLen),
+		VAPID:          testVAPID(t),
 		HTTPClient:     srv.Client(),
 		EndpointPolicy: policy,
 	})
@@ -182,10 +225,8 @@ func TestDispatcher_BoundsConcurrentDeliveryJobs(t *testing.T) {
 		t.Fatal(err)
 	}
 	d := New(Options{
-		Store: &fakeStore{subs: []Subscription{{
-			ID: 1, UserID: "u1", EndpointURL: srv.URL + "/topic", PushKind: "unifiedpush",
-		}}},
-		TransportKey:            make([]byte, MinTransportKeyLen),
+		Store:                   &fakeStore{subs: []Subscription{testSubscription(t, 1, "u1", srv.URL+"/topic")}},
+		VAPID:                   testVAPID(t),
 		HTTPClient:              srv.Client(),
 		EndpointPolicy:          policy,
 		MaxConcurrentDeliveries: 1,
@@ -210,13 +251,13 @@ func TestDispatcher_WarningsNeverLogRawUserID(t *testing.T) {
 	var output bytes.Buffer
 	d := New(Options{
 		Store:                   &fakeStore{listErr: errors.New("database unavailable")},
-		TransportKey:            make([]byte, MinTransportKeyLen),
+		VAPID:                   testVAPID(t),
 		MaxConcurrentDeliveries: 1,
 		Logger:                  slog.New(slog.NewTextHandler(&output, nil)),
 	})
 
 	// The storage-error warning and the overload warning are separate paths.
-	d.deliver(context.Background(), rawUserID, &pb.Envelope{})
+	d.deliver(context.Background(), rawUserID)
 	d.deliverySlots <- struct{}{}
 	d.NotifyOffline(context.Background(), rawUserID, &pb.Envelope{})
 	<-d.deliverySlots
