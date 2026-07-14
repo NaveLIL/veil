@@ -32,10 +32,10 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
    [`docs/reviews/phase-1-4c-completion-gate.md`](docs/reviews/phase-1-4c-completion-gate.md).
 2. Completion gate Phase 4D пройден и опубликован в
    [`docs/reviews/phase-4d-completion-gate.md`](docs/reviews/phase-4d-completion-gate.md).
-3. Выполнить Phase 4E (Veil Spaces Experience) на закрытом desktop/profile и
-   access/crypto фундаменте, не переоткрывая baselines 4A–4D.
-4. Phase 3B (attachment UX) и Phase 4P (device push clients) остаются явными
-   product scopes до beta и не прячутся внутри 4E.
+3. Phase 4E implementation и automated gate выполнены; physical Veil Link /
+   two-device matrix остаётся release evidence и не переоткрывает baselines 4A–4D.
+4. Phase 3B desktop implementation выполнена; physical attachment matrix и
+   mobile часть 4P остаются явными product scopes до beta.
 5. На стабильном desktop/profile фундаменте начать Android foundation (5A),
    после per-device модели подключить боевые сообщения Android (5B).
 6. Затем довести MLS runtime, звонки и release polish.
@@ -52,7 +52,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4B | Desktop UX & Appearance | закрыто: visual/a11y/scale/wallpaper/Windows bundle зелёные |
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
-| 4E | Veil Spaces Experience | запланировано: Home/Circle/Space/Room IA, Veil Link, settings и manual device matrix |
+| 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
 | 5A | Android foundation | визуальный прототип есть, runtime не подключён |
 | 5B | Android messaging | не начато |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
