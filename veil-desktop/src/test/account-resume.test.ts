@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -7,6 +7,17 @@ const mocks = vi.hoisted(() => ({
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
+
+beforeEach(() => {
+  // Keep this renderer-session test independent from the endpoint baked into
+  // a release build. Its native mock authenticates the loopback Node.
+  vi.stubEnv("VITE_VEIL_WS_URL", "ws://127.0.0.1:9080/ws");
+  vi.stubEnv("VITE_VEIL_HTTP_URL", "http://127.0.0.1:9080");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
 
 describe("account renderer session resume", () => {
   it("publishes a fresh UI session after sign-out and reopens the stored identity", async () => {
