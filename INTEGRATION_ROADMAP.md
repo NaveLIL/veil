@@ -265,8 +265,10 @@ authenticated E2E sync; plaintext preview и silent fallback отсутству�
 **Phase 4P — Device Push Clients:**
 - Desktop management готов: list/policy/mute/delete; ручное добавление endpoint
   удалено, потому что ключевой материал обязан создавать native connector.
-- Android receiver/register lifecycle выполняется после production native
-  crypto/auth/background-sync boundary Phase 5A. Expo dev mock push не получает.
+- Android `PushService` boundary реализован: принимает только decrypted 2048-byte
+  wake и bounded account instance, не отдаёт endpoint/payload в JS. Register,
+  signed confirm и bounded sync включаются только после account/origin-bound
+  native auth runtime Phase 5A; до этого они fail closed и dormant.
 - iOS APNS extension и App Group остаются отдельным iOS foundation.
 - physical distributor/device matrix обязательна перед production release.
 
@@ -1159,6 +1161,15 @@ Zustand, а `VeilCrypto` в dev возвращает mock identity/signatures.
   tokens и поведение, а не конкретная CSS-библиотека.
 
 ### Phase 5A — Android foundation
+
+**Foundation checkpoint 2026-07-14: в работе.** Android project теперь
+versioned; Rust/UniFFI воспроизводимо собирается для `arm64-v8a` и `x86_64`.
+Удалён runtime crypto mock и raw sign/AEAD JS surface, release больше не может
+подписываться debug key. Recovery phrase хранится через Android Keystore-wrapped
+AES-GCM vault, backup отключён, secret screens используют `FLAG_SECURE`, copy в
+clipboard удалён и добавлено подтверждение слов. Состояния local identity и
+native failure разделены. Это закрывает первый пункт и часть пунктов 3–5 ниже,
+но не заменяет SQLCipher, lock policy и authenticated mobile runtime.
 
 1. Воспроизводимый Rust build для `arm64-v8a` и `x86_64`, Expo config plugin
    либо versioned native Android project, плюс mobile CI.

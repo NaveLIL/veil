@@ -9,5 +9,5 @@ dist/
 *.orig.*
 web-build/
 ios/
-android/
-src/native/generated/
+# Android contains Veil's security-critical native boundary and is intentionally
+# versioned. Build output and local signing material remain ignored by android/.gitignore.

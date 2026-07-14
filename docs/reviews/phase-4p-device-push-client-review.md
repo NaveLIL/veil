@@ -51,13 +51,19 @@ Android registration/receiver требует production native identity/auth run
 5. generic notification и bounded sync только для текущего native binding;
 6. unregister/cancel при account switch, logout или origin change.
 
-До появления этой native границы Expo dev mock не имеет права регистрировать
-push: он использует фиктивные ключи и не является security boundary.
+Первый Android native checkpoint добавляет versioned Android project и реальный
+`PushService`: он принимает только успешно расшифрованный generic wake ровно
+2048 bytes и bounded account-instance format. Endpoint и wake не передаются в
+JavaScript. Публикация endpoint и запуск sync пока намеренно dormant: без
+account/origin-bound authenticated native session это создало бы substitution
+risk. Expo dev mock по-прежнему не имеет права регистрировать push.
 
 ## Остаток Phase 4P
 
 - server Web Push/VAPID/capability validation: реализовано;
 - desktop policy/device management: реализовано;
-- Android connector receiver: блокируется Phase 5A native crypto/auth runtime;
+- Android connector receiver envelope boundary: реализован и компилируется;
+- Android register/confirm/sync lifecycle: блокируется оставшимся Phase 5A
+  authenticated native runtime;
 - iOS APNS extension/App Group: отдельный iOS foundation;
 - physical distributor/device matrix: обязательна перед production release.
