@@ -68,7 +68,29 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libsecret-1-dev
+          sudo apt-get install -y \
+            libayatana-appindicator3-dev \
+            libsecret-1-dev \
+            libwebkit2gtk-4.1-dev \
+            librsvg2-dev \
+            protobuf-compiler
+          protoc --version
+
+      - name: Install system deps (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install protobuf
+          protoc --version
+
+      - name: Install system deps (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (-not (Get-Command protoc -ErrorAction SilentlyContinue)) {
+            choco install protoc --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          protoc --version
 
       - name: Check formatting
         run: cargo fmt --all -- --check
