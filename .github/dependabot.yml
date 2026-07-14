@@ -4,70 +4,110 @@ updates:
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: monday
+      time: "04:00"
+      timezone: Asia/Yekaterinburg
+    open-pull-requests-limit: 2
     groups:
       actions:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["patch"]
 
   - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: monday
+      time: "04:10"
+      timezone: Asia/Yekaterinburg
+    open-pull-requests-limit: 2
     groups:
       rust:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["patch"]
 
   - package-ecosystem: gomod
     directory: /veil-server
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: monday
+      time: "04:20"
+      timezone: Asia/Yekaterinburg
+    open-pull-requests-limit: 2
     groups:
       go:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["patch"]
 
   - package-ecosystem: npm
     directory: /veil-desktop
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: monday
+      time: "04:30"
+      timezone: Asia/Yekaterinburg
+    open-pull-requests-limit: 2
     groups:
       desktop:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["patch"]
 
   - package-ecosystem: npm
     directory: /veil-mobile
     schedule:
       interval: weekly
-    open-pull-requests-limit: 5
+      day: monday
+      time: "04:40"
+      timezone: Asia/Yekaterinburg
+    open-pull-requests-limit: 2
     groups:
       mobile:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["patch"]
 
   - package-ecosystem: docker
     directory: /veil-server
     schedule:
       interval: weekly
-    open-pull-requests-limit: 3
+      day: monday
+      time: "04:50"
+      timezone: Asia/Yekaterinburg
+    open-pull-requests-limit: 1
     groups:
       gateway-image:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["patch"]
 
   - package-ecosystem: docker-compose
     directory: /
     schedule:
       interval: weekly
-    open-pull-requests-limit: 3
+      day: monday
+      time: "05:00"
+      timezone: Asia/Yekaterinburg
+    open-pull-requests-limit: 1
     groups:
       development-images:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["patch"]
 
   - package-ecosystem: docker-compose
     directory: /deploy
     schedule:
       interval: weekly
-    open-pull-requests-limit: 3
+      day: monday
+      time: "05:10"
+      timezone: Asia/Yekaterinburg
+    open-pull-requests-limit: 1
     groups:
       deployment-images:
+        applies-to: version-updates
         patterns: ["*"]
+        update-types: ["patch"]
