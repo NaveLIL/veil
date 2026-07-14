@@ -3977,6 +3977,61 @@ impl VeilDb {
         Ok(messages)
     }
 
+    /// Read one newest-first page for an origin-scoped in-memory search rebuild.
+    ///
+    /// `local_order` is the SQLite rowid cursor. It gives stable, gap-tolerant
+    /// keyset pagination without OFFSET scans. Callers hold decrypted rows only
+    /// in process memory and apply their own global memory/document budget.
+    pub fn get_search_index_page(
+        &self,
+        canonical_server_origin: &str,
+        before_local_order: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<crate::models::SearchIndexDocument>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        if limit == 0 || limit > 2_048 {
+            return Err("search rebuild page limit must be between 1 and 2048".to_string());
+        }
+        if before_local_order.is_some_and(|cursor| cursor <= 0) {
+            return Err("search rebuild cursor must be positive".to_string());
+        }
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT m.rowid, m.id, m.conversation_id, m.sender_key, m.plaintext,
+                        COALESCE(
+                          m.server_timestamp,
+                          CAST(strftime('%s', m.created_at) AS INTEGER) * 1000
+                        ) AS effective_timestamp
+                 FROM messages AS m
+                 INNER JOIN conversations AS c ON c.id = m.conversation_id
+                 WHERE c.server_origin = ?1
+                   AND (?2 IS NULL OR m.rowid < ?2)
+                   AND m.plaintext <> ''
+                 ORDER BY m.rowid DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| format!("prepare search rebuild page: {e}"))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![canonical_server_origin, before_local_order, limit],
+                |row| {
+                    Ok(crate::models::SearchIndexDocument {
+                        local_order: row.get(0)?,
+                        id: row.get(1)?,
+                        conversation_id: row.get(2)?,
+                        sender_key: row.get(3)?,
+                        plaintext: row.get(4)?,
+                        timestamp: row.get(5)?,
+                    })
+                },
+            )
+            .map_err(|e| format!("query search rebuild page: {e}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("collect search rebuild page: {e}"))
+    }
+
     /// Load one current message row for a RAM search-index hit.
     ///
     /// The index is deliberately not an identity authority. Callers must
@@ -6518,6 +6573,89 @@ mod tests {
             .unwrap();
 
         assert_eq!(name, "Test Group");
+    }
+
+    #[test]
+    fn search_rebuild_page_is_origin_scoped_and_keyset_paginated() {
+        let db = VeilDb::open_memory(&[42u8; 32]).unwrap();
+        db.upsert_directory_conversation(
+            "search-a",
+            1,
+            ORIGIN_A,
+            Some("Alpha"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+        db.upsert_directory_conversation(
+            "search-b",
+            1,
+            ORIGIN_B,
+            Some("Beta"),
+            None,
+            None,
+            None,
+            "2026-07-14T00:00:00Z",
+        )
+        .unwrap();
+
+        db.insert_message(
+            "a-1",
+            "search-a",
+            &[1u8; 32],
+            "oldest",
+            false,
+            Some(1),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            "b-1",
+            "search-b",
+            &[2u8; 32],
+            "other origin",
+            false,
+            Some(2),
+            None,
+        )
+        .unwrap();
+        db.insert_message(
+            "a-2",
+            "search-a",
+            &[1u8; 32],
+            "middle",
+            false,
+            Some(3),
+            None,
+        )
+        .unwrap();
+        db.insert_message("a-empty", "search-a", &[1u8; 32], "", false, Some(4), None)
+            .unwrap();
+        db.insert_message(
+            "a-3",
+            "search-a",
+            &[1u8; 32],
+            "newest",
+            false,
+            Some(5),
+            None,
+        )
+        .unwrap();
+
+        let first = db.get_search_index_page(ORIGIN_A, None, 2).unwrap();
+        assert_eq!(
+            first.iter().map(|row| row.id.as_str()).collect::<Vec<_>>(),
+            vec!["a-3", "a-2"]
+        );
+        assert!(first.iter().all(|row| row.conversation_id == "search-a"));
+        let second = db
+            .get_search_index_page(ORIGIN_A, Some(first[1].local_order), 2)
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].id, "a-1");
+        assert_eq!(second[0].timestamp, 1);
     }
 
     #[test]

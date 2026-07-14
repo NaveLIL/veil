@@ -42,10 +42,45 @@ interface Props {
   onOpenIdentity: (profile: IdentityIslandProfile, returnFocusTo: HTMLElement | null) => void;
 }
 
+interface SearchRebuildReport {
+  indexedMessages: number;
+  indexedSourceBytes: number;
+  maxSourceBytes: number;
+  truncated: boolean;
+  cancelled: boolean;
+}
+
 const portalHost = () =>
   (typeof document !== "undefined" && document.getElementById("island-portal")) || undefined;
 
 const DEBOUNCE_MS = 120;
+const SEARCH_MAX_SOURCE_BYTES = 64 * 1024 * 1024;
+const SEARCH_MAX_DOCUMENTS = 250_000;
+
+function validatedSearchRebuildReport(value: unknown): SearchRebuildReport {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("invalid search rebuild response");
+  }
+  const report = value as Partial<SearchRebuildReport>;
+  const validCount = Number.isSafeInteger(report.indexedMessages)
+    && (report.indexedMessages ?? -1) >= 0
+    && (report.indexedMessages ?? SEARCH_MAX_DOCUMENTS + 1) <= SEARCH_MAX_DOCUMENTS;
+  const validBytes = Number.isSafeInteger(report.indexedSourceBytes)
+    && (report.indexedSourceBytes ?? -1) >= 0
+    && (report.indexedSourceBytes ?? SEARCH_MAX_SOURCE_BYTES + 1) <= SEARCH_MAX_SOURCE_BYTES;
+  if (
+    !validCount
+    || !validBytes
+    || report.maxSourceBytes !== SEARCH_MAX_SOURCE_BYTES
+    || typeof report.truncated !== "boolean"
+    || typeof report.cancelled !== "boolean"
+    || (report.cancelled
+      && (report.indexedMessages !== 0 || report.indexedSourceBytes !== 0 || report.truncated))
+  ) {
+    throw new Error("invalid search rebuild response");
+  }
+  return report as SearchRebuildReport;
+}
 
 function highlight(body: string, query: string) {
   const q = query.trim();
@@ -77,6 +112,7 @@ export const CommandPalette: Component<Props> = (props) => {
   const [active, setActive] = createSignal(0);
   const [loading, setLoading] = createSignal(false);
   const [rebuilding, setRebuilding] = createSignal(false);
+  const [cancelingRebuild, setCancelingRebuild] = createSignal(false);
   const [rebuildMsg, setRebuildMsg] = createSignal<string | null>(null);
   const listboxId = `message-search-${createUniqueId()}`;
 
@@ -189,6 +225,7 @@ export const CommandPalette: Component<Props> = (props) => {
     setActive(0);
     setLoading(false);
     setRebuilding(false);
+    setCancelingRebuild(false);
     setRebuildMsg(null);
     props.onClose();
   });
@@ -283,16 +320,43 @@ export const CommandPalette: Component<Props> = (props) => {
     setRebuilding(true);
     setRebuildMsg(null);
     try {
-      const n = await invoke<number>("rebuild_search_index");
+      const report = validatedSearchRebuildReport(await invoke<unknown>("rebuild_search_index"));
       if (!isUiSessionEpochCurrent(sessionEpoch)) return;
-      setRebuildMsg(`Indexed ${n} message${n === 1 ? "" : "s"}.`);
+      if (report.cancelled) {
+        setRebuildMsg("Rebuild cancelled. The previous complete index was kept.");
+      } else if (report.truncated) {
+        const limitMiB = Math.round(report.maxSourceBytes / (1024 * 1024));
+        setRebuildMsg(
+          `Indexed the newest ${report.indexedMessages.toLocaleString()} messages · ${limitMiB} MiB local limit; older history omitted.`,
+        );
+      } else {
+        setRebuildMsg(
+          `Indexed ${report.indexedMessages.toLocaleString()} message${report.indexedMessages === 1 ? "" : "s"}.`,
+        );
+      }
       if (query().trim()) await runSearch(query());
     } catch (err) {
       if (!isUiSessionEpochCurrent(sessionEpoch)) return;
       console.error("rebuild_search_index failed", err);
       setRebuildMsg("Rebuild failed — see console.");
     } finally {
-      if (isUiSessionEpochCurrent(sessionEpoch)) setRebuilding(false);
+      if (isUiSessionEpochCurrent(sessionEpoch)) {
+        setRebuilding(false);
+        setCancelingRebuild(false);
+      }
+    }
+  };
+
+  const cancelRebuild = async () => {
+    if (!rebuilding() || cancelingRebuild()) return;
+    setCancelingRebuild(true);
+    setRebuildMsg("Cancelling rebuild…");
+    try {
+      await invoke("cancel_search_rebuild");
+    } catch (err) {
+      console.error("cancel_search_rebuild failed", err);
+      setRebuildMsg("Could not cancel the rebuild.");
+      setCancelingRebuild(false);
     }
   };
 
@@ -514,8 +578,8 @@ export const CommandPalette: Component<Props> = (props) => {
                       </span>
                       <button
                         type="button"
-                        onClick={rebuild}
-                        disabled={rebuilding()}
+                        onClick={() => void (rebuilding() ? cancelRebuild() : rebuild())}
+                        disabled={cancelingRebuild()}
                         style={{
                           "margin-top": "4px",
                           display: "inline-flex", "align-items": "center", gap: "6px",
@@ -523,13 +587,13 @@ export const CommandPalette: Component<Props> = (props) => {
                           background: "color-mix(in srgb, var(--veil-accent) 15%, transparent)",
                           color: "var(--veil-accent-hi)",
                           border: "1px solid color-mix(in srgb, var(--veil-accent) 30%, transparent)",
-                          cursor: rebuilding() ? "not-allowed" : "pointer",
+                          cursor: cancelingRebuild() ? "not-allowed" : "pointer",
                           "font-size": "12px", "font-weight": "500",
-                          opacity: rebuilding() ? "0.5" : "1",
+                          opacity: cancelingRebuild() ? "0.5" : "1",
                           transition: "background 0.15s",
                         }}
                         onMouseEnter={(e) => {
-                          if (rebuilding()) return;
+                          if (cancelingRebuild()) return;
                           (e.currentTarget as HTMLElement).style.background = "color-mix(in srgb, var(--veil-accent) 25%, transparent)";
                         }}
                         onMouseLeave={(e) => {
@@ -540,11 +604,10 @@ export const CommandPalette: Component<Props> = (props) => {
                           size={13}
                           style={rebuilding() ? { animation: "spin 1s linear infinite" } : undefined}
                         />
-                        {rebuilding() ? "Rebuilding…" : "Rebuild index"}
+                        {rebuilding()
+                          ? cancelingRebuild() ? "Cancelling…" : "Cancel rebuild"
+                          : "Rebuild index"}
                       </button>
-                      <Show when={rebuildMsg()}>
-                        <span style={{ "font-size": "11px", opacity: "0.8" }}>{rebuildMsg()}</span>
-                      </Show>
                     </Show>
                   </div>
               </Show>
@@ -586,33 +649,52 @@ export const CommandPalette: Component<Props> = (props) => {
                   </IdentityTrigger>
                 )}
               </Show>
+              <Show when={rebuildMsg()} keyed>
+                {(message) => (
+                  <span
+                    role="status"
+                    aria-live="polite"
+                    title={message}
+                    style={{
+                      "margin-left": activeIdentityProfile() ? "0" : "auto",
+                      "max-width": "260px",
+                      overflow: "hidden",
+                      "text-overflow": "ellipsis",
+                      "white-space": "nowrap",
+                      color: "var(--veil-text-muted)",
+                    }}
+                  >
+                    {message}
+                  </span>
+                )}
+              </Show>
               <button
                 type="button"
-                onClick={rebuild}
-                disabled={rebuilding()}
+                onClick={() => void (rebuilding() ? cancelRebuild() : rebuild())}
+                disabled={cancelingRebuild()}
                 style={{
-                  "margin-left": "auto",
+                  "margin-left": rebuildMsg() ? "0" : "auto",
                   display: "inline-flex", "align-items": "center", gap: "4px",
                   background: "transparent", border: "none",
-                  color: "var(--veil-text-faint)", cursor: rebuilding() ? "not-allowed" : "pointer",
+                  color: "var(--veil-text-faint)", cursor: cancelingRebuild() ? "not-allowed" : "pointer",
                   "font-size": "11px",
-                  opacity: rebuilding() ? "0.5" : "1",
+                  opacity: cancelingRebuild() ? "0.5" : "1",
                   transition: "color 0.15s",
                 }}
                 onMouseEnter={(e) => {
-                  if (rebuilding()) return;
+                  if (cancelingRebuild()) return;
                   (e.currentTarget as HTMLElement).style.color = "var(--veil-text)";
                 }}
                 onMouseLeave={(e) => {
                   (e.currentTarget as HTMLElement).style.color = "var(--veil-text-faint)";
                 }}
-                title="Rebuild local search index from DB"
+                title={rebuilding() ? "Cancel local search index rebuild" : "Rebuild local search index from SQLCipher"}
               >
                 <RefreshCw
                   size={11}
                   style={rebuilding() ? { animation: "spin 1s linear infinite" } : undefined}
                 />
-                Rebuild
+                {rebuilding() ? cancelingRebuild() ? "Cancelling…" : "Cancel" : "Rebuild"}
               </button>
             </div>
           </KDialog.Content>

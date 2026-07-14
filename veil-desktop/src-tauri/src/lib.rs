@@ -13,11 +13,11 @@ use veil_client::api::{
     VeilClient,
 };
 use veil_client::connection::ConnectionEvent;
-use veil_search::{Indexer, SearchHit};
+use veil_search::{Indexer, SearchDocument, SearchError, SearchHit};
 use veil_store::keychain;
 use veil_store::models::{
     AccountSnapshot, AccountSnapshotSource, HistoricalAccountContinuity, LocalIdentityVerification,
-    Message, MessageAuthorContext, NetworkProfile, ProfileLocator,
+    Message, MessageAuthorContext, NetworkProfile, ProfileLocator, SearchIndexDocument,
 };
 use zeroize::{Zeroize, Zeroizing};
 
@@ -183,6 +183,10 @@ struct AppState {
     /// Decrypted full-text index kept in process memory only. Rebuilt from the
     /// SQLCipher database after unlock and cleared before key material drops.
     indexer: Arc<Indexer>,
+    /// Monotonic owner of an in-flight search rebuild. Starting another rebuild,
+    /// locking, or changing origin invalidates the previous candidate without
+    /// publishing a partial plaintext index.
+    search_rebuild_generation: AtomicU64,
 }
 
 struct PendingVeilLink {
@@ -1193,6 +1197,9 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
     // The client mutex is the linearization point: operations already holding
     // it finish first; every later operation observes an empty client.
     *state.client.lock().map_err(|e| e.to_string())? = VeilClient::new();
+    state
+        .search_rebuild_generation
+        .fetch_add(1, Ordering::SeqCst);
     state.indexer.clear().map_err(|e| e.to_string())
 }
 
@@ -4746,6 +4753,9 @@ fn connect_to_server(
             .map_err(|e| e.to_string())? = None;
         // The index stores plaintext in process memory and has no origin
         // field. Erase it before authenticating another binding.
+        state
+            .search_rebuild_generation
+            .fetch_add(1, Ordering::SeqCst);
         state.indexer.clear().map_err(|e| e.to_string())?;
     }
     let mut client = state.client.lock().map_err(|e| e.to_string())?;
@@ -10780,6 +10790,21 @@ struct SearchHitDto {
     author: Option<SearchAuthorDto>,
 }
 
+const SEARCH_REBUILD_PAGE_SIZE: u32 = 512;
+const SEARCH_MAX_DOCUMENTS: usize = 250_000;
+const SEARCH_MAX_SOURCE_BYTES: usize = 64 * 1024 * 1024;
+const SEARCH_DOCUMENT_OVERHEAD_BYTES: usize = 64;
+
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SearchRebuildReport {
+    indexed_messages: usize,
+    indexed_source_bytes: usize,
+    max_source_bytes: usize,
+    truncated: bool,
+    cancelled: bool,
+}
+
 fn validated_search_hit_dto(
     hit: SearchHit,
     stored: Message,
@@ -10895,74 +10920,169 @@ fn search_messages(
 #[tauri::command]
 fn clear_search_index(state: State<'_, AppState>) -> Result<(), String> {
     require_unlocked(&state)?;
+    state
+        .search_rebuild_generation
+        .fetch_add(1, Ordering::SeqCst);
     state.indexer.clear().map_err(|e| e.to_string())
 }
 
-fn rebuild_search_index_for_current_origin(state: &AppState) -> Result<usize, String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
+fn search_rebuild_is_current(
+    state: &AppState,
+    generation: u64,
+    session_epoch: u64,
+    binding: &RestBinding,
+) -> bool {
+    state.unlocked.load(Ordering::Acquire)
+        && state.session_epoch.load(Ordering::Acquire) == session_epoch
+        && state.search_rebuild_generation.load(Ordering::Acquire) == generation
+        && state
+            .authenticated_rest_origin
+            .lock()
+            .ok()
+            .and_then(|current| current.clone())
+            .as_ref()
+            == Some(binding)
+}
+
+fn cancelled_search_rebuild_report() -> SearchRebuildReport {
+    SearchRebuildReport {
+        indexed_messages: 0,
+        indexed_source_bytes: 0,
+        max_source_bytes: SEARCH_MAX_SOURCE_BYTES,
+        truncated: false,
+        cancelled: true,
+    }
+}
+
+fn append_bounded_search_document(
+    documents: &mut Vec<SearchDocument>,
+    indexed_source_bytes: &mut usize,
+    row: SearchIndexDocument,
+    max_documents: usize,
+    max_source_bytes: usize,
+) -> Result<bool, String> {
+    if row.sender_key.len() != 32 {
+        return Err("search rebuild encountered an invalid sender key".to_string());
+    }
+    let document_bytes = row
+        .plaintext
+        .len()
+        .saturating_add(row.id.len())
+        .saturating_add(row.conversation_id.len())
+        .saturating_add(row.sender_key.len())
+        .saturating_add(SEARCH_DOCUMENT_OVERHEAD_BYTES);
+    if documents.len() >= max_documents
+        || indexed_source_bytes.saturating_add(document_bytes) > max_source_bytes
+    {
+        return Ok(false);
+    }
+    *indexed_source_bytes = indexed_source_bytes.saturating_add(document_bytes);
+    documents.push(SearchDocument {
+        id: row.id,
+        conversation_id: row.conversation_id,
+        sender: hex::encode(row.sender_key),
+        body: row.plaintext,
+        ts: row.timestamp,
+    });
+    Ok(true)
+}
+
+fn rebuild_search_index_for_current_origin(
+    state: &AppState,
+) -> Result<SearchRebuildReport, String> {
     require_unlocked(state)?;
-    let canonical_server_origin = authenticated_rest_binding(state)?
-        .origin
-        .canonical_server_origin();
+    let binding = authenticated_rest_binding(state)?;
+    let canonical_server_origin = binding.origin.canonical_server_origin();
+    let session_epoch = state.session_epoch.load(Ordering::Acquire);
+    let generation = state
+        .search_rebuild_generation
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
     let client = state.client.lock().map_err(|e| e.to_string())?;
     let db = client.db().ok_or("database not initialized")?;
-    state.indexer.clear().map_err(|e| e.to_string())?;
-    let convs: Vec<_> = db
-        .get_conversations()?
-        .into_iter()
-        .filter(|conversation| {
-            conversation.server_origin.as_deref() == Some(canonical_server_origin.as_str())
-        })
-        .collect();
-    let mut indexed = 0usize;
-    for conv in convs {
-        if let Err(error) = require_session_still_unlocked(state) {
-            let _ = state.indexer.clear();
-            return Err(error);
+    let mut before_local_order = None;
+    let mut documents = Vec::new();
+    let mut indexed_source_bytes = 0usize;
+    let mut truncated = false;
+
+    loop {
+        if !search_rebuild_is_current(state, generation, session_epoch, &binding) {
+            return Ok(cancelled_search_rebuild_report());
         }
-        let msgs = db.get_messages(&conv.id, 100_000)?;
-        for m in msgs {
-            if indexed.is_multiple_of(64) {
-                if let Err(error) = require_session_still_unlocked(state) {
-                    let _ = state.indexer.clear();
-                    return Err(error);
-                }
+        let page = db.get_search_index_page(
+            &canonical_server_origin,
+            before_local_order,
+            SEARCH_REBUILD_PAGE_SIZE + 1,
+        )?;
+        if page.is_empty() {
+            break;
+        }
+        let has_more = page.len() > SEARCH_REBUILD_PAGE_SIZE as usize;
+        for row in page.into_iter().take(SEARCH_REBUILD_PAGE_SIZE as usize) {
+            let local_order = row.local_order;
+            if !append_bounded_search_document(
+                &mut documents,
+                &mut indexed_source_bytes,
+                row,
+                SEARCH_MAX_DOCUMENTS,
+                SEARCH_MAX_SOURCE_BYTES,
+            )? {
+                truncated = true;
+                break;
             }
-            let ts = m.server_timestamp.unwrap_or_else(|| {
-                SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0)
-            });
-            if state
-                .indexer
-                .index_message(
-                    &m.id,
-                    &conv.id,
-                    &hex::encode(&m.sender_key),
-                    &m.plaintext,
-                    ts,
-                )
-                .is_ok()
-            {
-                indexed += 1;
-            }
+            before_local_order = Some(local_order);
+        }
+        if truncated {
+            break;
+        }
+        if !has_more {
+            break;
         }
     }
-    require_session_still_unlocked(state)?;
-    Ok(indexed)
+
+    if !search_rebuild_is_current(state, generation, session_epoch, &binding) {
+        return Ok(cancelled_search_rebuild_report());
+    }
+    match state
+        .indexer
+        .replace_all_in_memory_cancellable(&documents, || {
+            search_rebuild_is_current(state, generation, session_epoch, &binding)
+        }) {
+        Ok(()) => {}
+        Err(SearchError::Cancelled) => return Ok(cancelled_search_rebuild_report()),
+        Err(error) => return Err(format!("replace local search index: {error}")),
+    }
+    if !search_rebuild_is_current(state, generation, session_epoch, &binding) {
+        return Ok(cancelled_search_rebuild_report());
+    }
+    Ok(SearchRebuildReport {
+        indexed_messages: documents.len(),
+        indexed_source_bytes,
+        max_source_bytes: SEARCH_MAX_SOURCE_BYTES,
+        truncated,
+        cancelled: false,
+    })
 }
 
 #[tauri::command]
-fn rebuild_search_index(state: State<'_, AppState>) -> Result<usize, String> {
+fn rebuild_search_index(state: State<'_, AppState>) -> Result<SearchRebuildReport, String> {
     rebuild_search_index_for_current_origin(&state)
 }
 
 /// Rebuild the process-memory-only search index after each unlock.
 #[tauri::command]
-fn ensure_search_backfill(state: State<'_, AppState>) -> Result<usize, String> {
+fn ensure_search_backfill(state: State<'_, AppState>) -> Result<SearchRebuildReport, String> {
     require_unlocked(&state)?;
     rebuild_search_index_for_current_origin(&state)
+}
+
+#[tauri::command]
+fn cancel_search_rebuild(state: State<'_, AppState>) -> Result<(), String> {
+    require_unlocked(&state)?;
+    state
+        .search_rebuild_generation
+        .fetch_add(1, Ordering::SeqCst);
+    Ok(())
 }
 
 // ─── App ──────────────────────────────────────────────
@@ -11092,6 +11212,7 @@ pub fn run() {
                     .build()
                     .expect("reqwest client"),
                 indexer,
+                search_rebuild_generation: AtomicU64::new(0),
             });
             let state = app.state::<AppState>();
             for raw in std::env::args().skip(1) {
@@ -11254,6 +11375,7 @@ pub fn run() {
             clear_search_index,
             rebuild_search_index,
             ensure_search_backfill,
+            cancel_search_rebuild,
             appearance::get_appearance_settings,
             appearance::save_appearance_settings,
             appearance::choose_appearance_wallpaper,
@@ -11319,10 +11441,10 @@ pub fn run() {
 #[cfg(test)]
 mod e2ee_rest_tests {
     use super::{
-        authenticated_event_payload, canonical_profile_version, consume_pending_lock_event,
-        current_target_admission_evidence, exact_confirmed_live_action_binding,
-        invalidate_disconnected_binding, offline_sync_url, parse_device_directory,
-        parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
+        append_bounded_search_document, authenticated_event_payload, canonical_profile_version,
+        consume_pending_lock_event, current_target_admission_evidence,
+        exact_confirmed_live_action_binding, invalidate_disconnected_binding, offline_sync_url,
+        parse_device_directory, parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
         parse_message_crypto_context, parse_network_profile_response, parse_pending_veil_link,
         parse_prekey_bundle, parse_push_subscription_views, pending_veil_link_view,
         preserve_created_group_outcome, proves_future_only_sender_key_history,
@@ -11341,10 +11463,10 @@ mod e2ee_rest_tests {
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
-    use veil_search::SearchHit;
+    use veil_search::{SearchDocument, SearchHit};
     use veil_store::models::{
         AccountSnapshot, AccountSnapshotSource, Message, MessageAuthorContext, MessageStatus,
-        ProfileLocator,
+        ProfileLocator, SearchIndexDocument,
     };
 
     fn authenticated_test_binding(host: &str, generation: u64) -> RestBinding {
@@ -12142,6 +12264,59 @@ mod e2ee_rest_tests {
                 "bindingGeneration": "18446744073709551615",
             })
         );
+    }
+
+    #[test]
+    fn search_rebuild_budget_never_publishes_an_oversized_document_set() {
+        let row = SearchIndexDocument {
+            local_order: 7,
+            id: "m".into(),
+            conversation_id: "c".into(),
+            sender_key: vec![0x11; 32],
+            plaintext: "body".into(),
+            timestamp: 9,
+        };
+        let exact_cost = 1 + 1 + 32 + 4 + 64;
+        let mut documents: Vec<SearchDocument> = Vec::new();
+        let mut bytes = 0;
+        assert!(append_bounded_search_document(
+            &mut documents,
+            &mut bytes,
+            row.clone(),
+            1,
+            exact_cost,
+        )
+        .unwrap());
+        assert_eq!(bytes, exact_cost);
+        assert_eq!(documents.len(), 1);
+        assert!(!append_bounded_search_document(
+            &mut documents,
+            &mut bytes,
+            row,
+            1,
+            exact_cost + 1,
+        )
+        .unwrap());
+        assert_eq!(documents.len(), 1);
+
+        let invalid = SearchIndexDocument {
+            local_order: 8,
+            id: "bad".into(),
+            conversation_id: "c".into(),
+            sender_key: vec![0x22; 31],
+            plaintext: "body".into(),
+            timestamp: 10,
+        };
+        let mut invalid_documents = Vec::new();
+        let mut invalid_bytes = 0;
+        assert!(append_bounded_search_document(
+            &mut invalid_documents,
+            &mut invalid_bytes,
+            invalid,
+            1,
+            1024,
+        )
+        .is_err());
     }
 
     #[test]

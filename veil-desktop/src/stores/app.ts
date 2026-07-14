@@ -1862,11 +1862,9 @@ export const appStore = {
         // client even when a stale Solid signal claimed the old socket was live.
         // ensureConnected coalesces with the chat-screen reconnect effect.
         appStore.ensureConnected();
-        // First-launch backfill of the local search index. Idempotent: backend
-        // marks itself "done" and no-ops on subsequent launches.
-        invoke<number>("ensure_search_backfill")
-          .then((n) => { if (n > 0) console.info(`[search] backfilled ${n} messages`); })
-          .catch((e) => console.warn("ensure_search_backfill failed:", e));
+        // The native authenticated-connect transaction rebuilds the exact
+        // origin-scoped RAM index after offline sync. Do not race it with a
+        // second renderer-owned rebuild while the binding is still changing.
       }, 1500);
     }
     return ok;

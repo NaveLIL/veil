@@ -41,6 +41,10 @@ pub enum SearchError {
     OpenDir(#[from] tantivy::directory::error::OpenDirectoryError),
     #[error("poisoned writer mutex")]
     Poisoned,
+    #[error("search rebuild cancelled")]
+    Cancelled,
+    #[error("atomic replacement is only available for an in-memory index")]
+    PersistentReplaceUnsupported,
 }
 
 pub type Result<T> = std::result::Result<T, SearchError>;
@@ -55,6 +59,17 @@ pub struct SearchHit {
     pub score: f32,
 }
 
+/// One owned document accepted by an atomic in-memory rebuild.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchDocument {
+    pub id: String,
+    pub conversation_id: String,
+    pub sender: String,
+    pub body: String,
+    pub ts: i64,
+}
+
+#[derive(Clone, Copy)]
 struct Fields {
     id: Field,
     conversation: Field,
@@ -65,8 +80,13 @@ struct Fields {
 
 /// Synchronous, thread-safe index handle. Cheap to clone via `Arc`.
 pub struct Indexer {
+    state: Mutex<IndexState>,
+    in_memory: bool,
+}
+
+struct IndexState {
     index: Index,
-    writer: Mutex<IndexWriter>,
+    writer: IndexWriter,
     fields: Fields,
 }
 
@@ -97,13 +117,10 @@ impl Indexer {
     /// on-disk Tantivy index. The desktop rebuilds this index from SQLCipher
     /// after unlock and clears it again when locking.
     pub fn in_memory() -> Result<Self> {
-        let (schema, fields) = build_schema();
-        let index = Index::open_or_create(RamDirectory::create(), schema)?;
-        let writer = index.writer(WRITER_HEAP)?;
+        let state = new_memory_state()?;
         Ok(Self {
-            index,
-            writer: Mutex::new(writer),
-            fields,
+            state: Mutex::new(state),
+            in_memory: true,
         })
     }
 
@@ -117,9 +134,12 @@ impl Indexer {
         let index = Index::open_or_create(tantivy::directory::MmapDirectory::open(path)?, schema)?;
         let writer = index.writer(WRITER_HEAP)?;
         Ok(Self {
-            index,
-            writer: Mutex::new(writer),
-            fields,
+            state: Mutex::new(IndexState {
+                index,
+                writer,
+                fields,
+            }),
+            in_memory: false,
         })
     }
 
@@ -132,25 +152,78 @@ impl Indexer {
         body: &str,
         ts: i64,
     ) -> Result<()> {
-        let mut writer = self.writer.lock().map_err(|_| SearchError::Poisoned)?;
+        let mut state = self.state.lock().map_err(|_| SearchError::Poisoned)?;
+        let fields = state.fields;
         // Delete any prior doc with this id so re-indexing replaces in place.
-        writer.delete_term(Term::from_field_text(self.fields.id, id));
-        writer.add_document(doc!(
-            self.fields.id => id,
-            self.fields.conversation => conversation_id,
-            self.fields.sender => sender,
-            self.fields.body => body,
-            self.fields.ts => ts,
+        state
+            .writer
+            .delete_term(Term::from_field_text(fields.id, id));
+        state.writer.add_document(doc!(
+            fields.id => id,
+            fields.conversation => conversation_id,
+            fields.sender => sender,
+            fields.body => body,
+            fields.ts => ts,
         ))?;
-        writer.commit()?;
+        state.writer.commit()?;
+        Ok(())
+    }
+
+    /// Build a fresh RAM index and publish it in one atomic swap.
+    ///
+    /// Searches continue to use the previous complete snapshot while the new
+    /// candidate is assembled. Cancellation drops the candidate and preserves
+    /// that previous snapshot, so the UI never observes a half-built index.
+    pub fn replace_all_in_memory_cancellable<F>(
+        &self,
+        documents: &[SearchDocument],
+        should_continue: F,
+    ) -> Result<()>
+    where
+        F: Fn() -> bool,
+    {
+        if !self.in_memory {
+            return Err(SearchError::PersistentReplaceUnsupported);
+        }
+        if !should_continue() {
+            return Err(SearchError::Cancelled);
+        }
+
+        let mut candidate = new_memory_state()?;
+        let fields = candidate.fields;
+        for (index, document) in documents.iter().enumerate() {
+            if index.is_multiple_of(64) && !should_continue() {
+                return Err(SearchError::Cancelled);
+            }
+            candidate.writer.add_document(doc!(
+                fields.id => document.id.as_str(),
+                fields.conversation => document.conversation_id.as_str(),
+                fields.sender => document.sender.as_str(),
+                fields.body => document.body.as_str(),
+                fields.ts => document.ts,
+            ))?;
+        }
+        candidate.writer.commit()?;
+        if !should_continue() {
+            return Err(SearchError::Cancelled);
+        }
+
+        let mut current = self.state.lock().map_err(|_| SearchError::Poisoned)?;
+        if !should_continue() {
+            return Err(SearchError::Cancelled);
+        }
+        *current = candidate;
         Ok(())
     }
 
     /// Remove a message from the index.
     pub fn delete(&self, id: &str) -> Result<()> {
-        let mut writer = self.writer.lock().map_err(|_| SearchError::Poisoned)?;
-        writer.delete_term(Term::from_field_text(self.fields.id, id));
-        writer.commit()?;
+        let mut state = self.state.lock().map_err(|_| SearchError::Poisoned)?;
+        let id_field = state.fields.id;
+        state
+            .writer
+            .delete_term(Term::from_field_text(id_field, id));
+        state.writer.commit()?;
         Ok(())
     }
 
@@ -167,12 +240,14 @@ impl Indexer {
         conversation_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<SearchHit>> {
-        let terms = tokenise(&self.index, self.fields.body, query);
+        let state = self.state.lock().map_err(|_| SearchError::Poisoned)?;
+        let fields = state.fields;
+        let terms = tokenise(&state.index, fields.body, query);
         if terms.is_empty() {
             return Ok(Vec::new());
         }
 
-        let reader = self
+        let reader = state
             .index
             .reader_builder()
             .reload_policy(ReloadPolicy::OnCommitWithDelay)
@@ -181,7 +256,7 @@ impl Indexer {
 
         let mut clauses: Vec<(Occur, Box<dyn Query>)> = Vec::with_capacity(terms.len() + 1);
         for t in terms {
-            let term = Term::from_field_text(self.fields.body, &t);
+            let term = Term::from_field_text(fields.body, &t);
             // (term, distance, transposition_cost_one) — distance 0 = pure prefix.
             let q: Box<dyn Query> = Box::new(FuzzyTermQuery::new_prefix(term, 0, true));
             clauses.push((Occur::Must, q));
@@ -190,7 +265,7 @@ impl Indexer {
             clauses.push((
                 Occur::Must,
                 Box::new(TermQuery::new(
-                    Term::from_field_text(self.fields.conversation, conv),
+                    Term::from_field_text(fields.conversation, conv),
                     IndexRecordOption::Basic,
                 )),
             ));
@@ -202,11 +277,11 @@ impl Indexer {
         for (score, addr) in top {
             let doc: tantivy::TantivyDocument = searcher.doc(addr)?;
             hits.push(SearchHit {
-                id: read_str(&doc, self.fields.id),
-                conversation_id: read_str(&doc, self.fields.conversation),
-                sender: read_str(&doc, self.fields.sender),
-                body: read_str(&doc, self.fields.body),
-                ts: read_i64(&doc, self.fields.ts),
+                id: read_str(&doc, fields.id),
+                conversation_id: read_str(&doc, fields.conversation),
+                sender: read_str(&doc, fields.sender),
+                body: read_str(&doc, fields.body),
+                ts: read_i64(&doc, fields.ts),
                 score,
             });
         }
@@ -215,11 +290,27 @@ impl Indexer {
 
     /// Drop every document. Used by "Rebuild index" / "Clear cache" actions.
     pub fn clear(&self) -> Result<()> {
-        let mut writer = self.writer.lock().map_err(|_| SearchError::Poisoned)?;
-        writer.delete_all_documents()?;
-        writer.commit()?;
+        if self.in_memory {
+            let replacement = new_memory_state()?;
+            *self.state.lock().map_err(|_| SearchError::Poisoned)? = replacement;
+            return Ok(());
+        }
+        let mut state = self.state.lock().map_err(|_| SearchError::Poisoned)?;
+        state.writer.delete_all_documents()?;
+        state.writer.commit()?;
         Ok(())
     }
+}
+
+fn new_memory_state() -> Result<IndexState> {
+    let (schema, fields) = build_schema();
+    let index = Index::open_or_create(RamDirectory::create(), schema)?;
+    let writer = index.writer(WRITER_HEAP)?;
+    Ok(IndexState {
+        index,
+        writer,
+        fields,
+    })
 }
 
 fn read_str(doc: &tantivy::TantivyDocument, f: Field) -> String {
@@ -311,5 +402,78 @@ mod tests {
         // Empty / metacharacter-only query yields nothing, not an error.
         assert!(idx.search("", None, 10).unwrap().is_empty());
         assert!(idx.search("***", None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn atomic_rebuild_publishes_complete_snapshot_and_preserves_old_on_cancel() {
+        let idx = Indexer::in_memory().unwrap();
+        idx.index_message("old", "c1", "alice", "previous snapshot", 1)
+            .unwrap();
+
+        let replacement = vec![
+            SearchDocument {
+                id: "new-1".into(),
+                conversation_id: "c1".into(),
+                sender: "bob".into(),
+                body: "fresh searchable body".into(),
+                ts: 2,
+            },
+            SearchDocument {
+                id: "new-2".into(),
+                conversation_id: "c2".into(),
+                sender: "carol".into(),
+                body: "another fresh result".into(),
+                ts: 3,
+            },
+        ];
+        idx.replace_all_in_memory_cancellable(&replacement, || true)
+            .unwrap();
+        assert!(idx.search("previous", None, 10).unwrap().is_empty());
+        assert_eq!(idx.search("fresh", None, 10).unwrap().len(), 2);
+
+        let cancelled = idx.replace_all_in_memory_cancellable(
+            &[SearchDocument {
+                id: "never-published".into(),
+                conversation_id: "c3".into(),
+                sender: "mallory".into(),
+                body: "discarded candidate".into(),
+                ts: 4,
+            }],
+            || false,
+        );
+        assert!(matches!(cancelled, Err(SearchError::Cancelled)));
+        assert!(idx.search("discarded", None, 10).unwrap().is_empty());
+        assert_eq!(idx.search("fresh", None, 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    #[ignore = "manual release-profile performance evidence"]
+    fn measures_large_profile_atomic_rebuild() {
+        let documents = (0..100_000)
+            .map(|index| SearchDocument {
+                id: format!("message-{index}"),
+                conversation_id: format!("conversation-{}", index % 64),
+                sender: format!("sender-{}", index % 128),
+                body: format!(
+                    "searchable synthetic history row {index} {}",
+                    "bounded payload ".repeat(12)
+                ),
+                ts: index,
+            })
+            .collect::<Vec<_>>();
+        let idx = Indexer::in_memory().unwrap();
+        let started = std::time::Instant::now();
+        idx.replace_all_in_memory_cancellable(&documents, || true)
+            .unwrap();
+        let elapsed = started.elapsed();
+        assert!(!idx
+            .search("synthetic history", None, 10)
+            .unwrap()
+            .is_empty());
+        eprintln!(
+            "atomic RAM search rebuild: {} documents in {:.3}s",
+            documents.len(),
+            elapsed.as_secs_f64()
+        );
     }
 }

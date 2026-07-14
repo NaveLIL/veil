@@ -1587,9 +1587,6 @@ const App: Component = () => {
         appStore.setScreen("chat");
         await appStore.loadConversations();
         appStore.connectToServer().catch((e) => console.warn("secure connect failed:", e));
-        invoke<number>("ensure_search_backfill").catch((e) =>
-          console.warn("ensure_search_backfill failed:", e),
-        );
       }
     } catch { appStore.setScreen("onboarding"); }
     await appStore.loadAutoLockSetting().catch((e) =>

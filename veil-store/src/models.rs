@@ -191,6 +191,21 @@ pub struct Message {
     pub attachments: Vec<MessageAttachment>,
 }
 
+/// Minimal decrypted row used to rebuild the process-memory-only search index.
+///
+/// This projection deliberately excludes presentation metadata and attachment
+/// keys. It is read only from SQLCipher while the native session is unlocked
+/// and must never be persisted outside the encrypted database.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchIndexDocument {
+    pub local_order: i64,
+    pub id: String,
+    pub conversation_id: String,
+    pub sender_key: Vec<u8>,
+    pub plaintext: String,
+    pub timestamp: i64,
+}
+
 /// Private attachment state. The renderer receives only presentation fields;
 /// content keys stay in native memory and SQLCipher.
 #[derive(Debug, Clone, Serialize, Deserialize)]

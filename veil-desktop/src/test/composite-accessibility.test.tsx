@@ -222,6 +222,56 @@ describe("composite widget accessibility", () => {
     await waitFor(() => expect(launcher).toHaveFocus());
   });
 
+  it("cancels a local rebuild without presenting a partial index", async () => {
+    let finishRebuild: ((report: {
+      indexedMessages: number;
+      indexedSourceBytes: number;
+      maxSourceBytes: number;
+      truncated: boolean;
+      cancelled: boolean;
+    }) => void) | undefined;
+    invokeMock.mockImplementation(async (command: string) => {
+      if (command === "rebuild_search_index") {
+        return new Promise((resolve) => { finishRebuild = resolve; });
+      }
+      if (command === "cancel_search_rebuild") return undefined;
+      if (command === "search_messages") return [];
+      return undefined;
+    });
+    const Harness = () => {
+      const [open, setOpen] = createSignal(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>Open cancellable search</button>
+          <CommandPalette
+            open={open()}
+            onClose={() => setOpen(false)}
+            onNavigate={() => undefined}
+            onOpenIdentity={() => undefined}
+          />
+          <div id="island-portal" />
+        </>
+      );
+    };
+    render(() => <Harness />);
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Open cancellable search" }));
+    await user.click(screen.getByRole("button", { name: "Rebuild" }));
+    const cancel = await screen.findByRole("button", { name: "Cancel" });
+    await user.click(cancel);
+    expect(invokeMock).toHaveBeenCalledWith("cancel_search_rebuild");
+    finishRebuild?.({
+      indexedMessages: 0,
+      indexedSourceBytes: 0,
+      maxSourceBytes: 64 * 1024 * 1024,
+      truncated: false,
+      cancelled: true,
+    });
+    expect(await screen.findByText("Rebuild cancelled. The previous complete index was kept."))
+      .toBeInTheDocument();
+  });
+
   it("opens only an exact origin-scoped author identity from message search", async () => {
     invokeMock.mockImplementation(async (command: string) => {
       if (command !== "search_messages") return 0;

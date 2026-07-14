@@ -136,6 +136,10 @@ keyboard navigation тестируются. Простые нативные `<bu
 
 ## Phase 2 — Tantivy локальный поиск
 
+**Статус product hardening 2026-07-14: закрыто автоматизированными проверками.**
+Completion evidence и границы RAM-only индекса зафиксированы в
+[`phase-2-search-product-gate.md`](docs/reviews/phase-2-search-product-gate.md).
+
 Полнотекстовый поиск по расшифрованным сообщениям. Индекс живёт только на
 устройстве, на сервер ничего не уходит. Поисковый трафик сервер не видит.
 
@@ -146,15 +150,32 @@ Windows ACL для search-директории и `search/v1`/`search/v2` бол
 
 Схема индекса: `id (STORED)`, `conversation_id (STORED + INDEXED)`, `sender_id (STORED + INDEXED)`, `body (TEXT)`, `timestamp (STORED + FAST для сортировки)`. Токенайзер — стандартный с lowercaser. Для кириллицы в v1 достаточно; multi-language остаётся отдельным улучшением.
 
-Tauri команды: `search_messages`, `rebuild_search_index`, `clear_search_index`, `ensure_search_backfill`. Backfill запускается после unlock, не блокирует UI и может быть безопасно повторён.
+Tauri команды: `search_messages`, `rebuild_search_index`,
+`cancel_search_rebuild`, `clear_search_index`, `ensure_search_backfill`.
+Origin-scoped backfill выполняется после authenticated offline sync и может быть
+безопасно повторён. Ручной rebuild отменяем; кандидат публикуется одной атомарной
+заменой, поэтому поиск видит либо предыдущий полный индекс, либо новый полный
+индекс, но не частично построенный snapshot.
 
 Что надо помнить:
 - Ротация ratchet ключей не требует реиндексации — plaintext не меняется, это важно задокументировать
 - При удалении сообщения надо вызывать `Indexer::delete(id)` — сделано
-- Индекс расходует RAM пропорционально истории. До большой публичной beta нужны лимит памяти, отменяемый rebuild и измерение на крупных профилях.
+- Индекс ограничен одновременно 64 MiB оценённого decrypted source и 250 000
+  новейших непустых сообщений одного exact origin. Это bounded input для
+  Tantivy, а не обещание, что allocator/index overhead равен ровно 64 MiB. При
+  достижении границы UI честно сообщает частичное покрытие старой истории.
+- Rebuild читает SQLCipher newest-first через keyset pagination без старого
+  молчаливого лимита 100 000 сообщений на conversation. Lock, смена account/
+  origin, новый rebuild или явная Cancel инвалидируют candidate до публикации.
+- Воспроизводимый release-profile test на 100 000 synthetic документов прошёл
+  за 0.192 s на текущей Windows-машине 2026-07-14. Это evidence регрессии и
+  bounded pipeline, а не универсальная гарантия времени для любого устройства.
 - Смена схемы означает полный rebuild из SQLCipher; миграция отдельного search-файла не требуется.
 
-Что сделано: crate `veil-search`, подключён в `veil-client::api` в шести местах (outgoing + incoming: insert, edit, delete). UI: `CommandPalette` на Kobalte Dialog + Cmd/Ctrl+K, debounce, inline `<mark>` highlight, клавиатурная навигация.
+Что сделано: crate `veil-search`, подключён в `veil-client::api` в шести местах
+(outgoing + incoming: insert, edit, delete). UI: `CommandPalette` на Kobalte
+Dialog + Cmd/Ctrl+K, debounce, inline `<mark>` highlight, клавиатурная навигация,
+доступная отмена rebuild и валидируемый bounded completion report.
 
 ---
 
