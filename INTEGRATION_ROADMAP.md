@@ -1072,7 +1072,10 @@ commits не являются вложенными фазами.
   только в native volatile memory с коротким TTL и очисткой при replacement/
   cancel/timeout/process exit/successful consumption. Persistence возможна лишь
   через отдельно reviewed OS-sealed storage, но не plaintext config и не
-  renderer state;
+  renderer state. Renderer получает только canonical origin, short selector
+  reference, TTL и независимый random process-local flow nonce. Он не
+  является selector/secret и нужен лишь для атомарной привязки preview,
+  cancel и join к точному pending Link;
 - после unlock link никогда автоматически не выбирает account, не переключает
   Node и не вступает в Space. При отсутствии аккаунта сначала выполняется
   обычный create/restore/auth на exact origin; Veil Link не является enrollment

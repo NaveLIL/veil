@@ -190,6 +190,7 @@ struct AppState {
 }
 
 struct PendingVeilLink {
+    flow_id: [u8; 32],
     canonical_origin: String,
     selector: String,
     secret: Zeroizing<String>,
@@ -259,6 +260,7 @@ struct PendingAttachmentDropView {
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PendingVeilLinkView {
+    flow_id: String,
     canonical_origin: String,
     selector_ref: String,
     expires_in_seconds: u64,
@@ -3549,10 +3551,12 @@ fn canonical_veil_link_origin(raw: &str) -> Result<String, String> {
         }
         _ => return Err("Veil Link origin must use HTTPS".to_string()),
     }
-    Ok(url.origin().ascii_serialization())
+    Ok(rest_origin(&url)?.canonical_server_origin())
 }
 
 fn parse_pending_veil_link(raw: &str, now: Instant) -> Result<PendingVeilLink, String> {
+    use rand::RngCore;
+
     let url = reqwest::Url::parse(raw).map_err(|_| "Veil Link is malformed".to_string())?;
     let (canonical_origin, selector) = match url.scheme() {
         "https" | "http" => {
@@ -3603,7 +3607,10 @@ fn parse_pending_veil_link(raw: &str, now: Instant) -> Result<PendingVeilLink, S
         .filter(|value| !value.contains('&'))
         .ok_or_else(|| "Veil Link secret is missing".to_string())?;
     validate_veil_link_token(fragment)?;
+    let mut flow_id = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut flow_id);
     Ok(PendingVeilLink {
+        flow_id,
         canonical_origin,
         selector,
         secret: Zeroizing::new(fragment.to_string()),
@@ -3615,6 +3622,7 @@ fn pending_veil_link_view(link: &PendingVeilLink, now: Instant) -> PendingVeilLi
     use sha2::{Digest, Sha256};
     let selector_hash = Sha256::digest(link.selector.as_bytes());
     PendingVeilLinkView {
+        flow_id: hex::encode(link.flow_id),
         canonical_origin: link.canonical_origin.clone(),
         selector_ref: hex::encode(&selector_hash[..6]),
         expires_in_seconds: link.expires_at.saturating_duration_since(now).as_secs(),
@@ -3641,6 +3649,17 @@ fn clear_expired_pending_veil_link(state: &AppState, now: Instant) -> Result<(),
     Ok(())
 }
 
+fn require_pending_veil_link_flow(
+    link: &PendingVeilLink,
+    expected_pending_flow_id: &str,
+) -> Result<[u8; 32], String> {
+    let expected = decode_lower_hex_32("pending Veil Link flow id", expected_pending_flow_id)?;
+    if link.flow_id != expected {
+        return Err("pending Veil Link changed before confirmation".to_string());
+    }
+    Ok(expected)
+}
+
 #[tauri::command]
 fn get_pending_veil_link(
     state: State<'_, AppState>,
@@ -3656,9 +3675,20 @@ fn get_pending_veil_link(
 }
 
 #[tauri::command]
-fn cancel_pending_veil_link(state: State<'_, AppState>) -> Result<(), String> {
-    *state.pending_veil_link.lock().map_err(|e| e.to_string())? = None;
-    Ok(())
+fn cancel_pending_veil_link(
+    state: State<'_, AppState>,
+    expected_pending_flow_id: String,
+) -> Result<bool, String> {
+    let expected = decode_lower_hex_32("pending Veil Link flow id", &expected_pending_flow_id)?;
+    let mut pending = state.pending_veil_link.lock().map_err(|e| e.to_string())?;
+    if pending
+        .as_ref()
+        .is_some_and(|link| link.flow_id == expected)
+    {
+        *pending = None;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn offline_sync_url(
@@ -10295,6 +10325,7 @@ fn upsert_channel_overwrite(
 fn preview_invite(
     state: State<'_, AppState>,
     user_id: String,
+    expected_pending_flow_id: String,
     expected_server_origin: String,
     expected_binding_generation: String,
 ) -> Result<serde_json::Value, String> {
@@ -10303,7 +10334,8 @@ fn preview_invite(
         &expected_server_origin,
         &expected_binding_generation,
     )?;
-    let (selector, secret) = pending_veil_link_material(&state, &binding)?;
+    let (_, selector, secret) =
+        pending_veil_link_material(&state, &binding, &expected_pending_flow_id)?;
     state.runtime.block_on(rest_send_json_for_binding(
         &state,
         reqwest::Method::POST,
@@ -10321,6 +10353,7 @@ fn preview_invite(
 fn use_invite(
     state: State<'_, AppState>,
     user_id: String,
+    expected_pending_flow_id: String,
     expected_server_origin: String,
     expected_binding_generation: String,
 ) -> Result<serde_json::Value, String> {
@@ -10329,7 +10362,8 @@ fn use_invite(
         &expected_server_origin,
         &expected_binding_generation,
     )?;
-    let (selector, secret) = pending_veil_link_material(&state, &binding)?;
+    let (flow_id, selector, secret) =
+        pending_veil_link_material(&state, &binding, &expected_pending_flow_id)?;
     let server_http_url = binding.origin.canonical_server_origin();
     let response = state.runtime.block_on(rest_send_json_for_binding(
         &state,
@@ -10342,10 +10376,7 @@ fn use_invite(
     let mut pending = state.pending_veil_link.lock().map_err(|e| e.to_string())?;
     if pending
         .as_ref()
-        .map(|link| {
-            link.canonical_origin == binding.origin.canonical_server_origin()
-                && link.selector == selector
-        })
+        .map(|link| link.flow_id == flow_id)
         .unwrap_or(false)
     {
         *pending = None;
@@ -10356,17 +10387,20 @@ fn use_invite(
 fn pending_veil_link_material(
     state: &AppState,
     binding: &RestBinding,
-) -> Result<(String, Zeroizing<String>), String> {
+    expected_pending_flow_id: &str,
+) -> Result<([u8; 32], String, Zeroizing<String>), String> {
     let now = Instant::now();
     clear_expired_pending_veil_link(state, now)?;
     let pending = state.pending_veil_link.lock().map_err(|e| e.to_string())?;
     let link = pending
         .as_ref()
         .ok_or_else(|| "no pending Veil Link".to_string())?;
+    require_pending_veil_link_flow(link, expected_pending_flow_id)?;
     if link.canonical_origin != binding.origin.canonical_server_origin() {
         return Err("Veil Link belongs to another Veil Node".to_string());
     }
     Ok((
+        link.flow_id,
         link.selector.clone(),
         Zeroizing::new(link.secret.as_str().to_string()),
     ))
@@ -11435,19 +11469,19 @@ mod e2ee_rest_tests {
         parse_message_crypto_context, parse_network_profile_response, parse_pending_veil_link,
         parse_prekey_bundle, parse_push_subscription_views, pending_veil_link_view,
         preserve_created_group_outcome, proves_future_only_sender_key_history,
-        publish_unlocked_session, require_matching_identity_fingerprint, resolve_auto_lock_seconds,
-        rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
-        run_blocking_native_task, valid_auto_lock_seconds, valid_unlock_pin,
-        validate_authenticated_binding_commit, validate_created_dm_account_directory,
-        validate_expected_dm_peer_identity_key, validate_expected_live_action_binding,
-        validate_expected_rest_binding, validate_live_action_rest_origin,
-        validate_live_message_security_context, validate_next_cursor,
-        validate_persisted_message_conversation, validate_pinned_directory_self,
-        validate_profile_avatar_jpeg, validate_rest_url, validate_server_endpoint_pair,
-        validate_utc_rfc3339_nano, validated_search_hit_dto, verify_device_directory_account_keys,
-        AuthenticatedSessionScope, ConversationSyncIsolation, CurrentTargetAdmissionEvidence,
-        ParsedMessageCryptoContext, PinnedDirectoryMember, RestBinding, RestOrigin,
-        DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES,
+        publish_unlocked_session, require_matching_identity_fingerprint,
+        require_pending_veil_link_flow, resolve_auto_lock_seconds, rest_api_url, rest_authority,
+        rest_canonical, rest_origin, rest_request_target, run_blocking_native_task,
+        valid_auto_lock_seconds, valid_unlock_pin, validate_authenticated_binding_commit,
+        validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
+        validate_expected_live_action_binding, validate_expected_rest_binding,
+        validate_live_action_rest_origin, validate_live_message_security_context,
+        validate_next_cursor, validate_persisted_message_conversation,
+        validate_pinned_directory_self, validate_profile_avatar_jpeg, validate_rest_url,
+        validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_hit_dto,
+        verify_device_directory_account_keys, AuthenticatedSessionScope, ConversationSyncIsolation,
+        CurrentTargetAdmissionEvidence, ParsedMessageCryptoContext, PinnedDirectoryMember,
+        RestBinding, RestOrigin, DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES,
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -13368,10 +13402,16 @@ mod e2ee_rest_tests {
             now,
         )
         .unwrap();
-        assert_eq!(parsed.canonical_origin, "https://veil.example");
+        assert_eq!(parsed.canonical_origin, "https://veil.example:443");
         assert_eq!(parsed.selector, selector);
         assert_eq!(parsed.secret.as_str(), secret);
-        let serialized = serde_json::to_string(&pending_veil_link_view(&parsed, now)).unwrap();
+        let view = pending_veil_link_view(&parsed, now);
+        assert_eq!(view.flow_id, hex::encode(parsed.flow_id));
+        assert_eq!(
+            require_pending_veil_link_flow(&parsed, &view.flow_id).unwrap(),
+            parsed.flow_id
+        );
+        let serialized = serde_json::to_string(&view).unwrap();
         assert!(!serialized.contains(&secret));
         assert!(!serialized.contains(&selector));
 
@@ -13381,6 +13421,21 @@ mod e2ee_rest_tests {
         )
         .unwrap();
         assert_eq!(transported.canonical_origin, parsed.canonical_origin);
+        assert_ne!(transported.flow_id, parsed.flow_id);
+        assert_eq!(transported.selector, parsed.selector);
+        let explicit_default_port = parse_pending_veil_link(
+            &format!("https://VEIL.example:443/join/v1/{selector}#s={secret}"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_default_port.canonical_origin,
+            parsed.canonical_origin
+        );
+        assert!(
+            require_pending_veil_link_flow(&parsed, &hex::encode(transported.flow_id)).is_err()
+        );
+        assert!(require_pending_veil_link_flow(&parsed, &view.flow_id.to_uppercase()).is_err());
     }
 
     #[test]

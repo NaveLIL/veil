@@ -1,6 +1,7 @@
 # Phase 4E Veil Link v1 — schema, API, privacy and security review
 
-Status: approved for the pre-release v1 implementation described below.
+Status: approved for the pre-release v1 implementation described below,
+including the process-local consent-flow binding amendment documented here.
 
 Date: 2026-07-14
 
@@ -162,7 +163,12 @@ the user to open the original link in Veil, but cannot join in the browser.
 - Native code may retain at most one pending link in volatile memory for five
   minutes. Replacement, cancel, timeout, lock, account/origin generation change,
   successful consumption and process exit clear it. Renderer state and
-  plaintext config never persist it.
+  plaintext config never persist it. Each staged capability also receives an
+  independent random 256-bit `flow_id`. Renderer IPC may see this opaque nonce
+  together with canonical origin, the 12-hex selector reference and remaining
+  TTL, but never the selector or secret. Preview, cancel and join must present
+  the exact current `flow_id`; replacing the pending capability therefore makes
+  every stale confirmation fail closed even when both Links use the same origin.
 
 ## Required evidence
 
@@ -178,6 +184,9 @@ the user to open the original link in Veil, but cannot join in the browser.
   side effect;
 - native parser rejects origin confusion, redirects, malformed base64url,
   query/userinfo/path variants and stale binding/account transitions;
+- deferred renderer/native tests prove replacement cannot reuse an old preview,
+  cancellation cannot clear a newer flow and session changes suppress late
+  navigation after an irreversible join;
 - logs and browser requests contain no raw secret.
 
 Any change to capability type, limits, URL grammar, disclosed preview fields,

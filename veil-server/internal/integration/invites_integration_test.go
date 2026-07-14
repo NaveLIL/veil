@@ -208,6 +208,101 @@ func TestVeilLinks_SecretExpiryUseAndRevocationAreFailClosed(t *testing.T) {
 	}
 }
 
+func TestVeilLinks_MaxUseAdmissionIsAtomicUnderConcurrency(t *testing.T) {
+	h := New(t)
+	owner := h.CreateUser("veil-link-race-owner")
+	first := h.CreateUser("veil-link-race-first")
+	second := h.CreateUser("veil-link-race-second")
+	spaceID := mkServer(t, h, owner, "Atomic admission")
+	link := createVeilLink(t, h, owner, spaceID, 1)
+	ctx := t.Context()
+
+	start := make(chan struct{})
+	type admissionResult struct {
+		userID  string
+		spaceID string
+		joined  bool
+		err     error
+	}
+	results := make(chan admissionResult, 2)
+	selector := link["public_selector"].(string)
+	secret := link["secret"].(string)
+	for _, user := range []*User{first, second} {
+		go func(candidate *User) {
+			<-start
+			space, joined, err := h.DB.UseInvite(ctx, selector, secret, candidate.ID)
+			admittedSpaceID := ""
+			if space != nil {
+				admittedSpaceID = space.ID
+			}
+			results <- admissionResult{
+				userID: candidate.ID, spaceID: admittedSpaceID, joined: joined, err: err,
+			}
+		}(user)
+	}
+	close(start)
+
+	var winner, loser admissionResult
+	for range 2 {
+		result := <-results
+		if result.err == nil && result.joined {
+			if winner.userID != "" {
+				t.Fatalf("multiple concurrent admissions succeeded: first=%s second=%s", winner.userID, result.userID)
+			}
+			winner = result
+		} else if result.err != nil && !result.joined && result.spaceID == "" {
+			if loser.userID != "" {
+				t.Fatalf("multiple concurrent admissions were rejected: first=%s second=%s", loser.userID, result.userID)
+			}
+			loser = result
+		} else {
+			t.Fatalf("unexpected concurrent admission result for %s: space=%q joined=%v err=%v", result.userID, result.spaceID, result.joined, result.err)
+		}
+	}
+	if winner.userID == "" || loser.userID == "" || winner.spaceID != spaceID {
+		t.Fatalf("concurrent max-use result: winner=%+v loser=%+v want-space=%s", winner, loser, spaceID)
+	}
+
+	repeatedSpace, repeatedJoined, err := h.DB.UseInvite(ctx, selector, secret, winner.userID)
+	if err != nil || repeatedJoined || repeatedSpace == nil || repeatedSpace.ID != spaceID {
+		t.Fatalf("winner repeat was not idempotent: space=%v joined=%v err=%v", repeatedSpace, repeatedJoined, err)
+	}
+	rejectedSpace, rejectedJoined, rejectedErr := h.DB.UseInvite(ctx, selector, secret, loser.userID)
+	if rejectedErr == nil || rejectedJoined || rejectedSpace != nil {
+		t.Fatalf("loser repeat bypassed exhausted admission: space=%v joined=%v err=%v", rejectedSpace, rejectedJoined, rejectedErr)
+	}
+
+	invite, err := h.DB.GetInvite(ctx, selector)
+	if err != nil || invite.Uses != 1 {
+		t.Fatalf("concurrent admission use count: invite=%v err=%v", invite, err)
+	}
+	var winnerMemberships, loserMemberships, winnerRoomRoster, loserRoomRoster, joinedEvents int
+	if err := h.DB.Pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT count(*) FROM server_members
+		   WHERE server_id=$1::uuid AND user_id=$2::uuid),
+		  (SELECT count(*) FROM server_members
+		   WHERE server_id=$1::uuid AND user_id=$3::uuid),
+		  (SELECT count(*) FROM conversation_members member
+		   JOIN channels room ON room.conversation_id=member.conversation_id
+		   WHERE room.server_id=$1::uuid AND member.user_id=$2::uuid),
+		  (SELECT count(*) FROM conversation_members member
+		   JOIN channels room ON room.conversation_id=member.conversation_id
+		   WHERE room.server_id=$1::uuid AND member.user_id=$3::uuid),
+		  (SELECT count(*) FROM veil_link_events
+		   WHERE server_id=$1::uuid AND link_id=$4::uuid AND event_type='joined')`,
+		spaceID, winner.userID, loser.userID, link["id"],
+	).Scan(&winnerMemberships, &loserMemberships, &winnerRoomRoster, &loserRoomRoster, &joinedEvents); err != nil {
+		t.Fatal(err)
+	}
+	if winnerMemberships != 1 || loserMemberships != 0 || winnerRoomRoster != 1 || loserRoomRoster != 0 || joinedEvents != 1 {
+		t.Fatalf(
+			"concurrent admission committed winner-members=%d loser-members=%d winner-room-roster=%d loser-room-roster=%d joined-events=%d",
+			winnerMemberships, loserMemberships, winnerRoomRoster, loserRoomRoster, joinedEvents,
+		)
+	}
+}
+
 func TestVeilLinks_StrictBoundsIdempotenceAndDeletedSpace(t *testing.T) {
 	h := New(t)
 	owner := h.CreateUser("strict-link-owner")

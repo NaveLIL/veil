@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -138,6 +139,42 @@ func TestVeilLinkPortalEscapesAuthoritativeSpaceText(t *testing.T) {
 		!strings.Contains(body, "&lt;script&gt;alert") ||
 		!strings.Contains(body, "&lt;img src=") {
 		t.Fatalf("portal did not preserve escaped text/mark contract: %s", body)
+	}
+}
+
+func TestVeilLinkPortalPreservesBoundedPseudoLocaleTextAndDeclaresWrapContract(t *testing.T) {
+	markSeed := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	name := "[!! " + strings.Repeat("Ž", 46) + " !!]"
+	description := "[!! " + strings.Repeat("Ž", 996) + " !!]"
+	if len([]byte(name)) != 100 || len([]byte(description)) != 2000 {
+		t.Fatalf("test fixture does not exercise exact UTF-8 bounds: name=%d description=%d", len([]byte(name)), len([]byte(description)))
+	}
+	if err := validateServerMetadata(&name, &description, nil); err != nil {
+		t.Fatalf("exact-boundary pseudo-locale metadata was rejected: %v", err)
+	}
+	var output bytes.Buffer
+	if err := veilLinkPortalTemplate.Execute(&output, map[string]string{
+		"MarkSeed": markSeed, "MarkRef": markSeed[:12], "Name": name,
+		"Origin": "https://veil.example", "Description": description,
+		"Expires": "15 Jul 2026 · 07:30 UTC", "Nonce": "AAAAAAAAAAAAAAAAAAAAAAAA",
+	}); err != nil {
+		t.Fatalf("render bounded pseudo-locale portal text: %v", err)
+	}
+	body := output.String()
+	if got := strings.Count(body, name); got != 2 {
+		t.Fatalf("portal rendered the exact-boundary Space name %d times, want 2", got)
+	}
+	if got := strings.Count(body, description); got != 1 {
+		t.Fatalf("portal rendered the exact-boundary Space description %d times, want 1", got)
+	}
+	for selector, pattern := range map[string]string{
+		"Space name":        `(?s)h1\s*\{[^}]*overflow-wrap:\s*anywhere;`,
+		"Space description": `(?s)\.description\s*\{[^}]*white-space:\s*pre-wrap;[^}]*overflow-wrap:\s*anywhere;`,
+		"server origin":     `(?s)\.origin\s*\{[^}]*overflow-wrap:\s*anywhere;`,
+	} {
+		if !regexp.MustCompile(pattern).MatchString(veilLinkPortalHTML) {
+			t.Fatalf("portal lost its %s wrapping declaration", selector)
+		}
 	}
 }
 

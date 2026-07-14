@@ -140,4 +140,119 @@ describe("authenticated event listener boundary", () => {
     await expect(confirmation).resolves.toBe(false);
     resetDecisionDialogsForTests();
   });
+
+  it("retires Room access immediately while a membership refresh republishes a new binding", async () => {
+    vi.resetModules();
+    mocks.handlers.clear();
+    mocks.listen.mockReset();
+    mocks.invoke.mockReset();
+    mocks.listen.mockImplementation(async (event: string, handler: (event: any) => unknown) => {
+      mocks.handlers.set(event, handler);
+      return vi.fn();
+    });
+
+    let connectCalls = 0;
+    let resolveRefresh!: (value: unknown) => void;
+    let markRefreshStarted!: () => void;
+    const refreshStarted = new Promise<void>((resolve) => { markRefreshStarted = resolve; });
+    const refreshResult = new Promise<unknown>((resolve) => { resolveRefresh = resolve; });
+    mocks.invoke.mockImplementation(async (command: string) => {
+      if (command === "connect_to_server") {
+        connectCalls += 1;
+        if (connectCalls === 1) {
+          return {
+            userId: USER_ID,
+            canonicalServerOrigin: "http://127.0.0.1:9080",
+            bindingGeneration: "10",
+          };
+        }
+        markRefreshStarted();
+        return refreshResult;
+      }
+      if (command === "list_channels") {
+        return [{
+          id: "550e8400-e29b-41d4-a716-446655440031",
+          server_id: "550e8400-e29b-41d4-a716-446655440030",
+          conversation_id: "550e8400-e29b-41d4-a716-446655440032",
+          name: "general",
+          channel_type: 0,
+          position: 0,
+        }];
+      }
+      if (
+        command === "get_conversation_crypto_diagnostics"
+        || command === "get_conversations"
+        || command === "get_messages"
+        || command === "get_group_members"
+        || command === "list_servers"
+      ) return [];
+      return undefined;
+    });
+
+    const { appStore } = await import("@/stores/app");
+    await appStore.setupEventListeners();
+    await appStore.connectToServer();
+    const spaceId = "550e8400-e29b-41d4-a716-446655440030";
+    const roomId = "550e8400-e29b-41d4-a716-446655440031";
+    const conversationId = "550e8400-e29b-41d4-a716-446655440032";
+    appStore.setServers([{ id: spaceId, name: "Exact roster", ownerId: USER_ID }]);
+    await appStore.loadChannels(spaceId);
+    appStore.selectServer(spaceId);
+    expect(appStore.workspaceRoute()).toMatchObject({
+      kind: "space",
+      spaceId,
+      roomId,
+      scope: { bindingGeneration: "10" },
+    });
+    expect(appStore.activeConversationId()).toBe(conversationId);
+
+    mocks.handlers.get("veil://membership-refresh-required")?.({
+      event: "veil://membership-refresh-required",
+      id: 2,
+      payload: {
+        serverScopeOrigin: "http://127.0.0.1:9080",
+        serverBindingGeneration: "10",
+      },
+    });
+    await refreshStarted;
+
+    expect(appStore.connected()).toBe(false);
+    expect(appStore.authenticatedServerScope()).toBeNull();
+    expect(appStore.bindingTransitioning()).toBe(true);
+    // Preserve local reading/draft context during a same-origin refresh, but
+    // retire every network mutation until the replacement scope is published.
+    expect(appStore.workspaceRoute()).toMatchObject({ kind: "space", spaceId, roomId });
+    const sendCalls = mocks.invoke.mock.calls.filter(([command]) => command === "send_message").length;
+    await expect(appStore.sendMessage("must stay blocked")).rejects.toThrow(
+      "authenticated server binding is not published",
+    );
+    expect(mocks.invoke.mock.calls.filter(([command]) => command === "send_message")).toHaveLength(sendCalls);
+
+    resolveRefresh({
+      userId: USER_ID,
+      canonicalServerOrigin: "http://127.0.0.1:9080",
+      bindingGeneration: "11",
+    });
+    await vi.waitFor(() => expect(appStore.connected()).toBe(true));
+    expect(appStore.authenticatedServerScope()?.bindingGeneration).toBe("11");
+    expect(appStore.workspaceRoute()).toMatchObject({
+      kind: "home",
+      scope: { bindingGeneration: "11" },
+    });
+    expect(appStore.activeServerId()).toBeNull();
+    expect(appStore.activeChannelId()).toBeNull();
+    expect(appStore.activeConversationId()).toBeNull();
+
+    mocks.handlers.get("veil://membership-refresh-required")?.({
+      event: "veil://membership-refresh-required",
+      id: 3,
+      payload: {
+        serverScopeOrigin: "http://127.0.0.1:9080",
+        serverBindingGeneration: "10",
+      },
+    });
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(connectCalls).toBe(2);
+  });
 });

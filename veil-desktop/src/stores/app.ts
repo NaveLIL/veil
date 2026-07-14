@@ -150,6 +150,7 @@ export interface CreatedVeilLink extends VeilLinkRecord {
 }
 
 export interface PendingVeilLink {
+  flowId: string;
   canonicalOrigin: string;
   selectorRef: string;
   expiresInSeconds: number;
@@ -263,6 +264,41 @@ export function canonicalServerOriginFromHttpUrl(httpRaw: string): string {
   const authority = bareHost.includes(":") ? `[${bareHost}]` : bareHost;
   const port = url.port || (url.protocol === "https:" ? "443" : "80");
   return `${url.protocol}//${authority}:${port}`;
+}
+
+function pendingVeilLinkFromJSON(value: unknown): PendingVeilLink | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const candidate = value as Partial<PendingVeilLink>;
+  if (
+    typeof candidate.flowId !== "string"
+    || !/^[0-9a-f]{64}$/.test(candidate.flowId)
+    || typeof candidate.canonicalOrigin !== "string"
+    || typeof candidate.selectorRef !== "string"
+    || !/^[0-9a-f]{12}$/.test(candidate.selectorRef)
+    || typeof candidate.expiresInSeconds !== "number"
+    || !Number.isSafeInteger(candidate.expiresInSeconds)
+    || candidate.expiresInSeconds < 0
+    || candidate.expiresInSeconds > 5 * 60
+  ) return null;
+  try {
+    const parsed = new URL(candidate.canonicalOrigin);
+    const bareHost = parsed.hostname.replace(/^\[/, "").replace(/\]$/, "").toLowerCase();
+    const loopback = bareHost === "localhost"
+      || bareHost === "127.0.0.1"
+      || bareHost === "::1";
+    if (
+      parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.username
+      || parsed.password
+      || (parsed.protocol === "http:" && !loopback)
+      || canonicalServerOriginFromHttpUrl(candidate.canonicalOrigin) !== candidate.canonicalOrigin
+    ) return null;
+  } catch {
+    return null;
+  }
+  return candidate as PendingVeilLink;
 }
 
 function normalizeServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpoints | null {
@@ -2816,30 +2852,48 @@ export const appStore = {
   },
 
   refreshPendingVeilLink: async (): Promise<PendingVeilLink | null> => {
-    const pending = await invoke<PendingVeilLink | null>("get_pending_veil_link");
+    const value = await invoke<unknown>("get_pending_veil_link");
+    const pending = value === null ? null : pendingVeilLinkFromJSON(value);
+    if (value !== null && !pending) {
+      setPendingVeilLink(null);
+      throw new Error("native pending Veil Link state is invalid");
+    }
     setPendingVeilLink(pending);
     return pending;
   },
 
-  cancelPendingVeilLink: async () => {
-    await invoke("cancel_pending_veil_link");
-    setPendingVeilLink(null);
+  cancelPendingVeilLink: async (expectedPendingFlowId: string): Promise<boolean> => {
+    if (!/^[0-9a-f]{64}$/.test(expectedPendingFlowId)) {
+      throw new Error("pending Veil Link flow id is invalid");
+    }
+    const cleared = await invoke<boolean>("cancel_pending_veil_link", { expectedPendingFlowId });
+    if (cleared && pendingVeilLink()?.flowId === expectedPendingFlowId) {
+      setPendingVeilLink(null);
+    }
+    return cleared;
   },
 
-  previewInvite: async (): Promise<any> => {
+  previewInvite: async (expectedPendingFlowId: string): Promise<any> => {
+    if (!/^[0-9a-f]{64}$/.test(expectedPendingFlowId)) {
+      throw new Error("pending Veil Link flow id is invalid");
+    }
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) throw new Error("No authenticated account for this Veil Node");
     const mutationScope = requirePublishedMutationScope();
     const preview = await invoke("preview_invite", {
       userId: uid,
+      expectedPendingFlowId,
       ...authenticatedMutationScopeArgs(mutationScope),
     });
     requireCurrentMutationScope(sessionEpoch, mutationScope);
     return preview;
   },
 
-  useInvite: async (): Promise<Server | null> => {
+  useInvite: async (expectedPendingFlowId: string): Promise<Server | null> => {
+    if (!/^[0-9a-f]{64}$/.test(expectedPendingFlowId)) {
+      throw new Error("pending Veil Link flow id is invalid");
+    }
     const sessionEpoch = captureUiSessionEpoch();
     const uid = userId();
     if (!uid) return null;
@@ -2847,6 +2901,7 @@ export const appStore = {
     try {
       const s = await invoke<any>("use_invite", {
         userId: uid,
+        expectedPendingFlowId,
         ...authenticatedMutationScopeArgs(mutationScope),
       });
       requireCurrentMutationScope(sessionEpoch, mutationScope);
@@ -2855,7 +2910,9 @@ export const appStore = {
         if (prev.some((p) => p.id === joined.id)) return prev;
         return [...prev, joined];
       });
-      setPendingVeilLink(null);
+      if (pendingVeilLink()?.flowId === expectedPendingFlowId) {
+        setPendingVeilLink(null);
+      }
       return joined;
     } catch (e) {
       rethrowIfStale(e);
@@ -3714,16 +3771,11 @@ export const appStore = {
     });
 
       await register<PendingVeilLink>("veil://pending-link", (event) => {
-        const value = event.payload;
-        if (
-          !value
-          || typeof value.canonicalOrigin !== "string"
-          || typeof value.selectorRef !== "string"
-          || typeof value.expiresInSeconds !== "number"
-        ) return;
+        const value = pendingVeilLinkFromJSON(event.payload);
         setPendingVeilLink(value);
       });
-      setPendingVeilLink(await invoke<PendingVeilLink | null>("get_pending_veil_link"));
+      const pendingValue = await invoke<unknown>("get_pending_veil_link");
+      setPendingVeilLink(pendingValue === null ? null : pendingVeilLinkFromJSON(pendingValue));
       eventListenersInitialized = true;
     } catch (error) {
       for (const unlisten of registered.reverse()) {

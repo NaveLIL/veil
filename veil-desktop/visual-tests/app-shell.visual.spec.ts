@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test";
 
 async function openFixture(
   page: Page,
-  state: "wallpaper" | "members" | "identity" | "identity-avatar" | "focus" | "lock",
+  state: "wallpaper" | "members" | "identity" | "identity-avatar" | "focus" | "lock" | "veil-link-long",
 ) {
   await page.goto(`/visual.html?state=${state}`, { waitUntil: "networkidle" });
   await expect(page.getByTestId("app-shell")).toHaveAttribute("data-visual-state", state);
@@ -387,6 +387,76 @@ test("composer focus ring follows the full composer geometry", async ({ page }) 
   expect(focusStyle.outlineColor).not.toBe("rgba(0, 0, 0, 0)");
 
   await expect(page).toHaveScreenshot("app-shell-composer-focus.png");
+});
+
+test("production Veil Link dialog contains exact-boundary text without trapping its actions", async ({ page }) => {
+  await openFixture(page, "veil-link-long");
+
+  const dialog = page.getByRole("dialog", { name: "Veil Link" });
+  const details = page.getByRole("region", { name: "Veil Link invitation details" });
+  const actions = page.getByRole("group", { name: "Veil Link actions" });
+  const cancel = page.getByRole("button", { name: "Cancel", exact: true });
+  const join = page.getByRole("button", { name: "Join Space", exact: true });
+  const close = page.getByRole("button", { name: "Close Veil Link", exact: true });
+
+  await expect(dialog).toBeVisible();
+  await expect(details).toBeVisible();
+  await expect(actions).toBeVisible();
+  await expect(cancel).toBeVisible();
+  await expect(join).toBeVisible();
+  await expect(join).toBeEnabled();
+  await expect(page.getByText("https://visual.veil.test:443", { exact: true })).toBeVisible();
+  await expect(page.getByText(`Capability ref ${"cd".repeat(6)}`, { exact: true })).toBeVisible();
+  expect(await dialog.evaluate((element) => element.closest("#island-portal") !== null)).toBe(true);
+
+  await dialog.evaluate(async (element) => {
+    await Promise.all(element.getAnimations().map((animation) => animation.finished.catch(() => undefined)));
+  });
+  await expectNoDocumentOverflow(page);
+
+  const viewport = page.viewportSize();
+  expect(viewport).not.toBeNull();
+  const [dialogBox, detailsBox, actionsBox, cancelBox, joinBox] = await Promise.all([
+    dialog.boundingBox(),
+    details.boundingBox(),
+    actions.boundingBox(),
+    cancel.boundingBox(),
+    join.boundingBox(),
+  ]);
+  for (const box of [dialogBox, detailsBox, actionsBox, cancelBox, joinBox]) expect(box).not.toBeNull();
+  if (viewport && dialogBox && detailsBox && actionsBox && cancelBox && joinBox) {
+    for (const box of [dialogBox, actionsBox, cancelBox, joinBox]) {
+      expect(box.x).toBeGreaterThanOrEqual(-1);
+      expect(box.y).toBeGreaterThanOrEqual(-1);
+      expect(box.x + box.width).toBeLessThanOrEqual(viewport.width + 1);
+      expect(box.y + box.height).toBeLessThanOrEqual(viewport.height + 1);
+    }
+    const detailsBottom = detailsBox.y + detailsBox.height;
+    expect(actionsBox.y).toBeGreaterThanOrEqual(detailsBottom - 1);
+    expect(cancelBox.y).toBeGreaterThanOrEqual(detailsBottom - 1);
+    expect(joinBox.y).toBeGreaterThanOrEqual(detailsBottom - 1);
+  }
+
+  const detailsOverflow = await details.evaluate((element) => ({
+    clientWidth: element.clientWidth,
+    scrollWidth: element.scrollWidth,
+    clientHeight: element.clientHeight,
+    scrollHeight: element.scrollHeight,
+  }));
+  expect(detailsOverflow.scrollWidth - detailsOverflow.clientWidth).toBeLessThanOrEqual(1);
+  expect(detailsOverflow.scrollHeight).toBeGreaterThan(detailsOverflow.clientHeight);
+
+  await details.focus();
+  await expect(details).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(cancel).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(join).toBeFocused();
+  await page.keyboard.press("Tab");
+  await expect(close).toBeFocused();
+  expect(await dialog.evaluate((element) => element.contains(document.activeElement))).toBe(true);
+  await page.keyboard.press("Shift+Tab");
+  await expect(join).toBeFocused();
 });
 
 test.describe("LockScreen minimum-window geometry", () => {
