@@ -1113,7 +1113,7 @@ export const SettingsScreen: Component = () => {
             style={S.input}
             value={wsUrl()}
             onInput={(e) => setWsUrl(e.currentTarget.value)}
-            placeholder="wss://secret.erez.pro/ws"
+            placeholder="wss://veil.erez.pro/ws"
           />
         </div>
 
@@ -1123,7 +1123,7 @@ export const SettingsScreen: Component = () => {
             style={S.input}
             value={httpUrl()}
             onInput={(e) => setHttpUrl(e.currentTarget.value)}
-            placeholder="https://secret.erez.pro"
+            placeholder="https://veil.erez.pro"
           />
         </div>
 

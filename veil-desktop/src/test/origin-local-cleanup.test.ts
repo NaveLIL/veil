@@ -157,7 +157,7 @@ describe("origin-local App cleanup", () => {
   it("refreshes only the open exact profile after a newer origin-scoped event", () => {
     const refreshEffect = section(
       "const notice = appStore.profileUpdateNotice()",
-      "createEffect(() => {\n    const conversationId",
+      "const conversationId = conv()?.id;",
     );
     expect(refreshEffect).toContain("canonicalIdentityOrigin(route.profile.canonicalServerOrigin) !== notice.canonicalServerOrigin");
     expect(refreshEffect).toContain("canonicalIdentityUserId(route.profile.userId) !== notice.userId");

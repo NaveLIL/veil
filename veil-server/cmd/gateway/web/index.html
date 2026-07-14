@@ -3,9 +3,9 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta name="description" content="Veil — зашифрованный мессенджер. Крипто в Rust, ключи не выходят из памяти.">
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'">
-  <title>Veil</title>
+  <meta name="description" content="Veil Preview — разрабатываемый E2EE-мессенджер: защищённые чаты, Spaces, профили и локальный поиск.">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'">
+  <title>Veil — Preview</title>
   <style>
     *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
@@ -21,6 +21,7 @@
       --text:          #ededf0;
       --muted:         #7a7a90;
       --green:         #34d399;
+      --amber:         #fbbf24;
       --radius:        14px;
     }
 
@@ -139,7 +140,7 @@
       margin-bottom: 32px;
     }
 
-    .hero-badge span { color: var(--green); font-size: 8px; }
+    .hero-badge span { color: var(--amber); font-size: 8px; }
 
     .hero h1 {
       font-size: clamp(48px, 8vw, 88px);
@@ -210,6 +211,88 @@
       color: var(--text);
       border-color: var(--border-hi);
     }
+
+    /* ─── Honest preview status ────────────────────────── */
+    .project-status {
+      padding: 0 0 80px;
+    }
+
+    .status-intro {
+      background: linear-gradient(135deg, rgba(251, 191, 36, 0.09), rgba(124, 107, 245, 0.07));
+      border: 1px solid rgba(251, 191, 36, 0.24);
+      border-radius: var(--radius);
+      padding: 24px;
+      margin: 28px 0 16px;
+      color: #d8d8e2;
+      font-size: 14px;
+      line-height: 1.65;
+    }
+
+    .status-intro strong { color: var(--amber); }
+
+    .status-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .status-card {
+      background: var(--island);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 24px;
+    }
+
+    .status-card h3 {
+      font-size: 16px;
+      margin: 14px 0 12px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      border-radius: 999px;
+      padding: 4px 9px;
+      font-size: 10px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .status-pill.ready {
+      color: var(--green);
+      background: rgba(52, 211, 153, 0.1);
+      border: 1px solid rgba(52, 211, 153, 0.2);
+    }
+
+    .status-pill.progress {
+      color: var(--amber);
+      background: rgba(251, 191, 36, 0.1);
+      border: 1px solid rgba(251, 191, 36, 0.2);
+    }
+
+    .status-list {
+      list-style: none;
+      display: grid;
+      gap: 11px;
+    }
+
+    .status-list li {
+      position: relative;
+      padding-left: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .status-list li::before {
+      content: '•';
+      position: absolute;
+      left: 2px;
+      color: var(--primary);
+    }
+
+    .status-card.progress .status-list li::before { color: var(--amber); }
+    .status-list strong { color: var(--text); font-weight: 600; }
 
     /* ─── Section header ───────────────────────────────── */
     .section-label {
@@ -526,6 +609,9 @@
       .hero { padding: 70px 0 60px; }
       .hero h1 { font-size: 52px; }
       nav { flex-wrap: wrap; gap: 16px; }
+      .nav-links { width: 100%; justify-content: space-between; gap: 12px; }
+      .nav-links a { font-size: 12px; }
+      .status-grid { grid-template-columns: 1fr; }
       .download-note { flex-direction: column; }
       footer { flex-direction: column; }
     }
@@ -543,6 +629,7 @@
         <span class="logo-text">Veil</span>
       </a>
       <div class="nav-links">
+        <a href="#status">Статус</a>
         <a href="#features">Возможности</a>
         <a href="#crypto">Крипто</a>
         <a href="#download">Скачать</a>
@@ -552,30 +639,72 @@
     <!-- Hero -->
     <section class="hero">
       <div class="hero-badge">
-        <span>●</span> MIT License · Open Source
+        <span>●</span> PRE-RELEASE · активная разработка
       </div>
       <h1>Veil</h1>
       <p>
-        E2EE мессенджер. <strong>Вся крипто в Rust</strong> —
-        ключи не пересекают FFI-границу, не оседают в JS heap,
-        не видны серверу. Никогда.
+        Desktop-клиент и self-hosted Veil Node находятся в активной разработке.
+        <strong>Защищённые чаты, Spaces, профили и локальный поиск уже работают.</strong>
+        Мобильные клиенты, звонки и стабильный подписанный релиз ещё готовятся.
       </p>
       <div class="hero-actions">
         <a href="#download" class="btn btn-primary">
-          Скачать
+          Скачать Preview
         </a>
-        <a href="#crypto" class="btn btn-ghost">
-          Как устроено
+        <a href="#status" class="btn btn-ghost">
+          Что уже готово
         </a>
       </div>
     </section>
 
+    <!-- Project status -->
+    <section class="project-status" id="status">
+      <div class="section-label">Статус проекта</div>
+      <div class="section-title">Рабочий preview, не финальный продукт</div>
+      <div class="section-sub">Ниже — состояние текущего кода, а не список обещаний.</div>
+
+      <div class="status-intro">
+        <strong>Важно:</strong> Veil ещё не проходил независимый криптографический аудит и не выпускался как
+        стабильный подписанный продукт. Preview подходит для тестирования и обратной связи; совместимость данных
+        и протокола до stable-релиза может меняться.
+      </div>
+
+      <div class="status-grid">
+        <article class="status-card">
+          <span class="status-pill ready">Уже реализовано</span>
+          <h3>Что можно тестировать сейчас</h3>
+          <ul class="status-list">
+            <li><strong>Direct, Circle и текстовые Rooms:</strong> X3DH, Double Ratchet и authenticated Sender Keys.</li>
+            <li><strong>Desktop:</strong> друзья, личные диалоги, ответы, редактирование, удаление и реакции.</li>
+            <li><strong>Spaces:</strong> Rooms, участники, роли, ACL, приглашения и Veil Link.</li>
+            <li><strong>Локальные данные:</strong> SQLCipher, OS Keychain, offline queue и поиск Tantivy только в памяти.</li>
+            <li><strong>Профили и идентичность:</strong> аватары, Phaseprint и локальное сравнение fingerprint.</li>
+            <li><strong>Файловое ядро:</strong> шифрование до отправки, resume и чанки для файлов до 2 ГБ.</li>
+          </ul>
+        </article>
+
+        <article class="status-card progress">
+          <span class="status-pill progress">Ещё в работе</span>
+          <h3>Чего пока нет в stable-качестве</h3>
+          <ul class="status-list">
+            <li><strong>Публичные пакеты:</strong> свежий Linux CI готовится к первому релизу; Windows требует подпись.</li>
+            <li><strong>Mobile:</strong> Android пока foundation/prototype; production messaging, iOS и macOS-релизы не готовы.</li>
+            <li><strong>Звонки:</strong> голос и видео ещё не реализованы как пользовательская функция.</li>
+            <li><strong>Физические матрицы:</strong> multi-device и полный upload/download/tamper/resume gate ещё закрываются.</li>
+            <li><strong>Release hardening:</strong> независимый аудит и воспроизводимая сборка остаются до stable.</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <div class="divider"></div>
+
     <!-- Features -->
     <section class="features" id="features">
       <div class="features-header">
-        <div class="section-label">Возможности</div>
-        <div class="section-title">Построен правильно с нуля</div>
-        <div class="section-sub">Переписан после того, как предыдущий вырос до 22k LOC монолита с криптой на TweetNaCl в JS.</div>
+        <div class="section-label">Реализовано в Preview</div>
+        <div class="section-title">Что уже есть в текущем коде</div>
+        <div class="section-sub">Рабочие подсистемы с честно обозначенными release-ограничениями.</div>
       </div>
 
       <div class="features-grid">
@@ -583,22 +712,22 @@
         <div class="feature-card">
           <div class="feature-icon">🔐</div>
           <h3>End-to-end шифрование</h3>
-          <p>X3DH для установки сессии, Double Ratchet для forward secrecy, Sender Keys для больших групп. Всё как у Signal — только в Rust.</p>
+          <p>X3DH устанавливает Direct-сессию, Double Ratchet обновляет ключи, authenticated Sender Keys защищают Circle и текстовые Rooms.</p>
           <span class="tag">XChaCha20-Poly1305</span>
         </div>
 
         <div class="feature-card">
           <div class="feature-icon">🦀</div>
           <h3>Крипто только в Rust</h3>
-          <p>Ни одной криптографической операции в JS или TypeScript. UI получает plaintext и метаданные — больше ничего. mlock() для страниц с ключами, zeroize on drop.</p>
+          <p>Приватные ключи и E2EE state остаются в native-ядре. Recovery phrase показывается в UI только во время явного onboarding или после PIN re-authentication.</p>
           <span class="tag">native FFI</span>
         </div>
 
         <div class="feature-card">
           <div class="feature-icon">📱</div>
-          <h3>Desktop + Mobile</h3>
-          <p>Tauri v2 для десктопа, React Native для мобильного. Единое ядро на Rust через UniFFI bidings для Kotlin и Swift.</p>
-          <span class="tag">Tauri · Expo</span>
+          <h3>Desktop + mobile foundation</h3>
+          <p>Tauri v2 desktop-клиент уже работает. Android-проект и UniFFI boundary существуют как foundation, но production mobile messaging ещё не готов.</p>
+          <span class="tag">Tauri · Android foundation</span>
         </div>
 
         <div class="feature-card">
@@ -610,16 +739,16 @@
 
         <div class="feature-card">
           <div class="feature-icon">📁</div>
-          <h3>Файлы до 2 ГБ</h3>
-          <p>tus.io resumable загрузки. Файл шифруется до отправки — chunked AEAD с привязкой каждого чанка к индексу и финальному флагу. Сервер хранит opaque blob.</p>
-          <span class="tag">chunked AEAD</span>
+          <h3>Зашифрованные файлы</h3>
+          <p>tus resume и chunked AEAD до 2 ГБ существенно реализованы. Полная физическая матрица upload/download/tamper/resume ещё входит в preview gate.</p>
+          <span class="tag">core готов · gate в работе</span>
         </div>
 
         <div class="feature-card">
           <div class="feature-icon">🔔</div>
-          <h3>Push без FCM</h3>
-          <p>UnifiedPush + self-hosted ntfy. Payload зашифрован, заполнен до 2 КБ, с jitter задержкой. Ntfy-оператор видит только размер и тайминг.</p>
-          <span class="tag">UnifiedPush · ntfy</span>
+          <h3>Push transport core</h3>
+          <p>Зашифрованный wake-up transport и self-hosted ntfy реализованы. Полный native device lifecycle остаётся частью mobile gate.</p>
+          <span class="tag">UnifiedPush · mobile gate</span>
         </div>
 
         <div class="feature-card">
@@ -631,9 +760,9 @@
 
         <div class="feature-card">
           <div class="feature-icon">🔗</div>
-          <h3>Secure Share</h3>
-          <p>Ссылки с TTL и счётчиком просмотров. Расшифровка происходит прямо в браузере через минимальный WASM-модуль (~50 KB). Сервер не видит ключ.</p>
-          <span class="tag">WASM · Argon2id</span>
+          <h3>Профили и идентичность</h3>
+          <p>Версионированные профили, безопасный avatar pipeline, Phaseprint и явное локальное сравнение fingerprint без превращения профиля в trust-сигнал.</p>
+          <span class="tag">Phaseprint · fingerprint</span>
         </div>
 
       </div>
@@ -715,8 +844,12 @@
             <span class="value">chunked AEAD</span>
           </div>
           <div class="crypto-row">
-            <span class="name">Сервер видит</span>
-            <span class="value">только ciphertext</span>
+            <span class="name">Содержимое для сервера</span>
+            <span class="value">ciphertext</span>
+          </div>
+          <div class="crypto-row">
+            <span class="name">Routing metadata</span>
+            <span class="value">sizes · timing · membership</span>
           </div>
         </div>
       </div>
@@ -726,55 +859,57 @@
 
     <!-- Download -->
     <section class="downloads" id="download">
-      <div class="section-label">Скачать</div>
-      <div class="section-title">Клиенты</div>
-      <div class="section-sub">Linux уже готов. Остальные платформы — на подходе.</div>
+      <div class="section-label">Тестовые сборки</div>
+      <div class="section-title">Скачать Veil Preview</div>
+      <div class="section-sub" id="release-status" aria-live="polite">
+        Проверенных preview-сборок пока нет. Они появятся здесь после первого успешного release gate.
+      </div>
 
-      <div class="platform-grid">
-        <a class="platform-card" href="/downloads/Veil_0.1.0_amd64.deb" download>
-          <span class="ready-badge">.deb</span>
+      <div class="platform-grid" id="release-grid">
+        <div class="platform-card wip">
+          <span class="wip-badge">нет preview</span>
           <div class="plat-icon">🐧</div>
           <div class="plat-name">Linux · Debian/Ubuntu</div>
-          <div class="plat-sub">Veil_0.1.0_amd64.deb · ~13&nbsp;МБ</div>
-        </a>
+          <div class="plat-sub">.deb</div>
+        </div>
 
-        <a class="platform-card" href="/downloads/Veil_0.1.0_amd64.AppImage" download>
-          <span class="ready-badge">AppImage</span>
+        <div class="platform-card wip">
+          <span class="wip-badge">нет preview</span>
           <div class="plat-icon">🐧</div>
           <div class="plat-name">Linux · универсально</div>
-          <div class="plat-sub">Veil_0.1.0_amd64.AppImage · ~113&nbsp;МБ</div>
-        </a>
-
-        <div class="platform-card wip">
-          <span class="wip-badge">в разработке</span>
-          <div class="plat-icon">🍎</div>
-          <div class="plat-name">macOS</div>
-          <div class="plat-sub">.dmg · Apple Silicon</div>
+          <div class="plat-sub">AppImage</div>
         </div>
 
         <div class="platform-card wip">
-          <span class="wip-badge">в разработке</span>
+          <span class="wip-badge">нет preview</span>
           <div class="plat-icon">🪟</div>
           <div class="plat-name">Windows</div>
-          <div class="plat-sub">.msi · x64</div>
+          <div class="plat-sub">подписанный installer · x64</div>
         </div>
 
         <div class="platform-card wip">
-          <span class="wip-badge">в разработке</span>
+          <span class="wip-badge">пока недоступно</span>
+          <div class="plat-icon">🍎</div>
+          <div class="plat-name">macOS</div>
+          <div class="plat-sub">ожидает подпись и notarization</div>
+        </div>
+
+        <div class="platform-card wip">
+          <span class="wip-badge">пока недоступно</span>
           <div class="plat-icon">📱</div>
           <div class="plat-name">Android</div>
-          <div class="plat-sub">APK · без FCM</div>
+          <div class="plat-sub">ожидает mobile release gate</div>
         </div>
       </div>
 
       <div class="download-note">
-        <div class="note-icon">🔐</div>
+        <div class="note-icon">🧪</div>
         <div>
-          <h3>Проверка целостности</h3>
+          <h3>Preview и проверка целостности</h3>
           <p>
-            SHA-256 хеши для всех релизов лежат рядом с бинарями:
-            <a href="/downloads/SHA256SUMS" style="color: var(--primary);">SHA256SUMS</a>.
-            Для macOS, Windows и Android сборки появятся по мере готовности.
+            Это тестовые сборки, а не stable-релиз. CI формирует SHA-256 хеши рядом с бинарями.
+            <a id="release-checksums" href="/downloads/SHA256SUMS" style="color: var(--primary);" hidden>Проверить SHA256SUMS.</a>
+            До stable сохраняйте recovery phrase офлайн; macOS и Android появятся только после подписи и отдельной проверки платформы.
           </p>
         </div>
       </div>
@@ -784,7 +919,7 @@
 
     <!-- Footer -->
     <footer>
-      <div class="copy">Veil · MIT License · 2025–2026 · сервер в Финляндии</div>
+      <div class="copy">Veil Preview · MIT License · 2025–2026 · активная разработка</div>
       <div class="links">
         <a href="/privacy">Конфиденциальность</a>
         <a href="/terms">Условия</a>
@@ -793,5 +928,117 @@
     </footer>
 
   </div><!-- .page -->
+  <script>
+    (() => {
+      const descriptors = [
+        { platform: "linux", kind: "deb", badge: ".deb", icon: "🐧", name: "Linux · Debian/Ubuntu" },
+        { platform: "linux", kind: "appimage", badge: "AppImage", icon: "🐧", name: "Linux · универсально" },
+        { platform: "windows", kind: "exe", badge: ".exe", icon: "🪟", name: "Windows · installer" },
+        { platform: "windows", kind: "msi", badge: ".msi", icon: "🪟", name: "Windows · MSI" },
+        { platform: "macos", kind: "dmg", badge: ".dmg", icon: "🍎", name: "macOS" },
+        { platform: "android", kind: "apk", badge: ".apk", icon: "📱", name: "Android" },
+      ];
+      const filenamePattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/;
+      const versionPattern = /^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$/;
+      const platformHint = `${(navigator.userAgentData && navigator.userAgentData.platform) || ""} ${navigator.platform || ""} ${navigator.userAgent || ""}`.toLowerCase();
+      const isIOS = /iphone|ipad|ipod/.test(platformHint);
+      let preferredPlatform = "";
+      if (platformHint.includes("android")) preferredPlatform = "android";
+      else if (!isIOS && platformHint.includes("win")) preferredPlatform = "windows";
+      else if (!isIOS && platformHint.includes("linux")) preferredPlatform = "linux";
+      else if (!isIOS && platformHint.includes("mac")) preferredPlatform = "macos";
+      const orderedDescriptors = [...descriptors].sort((left, right) =>
+        Number(right.platform === preferredPlatform) - Number(left.platform === preferredPlatform)
+      );
+      const grid = document.getElementById("release-grid");
+      const status = document.getElementById("release-status");
+      const checksums = document.getElementById("release-checksums");
+
+      const formatBytes = (raw) => {
+        const bytes = Number(raw);
+        if (!Number.isSafeInteger(bytes) || bytes < 0) return "размер указан в SHA256SUMS";
+        const units = ["Б", "КБ", "МБ", "ГБ"];
+        let value = bytes;
+        let unit = 0;
+        while (value >= 1024 && unit < units.length - 1) {
+          value /= 1024;
+          unit += 1;
+        }
+        return `${value.toFixed(unit === 0 ? 0 : 1)} ${units[unit]}`;
+      };
+
+      const releaseCard = (descriptor, file) => {
+        const card = document.createElement("a");
+        card.className = "platform-card";
+        card.href = `/downloads/${encodeURIComponent(file.filename)}`;
+        card.setAttribute("download", "");
+
+        const badge = document.createElement("span");
+        badge.className = "ready-badge";
+        badge.textContent = descriptor.platform === preferredPlatform
+          ? `${descriptor.badge} · preview · рекомендуется`
+          : `${descriptor.badge} · preview`;
+        const icon = document.createElement("div");
+        icon.className = "plat-icon";
+        icon.textContent = descriptor.icon;
+        const name = document.createElement("div");
+        name.className = "plat-name";
+        name.textContent = descriptor.name;
+        const detail = document.createElement("div");
+        detail.className = "plat-sub";
+        detail.textContent = `${file.filename} · ${formatBytes(file.size)}`;
+        card.append(badge, icon, name, detail);
+        return card;
+      };
+
+      const pendingCard = (descriptor) => {
+        const card = document.createElement("div");
+        card.className = "platform-card wip";
+        const badge = document.createElement("span");
+        badge.className = "wip-badge";
+        badge.textContent = "пока недоступно";
+        const icon = document.createElement("div");
+        icon.className = "plat-icon";
+        icon.textContent = descriptor.icon;
+        const name = document.createElement("div");
+        name.className = "plat-name";
+        name.textContent = descriptor.name;
+        const detail = document.createElement("div");
+        detail.className = "plat-sub";
+        detail.textContent = `${descriptor.badge} · ожидает сборку и проверку`;
+        card.append(badge, icon, name, detail);
+        return card;
+      };
+
+      fetch("/downloads/latest.json", { cache: "no-store", credentials: "omit" })
+        .then((response) => {
+          if (!response.ok) throw new Error("release manifest unavailable");
+          return response.json();
+        })
+        .then((manifest) => {
+          if (!manifest || !versionPattern.test(manifest.version) || !Array.isArray(manifest.files)) {
+            throw new Error("invalid release manifest");
+          }
+          const files = manifest.files.filter((file) => file && filenamePattern.test(file.filename));
+          let available = 0;
+          const cards = orderedDescriptors.map((descriptor) => {
+            const file = files.find((candidate) =>
+              candidate.platform === descriptor.platform && candidate.kind === descriptor.kind
+            );
+            if (!file) return pendingCard(descriptor);
+            available += 1;
+            return releaseCard(descriptor, file);
+          });
+          if (available === 0) throw new Error("release has no supported files");
+          grid.replaceChildren(...cards);
+          status.textContent = `Veil Preview ${manifest.version}. Это тестовая сборка; карточки обновляются автоматически после release gate.`;
+          checksums.hidden = false;
+        })
+        .catch(() => {
+          // The static fallback is intentionally honest: no manifest means no
+          // release card and therefore no link that can silently become a 404.
+        });
+    })();
+  </script>
 </body>
 </html>

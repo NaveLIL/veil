@@ -274,6 +274,7 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+	mux.HandleFunc("GET /readyz", readinessHandler(database.Pool))
 
 	// W4 — Prometheus exposition endpoint moves to a separate internal-only
 	// listener bound to VEIL_INTERNAL_ADDR (default 127.0.0.1:9090). The
@@ -292,11 +293,16 @@ func main() {
 	}
 	publicHandler := http.HandlerFunc(preAuthRL.Wrap(mux.ServeHTTP))
 	server := &http.Server{
-		Addr:         ":" + cfg.Port,
-		Handler:      httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(corsOrigins), httpmw.AccessLog(slog.Default()))(publicHandler),
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
-		IdleTimeout:  60 * time.Second,
+		Addr:              ":" + cfg.Port,
+		Handler:           httpmw.Chain(httpmw.SecurityHeaders, httpmw.CORS(corsOrigins), httpmw.AccessLog(slog.Default()))(publicHandler),
+		ReadHeaderTimeout: 10 * time.Second,
+		// Encrypted tus chunks and large signed REST responses must not be cut
+		// off by the old 15-second whole-request deadline. HeaderTimeout keeps
+		// the slowloris boundary tight while body I/O gets the same bounded
+		// window as the production reverse proxy.
+		ReadTimeout:  time.Hour,
+		WriteTimeout: time.Hour,
+		IdleTimeout:  90 * time.Second,
 	}
 
 	log.Printf("veil-gateway starting on :%s", cfg.Port)
@@ -340,6 +346,26 @@ func main() {
 	server.Shutdown(shutdownCtx)
 	if internalSrv != nil {
 		internalSrv.Shutdown(shutdownCtx)
+	}
+}
+
+type pinger interface {
+	Ping(context.Context) error
+}
+
+func readinessHandler(database pinger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Cache-Control", "no-store")
+		if err := database.Ping(ctx); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"status":"unavailable"}`))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ready"}`))
 	}
 }
 

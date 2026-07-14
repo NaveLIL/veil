@@ -1,9 +1,9 @@
 Contact: mailto:security@erez.pro
 Expires: 2027-04-24T00:00:00.000Z
 Preferred-Languages: ru, en
-Canonical: https://secret.erez.pro/.well-known/security.txt
-Policy: https://secret.erez.pro/terms
-Acknowledgments: https://secret.erez.pro/
+Canonical: https://veil.erez.pro/.well-known/security.txt
+Policy: https://veil.erez.pro/terms
+Acknowledgments: https://veil.erez.pro/
 
 # Veil — open-source E2EE messenger.
 # Сообщайте об уязвимостях по адресу security@erez.pro.

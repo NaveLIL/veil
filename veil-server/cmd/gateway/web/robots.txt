@@ -38,4 +38,4 @@ Disallow: /
 User-agent: ClaudeBot
 Disallow: /
 
-Sitemap: https://secret.erez.pro/sitemap.xml
+Sitemap: https://veil.erez.pro/sitemap.xml

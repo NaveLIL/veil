@@ -158,7 +158,31 @@ $env:VEIL_TLS_EMAIL = 'admin@example.com'
 docker compose --profile proxy up -d --build
 ```
 
-## Desktop development и Windows release
+На `erez-vps` этот profile не используется: публичные 80/443 уже принадлежат
+системному Nginx. Точная production-схема, backup gate, TLS/SNI и smoke checks
+описаны в [deploy/README.md](deploy/README.md).
+
+## Публичные релизы
+
+Старые Linux-ветки и вручную собранные `Veil_0.1.0_*` не являются источником
+релиза. Linux и Windows всегда собираются из одного tag на актуальном
+`master`; если Linux build или общий quality gate падает, новый релиз не
+публикуется и сайт не предлагает устаревший файл.
+
+Tag вида `vMAJOR.MINOR.PATCH` запускает GitHub release workflow. Он проверяет
+совпадение версии, собирает поддерживаемые desktop targets, создаёт стабильные
+имена файлов, `SHA256SUMS` и `latest.json`, а затем публикует GitHub Release.
+Тот же проверенный набор обязательно атомарно устанавливается через VPS
+secrets в `/srv/veil/releases/current`; только после этого draft GitHub Release
+становится публичным. Лендинг читает `latest.json`, поэтому версия, размеры и
+доступные платформы обновляются без изменения HTML.
+
+Windows job включается repository variable
+`VEIL_ENABLE_WINDOWS_RELEASE=true` и требует Authenticode secrets. Без подписи
+Windows installer не попадает в публичный релиз. macOS и Android остаются
+недоступными до появления platform signing/notarization и отдельного gate.
+
+## Desktop development и локальный Windows bundle
 
 На Windows путь Rust target обязан быть ASCII. Кириллица в обычном workspace
 target ломает upstream OpenSSL/nmake:
@@ -184,8 +208,9 @@ Pop-Location
 ```
 
 NSIS появляется в
-`D:\veil-release-target\release\bundle\nsis\`. До Phase 8 это unsigned
-development artifact, а не публичный установщик.
+`D:\veil-release-target\release\bundle\nsis\`. Локальный bundle без явно
+настроенной Authenticode-подписи — development artifact, а не публичный
+установщик.
 
 ## Проверки перед checkpoint
 

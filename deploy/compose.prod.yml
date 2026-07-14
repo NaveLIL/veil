@@ -1,0 +1,161 @@
+name: veil
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  postgres:
+    image: "${VEIL_POSTGRES_IMAGE:-postgres:16.14-alpine3.24}"
+    restart: unless-stopped
+    stop_grace_period: 1m
+    shm_size: "256m"
+    environment:
+      POSTGRES_DB: veil
+      POSTGRES_USER: veil
+      POSTGRES_PASSWORD: "${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in deploy/.env}"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U veil -d veil"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+    logging: *default-logging
+    pids_limit: 256
+
+  migrate:
+    image: "${VEIL_POSTGRES_IMAGE:-postgres:16.14-alpine3.24}"
+    restart: "no"
+    read_only: true
+    environment:
+      DATABASE_URL: "postgres://veil:${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in deploy/.env}@postgres:5432/veil?sslmode=disable"
+      HOME: /tmp
+      # Changing this value forces Compose to recreate the completed one-shot
+      # container for every release, even when only bind-mounted SQL changed.
+      VEIL_RELEASE_ID: "${VEIL_RELEASE_ID:?set VEIL_RELEASE_ID to the release tag or git SHA}"
+    volumes:
+      - ../veil-server/migrations:/migrations:ro
+      - ../scripts/apply-migrations.sh:/usr/local/bin/apply-migrations:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    entrypoint: ["/bin/sh", "/usr/local/bin/apply-migrations"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - backend
+    logging: *default-logging
+    pids_limit: 128
+
+  gateway:
+    image: "${VEIL_GATEWAY_IMAGE:?set VEIL_GATEWAY_IMAGE to an immutable ghcr.io image digest}"
+    pull_policy: always
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 20s
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    ports:
+      - "127.0.0.1:${VEIL_GATEWAY_PORT:-9080}:8080"
+    environment:
+      PORT: "8080"
+      DATABASE_URL: "postgres://veil:${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in deploy/.env}@postgres:5432/veil?sslmode=disable"
+      VEIL_WS_ORIGINS: "${VEIL_WS_ORIGINS:-https://veil.erez.pro}"
+      VEIL_CORS_ORIGINS: "${VEIL_CORS_ORIGINS:-https://veil.erez.pro}"
+      VEIL_WS_MAX_CONNS_PER_IP: "${VEIL_WS_MAX_CONNS_PER_IP:-64}"
+      # Safe only because the published gateway port is bound to host loopback
+      # and the host Nginx is the sole public ingress.
+      VEIL_TRUST_PROXY_HEADERS: "true"
+      VEIL_INTERNAL_ADDR: "${VEIL_INTERNAL_ADDR:-off}"
+      VEIL_PUSH_VAPID_PRIVATE_KEY: "${VEIL_PUSH_VAPID_PRIVATE_KEY:-}"
+      VEIL_PUSH_VAPID_SUBJECT: "${VEIL_PUSH_VAPID_SUBJECT:-}"
+      VEIL_PUSH_JITTER_MS: "${VEIL_PUSH_JITTER_MS:-2000}"
+      VEIL_PUSH_ALLOWED_PRIVATE_ORIGINS: "${VEIL_PUSH_ALLOWED_PRIVATE_ORIGINS:-http://ntfy:80}"
+      VEIL_UPLOAD_TOKEN_KEY: "${VEIL_UPLOAD_TOKEN_KEY:?set VEIL_UPLOAD_TOKEN_KEY in deploy/.env}"
+      UPLOAD_LOCAL_DIR: /var/veil/uploads
+      UPLOAD_MAX_BYTES: "${UPLOAD_MAX_BYTES:-2147516416}"
+      UPLOAD_USER_DAILY_QUOTA_BYTES: "${UPLOAD_USER_DAILY_QUOTA_BYTES:-5368709120}"
+      UPLOAD_QUOTA_WINDOW: "${UPLOAD_QUOTA_WINDOW:-24h}"
+      UPLOAD_RETENTION: "${UPLOAD_RETENTION:-720h}"
+      UPLOAD_ABORT_TTL: "${UPLOAD_ABORT_TTL:-24h}"
+      UPLOAD_SWEEP_INTERVAL: "${UPLOAD_SWEEP_INTERVAL:-1h}"
+      UPLOAD_TOKEN_TTL: "${UPLOAD_TOKEN_TTL:-24h}"
+    volumes:
+      - uploadsdata:/var/veil/uploads
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    depends_on:
+      postgres:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - backend
+      - edge
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    logging: *default-logging
+    pids_limit: 256
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+  ntfy:
+    image: "${VEIL_NTFY_IMAGE:-binwiederhier/ntfy:v2.23.0}"
+    profiles: ["push"]
+    restart: unless-stopped
+    command: serve
+    ports:
+      - "127.0.0.1:${VEIL_NTFY_PORT:-9081}:80"
+    environment:
+      NTFY_BASE_URL: "${VEIL_NTFY_BASE_URL:-https://push.veil.erez.pro}"
+      NTFY_BEHIND_PROXY: "true"
+      NTFY_AUTH_FILE: /var/lib/ntfy/user.db
+      NTFY_AUTH_DEFAULT_ACCESS: deny-all
+      # UnifiedPush application servers need anonymous write access to their
+      # unguessable up* capability topics; anonymous reads remain denied.
+      NTFY_AUTH_ACCESS: "*:up*:wo"
+      NTFY_CACHE_FILE: /var/lib/ntfy/cache.db
+      NTFY_ATTACHMENT_CACHE_DIR: /var/lib/ntfy/attachments
+      NTFY_ATTACHMENT_TOTAL_SIZE_LIMIT: "0"
+    volumes:
+      - ntfydata:/var/lib/ntfy
+    networks:
+      - edge
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1/v1/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+    logging: *default-logging
+    pids_limit: 128
+
+volumes:
+  pgdata:
+    name: veil_pgdata
+  uploadsdata:
+    name: veil_uploadsdata
+  ntfydata:
+    name: veil_ntfydata
+
+networks:
+  backend:
+    name: veil_backend
+    internal: true
+  edge:
+    name: veil_edge

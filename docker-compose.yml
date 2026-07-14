@@ -38,6 +38,7 @@ services:
       PORT: "8080"
       DATABASE_URL: "postgres://veil:${VEIL_DB_PASSWORD:?set VEIL_DB_PASSWORD in .env}@postgres:5432/veil?sslmode=disable"
       VEIL_WS_ORIGINS:           "${VEIL_WS_ORIGINS:?set VEIL_WS_ORIGINS in .env}"
+      VEIL_CORS_ORIGINS:         "${VEIL_CORS_ORIGINS:-}"
       VEIL_WS_MAX_CONNS_PER_IP:  "${VEIL_WS_MAX_CONNS_PER_IP:-64}"
       # Compose traffic may arrive through the bundled Caddy proxy. Outside
       # this topology the application default remains false/fail-closed.
@@ -69,6 +70,12 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -T 3 -O /dev/null http://127.0.0.1:8080/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
 
   # Self-hosted UnifiedPush distributor. Mobile clients can register
   # against http://<your-host>:9081/<up-topic> and the gateway POSTs RFC 8291
@@ -95,7 +102,7 @@ services:
 
   # Опциональный reverse-proxy для публичного домена с автоматическим
   # TLS (Let's Encrypt). Включается через профиль:
-  #   VEIL_PUBLIC_HOST=secret.erez.pro VEIL_TLS_EMAIL=admin@example.com \
+  #   VEIL_PUBLIC_HOST=veil.erez.pro VEIL_TLS_EMAIL=admin@example.com \
   #     docker compose --profile proxy up -d
   # Без VEIL_PUBLIC_HOST смысла поднимать нет — gateway уже доступен
   # на :9080 для локальной разработки.
@@ -115,7 +122,8 @@ services:
       - caddydata:/data
       - caddyconfig:/config
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
 
 volumes:
   pgdata:
