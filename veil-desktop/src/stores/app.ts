@@ -328,12 +328,6 @@ function normalizeServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpoin
 }
 
 function initialServerEndpoints(): ServerEndpoints {
-  const configured = normalizeServerEndpoints(
-    import.meta.env.VITE_VEIL_WS_URL || "",
-    import.meta.env.VITE_VEIL_HTTP_URL || "",
-  );
-  if (configured) return configured;
-
   try {
     const stored = JSON.parse(localStorage.getItem(SERVER_ENDPOINTS_STORAGE_KEY) || "null") as
       | Partial<ServerEndpoints>
@@ -345,6 +339,14 @@ function initialServerEndpoints(): ServerEndpoints {
   } catch {
     // Treat malformed or unavailable renderer storage as untrusted input.
   }
+
+  // Packaged endpoints are the first-run default, not a policy lock. A valid
+  // explicit self-host choice must survive application restarts.
+  const configured = normalizeServerEndpoints(
+    import.meta.env.VITE_VEIL_WS_URL || "",
+    import.meta.env.VITE_VEIL_HTTP_URL || "",
+  );
+  if (configured) return configured;
 
   return { ...DEFAULT_SERVER_ENDPOINTS };
 }

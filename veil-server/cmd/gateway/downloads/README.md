@@ -20,10 +20,23 @@
       "filename": "Veil-linux-amd64.deb",
       "size": 12345678,
       "sha256": "..."
+    },
+    {
+      "platform": "windows",
+      "kind": "exe",
+      "label": "Windows installer (x64)",
+      "filename": "Veil-windows-x64-setup.exe",
+      "size": 23456789,
+      "sha256": "...",
+      "signature": "unsigned"
     }
   ]
 }
 ```
+
+Для Windows поле `signature` обязательно и имеет значение `authenticode` либо
+`unsigned`. Неподписанный пакет допустим только как явно обозначенный Preview;
+сайт предупреждает о SmartScreen/Smart App Control и предлагает сверить SHA-256.
 
 Для локальной проверки можно положить сюда `latest.json`, `SHA256SUMS` и
 указанные в манифесте файлы, затем запустить gateway с

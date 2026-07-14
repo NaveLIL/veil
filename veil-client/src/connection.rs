@@ -35,8 +35,8 @@ const MAX_EVENT_ID_BYTES: usize = 256;
 const MAX_EVENT_CIPHERTEXT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_HEADER_BYTES: usize = 512;
 
-fn client_version(device_name: &str) -> String {
-    format!("{device_name}/{}", env!("CARGO_PKG_VERSION"))
+fn client_version(client_id: &str) -> String {
+    format!("{client_id}/{}", env!("CARGO_PKG_VERSION"))
 }
 
 /// Configuration for the WebSocket connection.
@@ -373,6 +373,7 @@ impl Connection {
         identity: &IdentityKeyPair,
         device_identity: &DeviceIdentityV1,
         device_name: &str,
+        client_id: &str,
     ) -> Result<Self, String> {
         let url = &config.server_url;
         validate_websocket_url(url)?;
@@ -443,7 +444,7 @@ impl Connection {
                     signature: sig.to_vec(),
                     device_id: binding.device_id.to_vec(),
                     device_name: device_name.to_string(),
-                    client_version: client_version(device_name),
+                    client_version: client_version(client_id),
                     device_binding: Some(proto::DeviceBindingV1 {
                         device_id: binding.device_id.to_vec(),
                         device_identity_key: binding.device_identity_key.to_vec(),
@@ -693,10 +694,14 @@ mod url_policy_tests {
     use veil_crypto::keys::IdentityKeyPair;
 
     #[test]
-    fn client_version_tracks_the_compiled_engine_version() {
+    fn client_version_uses_a_stable_product_id() {
         assert_eq!(
             client_version("veil-desktop"),
             concat!("veil-desktop/", env!("CARGO_PKG_VERSION"))
+        );
+        assert_ne!(
+            client_version("veil-desktop"),
+            client_version("MacBook Pro")
         );
     }
 

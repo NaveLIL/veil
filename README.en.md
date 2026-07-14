@@ -137,6 +137,13 @@ verified Preview is available, the site should not offer a stale manual
 artifact. Historical Linux branches and locally built installers are not the
 release source.
 
+Every desktop release must contain Linux `.deb` and AppImage packages plus
+Windows `.exe` and `.msi` installers. Windows artifacts are Authenticode-signed
+when both signing secrets are configured; otherwise they are explicitly marked
+as an unsigned Preview and may trigger SmartScreen or Smart App Control. The
+site exposes the signing state and SHA-256 checksums. A partial or invalid
+signing configuration fails closed instead of silently downgrading.
+
 Preview support is best effort and has no SLA. See [SUPPORT.md](SUPPORT.md).
 Report suspected vulnerabilities privately to **security@erez.pro** according
 to [SECURITY.md](SECURITY.md), never through a public Issue.

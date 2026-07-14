@@ -70,8 +70,10 @@ Direct, Circle и структурированных Space/Room. Проект е
 - Android имеет foundation/prototype, а production messaging остаётся Phase
   5A/5B. MLS runtime и звонки пока не включены как пользовательские функции.
 
-Текущий Windows installer не подписан. Не распространяйте development bundle
-как официальный релиз.
+Публичный Windows Preview собирается только в CI и всегда сопровождается
+`SHA256SUMS`. До появления доверенного Authenticode-сертификата он явно
+помечается как неподписанный и может вызвать SmartScreen/Smart App Control;
+локальный development bundle официальным релизом не является.
 
 ## Архитектура
 
@@ -176,10 +178,9 @@ docker compose --profile proxy up -d --build
 ## Публичные релизы
 
 Старые Linux-ветки и вручную собранные `Veil_0.1.0_*` не являются источником
-релиза. Linux-сборки и включённые для конкретного релиза Windows-сборки
-создаются из одного tag на актуальном `master`; если обязательный Linux build
-или общий quality gate падает, новый релиз не публикуется и сайт не предлагает
-устаревший файл.
+релиза. Linux и Windows собираются из одного tag на актуальном `master`; если
+общий quality gate или любая обязательная platform build падает, новый релиз
+не публикуется и сайт не предлагает устаревший файл.
 
 Tag вида `vMAJOR.MINOR.PATCH` запускает GitHub release workflow. Он проверяет
 совпадение версии, собирает поддерживаемые desktop targets, создаёт стабильные
@@ -189,10 +190,13 @@ secrets в `/srv/veil/releases/current`; только после этого draf
 становится публичным. Лендинг читает `latest.json`, поэтому версия, размеры и
 доступные платформы обновляются без изменения HTML.
 
-Windows job включается repository variable
-`VEIL_ENABLE_WINDOWS_RELEASE=true` и требует Authenticode secrets. Без подписи
-Windows installer не попадает в публичный релиз. macOS и Android остаются
-недоступными до появления platform signing/notarization и отдельного gate.
+Windows job всегда обязан создать и проверить `.exe` и `.msi`. При наличии
+обоих Authenticode secrets CI подписывает приложение и установщики; без них он
+выпускает явно помеченный `unsigned` Preview. Один отсутствующий secret,
+неверный PFX или ошибка подписи останавливают релиз без тихого downgrade.
+Переменная `VEIL_REQUIRE_WINDOWS_SIGNING=true` позволяет полностью запретить
+unsigned Preview после приобретения доверенного сертификата. macOS и Android
+остаются недоступными до platform signing/notarization и отдельного gate.
 
 ## Desktop development и локальный Windows bundle
 
@@ -222,8 +226,8 @@ Pop-Location
 
 NSIS появляется в
 `D:\veil-release-target\release\bundle\nsis\`. Локальный bundle без явно
-настроенной Authenticode-подписи — development artifact, а не публичный
-установщик.
+настроенной Authenticode-подписи — development artifact, а не опубликованный
+CI Preview.
 
 ## Проверки перед checkpoint
 
