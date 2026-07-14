@@ -41,6 +41,11 @@ jobs:
   test:
     name: Typecheck, unit and accessibility smoke
     runs-on: ubuntu-latest
+    # Match the packaged renderer environment so PR CI catches tests that
+    # accidentally depend on the development loopback default.
+    env:
+      VITE_VEIL_WS_URL: wss://veil.erez.pro/ws
+      VITE_VEIL_HTTP_URL: https://veil.erez.pro
     defaults:
       run:
         working-directory: veil-desktop

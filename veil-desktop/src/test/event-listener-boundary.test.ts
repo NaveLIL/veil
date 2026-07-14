@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
@@ -11,9 +11,17 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: mocks.listen }));
 
 const USER_ID = "550e8400-e29b-41d4-a716-446655440000";
 
+beforeEach(() => {
+  // These native mocks authenticate loopback. Pin that endpoint explicitly so
+  // the boundary tests also pass when release CI injects the production URL.
+  vi.stubEnv("VITE_VEIL_WS_URL", "ws://127.0.0.1:9080/ws");
+  vi.stubEnv("VITE_VEIL_HTTP_URL", "http://127.0.0.1:9080");
+});
+
 afterEach(() => {
   vi.clearAllTimers();
   vi.useRealTimers();
+  vi.unstubAllEnvs();
 });
 
 describe("authenticated event listener boundary", () => {
