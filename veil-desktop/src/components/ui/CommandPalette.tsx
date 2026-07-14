@@ -10,7 +10,7 @@ import {
   onCleanup,
   onMount,
 } from "solid-js";
-import { Search, MessageCircle, Users, RefreshCw } from "lucide-solid";
+import { Search, MessageCircle, Users, RefreshCw, ShieldCheck } from "lucide-solid";
 import { invoke } from "@tauri-apps/api/core";
 import { IdentityTrigger } from "@/components/identity/IdentityTrigger";
 import { UserAvatar } from "@/components/identity/UserAvatar";
@@ -404,7 +404,7 @@ export const CommandPalette: Component<Props> = (props) => {
             background: "var(--veil-backdrop)",
             "backdrop-filter": "blur(6px)",
             "-webkit-backdrop-filter": "blur(6px)",
-            animation: "fadeIn 120ms ease-out",
+            animation: "veilBackdropIn 120ms ease-out",
           }}
         />
         <div style={{
@@ -424,16 +424,18 @@ export const CommandPalette: Component<Props> = (props) => {
             }}
             style={{
               "pointer-events": "auto",
-              width: "640px", "max-width": "calc(100vw - 32px)",
+              width: "680px", "max-width": "calc(100vw - 32px)",
               display: "flex", "flex-direction": "column",
               background: "var(--veil-island)",
-              "border-radius": "12px",
-              border: "1px solid var(--veil-border)",
-              "box-shadow": "0 20px 60px var(--veil-backdrop)",
+              "border-radius": "18px",
+              border: "1px solid color-mix(in srgb, var(--veil-accent) 18%, var(--veil-border))",
+              "box-shadow": "0 28px 90px var(--veil-backdrop), 0 0 0 1px color-mix(in srgb, var(--veil-accent) 5%, transparent)",
               overflow: "hidden",
               color: "var(--veil-text)",
               "font-family": "'Inter', system-ui, sans-serif",
               animation: "fadeInScale 180ms ease-out",
+              "transform-origin": "center top",
+              "will-change": "transform, opacity",
               outline: "none",
             }}
           >
@@ -445,14 +447,39 @@ export const CommandPalette: Component<Props> = (props) => {
               Search messages
             </KDialog.Title>
 
-            {/* Search input row */}
             <div style={{
-              display: "flex", "align-items": "center", gap: "10px",
-              padding: "14px 18px",
-              "border-bottom": "1px solid var(--veil-border-soft)",
-              "flex-shrink": "0",
+              display: "flex", "align-items": "center", "justify-content": "space-between", gap: "16px",
+              padding: "17px 20px 13px",
             }}>
-              <Search size={16} color="var(--veil-text-muted)" />
+              <div style={{ "min-width": "0" }}>
+                <div style={{ color: "var(--veil-text-strong)", "font-size": "15px", "font-weight": "720", "letter-spacing": "-.01em" }}>
+                  Search your Veil history
+                </div>
+                <div style={{ color: "var(--veil-text-faint)", "font-size": "10.5px", "margin-top": "3px" }}>
+                  Find messages across Direct, Circles and Spaces
+                </div>
+              </div>
+              <div style={{
+                display: "inline-flex", "align-items": "center", gap: "6px", "flex-shrink": "0",
+                padding: "6px 9px", "border-radius": "999px",
+                background: "color-mix(in srgb, var(--veil-success) 10%, transparent)",
+                border: "1px solid color-mix(in srgb, var(--veil-success) 22%, transparent)",
+                color: "var(--veil-success)", "font-size": "10px", "font-weight": "650",
+              }}>
+                <ShieldCheck size={13} aria-hidden="true" />
+                On-device only
+              </div>
+            </div>
+
+            <div style={{ padding: "0 20px 16px", "border-bottom": "1px solid var(--veil-border-soft)" }}>
+              <div style={{
+                display: "flex", "align-items": "center", gap: "10px",
+                height: "44px", padding: "0 13px", "border-radius": "11px",
+                background: "var(--veil-control)",
+                border: "1px solid color-mix(in srgb, var(--veil-accent) 40%, var(--veil-border))",
+                "box-shadow": "0 0 0 3px color-mix(in srgb, var(--veil-accent) 8%, transparent)",
+              }}>
+              <Search size={17} color="var(--veil-accent)" aria-hidden="true" />
               <input
                 ref={inputRef}
                 role="combobox"
@@ -468,12 +495,14 @@ export const CommandPalette: Component<Props> = (props) => {
                 placeholder="Search messages…"
                 style={{
                   flex: "1", background: "transparent", border: "none", outline: "none",
-                  color: "var(--veil-text-strong)", "font-size": "14px",
+                  color: "var(--veil-text-strong)", "font-size": "14px", "line-height": "1",
                 }}
               />
               <Show when={loading()}>
-                <span style={{ "font-size": "11px", color: "var(--veil-text-muted)" }}>…</span>
+                <RefreshCw size={13} color="var(--veil-text-muted)" style={{ animation: "spin .8s linear infinite" }} aria-hidden="true" />
               </Show>
+              <kbd style={{ padding: "3px 6px", "border-radius": "5px", background: "var(--veil-contrast-04)", color: "var(--veil-text-faint)", "font-size": "10px" }}>Esc</kbd>
+              </div>
               <span
                 role="status"
                 aria-live="polite"
@@ -558,16 +587,22 @@ export const CommandPalette: Component<Props> = (props) => {
               <Show when={hits().length === 0}>
                   <div style={{
                     display: "flex", "flex-direction": "column", "align-items": "center",
-                    gap: "12px", padding: "40px 18px", color: "var(--veil-text-muted)",
+                    gap: "10px", padding: "34px 18px 38px", color: "var(--veil-text-muted)",
                     "font-size": "13px", "text-align": "center",
                   }}>
                     <Show
                       when={query().trim()}
                       fallback={
                         <>
-                          <span>Type to search across all decrypted messages</span>
-                          <span style={{ "font-size": "11px", opacity: "0.7" }}>
-                            Index is local-only and never leaves this device.
+                          <span aria-hidden="true" style={{
+                            width: "48px", height: "48px", "border-radius": "15px", display: "grid", "place-items": "center",
+                            background: "color-mix(in srgb, var(--veil-accent) 11%, transparent)",
+                            border: "1px solid color-mix(in srgb, var(--veil-accent) 18%, transparent)",
+                            color: "var(--veil-accent)", "margin-bottom": "3px",
+                          }}><Search size={20} strokeWidth={1.8} /></span>
+                          <span style={{ color: "var(--veil-text)", "font-weight": "620" }}>Start with a word or phrase</span>
+                          <span style={{ "font-size": "11px", opacity: "0.72", "max-width": "360px", "line-height": "1.55" }}>
+                            Veil searches the decrypted index stored on this device. Your query and results never reach the Node.
                           </span>
                         </>
                       }

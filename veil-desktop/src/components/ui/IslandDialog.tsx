@@ -77,7 +77,7 @@ export const IslandDialog: Component<Props> = (props) => {
             background: "var(--veil-backdrop)",
             "backdrop-filter": "blur(6px)",
             "-webkit-backdrop-filter": "blur(6px)",
-            animation: "fadeIn 140ms ease-out",
+            animation: "veilBackdropIn 140ms ease-out",
           }}
         />
         <div
@@ -105,6 +105,8 @@ export const IslandDialog: Component<Props> = (props) => {
               color: "var(--veil-text)",
               "font-family": "'Inter', system-ui, sans-serif",
               animation: "fadeInScale 180ms ease-out",
+              "transform-origin": "center center",
+              "will-change": "transform, opacity",
               outline: "none",
             }}
           >

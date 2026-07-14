@@ -920,7 +920,7 @@ func (db *DB) AuthenticateInvite(ctx context.Context, selector, secret string) (
 		 FROM server_invites WHERE public_selector=$1`, selector,
 	), true)
 	if err != nil || inv.Version != 1 || inv.LinkType != "space" || inv.RevokedAt != nil ||
-		time.Now().After(inv.ExpiresAt) || inv.Uses >= inv.MaxUses ||
+		time.Now().After(inv.ExpiresAt) ||
 		subtle.ConstantTimeCompare(providedHash, inv.SecretHash) != 1 {
 		return nil, errors.New("Veil Link unavailable")
 	}

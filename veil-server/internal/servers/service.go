@@ -855,16 +855,25 @@ func (s *Service) PreviewInvite(ctx context.Context, selector string) (*db.Serve
 	return srv, inv, nil
 }
 
-func (s *Service) AuthenticatedPreviewInvite(ctx context.Context, selector, secret string) (*db.Server, *db.Invite, error) {
+func (s *Service) AuthenticatedPreviewInvite(ctx context.Context, selector, secret, userID string) (*db.Server, *db.Invite, bool, error) {
 	inv, err := s.db.AuthenticateInvite(ctx, selector, secret)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, false, err
+	}
+	alreadyMember, err := s.db.IsServerMember(ctx, inv.ServerID, userID)
+	if err != nil {
+		return nil, nil, false, errors.New("Veil Link unavailable")
+	}
+	// A consumed link remains useful to an existing member as a safe route back
+	// to the Space, but it must never admit a new account beyond max_uses.
+	if !alreadyMember && inv.Uses >= inv.MaxUses {
+		return nil, nil, false, errors.New("Veil Link unavailable")
 	}
 	srv, err := s.db.GetServer(ctx, inv.ServerID)
 	if err != nil {
-		return nil, nil, errors.New("Veil Link unavailable")
+		return nil, nil, false, errors.New("Veil Link unavailable")
 	}
-	return srv, inv, nil
+	return srv, inv, alreadyMember, nil
 }
 
 // ─── Internal broadcast helpers ──────────────────────

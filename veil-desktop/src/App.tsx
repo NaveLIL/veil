@@ -64,7 +64,7 @@ import { alertDecision, confirmDecision, promptDecision } from "@/lib/decisionDi
 import {
   Users, UserPlus, UserMinus, Settings, Lock,
   ChevronDown, Reply, Pencil, Copy, Link2, Trash2, X,
-  MessageSquare, Eye, Shield, Send, Paperclip, Download, FileText, Play,
+  MessageSquare, Eye, Shield, Send, Paperclip, Download, FileText, Play, Search,
 } from "lucide-solid";
 
 const formatAttachmentBytes = (bytes: number): string => {
@@ -1289,9 +1289,10 @@ const App: Component = () => {
     }
   };
 
-  const findInitialCircleMember = async () => {
-    const query = circleMemberQuery().trim();
+  const findInitialCircleMember = async (requestedUsername?: string) => {
+    const query = (requestedUsername ?? circleMemberQuery()).trim();
     if (!query || circleMemberSearching()) return;
+    setCircleMemberQuery(query);
     setCircleMemberSearching(true);
     setGroupCreateError("");
     try {
@@ -2324,7 +2325,7 @@ const App: Component = () => {
                     onClick={() => setCmdkOpen(true)}
                     style={{ width: "30px", height: "30px", "border-radius": "8px", border: "1px solid var(--veil-border-soft)", background: "var(--veil-control)", color: "var(--veil-text-muted)", cursor: "pointer", display: "flex", "align-items": "center", "justify-content": "center" }}
                   >
-                    <span aria-hidden="true" style={{ "font-size": "15px" }}>⌕</span>
+                    <Search size={15} strokeWidth={2} aria-hidden="true" />
                   </button>
                 </div>
               </div>
@@ -2355,6 +2356,9 @@ const App: Component = () => {
               <Show when={showNewGroup()}>
                 <div style={{ margin: "8px 12px 5px", padding: "12px", "border-radius": "10px", background: "rgba(var(--veil-accent-rgb),0.07)", border: "1px solid rgba(var(--veil-accent-rgb),0.18)" }}>
                   <div style={{ color: "var(--veil-text-strong)", "font-size": "12px", "font-weight": "650", "margin-bottom": "8px" }}>Create Circle</div>
+                  <div style={{ color: "var(--veil-text-muted)", "font-size": "10px", "line-height": "1.45", "margin-bottom": "9px" }}>
+                    A Circle begins with you and one exact account on this Veil Node. This fixes the encrypted roster before the first message.
+                  </div>
                   <div style={{ display: "flex", gap: "7px", "margin-bottom": "7px" }}>
                     <input
                       ref={newGroupInputRef}
@@ -2381,7 +2385,7 @@ const App: Component = () => {
                         <input
                           aria-label="Find initial Circle member"
                           style={{ ...S.searchBox, flex: "1", "min-width": "0" }}
-                          placeholder="Exact username"
+                          placeholder="Exact account name"
                           value={circleMemberQuery()}
                           disabled={creatingGroup() || circleMemberSearching()}
                           onInput={(event) => { setCircleMemberQuery(event.currentTarget.value); setGroupCreateError(""); }}
@@ -2404,6 +2408,32 @@ const App: Component = () => {
                         <button type="button" aria-label="Remove initial Circle member" style={{ background: "none", border: "none", color: "var(--veil-text-faint)", cursor: "pointer" }} onClick={() => setCircleMember(null)}>×</button>
                       </div>
                     )}
+                  </Show>
+                  <Show when={!circleMember()}>
+                    <Show
+                      when={appStore.friends().length > 0}
+                      fallback={
+                        <div style={{ padding: "8px 9px", "border-radius": "8px", background: "var(--veil-contrast-03)", color: "var(--veil-text-faint)", "font-size": "9.5px", "line-height": "1.45" }}>
+                          No contacts on this Node yet. Enter the exact account name from the other person’s Identity view, or add them under Friends &amp; requests first.
+                        </div>
+                      }
+                    >
+                      <div style={{ "margin-top": "2px" }}>
+                        <div style={{ color: "var(--veil-text-faint)", "font-size": "9px", "font-weight": "700", "letter-spacing": ".07em", "text-transform": "uppercase", "margin-bottom": "6px" }}>Your contacts</div>
+                        <div style={{ display: "flex", "flex-wrap": "wrap", gap: "5px" }}>
+                          <For each={appStore.friends().slice(0, 6)}>
+                            {(friend) => (
+                              <button
+                                type="button"
+                                disabled={circleMemberSearching()}
+                                onClick={() => void findInitialCircleMember(friend.username)}
+                                style={{ padding: "5px 8px", "border-radius": "999px", border: "1px solid var(--veil-border-soft)", background: "var(--veil-control)", color: "var(--veil-text-muted)", cursor: circleMemberSearching() ? "wait" : "pointer", "font-size": "9.5px" }}
+                              >{friend.username}</button>
+                            )}
+                          </For>
+                        </div>
+                      </div>
+                    </Show>
                   </Show>
                   <Show when={groupCreateError()}>
                     <div role="alert" style={{ "margin-top": "7px", color: "var(--veil-danger)", "font-size": "10px", "line-height": "1.35" }}>{groupCreateError()}</div>

@@ -83,6 +83,8 @@ func TestVeilLinks_CreateListPreviewAndJoin(t *testing.T) {
 	if portal.StatusCode != http.StatusOK ||
 		!strings.Contains(portal.Header.Get("Content-Security-Policy"), "default-src 'none'") ||
 		portal.Header.Get("Referrer-Policy") != "no-referrer" ||
+		!strings.Contains(string(portalBody), "A Veil Link for a private Space") ||
+		!strings.Contains(string(portalBody), "Review in Veil, then confirm") ||
 		strings.Contains(string(portalBody), secret) || strings.Contains(string(portalBody), owner.ID) {
 		t.Fatalf("unsafe Veil Link portal status=%d headers=%v body=%s", portal.StatusCode, portal.Header, portalBody)
 	}
@@ -95,9 +97,20 @@ func TestVeilLinks_CreateListPreviewAndJoin(t *testing.T) {
 		t.Fatalf("invalid portal status=%d", invalidPortal.StatusCode)
 	}
 
+	previewPath := "/v1/veil-links/" + selector + "/preview"
+	previewBody := map[string]string{"secret": secret}
+	status, _, signedPreview := h.Do(joiner, http.MethodPost, previewPath, previewBody)
+	if status != http.StatusOK || signedPreview["already_member"] != false {
+		t.Fatalf("pre-join authenticated preview status=%d body=%v", status, signedPreview)
+	}
+
 	status, used := joinVeilLink(t, h, joiner, link)
 	if status != http.StatusOK || used["id"] != spaceID {
 		t.Fatalf("join status=%d body=%v", status, used)
+	}
+	status, _, signedPreview = h.Do(joiner, http.MethodPost, previewPath, previewBody)
+	if status != http.StatusOK || signedPreview["already_member"] != true {
+		t.Fatalf("member authenticated preview status=%d body=%v", status, signedPreview)
 	}
 	var createdEvents, joinedEvents int
 	if err := h.DB.Pool.QueryRow(t.Context(),
@@ -212,6 +225,14 @@ func TestVeilLinks_StrictBoundsIdempotenceAndDeletedSpace(t *testing.T) {
 	}
 	if status, _ := joinVeilLink(t, h, joiner, link); status != http.StatusOK {
 		t.Fatalf("existing member repeat status=%d", status)
+	}
+	previewPath := "/v1/veil-links/" + link["public_selector"].(string) + "/preview"
+	previewBody := map[string]string{"secret": link["secret"].(string)}
+	if status, _, preview := h.Do(joiner, http.MethodPost, previewPath, previewBody); status != http.StatusOK || preview["already_member"] != true {
+		t.Fatalf("consumed link did not route existing member: status=%d body=%v", status, preview)
+	}
+	if status, _, _ := h.Do(other, http.MethodPost, previewPath, previewBody); status == http.StatusOK {
+		t.Fatal("consumed link preview offered admission to a new member")
 	}
 	inv, err := h.DB.GetInvite(t.Context(), link["public_selector"].(string))
 	if err != nil || inv.Uses != 1 {
