@@ -18,7 +18,7 @@ RUN node scripts/generate-third-party-notices.mjs \
     -ldflags="-s -w -X main.buildCommit=${VEIL_BUILD_COMMIT}" \
     -o veil-gateway ./cmd/gateway
 
-FROM alpine:3.21
+FROM alpine:3.24
 ARG VEIL_BUILD_COMMIT
 LABEL org.opencontainers.image.title="Veil Gateway" \
       org.opencontainers.image.description="Self-hosted Veil messaging gateway" \
