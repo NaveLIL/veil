@@ -21,6 +21,62 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// Machine-readable authentication outcomes. REGISTRATION_CLOSED and
+// INVITE_INVALID are emitted only after account-key proof succeeds, avoiding
+// an unauthenticated account/invite oracle. Invalid, expired, and reused
+// invites intentionally share one indistinguishable result.
+type AuthFailureReason int32
+
+const (
+	AuthFailureReason_AUTH_FAILURE_REASON_UNSPECIFIED           AuthFailureReason = 0
+	AuthFailureReason_AUTH_FAILURE_REASON_AUTHENTICATION_FAILED AuthFailureReason = 1
+	AuthFailureReason_AUTH_FAILURE_REASON_REGISTRATION_CLOSED   AuthFailureReason = 2
+	AuthFailureReason_AUTH_FAILURE_REASON_INVITE_INVALID        AuthFailureReason = 3
+)
+
+// Enum value maps for AuthFailureReason.
+var (
+	AuthFailureReason_name = map[int32]string{
+		0: "AUTH_FAILURE_REASON_UNSPECIFIED",
+		1: "AUTH_FAILURE_REASON_AUTHENTICATION_FAILED",
+		2: "AUTH_FAILURE_REASON_REGISTRATION_CLOSED",
+		3: "AUTH_FAILURE_REASON_INVITE_INVALID",
+	}
+	AuthFailureReason_value = map[string]int32{
+		"AUTH_FAILURE_REASON_UNSPECIFIED":           0,
+		"AUTH_FAILURE_REASON_AUTHENTICATION_FAILED": 1,
+		"AUTH_FAILURE_REASON_REGISTRATION_CLOSED":   2,
+		"AUTH_FAILURE_REASON_INVITE_INVALID":        3,
+	}
+)
+
+func (x AuthFailureReason) Enum() *AuthFailureReason {
+	p := new(AuthFailureReason)
+	*p = x
+	return p
+}
+
+func (x AuthFailureReason) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (AuthFailureReason) Descriptor() protoreflect.EnumDescriptor {
+	return file_veil_v1_auth_proto_enumTypes[0].Descriptor()
+}
+
+func (AuthFailureReason) Type() protoreflect.EnumType {
+	return &file_veil_v1_auth_proto_enumTypes[0]
+}
+
+func (x AuthFailureReason) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use AuthFailureReason.Descriptor instead.
+func (AuthFailureReason) EnumDescriptor() ([]byte, []int) {
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{0}
+}
+
 // Bit values carried in DeviceBindingV1.capabilities. Values may be ORed.
 type DeviceCapability int32
 
@@ -55,11 +111,11 @@ func (x DeviceCapability) String() string {
 }
 
 func (DeviceCapability) Descriptor() protoreflect.EnumDescriptor {
-	return file_veil_v1_auth_proto_enumTypes[0].Descriptor()
+	return file_veil_v1_auth_proto_enumTypes[1].Descriptor()
 }
 
 func (DeviceCapability) Type() protoreflect.EnumType {
-	return &file_veil_v1_auth_proto_enumTypes[0]
+	return &file_veil_v1_auth_proto_enumTypes[1]
 }
 
 func (x DeviceCapability) Number() protoreflect.EnumNumber {
@@ -68,7 +124,7 @@ func (x DeviceCapability) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DeviceCapability.Descriptor instead.
 func (DeviceCapability) EnumDescriptor() ([]byte, []int) {
-	return file_veil_v1_auth_proto_rawDescGZIP(), []int{0}
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{1}
 }
 
 type DeviceBindingStatus int32
@@ -111,11 +167,11 @@ func (x DeviceBindingStatus) String() string {
 }
 
 func (DeviceBindingStatus) Descriptor() protoreflect.EnumDescriptor {
-	return file_veil_v1_auth_proto_enumTypes[1].Descriptor()
+	return file_veil_v1_auth_proto_enumTypes[2].Descriptor()
 }
 
 func (DeviceBindingStatus) Type() protoreflect.EnumType {
-	return &file_veil_v1_auth_proto_enumTypes[1]
+	return &file_veil_v1_auth_proto_enumTypes[2]
 }
 
 func (x DeviceBindingStatus) Number() protoreflect.EnumNumber {
@@ -124,7 +180,7 @@ func (x DeviceBindingStatus) Number() protoreflect.EnumNumber {
 
 // Deprecated: Use DeviceBindingStatus.Descriptor instead.
 func (DeviceBindingStatus) EnumDescriptor() ([]byte, []int) {
-	return file_veil_v1_auth_proto_rawDescGZIP(), []int{1}
+	return file_veil_v1_auth_proto_rawDescGZIP(), []int{2}
 }
 
 // Сервер отправляет challenge при подключении
@@ -183,8 +239,12 @@ type AuthResponse struct {
 	ClientVersion   string                 `protobuf:"bytes,6,opt,name=client_version,json=clientVersion,proto3" json:"client_version,omitempty"`       // "veil-desktop/1.0.0"
 	DeviceBinding   *DeviceBindingV1       `protobuf:"bytes,7,opt,name=device_binding,json=deviceBinding,proto3" json:"device_binding,omitempty"`       // Present only for cryptographic per-device auth.
 	DeviceSignature []byte                 `protobuf:"bytes,8,opt,name=device_signature,json=deviceSignature,proto3" json:"device_signature,omitempty"` // Ed25519 signature over veil-device-auth-v1 preimage.
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Optional 256-bit Node Access invite. A first-time identity presents it
+	// inside the already-established TLS WebSocket after proving possession of
+	// its account keys. Existing identities never need an invite.
+	NodeAccessInvite []byte `protobuf:"bytes,9,opt,name=node_access_invite,json=nodeAccessInvite,proto3" json:"node_access_invite,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *AuthResponse) Reset() {
@@ -273,6 +333,13 @@ func (x *AuthResponse) GetDeviceSignature() []byte {
 	return nil
 }
 
+func (x *AuthResponse) GetNodeAccessInvite() []byte {
+	if x != nil {
+		return x.NodeAccessInvite
+	}
+	return nil
+}
+
 // Результат аутентификации
 type AuthResult struct {
 	state                protoimpl.MessageState `protogen:"open.v1"`
@@ -282,6 +349,7 @@ type AuthResult struct {
 	PerDeviceSecure      bool                   `protobuf:"varint,4,opt,name=per_device_secure,json=perDeviceSecure,proto3" json:"per_device_secure,omitempty"`
 	DeviceBindingVersion uint64                 `protobuf:"varint,5,opt,name=device_binding_version,json=deviceBindingVersion,proto3" json:"device_binding_version,omitempty"`
 	DeviceBindingStatus  DeviceBindingStatus    `protobuf:"varint,6,opt,name=device_binding_status,json=deviceBindingStatus,proto3,enum=veil.v1.DeviceBindingStatus" json:"device_binding_status,omitempty"`
+	FailureReason        AuthFailureReason      `protobuf:"varint,7,opt,name=failure_reason,json=failureReason,proto3,enum=veil.v1.AuthFailureReason" json:"failure_reason,omitempty"`
 	unknownFields        protoimpl.UnknownFields
 	sizeCache            protoimpl.SizeCache
 }
@@ -356,6 +424,13 @@ func (x *AuthResult) GetDeviceBindingStatus() DeviceBindingStatus {
 		return x.DeviceBindingStatus
 	}
 	return DeviceBindingStatus_DEVICE_BINDING_STATUS_UNSPECIFIED
+}
+
+func (x *AuthResult) GetFailureReason() AuthFailureReason {
+	if x != nil {
+		return x.FailureReason
+	}
+	return AuthFailureReason_AUTH_FAILURE_REASON_UNSPECIFIED
 }
 
 // Account-authorized immutable version of one cryptographic device binding.
@@ -737,7 +812,7 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\n" +
 	"\x12veil/v1/auth.proto\x12\aveil.v1\"-\n" +
 	"\rAuthChallenge\x12\x1c\n" +
-	"\tchallenge\x18\x01 \x01(\fR\tchallenge\"\xc1\x02\n" +
+	"\tchallenge\x18\x01 \x01(\fR\tchallenge\"\xef\x02\n" +
 	"\fAuthResponse\x12!\n" +
 	"\fidentity_key\x18\x01 \x01(\fR\videntityKey\x12\x1f\n" +
 	"\vsigning_key\x18\x02 \x01(\fR\n" +
@@ -748,7 +823,8 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"deviceName\x12%\n" +
 	"\x0eclient_version\x18\x06 \x01(\tR\rclientVersion\x12?\n" +
 	"\x0edevice_binding\x18\a \x01(\v2\x18.veil.v1.DeviceBindingV1R\rdeviceBinding\x12)\n" +
-	"\x10device_signature\x18\b \x01(\fR\x0fdeviceSignature\"\xc0\x02\n" +
+	"\x10device_signature\x18\b \x01(\fR\x0fdeviceSignature\x12,\n" +
+	"\x12node_access_invite\x18\t \x01(\fR\x10nodeAccessInvite\"\x83\x03\n" +
 	"\n" +
 	"AuthResult\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\x12\x1c\n" +
@@ -756,7 +832,8 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\rerror_message\x18\x03 \x01(\tH\x01R\ferrorMessage\x88\x01\x01\x12*\n" +
 	"\x11per_device_secure\x18\x04 \x01(\bR\x0fperDeviceSecure\x124\n" +
 	"\x16device_binding_version\x18\x05 \x01(\x04R\x14deviceBindingVersion\x12P\n" +
-	"\x15device_binding_status\x18\x06 \x01(\x0e2\x1c.veil.v1.DeviceBindingStatusR\x13deviceBindingStatusB\n" +
+	"\x15device_binding_status\x18\x06 \x01(\x0e2\x1c.veil.v1.DeviceBindingStatusR\x13deviceBindingStatus\x12A\n" +
+	"\x0efailure_reason\x18\a \x01(\x0e2\x1a.veil.v1.AuthFailureReasonR\rfailureReasonB\n" +
 	"\n" +
 	"\b_user_idB\x10\n" +
 	"\x0e_error_message\"\xad\x02\n" +
@@ -798,7 +875,12 @@ const file_veil_v1_auth_proto_rawDesc = "" +
 	"\vdevice_name\x18\x04 \x01(\tR\n" +
 	"deviceName\x12*\n" +
 	"\x0elink_signature\x18\x05 \x01(\fH\x00R\rlinkSignature\x88\x01\x01B\x11\n" +
-	"\x0f_link_signature*\x80\x01\n" +
+	"\x0f_link_signature*\xbc\x01\n" +
+	"\x11AuthFailureReason\x12#\n" +
+	"\x1fAUTH_FAILURE_REASON_UNSPECIFIED\x10\x00\x12-\n" +
+	")AUTH_FAILURE_REASON_AUTHENTICATION_FAILED\x10\x01\x12+\n" +
+	"'AUTH_FAILURE_REASON_REGISTRATION_CLOSED\x10\x02\x12&\n" +
+	"\"AUTH_FAILURE_REASON_INVITE_INVALID\x10\x03*\x80\x01\n" +
 	"\x10DeviceCapability\x12!\n" +
 	"\x1dDEVICE_CAPABILITY_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fDEVICE_CAPABILITY_SENDER_KEY_V5\x10\x01\x12$\n" +
@@ -822,30 +904,32 @@ func file_veil_v1_auth_proto_rawDescGZIP() []byte {
 	return file_veil_v1_auth_proto_rawDescData
 }
 
-var file_veil_v1_auth_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
+var file_veil_v1_auth_proto_enumTypes = make([]protoimpl.EnumInfo, 3)
 var file_veil_v1_auth_proto_msgTypes = make([]protoimpl.MessageInfo, 7)
 var file_veil_v1_auth_proto_goTypes = []any{
-	(DeviceCapability)(0),               // 0: veil.v1.DeviceCapability
-	(DeviceBindingStatus)(0),            // 1: veil.v1.DeviceBindingStatus
-	(*AuthChallenge)(nil),               // 2: veil.v1.AuthChallenge
-	(*AuthResponse)(nil),                // 3: veil.v1.AuthResponse
-	(*AuthResult)(nil),                  // 4: veil.v1.AuthResult
-	(*DeviceBindingV1)(nil),             // 5: veil.v1.DeviceBindingV1
-	(*DeviceDirectoryEntry)(nil),        // 6: veil.v1.DeviceDirectoryEntry
-	(*ConversationDeviceDirectory)(nil), // 7: veil.v1.ConversationDeviceDirectory
-	(*RegisterDevice)(nil),              // 8: veil.v1.RegisterDevice
+	(AuthFailureReason)(0),              // 0: veil.v1.AuthFailureReason
+	(DeviceCapability)(0),               // 1: veil.v1.DeviceCapability
+	(DeviceBindingStatus)(0),            // 2: veil.v1.DeviceBindingStatus
+	(*AuthChallenge)(nil),               // 3: veil.v1.AuthChallenge
+	(*AuthResponse)(nil),                // 4: veil.v1.AuthResponse
+	(*AuthResult)(nil),                  // 5: veil.v1.AuthResult
+	(*DeviceBindingV1)(nil),             // 6: veil.v1.DeviceBindingV1
+	(*DeviceDirectoryEntry)(nil),        // 7: veil.v1.DeviceDirectoryEntry
+	(*ConversationDeviceDirectory)(nil), // 8: veil.v1.ConversationDeviceDirectory
+	(*RegisterDevice)(nil),              // 9: veil.v1.RegisterDevice
 }
 var file_veil_v1_auth_proto_depIdxs = []int32{
-	5, // 0: veil.v1.AuthResponse.device_binding:type_name -> veil.v1.DeviceBindingV1
-	1, // 1: veil.v1.AuthResult.device_binding_status:type_name -> veil.v1.DeviceBindingStatus
-	1, // 2: veil.v1.DeviceBindingV1.status:type_name -> veil.v1.DeviceBindingStatus
-	5, // 3: veil.v1.DeviceDirectoryEntry.binding:type_name -> veil.v1.DeviceBindingV1
-	6, // 4: veil.v1.ConversationDeviceDirectory.devices:type_name -> veil.v1.DeviceDirectoryEntry
-	5, // [5:5] is the sub-list for method output_type
-	5, // [5:5] is the sub-list for method input_type
-	5, // [5:5] is the sub-list for extension type_name
-	5, // [5:5] is the sub-list for extension extendee
-	0, // [0:5] is the sub-list for field type_name
+	6, // 0: veil.v1.AuthResponse.device_binding:type_name -> veil.v1.DeviceBindingV1
+	2, // 1: veil.v1.AuthResult.device_binding_status:type_name -> veil.v1.DeviceBindingStatus
+	0, // 2: veil.v1.AuthResult.failure_reason:type_name -> veil.v1.AuthFailureReason
+	2, // 3: veil.v1.DeviceBindingV1.status:type_name -> veil.v1.DeviceBindingStatus
+	6, // 4: veil.v1.DeviceDirectoryEntry.binding:type_name -> veil.v1.DeviceBindingV1
+	7, // 5: veil.v1.ConversationDeviceDirectory.devices:type_name -> veil.v1.DeviceDirectoryEntry
+	6, // [6:6] is the sub-list for method output_type
+	6, // [6:6] is the sub-list for method input_type
+	6, // [6:6] is the sub-list for extension type_name
+	6, // [6:6] is the sub-list for extension extendee
+	0, // [0:6] is the sub-list for field type_name
 }
 
 func init() { file_veil_v1_auth_proto_init() }
@@ -862,7 +946,7 @@ func file_veil_v1_auth_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_veil_v1_auth_proto_rawDesc), len(file_veil_v1_auth_proto_rawDesc)),
-			NumEnums:      2,
+			NumEnums:      3,
 			NumMessages:   7,
 			NumExtensions: 0,
 			NumServices:   0,

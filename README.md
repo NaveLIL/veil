@@ -13,9 +13,15 @@
 
 Veil — native-first система защищённых личных и совместных пространств. Один
 origin-scoped account и одна понятная модель доверия используются в Home,
-Direct, Circle и структурированных Space/Room. Проект ещё не выпускался и
-сейчас находится в pre-release разработке: это не завершённый, независимо
-проаудированный или подписанный production-релиз.
+Direct, Circle и структурированных Space/Room. Проект публикует версионированные
+Preview-сборки, но ещё не достиг стабильного релиза: это не завершённый,
+независимо проаудированный или подписанный production-продукт.
+
+[Сайт проекта](https://veil.erez.pro/) ·
+[Скачать Preview](https://veil.erez.pro/#download) ·
+[Документация](docs/README.md) ·
+[Безопасность](SECURITY.md) ·
+[Участие в разработке](CONTRIBUTING.md)
 
 > **Security boundary.** Операции с приватными ключами, E2EE state и
 > расшифрованное долговременное хранилище остаются в Rust. Recovery phrase
@@ -35,6 +41,7 @@ Direct, Circle и структурированных Space/Room. Проект е
 | **Space** | совместное пространство с участниками, ролями и Rooms |
 | **Room** | отдельный функциональный и криптографический контекст внутри Space |
 | **Veil Node** | self-hosted инфраструктура и exact canonical origin аккаунта |
+| **Node Access Pass** | одноразовый доступ к созданию одного аккаунта на закрытом Node; повторные входы его не требуют |
 | **Veil Link** | ограниченное versioned приглашение в Space; не identity proof и не credential аккаунта |
 
 Будущий **Community** — это публикационная форма совместного пространства с
@@ -43,9 +50,10 @@ Direct, Circle и структурированных Space/Room. Проект е
 отдельные product/schema/privacy/security review и явная политика истории.
 
 Браузерного клиента Veil нет и не планируется. Web-поверхности ограничены
-статическим сайтом/документацией/загрузками, origin-hosted preview Veil Link и
-узким one-time Share Viewer. Они не получают account session, recovery flow,
-историю сообщений или ключи native-клиента.
+статическим сайтом/документацией/загрузками, origin-hosted страницами Node
+Access Pass и preview Veil Link, а также узким one-time Share Viewer. Они не
+получают account session, recovery flow, историю сообщений или ключи
+native-клиента.
 
 ## Текущее состояние
 

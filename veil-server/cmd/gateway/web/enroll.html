@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <meta name="theme-color" content="#07101d">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'">
+  <title>Veil Node Access Pass</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #050912;
+      color: #f2f7ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      min-height: 100svh;
+      overflow-x: hidden;
+      background:
+        radial-gradient(circle at 12% 9%, rgba(27, 149, 232, .24), transparent 34%),
+        radial-gradient(circle at 88% 88%, rgba(112, 71, 236, .23), transparent 38%),
+        linear-gradient(145deg, #07101d 0%, #070a15 52%, #100d25 100%);
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .16;
+      background-image: linear-gradient(rgba(126, 190, 255, .15) 1px, transparent 1px), linear-gradient(90deg, rgba(126, 190, 255, .15) 1px, transparent 1px);
+      background-size: 46px 46px;
+      mask-image: linear-gradient(to bottom, black, transparent 78%);
+    }
+    .shell {
+      position: relative;
+      min-height: 100vh;
+      min-height: 100svh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      padding: 28px clamp(18px, 5vw, 72px);
+    }
+    .top, .foot { display: flex; align-items: center; justify-content: space-between; }
+    .brand { display: flex; align-items: center; gap: 11px; font-size: 12px; font-weight: 800; letter-spacing: .22em; }
+    .brandmark {
+      width: 34px; height: 34px; border-radius: 11px; display: grid; place-items: center;
+      background: linear-gradient(145deg, #46b4fb, #7259ef);
+      box-shadow: 0 10px 34px rgba(68, 145, 250, .3), inset 0 1px rgba(255,255,255,.2);
+    }
+    .brandmark svg { width: 20px; height: 20px; }
+    .preview { color: #90a4c3; font: 11px ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .stage { display: grid; place-items: center; padding: 44px 0; }
+    .pass {
+      position: relative;
+      width: min(940px, 100%);
+      display: grid;
+      grid-template-columns: minmax(0, 1.16fr) minmax(315px, .84fr);
+      overflow: hidden;
+      border: 1px solid rgba(101, 157, 222, .38);
+      border-radius: 28px;
+      background: linear-gradient(137deg, rgba(17, 31, 53, .96), rgba(8, 14, 27, .97));
+      box-shadow: 0 44px 130px rgba(0,0,0,.65), 0 0 100px rgba(55, 132, 220, .12);
+      backdrop-filter: blur(18px);
+    }
+    .pass::before, .pass::after {
+      content: ""; position: absolute; left: calc(58% - 15px); z-index: 2;
+      width: 30px; height: 30px; border-radius: 50%; background: #060c17; border: 1px solid #304a70;
+    }
+    .pass::before { top: -16px; }
+    .pass::after { bottom: -16px; }
+    .hero {
+      min-width: 0; min-height: 520px; padding: 58px;
+      display: flex; flex-direction: column; justify-content: center;
+      background: radial-gradient(circle at 26% 22%, rgba(40, 128, 190, .42), transparent 49%);
+    }
+    .eyebrow { color: #82d0ff; font-size: 10px; font-weight: 800; letter-spacing: .24em; text-transform: uppercase; }
+    .keymark {
+      width: 88px; height: 88px; margin: 27px 0 25px; border-radius: 27px;
+      display: grid; place-items: center; color: #8bd5ff;
+      background: linear-gradient(145deg, #173b5b, #252553);
+      border: 1px solid #46749b;
+      box-shadow: inset 0 1px rgba(255,255,255,.09), 0 18px 50px rgba(0,0,0,.36);
+    }
+    .keymark svg { width: 48px; height: 48px; }
+    h1 { margin: 0; font-size: clamp(36px, 5vw, 60px); line-height: 1.02; letter-spacing: -.05em; }
+    .lead { max-width: 540px; margin: 20px 0 0; color: #c2cee1; font-size: 15px; line-height: 1.7; }
+    .side {
+      min-width: 0; padding: 46px 40px; border-left: 1px dashed #314664;
+      display: flex; flex-direction: column; justify-content: center;
+    }
+    .label { color: #8197b8; font-size: 9px; font-weight: 800; letter-spacing: .17em; text-transform: uppercase; }
+    .origin { margin: 8px 0 24px; color: #dbe7f7; font: 12px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .facts { display: grid; gap: 9px; margin-bottom: 25px; }
+    .fact { padding: 13px 14px; border: 1px solid #273d5d; border-radius: 13px; background: rgba(4, 12, 24, .68); }
+    .fact b { display: block; margin-bottom: 5px; color: #8197b8; font-size: 9px; letter-spacing: .13em; text-transform: uppercase; }
+    .fact span { color: #d7e3f4; font-size: 12px; line-height: 1.45; }
+    .primary, .secondary {
+      min-height: 50px; border-radius: 14px; display: flex; align-items: center; justify-content: center;
+      gap: 9px; font: inherit; font-weight: 800; text-decoration: none; cursor: pointer;
+    }
+    .primary { border: 0; color: #06101e; background: linear-gradient(135deg, #65c4fa, #8066f6); box-shadow: 0 14px 34px rgba(77, 121, 220, .3); }
+    .primary::after { content: "\2192"; font-size: 18px; }
+    .primary:hover { filter: brightness(1.07); transform: translateY(-1px); }
+    .primary[aria-disabled="true"] { pointer-events: none; opacity: .42; }
+    .secondary { min-height: 42px; margin-top: 10px; border: 1px solid #2c4568; color: #bed2ec; background: rgba(10, 22, 39, .78); font-size: 12px; }
+    .actions { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+    .note { min-height: 34px; margin: 14px 2px 0; color: #8194b1; font-size: 10.5px; line-height: 1.55; text-align: center; }
+    .danger { color: #f2b36e; }
+    .foot { justify-content: center; color: #8194b1; font-size: 11px; text-align: center; }
+    :focus-visible { outline: 3px solid #76caff; outline-offset: 4px; }
+    @media (max-width: 760px) {
+      .shell { padding: 20px 15px; }
+      .preview { display: none; }
+      .stage { padding: 28px 0; }
+      .pass { grid-template-columns: 1fr; border-radius: 22px; }
+      .pass::before, .pass::after { display: none; }
+      .hero { min-height: auto; padding: 38px 28px 34px; }
+      .keymark { width: 72px; height: 72px; border-radius: 22px; }
+      .keymark svg { width: 40px; height: 40px; }
+      .side { padding: 30px 28px 34px; border-left: 0; border-top: 1px dashed #314664; }
+      .actions { grid-template-columns: 1fr; }
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .pass { animation: enter .4s cubic-bezier(.2,.8,.2,1); }
+      @keyframes enter { from { opacity: 0; transform: translateY(14px) scale(.99); } to { opacity: 1; transform: none; } }
+      .primary { transition: transform .18s ease, filter .18s ease; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header class="top">
+      <div class="brand">
+        <span class="brandmark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 4H8V11.8L4 13ZM4 16L8 14.8V20H4ZM10 2H14V10.5L10 11.7ZM10 14.7L14 13.5V22H10ZM16 5H20V8.2L16 9.4ZM16 12.4L20 11.2V19H16Z"/></svg>
+        </span>
+        VEIL
+      </div>
+      <div class="preview">PREVIEW ACCESS &middot; ONE USE</div>
+    </header>
+    <main class="stage">
+      <article class="pass">
+        <section class="hero">
+          <div class="eyebrow">Node Access Pass</div>
+          <div class="keymark" aria-hidden="true">
+            <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M20 28a11 11 0 1 1 7.8-3.2L42 39v4h-6v-5h-5v-5h-4.3"/>
+              <circle cx="14" cy="17" r="2" fill="currentColor" stroke="none"/>
+            </svg>
+          </div>
+          <h1>Доступ к Veil Preview</h1>
+          <p class="lead">Этот пропуск позволяет один раз создать аккаунт на управляемом Veil Node. Recovery phrase будет сгенерирована только внутри приложения на вашем устройстве.</p>
+        </section>
+        <aside class="side">
+          <div class="label">Exact Veil Node</div>
+          <div id="origin" class="origin">https://veil.erez.pro</div>
+          <div class="facts">
+            <div class="fact"><b>Использование</b><span>Одна успешная регистрация, затем пропуск сгорает</span></div>
+            <div class="fact"><b>Приватность</b><span>Оператор Node не получает вашу recovery phrase</span></div>
+            <div class="fact"><b>Что дальше</b><span>Вступление в Space оформляется отдельным Veil Link</span></div>
+          </div>
+          <a id="open" class="primary" aria-disabled="true">Открыть в Veil</a>
+          <div class="actions">
+            <button id="copy" class="secondary" type="button" disabled>Скопировать ссылку</button>
+            <a class="secondary" href="/#download" target="_blank" rel="noopener">Скачать приложение</a>
+          </div>
+          <p id="status" class="note" role="status">Проверяем одноразовый пропуск…</p>
+        </aside>
+      </article>
+    </main>
+    <footer class="foot">Node Access Pass создаёт аккаунт, но не подтверждает личность отправителя и не добавляет вас в Space.</footer>
+  </div>
+  <script>
+    (() => {
+      const open = document.getElementById('open');
+      const copy = document.getElementById('copy');
+      const status = document.getElementById('status');
+      document.getElementById('origin').textContent = location.origin;
+      const token = new URLSearchParams(location.hash.slice(1)).get('invite');
+      if (location.hash) history.replaceState(null, '', location.pathname);
+      const canonical = /^[A-Za-z0-9_-]{43}$/.test(token || '');
+      if (!canonical) {
+        status.textContent = 'Пропуск повреждён, уже удалён из ссылки или имеет неподдерживаемый формат.';
+        status.classList.add('danger');
+        return;
+      }
+
+      try {
+        const decoded = atob(token.replace(/-/g, '+').replace(/_/g, '/') + '=');
+        if (decoded.length !== 32) throw new Error('wrong length');
+      } catch {
+        status.textContent = 'Пропуск повреждён или имеет неподдерживаемый формат.';
+        status.classList.add('danger');
+        return;
+      }
+      // Keep the clipboard fallback canonical even when the page was opened
+      // through the compatibility /enroll/ route. The native parser accepts
+      // only /enroll so a copied pass cannot acquire an ambiguous path.
+      const enrollmentLink = location.origin + '/enroll#invite=' + token;
+      const deepLink = 'veil://enroll/v1?origin=' + encodeURIComponent(location.origin) + '&invite=' + encodeURIComponent(token);
+      open.href = deepLink;
+      open.removeAttribute('aria-disabled');
+      copy.disabled = false;
+      status.textContent = 'Пропуск готов. Приложение проверит точный Node перед отправкой.';
+
+      copy.addEventListener('click', async () => {
+        try {
+          await navigator.clipboard.writeText(enrollmentLink);
+          copy.textContent = 'Ссылка скопирована';
+          status.textContent = 'Вставьте ссылку в Veil сразу: история буфера обмена может сохранить её.';
+          window.setTimeout(() => { copy.textContent = 'Скопировать ссылку'; }, 2500);
+        } catch {
+          status.textContent = 'Браузер запретил доступ к буферу. Откройте исходную ссылку в Veil.';
+          status.classList.add('danger');
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

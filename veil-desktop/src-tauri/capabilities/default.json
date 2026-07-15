@@ -4,6 +4,7 @@
   "description": "Default permissions for the main window",
   "windows": ["main"],
   "permissions": [
+    "core:app:allow-version",
     "core:window:default",
     "core:window:allow-minimize",
     "core:window:allow-toggle-maximize",

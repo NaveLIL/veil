@@ -16,7 +16,10 @@ RUN node scripts/generate-third-party-notices.mjs \
     && cd veil-server \
     && CGO_ENABLED=0 go build -trimpath \
     -ldflags="-s -w -X main.buildCommit=${VEIL_BUILD_COMMIT}" \
-    -o veil-gateway ./cmd/gateway
+    -o veil-gateway ./cmd/gateway \
+    && CGO_ENABLED=0 go build -trimpath \
+    -ldflags="-s -w" \
+    -o veil-admin ./cmd/veil-admin
 
 FROM alpine:3.21
 ARG VEIL_BUILD_COMMIT
@@ -42,6 +45,7 @@ RUN apk add --no-cache ca-certificates \
     } > /usr/share/licenses/veil/ALPINE_PACKAGES.txt
 WORKDIR /app
 COPY --from=build /src/veil-server/veil-gateway /app/veil-gateway
+COPY --from=build /src/veil-server/veil-admin /app/veil-admin
 COPY --from=build /src/veil-server/THIRD_PARTY_NOTICES.txt /usr/share/licenses/veil/THIRD_PARTY_NOTICES.txt
 COPY LICENSE NOTICE THIRD_PARTY_NOTICES.md TRADEMARKS.md /usr/share/licenses/veil/
 RUN chmod 0755 /usr/share/licenses /usr/share/licenses/veil \

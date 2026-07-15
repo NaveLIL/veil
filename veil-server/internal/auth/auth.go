@@ -36,6 +36,7 @@ var (
 	ErrBadDeviceName      = errors.New("device_name must be 1..128 UTF-8 bytes without control characters")
 	ErrTooManyAttempts    = errors.New("too many auth attempts")
 	ErrRegistrationClosed = errors.New("registration is closed")
+	ErrInviteInvalid      = errors.New("node access invite is invalid")
 )
 
 const wsAuthDomainV2 = "veil-ws-auth-v2\x00"
@@ -125,6 +126,16 @@ func (s *Service) VerifyResponse(ctx context.Context, connID string, identityKey
 // cryptographic per-device binding and proof of possession. A legacy device
 // may omit the extension only while it has never been cryptographically bound.
 func (s *Service) VerifyResponseV1(ctx context.Context, connID string, identityKey, signingKey, signature, deviceID []byte, deviceName string, binding *DeviceBindingInput, deviceSignature []byte) (*AuthResult, error) {
+	return s.VerifyResponseV2(
+		ctx, connID, identityKey, signingKey, signature, deviceID, deviceName,
+		binding, deviceSignature, nil,
+	)
+}
+
+// VerifyResponseV2 adds an optional closed-Preview Node Access invite. Invite
+// state is intentionally consulted only after X25519 and Ed25519
+// proof-of-possession succeeds. Existing accounts do not need an invite.
+func (s *Service) VerifyResponseV2(ctx context.Context, connID string, identityKey, signingKey, signature, deviceID []byte, deviceName string, binding *DeviceBindingInput, deviceSignature, nodeAccessInvite []byte) (*AuthResult, error) {
 	// --- Input validation ---
 	if len(identityKey) != 32 {
 		return nil, ErrBadKeyLength
@@ -190,12 +201,21 @@ func (s *Service) VerifyResponseV1(ctx context.Context, connID string, identityK
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("find user: %w", err)
 		}
-		if !s.cfg.AllowRegistration {
-			return nil, ErrRegistrationClosed
-		}
 		// User doesn't exist — register
 		username := fmt.Sprintf("user_%x", identityKey[:4])
-		user, err = s.db.CreateUser(ctx, identityKey, signingKey, username)
+		if s.cfg.AllowRegistration {
+			user, err = s.db.CreateUser(ctx, identityKey, signingKey, username)
+		} else {
+			if len(nodeAccessInvite) == 0 {
+				return nil, ErrRegistrationClosed
+			}
+			user, err = s.db.CreateUserWithNodeAccessInvite(
+				ctx, nodeAccessInvite, identityKey, signingKey, username,
+			)
+			if errors.Is(err, db.ErrNodeAccessInviteInvalid) {
+				return nil, ErrInviteInvalid
+			}
+		}
 		if err != nil {
 			return nil, fmt.Errorf("create user: %w", err)
 		}

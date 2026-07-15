@@ -254,7 +254,9 @@ export const SettingsScreen: Component = () => {
       const pin = await invoke<boolean>("has_pin");
       setHasPin(pin);
     } catch { /* ignore */ }
-    getVersion().then(setAppVersion).catch(() => {});
+    getVersion().then(setAppVersion).catch((error) => {
+      console.warn("Failed to read application version:", error);
+    });
   });
 
   // Close on Escape

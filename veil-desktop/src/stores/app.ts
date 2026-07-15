@@ -159,6 +159,13 @@ export interface PendingVeilLink {
   expiresInSeconds: number;
 }
 
+export interface PendingNodeAccessPass {
+  flowId: string;
+  canonicalOrigin: string;
+  tokenRef: string;
+  expiresInSeconds: number;
+}
+
 export interface ConversationCryptoDiagnostic {
   conversationId: string;
   code: string;
@@ -302,6 +309,75 @@ function pendingVeilLinkFromJSON(value: unknown): PendingVeilLink | null {
     return null;
   }
   return candidate as PendingVeilLink;
+}
+
+export function pendingNodeAccessPassFromJSON(value: unknown): PendingNodeAccessPass | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const keys = Object.keys(value).sort();
+  if (keys.join("\n") !== [
+    "canonicalOrigin",
+    "expiresInSeconds",
+    "flowId",
+    "tokenRef",
+  ].join("\n")) return null;
+  const candidate = value as Partial<PendingNodeAccessPass>;
+  if (
+    typeof candidate.flowId !== "string"
+    || !/^[0-9a-f]{64}$/.test(candidate.flowId)
+    || typeof candidate.canonicalOrigin !== "string"
+    || typeof candidate.tokenRef !== "string"
+    || !/^[0-9a-f]{12}$/.test(candidate.tokenRef)
+    || typeof candidate.expiresInSeconds !== "number"
+    || !Number.isSafeInteger(candidate.expiresInSeconds)
+    || candidate.expiresInSeconds < 0
+    || candidate.expiresInSeconds > 10 * 60
+  ) return null;
+  try {
+    const parsed = new URL(candidate.canonicalOrigin);
+    if (
+      parsed.protocol !== "https:"
+      || parsed.pathname !== "/"
+      || parsed.search
+      || parsed.hash
+      || parsed.username
+      || parsed.password
+      || canonicalServerOriginFromHttpUrl(candidate.canonicalOrigin) !== candidate.canonicalOrigin
+    ) return null;
+  } catch {
+    return null;
+  }
+  return candidate as PendingNodeAccessPass;
+}
+
+export function nodeAccessEndpointsFromOrigin(canonicalOrigin: string): ServerEndpoints {
+  if (canonicalServerOriginFromHttpUrl(canonicalOrigin) !== canonicalOrigin) {
+    throw new Error("Node Access Pass origin is not canonical");
+  }
+  const http = new URL(canonicalOrigin);
+  if (http.protocol !== "https:" || http.pathname !== "/" || http.search || http.hash) {
+    throw new Error("Node Access Pass origin must use HTTPS");
+  }
+  const ws = new URL(http.toString());
+  ws.protocol = "wss:";
+  ws.pathname = "/ws";
+  return {
+    ws: ws.toString(),
+    http: http.toString().replace(/\/$/, ""),
+  };
+}
+
+export function friendlyNodeAccessError(error: unknown): string {
+  const detail = String(error);
+  if (detail.includes("node access registration is closed")) {
+    return "Registration on this Veil Node is invite-only. Paste a Node Access Pass from the node administrator, then continue with this identity.";
+  }
+  if (detail.includes("node access pass is invalid, expired, or already used")) {
+    return "This Node Access Pass is invalid, expired, or has already been used. Ask the node administrator for a fresh one-time pass.";
+  }
+  if (detail.includes("Node Access Pass") || detail.includes("node access pass")) {
+    return detail;
+  }
+  return detail;
 }
 
 function normalizeServerEndpoints(wsRaw: string, httpRaw: string): ServerEndpoints | null {
@@ -494,6 +570,8 @@ const [conversationCryptoDiagnostics, setConversationCryptoDiagnostics] = create
 const [serverMembers, setServerMembers] = createSignal<Record<string, ServerMember[]>>({});
 const [serverRoles, setServerRoles] = createSignal<Record<string, Role[]>>({});
 const [pendingVeilLink, setPendingVeilLink] = createSignal<PendingVeilLink | null>(null);
+const [pendingNodeAccessPass, setPendingNodeAccessPass] =
+  createSignal<PendingNodeAccessPass | null>(null);
 // Currently-open server settings overlay; null = closed.
 const [serverSettingsId, setServerSettingsId] = createSignal<string | null>(null);
 // Typing indicators: conversationId → Set of identityKeys currently typing
@@ -682,8 +760,42 @@ function scheduleReconnect(expectedEpoch: number, immediate = false): void {
   }, delay);
 }
 
+export function routePendingNodeAccessPassScreen(
+  next: Screen,
+  hasPendingPass: boolean,
+  isConnected: boolean,
+): Screen {
+  return hasPendingPass && !isConnected && next !== "locked" && next !== "onboarding"
+    ? "onboarding"
+    : next;
+}
+
+export function requirePendingEnrollmentAccountSwitch(
+  currentScreen: Screen,
+  pending: PendingNodeAccessPass | null,
+  expectedFlowId: string,
+  isConnected: boolean,
+): string {
+  if (
+    currentScreen !== "onboarding"
+    || isConnected
+    || !pending
+    || !/^[0-9a-f]{64}$/.test(expectedFlowId)
+    || pending.flowId !== expectedFlowId
+    || pending.expiresInSeconds <= 0
+  ) {
+    throw new Error("account switch requires the exact pending enrollment flow");
+  }
+  return expectedFlowId;
+}
+
 const setScreen: typeof setScreenRaw = ((value: Parameters<typeof setScreenRaw>[0]) => {
-  const next = typeof value === "function" ? value(screen()) : value;
+  const requested = typeof value === "function" ? value(screen()) : value;
+  const next = routePendingNodeAccessPassScreen(
+    requested,
+    pendingNodeAccessPass() !== null,
+    connected(),
+  );
   if (!uiSessionActive && next !== "locked" && next !== "onboarding") return screen();
   return setScreenRaw(next);
 }) as typeof setScreenRaw;
@@ -1082,6 +1194,7 @@ function clearSensitiveUi(): void {
   setScreen("locked");
   setIdentity(null);
   setPendingVeilLink(null);
+  setPendingNodeAccessPass(null);
   setAuthenticatedServerScope(null);
   setPendingAuthenticatedServerScope(null);
   setBindingTransitioning(false);
@@ -1219,6 +1332,7 @@ export const appStore = {
   serverMembers,
   serverRoles,
   pendingVeilLink,
+  pendingNodeAccessPass,
   serverSettingsId,
   typingUsers,
   reactions,
@@ -1375,6 +1489,7 @@ export const appStore = {
         setOriginTransitioning(false);
         setUserId(scope.userId);
         setConnected(true);
+        setPendingNodeAccessPass(null);
         setReconnecting(false);
         setBindingTransitioning(false);
         reconnectAttempt = 0;
@@ -1941,9 +2056,14 @@ export const appStore = {
       const key = await invoke<string>("get_identity_key");
       if (!activateUiSession(unlockAttemptEpoch)) return false;
       setIdentity(key);
+      await appStore.refreshPendingNodeAccessPass().catch(() => null);
       const unlockedEpoch = captureUiSessionEpoch();
       setTimeout(async () => {
         if (!isUiSessionEpochCurrent(unlockedEpoch)) return;
+        if (pendingNodeAccessPass()) {
+          setScreen("onboarding");
+          return;
+        }
         await appStore.loadConversations();
         if (!isUiSessionEpochCurrent(unlockedEpoch)) return;
         appStore.startAutoLock();
@@ -2010,6 +2130,42 @@ export const appStore = {
     }
     setPinConfigured(false);
     setScreen("onboarding");
+  },
+
+  /**
+   * Remove the current identity while preserving only the exact native
+   * enrollment pass the user is presently confirming on onboarding.
+   */
+  signOutForPendingNodeAccessPass: async (
+    expectedPendingFlowId: string,
+  ): Promise<void> => {
+    const flowId = requirePendingEnrollmentAccountSwitch(
+      screen(),
+      pendingNodeAccessPass(),
+      expectedPendingFlowId,
+      connected(),
+    );
+    await invoke("sign_out_for_node_access_pass", {
+      expectedPendingFlowId: flowId,
+    });
+
+    clearSensitiveUi();
+    const clearedEpoch = captureUiSessionEpoch();
+    if (!activateUiSession(clearedEpoch)) {
+      throw new StaleUiSessionError();
+    }
+    setPinConfigured(false);
+    setScreen("onboarding");
+
+    // clearSensitiveUi intentionally drops every renderer-held capability.
+    // Rehydrate only the safe native view, then require the same flow we
+    // authorized before allowing onboarding to continue.
+    const restored = await appStore.refreshPendingNodeAccessPass();
+    if (!restored || restored.flowId !== flowId) {
+      throw new Error(
+        "native account switch did not preserve the expected Node Access Pass",
+      );
+    }
   },
 
   /** Re-open the keychain identity and publish a fresh renderer session. */
@@ -2923,6 +3079,49 @@ export const appStore = {
       console.error("create_invite failed:", e);
       throw e;
     }
+  },
+
+  stageNodeAccessPassFromClipboard: async (): Promise<PendingNodeAccessPass> => {
+    const value = await invoke<unknown>("stage_node_access_pass_from_clipboard");
+    const pending = pendingNodeAccessPassFromJSON(value);
+    if (!pending) {
+      setPendingNodeAccessPass(null);
+      throw new Error("native Node Access Pass view is invalid");
+    }
+    if (!connected()) {
+      const endpoints = nodeAccessEndpointsFromOrigin(pending.canonicalOrigin);
+      setServerEndpoints(endpoints.ws, endpoints.http);
+    }
+    setPendingNodeAccessPass(pending);
+    return pending;
+  },
+
+  refreshPendingNodeAccessPass: async (): Promise<PendingNodeAccessPass | null> => {
+    const value = await invoke<unknown>("get_pending_node_access_pass");
+    const pending = value === null ? null : pendingNodeAccessPassFromJSON(value);
+    if (value !== null && !pending) {
+      setPendingNodeAccessPass(null);
+      throw new Error("native pending Node Access Pass state is invalid");
+    }
+    if (pending && !connected()) {
+      const endpoints = nodeAccessEndpointsFromOrigin(pending.canonicalOrigin);
+      setServerEndpoints(endpoints.ws, endpoints.http);
+    }
+    setPendingNodeAccessPass(pending);
+    return pending;
+  },
+
+  cancelPendingNodeAccessPass: async (expectedPendingFlowId: string): Promise<boolean> => {
+    if (!/^[0-9a-f]{64}$/.test(expectedPendingFlowId)) {
+      throw new Error("pending Node Access Pass flow id is invalid");
+    }
+    const cleared = await invoke<boolean>("cancel_pending_node_access_pass", {
+      expectedPendingFlowId,
+    });
+    if (cleared && pendingNodeAccessPass()?.flowId === expectedPendingFlowId) {
+      setPendingNodeAccessPass(null);
+    }
+    return cleared;
   },
 
   refreshPendingVeilLink: async (): Promise<PendingVeilLink | null> => {
@@ -3859,6 +4058,30 @@ export const appStore = {
       // linear with the same authority.
       if (!pendingLinkEventObserved) {
         setPendingVeilLink(pendingValue === null ? null : pendingVeilLinkFromJSON(pendingValue));
+      }
+
+      let pendingNodeAccessEventObserved = false;
+      await register<PendingNodeAccessPass>("veil://pending-node-access-pass", (event) => {
+        pendingNodeAccessEventObserved = true;
+        const value = pendingNodeAccessPassFromJSON(event.payload);
+        setPendingNodeAccessPass(value);
+        if (value && !connected() && screen() !== "locked") {
+          setScreen("onboarding");
+          const endpoints = nodeAccessEndpointsFromOrigin(value.canonicalOrigin);
+          setServerEndpoints(endpoints.ws, endpoints.http);
+        }
+      });
+      const pendingNodeAccessValue = await invoke<unknown>("get_pending_node_access_pass");
+      if (!pendingNodeAccessEventObserved) {
+        const value = pendingNodeAccessValue === null
+          ? null
+          : pendingNodeAccessPassFromJSON(pendingNodeAccessValue);
+        setPendingNodeAccessPass(value);
+        if (value && !connected() && screen() !== "locked") {
+          setScreen("onboarding");
+          const endpoints = nodeAccessEndpointsFromOrigin(value.canonicalOrigin);
+          setServerEndpoints(endpoints.ws, endpoints.http);
+        }
       }
       eventListenersInitialized = true;
     } catch (error) {

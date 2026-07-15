@@ -39,6 +39,14 @@ fn client_version(client_id: &str) -> String {
     format!("{client_id}/{}", env!("CARGO_PKG_VERSION"))
 }
 
+fn node_access_invite_wire_value(invite: Option<&[u8]>) -> Result<Vec<u8>, String> {
+    match invite {
+        None => Ok(Vec::new()),
+        Some(value) if value.len() == 32 => Ok(value.to_vec()),
+        Some(_) => Err("node access pass must contain exactly 32 bytes".to_string()),
+    }
+}
+
 /// Configuration for the WebSocket connection.
 pub struct ConnectionConfig {
     pub server_url: String,
@@ -93,10 +101,23 @@ fn validate_per_device_auth_result(
     expected: &DeviceBindingPublicV1,
 ) -> Result<String, String> {
     if !result.success {
-        return Err(format!(
-            "auth failed: {}",
-            result.error_message.clone().unwrap_or_default()
-        ));
+        let message = match proto::AuthFailureReason::try_from(result.failure_reason) {
+            Ok(proto::AuthFailureReason::RegistrationClosed) => {
+                "node access registration is closed; a valid access pass is required".to_string()
+            }
+            Ok(proto::AuthFailureReason::InviteInvalid) => {
+                "node access pass is invalid, expired, or already used".to_string()
+            }
+            _ => {
+                let detail = result.error_message.as_deref().unwrap_or_default().trim();
+                if detail.is_empty() {
+                    "authentication failed".to_string()
+                } else {
+                    format!("authentication failed: {detail}")
+                }
+            }
+        };
+        return Err(message);
     }
     if !result.per_device_secure {
         return Err(
@@ -374,9 +395,11 @@ impl Connection {
         device_identity: &DeviceIdentityV1,
         device_name: &str,
         client_id: &str,
+        node_access_invite: Option<&[u8]>,
     ) -> Result<Self, String> {
         let url = &config.server_url;
         validate_websocket_url(url)?;
+        let node_access_invite = node_access_invite_wire_value(node_access_invite)?;
         // Keep endpoint and account metadata out of production diagnostics.
         info!("connecting to validated WebSocket endpoint");
 
@@ -434,7 +457,7 @@ impl Connection {
         let sig = websocket_auth_signature(identity, &challenge)?;
         let device_sig = device_identity.auth_signature(identity, &challenge)?;
         let binding = device_identity.binding();
-        let auth_resp = proto::Envelope {
+        let mut auth_resp = proto::Envelope {
             seq: 2,
             timestamp: 0,
             payload: Some(proto::envelope::Payload::AuthResponse(
@@ -455,10 +478,14 @@ impl Connection {
                         account_signature: binding.account_signature.to_vec(),
                     }),
                     device_signature: device_sig.to_vec(),
+                    node_access_invite,
                 },
             )),
         };
         let auth_bytes = auth_resp.encode_to_vec();
+        if let Some(proto::envelope::Payload::AuthResponse(response)) = auth_resp.payload.as_mut() {
+            response.node_access_invite.zeroize();
+        }
         ws_write
             .send(WsMessage::Binary(auth_bytes))
             .await
@@ -684,8 +711,9 @@ impl Drop for Connection {
 #[allow(clippy::items_after_test_module)]
 mod url_policy_tests {
     use super::{
-        client_version, signal_disconnected, validate_per_device_auth_result,
-        validate_websocket_url, websocket_auth_signature, Connection, ConnectionEvent,
+        client_version, node_access_invite_wire_value, signal_disconnected,
+        validate_per_device_auth_result, validate_websocket_url, websocket_auth_signature,
+        Connection, ConnectionEvent,
     };
     use crate::device_identity::{
         DeviceBindingPublicV1, DEVICE_BINDING_STATUS_ACTIVE, REQUIRED_DEVICE_CAPABILITIES,
@@ -703,6 +731,17 @@ mod url_policy_tests {
             client_version("veil-desktop"),
             client_version("MacBook Pro")
         );
+    }
+
+    #[test]
+    fn existing_account_auth_omits_node_access_pass_and_new_registration_is_exact() {
+        assert!(node_access_invite_wire_value(None).unwrap().is_empty());
+        assert_eq!(
+            node_access_invite_wire_value(Some(&[0x42; 32])).unwrap(),
+            vec![0x42; 32]
+        );
+        assert!(node_access_invite_wire_value(Some(&[0x42; 31])).is_err());
+        assert!(node_access_invite_wire_value(Some(&[0x42; 33])).is_err());
     }
 
     #[test]
@@ -820,6 +859,7 @@ mod url_policy_tests {
             per_device_secure: true,
             device_binding_version: 1,
             device_binding_status: i32::from(DEVICE_BINDING_STATUS_ACTIVE),
+            failure_reason: proto::AuthFailureReason::Unspecified as i32,
         };
         assert_eq!(
             validate_per_device_auth_result(&secure, &binding).unwrap(),
@@ -837,6 +877,40 @@ mod url_policy_tests {
         let mut excluded = secure;
         excluded.device_binding_status = 2;
         assert!(validate_per_device_auth_result(&excluded, &binding).is_err());
+    }
+
+    #[test]
+    fn maps_closed_registration_and_invalid_pass_without_server_secret_detail() {
+        let binding = DeviceBindingPublicV1 {
+            device_id: [1u8; 16],
+            device_identity_key: [2u8; 32],
+            device_signing_key: [3u8; 32],
+            version: 1,
+            capabilities: REQUIRED_DEVICE_CAPABILITIES,
+            status: DEVICE_BINDING_STATUS_ACTIVE,
+            account_signature: [4u8; 64],
+        };
+        let mut failed = proto::AuthResult {
+            success: false,
+            user_id: None,
+            error_message: Some("internal invite lookup detail".to_string()),
+            per_device_secure: false,
+            device_binding_version: 0,
+            device_binding_status: 0,
+            failure_reason: proto::AuthFailureReason::RegistrationClosed as i32,
+        };
+        assert_eq!(
+            validate_per_device_auth_result(&failed, &binding).unwrap_err(),
+            "node access registration is closed; a valid access pass is required"
+        );
+
+        failed.failure_reason = proto::AuthFailureReason::InviteInvalid as i32;
+        let error = validate_per_device_auth_result(&failed, &binding).unwrap_err();
+        assert_eq!(
+            error,
+            "node access pass is invalid, expired, or already used"
+        );
+        assert!(!error.contains("lookup"));
     }
 }
 

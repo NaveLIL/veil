@@ -1,7 +1,7 @@
 import { Component, createSignal, Show, For, onMount, onCleanup } from "solid-js";
 import { invoke } from "@tauri-apps/api/core";
-import { appStore, StaleUiSessionError } from "@/stores/app";
-import { AlertTriangle, ArrowRightLeft, Check, Copy, Eye, EyeOff, KeyRound, LogIn, ShieldCheck } from "lucide-solid";
+import { appStore, friendlyNodeAccessError, StaleUiSessionError } from "@/stores/app";
+import { AlertTriangle, ArrowRightLeft, Check, Copy, Eye, EyeOff, KeyRound, LogIn, ShieldCheck, TicketCheck, X } from "lucide-solid";
 import { VeilMark } from "@/components/brand/VeilMark";
 import { Z } from "@/lib/zIndex";
 import { confirmDecision, promptDecision } from "@/lib/decisionDialog";
@@ -51,6 +51,7 @@ export const OnboardingScreen: Component = () => {
   const [leaving, setLeaving] = createSignal(false);
   const [entering, setEntering] = createSignal(false);
   const [phraseCopied, setPhraseCopied] = createSignal(false);
+  const [accessPassLoading, setAccessPassLoading] = createSignal(false);
 
   const words = () => mnemonic().split(" ").filter(Boolean);
   const existingIdentity = () => identityState() === "existing";
@@ -81,7 +82,10 @@ export const OnboardingScreen: Component = () => {
   });
 
   onMount(async () => {
-    await refreshIdentityState();
+    await Promise.all([
+      refreshIdentityState(),
+      appStore.refreshPendingNodeAccessPass().catch(() => null),
+    ]);
   });
 
   let taglineTimer: ReturnType<typeof setInterval>;
@@ -178,7 +182,15 @@ export const OnboardingScreen: Component = () => {
         setStep("welcome");
         await refreshIdentityState();
       } else {
-        setError(detail);
+        const friendly = friendlyNodeAccessError(e);
+        if (
+          detail.includes("node access registration is closed")
+          || detail.includes("node access pass is invalid, expired, or already used")
+        ) {
+          setStep("welcome");
+          await refreshIdentityState();
+        }
+        setError(friendly);
       }
     } finally {
       // Publication can fail while offline after the identity is already
@@ -198,9 +210,36 @@ export const OnboardingScreen: Component = () => {
     try {
       await appStore.resumeStoredIdentity();
     } catch (e) {
-      setError(String(e));
+      setError(friendlyNodeAccessError(e));
     } finally {
       setLoading(false);
+    }
+  };
+
+  const stageAccessPass = async () => {
+    if (accessPassLoading()) return;
+    setAccessPassLoading(true);
+    setError("");
+    try {
+      await appStore.stageNodeAccessPassFromClipboard();
+    } catch (e) {
+      setError(friendlyNodeAccessError(e));
+    } finally {
+      setAccessPassLoading(false);
+    }
+  };
+
+  const cancelAccessPass = async () => {
+    const pending = appStore.pendingNodeAccessPass();
+    if (!pending || accessPassLoading()) return;
+    setAccessPassLoading(true);
+    setError("");
+    try {
+      await appStore.cancelPendingNodeAccessPass(pending.flowId);
+    } catch (e) {
+      setError(friendlyNodeAccessError(e));
+    } finally {
+      setAccessPassLoading(false);
     }
   };
 
@@ -239,15 +278,27 @@ export const OnboardingScreen: Component = () => {
     setLoading(true);
     setError("");
     try {
-      await appStore.signOut();
+      const pending = appStore.pendingNodeAccessPass();
+      if (pending) {
+        await appStore.signOutForPendingNodeAccessPass(pending.flowId);
+      } else {
+        await appStore.signOut();
+      }
       setIdentityState("empty");
       setStep("welcome");
     } catch (e) {
       const detail = String(e);
-      if (e instanceof StaleUiSessionError || detail.includes("renderer session changed while IPC was in flight")) {
-        setIdentityState("empty");
+      // The native identity removal may have completed even if the safe pass
+      // rehydrate failed (for example, it expired at that exact boundary).
+      // Re-read native state so the UI never presents a deleted identity as
+      // still active after a post-destructive renderer error.
+      const refreshedIdentity = await refreshIdentityState();
+      if (refreshedIdentity === "empty") {
         setStep("welcome");
-      } else {
+        if (!(e instanceof StaleUiSessionError) && !detail.includes("renderer session changed while IPC was in flight")) {
+          setError(detail);
+        }
+      } else if (!(e instanceof StaleUiSessionError) && !detail.includes("renderer session changed while IPC was in flight")) {
         setError(detail);
       }
     } finally {
@@ -546,6 +597,62 @@ export const OnboardingScreen: Component = () => {
               </svg>
               Restore from Phrase
             </button>
+            <Show
+              when={appStore.pendingNodeAccessPass()}
+              fallback={
+                <div style={{
+                  padding: "10px", "border-radius": "12px",
+                  background: "color-mix(in srgb, var(--veil-accent) 5%, transparent)",
+                  border: "1px solid color-mix(in srgb, var(--veil-accent) 14%, transparent)",
+                }}>
+                  <div style={{ display: "flex", "align-items": "center", gap: "6px", "margin-bottom": "7px" }}>
+                    <TicketCheck size={13} color="var(--veil-accent)" />
+                    <span style={{ "font-size": "10px", "font-weight": "700", color: "var(--veil-contrast-70)", "letter-spacing": "0.08em" }}>
+                      NODE ACCESS PASS
+                    </span>
+                  </div>
+                  <button
+                    style={{ ...S.btnPrimary, width: "100%", height: "32px", padding: "0 10px", "font-size": "11px" }}
+                    disabled={accessPassLoading()}
+                    onClick={() => void stageAccessPass()}
+                  >{accessPassLoading() ? "Reading clipboard..." : "Paste full pass link from clipboard"}</button>
+                  <div style={{ "font-size": "9px", color: "var(--veil-text-faint)", "line-height": "1.4", "margin-top": "6px" }}>
+                    Deep links open here automatically. Clipboard import is read by the native process; the renderer receives only a short reference.
+                  </div>
+                </div>
+              }
+            >
+              {(pending) => (
+                <div style={{
+                  padding: "10px", "border-radius": "12px",
+                  background: "color-mix(in srgb, var(--veil-success) 7%, transparent)",
+                  border: "1px solid color-mix(in srgb, var(--veil-success) 22%, transparent)",
+                }}>
+                  <div style={{ display: "flex", "align-items": "center", gap: "7px" }}>
+                    <TicketCheck size={14} color="var(--veil-success)" />
+                    <div style={{ flex: "1", "min-width": "0" }}>
+                      <div style={{ "font-size": "10px", "font-weight": "700", color: "var(--veil-success)" }}>
+                        ACCESS PASS READY
+                      </div>
+                      <div style={{ "font-size": "9px", color: "var(--veil-text-faint)", overflow: "hidden", "text-overflow": "ellipsis", "white-space": "nowrap" }}>
+                        {pending().canonicalOrigin} · ref {pending().tokenRef}
+                      </div>
+                    </div>
+                    <button
+                      aria-label="Cancel Node Access Pass"
+                      title="Cancel Node Access Pass"
+                      disabled={accessPassLoading()}
+                      onClick={() => void cancelAccessPass()}
+                      style={{
+                        width: "26px", height: "26px", display: "flex", "align-items": "center", "justify-content": "center",
+                        "border-radius": "7px", border: "1px solid var(--veil-contrast-08)",
+                        background: "transparent", color: "var(--veil-text-faint)", cursor: "pointer",
+                      }}
+                    ><X size={13} /></button>
+                  </div>
+                </div>
+              )}
+            </Show>
           </div>
         </div>
       </Show>

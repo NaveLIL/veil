@@ -1242,8 +1242,30 @@ impl VeilClient {
     /// Performs Ed25519 challenge-response authentication.
     /// Returns the server-assigned user_id (UUID).
     pub async fn connect(&mut self, server_url: &str) -> Result<String, String> {
-        self.connect_with_client_metadata(server_url, "veil-desktop", "veil-desktop")
-            .await
+        self.connect_with_client_metadata_and_node_access(
+            server_url,
+            "veil-desktop",
+            "veil-desktop",
+            None,
+        )
+        .await
+    }
+
+    /// Connect while presenting an optional origin-scoped Node Access Pass.
+    /// The caller owns pass lifetime and storage; the client copies it only
+    /// into the TLS-protected authentication envelope for this attempt.
+    pub async fn connect_with_node_access_invite(
+        &mut self,
+        server_url: &str,
+        node_access_invite: Option<&[u8]>,
+    ) -> Result<String, String> {
+        self.connect_with_client_metadata_and_node_access(
+            server_url,
+            "veil-desktop",
+            "veil-desktop",
+            node_access_invite,
+        )
+        .await
     }
 
     /// Connect with a fixed, native-platform device label. Product frontends
@@ -1266,6 +1288,20 @@ impl VeilClient {
         device_name: &str,
         client_id: &str,
     ) -> Result<String, String> {
+        self.connect_with_client_metadata_and_node_access(server_url, device_name, client_id, None)
+            .await
+    }
+
+    async fn connect_with_client_metadata_and_node_access(
+        &mut self,
+        server_url: &str,
+        device_name: &str,
+        client_id: &str,
+        node_access_invite: Option<&[u8]>,
+    ) -> Result<String, String> {
+        if node_access_invite.is_some_and(|invite| invite.len() != 32) {
+            return Err("node access pass must contain exactly 32 bytes".to_string());
+        }
         if device_name.is_empty()
             || device_name.len() > 128
             || device_name.chars().any(|character| {
@@ -1291,8 +1327,15 @@ impl VeilClient {
             server_url: server_url.to_string(),
         };
 
-        let mut conn =
-            Connection::connect(&config, identity, device_identity, device_name, client_id).await?;
+        let mut conn = Connection::connect(
+            &config,
+            identity,
+            device_identity,
+            device_name,
+            client_id,
+            node_access_invite,
+        )
+        .await?;
 
         // Drain the Authenticated event to get user_id
         let user_id = match conn.events.try_recv() {

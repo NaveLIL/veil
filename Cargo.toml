@@ -10,6 +10,7 @@ members = [
     "veil-uploads",
     "veil-mls",
 ]
+exclude = ["third_party/wayland-scanner-0.31.10"]
 resolver = "2"
 
 [workspace.package]
@@ -26,6 +27,12 @@ publish = false
 # updated it to 0.0.8.  Pin the reviewed upstream revision until the next
 # hpke-rs-libcrux release is published.
 hpke-rs-libcrux = { git = "https://github.com/celabshq/hpke-rs", rev = "654df20e5c2e6657f0ac17f2a903f179bb97a5ae" }
+
+# wayland-scanner 0.31.10 pins quick-xml 0.39, which is affected by
+# RUSTSEC-2026-0194 and RUSTSEC-2026-0195. The vendored crates.io source keeps
+# the released scanner API and applies only upstream's dependency-only 0.41
+# security bump. See third_party/wayland-scanner-0.31.10/UPSTREAM.md.
+wayland-scanner = { path = "third_party/wayland-scanner-0.31.10" }
 
 [profile.release.package.veil-share-viewer]
 opt-level = "s"

@@ -18,6 +18,10 @@ message AuthResponse {
   string client_version = 6; // "veil-desktop/1.0.0"
   DeviceBindingV1 device_binding = 7; // Present only for cryptographic per-device auth.
   bytes device_signature = 8;         // Ed25519 signature over veil-device-auth-v1 preimage.
+  // Optional 256-bit Node Access invite. A first-time identity presents it
+  // inside the already-established TLS WebSocket after proving possession of
+  // its account keys. Existing identities never need an invite.
+  bytes node_access_invite = 9;
 }
 
 // Результат аутентификации
@@ -28,6 +32,18 @@ message AuthResult {
   bool per_device_secure = 4;
   uint64 device_binding_version = 5;
   DeviceBindingStatus device_binding_status = 6;
+  AuthFailureReason failure_reason = 7;
+}
+
+// Machine-readable authentication outcomes. REGISTRATION_CLOSED and
+// INVITE_INVALID are emitted only after account-key proof succeeds, avoiding
+// an unauthenticated account/invite oracle. Invalid, expired, and reused
+// invites intentionally share one indistinguishable result.
+enum AuthFailureReason {
+  AUTH_FAILURE_REASON_UNSPECIFIED = 0;
+  AUTH_FAILURE_REASON_AUTHENTICATION_FAILED = 1;
+  AUTH_FAILURE_REASON_REGISTRATION_CLOSED = 2;
+  AUTH_FAILURE_REASON_INVITE_INVALID = 3;
 }
 
 // Bit values carried in DeviceBindingV1.capabilities. Values may be ORed.

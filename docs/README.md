@@ -19,6 +19,7 @@ evidence для completion gates. Veil остаётся pre-release проект
 ## Architecture Decision Records
 
 - [ADR-0001: Authenticated Sender Keys v5 for server channels](adr/0001-authenticated-sender-keys-v5-for-server-channels.md)
+- [ADR-0002: Origin-bound one-time Node Access Passes](adr/0002-origin-bound-node-access-passes.md)
 
 ADR фиксирует принятое решение и причины. Изменение такого решения должно
 добавлять новый ADR, а не незаметно переписывать исторический документ.
