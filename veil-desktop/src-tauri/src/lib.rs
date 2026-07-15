@@ -1764,9 +1764,9 @@ fn take_expected_node_access_pass(
         *pending = None;
         return Err("expected pending Node Access Pass has expired".to_string());
     }
-    if !pending
+    if pending
         .as_ref()
-        .is_some_and(|pass| pass.flow_id == expected_flow_id)
+        .is_none_or(|pass| pass.flow_id != expected_flow_id)
     {
         return Err("expected pending Node Access Pass is unavailable".to_string());
     }
@@ -14759,7 +14759,7 @@ mod e2ee_rest_tests {
             format!("https://user@access.example/enroll#invite={token}"),
             format!("https://access.example/enroll/?x=1#invite={token}"),
             format!("https://access.example/enroll?next=evil#invite={token}"),
-            format!("https://access.example/enroll#invite=short"),
+            "https://access.example/enroll#invite=short".to_string(),
             format!("https://access.example/enroll#invite={token}&extra=1"),
             format!("veil://enroll/v2?origin=https%3A%2F%2Faccess.example#invite={token}"),
             format!("veil://enroll/v1?origin=http%3A%2F%2Faccess.example#invite={token}"),
