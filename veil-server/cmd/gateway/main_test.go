@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -35,6 +36,56 @@ func TestReadinessReflectsDatabaseAvailability(t *testing.T) {
 				t.Fatalf("Cache-Control = %q, want no-store", got)
 			}
 		})
+	}
+}
+
+func TestNodeAccessPassKeepsBearerOutOfHTTPRequestsAndCaches(t *testing.T) {
+	recorder := httptest.NewRecorder()
+	nodeAccessPassHandler(enrollHTML).ServeHTTP(
+		recorder,
+		httptest.NewRequest(http.MethodGet, "/enroll#invite=not-sent-by-http", nil),
+	)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", recorder.Code)
+	}
+	for name, want := range map[string]string{
+		"Cache-Control":          "no-store",
+		"Referrer-Policy":        "no-referrer",
+		"X-Content-Type-Options": "nosniff",
+		"X-Frame-Options":        "DENY",
+		"X-Robots-Tag":           "noindex, nofollow",
+	} {
+		if got := recorder.Header().Get(name); got != want {
+			t.Fatalf("%s = %q, want %q", name, got, want)
+		}
+	}
+	csp := recorder.Header().Get("Content-Security-Policy")
+	if !strings.Contains(csp, "connect-src 'none'") || !strings.Contains(csp, "frame-ancestors 'none'") {
+		t.Fatalf("unexpected Content-Security-Policy: %q", csp)
+	}
+
+	page := recorder.Body.String()
+	for _, required := range []string{
+		"location.hash",
+		"history.replaceState",
+		"veil://enroll/v1?origin=",
+		"&invite=",
+		"document.getElementById('origin').textContent = location.origin",
+		"location.origin + '/enroll#invite=' + token",
+		"navigator.clipboard.writeText(enrollmentLink)",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("access pass page is missing %q", required)
+		}
+	}
+	for _, forbidden := range []string{"location.search", "fetch("} {
+		if strings.Contains(page, forbidden) {
+			t.Fatalf("access pass page must not contain %q", forbidden)
+		}
+	}
+	if clearAt, validateAt := strings.Index(page, "history.replaceState"), strings.Index(page, "const canonical"); clearAt < 0 || validateAt < 0 || clearAt > validateAt {
+		t.Fatal("the bearer fragment must be removed before validation returns")
 	}
 }
 

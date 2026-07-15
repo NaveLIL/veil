@@ -8,6 +8,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/NaveLIL/veil/veil-server/internal/auth"
 	"github.com/NaveLIL/veil/veil-server/internal/publicerr"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
@@ -43,8 +44,46 @@ func TestSendPublicAuthFailureDoesNotExposeCause(t *testing.T) {
 	if result == nil || result.GetSuccess() || result.GetErrorMessage() != "authentication failed" {
 		t.Fatalf("unexpected auth result: %#v", result)
 	}
+	if result.GetFailureReason() != pb.AuthFailureReason_AUTH_FAILURE_REASON_AUTHENTICATION_FAILED {
+		t.Fatalf("failure reason = %v, want generic authentication failure", result.GetFailureReason())
+	}
 	if strings.Contains(result.GetErrorMessage(), transportSecretCanary) {
 		t.Fatal("private cause leaked through unauthenticated handshake")
+	}
+}
+
+func TestMappedAuthFailuresExposeOnlySafeEnrollmentReasons(t *testing.T) {
+	t.Parallel()
+	for name, testCase := range map[string]struct {
+		err    error
+		reason pb.AuthFailureReason
+		text   string
+	}{
+		"registration closed": {
+			err:    auth.ErrRegistrationClosed,
+			reason: pb.AuthFailureReason_AUTH_FAILURE_REASON_REGISTRATION_CLOSED,
+			text:   "registration is closed",
+		},
+		"invalid invite": {
+			err:    auth.ErrInviteInvalid,
+			reason: pb.AuthFailureReason_AUTH_FAILURE_REASON_INVITE_INVALID,
+			text:   "invite is invalid, expired, or already used",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			client := &Client{send: make(chan []byte, 1)}
+			if err := client.sendMappedAuthFailure(73, testCase.err); err != nil {
+				t.Fatal(err)
+			}
+			var envelope pb.Envelope
+			if err := proto.Unmarshal(<-client.send, &envelope); err != nil {
+				t.Fatal(err)
+			}
+			result := envelope.GetAuthResult()
+			if result.GetFailureReason() != testCase.reason || result.GetErrorMessage() != testCase.text {
+				t.Fatalf("unexpected safe enrollment failure: %#v", result)
+			}
+		})
 	}
 }
 

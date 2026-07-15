@@ -26,6 +26,11 @@ spaces, backed by a self-hostable Veil Node.
 [Security](SECURITY.md) ·
 [Contributing](CONTRIBUTING.md)
 
+Registration on the managed Preview Node is invite-only. A one-time **Node
+Access Pass** authorizes creation of one account identity; that registered
+identity can reconnect without another pass. A **Veil Link** is separate and
+only invites an existing account into a Space.
+
 ## What exists today
 
 Substantial Preview implementations exist for:
@@ -55,8 +60,8 @@ status and remaining physical/device matrices are tracked in
 - Platform signing, multi-device, attachment, and distributor matrices still
   require release evidence.
 - There is no full browser client. Web surfaces are deliberately limited to
-  the project site, origin-hosted invitation preview, and a narrow one-time
-  Share Viewer.
+  the project site, origin-hosted Node Access and Space invitation pages, and
+  a narrow one-time Share Viewer.
 
 ## Security boundary
 

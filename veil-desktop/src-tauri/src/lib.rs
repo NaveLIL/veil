@@ -6,6 +6,8 @@ use subtle::ConstantTimeEq;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{AppHandle, Emitter, Manager, State, WindowEvent};
+use tauri_plugin_clipboard_manager::ClipboardExt;
+use tauri_plugin_deep_link::DeepLinkExt;
 use tauri_plugin_notification::NotificationExt;
 use veil_client::api::{
     DeviceBindingCandidateV1, DeviceRosterCandidateV1, DeviceRosterEntryV1,
@@ -168,6 +170,10 @@ struct AppState {
     /// At most one OS-delivered Veil Link capability. The raw secret never
     /// enters renderer state, config, SQLCipher, logs, or Tauri IPC output.
     pending_veil_link: Mutex<Option<PendingVeilLink>>,
+    /// One first-registration Node Access Pass. The 256-bit token remains in
+    /// native process memory, is bound to one canonical HTTPS origin, and is
+    /// never serialized back across IPC or written to durable storage.
+    pending_node_access_pass: Mutex<Option<PendingNodeAccessPass>>,
     /// OS drag-and-drop paths never cross IPC. The renderer receives only a
     /// short-lived random capability that can consume this exact path set.
     pending_attachment_drop: Mutex<Option<PendingAttachmentDrop>>,
@@ -203,6 +209,18 @@ struct PendingVeilLink {
     selector: String,
     secret: Zeroizing<String>,
     expires_at: Instant,
+}
+
+struct PendingNodeAccessPass {
+    flow_id: [u8; 32],
+    canonical_origin: String,
+    token: Zeroizing<Vec<u8>>,
+    expires_at: Instant,
+}
+
+struct NodeAccessAttempt {
+    flow_id: [u8; 32],
+    token: Zeroizing<Vec<u8>>,
 }
 
 struct PendingAttachmentDrop {
@@ -274,7 +292,17 @@ struct PendingVeilLinkView {
     expires_in_seconds: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PendingNodeAccessPassView {
+    flow_id: String,
+    canonical_origin: String,
+    token_ref: String,
+    expires_in_seconds: u64,
+}
+
 const PENDING_VEIL_LINK_TTL: Duration = Duration::from_secs(5 * 60);
+const PENDING_NODE_ACCESS_PASS_TTL: Duration = Duration::from_secs(10 * 60);
 const PENDING_ATTACHMENT_DROP_TTL: Duration = Duration::from_secs(60);
 const MEDIA_SESSION_TTL: Duration = Duration::from_secs(10 * 60);
 const MAX_MEDIA_RANGE_BYTES: u64 = 8 * 1024 * 1024;
@@ -1239,6 +1267,14 @@ fn reset_sensitive_state_locked(state: &AppState) -> Result<(), String> {
     }
     state.pending_veil_link.clear_poison();
     {
+        let mut pending_pass = state
+            .pending_node_access_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *pending_pass = None;
+    }
+    state.pending_node_access_pass.clear_poison();
+    {
         let mut pending_drop = state
             .pending_attachment_drop
             .lock()
@@ -1693,11 +1729,23 @@ async fn reveal_recovery_phrase(state: State<'_, AppState>, pin: String) -> Resu
     Ok(phrase.as_str().to_owned())
 }
 
+fn lock_transition_requires_sensitive_reset(currently_unlocked: bool) -> bool {
+    currently_unlocked
+}
+
 #[tauri::command]
 fn lock_app(state: State<'_, AppState>) -> Result<(), String> {
     let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
     if !configured_pin(&state) {
         return Err("configure a PIN before locking the application".into());
+    }
+    // Startup with a configured PIN is already natively locked. Bootstrap
+    // calls this command to synchronize the renderer; it must not erase an
+    // access pass delivered by the OS moments earlier. Explicit locks and
+    // timeouts begin from an unlocked session and still scrub the pass below.
+    if !lock_transition_requires_sensitive_reset(state.unlocked.load(Ordering::Acquire)) {
+        state.lock_event_pending.store(false, Ordering::Release);
+        return Ok(());
     }
     let result = reset_sensitive_state_locked(&state);
     // Renderer-initiated lock already cleared its own state.
@@ -1707,49 +1755,144 @@ fn lock_app(state: State<'_, AppState>) -> Result<(), String> {
     result
 }
 
+fn take_expected_node_access_pass(
+    pending: &mut Option<PendingNodeAccessPass>,
+    expected_flow_id: [u8; 32],
+    now: Instant,
+) -> Result<PendingNodeAccessPass, String> {
+    if pending.as_ref().is_some_and(|pass| pass.expires_at <= now) {
+        *pending = None;
+        return Err("expected pending Node Access Pass has expired".to_string());
+    }
+    if !pending
+        .as_ref()
+        .is_some_and(|pass| pass.flow_id == expected_flow_id)
+    {
+        return Err("expected pending Node Access Pass is unavailable".to_string());
+    }
+    pending
+        .take()
+        .ok_or_else(|| "expected pending Node Access Pass is unavailable".to_string())
+}
+
+fn restore_expected_node_access_pass(
+    pending: &mut Option<PendingNodeAccessPass>,
+    preserved: PendingNodeAccessPass,
+) -> Result<(), String> {
+    if pending.is_some() {
+        return Err("pending Node Access Pass changed during account switch".to_string());
+    }
+    *pending = Some(preserved);
+    Ok(())
+}
+
+fn sign_out_locked(
+    state: &AppState,
+    preserved_node_access_flow: Option<[u8; 32]>,
+) -> Result<(), String> {
+    require_unlocked_locked(state)?;
+    if !keychain::has_seed(KEYCHAIN_ACCOUNT)? {
+        return Err("no stored identity is available to sign out".to_string());
+    }
+
+    let mut preserved_pass = if let Some(expected_flow_id) = preserved_node_access_flow {
+        let mut pending = state
+            .pending_node_access_pass
+            .lock()
+            .map_err(|error| error.to_string())?;
+        Some(take_expected_node_access_pass(
+            &mut pending,
+            expected_flow_id,
+            Instant::now(),
+        )?)
+    } else {
+        None
+    };
+
+    let operation = (|| -> Result<(), String> {
+        // Remove the PIN policy before the seed. If keychain access fails, the
+        // operation aborts while the active account is still recoverable.
+        if keychain::has_seed(PIN_MATERIAL_ACCOUNT)? {
+            keychain::delete_seed(PIN_MATERIAL_ACCOUNT)?;
+        }
+        if keychain::has_seed(PIN_HASH_ACCOUNT)? {
+            keychain::delete_seed(PIN_HASH_ACCOUNT)?;
+        }
+        if keychain::has_seed(PIN_SALT_ACCOUNT)? {
+            keychain::delete_seed(PIN_SALT_ACCOUNT)?;
+        }
+        if keychain::has_seed(PIN_THROTTLE_ACCOUNT)? {
+            keychain::delete_seed(PIN_THROTTLE_ACCOUNT)?;
+        }
+        keychain::delete_seed(KEYCHAIN_ACCOUNT)?;
+
+        // The pass is temporarily held in a Zeroizing native value outside
+        // AppState, so the ordinary account reset can keep its invariant that
+        // every normal lock/sign-out scrubs bearer capabilities.
+        reset_sensitive_state_locked(state)?;
+        state.pin_configured.store(false, Ordering::Release);
+        state.lock_event_pending.store(false, Ordering::Release);
+        state
+            .pin_throttle
+            .lock()
+            .map_err(|e| e.to_string())?
+            .reset();
+        // No identity/PIN remains, so onboarding is intentionally allowed to
+        // initialize the next account without passing through a lock screen.
+        publish_unlocked_session(
+            &state.lock_event_pending,
+            &state.unlocked,
+            &state.session_epoch,
+        );
+        Ok(())
+    })();
+
+    let restore = if let Some(pass) = preserved_pass.take() {
+        let mut pending = state
+            .pending_node_access_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = restore_expected_node_access_pass(&mut pending, pass);
+        state.pending_node_access_pass.clear_poison();
+        result
+    } else {
+        Ok(())
+    };
+
+    match (operation, restore) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(restore_error)) => Err(restore_error),
+        (Err(error), Err(restore_error)) => Err(format!(
+            "{error}; failed to restore Node Access Pass: {restore_error}"
+        )),
+    }
+}
+
 /// Remove the active account from this device without touching the server.
 /// The account-scoped SQLCipher vault remains on disk and can be reopened
 /// with its recovery phrase; only the keychain seed and app PIN are removed.
 #[tauri::command]
 fn sign_out(state: State<'_, AppState>) -> Result<(), String> {
     let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
-    require_unlocked_locked(&state)?;
-    if !keychain::has_seed(KEYCHAIN_ACCOUNT)? {
-        return Err("no stored identity is available to sign out".to_string());
-    }
+    sign_out_locked(&state, None)
+}
 
-    // Remove the PIN policy before the seed. If keychain access fails, the
-    // operation aborts while the active account is still recoverable.
-    if keychain::has_seed(PIN_MATERIAL_ACCOUNT)? {
-        keychain::delete_seed(PIN_MATERIAL_ACCOUNT)?;
-    }
-    if keychain::has_seed(PIN_HASH_ACCOUNT)? {
-        keychain::delete_seed(PIN_HASH_ACCOUNT)?;
-    }
-    if keychain::has_seed(PIN_SALT_ACCOUNT)? {
-        keychain::delete_seed(PIN_SALT_ACCOUNT)?;
-    }
-    if keychain::has_seed(PIN_THROTTLE_ACCOUNT)? {
-        keychain::delete_seed(PIN_THROTTLE_ACCOUNT)?;
-    }
-    keychain::delete_seed(KEYCHAIN_ACCOUNT)?;
-
-    reset_sensitive_state_locked(&state)?;
-    state.pin_configured.store(false, Ordering::Release);
-    state.lock_event_pending.store(false, Ordering::Release);
-    state
-        .pin_throttle
-        .lock()
-        .map_err(|e| e.to_string())?
-        .reset();
-    // No identity/PIN remains, so onboarding is intentionally allowed to
-    // initialize the next account without passing through a lock screen.
-    publish_unlocked_session(
-        &state.lock_event_pending,
-        &state.unlocked,
-        &state.session_epoch,
-    );
-    Ok(())
+#[tauri::command]
+fn sign_out_for_node_access_pass(
+    state: State<'_, AppState>,
+    expected_pending_flow_id: String,
+) -> Result<(), String> {
+    let expected_flow_id = decode_lower_hex_32(
+        "pending Node Access Pass flow id",
+        &expected_pending_flow_id,
+    )?;
+    // A connect attempt can transiently hold a copy of this bearer token.
+    // Wait for it to finish before validating/taking the exact pass, using
+    // the same connect -> session lock order as connect_to_server.
+    let _connect_transition = state.connect_transition.lock().map_err(|e| e.to_string())?;
+    let _transition = state.session_transition.lock().map_err(|e| e.to_string())?;
+    sign_out_locked(&state, Some(expected_flow_id))
 }
 
 #[tauri::command]
@@ -3617,6 +3760,22 @@ fn validate_veil_link_token(token: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn decode_node_access_token(token: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+    use base64::Engine;
+    if token.is_empty() || token.contains('=') {
+        return Err("Node Access Pass token is not canonical base64url".to_string());
+    }
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(token)
+        .map_err(|_| "Node Access Pass token is not canonical base64url".to_string())?;
+    if decoded.len() != 32
+        || base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&decoded) != token
+    {
+        return Err("Node Access Pass token must encode exactly 256 bits".to_string());
+    }
+    Ok(Zeroizing::new(decoded))
+}
+
 fn canonical_veil_link_origin(raw: &str) -> Result<String, String> {
     let url = reqwest::Url::parse(raw).map_err(|_| "Veil Link origin is invalid".to_string())?;
     if !url.username().is_empty()
@@ -3645,6 +3804,267 @@ fn canonical_veil_link_origin(raw: &str) -> Result<String, String> {
         _ => return Err("Veil Link origin must use HTTPS".to_string()),
     }
     Ok(rest_origin(&url)?.canonical_server_origin())
+}
+
+fn canonical_node_access_origin(raw: &str) -> Result<String, String> {
+    let url =
+        reqwest::Url::parse(raw).map_err(|_| "Node Access Pass origin is invalid".to_string())?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !(url.path().is_empty() || url.path() == "/")
+    {
+        return Err("Node Access Pass origin must be a bare HTTPS authority".to_string());
+    }
+    Ok(rest_origin(&url)?.canonical_server_origin())
+}
+
+fn parse_pending_node_access_pass(
+    raw: &str,
+    now: Instant,
+) -> Result<PendingNodeAccessPass, String> {
+    use rand::RngCore;
+
+    let url =
+        reqwest::Url::parse(raw).map_err(|_| "Node Access Pass link is malformed".to_string())?;
+    let (canonical_origin, token) = match url.scheme() {
+        "https" => {
+            if !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.path() != "/enroll"
+            {
+                return Err("Node Access Pass HTTPS link is unsupported".to_string());
+            }
+            let mut origin = url.clone();
+            origin.set_path("");
+            origin.set_fragment(None);
+            let encoded_token = url
+                .fragment()
+                .and_then(|fragment| fragment.strip_prefix("invite="))
+                .filter(|value| !value.is_empty() && !value.contains('&'))
+                .ok_or_else(|| "Node Access Pass token is missing".to_string())?;
+            (
+                canonical_node_access_origin(origin.as_str())?,
+                decode_node_access_token(encoded_token)?,
+            )
+        }
+        "veil" => {
+            if url.host_str() != Some("enroll") || url.path() != "/v1" {
+                return Err("custom Node Access Pass link is unsupported".to_string());
+            }
+            let query: Vec<_> = url.query_pairs().collect();
+            let origins: Vec<_> = query
+                .iter()
+                .filter(|(key, _)| key == "origin")
+                .map(|(_, value)| value.as_ref())
+                .collect();
+            let query_tokens: Vec<_> = query
+                .iter()
+                .filter(|(key, _)| key == "invite")
+                .map(|(_, value)| value.as_ref())
+                .collect();
+            if origins.len() != 1
+                || query.len() != origins.len() + query_tokens.len()
+                || query_tokens.len() > 1
+            {
+                return Err("custom Node Access Pass link has no exact HTTPS origin".to_string());
+            }
+            let fragment_token = url
+                .fragment()
+                .and_then(|fragment| fragment.strip_prefix("invite="))
+                .filter(|value| !value.is_empty() && !value.contains('&'));
+            let encoded_token = match (query_tokens.first().copied(), fragment_token) {
+                (Some(_), Some(_)) => {
+                    return Err("custom Node Access Pass link has ambiguous tokens".to_string())
+                }
+                (Some(token), None) | (None, Some(token)) => token,
+                (None, None) => return Err("Node Access Pass token is missing".to_string()),
+            };
+            (
+                canonical_node_access_origin(origins[0])?,
+                decode_node_access_token(encoded_token)?,
+            )
+        }
+        _ => return Err("unsupported Node Access Pass transport".to_string()),
+    };
+    let mut flow_id = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut flow_id);
+    Ok(PendingNodeAccessPass {
+        flow_id,
+        canonical_origin,
+        token,
+        expires_at: now + PENDING_NODE_ACCESS_PASS_TTL,
+    })
+}
+
+fn pending_node_access_pass_view(
+    pass: &PendingNodeAccessPass,
+    now: Instant,
+) -> PendingNodeAccessPassView {
+    use sha2::{Digest, Sha256};
+    let token_hash = Sha256::digest(pass.token.as_slice());
+    PendingNodeAccessPassView {
+        flow_id: hex::encode(pass.flow_id),
+        canonical_origin: pass.canonical_origin.clone(),
+        token_ref: hex::encode(&token_hash[..6]),
+        expires_in_seconds: pass.expires_at.saturating_duration_since(now).as_secs(),
+    }
+}
+
+fn stage_pending_node_access_pass(
+    state: &AppState,
+    raw: &str,
+) -> Result<PendingNodeAccessPassView, String> {
+    let _transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let now = Instant::now();
+    let parsed = parse_pending_node_access_pass(raw.trim(), now)?;
+    let view = pending_node_access_pass_view(&parsed, now);
+    *state
+        .pending_node_access_pass
+        .lock()
+        .map_err(|error| error.to_string())? = Some(parsed);
+    Ok(view)
+}
+
+fn native_clipboard_text(app: &AppHandle) -> Result<Zeroizing<String>, String> {
+    const MAX_CLIPBOARD_LINK_BYTES: usize = 4 * 1024;
+    let text = Zeroizing::new(
+        app.clipboard()
+            .read_text()
+            .map_err(|_| "could not read the native clipboard".to_string())?,
+    );
+    if text.trim().is_empty() {
+        return Err("the native clipboard does not contain a Node Access Pass link".to_string());
+    }
+    if text.len() > MAX_CLIPBOARD_LINK_BYTES {
+        return Err("the native clipboard link is too long".to_string());
+    }
+    Ok(text)
+}
+
+fn node_access_attempt_for_origin(
+    pending: &mut Option<PendingNodeAccessPass>,
+    canonical_origin: &str,
+    now: Instant,
+) -> Option<NodeAccessAttempt> {
+    if pending.as_ref().is_some_and(|pass| pass.expires_at <= now) {
+        *pending = None;
+        return None;
+    }
+    let pass = pending
+        .as_ref()
+        .filter(|pass| pass.canonical_origin == canonical_origin)?;
+    Some(NodeAccessAttempt {
+        flow_id: pass.flow_id,
+        token: Zeroizing::new(pass.token.to_vec()),
+    })
+}
+
+fn clear_expired_pending_node_access_pass(state: &AppState, now: Instant) -> Result<(), String> {
+    let mut pending = state
+        .pending_node_access_pass
+        .lock()
+        .map_err(|error| error.to_string())?;
+    if pending.as_ref().is_some_and(|pass| pass.expires_at <= now) {
+        *pending = None;
+    }
+    Ok(())
+}
+
+fn clear_node_access_pass_after_success(
+    pending: &mut Option<PendingNodeAccessPass>,
+    attempted_flow_id: [u8; 32],
+) {
+    if pending
+        .as_ref()
+        .is_some_and(|pass| pass.flow_id == attempted_flow_id)
+    {
+        *pending = None;
+    }
+}
+
+fn cancel_node_access_pass(
+    pending: &mut Option<PendingNodeAccessPass>,
+    expected_flow_id: [u8; 32],
+) -> bool {
+    if pending
+        .as_ref()
+        .is_some_and(|pass| pass.flow_id == expected_flow_id)
+    {
+        *pending = None;
+        return true;
+    }
+    false
+}
+
+#[tauri::command]
+async fn stage_node_access_pass_from_clipboard(
+    state: State<'_, AppState>,
+    app: AppHandle,
+) -> Result<PendingNodeAccessPassView, String> {
+    let read_app = app.clone();
+    let link = tauri::async_runtime::spawn_blocking(move || native_clipboard_text(&read_app))
+        .await
+        .map_err(|_| "native clipboard worker failed".to_string())??;
+    let view = stage_pending_node_access_pass(&state, link.trim())?;
+
+    // Clear only if the clipboard still contains the exact link we staged;
+    // never destroy unrelated content copied during this command. Clipboard
+    // history may retain an older copy, which the UI calls out separately.
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        if let Ok(current) = native_clipboard_text(&app) {
+            if current.trim() == link.trim() {
+                let _ = app.clipboard().clear();
+            }
+        }
+    })
+    .await;
+    Ok(view)
+}
+
+#[tauri::command]
+fn get_pending_node_access_pass(
+    state: State<'_, AppState>,
+) -> Result<Option<PendingNodeAccessPassView>, String> {
+    let _transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let now = Instant::now();
+    clear_expired_pending_node_access_pass(&state, now)?;
+    let pending = state
+        .pending_node_access_pass
+        .lock()
+        .map_err(|error| error.to_string())?;
+    Ok(pending
+        .as_ref()
+        .map(|pass| pending_node_access_pass_view(pass, now)))
+}
+
+#[tauri::command]
+fn cancel_pending_node_access_pass(
+    state: State<'_, AppState>,
+    expected_pending_flow_id: String,
+) -> Result<bool, String> {
+    let _transition = state
+        .session_transition
+        .lock()
+        .map_err(|error| error.to_string())?;
+    let expected = decode_lower_hex_32(
+        "pending Node Access Pass flow id",
+        &expected_pending_flow_id,
+    )?;
+    let mut pending = state
+        .pending_node_access_pass
+        .lock()
+        .map_err(|error| error.to_string())?;
+    Ok(cancel_node_access_pass(&mut pending, expected))
 }
 
 fn parse_pending_veil_link(raw: &str, now: Instant) -> Result<PendingVeilLink, String> {
@@ -3782,6 +4202,19 @@ fn cancel_pending_veil_link(
         return Ok(true);
     }
     Ok(false)
+}
+
+fn stage_opened_veil_url(app: &AppHandle, raw: &str) -> bool {
+    let state = app.state::<AppState>();
+    if let Ok(view) = stage_pending_node_access_pass(&state, raw) {
+        let _ = app.emit("veil://pending-node-access-pass", view);
+        return true;
+    }
+    if let Ok(view) = stage_pending_veil_link(&state, raw) {
+        let _ = app.emit("veil://pending-link", view);
+        return true;
+    }
+    false
 }
 
 fn offline_sync_url(
@@ -4831,6 +5264,13 @@ fn connect_to_server(
         reqwest::Url::parse(&server_http_url).map_err(|e| format!("invalid REST URL: {e}"))?;
     let requested_rest_origin = rest_origin(&requested_rest_url)?;
     let canonical_server_origin = requested_rest_origin.canonical_server_origin();
+    let mut node_access_attempt = {
+        let mut pending = state
+            .pending_node_access_pass
+            .lock()
+            .map_err(|error| error.to_string())?;
+        node_access_attempt_for_origin(&mut pending, &canonical_server_origin, Instant::now())
+    };
     {
         let mut pending = state.pending_veil_link.lock().map_err(|e| e.to_string())?;
         if pending
@@ -4884,7 +5324,21 @@ fn connect_to_server(
     client.clear_server_scoped_conversation_routing();
     client.clear_all_authorized_conversation_senders();
     client.clear_device_rosters_v1();
-    let result = state.runtime.block_on(client.connect(&server_url))?;
+    let result = state.runtime.block_on(
+        client.connect_with_node_access_invite(
+            &server_url,
+            node_access_attempt
+                .as_ref()
+                .map(|attempt| attempt.token.as_slice()),
+        ),
+    )?;
+    if let Some(attempt) = node_access_attempt.take() {
+        let mut pending = state
+            .pending_node_access_pass
+            .lock()
+            .map_err(|error| error.to_string())?;
+        clear_node_access_pass_after_success(&mut pending, attempt.flow_id);
+    }
     decode_canonical_uuid("authenticated user id", &result)?;
     let local_identity_key = client.identity_key()?;
     let local_signing_key = client.signing_key()?;
@@ -11553,21 +12007,19 @@ pub fn run() {
                 responder.respond(response);
             });
         })
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             // A second instance tried to start — focus the existing window instead.
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.show();
                 let _ = win.set_focus();
                 let _ = win.unminimize();
             }
-            let state = app.state::<AppState>();
-            for raw in argv {
-                if let Ok(view) = stage_pending_veil_link(&state, &raw) {
-                    let _ = app.emit("veil://pending-link", view);
-                    break;
-                }
-            }
+            // With the `deep-link` feature, single-instance forwards argv to
+            // tauri-plugin-deep-link before this focus-only callback runs.
+            // Raw capability URLs are parsed by the native listener below.
         }))
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_os::init())
         .plugin(tauri_plugin_notification::init())
         .on_webview_event(|webview, event| {
@@ -11613,6 +12065,15 @@ pub fn run() {
             }
         })
         .setup(|app| {
+            // Installed Windows bundles register the scheme at install time.
+            // Linux and debug Windows builds need an explicit registration;
+            // keep this native so deep-link contents never pass through a
+            // renderer-side plugin API.
+            #[cfg(any(target_os = "linux", all(windows, debug_assertions)))]
+            if app.deep_link().register_all().is_err() {
+                eprintln!("Veil dynamic deep-link registration is unavailable; continuing");
+            }
+
             let data_dir = app
                 .path()
                 .app_data_dir()
@@ -11647,6 +12108,7 @@ pub fn run() {
                 lock_event_pending: AtomicBool::new(false),
                 pin_throttle: Mutex::new(PinThrottle::default()),
                 pending_veil_link: Mutex::new(None),
+                pending_node_access_pass: Mutex::new(None),
                 pending_attachment_drop: Mutex::new(None),
                 media_sessions: Mutex::new(std::collections::HashMap::new()),
                 runtime: tokio::runtime::Runtime::new().expect("failed to create tokio runtime"),
@@ -11668,11 +12130,19 @@ pub fn run() {
                 search_rebuild_generation: AtomicU64::new(0),
                 search_publication: Mutex::new(None),
             });
-            let state = app.state::<AppState>();
-            for raw in std::env::args().skip(1) {
-                if let Ok(view) = stage_pending_veil_link(&state, &raw) {
-                    let _ = app.emit("veil://pending-link", view);
-                    break;
+            let deep_link_app = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                for url in event.urls() {
+                    if stage_opened_veil_url(&deep_link_app, url.as_str()) {
+                        break;
+                    }
+                }
+            });
+            if let Some(urls) = app.deep_link().get_current()? {
+                for url in urls {
+                    if stage_opened_veil_url(app.handle(), url.as_str()) {
+                        break;
+                    }
                 }
             }
             let watchdog_app = app.handle().clone();
@@ -11681,6 +12151,7 @@ pub fn run() {
                 let state = watchdog_app.state::<AppState>();
                 let mut emit_locked = false;
                 if let Ok(_transition) = state.session_transition.lock() {
+                    let _ = clear_expired_pending_node_access_pass(&state, Instant::now());
                     emit_locked =
                         consume_pending_lock_event(&state.lock_event_pending, &state.unlocked);
                     if state.unlocked.load(Ordering::Acquire)
@@ -11798,6 +12269,7 @@ pub fn run() {
             reveal_recovery_phrase,
             lock_app,
             sign_out,
+            sign_out_for_node_access_pass,
             touch_activity,
             idle_seconds,
             get_auto_lock_seconds,
@@ -11882,6 +12354,9 @@ pub fn run() {
             upsert_channel_overwrite,
             get_pending_veil_link,
             cancel_pending_veil_link,
+            stage_node_access_pass_from_clipboard,
+            get_pending_node_access_pass,
+            cancel_pending_node_access_pass,
             preview_invite,
             use_invite,
             mark_channel_conversation,
@@ -11896,30 +12371,33 @@ pub fn run() {
 #[cfg(test)]
 mod e2ee_rest_tests {
     use super::{
-        append_bounded_search_document, authenticated_event_payload, canonical_profile_version,
+        append_bounded_search_document, authenticated_event_payload, cancel_node_access_pass,
+        canonical_profile_version, clear_node_access_pass_after_success,
         consume_pending_lock_event, current_target_admission_evidence,
-        exact_confirmed_live_action_binding, invalidate_disconnected_binding, offline_sync_url,
+        exact_confirmed_live_action_binding, invalidate_disconnected_binding,
+        lock_transition_requires_sensitive_reset, node_access_attempt_for_origin, offline_sync_url,
         parse_device_directory, parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
-        parse_message_crypto_context, parse_network_profile_response, parse_pending_veil_link,
-        parse_prekey_bundle, parse_push_subscription_views, pending_veil_link_view,
+        parse_message_crypto_context, parse_network_profile_response,
+        parse_pending_node_access_pass, parse_pending_veil_link, parse_prekey_bundle,
+        parse_push_subscription_views, pending_node_access_pass_view, pending_veil_link_view,
         preserve_created_group_outcome, proves_future_only_sender_key_history,
         publish_unlocked_session, renderer_message_json, require_matching_identity_fingerprint,
         require_pending_veil_link_flow, reset_sensitive_state_locked, resolve_auto_lock_seconds,
         rest_api_url, rest_authority, rest_canonical, rest_origin, rest_request_target,
-        run_blocking_native_task, run_bounded_search_backfill, valid_auto_lock_seconds,
-        valid_unlock_pin, validate_authenticated_binding_commit,
-        validate_created_dm_account_directory, validate_expected_dm_peer_identity_key,
-        validate_expected_live_action_binding, validate_expected_rest_binding,
-        validate_live_action_rest_origin, validate_live_message_security_context,
-        validate_next_cursor, validate_persisted_message_conversation,
-        validate_pinned_directory_self, validate_profile_avatar_jpeg, validate_rest_url,
-        validate_search_context_session, validate_server_endpoint_pair, validate_utc_rfc3339_nano,
-        validated_search_coverage, validated_search_hit_dto, verify_device_directory_account_keys,
-        AppState, AuthenticatedSessionScope, ConversationSyncIsolation,
-        CurrentTargetAdmissionEvidence, ParsedMessageCryptoContext, PinnedDirectoryMember,
-        PublishedSearchBinding, RestBinding, RestOrigin, SearchCoverage, SearchRebuildReport,
-        SearchResultContextDto, DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES,
-        SEARCH_MAX_SOURCE_BYTES,
+        restore_expected_node_access_pass, run_blocking_native_task, run_bounded_search_backfill,
+        take_expected_node_access_pass, valid_auto_lock_seconds, valid_unlock_pin,
+        validate_authenticated_binding_commit, validate_created_dm_account_directory,
+        validate_expected_dm_peer_identity_key, validate_expected_live_action_binding,
+        validate_expected_rest_binding, validate_live_action_rest_origin,
+        validate_live_message_security_context, validate_next_cursor,
+        validate_persisted_message_conversation, validate_pinned_directory_self,
+        validate_profile_avatar_jpeg, validate_rest_url, validate_search_context_session,
+        validate_server_endpoint_pair, validate_utc_rfc3339_nano, validated_search_coverage,
+        validated_search_hit_dto, verify_device_directory_account_keys, AppState,
+        AuthenticatedSessionScope, ConversationSyncIsolation, CurrentTargetAdmissionEvidence,
+        ParsedMessageCryptoContext, PinnedDirectoryMember, PublishedSearchBinding, RestBinding,
+        RestOrigin, SearchCoverage, SearchRebuildReport, SearchResultContextDto,
+        DEFAULT_AUTO_LOCK_SECONDS, MAX_MEDIA_RANGE_BYTES, SEARCH_MAX_SOURCE_BYTES,
     };
     use base64::Engine;
     use ed25519_dalek::SigningKey;
@@ -12894,7 +13372,7 @@ mod e2ee_rest_tests {
     }
 
     #[test]
-    fn lock_reset_scrubs_a_live_index_mutation_that_started_before_client_quiescence() {
+    fn real_lock_reset_scrubs_account_state_and_node_access_pass() {
         let indexer = std::sync::Arc::new(veil_search::Indexer::in_memory().unwrap());
         indexer
             .index_message("old", "conversation", "sender", "old plaintext", 1)
@@ -12914,7 +13392,19 @@ mod e2ee_rest_tests {
             unavailable_conversations: std::sync::Mutex::new(std::collections::HashMap::new()),
             lock_event_pending: std::sync::atomic::AtomicBool::new(false),
             pin_throttle: std::sync::Mutex::new(super::PinThrottle::default()),
-            pending_veil_link: std::sync::Mutex::new(None),
+            pending_veil_link: std::sync::Mutex::new(Some(super::PendingVeilLink {
+                flow_id: [0x21; 32],
+                canonical_origin: "https://access.example:443".to_string(),
+                selector: "selector".to_string(),
+                secret: zeroize::Zeroizing::new("secret".to_string()),
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            })),
+            pending_node_access_pass: std::sync::Mutex::new(Some(super::PendingNodeAccessPass {
+                flow_id: [0x22; 32],
+                canonical_origin: "https://access.example:443".to_string(),
+                token: zeroize::Zeroizing::new(vec![0x23; 32]),
+                expires_at: std::time::Instant::now() + std::time::Duration::from_secs(10 * 60),
+            })),
             pending_attachment_drop: std::sync::Mutex::new(None),
             media_sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             runtime: tokio::runtime::Runtime::new().unwrap(),
@@ -12965,6 +13455,8 @@ mod e2ee_rest_tests {
         reset.join().unwrap().unwrap();
 
         assert!(!state.unlocked.load(std::sync::atomic::Ordering::Acquire));
+        assert!(state.pending_veil_link.lock().unwrap().is_none());
+        assert!(state.pending_node_access_pass.lock().unwrap().is_none());
         assert!(indexer.search("old", None, 10).unwrap().is_empty());
         assert!(indexer.search("raced", None, 10).unwrap().is_empty());
         let coverage = indexer.coverage_snapshot().unwrap();
@@ -14204,5 +14696,185 @@ mod e2ee_rest_tests {
             now,
         )
         .is_ok());
+    }
+
+    #[test]
+    fn node_access_pass_parser_canonicalizes_both_transports_without_exposing_token() {
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0xA7; 32]);
+        let now = std::time::Instant::now();
+        let web = parse_pending_node_access_pass(
+            &format!("https://ACCESS.Example:443/enroll#invite={token}"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(web.canonical_origin, "https://access.example:443");
+        assert_eq!(web.token.as_slice(), &[0xA7; 32]);
+
+        let custom = parse_pending_node_access_pass(
+            &format!("veil://enroll/v1?origin=https%3A%2F%2FACCESS.Example%3A443&invite={token}"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(custom.canonical_origin, web.canonical_origin);
+        assert_eq!(custom.token.as_slice(), web.token.as_slice());
+        let fragment_compatible = parse_pending_node_access_pass(
+            &format!("veil://enroll/v1?origin=https%3A%2F%2FACCESS.Example%3A443#invite={token}"),
+            now,
+        )
+        .unwrap();
+        assert_eq!(fragment_compatible.token.as_slice(), web.token.as_slice());
+
+        let view = pending_node_access_pass_view(&web, now);
+        assert_eq!(view.canonical_origin, web.canonical_origin);
+        assert_eq!(view.flow_id, hex::encode(web.flow_id));
+        assert_eq!(view.token_ref.len(), 12);
+        let serialized = serde_json::to_string(&view).unwrap();
+        assert!(!serialized.contains(&token));
+        assert!(!serialized.contains("p6en"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&serialized)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [
+                "canonicalOrigin".to_string(),
+                "expiresInSeconds".to_string(),
+                "flowId".to_string(),
+                "tokenRef".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+    }
+
+    #[test]
+    fn node_access_pass_rejects_malformed_or_ambiguous_links() {
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x61; 32]);
+        let now = std::time::Instant::now();
+        for raw in [
+            format!("http://access.example/enroll#invite={token}"),
+            format!("https://user@access.example/enroll#invite={token}"),
+            format!("https://access.example/enroll/?x=1#invite={token}"),
+            format!("https://access.example/enroll?next=evil#invite={token}"),
+            format!("https://access.example/enroll#invite=short"),
+            format!("https://access.example/enroll#invite={token}&extra=1"),
+            format!("veil://enroll/v2?origin=https%3A%2F%2Faccess.example#invite={token}"),
+            format!("veil://enroll/v1?origin=http%3A%2F%2Faccess.example#invite={token}"),
+            format!("veil://enroll/v1?origin=https%3A%2F%2Faccess.example&x=1#invite={token}"),
+            format!("veil://enroll/v1?origin=https%3A%2F%2Faccess.example&invite={token}#invite={token}"),
+        ] {
+            assert!(
+                parse_pending_node_access_pass(&raw, now).is_err(),
+                "accepted {raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn node_access_pass_is_origin_bound_expires_and_clears_only_matching_success() {
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x33; 32]);
+        let now = std::time::Instant::now();
+        let mut pending = Some(
+            parse_pending_node_access_pass(
+                &format!("https://access.example/enroll#invite={token}"),
+                now,
+            )
+            .unwrap(),
+        );
+        let original_flow = pending.as_ref().unwrap().flow_id;
+
+        assert!(
+            node_access_attempt_for_origin(&mut pending, "https://other.example:443", now,)
+                .is_none()
+        );
+        assert!(pending.is_some(), "wrong origin must not consume the pass");
+
+        let attempt =
+            node_access_attempt_for_origin(&mut pending, "https://access.example:443", now)
+                .unwrap();
+        assert_eq!(attempt.token.as_slice(), &[0x33; 32]);
+        clear_node_access_pass_after_success(&mut pending, [0xFF; 32]);
+        assert!(
+            pending.is_some(),
+            "a stale attempt cannot clear a newer pass"
+        );
+        assert!(!cancel_node_access_pass(&mut pending, [0xEE; 32]));
+        assert!(pending.is_some());
+        assert!(cancel_node_access_pass(&mut pending, original_flow));
+        assert!(pending.is_none());
+
+        pending = Some(
+            parse_pending_node_access_pass(
+                &format!("https://access.example/enroll#invite={token}"),
+                now,
+            )
+            .unwrap(),
+        );
+        let original_flow = pending.as_ref().unwrap().flow_id;
+        clear_node_access_pass_after_success(&mut pending, original_flow);
+        assert!(pending.is_none());
+
+        let mut expired = Some(
+            parse_pending_node_access_pass(
+                &format!("https://access.example/enroll#invite={token}"),
+                now,
+            )
+            .unwrap(),
+        );
+        assert!(node_access_attempt_for_origin(
+            &mut expired,
+            "https://access.example:443",
+            now + std::time::Duration::from_secs(10 * 60 + 1),
+        )
+        .is_none());
+        assert!(expired.is_none());
+    }
+
+    #[test]
+    fn account_switch_preserves_only_the_exact_live_node_access_flow() {
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x52; 32]);
+        let now = std::time::Instant::now();
+        let mut pending = Some(
+            parse_pending_node_access_pass(
+                &format!("https://access.example/enroll#invite={token}"),
+                now,
+            )
+            .unwrap(),
+        );
+        let expected_flow = pending.as_ref().unwrap().flow_id;
+        let mut wrong_flow = expected_flow;
+        wrong_flow[0] ^= 1;
+
+        assert!(take_expected_node_access_pass(&mut pending, wrong_flow, now).is_err());
+        assert_eq!(pending.as_ref().unwrap().flow_id, expected_flow);
+
+        let preserved = take_expected_node_access_pass(&mut pending, expected_flow, now).unwrap();
+        assert!(pending.is_none());
+        assert_eq!(preserved.flow_id, expected_flow);
+        assert_eq!(preserved.token.as_slice(), &[0x52; 32]);
+
+        restore_expected_node_access_pass(&mut pending, preserved).unwrap();
+        let restored = pending.as_ref().unwrap();
+        assert_eq!(restored.flow_id, expected_flow);
+        assert_eq!(restored.canonical_origin, "https://access.example:443");
+        assert_eq!(restored.token.as_slice(), &[0x52; 32]);
+
+        let mut expired = pending;
+        assert!(take_expected_node_access_pass(
+            &mut expired,
+            expected_flow,
+            now + std::time::Duration::from_secs(10 * 60 + 1),
+        )
+        .is_err());
+        assert!(expired.is_none(), "an expired pass must be scrubbed");
+    }
+
+    #[test]
+    fn bootstrap_lock_preserves_pass_but_real_lock_scrubs_sensitive_state() {
+        assert!(!lock_transition_requires_sensitive_reset(false));
+        assert!(lock_transition_requires_sensitive_reset(true));
     }
 }

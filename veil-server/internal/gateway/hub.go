@@ -691,9 +691,15 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 
 	if resp == nil {
 		metrics.WSAuthFailuresTotal.Inc()
-		_ = c.sendAuthResult(seq, false, "", "missing authentication response")
+		_ = c.sendPublicAuthFailure(seq, publicerr.New(
+			http.StatusUnauthorized, "authentication_failed", "authentication failed", errors.New("missing authentication response"),
+		))
 		return
 	}
+	// The access pass is a short-lived bearer. Protobuf and WebSocket/TLS
+	// decoding necessarily create transient wire copies, but this avoidable
+	// decoded field must not remain in the heap until the envelope is collected.
+	defer clear(resp.NodeAccessInvite)
 	deviceBinding, err := deviceBindingFromProto(resp.GetDeviceBinding())
 	if err != nil {
 		metrics.WSAuthFailuresTotal.Inc()
@@ -702,17 +708,16 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 		))
 		return
 	}
-	result, err := c.hub.authSvc.VerifyResponseV1(
+	result, err := c.hub.authSvc.VerifyResponseV2(
 		ctx, c.connID,
 		resp.IdentityKey, resp.SigningKey, resp.Signature,
 		resp.DeviceId, resp.DeviceName, deviceBinding, resp.GetDeviceSignature(),
+		resp.GetNodeAccessInvite(),
 	)
 	if err != nil {
 		log.Printf("auth failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
 		metrics.WSAuthFailuresTotal.Inc()
-		_ = c.sendPublicAuthFailure(seq, publicerr.New(
-			http.StatusUnauthorized, "authentication_failed", "authentication failed", err,
-		))
+		_ = c.sendMappedAuthFailure(seq, err)
 		return
 	}
 
@@ -1582,7 +1587,49 @@ func (c *Client) sendPublicError(refSeq uint64, status int, err error) {
 }
 
 func (c *Client) sendPublicAuthFailure(seq uint64, err error) error {
-	return c.sendAuthResult(seq, false, "", publicerr.Message(http.StatusUnauthorized, err))
+	return c.sendAuthFailure(
+		seq,
+		pb.AuthFailureReason_AUTH_FAILURE_REASON_AUTHENTICATION_FAILED,
+		publicerr.Message(http.StatusUnauthorized, err),
+	)
+}
+
+// sendMappedAuthFailure exposes the two enrollment outcomes only after the
+// auth service has completed account-key proof. Every earlier failure remains
+// the same generic authentication result.
+func (c *Client) sendMappedAuthFailure(seq uint64, err error) error {
+	switch {
+	case errors.Is(err, auth.ErrRegistrationClosed):
+		return c.sendAuthFailure(
+			seq,
+			pb.AuthFailureReason_AUTH_FAILURE_REASON_REGISTRATION_CLOSED,
+			"registration is closed",
+		)
+	case errors.Is(err, auth.ErrInviteInvalid):
+		return c.sendAuthFailure(
+			seq,
+			pb.AuthFailureReason_AUTH_FAILURE_REASON_INVITE_INVALID,
+			"invite is invalid, expired, or already used",
+		)
+	default:
+		return c.sendPublicAuthFailure(seq, publicerr.New(
+			http.StatusUnauthorized, "authentication_failed", "authentication failed", err,
+		))
+	}
+}
+
+func (c *Client) sendAuthFailure(seq uint64, reason pb.AuthFailureReason, message string) error {
+	result := &pb.AuthResult{
+		Success:       false,
+		FailureReason: reason,
+		ErrorMessage:  &message,
+	}
+	return c.enqueueEnvelope(&pb.Envelope{
+		Seq: seq,
+		Payload: &pb.Envelope_AuthResult{
+			AuthResult: result,
+		},
+	})
 }
 
 func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string, authDetails ...*auth.AuthResult) error {

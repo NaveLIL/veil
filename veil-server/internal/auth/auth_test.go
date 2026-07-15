@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"errors"
 	"testing"
 	"time"
 
@@ -155,6 +156,32 @@ func TestVerifyResponse_BadSignature(t *testing.T) {
 	_ = serverPublic
 	if err != auth.ErrBadSignature {
 		t.Fatalf("expected ErrBadSignature, got %v", err)
+	}
+}
+
+func TestVerifyResponseV2ChecksProofBeforeInvite(t *testing.T) {
+	svc := newTestService()
+	svc.CreateChallenge("invite-before-proof")
+
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, identityKey := x25519KeyPair(t)
+	deviceID := make([]byte, 16)
+	if _, err := rand.Read(deviceID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Even a malformed supplied invite must not be inspected until both key
+	// possession proofs succeed. The bad signature is therefore authoritative.
+	_, err = svc.VerifyResponseV2(
+		context.Background(), "invite-before-proof",
+		identityKey, pub, make([]byte, ed25519.SignatureSize),
+		deviceID, "test", nil, nil, []byte("malformed-invite"),
+	)
+	if !errors.Is(err, auth.ErrBadSignature) {
+		t.Fatalf("error = %v, want ErrBadSignature before invite evaluation", err)
 	}
 }
 

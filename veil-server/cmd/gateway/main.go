@@ -41,6 +41,9 @@ var privacyHTML []byte
 //go:embed web/terms.html
 var termsHTML []byte
 
+//go:embed web/enroll.html
+var enrollHTML []byte
+
 //go:embed web/legal.css
 var legalCSS []byte
 
@@ -129,6 +132,19 @@ func sourceMetadataForBuild(commit, overrideRevision, overrideArchive, overrideB
 	metadata.ArchiveURL = projectRepositoryURL + "/archive/" + revision + ".tar.gz"
 	metadata.BrowseURL = projectRepositoryURL + "/tree/" + revision
 	return metadata, nil
+}
+
+func nodeAccessPassHandler(body []byte) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Robots-Tag", "noindex, nofollow")
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; img-src data:; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Write(body)
+	}
 }
 
 func main() {
@@ -310,6 +326,9 @@ func main() {
 	mux.HandleFunc("GET /privacy/", staticHTML(privacyHTML))
 	mux.HandleFunc("GET /terms", staticHTML(termsHTML))
 	mux.HandleFunc("GET /terms/", staticHTML(termsHTML))
+	enrollPage := nodeAccessPassHandler(enrollHTML)
+	mux.HandleFunc("GET /enroll", enrollPage)
+	mux.HandleFunc("GET /enroll/", enrollPage)
 	mux.HandleFunc("GET /source", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		target := sourceInfo.ArchiveURL

@@ -44,6 +44,30 @@ out identities already registered on that Node. Opening registration is an
 explicit operator decision and must be coordinated with the site's published
 privacy and support information.
 
+Closed Preview uses one-time Node Access links instead of opening public
+registration. After migration `026_node_access_invites.sql` is applied, the
+operator can generate a private batch from the running gateway image:
+
+```sh
+umask 077
+docker compose -f deploy/compose.prod.yml --env-file deploy/.env exec -T gateway \
+  /app/veil-admin invite create --count 20 --expires 168h \
+  > node-access-invites.txt
+```
+
+Each output line is one independently random, single-use enrollment URL such
+as `https://veil.erez.pro/enroll#invite=...`. The 256-bit bearer token is in the
+URL fragment, so browsers do not send it in the HTTP request or Nginx access
+logs. The database stores only its SHA-256 digest. Deliver each line privately
+to exactly one tester; do not paste the batch into chat rooms, tickets, CI
+output, or container logs. Securely delete the local file after distribution.
+Expired, invalid, and already-used links have the same client-visible result.
+Existing accounts continue to authenticate without a link, and
+`VEIL_ALLOW_REGISTRATION=false` remains unchanged. One link authorizes exactly
+one new account identity. Reconnecting that registered identity never needs
+another link, and if an existing identity presents an unused link the server
+does not consume it.
+
 Make the GHCR package public, or authenticate Docker once with a dedicated
 token that has only `read:packages`. Do not store that token in `deploy/.env`:
 
