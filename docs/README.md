@@ -33,6 +33,15 @@ ADR фиксирует принятое решение и причины. Изм
 Операционные инструкции не заменяют backup, rollback и smoke gate конкретного
 развёртывания. Секреты и production-значения не должны попадать в документацию.
 
+## Product/security contracts
+
+- [Node administration, moderation and reports](product/node-administration-and-reports.md)
+- [Secure Share for guests](product/secure-share-for-guests.md)
+
+Эти документы фиксируют planned boundaries и completion criteria. Наличие
+контракта или prototype-модуля не означает, что функция доступна в Preview.
+После принятия wire/storage решения оно дополнительно фиксируется ADR.
+
 ## Reviews и completion gates
 
 - [Phase 1–4C completion gate](reviews/phase-1-4c-completion-gate.md)

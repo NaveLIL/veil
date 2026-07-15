@@ -27,12 +27,13 @@ flowchart LR
     Node --> DB["PostgreSQL: accounts, routing state, ciphertext"]
     Node --> Uploads["Upload volume: encrypted chunks"]
     Node --> Push["ntfy / push: generic wake-up"]
-    Browser["Static site, Veil Link, Share Viewer"] --> Node
+    Browser["Static site, Veil Link; Secure Share planned"] --> Node
 ~~~
 
 Veil не имеет полноценного browser client. Web surfaces ограничены сайтом,
-origin-hosted invitation preview и узким one-time Share Viewer; они не получают
-native account session или долговременные E2EE-ключи desktop-клиента.
+origin-hosted invitation preview и будущим узким Secure Share Viewer; они не
+получают native account session или долговременные E2EE-ключи desktop-клиента.
+Текущий share viewer является prototype и не подключён к production gateway.
 
 ## Компоненты репозитория
 
@@ -49,7 +50,7 @@ native account session или долговременные E2EE-ключи deskt
 | **veil-mobile** | React Native/Expo foundation; production messaging runtime ещё не завершён |
 | **veil-server** | Go gateway, auth, messaging, Spaces/ACL, push, uploads и Veil Link |
 | **veil-proto** | Versioned wire contracts |
-| **veil-share-viewer** | Изолированный WASM viewer для one-time share capability |
+| **veil-share-viewer** | Экспериментальный WASM viewer prototype; production Secure Share не подключён |
 
 Публичный production entry point Node — единый gateway. PostgreSQL migrations
 выполняются отдельным one-shot этапом до запуска gateway; ошибка migration
