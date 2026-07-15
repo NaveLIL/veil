@@ -1015,6 +1015,17 @@
       const packageStatus = document.getElementById("package-release-status");
       const checksums = document.getElementById("release-checksums");
       const sourceLink = document.getElementById("release-source");
+      const fallbackCards = [...grid.children].map((card) => card.cloneNode(true));
+      const releaseFailure = (reason) => Object.assign(new Error(reason), { releaseFailure: reason });
+
+      const showReleaseFailure = (message) => {
+        grid.replaceChildren(...fallbackCards.map((card) => card.cloneNode(true)));
+        checksums.hidden = true;
+        checksums.removeAttribute("href");
+        sourceLink.hidden = true;
+        sourceLink.removeAttribute("href");
+        status.textContent = message;
+      };
 
       const formatBytes = (raw) => {
         const bytes = Number(raw);
@@ -1076,8 +1087,11 @@
 
       fetch("/downloads/latest.json", { cache: "no-store", credentials: "omit" })
         .then((response) => {
-          if (!response.ok) throw new Error("release manifest unavailable");
-          return response.json();
+          if (response.status === 404) throw releaseFailure("not-found");
+          if (!response.ok) throw releaseFailure("unavailable");
+          return response.json().catch(() => {
+            throw releaseFailure("invalid");
+          });
         })
         .then((manifest) => {
           if (
@@ -1094,7 +1108,7 @@
             || manifest.source.size <= 0
             || !Array.isArray(manifest.files)
           ) {
-            throw new Error("invalid release manifest");
+            throw releaseFailure("invalid");
           }
           const files = manifest.files.filter((file) =>
             file
@@ -1118,18 +1132,18 @@
           for (const file of files) {
             const key = `${file.platform}:${file.kind}`;
             if (!requiredFileKeys.has(key)) continue;
-            if (requiredFiles.has(key)) throw new Error("duplicate required release file");
+            if (requiredFiles.has(key)) throw releaseFailure("invalid");
             requiredFiles.set(key, file);
           }
           if ([...requiredFileKeys].some((key) => !requiredFiles.has(key))) {
-            throw new Error("incomplete desktop release manifest");
+            throw releaseFailure("invalid");
           }
           const windowsSigningModes = new Set([
             requiredFiles.get("windows:exe").signature,
             requiredFiles.get("windows:msi").signature,
           ]);
           if (windowsSigningModes.size !== 1) {
-            throw new Error("inconsistent Windows signing metadata");
+            throw releaseFailure("invalid");
           }
           const windowsSigningMode = [...windowsSigningModes][0];
           let available = 0;
@@ -1144,7 +1158,7 @@
             if (isRecommended) recommendationAssigned = true;
             return releaseCard(descriptor, file, isRecommended);
           });
-          if (available === 0) throw new Error("release has no supported files");
+          if (available === 0) throw releaseFailure("invalid");
           const windowsUnsigned = windowsSigningMode === "unsigned";
           grid.replaceChildren(...cards);
           status.textContent = `Veil Preview ${manifest.version}. Это тестовая сборка; карточки обновляются автоматически после release gate.`;
@@ -1154,14 +1168,22 @@
             packageLabel,
             ` Veil Preview ${manifest.version} прошёл release gate; доступны Linux и Windows.${windowsUnsigned ? " Windows Preview пока без Authenticode — проверьте SHA-256 и ожидайте предупреждение SmartScreen." : " Windows-пакеты подписаны Authenticode."}`
           );
+          checksums.href = "/downloads/SHA256SUMS";
           checksums.hidden = false;
           sourceLink.href = `/downloads/${encodeURIComponent(manifest.source.filename)}`;
           sourceLink.textContent = `Скачать исходники этой сборки (${formatBytes(manifest.source.size)}, AGPL).`;
           sourceLink.hidden = false;
         })
-        .catch(() => {
-          // The static fallback is intentionally honest: no manifest means no
-          // release card and therefore no link that can silently become a 404.
+        .catch((error) => {
+          if (error && error.releaseFailure === "not-found") {
+            showReleaseFailure("Проверенных preview-сборок пока нет. Они появятся здесь после первого успешного release gate.");
+            return;
+          }
+          if (error && error.releaseFailure === "invalid") {
+            showReleaseFailure("Данные о релизе не прошли проверку. Ссылки на загрузки скрыты для безопасности.");
+            return;
+          }
+          showReleaseFailure("Не удалось проверить наличие релизов: сервис загрузок временно недоступен. Ссылки скрыты; попробуйте обновить страницу позже.");
         });
     })();
   </script>
