@@ -17,6 +17,7 @@ env:
   VITE_VEIL_WS_URL: wss://veil.erez.pro/ws
   VITE_VEIL_HTTP_URL: https://veil.erez.pro
   VEIL_PROJECT_SOURCE_URL: https://github.com/${{ github.repository }}/tree/${{ github.sha }}
+  VEIL_RELEASE_PUBLISHER: NaveLIL
 
 jobs:
   validate:
@@ -27,7 +28,12 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
+          persist-credentials: false
           fetch-depth: 0
+
+      - name: Test release SSH preparation
+        shell: bash
+        run: bash scripts/tests/prepare-release-ssh.test.sh
 
       - name: Parse stable semantic version
         id: version
@@ -57,16 +63,51 @@ jobs:
           tauri_version="$(jq -r .version veil-desktop/src-tauri/tauri.conf.json)"
           cargo_version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' veil-desktop/src-tauri/Cargo.toml | head -n 1)"
           client_version="$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' veil-client/Cargo.toml | head -n 1)"
+          bundle_publisher="$(jq -r .bundle.publisher veil-desktop/src-tauri/tauri.conf.json)"
           for actual in "$package_version" "$tauri_version" "$cargo_version" "$client_version"; do
             if [[ "$actual" != "$version" ]]; then
               echo "Tag version $version does not match desktop version $actual" >&2
               exit 1
             fi
           done
+          if [[ "$bundle_publisher" != "$VEIL_RELEASE_PUBLISHER" ]]; then
+            echo "Unexpected bundle publisher: $bundle_publisher" >&2
+            exit 1
+          fi
+
+  vps-preflight:
+    name: VPS release sync preflight
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Validate pinned SSH access and release directory
+        shell: bash
+        env:
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+          VPS_USER: ${{ secrets.VPS_USER }}
+          VPS_SSH_PRIVATE_KEY: ${{ secrets.VPS_SSH_PRIVATE_KEY }}
+          VPS_SSH_KNOWN_HOSTS: ${{ secrets.VPS_SSH_KNOWN_HOSTS }}
+          VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
+        run: |
+          set -euo pipefail
+          ssh_directory="$(mktemp -d "$RUNNER_TEMP/veil-release-ssh.XXXXXX")"
+          cleanup() {
+            rm -rf -- "$ssh_directory"
+          }
+          trap cleanup EXIT
+
+          bash scripts/prepare-release-ssh.sh "$ssh_directory"
+          ssh -F "$ssh_directory/config" veil-release \
+            "set -eu; test -d /srv/veil/releases; test -r /srv/veil/releases; test -w /srv/veil/releases; test -x /srv/veil/releases; command -v tar sha256sum ln mv >/dev/null"
+          echo "VPS release sync preflight passed."
 
   quality:
     name: Release quality gate
-    needs: validate
+    needs: [validate, vps-preflight]
     runs-on: ubuntu-22.04
     env:
       RUSTFLAGS: -D warnings
@@ -237,12 +278,17 @@ jobs:
           deb_arch="$(dpkg-deb -f "${debs[0]}" Architecture)"
           deb_depends="$(dpkg-deb -f "${debs[0]}" Depends)"
           deb_package="$(dpkg-deb -f "${debs[0]}" Package)"
+          deb_maintainer="$(dpkg-deb -f "${debs[0]}" Maintainer)"
           if [[ "$deb_version" != "$RELEASE_VERSION" ]]; then
             echo "Debian package version $deb_version does not match release $RELEASE_VERSION" >&2
             exit 1
           fi
           if [[ "$deb_arch" != "amd64" || -z "$deb_depends" ]]; then
             echo "Unexpected Debian metadata: architecture=$deb_arch depends=$deb_depends" >&2
+            exit 1
+          fi
+          if [[ "$deb_maintainer" != "$VEIL_RELEASE_PUBLISHER" ]]; then
+            echo "Unexpected Debian Maintainer: $deb_maintainer" >&2
             exit 1
           fi
           sudo apt-get install -y "${debs[0]}"
@@ -422,6 +468,45 @@ jobs:
           if ($nsis.Count -ne 1) { throw "Expected exactly one NSIS installer, found $($nsis.Count)" }
           if ($msi.Count -ne 1) { throw "Expected exactly one MSI installer, found $($msi.Count)" }
           $app = Get-Item (Join-Path $env:CARGO_TARGET_DIR "release\veil-desktop.exe")
+          $record = $null
+          $view = $null
+          $database = $null
+          $installer = New-Object -ComObject WindowsInstaller.Installer
+          try {
+            $database = $installer.GetType().InvokeMember(
+              "OpenDatabase",
+              [Reflection.BindingFlags]::InvokeMethod,
+              $null,
+              $installer,
+              @($msi[0].FullName, 0)
+            )
+            $view = $database.GetType().InvokeMember(
+              "OpenView",
+              [Reflection.BindingFlags]::InvokeMethod,
+              $null,
+              $database,
+              "SELECT ``Value`` FROM ``Property`` WHERE ``Property`` = 'Manufacturer'"
+            )
+            $view.GetType().InvokeMember("Execute", [Reflection.BindingFlags]::InvokeMethod, $null, $view, $null) | Out-Null
+            $record = $view.GetType().InvokeMember("Fetch", [Reflection.BindingFlags]::InvokeMethod, $null, $view, $null)
+            if ($null -eq $record) { throw "MSI Manufacturer property is missing" }
+            $manufacturer = $record.GetType().InvokeMember(
+              "StringData",
+              [Reflection.BindingFlags]::GetProperty,
+              $null,
+              $record,
+              1
+            )
+            if ($manufacturer -ne $env:VEIL_RELEASE_PUBLISHER) {
+              throw "Unexpected MSI Manufacturer: $manufacturer"
+            }
+          } finally {
+            foreach ($comObject in @($record, $view, $database, $installer)) {
+              if ($null -ne $comObject -and [Runtime.InteropServices.Marshal]::IsComObject($comObject)) {
+                [void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($comObject)
+              }
+            }
+          }
           $artifacts = @($app, $nsis[0], $msi[0])
           foreach ($artifact in $artifacts) {
             if ($artifact.Length -le 0) { throw "Empty Windows artifact: $($artifact.FullName)" }
@@ -695,46 +780,27 @@ jobs:
           VPS_SSH_PORT: ${{ secrets.VPS_SSH_PORT }}
         run: |
           set -euo pipefail
-          configured=0
-          for value in "$VPS_HOST" "$VPS_USER" "$VPS_SSH_PRIVATE_KEY" "$VPS_SSH_KNOWN_HOSTS"; do
-            [[ -n "$value" ]] && configured=$((configured + 1))
-          done
-          if [[ "$configured" -ne 4 ]]; then
-            echo "VPS sync requires all four VPS_* secrets before a public release can be published." >&2
-            exit 1
-          fi
-          VPS_SSH_PORT="${VPS_SSH_PORT:-22}"
-          if [[ ! "$VPS_SSH_PORT" =~ ^[0-9]+$ ]]; then
-            echo "VPS_SSH_PORT must be numeric" >&2
-            exit 1
-          fi
-
-          key_file="$RUNNER_TEMP/veil-vps-key"
-          known_hosts_file="$RUNNER_TEMP/veil-known-hosts"
+          ssh_directory="$(mktemp -d "$RUNNER_TEMP/veil-release-ssh.XXXXXX")"
           archive="$RUNNER_TEMP/veil-release-assets.tar.gz"
-          printf '%s\n' "$VPS_SSH_PRIVATE_KEY" | tr -d '\r' > "$key_file"
-          printf '%s\n' "$VPS_SSH_KNOWN_HOSTS" | tr -d '\r' > "$known_hosts_file"
-          chmod 600 "$key_file" "$known_hosts_file"
+          cleanup() {
+            rm -rf -- "$ssh_directory"
+            rm -f -- "$archive"
+          }
+          trap cleanup EXIT
+
+          bash scripts/prepare-release-ssh.sh "$ssh_directory"
           tar -C release-assets -czf "$archive" .
 
-          ssh_options=(
-            -i "$key_file"
-            -o "Port=$VPS_SSH_PORT"
-            -o "UserKnownHostsFile=$known_hosts_file"
-            -o "StrictHostKeyChecking=yes"
-            -o "BatchMode=yes"
-          )
-          destination="${VPS_USER}@${VPS_HOST}"
           stage_name="${GITHUB_REF_NAME}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           remote_base="/srv/veil/releases"
           remote_stage="$remote_base/.incoming/$stage_name"
 
-          ssh "${ssh_options[@]}" "$destination" \
+          ssh -F "$ssh_directory/config" veil-release \
             "umask 022; mkdir -p '$remote_stage' '$remote_base'"
-          scp "${ssh_options[@]}" "$archive" \
-            "$destination:$remote_stage/release-assets.tar.gz"
+          scp -F "$ssh_directory/config" "$archive" \
+            "veil-release:$remote_stage/release-assets.tar.gz"
 
-          ssh "${ssh_options[@]}" "$destination" \
+          ssh -F "$ssh_directory/config" veil-release \
             "sh -s -- '$stage_name'" <<'REMOTE_SCRIPT'
           set -eu
           stage_name="$1"
@@ -756,8 +822,7 @@ jobs:
           mv -Tf "$current_tmp" "$base/current"
           REMOTE_SCRIPT
 
-          rm -f "$key_file" "$known_hosts_file" "$archive"
-          echo "Published $GITHUB_REF_NAME to $VPS_HOST:$remote_base/current"
+          echo "Published $GITHUB_REF_NAME to the pinned VPS release directory."
 
       - name: Publish GitHub Release
         shell: bash

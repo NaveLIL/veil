@@ -39,6 +39,7 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "publisher": "NaveLIL",
     "copyright": "Copyright © 2026 NaveLIL",
     "license": "AGPL-3.0-or-later",
     "licenseFile": "../../LICENSE",
