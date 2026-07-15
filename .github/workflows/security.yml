@@ -65,9 +65,13 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      # pnpm 10 uses npm's retired quick-audit endpoints. pnpm 11 uses the
+      # supported bulk advisory API while auditing the committed lockfile.
+      # Build/install jobs stay on pnpm 10 until overrides move to
+      # pnpm-workspace.yaml; this audit-only job does not rewrite the lockfile.
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
-          version: 10
+          version: 11.13.0
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -75,7 +79,7 @@ jobs:
 
       - name: Audit dependencies
         working-directory: veil-desktop
-        run: pnpm audit
+        run: pnpm audit --audit-level=low
 
   mobile-audit:
     name: Mobile Dependency Audit
@@ -83,9 +87,11 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
+      # Keep this aligned with desktop-audit so registry API behavior cannot
+      # diverge between the two JavaScript dependency gates.
       - uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
         with:
-          version: 10
+          version: 11.13.0
 
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
@@ -93,7 +99,7 @@ jobs:
 
       - name: Audit dependencies
         working-directory: veil-mobile
-        run: pnpm audit
+        run: pnpm audit --audit-level=low
 
   third-party-notices:
     name: Third-party Notice Generation
