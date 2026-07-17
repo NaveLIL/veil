@@ -13,7 +13,20 @@ import uniffi.veil_ffi.validateMnemonic
 
 class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context), LifecycleEventListener {
   private val vault = NativeIdentityVault(context)
-  private var identity: VeilIdentity? = null
+  private val identityState = SerializedIdentityState<VeilIdentity>(
+    // ReactContext lifecycle state is not a cross-thread authority. Start
+    // closed and grant access only from the registered onHostResume callback.
+    initiallyAccessible = false,
+    loadExisting = {
+      if (!vault.hasIdentity()) {
+        null
+      } else {
+        vault.withMnemonicBytes { mnemonicUtf8 ->
+          VeilIdentity.fromMnemonicBytes(mnemonicUtf8)
+        }
+      }
+    },
+  )
 
   init {
     context.addLifecycleEventListener(this)
@@ -22,19 +35,19 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
   override fun getName(): String = "VeilCrypto"
 
   @ReactMethod
-  fun generateMnemonic(promise: Promise) = resolve(promise) { generateMnemonic() }
+  fun generateMnemonic(promise: Promise) = resolveScoped(promise) { generateMnemonic() }
 
   @ReactMethod
   fun validateMnemonic(mnemonic: String, promise: Promise) =
-    resolve(promise) { validateMnemonic(normalizeMnemonic(mnemonic)) }
+    resolveScoped(promise) { validateMnemonic(normalizeMnemonic(mnemonic)) }
 
   @ReactMethod
-  fun hasIdentity(promise: Promise) = resolve(promise) {
-    if (!vault.hasIdentity()) false else loadIdentity().let { true }
+  fun hasIdentity(promise: Promise) = resolveScoped(promise) {
+    identityState.withExisting { true } ?: false
   }
 
   @ReactMethod
-  fun setSensitiveScreen(enabled: Boolean, promise: Promise) {
+  fun setSensitiveScreen(_enabled: Boolean, promise: Promise) {
     val activity = currentActivity
     if (activity == null) {
       promise.reject("E_VEIL_WINDOW", "current activity is unavailable")
@@ -42,71 +55,78 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
     }
     activity.runOnUiThread {
       try {
-        if (enabled) {
-          activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        } else {
-          activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
-        }
+        // FLAG_SECURE is Activity-wide for the closed preview. The legacy
+        // recovery UI may request stronger protection, but its cleanup must
+        // never downgrade the global task/screenshot boundary.
+        activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
         promise.resolve(true)
-      } catch (error: Throwable) {
-        promise.reject("E_VEIL_WINDOW", "unable to update sensitive screen protection", error)
+      } catch (_: Throwable) {
+        promise.reject("E_VEIL_WINDOW", "Unable to update sensitive screen protection")
       }
     }
   }
 
   @ReactMethod
-  fun createIdentity(mnemonic: String, promise: Promise) = resolve(promise) {
+  fun createIdentity(mnemonic: String, promise: Promise) = resolveScoped(promise) {
     val normalized = normalizeMnemonic(mnemonic)
     if (!validateMnemonic(normalized)) throw IllegalArgumentException("invalid recovery phrase")
     val candidate = identityFromMnemonic(normalized)
+    var installed = false
     try {
-      val existing = if (vault.hasIdentity()) loadIdentity() else null
-      if (existing != null) {
-        if (!MessageDigest.isEqual(existing.identityKey(), candidate.identityKey())) {
-          throw IdentityVaultException("a different identity already exists on this device")
-        }
-        return@resolve existing.identityKey().toHex()
-      }
-      vault.storeNewMnemonic(normalized)
-      synchronized(this) {
-        identity?.close()
-        identity = candidate
-      }
-      candidate.identityKey().toHex()
+      val candidateKey = candidate.identityKey()
+      installed = identityState.installOrVerify(
+        candidate = candidate,
+        verifyExisting = { existing, _ ->
+          if (!MessageDigest.isEqual(existing.identityKey(), candidateKey)) {
+            throw IdentityVaultException("a different identity already exists on this device")
+          }
+        },
+        persistCandidate = { vault.storeNewMnemonic(normalized) },
+      )
+      candidateKey.toHex()
     } finally {
-      synchronized(this) {
-        if (identity !== candidate) candidate.close()
+      if (!installed) {
+        candidate.close()
       }
     }
   }
 
   @ReactMethod
-  fun getIdentityKey(promise: Promise) = resolve(promise) { loadIdentity().identityKey().toHex() }
-
-  @Synchronized
-  private fun loadIdentity(): VeilIdentity {
-    identity?.let { return it }
-    val loaded = vault.withMnemonicBytes { mnemonicUtf8 ->
-      VeilIdentity.fromMnemonicBytes(mnemonicUtf8)
-    }
-    identity = loaded
-    return loaded
+  fun getIdentityKey(promise: Promise) = resolveScoped(promise) {
+    identityState.withExisting { loaded -> loaded.identityKey().toHex() }
+      ?: throw IdentityVaultException("no local identity exists")
   }
 
-  @Synchronized
   private fun closeIdentity() {
-    identity?.close()
-    identity = null
+    try {
+      identityState.close()
+    } catch (_: Throwable) {
+      // The serialized owner already dropped its reference before closing.
+      // UniFFI's cleaner remains a fallback and lifecycle teardown must not
+      // crash or reflect native diagnostics into React Native.
+    }
   }
 
-  override fun onHostResume() = Unit
+  override fun onHostResume() {
+    identityState.resumeAccess()
+  }
 
   override fun onHostPause() {
-    closeIdentity()
+    try {
+      identityState.suspendAccess()
+    } catch (_: Throwable) {
+      // The owner drops its native reference before close. Backgrounding must
+      // remain fail-closed even if native cleanup reports an error.
+    }
   }
 
   override fun onHostDestroy() {
-    closeIdentity()
+    try {
+      identityState.suspendAccess()
+    } catch (_: Throwable) {
+      // A React context can survive Activity recreation; keep the owner
+      // resumable while ensuring no native handle remains usable meanwhile.
+    }
   }
 
   override fun invalidate() {
@@ -124,11 +144,15 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
     }
   }
 
-  private inline fun resolve(promise: Promise, operation: () -> Any?) {
+  private fun resolveScoped(promise: Promise, operation: () -> Any?) {
     try {
-      promise.resolve(operation())
-    } catch (error: Throwable) {
-      promise.reject("E_VEIL_CRYPTO", error.message ?: "native cryptographic operation failed", error)
+      identityState.runIfAccessible(operation) { result -> promise.resolve(result) }
+    } catch (_: IdentityAccessSuspendedException) {
+      promise.reject("E_VEIL_LOCKED", "Return to Veil before using the secure identity")
+    } catch (_: Throwable) {
+      // Native errors and causes may contain storage or cryptographic details.
+      // Keep the JS boundary stable and non-diagnostic.
+      promise.reject("E_VEIL_CRYPTO", "Native cryptographic operation failed")
     }
   }
 

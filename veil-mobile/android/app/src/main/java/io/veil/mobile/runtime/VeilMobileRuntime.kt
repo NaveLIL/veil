@@ -9,6 +9,7 @@ import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import uniffi.veil_ffi.MobileAuthenticatedBinding
+import uniffi.veil_ffi.MobileConnectCancellation
 import uniffi.veil_ffi.VeilMobileSession
 
 internal enum class NativeSessionState {
@@ -45,13 +46,28 @@ internal class VeilMobileRuntimeException(
   message: String,
 ) : Exception(message)
 
+internal fun interface NativeConnectCancellation : AutoCloseable {
+  fun cancel()
+
+  override fun close() = Unit
+}
+
+internal fun interface NativeConnectCancellationFactory {
+  fun create(): NativeConnectCancellation
+}
+
 internal interface NativeMobileSession : AutoCloseable {
-  fun connect(websocketUrl: String, canonicalOrigin: String): PublicAuthenticatedBinding
+  fun connect(
+    websocketUrl: String,
+    canonicalOrigin: String,
+    cancellation: NativeConnectCancellation,
+  ): PublicAuthenticatedBinding
 
   fun connectWithNodeAccessPass(
     websocketUrl: String,
     canonicalOrigin: String,
     nodeAccessPass: ByteArray,
+    cancellation: NativeConnectCancellation,
   ): PublicAuthenticatedBinding
 
   fun disconnect()
@@ -65,6 +81,7 @@ internal class VeilMobileRuntime internal constructor(
   private val vault: NativeIdentityVaultAccess,
   private val passStore: NodeAccessPassStore,
   private val sessionFactory: NativeMobileSessionFactory,
+  private val cancellationFactory: NativeConnectCancellationFactory,
   private val executor: ExecutorService,
   private val databasePathProvider: () -> String,
 ) {
@@ -72,6 +89,7 @@ internal class VeilMobileRuntime internal constructor(
     vault = NativeIdentityVault(context.applicationContext),
     passStore = NodeAccessPassStore(clockMillis = { SystemClock.elapsedRealtime() }),
     sessionFactory = UniFfiMobileSessionFactory,
+    cancellationFactory = UniFfiConnectCancellationFactory,
     executor = newRuntimeExecutor(),
     databasePathProvider = { resolveDatabasePath(context.applicationContext) },
   )
@@ -84,6 +102,23 @@ internal class VeilMobileRuntime internal constructor(
   private var connectionState = NativeConnectionState.DISCONNECTED
   private var binding: PublicAuthenticatedBinding? = null
   private var directoryReady = false
+  // Process-scoped runtimes start without UI authority. Only an Activity
+  // lifecycle transition may grant foreground access; this prevents a cold
+  // headless process (for example future push handling) from opening the
+  // encrypted account before any visible Veil surface exists.
+  private var foreground = false
+  private var lifecycleEpoch = 0L
+  private var activeConnect: ActiveConnect? = null
+
+  private data class ActiveConnect(
+    val session: NativeMobileSession,
+    val cancellation: NativeConnectCancellation,
+    val epoch: Long,
+  )
+
+  private data class BackgroundLockRequest(
+    val epoch: Long,
+  )
 
   fun execute(operation: () -> Unit) {
     executor.execute(operation)
@@ -114,40 +149,64 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   fun openSession(): VeilMobileRuntimeSnapshot {
-    synchronized(stateLock) {
-      if (session != null && sessionState == NativeSessionState.OPEN) return snapshotLocked()
+    val openingEpoch = synchronized(stateLock) {
+      if (!foreground) {
+        throw VeilMobileRuntimeException("E_VEIL_LOCKED", "Return to Veil before opening the local account")
+      }
+      if (session != null) {
+        if (sessionState == NativeSessionState.CLOSING) {
+          throw VeilMobileRuntimeException("E_VEIL_LOCKED", "The local account is still locking")
+        }
+        sessionState = NativeSessionState.OPEN
+        return snapshotLocked()
+      }
+      lifecycleEpoch += 1
       sessionState = NativeSessionState.OPENING
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
       directoryReady = false
+      lifecycleEpoch
     }
     publishSnapshot()
 
-    var candidate: NativeMobileSession? = null
-    try {
-      candidate = vault.withMnemonicBytes { mnemonicUtf8 ->
+    val candidate = try {
+      vault.withMnemonicBytes { mnemonicUtf8 ->
         sessionFactory.create(mnemonicUtf8, databasePathProvider())
       }
-      synchronized(stateLock) {
-        session?.closeQuietly()
-        session = candidate
-        candidate = null
-        sessionState = NativeSessionState.OPEN
-        connectionState = NativeConnectionState.DISCONNECTED
-      }
-      return publishSnapshot()
     } catch (_: Throwable) {
-      candidate?.closeQuietly()
       synchronized(stateLock) {
-        session = null
-        sessionState = NativeSessionState.ERROR
-        connectionState = NativeConnectionState.DISCONNECTED
-        binding = null
-        directoryReady = false
+        if (foreground && lifecycleEpoch == openingEpoch && session == null) {
+          sessionState = NativeSessionState.ERROR
+          connectionState = NativeConnectionState.DISCONNECTED
+          binding = null
+          directoryReady = false
+        }
       }
       publishSnapshot()
       throw VeilMobileRuntimeException("E_VEIL_OPEN", "Unable to open the encrypted local account")
     }
+
+    val installed = synchronized(stateLock) {
+      if (
+        foreground &&
+        lifecycleEpoch == openingEpoch &&
+        session == null &&
+        sessionState == NativeSessionState.OPENING
+      ) {
+        session = candidate
+        sessionState = NativeSessionState.OPEN
+        connectionState = NativeConnectionState.DISCONNECTED
+        true
+      } else {
+        false
+      }
+    }
+    if (!installed) {
+      candidate.closeQuietly()
+      publishSnapshot()
+      throw VeilMobileRuntimeException("E_VEIL_LOCKED", "The local account was locked while opening")
+    }
+    return publishSnapshot()
   }
 
   fun connect(rawOrigin: String): PublicAuthenticatedBinding {
@@ -193,30 +252,74 @@ internal class VeilMobileRuntime internal constructor(
     origin: CanonicalServerOrigin,
     accessAttempt: NodeAccessPassAttempt?,
   ): PublicAuthenticatedBinding {
-    val active = synchronized(stateLock) {
-      session ?: throw VeilMobileRuntimeException("E_VEIL_LOCKED", "Open the local account before connecting")
+    val attempt = synchronized(stateLock) {
+      if (!foreground) {
+        throw VeilMobileRuntimeException("E_VEIL_LOCKED", "Return to Veil before connecting")
+      }
+      val active = session
+        ?: throw VeilMobileRuntimeException("E_VEIL_LOCKED", "Open the local account before connecting")
+      if (sessionState != NativeSessionState.OPEN) {
+        throw VeilMobileRuntimeException("E_VEIL_LOCKED", "The local account is not ready to connect")
+      }
+      if (activeConnect != null) {
+        throw VeilMobileRuntimeException("E_VEIL_CONNECTING", "A connection attempt is already running")
+      }
+      val pending = ActiveConnect(
+        session = active,
+        cancellation = cancellationFactory.create(),
+        epoch = lifecycleEpoch,
+      )
+      activeConnect = pending
+      connectionState = NativeConnectionState.CONNECTING
+      binding = null
+      directoryReady = false
+      pending
     }
+    val active = attempt.session
+    publishSnapshot()
+
     try {
       active.disconnect()
     } catch (_: Throwable) {
       // A stale transport must not prevent a fresh, serialized connection.
     }
-    synchronized(stateLock) {
-      connectionState = NativeConnectionState.CONNECTING
-      binding = null
-      directoryReady = false
-    }
-    publishSnapshot()
 
     return try {
-      val authenticated = if (accessAttempt == null) {
-        active.connect(origin.websocketUrl, origin.value)
-      } else {
-        active.connectWithNodeAccessPass(origin.websocketUrl, origin.value, accessAttempt.token)
+      val mayConnect = synchronized(stateLock) {
+        foreground &&
+          lifecycleEpoch == attempt.epoch &&
+          session === active &&
+          activeConnect === attempt
       }
-      synchronized(stateLock) {
-        binding = authenticated
-        connectionState = NativeConnectionState.CONNECTED
+      if (!mayConnect) {
+        throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
+      }
+
+      val authenticated = if (accessAttempt == null) {
+        active.connect(origin.websocketUrl, origin.value, attempt.cancellation)
+      } else {
+        active.connectWithNodeAccessPass(
+          origin.websocketUrl,
+          origin.value,
+          accessAttempt.token,
+          attempt.cancellation,
+        )
+      }
+
+      val accepted = synchronized(stateLock) {
+        val current = foreground &&
+          lifecycleEpoch == attempt.epoch &&
+          session === active &&
+          activeConnect === attempt
+        if (activeConnect === attempt) activeConnect = null
+        if (current) {
+          binding = authenticated
+          connectionState = NativeConnectionState.CONNECTED
+        }
+        current
+      }
+      if (!accepted) {
+        throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
       }
       if (accessAttempt != null) passStore.clearAfterSuccess(accessAttempt.flowId)
       publishSnapshot()
@@ -228,38 +331,71 @@ internal class VeilMobileRuntime internal constructor(
         // Preserve the original, sanitized connection failure.
       }
       synchronized(stateLock) {
-        connectionState = NativeConnectionState.ERROR
-        binding = null
-        directoryReady = false
+        val current = activeConnect === attempt
+        if (current) activeConnect = null
+        if (
+          current &&
+          foreground &&
+          lifecycleEpoch == attempt.epoch &&
+          session === active
+        ) {
+          connectionState = NativeConnectionState.ERROR
+          binding = null
+          directoryReady = false
+        }
       }
       publishSnapshot()
+      if (error is VeilMobileRuntimeException) throw error
       throw publicConnectError(error)
+    } finally {
+      try {
+        attempt.cancellation.close()
+      } catch (_: Throwable) {
+        // The one-shot token contains no session state; its native cleaner is
+        // still a fallback if explicit release reports an unexpected error.
+      }
     }
   }
 
   fun disconnect(): VeilMobileRuntimeSnapshot {
-    val active = synchronized(stateLock) { session }
+    val target = synchronized(stateLock) { session to lifecycleEpoch }
+    val active = target.first
     try {
       active?.disconnect()
     } catch (_: Throwable) {
       synchronized(stateLock) {
-        connectionState = NativeConnectionState.ERROR
-        binding = null
-        directoryReady = false
+        if (
+          foreground &&
+          lifecycleEpoch == target.second &&
+          session === active
+        ) {
+          connectionState = NativeConnectionState.ERROR
+          binding = null
+          directoryReady = false
+        }
       }
       publishSnapshot()
       throw VeilMobileRuntimeException("E_VEIL_DISCONNECT", "Unable to close the Veil Node connection cleanly")
     }
     synchronized(stateLock) {
-      connectionState = NativeConnectionState.DISCONNECTED
-      binding = null
-      directoryReady = false
+      if (lifecycleEpoch == target.second && session === active) {
+        connectionState = NativeConnectionState.DISCONNECTED
+        binding = null
+        directoryReady = false
+      }
     }
     return publishSnapshot()
   }
 
   fun lockSession(): VeilMobileRuntimeSnapshot {
     val active = synchronized(stateLock) {
+      lifecycleEpoch += 1
+      // Cancel while holding the same lock that owns activeConnect. The
+      // connect finalizer cannot clear the attempt and close its UniFFI handle
+      // between selecting it and this call. Rust cancellation is deliberately
+      // atomic/non-blocking and never calls back into this runtime.
+      activeConnect?.cancellation?.cancelQuietly()
+      activeConnect = null
       sessionState = NativeSessionState.CLOSING
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
@@ -281,15 +417,56 @@ internal class VeilMobileRuntime internal constructor(
     return publishSnapshot()
   }
 
+  fun markForeground(): VeilMobileRuntimeSnapshot {
+    synchronized(stateLock) {
+      if (foreground) return snapshotLocked()
+      foreground = true
+    }
+    return publishSnapshot()
+  }
+
   fun lockForBackground() {
+    val request = synchronized(stateLock) {
+      foreground = false
+      lifecycleEpoch += 1
+      // See lockSession(): selecting and cancelling the capability must be one
+      // linearized state transition so onStop cannot race a UniFFI close.
+      activeConnect?.cancellation?.cancelQuietly()
+      sessionState = NativeSessionState.CLOSING
+      connectionState = NativeConnectionState.DISCONNECTED
+      binding = null
+      directoryReady = false
+      BackgroundLockRequest(lifecycleEpoch)
+    }
+    passStore.close()
+    publishSnapshot()
     execute {
-      try {
-        lockSession()
-      } catch (_: Throwable) {
-        // There is no safe UI target while backgrounding; teardown is already
-        // fail-closed and the process will reclaim remaining native memory.
+      finalizeBackgroundLock(request)
+    }
+  }
+
+  private fun finalizeBackgroundLock(request: BackgroundLockRequest) {
+    val active = synchronized(stateLock) {
+      if (lifecycleEpoch != request.epoch) return
+      activeConnect = null
+      session.also { session = null }
+    }
+    try {
+      active?.disconnect()
+    } catch (_: Throwable) {
+      // Background teardown remains fail-closed even after transport errors.
+    } finally {
+      active?.closeQuietly()
+    }
+    synchronized(stateLock) {
+      if (lifecycleEpoch == request.epoch && session == null) {
+        sessionState = NativeSessionState.LOCKED
+        connectionState = NativeConnectionState.DISCONNECTED
+        binding = null
+        directoryReady = false
       }
     }
+    publishSnapshot()
   }
 
   fun cancelPendingAccessPass(expectedFlowId: String): Boolean {
@@ -315,10 +492,9 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   private fun snapshotLocked(): VeilMobileRuntimeSnapshot {
-    val identityExists = try {
+    val identityExists = session != null || try {
       vault.hasIdentity()
     } catch (_: Throwable) {
-      sessionState = NativeSessionState.ERROR
       false
     }
     return VeilMobileRuntimeSnapshot(
@@ -338,6 +514,10 @@ internal class VeilMobileRuntime internal constructor(
   private fun publicConnectError(error: Throwable): VeilMobileRuntimeException {
     val detail = error.message.orEmpty().lowercase()
     return when {
+      "mobile connection attempt cancelled" in detail -> VeilMobileRuntimeException(
+        "E_VEIL_CANCELLED",
+        "Connection attempt was cancelled",
+      )
       "registration is closed" in detail -> VeilMobileRuntimeException(
         "E_VEIL_ACCESS_REQUIRED",
         "Registration on this Veil Node requires a valid Node Access Pass",
@@ -375,18 +555,49 @@ private object UniFfiMobileSessionFactory : NativeMobileSessionFactory {
     UniFfiMobileSession(VeilMobileSession.fromMnemonicBytes(mnemonicUtf8, databasePath))
 }
 
+private object UniFfiConnectCancellationFactory : NativeConnectCancellationFactory {
+  override fun create(): NativeConnectCancellation =
+    UniFfiConnectCancellation(MobileConnectCancellation())
+}
+
+private class UniFfiConnectCancellation(
+  val delegate: MobileConnectCancellation,
+) : NativeConnectCancellation {
+  override fun cancel() {
+    delegate.cancel()
+  }
+
+  override fun close() {
+    delegate.close()
+  }
+}
+
 private class UniFfiMobileSession(
   private val delegate: VeilMobileSession,
 ) : NativeMobileSession {
-  override fun connect(websocketUrl: String, canonicalOrigin: String): PublicAuthenticatedBinding =
-    delegate.connect(websocketUrl, canonicalOrigin).toPublicBinding()
+  override fun connect(
+    websocketUrl: String,
+    canonicalOrigin: String,
+    cancellation: NativeConnectCancellation,
+  ): PublicAuthenticatedBinding =
+    delegate.connectCancellable(
+      websocketUrl,
+      canonicalOrigin,
+      cancellation.requireUniFfiDelegate(),
+    ).toPublicBinding()
 
   override fun connectWithNodeAccessPass(
     websocketUrl: String,
     canonicalOrigin: String,
     nodeAccessPass: ByteArray,
+    cancellation: NativeConnectCancellation,
   ): PublicAuthenticatedBinding =
-    delegate.connectWithNodeAccessPass(websocketUrl, canonicalOrigin, nodeAccessPass).toPublicBinding()
+    delegate.connectWithNodeAccessPassCancellable(
+      websocketUrl,
+      canonicalOrigin,
+      nodeAccessPass,
+      cancellation.requireUniFfiDelegate(),
+    ).toPublicBinding()
 
   override fun disconnect() {
     delegate.disconnect()
@@ -394,6 +605,20 @@ private class UniFfiMobileSession(
 
   override fun close() {
     delegate.close()
+  }
+}
+
+private fun NativeConnectCancellation.requireUniFfiDelegate(): MobileConnectCancellation =
+  (this as? UniFfiConnectCancellation)?.delegate
+    ?: throw IllegalStateException("native mobile cancellation capability is incompatible")
+
+private fun NativeConnectCancellation.cancelQuietly() {
+  try {
+    cancel()
+  } catch (_: Throwable) {
+    // A capability can only be absent here if its connect attempt already
+    // completed and cleared activeConnect under stateLock. Keep lifecycle
+    // teardown fail-closed and never reflect native diagnostics to Android.
   }
 }
 

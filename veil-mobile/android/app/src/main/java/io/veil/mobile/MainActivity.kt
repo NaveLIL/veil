@@ -3,6 +3,7 @@ package io.veil.mobile
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.view.WindowManager
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
@@ -18,13 +19,26 @@ class MainActivity : ReactActivity() {
     // coloring the background, status bar, and navigation bar.
     // This is required for expo-splash-screen.
     setTheme(R.style.AppTheme);
+    // Closed preview policy: never allow Android screenshots, non-secure
+    // displays, or an unredacted task snapshot to capture account plaintext.
+    // A future user-facing screenshot preference must preserve recovery and
+    // task-switcher protection as separate non-optional boundaries.
+    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
     super.onCreate(null)
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+      setRecentsScreenshotEnabled(false)
+    }
   }
 
   override fun onNewIntent(intent: Intent) {
     consumeEnrollmentIntent(intent)
     super.onNewIntent(intent)
     setIntent(intent)
+  }
+
+  override fun onStart() {
+    super.onStart()
+    (application as MainApplication).veilMobileRuntime.markForeground()
   }
 
   override fun onStop() {

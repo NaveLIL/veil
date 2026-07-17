@@ -1,11 +1,13 @@
 use std::{
+    future::Future,
     path::PathBuf,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+use tokio::sync::Notify;
 use veil_crypto::{
     aead, fingerprint, kdf, keys, ratchet, share, signature, x3dh, IdentityKeyPair, RatchetSession,
 };
@@ -146,6 +148,62 @@ impl VeilIdentity {
     }
 }
 
+// ── MobileConnectCancellation (thread-safe cooperative cancellation) ──
+
+/// One-shot cancellation capability for a single mobile connection attempt.
+///
+/// `cancel` is the only mobile-session-adjacent operation designed to run from
+/// an Android lifecycle thread while `connect_*_cancellable` is blocked on the
+/// serialized native runtime thread. It never locks or closes `VeilClient`.
+#[derive(uniffi::Object)]
+pub struct MobileConnectCancellation {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+#[uniffi::export]
+impl MobileConnectCancellation {
+    #[uniffi::constructor]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        })
+    }
+
+    /// Request cancellation without waiting for the mobile client mutex.
+    /// Repeated calls are harmless and cancellation remains sticky.
+    pub fn cancel(&self) {
+        if !self.cancelled.swap(true, Ordering::AcqRel) {
+            self.notify.notify_waiters();
+        }
+    }
+}
+
+impl MobileConnectCancellation {
+    fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::Acquire)
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+
+            // Register before the second atomic read. This closes the race in
+            // which cancel happens between observing false and awaiting Notify.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_cancelled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
 // ── VeilMobileSession (native account/origin binding) ──────
 
 /// Native mobile session backed by the same SQLCipher/per-device engine as
@@ -215,7 +273,26 @@ impl VeilMobileSession {
         websocket_url: String,
         canonical_server_origin: String,
     ) -> Result<MobileAuthenticatedBinding, VeilError> {
-        self.connect_inner(websocket_url, canonical_server_origin, None)
+        self.connect_inner(websocket_url, canonical_server_origin, None, None)
+    }
+
+    /// Connect with lifecycle-safe cooperative cancellation.
+    ///
+    /// Cancelling never closes this UniFFI object from another thread. Instead,
+    /// it wakes the in-flight future so the serialized native thread can tear
+    /// down the partially-open transport and clear its authenticated binding.
+    pub fn connect_cancellable(
+        &self,
+        websocket_url: String,
+        canonical_server_origin: String,
+        cancellation: Arc<MobileConnectCancellation>,
+    ) -> Result<MobileAuthenticatedBinding, VeilError> {
+        self.connect_inner(
+            websocket_url,
+            canonical_server_origin,
+            None,
+            Some(cancellation.as_ref()),
+        )
     }
 
     /// Connect a newly enrolled account with a single-use Node Access Pass.
@@ -231,6 +308,24 @@ impl VeilMobileSession {
             websocket_url,
             canonical_server_origin,
             Some(node_access_pass),
+            None,
+        )
+    }
+
+    /// Connect a newly enrolled account with cooperative lifecycle
+    /// cancellation. The access pass remains zeroized on every exit path.
+    pub fn connect_with_node_access_pass_cancellable(
+        &self,
+        websocket_url: String,
+        canonical_server_origin: String,
+        node_access_pass: Vec<u8>,
+        cancellation: Arc<MobileConnectCancellation>,
+    ) -> Result<MobileAuthenticatedBinding, VeilError> {
+        self.connect_inner(
+            websocket_url,
+            canonical_server_origin,
+            Some(node_access_pass),
+            Some(cancellation.as_ref()),
         )
     }
 
@@ -315,6 +410,7 @@ impl VeilMobileSession {
         websocket_url: String,
         canonical_server_origin: String,
         node_access_pass: Option<Vec<u8>>,
+        cancellation: Option<&MobileConnectCancellation>,
     ) -> Result<MobileAuthenticatedBinding, VeilError> {
         let node_access_pass = guard_mobile_node_access_pass(node_access_pass)?;
         validate_mobile_endpoint_pair(&websocket_url, &canonical_server_origin)?;
@@ -324,15 +420,32 @@ impl VeilMobileSession {
         // can race with the new authentication result.
         let mut client = invalidate_mobile_session(&self.binding, &self.client)?;
         let has_node_access_pass = node_access_pass.is_some();
-        let user_id = self
+        let connection = client.connect_with_client_metadata_and_access_pass(
+            &websocket_url,
+            "veil-android",
+            "veil-android",
+            mobile_node_access_pass_bytes(&node_access_pass),
+        );
+        let user_id = match self
             .runtime
-            .block_on(client.connect_with_client_metadata_and_access_pass(
-                &websocket_url,
-                "veil-android",
-                "veil-android",
-                mobile_node_access_pass_bytes(&node_access_pass),
-            ))
-            .map_err(|msg| safe_mobile_connect_error(msg, has_node_access_pass))?;
+            .block_on(await_mobile_connect(connection, cancellation))
+        {
+            MobileConnectOutcome::Completed(result) => {
+                if cancellation.is_some_and(MobileConnectCancellation::is_cancelled) {
+                    return Err(fail_closed_mobile_connect_cancellation(
+                        &mut client,
+                        &self.binding,
+                    ));
+                }
+                result.map_err(|msg| safe_mobile_connect_error(msg, has_node_access_pass))?
+            }
+            MobileConnectOutcome::Cancelled => {
+                return Err(fail_closed_mobile_connect_cancellation(
+                    &mut client,
+                    &self.binding,
+                ));
+            }
+        };
         let post_auth_result = (|| {
             require_canonical_user_id("authenticated mobile user ID", &user_id)?;
             let identity_key = client
@@ -364,7 +477,19 @@ impl VeilMobileSession {
         })();
 
         match post_auth_result {
-            Ok(binding) => Ok(binding),
+            Ok(binding) => {
+                // This load is the cancellation linearization point after all
+                // synchronous post-auth work. If connect wins this race, the
+                // Kotlin lifecycle epoch still guards publication to JS.
+                if cancellation.is_some_and(MobileConnectCancellation::is_cancelled) {
+                    Err(fail_closed_mobile_connect_cancellation(
+                        &mut client,
+                        &self.binding,
+                    ))
+                } else {
+                    Ok(binding)
+                }
+            }
             Err(error) => {
                 fail_closed_mobile_post_auth(|| client.disconnect(), &self.binding, error)
             }
@@ -834,6 +959,41 @@ fn mobile_node_access_pass_bytes(node_access_pass: &Option<Zeroizing<Vec<u8>>>) 
     node_access_pass.as_ref().map(|pass| pass.as_slice())
 }
 
+enum MobileConnectOutcome<T> {
+    Completed(T),
+    Cancelled,
+}
+
+async fn await_mobile_connect<F, T>(
+    connection: F,
+    cancellation: Option<&MobileConnectCancellation>,
+) -> MobileConnectOutcome<T>
+where
+    F: Future<Output = T>,
+{
+    match cancellation {
+        Some(cancellation) => {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => MobileConnectOutcome::Cancelled,
+                result = connection => MobileConnectOutcome::Completed(result),
+            }
+        }
+        None => MobileConnectOutcome::Completed(connection.await),
+    }
+}
+
+fn fail_closed_mobile_connect_cancellation(
+    client: &mut veil_client::api::VeilClient,
+    binding: &Mutex<Option<MobileAuthenticatedBinding>>,
+) -> VeilError {
+    clear_mobile_binding_fail_closed(binding);
+    client.disconnect();
+    VeilError::Session {
+        msg: "mobile connection attempt cancelled".to_string(),
+    }
+}
+
 fn safe_mobile_connect_error(msg: String, has_node_access_pass: bool) -> VeilError {
     let msg = if has_node_access_pass {
         match msg.as_str() {
@@ -1170,6 +1330,86 @@ mod tests {
                 format!("Session error: {safe_reason}")
             );
         }
+    }
+
+    #[test]
+    fn mobile_connect_cancellation_is_sticky_before_waiting() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cancellation = MobileConnectCancellation::new();
+        cancellation.cancel();
+        cancellation.cancel();
+
+        let outcome = runtime
+            .block_on(async {
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    await_mobile_connect(std::future::pending::<()>(), Some(cancellation.as_ref())),
+                )
+                .await
+            })
+            .expect("pre-cancelled mobile connect must not wait");
+        assert!(matches!(outcome, MobileConnectOutcome::Cancelled));
+    }
+
+    #[test]
+    fn mobile_connect_cancellation_wakes_a_pending_waiter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let cancellation = MobileConnectCancellation::new();
+            let waiter_cancellation = Arc::clone(&cancellation);
+            let waiter = tokio::spawn(async move {
+                await_mobile_connect(
+                    std::future::pending::<()>(),
+                    Some(waiter_cancellation.as_ref()),
+                )
+                .await
+            });
+            tokio::task::yield_now().await;
+
+            cancellation.cancel();
+            let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+                .await
+                .expect("mobile connect cancellation did not wake its waiter")
+                .expect("mobile connect cancellation waiter panicked");
+            assert!(matches!(outcome, MobileConnectOutcome::Cancelled));
+        });
+    }
+
+    #[test]
+    fn mobile_connect_without_cancellation_preserves_legacy_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let outcome = runtime.block_on(await_mobile_connect(async { 42_u8 }, None));
+        match outcome {
+            MobileConnectOutcome::Completed(value) => assert_eq!(value, 42),
+            MobileConnectOutcome::Cancelled => panic!("legacy mobile connect was cancelled"),
+        }
+    }
+
+    #[test]
+    fn mobile_connect_cancellation_clears_binding_and_disconnects_fail_closed() {
+        let binding = Mutex::new(Some(MobileAuthenticatedBinding {
+            canonical_server_origin: "https://old.example.test:443".to_string(),
+            user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+        }));
+        let mut client = veil_client::api::VeilClient::new();
+
+        let error = fail_closed_mobile_connect_cancellation(&mut client, &binding);
+
+        assert!(binding.lock().unwrap().is_none());
+        assert!(!client.is_connected());
+        assert_eq!(
+            error.to_string(),
+            "Session error: mobile connection attempt cancelled"
+        );
     }
 
     #[test]
