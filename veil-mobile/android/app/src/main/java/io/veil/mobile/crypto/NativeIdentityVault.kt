@@ -11,12 +11,18 @@ import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
 /** Device-local encrypted storage for the recovery phrase used to recreate Rust identity state. */
-internal class NativeIdentityVault(context: Context) {
+internal interface NativeIdentityVaultAccess {
+  fun hasIdentity(): Boolean
+
+  fun <T> withMnemonicBytes(operation: (ByteArray) -> T): T
+}
+
+internal class NativeIdentityVault(context: Context) : NativeIdentityVaultAccess {
   private val preferences =
     context.getSharedPreferences("veil_native_identity_v1", Context.MODE_PRIVATE)
 
   @Synchronized
-  fun hasIdentity(): Boolean {
+  override fun hasIdentity(): Boolean {
     val fields = listOf(KEY_VERSION, KEY_IV, KEY_CIPHERTEXT)
     val present = fields.count(preferences::contains)
     if (present != 0 && present != fields.size) {
@@ -52,9 +58,16 @@ internal class NativeIdentityVault(context: Context) {
     }
   }
 
+  /**
+   * Opens the recovery phrase only inside the native Android boundary.
+   *
+   * The supplied byte array is valid only for the duration of [operation] and
+   * is cleared before this method returns, including when [operation] throws.
+   * Callers must not retain it or return it from the callback.
+   */
   @Synchronized
-  fun loadMnemonic(): String? {
-    if (!hasIdentity()) return null
+  override fun <T> withMnemonicBytes(operation: (ByteArray) -> T): T {
+    if (!hasIdentity()) throw IdentityVaultException("no local identity exists")
     if (preferences.getInt(KEY_VERSION, 0) != FORMAT_VERSION) {
       throw IdentityVaultException("unsupported identity vault version")
     }
@@ -66,7 +79,7 @@ internal class NativeIdentityVault(context: Context) {
       cipher.init(Cipher.DECRYPT_MODE, getExistingKey(), GCMParameterSpec(GCM_TAG_BITS, iv))
       val plaintext = cipher.doFinal(ciphertext)
       return try {
-        plaintext.toString(Charsets.UTF_8)
+        operation(plaintext)
       } finally {
         plaintext.fill(0)
       }

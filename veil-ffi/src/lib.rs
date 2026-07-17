@@ -9,6 +9,7 @@ use std::{
 use veil_crypto::{
     aead, fingerprint, kdf, keys, ratchet, share, signature, x3dh, IdentityKeyPair, RatchetSession,
 };
+use zeroize::Zeroizing;
 
 uniffi::setup_scaffolding!();
 
@@ -106,9 +107,22 @@ impl VeilIdentity {
     }
 
     #[uniffi::constructor]
+    /// Compatibility constructor for non-mobile callers. Android must use
+    /// `from_mnemonic_bytes` so its decrypted mnemonic never becomes a JVM
+    /// `String`.
     pub fn from_mnemonic(mnemonic: String) -> Result<Arc<Self>, VeilError> {
+        Self::from_mnemonic_bytes(mnemonic.into_bytes())
+    }
+
+    #[uniffi::constructor]
+    pub fn from_mnemonic_bytes(mnemonic_utf8: Vec<u8>) -> Result<Arc<Self>, VeilError> {
+        let mnemonic_utf8 = guard_utf8_secret(mnemonic_utf8, "mnemonic")?;
+        let mnemonic =
+            std::str::from_utf8(mnemonic_utf8.as_slice()).map_err(|_| VeilError::InvalidInput {
+                msg: "mnemonic must be valid UTF-8".to_string(),
+            })?;
         let kp =
-            IdentityKeyPair::from_mnemonic(&mnemonic).map_err(|e| VeilError::Crypto { msg: e })?;
+            IdentityKeyPair::from_mnemonic(mnemonic).map_err(|e| VeilError::Crypto { msg: e })?;
         Ok(Arc::new(Self { inner: kp }))
     }
 
@@ -148,7 +162,23 @@ pub struct VeilMobileSession {
 #[uniffi::export]
 impl VeilMobileSession {
     #[uniffi::constructor]
+    /// Compatibility constructor for non-mobile callers. Android must pass
+    /// decrypted mnemonic bytes to `from_mnemonic_bytes` and clear its own
+    /// `ByteArray` immediately after this call.
     pub fn from_mnemonic(mnemonic: String, database_path: String) -> Result<Arc<Self>, VeilError> {
+        Self::from_mnemonic_bytes(mnemonic.into_bytes(), database_path)
+    }
+
+    #[uniffi::constructor]
+    pub fn from_mnemonic_bytes(
+        mnemonic_utf8: Vec<u8>,
+        database_path: String,
+    ) -> Result<Arc<Self>, VeilError> {
+        let mnemonic_utf8 = guard_utf8_secret(mnemonic_utf8, "mnemonic")?;
+        let mnemonic =
+            std::str::from_utf8(mnemonic_utf8.as_slice()).map_err(|_| VeilError::InvalidInput {
+                msg: "mnemonic must be valid UTF-8".to_string(),
+            })?;
         if database_path.is_empty() || database_path.len() > 4096 {
             return Err(VeilError::InvalidInput {
                 msg: "mobile database path is empty or oversized".to_string(),
@@ -162,7 +192,7 @@ impl VeilMobileSession {
         }
         let mut client = veil_client::api::VeilClient::new();
         client
-            .init_with_mnemonic(&mnemonic, &path)
+            .init_with_mnemonic(mnemonic, &path)
             .map_err(|msg| VeilError::Session { msg })?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -185,48 +215,23 @@ impl VeilMobileSession {
         websocket_url: String,
         canonical_server_origin: String,
     ) -> Result<MobileAuthenticatedBinding, VeilError> {
-        validate_mobile_endpoint_pair(&websocket_url, &canonical_server_origin)?;
-        let mut client = self.client.lock().map_err(|error| VeilError::Session {
-            msg: format!("lock mobile client: {error}"),
-        })?;
-        let user_id = self
-            .runtime
-            .block_on(client.connect_with_client_metadata(
-                &websocket_url,
-                "veil-android",
-                "veil-android",
-            ))
-            .map_err(|msg| VeilError::Session { msg })?;
-        require_canonical_user_id("authenticated mobile user ID", &user_id)?;
-        let identity_key = client
-            .identity_key()
-            .map_err(|msg| VeilError::Session { msg })?;
-        let signing_key = client
-            .signing_key()
-            .map_err(|msg| VeilError::Session { msg })?;
-        if let Err(msg) = client
-            .db()
-            .ok_or_else(|| "mobile SQLCipher database is unavailable".to_string())
-            .and_then(|database| {
-                database.bind_authenticated_self(
-                    &canonical_server_origin,
-                    &user_id,
-                    &identity_key,
-                    &signing_key,
-                )
-            })
-        {
-            client.disconnect();
-            return Err(VeilError::Session { msg });
-        }
-        let binding = MobileAuthenticatedBinding {
+        self.connect_inner(websocket_url, canonical_server_origin, None)
+    }
+
+    /// Connect a newly enrolled account with a single-use Node Access Pass.
+    /// The pass remains in native memory, is never returned in diagnostics,
+    /// and is zeroized after this connection attempt (including early errors).
+    pub fn connect_with_node_access_pass(
+        &self,
+        websocket_url: String,
+        canonical_server_origin: String,
+        node_access_pass: Vec<u8>,
+    ) -> Result<MobileAuthenticatedBinding, VeilError> {
+        self.connect_inner(
+            websocket_url,
             canonical_server_origin,
-            user_id,
-        };
-        *self.binding.lock().map_err(|error| VeilError::Session {
-            msg: format!("lock mobile binding: {error}"),
-        })? = Some(binding.clone());
-        Ok(binding)
+            Some(node_access_pass),
+        )
     }
 
     pub fn authenticated_binding(&self) -> Result<MobileAuthenticatedBinding, VeilError> {
@@ -299,18 +304,73 @@ impl VeilMobileSession {
     }
 
     pub fn disconnect(&self) -> Result<(), VeilError> {
-        let mut client = self.client.lock().map_err(|error| VeilError::Session {
-            msg: format!("lock mobile client: {error}"),
-        })?;
-        client.disconnect();
-        *self.binding.lock().map_err(|error| VeilError::Session {
-            msg: format!("lock mobile binding: {error}"),
-        })? = None;
+        let _client = invalidate_mobile_session(&self.binding, &self.client)?;
         Ok(())
     }
 }
 
 impl VeilMobileSession {
+    fn connect_inner(
+        &self,
+        websocket_url: String,
+        canonical_server_origin: String,
+        node_access_pass: Option<Vec<u8>>,
+    ) -> Result<MobileAuthenticatedBinding, VeilError> {
+        let node_access_pass = guard_mobile_node_access_pass(node_access_pass)?;
+        validate_mobile_endpoint_pair(&websocket_url, &canonical_server_origin)?;
+        // Starting a new authentication attempt invalidates the previous
+        // account/origin epoch before locking or touching the network. The
+        // previous transport is closed under the client lock so no old event
+        // can race with the new authentication result.
+        let mut client = invalidate_mobile_session(&self.binding, &self.client)?;
+        let has_node_access_pass = node_access_pass.is_some();
+        let user_id = self
+            .runtime
+            .block_on(client.connect_with_client_metadata_and_access_pass(
+                &websocket_url,
+                "veil-android",
+                "veil-android",
+                mobile_node_access_pass_bytes(&node_access_pass),
+            ))
+            .map_err(|msg| safe_mobile_connect_error(msg, has_node_access_pass))?;
+        let post_auth_result = (|| {
+            require_canonical_user_id("authenticated mobile user ID", &user_id)?;
+            let identity_key = client
+                .identity_key()
+                .map_err(|msg| VeilError::Session { msg })?;
+            let signing_key = client
+                .signing_key()
+                .map_err(|msg| VeilError::Session { msg })?;
+            client
+                .db()
+                .ok_or_else(|| VeilError::Session {
+                    msg: "mobile SQLCipher database is unavailable".to_string(),
+                })?
+                .bind_authenticated_self(
+                    &canonical_server_origin,
+                    &user_id,
+                    &identity_key,
+                    &signing_key,
+                )
+                .map_err(|msg| VeilError::Session { msg })?;
+            let binding = MobileAuthenticatedBinding {
+                canonical_server_origin,
+                user_id,
+            };
+            *self.binding.lock().map_err(|error| VeilError::Session {
+                msg: format!("lock mobile binding: {error}"),
+            })? = Some(binding.clone());
+            Ok(binding)
+        })();
+
+        match post_auth_result {
+            Ok(binding) => Ok(binding),
+            Err(error) => {
+                fail_closed_mobile_post_auth(|| client.disconnect(), &self.binding, error)
+            }
+        }
+    }
+
     fn next_rest_timestamp_ms(&self) -> Result<i64, VeilError> {
         let now: i64 = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -743,6 +803,101 @@ fn validate_mobile_endpoint_pair(
     Ok(())
 }
 
+fn guard_utf8_secret(secret_utf8: Vec<u8>, label: &str) -> Result<Zeroizing<Vec<u8>>, VeilError> {
+    let guarded = Zeroizing::new(secret_utf8);
+    if guarded.is_empty() || guarded.len() > 1024 {
+        return Err(VeilError::InvalidInput {
+            msg: format!("{label} is empty or oversized"),
+        });
+    }
+    if std::str::from_utf8(guarded.as_slice()).is_err() {
+        return Err(VeilError::InvalidInput {
+            msg: format!("{label} must be valid UTF-8"),
+        });
+    }
+    Ok(guarded)
+}
+
+fn guard_mobile_node_access_pass(
+    node_access_pass: Option<Vec<u8>>,
+) -> Result<Option<Zeroizing<Vec<u8>>>, VeilError> {
+    let guarded = node_access_pass.map(Zeroizing::new);
+    if guarded.as_ref().is_some_and(|pass| pass.len() != 32) {
+        return Err(VeilError::InvalidInput {
+            msg: "node access pass must contain exactly 32 bytes".to_string(),
+        });
+    }
+    Ok(guarded)
+}
+
+fn mobile_node_access_pass_bytes(node_access_pass: &Option<Zeroizing<Vec<u8>>>) -> Option<&[u8]> {
+    node_access_pass.as_ref().map(|pass| pass.as_slice())
+}
+
+fn safe_mobile_connect_error(msg: String, has_node_access_pass: bool) -> VeilError {
+    let msg = if has_node_access_pass {
+        match msg.as_str() {
+            "node access registration is closed; a valid access pass is required"
+            | "node access pass is invalid, expired, or already used" => msg,
+            _ => "mobile connection attempt failed".to_string(),
+        }
+    } else {
+        msg
+    };
+    VeilError::Session { msg }
+}
+
+fn clear_mobile_binding_fail_closed(binding: &Mutex<Option<MobileAuthenticatedBinding>>) {
+    clear_mobile_binding_guard(binding.lock());
+}
+
+fn clear_mobile_binding_guard(
+    binding: std::sync::LockResult<std::sync::MutexGuard<'_, Option<MobileAuthenticatedBinding>>>,
+) {
+    match binding {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+}
+
+fn invalidate_mobile_session<'a>(
+    binding: &Mutex<Option<MobileAuthenticatedBinding>>,
+    client: &'a Mutex<veil_client::api::VeilClient>,
+) -> Result<std::sync::MutexGuard<'a, veil_client::api::VeilClient>, VeilError> {
+    clear_mobile_binding_fail_closed(binding);
+    disconnect_mobile_client_guard(client.lock())
+}
+
+fn disconnect_mobile_client_guard<'a>(
+    client: std::sync::LockResult<std::sync::MutexGuard<'a, veil_client::api::VeilClient>>,
+) -> Result<std::sync::MutexGuard<'a, veil_client::api::VeilClient>, VeilError> {
+    match client {
+        Ok(mut guard) => {
+            guard.disconnect();
+            Ok(guard)
+        }
+        Err(poisoned) => {
+            let error = VeilError::Session {
+                msg: format!("lock mobile client: {poisoned}"),
+            };
+            // A poisoned mutex still owns a usable guard. Recover it solely
+            // to tear down the transport, then preserve the poison error.
+            poisoned.into_inner().disconnect();
+            Err(error)
+        }
+    }
+}
+
+fn fail_closed_mobile_post_auth<T>(
+    disconnect: impl FnOnce(),
+    binding: &Mutex<Option<MobileAuthenticatedBinding>>,
+    error: VeilError,
+) -> Result<T, VeilError> {
+    clear_mobile_binding_fail_closed(binding);
+    disconnect();
+    Err(error)
+}
+
 fn require_rest_method(method: &str) -> Result<&str, VeilError> {
     match method {
         "GET" | "POST" | "PUT" | "PATCH" | "DELETE" => Ok(method),
@@ -798,6 +953,39 @@ mod tests {
         let id = VeilIdentity::generate();
         assert_eq!(id.identity_key().len(), 32);
         assert_eq!(id.signing_key().len(), 32);
+    }
+
+    #[test]
+    fn mnemonic_byte_constructor_matches_legacy_identity_constructor() {
+        let mnemonic = generate_mnemonic();
+        let legacy = VeilIdentity::from_mnemonic(mnemonic.clone()).unwrap();
+        let from_bytes = VeilIdentity::from_mnemonic_bytes(mnemonic.into_bytes()).unwrap();
+        assert_eq!(legacy.identity_key(), from_bytes.identity_key());
+        assert_eq!(legacy.signing_key(), from_bytes.signing_key());
+    }
+
+    #[test]
+    fn mnemonic_byte_constructors_reject_invalid_utf8_before_use() {
+        let identity_error = match VeilIdentity::from_mnemonic_bytes(vec![0xff, 0xfe]) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid UTF-8 mnemonic unexpectedly created an identity"),
+        };
+        assert_eq!(
+            identity_error.to_string(),
+            "Invalid input: mnemonic must be valid UTF-8"
+        );
+
+        let session_error = match VeilMobileSession::from_mnemonic_bytes(
+            vec![0xff, 0xfe],
+            "database-path-must-not-be-reached".to_string(),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("invalid UTF-8 mnemonic unexpectedly created a mobile session"),
+        };
+        assert_eq!(
+            session_error.to_string(),
+            "Invalid input: mnemonic must be valid UTF-8"
+        );
     }
 
     #[test]
@@ -937,6 +1125,113 @@ mod tests {
                 validate_mobile_endpoint_pair(websocket, "https://chat.example.test:443",).is_err()
             );
         }
+    }
+
+    #[test]
+    fn mobile_node_access_pass_is_optional_and_exactly_32_bytes() {
+        let absent = guard_mobile_node_access_pass(None).unwrap();
+        assert!(mobile_node_access_pass_bytes(&absent).is_none());
+
+        let expected = (0u8..32).collect::<Vec<_>>();
+        let guarded = guard_mobile_node_access_pass(Some(expected.clone())).unwrap();
+        assert_eq!(
+            mobile_node_access_pass_bytes(&guarded),
+            Some(expected.as_slice())
+        );
+
+        for invalid_length in [0, 1, 31, 33, 64] {
+            let error = guard_mobile_node_access_pass(Some(vec![0x42; invalid_length]))
+                .expect_err("invalid Node Access Pass length must fail before networking");
+            assert!(matches!(error, VeilError::InvalidInput { .. }));
+            assert_eq!(
+                error.to_string(),
+                "Invalid input: node access pass must contain exactly 32 bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_node_access_pass_attempt_never_reflects_server_diagnostics() {
+        let secret = "0123456789abcdef0123456789abcdef";
+        let error = safe_mobile_connect_error(
+            format!("malicious server reflected access pass: {secret}"),
+            true,
+        );
+        let rendered = error.to_string();
+        assert_eq!(rendered, "Session error: mobile connection attempt failed");
+        assert!(!rendered.contains(secret));
+
+        for safe_reason in [
+            "node access registration is closed; a valid access pass is required",
+            "node access pass is invalid, expired, or already used",
+        ] {
+            assert_eq!(
+                safe_mobile_connect_error(safe_reason.to_string(), true).to_string(),
+                format!("Session error: {safe_reason}")
+            );
+        }
+    }
+
+    #[test]
+    fn mobile_post_auth_failure_disconnects_clears_and_preserves_error() {
+        let binding = Mutex::new(Some(MobileAuthenticatedBinding {
+            canonical_server_origin: "https://old.example.test:443".to_string(),
+            user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+        }));
+        let disconnect_count = std::cell::Cell::new(0);
+        let result: Result<(), VeilError> = fail_closed_mobile_post_auth(
+            || disconnect_count.set(disconnect_count.get() + 1),
+            &binding,
+            VeilError::Session {
+                msg: "original sanitized post-auth failure".to_string(),
+            },
+        );
+
+        assert_eq!(disconnect_count.get(), 1);
+        assert!(binding.lock().unwrap().is_none());
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            "Session error: original sanitized post-auth failure"
+        );
+    }
+
+    #[test]
+    fn mobile_binding_cleanup_recovers_a_poisoned_guard() {
+        let binding = Mutex::new(Some(MobileAuthenticatedBinding {
+            canonical_server_origin: "https://old.example.test:443".to_string(),
+            user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+        }));
+        let guard = binding.lock().unwrap();
+        clear_mobile_binding_guard(Err(std::sync::PoisonError::new(guard)));
+        assert!(binding.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn mobile_session_invalidation_clears_binding_and_closes_prior_epoch() {
+        let binding = Mutex::new(Some(MobileAuthenticatedBinding {
+            canonical_server_origin: "https://old.example.test:443".to_string(),
+            user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+        }));
+        let client = Mutex::new(veil_client::api::VeilClient::new());
+
+        let client_guard = invalidate_mobile_session(&binding, &client).unwrap();
+        assert!(binding.lock().unwrap().is_none());
+        assert!(!client_guard.is_connected());
+    }
+
+    #[test]
+    fn poisoned_mobile_client_guard_is_disconnected_and_reports_lock_error() {
+        let client = Mutex::new(veil_client::api::VeilClient::new());
+        let guard = client.lock().unwrap();
+        let error = match disconnect_mobile_client_guard(Err(std::sync::PoisonError::new(guard))) {
+            Err(error) => error,
+            Ok(_) => panic!("synthetic poisoned client guard unexpectedly succeeded"),
+        };
+
+        assert!(error
+            .to_string()
+            .starts_with("Session error: lock mobile client:"));
+        assert!(!client.lock().unwrap().is_connected());
     }
 
     #[test]

@@ -774,6 +774,12 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -823,6 +829,8 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_authenticated_binding(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_rest_request(
@@ -835,9 +843,13 @@ fun uniffi_veil_ffi_checksum_method_veilratchet_serialize(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic(
 ): Short
+fun uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic_bytes(
+): Short
 fun uniffi_veil_ffi_checksum_constructor_veilidentity_generate(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic(
+): Short
+fun uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic_bytes(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilratchet_deserialize(
 ): Short
@@ -900,6 +912,8 @@ fun uniffi_veil_ffi_fn_free_veilidentity(`ptr`: Pointer,uniffi_out_err: UniffiRu
 ): Unit
 fun uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic(`mnemonic`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
+fun uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic_bytes(`mnemonicUtf8`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
 fun uniffi_veil_ffi_fn_constructor_veilidentity_generate(uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
 fun uniffi_veil_ffi_fn_method_veilidentity_identity_key(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
@@ -916,9 +930,13 @@ fun uniffi_veil_ffi_fn_free_veilmobilesession(`ptr`: Pointer,uniffi_out_err: Uni
 ): Unit
 fun uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic(`mnemonic`: RustBuffer.ByValue,`databasePath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
+fun uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic_bytes(`mnemonicUtf8`: RustBuffer.ByValue,`databasePath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
 fun uniffi_veil_ffi_fn_method_veilmobilesession_authenticated_binding(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`nodeAccessPass`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_disconnect(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
@@ -1139,6 +1157,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect() != 62689.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass() != 52518.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect() != 63203.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1154,13 +1175,19 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilratchet_serialize() != 60336.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic() != 62701.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic() != 47191.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic_bytes() != 61700.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_generate() != 34969.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic() != 57352.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic() != 36500.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic_bytes() != 10254.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilratchet_deserialize() != 1736.toShort()) {
@@ -1684,11 +1711,27 @@ open class VeilIdentity: Disposable, AutoCloseable, VeilIdentityInterface
 
     companion object {
 
+    /**
+     * Compatibility constructor for non-mobile callers. Android must use
+     * `from_mnemonic_bytes` so its decrypted mnemonic never becomes a JVM
+     * `String`.
+     */
     @Throws(VeilException::class) fun `fromMnemonic`(`mnemonic`: kotlin.String): VeilIdentity {
             return FfiConverterTypeVeilIdentity.lift(
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic(
         FfiConverterString.lower(`mnemonic`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(VeilException::class) fun `fromMnemonicBytes`(`mnemonicUtf8`: kotlin.ByteArray): VeilIdentity {
+            return FfiConverterTypeVeilIdentity.lift(
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic_bytes(
+        FfiConverterByteArray.lower(`mnemonicUtf8`),_status)
 }
     )
     }
@@ -1847,6 +1890,13 @@ public interface VeilMobileSessionInterface {
 
     fun `connect`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String): MobileAuthenticatedBinding
 
+    /**
+     * Connect a newly enrolled account with a single-use Node Access Pass.
+     * The pass remains in native memory, is never returned in diagnostics,
+     * and is zeroized after this connection attempt (including early errors).
+     */
+    fun `connectWithNodeAccessPass`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray): MobileAuthenticatedBinding
+
     fun `disconnect`()
 
     fun `signRestRequest`(`canonicalServerOrigin`: kotlin.String, `method`: kotlin.String, `requestTarget`: kotlin.String, `body`: kotlin.ByteArray): RestSignatureData
@@ -1968,6 +2018,24 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
+    /**
+     * Connect a newly enrolled account with a single-use Node Access Pass.
+     * The pass remains in native memory, is never returned in diagnostics,
+     * and is zeroized after this connection attempt (including early errors).
+     */
+    @Throws(VeilException::class)override fun `connectWithNodeAccessPass`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray): MobileAuthenticatedBinding {
+            return FfiConverterTypeMobileAuthenticatedBinding.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass(
+        it, FfiConverterString.lower(`websocketUrl`),FfiConverterString.lower(`canonicalServerOrigin`),FfiConverterByteArray.lower(`nodeAccessPass`),_status)
+}
+    }
+    )
+    }
+
+
+
     @Throws(VeilException::class)override fun `disconnect`()
         =
     callWithPointer {
@@ -1997,11 +2065,27 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
     companion object {
 
+    /**
+     * Compatibility constructor for non-mobile callers. Android must pass
+     * decrypted mnemonic bytes to `from_mnemonic_bytes` and clear its own
+     * `ByteArray` immediately after this call.
+     */
     @Throws(VeilException::class) fun `fromMnemonic`(`mnemonic`: kotlin.String, `databasePath`: kotlin.String): VeilMobileSession {
             return FfiConverterTypeVeilMobileSession.lift(
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic(
         FfiConverterString.lower(`mnemonic`),FfiConverterString.lower(`databasePath`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(VeilException::class) fun `fromMnemonicBytes`(`mnemonicUtf8`: kotlin.ByteArray, `databasePath`: kotlin.String): VeilMobileSession {
+            return FfiConverterTypeVeilMobileSession.lift(
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic_bytes(
+        FfiConverterByteArray.lower(`mnemonicUtf8`),FfiConverterString.lower(`databasePath`),_status)
 }
     )
     }

@@ -1292,6 +1292,25 @@ impl VeilClient {
             .await
     }
 
+    /// Connect with fixed client metadata and an optional, single-use Node
+    /// Access Pass. The pass is borrowed only for the duration of this
+    /// attempt; callers remain responsible for zeroizing their owning buffer.
+    pub async fn connect_with_client_metadata_and_access_pass(
+        &mut self,
+        server_url: &str,
+        device_name: &str,
+        client_id: &str,
+        node_access_pass: Option<&[u8]>,
+    ) -> Result<String, String> {
+        self.connect_with_client_metadata_and_node_access(
+            server_url,
+            device_name,
+            client_id,
+            node_access_pass,
+        )
+        .await
+    }
+
     async fn connect_with_client_metadata_and_node_access(
         &mut self,
         server_url: &str,
@@ -4966,6 +4985,53 @@ impl Drop for VeilClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn metadata_access_pass_boundary_is_exact_before_networking() {
+        let mut client = VeilClient::new();
+
+        assert_eq!(
+            client
+                .connect_with_client_metadata_and_access_pass(
+                    "wss://chat.example.test/ws",
+                    "veil-android",
+                    "veil-android",
+                    None,
+                )
+                .await
+                .unwrap_err(),
+            "not initialized"
+        );
+
+        let valid = [0x42; 32];
+        assert_eq!(
+            client
+                .connect_with_client_metadata_and_access_pass(
+                    "wss://chat.example.test/ws",
+                    "veil-android",
+                    "veil-android",
+                    Some(&valid),
+                )
+                .await
+                .unwrap_err(),
+            "not initialized"
+        );
+
+        for invalid in [vec![0x42; 31], vec![0x42; 33]] {
+            assert_eq!(
+                client
+                    .connect_with_client_metadata_and_access_pass(
+                        "wss://chat.example.test/ws",
+                        "veil-android",
+                        "veil-android",
+                        Some(&invalid),
+                    )
+                    .await
+                    .unwrap_err(),
+                "node access pass must contain exactly 32 bytes"
+            );
+        }
+    }
 
     fn test_roster_commitment(candidate: &DeviceRosterCandidateV1) -> [u8; 32] {
         let conversation = uuid::Uuid::parse_str(&candidate.conversation_id).unwrap();

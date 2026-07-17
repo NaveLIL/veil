@@ -4,15 +4,20 @@ import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
+import com.facebook.react.bridge.LifecycleEventListener
 import java.security.MessageDigest
 import android.view.WindowManager
 import uniffi.veil_ffi.VeilIdentity
 import uniffi.veil_ffi.generateMnemonic
 import uniffi.veil_ffi.validateMnemonic
 
-class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context) {
+class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context), LifecycleEventListener {
   private val vault = NativeIdentityVault(context)
   private var identity: VeilIdentity? = null
+
+  init {
+    context.addLifecycleEventListener(this)
+  }
 
   override fun getName(): String = "VeilCrypto"
 
@@ -53,7 +58,7 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
   fun createIdentity(mnemonic: String, promise: Promise) = resolve(promise) {
     val normalized = normalizeMnemonic(mnemonic)
     if (!validateMnemonic(normalized)) throw IllegalArgumentException("invalid recovery phrase")
-    val candidate = VeilIdentity.fromMnemonic(normalized)
+    val candidate = identityFromMnemonic(normalized)
     try {
       val existing = if (vault.hasIdentity()) loadIdentity() else null
       if (existing != null) {
@@ -81,10 +86,42 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
   @Synchronized
   private fun loadIdentity(): VeilIdentity {
     identity?.let { return it }
-    val mnemonic = vault.loadMnemonic() ?: throw IdentityVaultException("no local identity exists")
-    val loaded = VeilIdentity.fromMnemonic(mnemonic)
+    val loaded = vault.withMnemonicBytes { mnemonicUtf8 ->
+      VeilIdentity.fromMnemonicBytes(mnemonicUtf8)
+    }
     identity = loaded
     return loaded
+  }
+
+  @Synchronized
+  private fun closeIdentity() {
+    identity?.close()
+    identity = null
+  }
+
+  override fun onHostResume() = Unit
+
+  override fun onHostPause() {
+    closeIdentity()
+  }
+
+  override fun onHostDestroy() {
+    closeIdentity()
+  }
+
+  override fun invalidate() {
+    reactApplicationContext.removeLifecycleEventListener(this)
+    closeIdentity()
+    super.invalidate()
+  }
+
+  private fun identityFromMnemonic(mnemonic: String): VeilIdentity {
+    val mnemonicUtf8 = mnemonic.toByteArray(Charsets.UTF_8)
+    return try {
+      VeilIdentity.fromMnemonicBytes(mnemonicUtf8)
+    } finally {
+      mnemonicUtf8.fill(0)
+    }
   }
 
   private inline fun resolve(promise: Promise, operation: () -> Any?) {

@@ -163,6 +163,7 @@ dependencies {
     // 3.0.10 is the newest connector built with Expo SDK 53's Kotlin 2.0.21 ABI.
     // 3.1+ requires Kotlin 2.2/2.3 and must land with the planned Expo upgrade.
     implementation("org.unifiedpush.android:connector:3.0.10")
+    testImplementation("junit:junit:4.13.2")
 
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";

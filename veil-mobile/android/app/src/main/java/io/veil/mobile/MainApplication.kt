@@ -16,8 +16,13 @@ import com.facebook.soloader.SoLoader
 import expo.modules.ApplicationLifecycleDispatcher
 import expo.modules.ReactNativeHostWrapper
 import io.veil.mobile.crypto.VeilCryptoPackage
+import io.veil.mobile.runtime.VeilMobileRuntime
+import io.veil.mobile.runtime.VeilMobileRuntimePackage
 
 class MainApplication : Application(), ReactApplication {
+  internal val veilMobileRuntime: VeilMobileRuntime by lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+    VeilMobileRuntime(this)
+  }
 
   override val reactNativeHost: ReactNativeHost = ReactNativeHostWrapper(
         this,
@@ -25,6 +30,7 @@ class MainApplication : Application(), ReactApplication {
           override fun getPackages(): List<ReactPackage> {
             val packages = PackageList(this).packages
             packages.add(VeilCryptoPackage())
+            packages.add(VeilMobileRuntimePackage(this@MainApplication.veilMobileRuntime))
             return packages
           }
 

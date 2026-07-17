@@ -1,5 +1,6 @@
 package io.veil.mobile
 
+import android.content.Intent
 import android.os.Build
 import android.os.Bundle
 
@@ -12,11 +13,39 @@ import expo.modules.ReactActivityDelegateWrapper
 
 class MainActivity : ReactActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
+    consumeEnrollmentIntent(intent)
     // Set the theme to AppTheme BEFORE onCreate to support
     // coloring the background, status bar, and navigation bar.
     // This is required for expo-splash-screen.
     setTheme(R.style.AppTheme);
     super.onCreate(null)
+  }
+
+  override fun onNewIntent(intent: Intent) {
+    consumeEnrollmentIntent(intent)
+    super.onNewIntent(intent)
+    setIntent(intent)
+  }
+
+  override fun onStop() {
+    if (!isChangingConfigurations) {
+      (application as MainApplication).veilMobileRuntime.lockForBackground()
+    }
+    super.onStop()
+  }
+
+  /**
+   * Enrollment capabilities are consumed before ReactActivity/Linking sees the
+   * Intent. Only a sanitized runtime snapshot is ever published to JavaScript.
+   */
+  private fun consumeEnrollmentIntent(intent: Intent?) {
+    if (intent?.action != Intent.ACTION_VIEW) return
+    val raw = intent.dataString ?: return
+    if (!(application as MainApplication).veilMobileRuntime.consumeEnrollmentUri(raw)) return
+    intent.data = null
+    intent.clipData = null
+    intent.selector = null
+    intent.replaceExtras(Bundle())
   }
 
   /**
