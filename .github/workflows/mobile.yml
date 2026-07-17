@@ -127,6 +127,13 @@ jobs:
             perl \
             pkg-config
 
+      - name: Set up Android command-line tools
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4.0.1
+        with:
+          cmdline-tools-version: "14742923"
+          packages: ""
+          log-accepted-android-sdk-licenses: false
+
       - name: Install pinned Android SDK and NDK packages
         shell: bash
         run: |
@@ -136,7 +143,8 @@ jobs:
             "build-tools;35.0.0" \
             "cmake;3.22.1" \
             "ndk;${ANDROID_NDK_VERSION}"
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/${ANDROID_NDK_VERSION}" >> "${GITHUB_ENV}"
+          echo "ANDROID_HOME=${ANDROID_SDK_ROOT}" >> "${GITHUB_ENV}"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "${GITHUB_ENV}"
 
       - name: Install pinned cargo-ndk
         run: cargo install cargo-ndk --locked --version "${CARGO_NDK_VERSION}"
