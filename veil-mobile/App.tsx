@@ -1,4 +1,4 @@
-import React, { useEffect } from "react";
+import React from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -17,7 +17,6 @@ import { useVeilRuntimeLifecycle } from "./src/hooks/useVeilRuntimeLifecycle";
 import { colors, radii, spacing } from "./src/lib/theme";
 import ChatListScreen from "./src/screens/ChatListScreen";
 import OnboardingScreen from "./src/screens/OnboardingScreen";
-import { useAuthStore } from "./src/stores/auth";
 import {
   canRenderChat,
   useRuntimeGateStore,
@@ -32,20 +31,6 @@ export default function App() {
   const requiresExplicitReopen = useRuntimeGateStore((state) => state.requiresExplicitReopen);
   const operation = useRuntimeGateStore((state) => state.operation);
   const publicError = useRuntimeGateStore((state) => state.publicError);
-  const onboardingIdentityState = useAuthStore((state) => state.nativeIdentityState);
-
-  // Onboarding still owns the existing recovery UI. Its public completion
-  // signal only triggers a new native snapshot; it never authorizes ChatList.
-  useEffect(() => {
-    if (
-      onboardingIdentityState === "local_identity_ready"
-      && phase === "ready"
-      && snapshot
-      && !snapshot.identityExists
-    ) {
-      void runtime.retryBootstrap();
-    }
-  }, [onboardingIdentityState, phase, runtime, snapshot]);
 
   const chatReady = canRenderChat(snapshot, requiresExplicitReopen);
 
@@ -60,7 +45,12 @@ export default function App() {
       />
     );
   } else if (!snapshot.identityExists) {
-    content = <OnboardingScreen />;
+    content = (
+      <OnboardingScreen
+        reducedMotion={reducedMotion}
+        onCommitted={runtime.retryBootstrap}
+      />
+    );
   } else if (chatReady) {
     content = (
       <View testID="chat-runtime-ready" style={styles.flex}>

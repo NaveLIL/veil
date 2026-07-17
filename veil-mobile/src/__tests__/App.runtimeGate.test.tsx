@@ -1,6 +1,6 @@
 import React from "react";
 import { beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { act, render, waitFor } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 import {
   AppState,
   type AppStateStatus,
@@ -8,7 +8,6 @@ import {
 
 import App from "../../App";
 import type { VeilMobileRuntimeSnapshot } from "../native/runtime";
-import { useAuthStore } from "../stores/auth";
 import { useChatStore } from "../stores/chat";
 import { resetRuntimeGateStoreForTests } from "../stores/runtime";
 
@@ -60,10 +59,16 @@ jest.mock("../screens/ChatListScreen", () => {
 });
 jest.mock("../screens/OnboardingScreen", () => {
   const ReactModule = jest.requireActual<typeof import("react")>("react");
-  const { Text: NativeText } = jest.requireActual<typeof import("react-native")>("react-native");
+  const { Pressable: NativePressable, Text: NativeText } =
+    jest.requireActual<typeof import("react-native")>("react-native");
   return {
     __esModule: true,
-    default: () => ReactModule.createElement(NativeText, null, "ONBOARDING"),
+    default: ({ onCommitted }: { onCommitted: () => Promise<void> }) =>
+      ReactModule.createElement(
+        NativePressable,
+        { testID: "mock-native-setup-committed", onPress: onCommitted },
+        ReactModule.createElement(NativeText, null, "ONBOARDING"),
+      ),
   };
 });
 
@@ -114,11 +119,6 @@ describe("App native runtime privacy gate", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     resetRuntimeGateStoreForTests();
-    useAuthStore.setState({
-      nativeIdentityState: "checking",
-      publicIdentityKey: null,
-      nativeError: null,
-    });
     useChatStore.setState({
       prototypeFixturesEnabled: true,
       messagesByChannel: {
@@ -220,6 +220,28 @@ describe("App native runtime privacy gate", () => {
     await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
     expect(view.getByText("Local account locked")).toBeTruthy();
     expect(view.queryByText("ONBOARDING")).toBeNull();
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+  });
+
+  it("refreshes native authority after commit but does not authorize from the callback", async () => {
+    const noIdentity = runtimeSnapshot({
+      identityExists: false,
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      binding: null,
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
+    mockRuntime.lock.mockResolvedValue(noIdentity);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+    expect(mockRuntime.getSnapshot).toHaveBeenCalledTimes(2);
+
+    fireEvent.press(view.getByTestId("mock-native-setup-committed"));
+
+    await waitFor(() => expect(mockRuntime.getSnapshot).toHaveBeenCalledTimes(4));
+    expect(view.getByText("ONBOARDING")).toBeTruthy();
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
   });
 
