@@ -10,7 +10,10 @@ members = [
     "veil-uploads",
     "veil-mls",
 ]
-exclude = ["third_party/wayland-scanner-0.31.10"]
+exclude = [
+    "third_party/openmls_rust_crypto-0.4.4",
+    "third_party/wayland-scanner-0.31.10",
+]
 resolver = "2"
 
 [workspace.package]
@@ -21,12 +24,12 @@ homepage = "https://veil.erez.pro"
 publish = false
 
 [patch.crates-io]
-# OpenMLS keeps its unused `libcrux-provider` backend in Cargo.lock even when
-# default features are disabled.  The latest crates.io release still pins the
-# vulnerable libcrux-aead 0.0.7 (RUSTSEC-2026-0124); upstream has already
-# updated it to 0.0.8.  Pin the reviewed upstream revision until the next
-# hpke-rs-libcrux release is published.
-hpke-rs-libcrux = { git = "https://github.com/celabshq/hpke-rs", rev = "654df20e5c2e6657f0ac17f2a903f179bb97a5ae" }
+# The published OpenMLS 0.7 provider pins hpke-rs 0.6, whose lock graph keeps
+# vulnerable libcrux 0.0.x crates. Upstream fixed the graph by moving the three
+# HPKE crates to 0.7 without changing provider code. Keep that dependency-only
+# backport local until crates.io publishes a compatible provider release.
+# See third_party/openmls_rust_crypto-0.4.4/UPSTREAM.md.
+openmls_rust_crypto = { path = "third_party/openmls_rust_crypto-0.4.4" }
 
 # wayland-scanner 0.31.10 pins quick-xml 0.39, which is affected by
 # RUSTSEC-2026-0194 and RUSTSEC-2026-0195. The vendored crates.io source keeps

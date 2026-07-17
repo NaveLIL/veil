@@ -584,6 +584,13 @@ mod tests {
         let (_c, w) = alice.add_member(&group_id, &bob_kp).expect("add");
         bob.process_welcome(&w).expect("welcome");
 
+        // An exporter is a compact assertion that the persisted epoch secret
+        // survives the storage round trip, rather than merely proving that a
+        // group record can be deserialized.
+        let exporter_before = bob
+            .export_secret(&group_id, b"storage-compat-v1", 32)
+            .expect("export before snapshot");
+
         // Snapshot bob's full state, including the persisted signer.
         let snapshot = bob.snapshot().expect("snapshot");
         let signer_blob = bob
@@ -598,11 +605,50 @@ mod tests {
         let bob2 = MlsClient::restore_with_snapshot(bob_leaf, bob_store2, &snapshot)
             .expect("restore with snapshot");
 
+        assert_eq!(
+            bob2.export_secret(&group_id, b"storage-compat-v1", 32)
+                .expect("export after restore"),
+            exporter_before,
+            "epoch secret changed across snapshot restore"
+        );
+
         // Alice sends a fresh message; bob2 (the restored client) can
         // still decrypt it because the group state survived the restart.
         let ct = alice.encrypt(&group_id, b"after restart").expect("enc");
         let pt = bob2.decrypt(&group_id, &ct).expect("dec after restore");
         assert_eq!(pt, b"after restart");
         assert_eq!(bob2.epoch(&group_id).unwrap(), 1);
+
+        // The restored state must also remain usable for future protocol
+        // evolution. Advance to epoch 2 and exchange messages in both
+        // directions using only the restored Bob instance.
+        let charlie = fresh_client("charlie::snap");
+        let charlie_kp = charlie.generate_key_package().expect("charlie kp");
+        let (commit, welcome) = alice
+            .add_member(&group_id, &charlie_kp)
+            .expect("add charlie after restore");
+        charlie.process_welcome(&welcome).expect("charlie welcome");
+        bob2.process_commit(&group_id, &commit)
+            .expect("restored bob applies epoch 2 commit");
+        assert_eq!(bob2.epoch(&group_id).unwrap(), 2);
+
+        let from_alice = alice
+            .encrypt(&group_id, b"after epoch advance")
+            .expect("alice encrypts at epoch 2");
+        assert_eq!(
+            bob2.decrypt(&group_id, &from_alice)
+                .expect("restored bob decrypts at epoch 2"),
+            b"after epoch advance"
+        );
+
+        let from_bob = bob2
+            .encrypt(&group_id, b"reply from restored state")
+            .expect("restored bob encrypts at epoch 2");
+        assert_eq!(
+            alice
+                .decrypt(&group_id, &from_bob)
+                .expect("alice decrypts restored bob reply"),
+            b"reply from restored state"
+        );
     }
 }
