@@ -790,6 +790,36 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -857,6 +887,30 @@ fun uniffi_veil_ffi_checksum_method_veilratchet_encrypt(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilratchet_serialize(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_cancel(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_choice_count(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_choice_word_index(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_count(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_position(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_confirm_challenge(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_consume_commit_authorization(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_is_commit_authorized(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_set_import_word_index(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_validate_import(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_count(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_index(
+): Short
 fun uniffi_veil_ffi_checksum_constructor_mobileconnectcancellation_new(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic(
@@ -874,6 +928,10 @@ fun uniffi_veil_ffi_checksum_constructor_veilratchet_deserialize(
 fun uniffi_veil_ffi_checksum_constructor_veilratchet_init_initiator(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilratchet_init_responder(
+): Short
+fun uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_create(
+): Short
+fun uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_restore(
 ): Short
 fun ffi_veil_ffi_uniffi_contract_version(
 ): Int
@@ -988,6 +1046,38 @@ fun uniffi_veil_ffi_fn_method_veilratchet_encrypt(`ptr`: Pointer,`plaintext`: Ru
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilratchet_serialize(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_clone_veilrecoverydraft(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_free_veilrecoverydraft(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_constructor_veilrecoverydraft_new_create(uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_constructor_veilrecoverydraft_new_restore(uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_cancel(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_choice_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_choice_word_index(`ptr`: Pointer,`slot`: Byte,`choice`: Byte,uniffi_out_err: UniffiRustCallStatus,
+): Short
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_position(`ptr`: Pointer,`slot`: Byte,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_confirm_challenge(`ptr`: Pointer,`slot`: Byte,`chosen`: Short,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_consume_commit_authorization(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_is_commit_authorized(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_set_import_word_index(`ptr`: Pointer,`position`: Byte,`index`: Short,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_validate_import(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_word_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_word_index(`ptr`: Pointer,`position`: Byte,uniffi_out_err: UniffiRustCallStatus,
+): Short
 fun uniffi_veil_ffi_fn_func_aead_decrypt(`key`: RustBuffer.ByValue,`ciphertext`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_func_aead_encrypt(`key`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1214,6 +1304,42 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilratchet_serialize() != 60336.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_cancel() != 49968.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_choice_count() != 11952.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_choice_word_index() != 64768.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_count() != 53824.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_position() != 35173.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_confirm_challenge() != 4264.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_consume_commit_authorization() != 8218.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_is_commit_authorized() != 29992.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_set_import_word_index() != 23815.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_validate_import() != 65163.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_count() != 62750.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_index() != 29093.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_constructor_mobileconnectcancellation_new() != 64803.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1239,6 +1365,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilratchet_init_responder() != 46456.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_create() != 16323.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_restore() != 1104.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1382,6 +1514,52 @@ private class JavaLangRefCleanable(
     val cleanable: java.lang.ref.Cleaner.Cleanable
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUShort: FfiConverter<UShort, Short> {
+    override fun lift(value: Short): UShort {
+        return value.toUShort()
+    }
+
+    override fun read(buf: ByteBuffer): UShort {
+        return lift(buf.getShort())
+    }
+
+    override fun lower(value: UShort): Short {
+        return value.toShort()
+    }
+
+    override fun allocationSize(value: UShort) = 2UL
+
+    override fun write(value: UShort, buf: ByteBuffer) {
+        buf.putShort(value.toShort())
+    }
 }
 
 /**
@@ -2777,6 +2955,487 @@ public object FfiConverterTypeVeilRatchet: FfiConverter<VeilRatchet, Pointer> {
     override fun allocationSize(value: VeilRatchet) = 8UL
 
     override fun write(value: VeilRatchet, buf: ByteBuffer) {
+        // The Rust code always expects pointers written as 8 bytes,
+        // and will fail to compile if they don't fit.
+        buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
+// to the live Rust struct on the other side of the FFI.
+//
+// Each instance implements core operations for working with the Rust `Arc<T>` and the
+// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque pointer to the underlying Rust struct.
+//     Method calls need to read this pointer from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its pointer should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the pointer, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
+//      before it can pass the pointer over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Opaque, serialized recovery setup state for Android.
+ *
+ * The object deliberately exposes only scalar word indices and positions.
+ * A complete recovery phrase is never represented by a UniFFI `String` or
+ * collection. Android maps indices through its pinned public BIP39 English
+ * dictionary and assembles one short-lived mutable ASCII buffer only after
+ * this draft authorizes commit.
+ */
+public interface VeilRecoveryDraftInterface {
+
+    /**
+     * Terminal, idempotent cancellation. Poison recovery is used only to
+     * erase state; no secret operation is permitted afterwards.
+     */
+    fun `cancel`()
+
+    fun `challengeChoiceCount`(): kotlin.UByte
+
+    fun `challengeChoiceWordIndex`(`slot`: kotlin.UByte, `choice`: kotlin.UByte): kotlin.UShort
+
+    fun `challengeCount`(): kotlin.UByte
+
+    fun `challengePosition`(`slot`: kotlin.UByte): kotlin.UByte
+
+    /**
+     * Confirm one randomized create-flow challenge. A wrong answer revokes
+     * that slot and therefore revokes commit authorization.
+     */
+    fun `confirmChallenge`(`slot`: kotlin.UByte, `chosen`: kotlin.UShort): kotlin.Boolean
+
+    /**
+     * Atomically consume the authorization immediately before provisioning.
+     * The first authorized caller wins; the draft is then zeroized and
+     * terminal. Provisioning failures must restart recovery setup.
+     */
+    fun `consumeCommitAuthorization`(): kotlin.Boolean
+
+    fun `isCommitAuthorized`(): kotlin.Boolean
+
+    /**
+     * Set one word index for the restore flow. Every edit revokes a previous
+     * checksum authorization until `validate_import` succeeds again.
+     */
+    fun `setImportWordIndex`(`position`: kotlin.UByte, `index`: kotlin.UShort)
+
+    /**
+     * Validate all imported indices and the BIP39 checksum. Invalid or
+     * incomplete input returns `false` without diagnostics derived from it.
+     */
+    fun `validateImport`(): kotlin.Boolean
+
+    fun `wordCount`(): kotlin.UByte
+
+    /**
+     * Return one generated word index for the create flow.
+     */
+    fun `wordIndex`(`position`: kotlin.UByte): kotlin.UShort
+
+    companion object
+}
+
+/**
+ * Opaque, serialized recovery setup state for Android.
+ *
+ * The object deliberately exposes only scalar word indices and positions.
+ * A complete recovery phrase is never represented by a UniFFI `String` or
+ * collection. Android maps indices through its pinned public BIP39 English
+ * dictionary and assembles one short-lived mutable ASCII buffer only after
+ * this draft authorizes commit.
+ */
+open class VeilRecoveryDraft: Disposable, AutoCloseable, VeilRecoveryDraftInterface
+{
+
+    constructor(pointer: Pointer) {
+        this.pointer = pointer
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    /**
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noPointer: NoPointer) {
+        this.pointer = null
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    protected val pointer: Pointer?
+    protected val cleanable: UniffiCleaner.Cleanable
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the pointer being freed concurrently.
+        try {
+            return block(this.uniffiClonePointer())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+        override fun run() {
+            pointer?.let { ptr ->
+                uniffiRustCall { status ->
+                    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_free_veilrecoverydraft(ptr, status)
+                }
+            }
+        }
+    }
+
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.uniffi_veil_ffi_fn_clone_veilrecoverydraft(pointer!!, status)
+        }
+    }
+
+
+    /**
+     * Terminal, idempotent cancellation. Poison recovery is used only to
+     * erase state; no secret operation is permitted afterwards.
+     */override fun `cancel`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_cancel(
+        it, _status)
+}
+    }
+
+
+
+    override fun `challengeChoiceCount`(): kotlin.UByte {
+            return FfiConverterUByte.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_choice_count(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `challengeChoiceWordIndex`(`slot`: kotlin.UByte, `choice`: kotlin.UByte): kotlin.UShort {
+            return FfiConverterUShort.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_choice_word_index(
+        it, FfiConverterUByte.lower(`slot`),FfiConverterUByte.lower(`choice`),_status)
+}
+    }
+    )
+    }
+
+
+    override fun `challengeCount`(): kotlin.UByte {
+            return FfiConverterUByte.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_count(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `challengePosition`(`slot`: kotlin.UByte): kotlin.UByte {
+            return FfiConverterUByte.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_position(
+        it, FfiConverterUByte.lower(`slot`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Confirm one randomized create-flow challenge. A wrong answer revokes
+     * that slot and therefore revokes commit authorization.
+     */
+    @Throws(VeilException::class)override fun `confirmChallenge`(`slot`: kotlin.UByte, `chosen`: kotlin.UShort): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_confirm_challenge(
+        it, FfiConverterUByte.lower(`slot`),FfiConverterUShort.lower(`chosen`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Atomically consume the authorization immediately before provisioning.
+     * The first authorized caller wins; the draft is then zeroized and
+     * terminal. Provisioning failures must restart recovery setup.
+     */override fun `consumeCommitAuthorization`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_consume_commit_authorization(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+    override fun `isCommitAuthorized`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_is_commit_authorized(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Set one word index for the restore flow. Every edit revokes a previous
+     * checksum authorization until `validate_import` succeeds again.
+     */
+    @Throws(VeilException::class)override fun `setImportWordIndex`(`position`: kotlin.UByte, `index`: kotlin.UShort)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_set_import_word_index(
+        it, FfiConverterUByte.lower(`position`),FfiConverterUShort.lower(`index`),_status)
+}
+    }
+
+
+
+
+    /**
+     * Validate all imported indices and the BIP39 checksum. Invalid or
+     * incomplete input returns `false` without diagnostics derived from it.
+     */
+    @Throws(VeilException::class)override fun `validateImport`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_validate_import(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+    override fun `wordCount`(): kotlin.UByte {
+            return FfiConverterUByte.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_word_count(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Return one generated word index for the create flow.
+     */
+    @Throws(VeilException::class)override fun `wordIndex`(`position`: kotlin.UByte): kotlin.UShort {
+            return FfiConverterUShort.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_word_index(
+        it, FfiConverterUByte.lower(`position`),_status)
+}
+    }
+    )
+    }
+
+
+
+
+
+    companion object {
+         fun `newCreate`(): VeilRecoveryDraft {
+            return FfiConverterTypeVeilRecoveryDraft.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilrecoverydraft_new_create(
+        _status)
+}
+    )
+    }
+
+
+         fun `newRestore`(): VeilRecoveryDraft {
+            return FfiConverterTypeVeilRecoveryDraft.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilrecoverydraft_new_restore(
+        _status)
+}
+    )
+    }
+
+
+
+    }
+
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeVeilRecoveryDraft: FfiConverter<VeilRecoveryDraft, Pointer> {
+
+    override fun lower(value: VeilRecoveryDraft): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): VeilRecoveryDraft {
+        return VeilRecoveryDraft(value)
+    }
+
+    override fun read(buf: ByteBuffer): VeilRecoveryDraft {
+        // The Rust code always writes pointers as 8 bytes, and will
+        // fail to compile if they don't fit.
+        return lift(Pointer(buf.getLong()))
+    }
+
+    override fun allocationSize(value: VeilRecoveryDraft) = 8UL
+
+    override fun write(value: VeilRecoveryDraft, buf: ByteBuffer) {
         // The Rust code always expects pointers written as 8 bytes,
         // and will fail to compile if they don't fit.
         buf.putLong(Pointer.nativeValue(lower(value)))

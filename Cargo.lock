@@ -7218,7 +7218,9 @@ name = "veil-ffi"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bip39",
  "hex",
+ "rand 0.8.6",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",

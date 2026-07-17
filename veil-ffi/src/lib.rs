@@ -1,3 +1,5 @@
+use bip39::Mnemonic;
+use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
 use std::{
     future::Future,
     path::PathBuf,
@@ -11,7 +13,7 @@ use tokio::sync::Notify;
 use veil_crypto::{
     aead, fingerprint, kdf, keys, ratchet, share, signature, x3dh, IdentityKeyPair, RatchetSession,
 };
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 uniffi::setup_scaffolding!();
 
@@ -145,6 +147,368 @@ impl VeilIdentity {
             identity_key: self.inner.x25519_public_bytes().to_vec(),
             signing_key: self.inner.ed25519_public_bytes().to_vec(),
         }
+    }
+}
+
+// ── VeilRecoveryDraft (native-only recovery state) ─────────
+
+const RECOVERY_WORD_COUNT: u8 = 12;
+const RECOVERY_DICTIONARY_WORD_COUNT: u16 = 2048;
+const RECOVERY_CHALLENGE_COUNT: u8 = 3;
+const RECOVERY_CHALLENGE_CHOICE_COUNT: u8 = 4;
+const RECOVERY_EMPTY_WORD_INDEX: u16 = u16::MAX;
+
+enum RecoveryDraftMode {
+    Create,
+    Restore,
+}
+
+struct RecoveryChallenge {
+    position: u8,
+    choices: [u16; RECOVERY_CHALLENGE_CHOICE_COUNT as usize],
+    confirmed: bool,
+}
+
+impl RecoveryChallenge {
+    fn clear(&mut self) {
+        self.position.zeroize();
+        self.choices.zeroize();
+        self.confirmed = false;
+    }
+}
+
+impl Drop for RecoveryChallenge {
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+struct RecoveryDraftState {
+    mode: RecoveryDraftMode,
+    words: [u16; RECOVERY_WORD_COUNT as usize],
+    challenges: [RecoveryChallenge; RECOVERY_CHALLENGE_COUNT as usize],
+    commit_authorized: bool,
+    cancelled: bool,
+}
+
+impl RecoveryDraftState {
+    fn clear_secret_state(&mut self) {
+        self.words.zeroize();
+        for challenge in &mut self.challenges {
+            challenge.clear();
+        }
+        self.commit_authorized = false;
+    }
+
+    fn cancel(&mut self) {
+        self.clear_secret_state();
+        self.cancelled = true;
+    }
+
+    fn ensure_active(&self) -> Result<(), VeilError> {
+        if self.cancelled {
+            Err(recovery_unavailable())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn ensure_create(&self) -> Result<(), VeilError> {
+        self.ensure_active()?;
+        if matches!(self.mode, RecoveryDraftMode::Create) {
+            Ok(())
+        } else {
+            Err(recovery_unavailable())
+        }
+    }
+
+    fn ensure_restore(&self) -> Result<(), VeilError> {
+        self.ensure_active()?;
+        if matches!(self.mode, RecoveryDraftMode::Restore) {
+            Ok(())
+        } else {
+            Err(recovery_unavailable())
+        }
+    }
+}
+
+impl Drop for RecoveryDraftState {
+    fn drop(&mut self) {
+        self.clear_secret_state();
+        self.cancelled = true;
+    }
+}
+
+/// Opaque, serialized recovery setup state for Android.
+///
+/// The object deliberately exposes only scalar word indices and positions.
+/// A complete recovery phrase is never represented by a UniFFI `String` or
+/// collection. Android maps indices through its pinned public BIP39 English
+/// dictionary and assembles one short-lived mutable ASCII buffer only after
+/// this draft authorizes commit.
+#[derive(uniffi::Object)]
+pub struct VeilRecoveryDraft {
+    state: Mutex<RecoveryDraftState>,
+}
+
+#[uniffi::export]
+impl VeilRecoveryDraft {
+    #[uniffi::constructor]
+    pub fn new_create() -> Arc<Self> {
+        let words = create_recovery_word_indices();
+        let challenges = create_recovery_challenges(&words);
+        Arc::new(Self {
+            state: Mutex::new(RecoveryDraftState {
+                mode: RecoveryDraftMode::Create,
+                words,
+                challenges,
+                commit_authorized: false,
+                cancelled: false,
+            }),
+        })
+    }
+
+    #[uniffi::constructor]
+    pub fn new_restore() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(RecoveryDraftState {
+                mode: RecoveryDraftMode::Restore,
+                words: [RECOVERY_EMPTY_WORD_INDEX; RECOVERY_WORD_COUNT as usize],
+                challenges: empty_recovery_challenges(),
+                commit_authorized: false,
+                cancelled: false,
+            }),
+        })
+    }
+
+    pub fn word_count(&self) -> u8 {
+        RECOVERY_WORD_COUNT
+    }
+
+    /// Return one generated word index for the create flow.
+    pub fn word_index(&self, position: u8) -> Result<u16, VeilError> {
+        let position = recovery_position(position)?;
+        let state = self.recovery_state()?;
+        state.ensure_create()?;
+        Ok(state.words[position])
+    }
+
+    /// Set one word index for the restore flow. Every edit revokes a previous
+    /// checksum authorization until `validate_import` succeeds again.
+    pub fn set_import_word_index(&self, position: u8, index: u16) -> Result<(), VeilError> {
+        let position = recovery_position(position)?;
+        require_recovery_word_index(index)?;
+        let mut state = self.recovery_state()?;
+        state.ensure_restore()?;
+        state.words[position] = index;
+        state.commit_authorized = false;
+        Ok(())
+    }
+
+    /// Validate all imported indices and the BIP39 checksum. Invalid or
+    /// incomplete input returns `false` without diagnostics derived from it.
+    pub fn validate_import(&self) -> Result<bool, VeilError> {
+        let mut state = self.recovery_state()?;
+        state.ensure_restore()?;
+        let valid = recovery_indices_have_valid_checksum(&state.words);
+        state.commit_authorized = valid;
+        Ok(valid)
+    }
+
+    pub fn challenge_count(&self) -> u8 {
+        RECOVERY_CHALLENGE_COUNT
+    }
+
+    pub fn challenge_position(&self, slot: u8) -> Result<u8, VeilError> {
+        let slot = recovery_challenge_slot(slot)?;
+        let state = self.recovery_state()?;
+        state.ensure_create()?;
+        Ok(state.challenges[slot].position)
+    }
+
+    pub fn challenge_choice_count(&self) -> u8 {
+        RECOVERY_CHALLENGE_CHOICE_COUNT
+    }
+
+    pub fn challenge_choice_word_index(&self, slot: u8, choice: u8) -> Result<u16, VeilError> {
+        let slot = recovery_challenge_slot(slot)?;
+        let choice = recovery_challenge_choice(choice)?;
+        let state = self.recovery_state()?;
+        state.ensure_create()?;
+        Ok(state.challenges[slot].choices[choice])
+    }
+
+    /// Confirm one randomized create-flow challenge. A wrong answer revokes
+    /// that slot and therefore revokes commit authorization.
+    pub fn confirm_challenge(&self, slot: u8, chosen: u16) -> Result<bool, VeilError> {
+        let slot = recovery_challenge_slot(slot)?;
+        require_recovery_word_index(chosen)?;
+        let mut state = self.recovery_state()?;
+        state.ensure_create()?;
+        let position = state.challenges[slot].position as usize;
+        if !state.challenges[slot].choices.contains(&chosen) {
+            state.challenges[slot].confirmed = false;
+            state.commit_authorized = false;
+            return Ok(false);
+        }
+        let correct = state.words[position] == chosen;
+        state.challenges[slot].confirmed = correct;
+        state.commit_authorized = state.challenges.iter().all(|item| item.confirmed);
+        Ok(correct)
+    }
+
+    pub fn is_commit_authorized(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| !state.cancelled && state.commit_authorized)
+            .unwrap_or(false)
+    }
+
+    /// Atomically consume the authorization immediately before provisioning.
+    /// The first authorized caller wins; the draft is then zeroized and
+    /// terminal. Provisioning failures must restart recovery setup.
+    pub fn consume_commit_authorization(&self) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return false;
+        };
+        if state.cancelled || !state.commit_authorized {
+            return false;
+        }
+        state.cancel();
+        true
+    }
+
+    /// Terminal, idempotent cancellation. Poison recovery is used only to
+    /// erase state; no secret operation is permitted afterwards.
+    pub fn cancel(&self) {
+        match self.state.lock() {
+            Ok(mut state) => state.cancel(),
+            Err(poisoned) => poisoned.into_inner().cancel(),
+        }
+    }
+}
+
+impl VeilRecoveryDraft {
+    fn recovery_state(&self) -> Result<std::sync::MutexGuard<'_, RecoveryDraftState>, VeilError> {
+        self.state.lock().map_err(|_| recovery_unavailable())
+    }
+}
+
+fn create_recovery_word_indices() -> [u16; RECOVERY_WORD_COUNT as usize] {
+    let mnemonic = keys::generate_mnemonic();
+    let mut words = [0u16; RECOVERY_WORD_COUNT as usize];
+    for (target, index) in words.iter_mut().zip(mnemonic.word_indices()) {
+        *target = u16::try_from(index).expect("BIP39 English indices fit in u16");
+    }
+    words
+}
+
+fn create_recovery_challenges(
+    words: &[u16; RECOVERY_WORD_COUNT as usize],
+) -> [RecoveryChallenge; RECOVERY_CHALLENGE_COUNT as usize] {
+    let mut rng = OsRng;
+    let mut positions = [0u8; RECOVERY_WORD_COUNT as usize];
+    for (position, value) in positions.iter_mut().enumerate() {
+        *value = u8::try_from(position).expect("recovery positions fit in u8");
+    }
+    positions.shuffle(&mut rng);
+
+    std::array::from_fn(|slot| {
+        let position = positions[slot];
+        let correct = words[position as usize];
+        let mut choices = [RECOVERY_EMPTY_WORD_INDEX; RECOVERY_CHALLENGE_CHOICE_COUNT as usize];
+        choices[0] = correct;
+        let mut filled = 1;
+        while filled < choices.len() {
+            // 2048 divides the u32 range, so masking is unbiased here.
+            let candidate = (rng.next_u32() as u16) & (RECOVERY_DICTIONARY_WORD_COUNT - 1);
+            if !choices[..filled].contains(&candidate) {
+                choices[filled] = candidate;
+                filled += 1;
+            }
+        }
+        choices.shuffle(&mut rng);
+        RecoveryChallenge {
+            position,
+            choices,
+            confirmed: false,
+        }
+    })
+}
+
+fn empty_recovery_challenges() -> [RecoveryChallenge; RECOVERY_CHALLENGE_COUNT as usize] {
+    std::array::from_fn(|_| RecoveryChallenge {
+        position: 0,
+        choices: [0; RECOVERY_CHALLENGE_CHOICE_COUNT as usize],
+        confirmed: false,
+    })
+}
+
+fn recovery_indices_have_valid_checksum(words: &[u16; RECOVERY_WORD_COUNT as usize]) -> bool {
+    if words
+        .iter()
+        .any(|index| *index >= RECOVERY_DICTIONARY_WORD_COUNT)
+    {
+        return false;
+    }
+
+    // A 12-word BIP39 phrase contains 128 entropy bits followed by a 4-bit
+    // checksum. Recover only the entropy bytes, ask `bip39` to recompute the
+    // canonical indices, compare, and erase the temporary entropy.
+    let mut entropy = [0u8; 16];
+    for bit in 0..128usize {
+        let word = words[bit / 11];
+        let word_bit = 10 - (bit % 11);
+        let value = ((word >> word_bit) & 1) as u8;
+        entropy[bit / 8] |= value << (7 - (bit % 8));
+    }
+    let canonical = Mnemonic::from_entropy(&entropy).ok();
+    entropy.zeroize();
+    canonical.is_some_and(|mnemonic| {
+        mnemonic
+            .word_indices()
+            .zip(words.iter().copied().map(usize::from))
+            .all(|(actual, expected)| actual == expected)
+    })
+}
+
+fn recovery_position(position: u8) -> Result<usize, VeilError> {
+    if position >= RECOVERY_WORD_COUNT {
+        return Err(recovery_invalid_input());
+    }
+    Ok(position as usize)
+}
+
+fn recovery_challenge_slot(slot: u8) -> Result<usize, VeilError> {
+    if slot >= RECOVERY_CHALLENGE_COUNT {
+        return Err(recovery_invalid_input());
+    }
+    Ok(slot as usize)
+}
+
+fn recovery_challenge_choice(choice: u8) -> Result<usize, VeilError> {
+    if choice >= RECOVERY_CHALLENGE_CHOICE_COUNT {
+        return Err(recovery_invalid_input());
+    }
+    Ok(choice as usize)
+}
+
+fn require_recovery_word_index(index: u16) -> Result<(), VeilError> {
+    if index >= RECOVERY_DICTIONARY_WORD_COUNT {
+        return Err(recovery_invalid_input());
+    }
+    Ok(())
+}
+
+fn recovery_invalid_input() -> VeilError {
+    VeilError::InvalidInput {
+        msg: "recovery input is invalid".to_string(),
+    }
+}
+
+fn recovery_unavailable() -> VeilError {
+    VeilError::Session {
+        msg: "recovery draft is unavailable".to_string(),
     }
 }
 
@@ -1101,11 +1465,244 @@ fn require_rest_target(target: &str) -> Result<(), VeilError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bip39::Language;
+    use sha2::{Digest, Sha256};
+
+    fn load_known_valid_restore(draft: &VeilRecoveryDraft) {
+        for position in 0..11 {
+            draft.set_import_word_index(position, 0).unwrap();
+        }
+        // "abandon" x11 + "about" is the standard valid 12-word vector.
+        draft.set_import_word_index(11, 3).unwrap();
+    }
+
+    fn confirm_all_create_challenges(draft: &VeilRecoveryDraft) {
+        for slot in 0..draft.challenge_count() {
+            let position = draft.challenge_position(slot).unwrap();
+            let correct = draft.word_index(position).unwrap();
+            assert!(draft.confirm_challenge(slot, correct).unwrap());
+        }
+    }
 
     #[test]
     fn test_generate_and_validate_mnemonic() {
         let m = generate_mnemonic();
         assert!(validate_mnemonic(m));
+    }
+
+    #[test]
+    fn recovery_dictionary_contract_is_pinned() {
+        let canonical = Language::English.word_list().join("\n");
+        assert_eq!(Language::English.word_list().len(), 2048);
+        assert_eq!(canonical.len(), 13_115);
+        assert!(!canonical.ends_with('\n'));
+        assert_eq!(
+            hex::encode(Sha256::digest(canonical.as_bytes())),
+            "187db04a869dd9bc7be80d21a86497d692c0db6abd3aa8cb6be5d618ff757fae"
+        );
+    }
+
+    #[test]
+    fn recovery_create_indices_and_challenges_are_bounded_and_unique() {
+        let draft = VeilRecoveryDraft::new_create();
+        assert_eq!(draft.word_count(), 12);
+        assert_eq!(draft.challenge_count(), 3);
+        assert_eq!(draft.challenge_choice_count(), 4);
+
+        for position in 0..draft.word_count() {
+            assert!(draft.word_index(position).unwrap() < RECOVERY_DICTIONARY_WORD_COUNT);
+        }
+
+        let mut positions = Vec::new();
+        for slot in 0..draft.challenge_count() {
+            let position = draft.challenge_position(slot).unwrap();
+            positions.push(position);
+            let correct = draft.word_index(position).unwrap();
+            let mut choices = Vec::new();
+            for choice in 0..draft.challenge_choice_count() {
+                choices.push(draft.challenge_choice_word_index(slot, choice).unwrap());
+            }
+            assert!(choices.contains(&correct));
+            choices.sort_unstable();
+            choices.dedup();
+            assert_eq!(choices.len(), RECOVERY_CHALLENGE_CHOICE_COUNT as usize);
+        }
+        positions.sort_unstable();
+        positions.dedup();
+        assert_eq!(positions.len(), RECOVERY_CHALLENGE_COUNT as usize);
+    }
+
+    #[test]
+    fn recovery_rejects_all_position_index_and_choice_bounds_generically() {
+        let create = VeilRecoveryDraft::new_create();
+        let restore = VeilRecoveryDraft::new_restore();
+
+        let errors = [
+            create.word_index(RECOVERY_WORD_COUNT).unwrap_err(),
+            create
+                .challenge_position(RECOVERY_CHALLENGE_COUNT)
+                .unwrap_err(),
+            create
+                .challenge_choice_word_index(0, RECOVERY_CHALLENGE_CHOICE_COUNT)
+                .unwrap_err(),
+            create
+                .confirm_challenge(0, RECOVERY_DICTIONARY_WORD_COUNT)
+                .unwrap_err(),
+            restore
+                .set_import_word_index(RECOVERY_WORD_COUNT, 0)
+                .unwrap_err(),
+            restore
+                .set_import_word_index(0, RECOVERY_DICTIONARY_WORD_COUNT)
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(
+                error.to_string(),
+                "Invalid input: recovery input is invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_mode_misuse_is_fail_closed_and_generic() {
+        let create = VeilRecoveryDraft::new_create();
+        let restore = VeilRecoveryDraft::new_restore();
+
+        assert_eq!(
+            create.set_import_word_index(0, 0).unwrap_err().to_string(),
+            "Session error: recovery draft is unavailable"
+        );
+        assert_eq!(
+            create.validate_import().unwrap_err().to_string(),
+            "Session error: recovery draft is unavailable"
+        );
+        assert_eq!(
+            restore.word_index(0).unwrap_err().to_string(),
+            "Session error: recovery draft is unavailable"
+        );
+        assert_eq!(
+            restore.challenge_position(0).unwrap_err().to_string(),
+            "Session error: recovery draft is unavailable"
+        );
+    }
+
+    #[test]
+    fn recovery_restore_requires_complete_valid_checksum_and_revalidates_edits() {
+        let draft = VeilRecoveryDraft::new_restore();
+        assert!(!draft.is_commit_authorized());
+        assert!(!draft.validate_import().unwrap());
+
+        load_known_valid_restore(&draft);
+        assert!(draft.validate_import().unwrap());
+        assert!(draft.is_commit_authorized());
+
+        // Every edit revokes the previous validation, even before the caller
+        // asks to validate the newly entered phrase.
+        draft.set_import_word_index(11, 0).unwrap();
+        assert!(!draft.is_commit_authorized());
+        assert!(!draft.validate_import().unwrap());
+        assert!(!draft.is_commit_authorized());
+
+        draft.set_import_word_index(11, 3).unwrap();
+        assert!(!draft.is_commit_authorized());
+        assert!(draft.validate_import().unwrap());
+        assert!(draft.is_commit_authorized());
+    }
+
+    #[test]
+    fn recovery_wrong_create_answer_never_authorizes_and_can_revoke() {
+        let draft = VeilRecoveryDraft::new_create();
+        let position = draft.challenge_position(0).unwrap();
+        let correct = draft.word_index(position).unwrap();
+        let wrong = (0..draft.challenge_choice_count())
+            .map(|choice| draft.challenge_choice_word_index(0, choice).unwrap())
+            .find(|candidate| *candidate != correct)
+            .unwrap();
+
+        assert!(!draft.confirm_challenge(0, wrong).unwrap());
+        assert!(!draft.is_commit_authorized());
+        confirm_all_create_challenges(&draft);
+        assert!(draft.is_commit_authorized());
+
+        assert!(!draft.confirm_challenge(0, wrong).unwrap());
+        assert!(!draft.is_commit_authorized());
+        assert!(draft.confirm_challenge(0, correct).unwrap());
+        assert!(draft.is_commit_authorized());
+    }
+
+    #[test]
+    fn recovery_cancel_is_terminal_idempotent_and_zeroizes_state() {
+        let draft = VeilRecoveryDraft::new_create();
+        draft.cancel();
+        draft.cancel();
+
+        assert!(!draft.is_commit_authorized());
+        assert!(!draft.consume_commit_authorization());
+        assert_eq!(
+            draft.word_index(0).unwrap_err().to_string(),
+            "Session error: recovery draft is unavailable"
+        );
+        assert_eq!(
+            draft.challenge_position(0).unwrap_err().to_string(),
+            "Session error: recovery draft is unavailable"
+        );
+        assert_eq!(
+            draft.confirm_challenge(0, 0).unwrap_err().to_string(),
+            "Session error: recovery draft is unavailable"
+        );
+
+        let state = draft.state.lock().unwrap();
+        assert!(state.cancelled);
+        assert_eq!(state.words, [0; RECOVERY_WORD_COUNT as usize]);
+        assert!(state.challenges.iter().all(|challenge| {
+            challenge.position == 0
+                && challenge.choices == [0; RECOVERY_CHALLENGE_CHOICE_COUNT as usize]
+                && !challenge.confirmed
+        }));
+    }
+
+    #[test]
+    fn recovery_commit_authorization_is_one_shot_under_race() {
+        let draft = VeilRecoveryDraft::new_create();
+        confirm_all_create_challenges(&draft);
+        assert!(draft.is_commit_authorized());
+
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+        for _ in 0..2 {
+            let draft = Arc::clone(&draft);
+            let barrier = Arc::clone(&barrier);
+            workers.push(std::thread::spawn(move || {
+                barrier.wait();
+                draft.consume_commit_authorization()
+            }));
+        }
+        barrier.wait();
+        let successes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .filter(|result| *result)
+            .count();
+
+        assert_eq!(successes, 1);
+        assert!(!draft.is_commit_authorized());
+        assert!(!draft.consume_commit_authorization());
+        assert!(draft.word_index(0).is_err());
+
+        let state = draft.state.lock().unwrap();
+        assert!(state.cancelled);
+        assert_eq!(state.words, [0; RECOVERY_WORD_COUNT as usize]);
+    }
+
+    #[test]
+    fn recovery_restore_authorization_is_also_consumed_once() {
+        let draft = VeilRecoveryDraft::new_restore();
+        load_known_valid_restore(&draft);
+        assert!(draft.validate_import().unwrap());
+        assert!(draft.consume_commit_authorization());
+        assert!(!draft.consume_commit_authorization());
+        assert!(draft.validate_import().is_err());
+        assert!(draft.set_import_word_index(0, 0).is_err());
     }
 
     #[test]

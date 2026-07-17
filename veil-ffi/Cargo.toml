@@ -21,7 +21,9 @@ serde_json = "1"
 url = "2"
 uuid = "1"
 base64 = "0.22"
+bip39 = { version = "2", features = ["zeroize"] }
 hex = "0.4"
+rand = "0.8"
 sha2 = "0.10"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 zeroize = "1"
