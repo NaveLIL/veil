@@ -180,10 +180,12 @@ interface ChatState {
   selectedChannelId: ChannelId | null;
   selectedDmId: DmId | null;
   messagesByChannel: Record<string, Message[]>;
+  prototypeFixturesEnabled: boolean;
   selectServer: (id: ServerId) => void;
   selectChannel: (id: ChannelId) => void;
   selectDm: (id: DmId) => void;
   sendMessage: (text: string) => void;
+  clearRenderableChat: () => void;
   channelsForServer: (id: ServerId) => Channel[];
   membersForServer: (id: ServerId) => Member[];
   currentMessages: () => Message[];
@@ -204,6 +206,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       { id: "a3", author: MEMBERS_BY_DM["dm-anya"][1], ts: "21:04", text: "see you tomorrow ✨" },
     ],
   },
+  prototypeFixturesEnabled: true,
 
   selectServer: (id) =>
     set((s) => {
@@ -224,7 +227,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const ch = s.channels.find((c) => c.id === id);
       if (!ch || ch.serverId !== s.selectedServerId) return s;
       const next = { ...s.messagesByChannel };
-      if (!next[id]) next[id] = makeMessages(ch.name, MEMBERS_BY_SERVER[ch.serverId] ?? []);
+      if (!next[id] && s.prototypeFixturesEnabled) {
+        next[id] = makeMessages(ch.name, MEMBERS_BY_SERVER[ch.serverId] ?? []);
+      }
       return { selectedChannelId: id, messagesByChannel: next };
     }),
 
@@ -232,7 +237,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     set((s) => {
       if (!s.dms.some((dm) => dm.id === id) || !MEMBERS_BY_DM[id]) return s;
       const next = { ...s.messagesByChannel };
-      if (!next[id]) {
+      if (!next[id] && s.prototypeFixturesEnabled) {
         const dm = s.dms.find((d) => d.id === id);
         next[id] = makeMessages(dm?.name ?? "dm", MEMBERS_BY_DM[id] ?? []);
       }
@@ -266,6 +271,16 @@ export const useChatStore = create<ChatState>((set, get) => ({
       const list = s.messagesByChannel[key] ?? [];
       return { messagesByChannel: { ...s.messagesByChannel, [key]: [...list, msg] } };
     }),
+
+  clearRenderableChat: () =>
+    set((state) => ({
+      prototypeFixturesEnabled: false,
+      messagesByChannel: {},
+      selectedServerId: DM_HOME_ID,
+      selectedChannelId: null,
+      selectedDmId: null,
+      dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, ...dm }) => dm),
+    })),
 
   channelsForServer: (id) => get().channels.filter((c) => c.serverId === id),
   membersForServer: (id) => MEMBERS_BY_SERVER[id] ?? [],

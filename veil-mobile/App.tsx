@@ -1,107 +1,190 @@
 import React, { useEffect } from "react";
-import { ActivityIndicator, Text, View } from "react-native";
+import {
+  ActivityIndicator,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
 import { SafeAreaProvider } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
-import { NavigationContainer, DefaultTheme } from "@react-navigation/native";
-import { createNativeStackNavigator } from "@react-navigation/native-stack";
 
-import OnboardingScreen from "./src/screens/OnboardingScreen";
+import { PrivacyCurtain } from "./src/components/runtime/PrivacyCurtain";
+import { SecureRuntimeGate } from "./src/components/runtime/SecureRuntimeGate";
+import { useReducedMotionPreference } from "./src/hooks/useReducedMotionPreference";
+import { useVeilRuntimeLifecycle } from "./src/hooks/useVeilRuntimeLifecycle";
+import { colors, radii, spacing } from "./src/lib/theme";
 import ChatListScreen from "./src/screens/ChatListScreen";
+import OnboardingScreen from "./src/screens/OnboardingScreen";
 import { useAuthStore } from "./src/stores/auth";
-import VeilCrypto from "./src/native/crypto";
-
-const Stack = createNativeStackNavigator();
-
-const navTheme = {
-  ...DefaultTheme,
-  dark: true,
-  colors: {
-    ...DefaultTheme.colors,
-    background: "#111117",
-    card: "#111117",
-    primary: "#7c6bf5",
-    text: "#ededf0",
-    border: "rgba(255,255,255,0.06)",
-    notification: "#7c6bf5",
-  },
-};
+import {
+  canRenderChat,
+  useRuntimeGateStore,
+} from "./src/stores/runtime";
 
 export default function App() {
-  const nativeIdentityState = useAuthStore((s) => s.nativeIdentityState);
-  const setLocalIdentityReady = useAuthStore((s) => s.setLocalIdentityReady);
-  const setLocked = useAuthStore((s) => s.setLocked);
-  const setNativeError = useAuthStore((s) => s.setNativeError);
-  const nativeError = useAuthStore((s) => s.nativeError);
+  const runtime = useVeilRuntimeLifecycle();
+  const reducedMotion = useReducedMotionPreference();
+  const phase = useRuntimeGateStore((state) => state.phase);
+  const snapshot = useRuntimeGateStore((state) => state.snapshot);
+  const curtainVisible = useRuntimeGateStore((state) => state.curtainVisible);
+  const requiresExplicitReopen = useRuntimeGateStore((state) => state.requiresExplicitReopen);
+  const operation = useRuntimeGateStore((state) => state.operation);
+  const publicError = useRuntimeGateStore((state) => state.publicError);
+  const onboardingIdentityState = useAuthStore((state) => state.nativeIdentityState);
 
+  // Onboarding still owns the existing recovery UI. Its public completion
+  // signal only triggers a new native snapshot; it never authorizes ChatList.
   useEffect(() => {
-    let active = true;
-    void VeilCrypto.hasIdentity()
-      .then(async (hasIdentity) => {
-        if (!active) return;
-        if (!hasIdentity) {
-          setLocked();
-          return;
-        }
-        const publicIdentityKey = await VeilCrypto.getIdentityKey();
-        if (active) setLocalIdentityReady(publicIdentityKey);
-      })
-      .catch((error) => {
-        if (active) setNativeError(error instanceof Error ? error.message : "Native identity runtime failed");
-      });
-    return () => {
-      active = false;
-    };
-  }, [setLocalIdentityReady, setLocked, setNativeError]);
+    if (
+      onboardingIdentityState === "local_identity_ready"
+      && phase === "ready"
+      && snapshot
+      && !snapshot.identityExists
+    ) {
+      void runtime.retryBootstrap();
+    }
+  }, [onboardingIdentityState, phase, runtime, snapshot]);
+
+  const chatReady = canRenderChat(snapshot, requiresExplicitReopen);
+
+  let content: React.ReactNode;
+  if (phase === "bootstrapping" || phase === "privacy") {
+    content = <RuntimeBootstrap reducedMotion={reducedMotion} />;
+  } else if (phase === "error" || !snapshot) {
+    content = (
+      <RuntimeError
+        message={publicError}
+        onRetry={() => void runtime.retryBootstrap()}
+      />
+    );
+  } else if (!snapshot.identityExists) {
+    content = <OnboardingScreen />;
+  } else if (chatReady) {
+    content = (
+      <View testID="chat-runtime-ready" style={styles.flex}>
+        <ChatListScreen />
+      </View>
+    );
+  } else {
+    content = (
+      <SecureRuntimeGate
+        snapshot={snapshot}
+        requiresExplicitReopen={requiresExplicitReopen}
+        operation={operation}
+        publicError={publicError}
+        reducedMotion={reducedMotion}
+        onUnlock={() => void runtime.unlock()}
+        onConnect={(origin) => void runtime.connect(origin)}
+        onUsePendingAccessPass={(flowId) => void runtime.usePendingAccessPass(flowId)}
+        onDiscardPendingAccessPass={(flowId) => void runtime.discardPendingAccessPass(flowId)}
+        onRefresh={() => void runtime.refresh()}
+      />
+    );
+  }
 
   return (
-    <GestureHandlerRootView style={{ flex: 1, backgroundColor: "#111117" }}>
+    <GestureHandlerRootView style={styles.root}>
       <SafeAreaProvider>
-        <NavigationContainer theme={navTheme}>
-          <StatusBar style="light" translucent />
-          <Stack.Navigator
-            screenOptions={{
-              headerShown: false,
-              contentStyle: { backgroundColor: "#111117" },
-              animation: "fade",
-              animationDuration: 320,
-            }}
-          >
-            {nativeIdentityState === "checking" ? (
-              <Stack.Screen name="IdentityBootstrap" component={IdentityBootstrap} />
-            ) : nativeIdentityState === "native_error" ? (
-              <Stack.Screen name="NativeIdentityError">
-                {() => <NativeIdentityError message={nativeError} />}
-              </Stack.Screen>
-            ) : nativeIdentityState === "locked" ? (
-              <Stack.Screen name="Onboarding" component={OnboardingScreen} />
-            ) : (
-              <Stack.Screen name="ChatList" component={ChatListScreen} />
-            )}
-          </Stack.Navigator>
-        </NavigationContainer>
+        <StatusBar style="light" translucent />
+        <View
+          style={styles.flex}
+          pointerEvents={curtainVisible ? "none" : "auto"}
+          importantForAccessibility={curtainVisible ? "no-hide-descendants" : "auto"}
+        >
+          {content}
+        </View>
+        {curtainVisible ? <PrivacyCurtain reducedMotion={reducedMotion} /> : null}
       </SafeAreaProvider>
     </GestureHandlerRootView>
   );
 }
 
-function IdentityBootstrap() {
+function RuntimeBootstrap({ reducedMotion }: { reducedMotion: boolean }) {
   return (
-    <View style={{ flex: 1, alignItems: "center", justifyContent: "center", backgroundColor: "#111117" }}>
-      <ActivityIndicator color="#7c6bf5" />
+    <View
+      testID="runtime-bootstrap"
+      accessibilityRole="progressbar"
+      accessibilityLabel="Verifying secure mobile runtime"
+      style={styles.centered}
+    >
+      {reducedMotion ? null : <ActivityIndicator color={colors.primaryHi} />}
+      <Text style={styles.bootstrapText}>Verifying native session...</Text>
     </View>
   );
 }
 
-function NativeIdentityError({ message }: { message: string | null }) {
+function RuntimeError({
+  message,
+  onRetry,
+}: {
+  message: string | null;
+  onRetry: () => void;
+}) {
   return (
-    <View style={{ flex: 1, padding: 32, alignItems: "center", justifyContent: "center", backgroundColor: "#111117" }}>
-      <Text style={{ color: "#ff6b78", fontSize: 17, fontWeight: "700", textAlign: "center" }}>
-        Secure identity runtime unavailable
-      </Text>
-      <Text style={{ color: "#a7a7b0", fontSize: 13, lineHeight: 19, textAlign: "center", marginTop: 10 }}>
-        {message ?? "Veil cannot safely open the local identity vault on this device."}
-      </Text>
+    <View testID="runtime-error" accessibilityRole="alert" style={styles.centered}>
+      <View style={styles.errorCard}>
+        <Text accessibilityRole="header" style={styles.errorTitle}>Secure runtime unavailable</Text>
+        <Text style={styles.errorBody}>
+          {message ?? "Veil could not verify the native account boundary. No messages were opened."}
+        </Text>
+        <Pressable
+          accessibilityRole="button"
+          onPress={onRetry}
+          style={({ pressed }) => [styles.retryButton, pressed && styles.retryPressed]}
+        >
+          <Text style={styles.retryText}>Try secure verification again</Text>
+        </Pressable>
+      </View>
     </View>
   );
 }
+
+const styles = StyleSheet.create({
+  root: { flex: 1, backgroundColor: colors.background },
+  flex: { flex: 1 },
+  centered: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.background,
+    padding: spacing.xxl,
+  },
+  bootstrapText: {
+    color: colors.textMd,
+    fontSize: 15,
+    lineHeight: 22,
+    textAlign: "center",
+    marginTop: spacing.md,
+  },
+  errorCard: {
+    width: "100%",
+    maxWidth: 460,
+    borderRadius: radii.xl,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.destructiveBorder,
+    backgroundColor: colors.surfaceSolid,
+    padding: spacing.xl,
+  },
+  errorTitle: { color: colors.textHi, fontSize: 21, fontWeight: "800", textAlign: "center" },
+  errorBody: {
+    color: colors.textMd,
+    fontSize: 15,
+    lineHeight: 22,
+    textAlign: "center",
+    marginTop: spacing.sm,
+  },
+  retryButton: {
+    minHeight: 48,
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radii.md,
+    backgroundColor: colors.primaryDeep,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+    marginTop: spacing.xl,
+  },
+  retryPressed: { opacity: 0.78 },
+  retryText: { color: "#fff", fontSize: 15, fontWeight: "800", textAlign: "center" },
+});
