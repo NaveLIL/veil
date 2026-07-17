@@ -41,8 +41,15 @@ internal class NativeIdentityVault(context: Context) : NativeIdentityVaultAccess
     }
   }
 
-  fun storeNewMnemonic(mnemonic: String) = NativeIdentityVaultProcessLock.withLock {
-    val plaintext = mnemonic.toByteArray(Charsets.UTF_8)
+  /**
+   * Durably stores a newly provisioned mnemonic without ever materializing it
+   * as an immutable JVM [String]. The caller retains ownership of
+   * [mnemonicUtf8] and must clear it; this vault encrypts a private copy and
+   * clears that copy before returning.
+  */
+  fun storeNewMnemonicBytes(mnemonicUtf8: ByteArray) = NativeIdentityVaultProcessLock.withLock {
+    require(mnemonicUtf8.size in 1..MAX_MNEMONIC_BYTES) { "mnemonic byte length is invalid" }
+    val plaintext = mnemonicUtf8.copyOf()
     var iv: ByteArray? = null
     var ciphertext: ByteArray? = null
     try {
@@ -130,6 +137,7 @@ internal class NativeIdentityVault(context: Context) : NativeIdentityVaultAccess
     private const val KEY_ALIAS = "veil.mobile.identity.v1"
     private const val TRANSFORMATION = "AES/GCM/NoPadding"
     private const val GCM_TAG_BITS = 128
+    private const val MAX_MNEMONIC_BYTES = 24 * 9
   }
 }
 

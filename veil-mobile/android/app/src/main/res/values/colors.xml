@@ -3,4 +3,12 @@
   <color name="colorPrimary">#023c69</color>
   <color name="colorPrimaryDark">#ffffff</color>
   <color name="activityBackground">#111117</color>
+  <color name="recoveryBackground">#08141F</color>
+  <color name="recoverySurface">#112536</color>
+  <color name="recoverySurfaceRaised">#183249</color>
+  <color name="recoveryPrimary">#38A8FF</color>
+  <color name="recoveryAccent">#45E0C3</color>
+  <color name="recoveryText">#F4F8FC</color>
+  <color name="recoveryTextMuted">#A8BDCE</color>
+  <color name="recoveryDanger">#FF7B89</color>
 </resources>

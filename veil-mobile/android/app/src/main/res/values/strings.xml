@@ -1,4 +1,30 @@
 <resources>
   <string name="app_name">Veil</string>
   <string name="expo_system_ui_user_interface_style" translatable="false">dark</string>
+  <string name="recovery_activity_label">Secure identity setup</string>
+  <string name="recovery_brand">VEIL · DIRECT PREVIEW</string>
+  <string name="recovery_create_title">Create your identity</string>
+  <string name="recovery_restore_title">Restore your identity</string>
+  <string name="recovery_create_intro">Write these words down in order. They are the only way to restore this identity.</string>
+  <string name="recovery_restore_intro">Enter each recovery word with the private in-app keyboard.</string>
+  <string name="recovery_accessibility_notice">For privacy, recovery words are excluded from screen readers and Android autofill.</string>
+  <string name="recovery_continue">Continue securely</string>
+  <string name="recovery_cancel">Cancel setup</string>
+  <string name="recovery_challenge_title">Confirm your backup</string>
+  <string name="recovery_challenge_prompt">Choose word #%1$d</string>
+  <string name="recovery_wrong_word">That word does not match. Check your written backup.</string>
+  <string name="recovery_word_progress">Word %1$d of %2$d</string>
+  <string name="recovery_private_input">Private input</string>
+  <string name="recovery_erase">Erase</string>
+  <string name="recovery_clear">Clear word</string>
+  <string name="recovery_invalid_phrase">Those words are not a valid recovery phrase. Review the final words and try again.</string>
+  <string name="recovery_ready_title">Ready to secure this device</string>
+  <string name="recovery_ready_body">Veil will verify the identity, encrypt it with Android Keystore, and read it back before continuing.</string>
+  <string name="recovery_commit_create">Create encrypted identity</string>
+  <string name="recovery_commit_restore">Restore encrypted identity</string>
+  <string name="recovery_committing_title">Securing your identity…</string>
+  <string name="recovery_committing_body">Keep Veil open. This step cannot be interrupted or undone.</string>
+  <string name="recovery_failed_title">Setup was not completed</string>
+  <string name="recovery_failed_body">No recovery material was returned to the app interface. Close this screen and start identity setup again.</string>
+  <string name="recovery_close">Close securely</string>
 </resources>

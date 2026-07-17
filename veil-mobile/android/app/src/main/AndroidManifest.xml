@@ -2,6 +2,7 @@
   <uses-permission android:name="android.permission.INTERNET"/>
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
   <uses-permission android:name="android.permission.VIBRATE"/>
+  <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS"/>
   <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" tools:node="remove"/>
   <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" tools:node="remove"/>
   <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" tools:node="remove"/>
@@ -12,7 +13,7 @@
       <data android:scheme="https"/>
     </intent>
   </queries>
-  <application android:name=".MainApplication" android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:allowBackup="false" android:theme="@style/AppTheme" android:supportsRtl="true">
+  <application android:name=".MainApplication" android:label="@string/app_name" android:icon="@drawable/ic_veil_launcher" android:roundIcon="@drawable/ic_veil_launcher" android:allowBackup="false" android:fullBackupContent="false" android:dataExtractionRules="@xml/data_extraction_rules" android:theme="@style/AppTheme" android:supportsRtl="true" android:usesCleartextTraffic="false">
     <meta-data android:name="expo.modules.updates.ENABLED" android:value="false"/>
     <meta-data android:name="expo.modules.updates.EXPO_UPDATES_CHECK_ON_LAUNCH" android:value="ALWAYS"/>
     <meta-data android:name="expo.modules.updates.EXPO_UPDATES_LAUNCH_WAIT_MS" android:value="0"/>
@@ -34,6 +35,15 @@
         <data android:scheme="https" android:host="veil.erez.pro" android:path="/enroll"/>
       </intent-filter>
     </activity>
+    <activity
+      android:name=".recovery.RecoveryActivity"
+      android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode"
+      android:enableOnBackInvokedCallback="true"
+      android:excludeFromRecents="true"
+      android:exported="false"
+      android:noHistory="false"
+      android:stateNotNeeded="true"
+      android:theme="@style/Theme.Veil.Recovery" />
     <service android:name=".push.VeilPushService" android:exported="false">
       <intent-filter>
         <action android:name="org.unifiedpush.android.connector.PUSH_EVENT"/>

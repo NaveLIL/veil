@@ -5,11 +5,8 @@ import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.LifecycleEventListener
-import java.security.MessageDigest
 import android.view.WindowManager
 import uniffi.veil_ffi.VeilIdentity
-import uniffi.veil_ffi.generateMnemonic
-import uniffi.veil_ffi.validateMnemonic
 
 class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context), LifecycleEventListener {
   private val vault = NativeIdentityVault(context)
@@ -35,13 +32,6 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
   override fun getName(): String = "VeilCrypto"
 
   @ReactMethod
-  fun generateMnemonic(promise: Promise) = resolveScoped(promise) { generateMnemonic() }
-
-  @ReactMethod
-  fun validateMnemonic(mnemonic: String, promise: Promise) =
-    resolveScoped(promise) { validateMnemonic(normalizeMnemonic(mnemonic)) }
-
-  @ReactMethod
   fun hasIdentity(promise: Promise) = resolveScoped(promise) {
     identityState.withExisting { true } ?: false
   }
@@ -62,31 +52,6 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
         promise.resolve(true)
       } catch (_: Throwable) {
         promise.reject("E_VEIL_WINDOW", "Unable to update sensitive screen protection")
-      }
-    }
-  }
-
-  @ReactMethod
-  fun createIdentity(mnemonic: String, promise: Promise) = resolveScoped(promise) {
-    val normalized = normalizeMnemonic(mnemonic)
-    if (!validateMnemonic(normalized)) throw IllegalArgumentException("invalid recovery phrase")
-    val candidate = identityFromMnemonic(normalized)
-    var installed = false
-    try {
-      val candidateKey = candidate.identityKey()
-      installed = identityState.installOrVerify(
-        candidate = candidate,
-        verifyExisting = { existing, _ ->
-          if (!MessageDigest.isEqual(existing.identityKey(), candidateKey)) {
-            throw IdentityVaultException("a different identity already exists on this device")
-          }
-        },
-        persistCandidate = { vault.storeNewMnemonic(normalized) },
-      )
-      candidateKey.toHex()
-    } finally {
-      if (!installed) {
-        candidate.close()
       }
     }
   }
@@ -135,15 +100,6 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
     super.invalidate()
   }
 
-  private fun identityFromMnemonic(mnemonic: String): VeilIdentity {
-    val mnemonicUtf8 = mnemonic.toByteArray(Charsets.UTF_8)
-    return try {
-      VeilIdentity.fromMnemonicBytes(mnemonicUtf8)
-    } finally {
-      mnemonicUtf8.fill(0)
-    }
-  }
-
   private fun resolveScoped(promise: Promise, operation: () -> Any?) {
     try {
       identityState.runIfAccessible(operation) { result -> promise.resolve(result) }
@@ -155,8 +111,6 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
       promise.reject("E_VEIL_CRYPTO", "Native cryptographic operation failed")
     }
   }
-
-  private fun normalizeMnemonic(value: String): String = value.trim().split(Regex("\\s+")).joinToString(" ")
 }
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
