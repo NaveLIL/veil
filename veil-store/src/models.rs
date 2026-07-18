@@ -183,6 +183,17 @@ pub struct AuthenticatedDirectDirectoryEntry {
     pub created_at: String,
 }
 
+/// Exact SQLCipher-backed trust scope used while replaying authenticated
+/// Direct history. Both accounts come from the same origin-scoped directory
+/// transaction as the pinned conversation route; network callers cannot
+/// substitute either key tuple independently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDirectHistoryScopeV1 {
+    pub conversation_id: String,
+    pub self_account: AccountSnapshot,
+    pub peer_account: AccountSnapshot,
+}
+
 /// A decrypted message (stored locally in SQLCipher).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {

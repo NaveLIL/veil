@@ -672,7 +672,7 @@ fn validate_cursor(field: &str, value: Option<&str>) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_canonical_origin(origin: &str) -> Result<(), String> {
+pub(crate) fn validate_canonical_origin(origin: &str) -> Result<(), String> {
     if origin.is_empty() || origin.len() > MAX_CANONICAL_ORIGIN_BYTES {
         return Err("invalid canonical server origin".to_string());
     }

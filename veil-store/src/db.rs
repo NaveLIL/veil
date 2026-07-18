@@ -1,7 +1,7 @@
 use crate::models::{
     AccountSnapshot, AccountSnapshotSource, AuthenticatedDirectDirectoryEntry,
-    HistoricalAccountContinuity, LocalIdentityVerification, Message, MessageAuthorContext,
-    NetworkProfile, ProfileLocator,
+    AuthenticatedDirectHistoryScopeV1, HistoricalAccountContinuity, LocalIdentityVerification,
+    Message, MessageAuthorContext, NetworkProfile, ProfileLocator,
 };
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
@@ -3339,6 +3339,91 @@ impl VeilDb {
         }
         tx.commit()
             .map_err(|error| format!("commit Direct directory transaction: {error}"))
+    }
+
+    /// Resolve one Direct history trust scope from a single SQLCipher read
+    /// transaction. The authenticated self binding, conversation origin/type,
+    /// immutable peer route and both directory account tuples must all agree.
+    ///
+    /// This helper deliberately accepts no candidate keys from the network.
+    /// A caller may compare its process-local pins with the returned tuples,
+    /// but it cannot use this function to establish new trust.
+    pub fn resolve_authenticated_direct_history_scope_v1(
+        &self,
+        canonical_server_origin: &str,
+        authenticated_user_id: &str,
+        conversation_id: &str,
+    ) -> Result<AuthenticatedDirectHistoryScopeV1, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid(
+            "Direct history authenticated user id",
+            authenticated_user_id,
+        )?;
+        validate_canonical_uuid("Direct history conversation id", conversation_id)?;
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin Direct history scope read: {error}"))?;
+        let self_binding = load_authenticated_self_binding(&tx, canonical_server_origin)?
+            .ok_or("Direct history origin has no authenticated self binding")?;
+        if self_binding.user_id != authenticated_user_id {
+            return Err("Direct history user differs from authenticated self".to_string());
+        }
+
+        let route = tx
+            .query_row(
+                "SELECT conv_type, server_origin, peer_user_id, peer_identity_key
+                 FROM conversations WHERE id = ?1",
+                rusqlite::params![conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u8>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load Direct history conversation route: {error}"))?
+            .ok_or("Direct history conversation is absent from SQLCipher")?;
+        let (conversation_type, stored_origin, peer_user_id, peer_identity_key) = route;
+        if conversation_type != 0 || stored_origin.as_deref() != Some(canonical_server_origin) {
+            return Err("Direct history conversation has the wrong type or origin".to_string());
+        }
+        let peer_user_id = peer_user_id.ok_or("Direct history conversation has no peer user")?;
+        validate_canonical_uuid("Direct history peer user id", &peer_user_id)?;
+        if peer_user_id == authenticated_user_id {
+            return Err("Direct history conversation points to authenticated self".to_string());
+        }
+        let peer_identity_key: [u8; 32] = peer_identity_key
+            .ok_or("Direct history conversation has no peer identity")?
+            .try_into()
+            .map_err(|_| "Direct history peer identity has the wrong length".to_string())?;
+
+        let self_account =
+            load_account_by_origin_user(&tx, canonical_server_origin, authenticated_user_id)?
+                .ok_or("Direct history authenticated account is absent from the directory")?;
+        let peer_account =
+            load_account_by_origin_user(&tx, canonical_server_origin, &peer_user_id)?
+                .ok_or("Direct history peer account is absent from the directory")?;
+        if self_account.locator.identity_key != self_binding.identity_key
+            || self_account.signing_key != self_binding.signing_key
+        {
+            return Err("Direct history authenticated directory tuple changed".to_string());
+        }
+        if peer_account.locator.identity_key != peer_identity_key {
+            return Err("Direct history peer route differs from its directory tuple".to_string());
+        }
+
+        tx.commit()
+            .map_err(|error| format!("commit Direct history scope read: {error}"))?;
+        Ok(AuthenticatedDirectHistoryScopeV1 {
+            conversation_id: conversation_id.to_string(),
+            self_account,
+            peer_account,
+        })
     }
 
     /// Atomically persist the text-channel conversations from one authenticated

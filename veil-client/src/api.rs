@@ -152,6 +152,39 @@ pub enum ReceiveMessageResult {
     Duplicate,
 }
 
+/// Internal classification used by authenticated Direct history.
+///
+/// Public desktop APIs deliberately keep their established `String` surface;
+/// this type exists so a peer-controlled cryptographic rejection can be
+/// quarantined without ever confusing it with an uncertain SQLCipher commit.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirectHistoryMutationError {
+    ConversationRejected(String),
+    StorageUncertain(String),
+}
+
+impl DirectHistoryMutationError {
+    fn rejected(error: impl Into<String>) -> Self {
+        Self::ConversationRejected(error.into())
+    }
+
+    fn storage(error: impl Into<String>) -> Self {
+        Self::StorageUncertain(error.into())
+    }
+
+    fn into_detail(self) -> String {
+        match self {
+            Self::ConversationRejected(detail) | Self::StorageUncertain(detail) => detail,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AtomicReceiveDecryptMode {
+    General,
+    DirectHistory,
+}
+
 pub struct RemoteMessageMetadata<'a> {
     pub revision_ms: i64,
     pub reactions: Option<&'a [RemoteReaction]>,
@@ -708,7 +741,7 @@ impl VeilClient {
     /// real WebSocket handshake. The feature is disabled in production.
     /// Durable origin/user/account continuity is checked before process state
     /// is changed; failure leaves `authenticated_user_id` untouched.
-    #[cfg(feature = "test-utils")]
+    #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
     pub fn test_only_restore_authenticated_user_from_durable_binding(
         &mut self,
@@ -1770,6 +1803,14 @@ impl VeilClient {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_only_confirm_peer_session_possession(
+        &mut self,
+        peer_identity_key: &[u8; 32],
+    ) -> Result<(), String> {
+        self.confirm_peer_session_possession(peer_identity_key)
+    }
+
     fn confirm_sender_key_distribution(
         &mut self,
         sequence: u64,
@@ -2617,6 +2658,15 @@ impl VeilClient {
         self.encrypt_for_conversation(&peer_identity_key, conversation_id, &inner)
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_only_encrypt_outgoing(
+        &mut self,
+        conversation_id: &str,
+        plaintext: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.encrypt_outgoing(conversation_id, plaintext)
+    }
+
     /// Context-free pairwise encryption is intentionally disabled: every
     /// ratchet message must authenticate its conversation and both identities.
     pub fn encrypt_for(
@@ -3078,6 +3128,184 @@ impl VeilClient {
                 ))
             }
         }
+    }
+
+    /// Direct history is pairwise text only. Keeping this path small and
+    /// classified lets callers distinguish authenticated-ciphertext rejection
+    /// from an uncertain SQLCipher write without parsing human-readable
+    /// errors. Candidate ratchets are persisted inside the caller's receive
+    /// savepoint and published to memory only after authentication succeeds.
+    fn decrypt_direct_history_text_classified(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        conversation_id: &str,
+        header: &[u8],
+        ciphertext: &[u8],
+    ) -> Result<Vec<u8>, DirectHistoryMutationError> {
+        if header.is_empty() || ciphertext.is_empty() {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct history ciphertext is empty",
+            ));
+        }
+
+        let plaintext = match header[0] {
+            HEADER_INITIAL => {
+                if header.len() != 1 + 32 + 4 + 4 + 41 {
+                    return Err(DirectHistoryMutationError::rejected(
+                        "invalid Direct history initial header length",
+                    ));
+                }
+                let mut ephemeral_key = [0u8; 32];
+                ephemeral_key.copy_from_slice(&header[1..33]);
+                let signed_prekey_id =
+                    u32::from_be_bytes([header[33], header[34], header[35], header[36]]);
+                let one_time_prekey_raw =
+                    u32::from_be_bytes([header[37], header[38], header[39], header[40]]);
+                let one_time_prekey_id =
+                    (one_time_prekey_raw != u32::MAX).then_some(one_time_prekey_raw);
+                let ratchet_header = MessageHeader::from_bytes(&header[41..82])
+                    .map_err(DirectHistoryMutationError::rejected)?;
+                let local_identity = self
+                    .identity_key()
+                    .map_err(DirectHistoryMutationError::storage)?;
+                let associated_data = ratchet_associated_data(
+                    conversation_id,
+                    sender_identity_key,
+                    &local_identity,
+                    &header[..41],
+                )
+                .map_err(DirectHistoryMutationError::rejected)?;
+
+                if self.has_session(sender_identity_key) {
+                    let mut candidate = self
+                        .ratchet_sessions
+                        .get(sender_identity_key)
+                        .cloned()
+                        .ok_or_else(|| {
+                            DirectHistoryMutationError::storage(
+                                "Direct history ratchet session lookup failed",
+                            )
+                        })?;
+                    let plaintext = candidate
+                        .decrypt_with_ad(&ratchet_header, ciphertext, &associated_data)
+                        .map_err(DirectHistoryMutationError::rejected)?;
+                    let data = Zeroizing::new(serde_json::to_vec(&candidate).map_err(|error| {
+                        DirectHistoryMutationError::storage(format!(
+                            "serialize Direct history ratchet session: {error}"
+                        ))
+                    })?);
+                    self.db
+                        .as_ref()
+                        .ok_or_else(|| {
+                            DirectHistoryMutationError::storage("database not initialized")
+                        })?
+                        .save_ratchet_session(sender_identity_key, &data)
+                        .map_err(DirectHistoryMutationError::storage)?;
+                    self.ratchet_sessions
+                        .insert(*sender_identity_key, candidate);
+                    plaintext
+                } else {
+                    let mut candidate = self
+                        .build_responder_session(
+                            sender_identity_key,
+                            &ephemeral_key,
+                            signed_prekey_id,
+                            one_time_prekey_id,
+                        )
+                        .map_err(DirectHistoryMutationError::rejected)?;
+                    let plaintext = candidate
+                        .decrypt_with_ad(&ratchet_header, ciphertext, &associated_data)
+                        .map_err(DirectHistoryMutationError::rejected)?;
+                    let data = Zeroizing::new(serde_json::to_vec(&candidate).map_err(|error| {
+                        DirectHistoryMutationError::storage(format!(
+                            "serialize Direct history initial ratchet session: {error}"
+                        ))
+                    })?);
+                    self.db
+                        .as_ref()
+                        .ok_or_else(|| {
+                            DirectHistoryMutationError::storage("database not initialized")
+                        })?
+                        .commit_initial_ratchet_session(
+                            sender_identity_key,
+                            &data,
+                            one_time_prekey_id,
+                        )
+                        .map_err(DirectHistoryMutationError::storage)?;
+                    if let Some(id) = one_time_prekey_id {
+                        if let Some(mut secret) = self.otk_secrets.remove(&id) {
+                            secret.zeroize();
+                        }
+                    }
+                    self.ratchet_sessions
+                        .insert(*sender_identity_key, candidate);
+                    plaintext
+                }
+            }
+            HEADER_RATCHET => {
+                if header.len() != 1 + 41 {
+                    return Err(DirectHistoryMutationError::rejected(
+                        "invalid Direct history ratchet header length",
+                    ));
+                }
+                let ratchet_header = MessageHeader::from_bytes(&header[1..])
+                    .map_err(DirectHistoryMutationError::rejected)?;
+                let local_identity = self
+                    .identity_key()
+                    .map_err(DirectHistoryMutationError::storage)?;
+                let associated_data = ratchet_associated_data(
+                    conversation_id,
+                    sender_identity_key,
+                    &local_identity,
+                    &header[..1],
+                )
+                .map_err(DirectHistoryMutationError::rejected)?;
+                let mut candidate = self
+                    .ratchet_sessions
+                    .get(sender_identity_key)
+                    .cloned()
+                    .ok_or_else(|| {
+                        DirectHistoryMutationError::rejected(
+                            "no Direct history ratchet session with this peer",
+                        )
+                    })?;
+                let plaintext = candidate
+                    .decrypt_with_ad(&ratchet_header, ciphertext, &associated_data)
+                    .map_err(DirectHistoryMutationError::rejected)?;
+                let data = Zeroizing::new(serde_json::to_vec(&candidate).map_err(|error| {
+                    DirectHistoryMutationError::storage(format!(
+                        "serialize Direct history ratchet session: {error}"
+                    ))
+                })?);
+                self.db
+                    .as_ref()
+                    .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
+                    .save_ratchet_session(sender_identity_key, &data)
+                    .map_err(DirectHistoryMutationError::storage)?;
+                self.ratchet_sessions
+                    .insert(*sender_identity_key, candidate);
+                plaintext
+            }
+            _ => {
+                return Err(DirectHistoryMutationError::rejected(
+                    "unsupported Direct history E2E header",
+                ));
+            }
+        };
+
+        let mut plaintext = Zeroizing::new(plaintext);
+        if plaintext.len() > MAX_PLAINTEXT_BYTES + 1 {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct history plaintext exceeds the text limit",
+            ));
+        }
+        if plaintext.first() != Some(&INNER_TEXT) {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct history ratchet payload is not text",
+            ));
+        }
+        plaintext.remove(0);
+        Ok(std::mem::take(&mut *plaintext))
     }
 
     /// Strip the inner type byte from ratchet-decrypted plaintext.
@@ -4146,6 +4374,57 @@ impl VeilClient {
         Ok(OfflineSenderKeyRefresh::Required)
     }
 
+    fn with_classified_receive_savepoint<T>(
+        &mut self,
+        rollback_label: &str,
+        operation: impl FnOnce(&mut Self) -> Result<T, DirectHistoryMutationError>,
+    ) -> Result<T, DirectHistoryMutationError> {
+        let crypto_snapshot = self.receive_crypto_snapshot();
+        self.db
+            .as_ref()
+            .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
+            .begin_receive_savepoint()
+            .map_err(DirectHistoryMutationError::storage)?;
+
+        match operation(self) {
+            Ok(value) => {
+                if let Err(commit_error) = self
+                    .db
+                    .as_ref()
+                    .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
+                    .commit_receive_savepoint()
+                {
+                    let rollback_error = self
+                        .db
+                        .as_ref()
+                        .and_then(|db| db.rollback_receive_savepoint().err());
+                    self.restore_receive_crypto(crypto_snapshot);
+                    let detail = rollback_error.map_or(commit_error.clone(), |rollback_error| {
+                        format!(
+                            "{commit_error}; {rollback_label} rollback also failed: {rollback_error}"
+                        )
+                    });
+                    return Err(DirectHistoryMutationError::storage(detail));
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                let rollback_error = self
+                    .db
+                    .as_ref()
+                    .and_then(|db| db.rollback_receive_savepoint().err());
+                self.restore_receive_crypto(crypto_snapshot);
+                if let Some(rollback_error) = rollback_error {
+                    return Err(DirectHistoryMutationError::storage(format!(
+                        "{}; {rollback_label} rollback also failed: {rollback_error}",
+                        error.into_detail()
+                    )));
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Authenticate, decrypt and persist one inbound network message as a
     /// single logical transaction. Crypto helpers write their advanced state
     /// to SQLite inside the savepoint; a later FK/message/index preparation
@@ -4286,30 +4565,108 @@ impl VeilClient {
         attachments: &[crate::attachments::WireAttachmentV1],
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
     ) -> Result<ReceiveMessageResult, String> {
+        self.receive_and_persist_message_with_attachments_classified(
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            author_snapshot,
+            author_context,
+            sender_key_mode,
+            security_context,
+            fallback_conversation_name,
+            header,
+            ciphertext,
+            server_timestamp,
+            reply_to_id,
+            attachments,
+            remote_metadata,
+            AtomicReceiveDecryptMode::General,
+        )
+        .map_err(DirectHistoryMutationError::into_detail)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn receive_and_persist_direct_history_message(
+        &mut self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        author_snapshot: &AccountSnapshot,
+        author_context: MessageAuthorContext,
+        header: &[u8],
+        ciphertext: &[u8],
+        server_timestamp: Option<i64>,
+        reply_to_id: Option<&str>,
+        remote_metadata: Option<&RemoteMessageMetadata<'_>>,
+    ) -> Result<ReceiveMessageResult, DirectHistoryMutationError> {
+        self.receive_and_persist_message_with_attachments_classified(
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            Some(author_snapshot),
+            Some(author_context),
+            false,
+            None,
+            None,
+            header,
+            ciphertext,
+            server_timestamp,
+            reply_to_id,
+            &[],
+            remote_metadata,
+            AtomicReceiveDecryptMode::DirectHistory,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn receive_and_persist_message_with_attachments_classified(
+        &mut self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
+        author_context: Option<MessageAuthorContext>,
+        sender_key_mode: bool,
+        security_context: Option<&MessageSecurityContextV1>,
+        fallback_conversation_name: Option<&str>,
+        header: &[u8],
+        ciphertext: &[u8],
+        server_timestamp: Option<i64>,
+        reply_to_id: Option<&str>,
+        attachments: &[crate::attachments::WireAttachmentV1],
+        remote_metadata: Option<&RemoteMessageMetadata<'_>>,
+        decrypt_mode: AtomicReceiveDecryptMode,
+    ) -> Result<ReceiveMessageResult, DirectHistoryMutationError> {
         if message_id.is_empty() || conversation_id.is_empty() {
-            return Err("inbound message and conversation ids must not be empty".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "inbound message and conversation ids must not be empty",
+            ));
         }
         if header.is_empty() || ciphertext.is_empty() {
-            return Err("inbound E2E header and ciphertext must not be empty".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "inbound E2E header and ciphertext must not be empty",
+            ));
         }
         if author_snapshot.is_some() != author_context.is_some() {
-            return Err(
-                "inbound author snapshot and observation context must be paired".to_string(),
-            );
+            return Err(DirectHistoryMutationError::rejected(
+                "inbound author snapshot and observation context must be paired",
+            ));
         }
         if !sender_key_mode && !self.trusted_signing_keys.contains_key(sender_identity_key) {
-            return Err("inbound sender identity is not pinned to a signing key".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "inbound sender identity is not pinned to a signing key",
+            ));
         }
         let wire_uses_sender_key = header.first() == Some(&HEADER_SENDER_KEY);
         if wire_uses_sender_key != sender_key_mode {
-            return Err(
-                "inbound E2E header conflicts with the pinned conversation type".to_string(),
-            );
+            return Err(DirectHistoryMutationError::rejected(
+                "inbound E2E header conflicts with the pinned conversation type",
+            ));
         }
         if sender_key_mode != security_context.is_some() {
-            return Err(
-                "inbound message security context conflicts with the conversation type".to_string(),
-            );
+            return Err(DirectHistoryMutationError::rejected(
+                "inbound message security context conflicts with the conversation type",
+            ));
         }
         if let Some(security_context) = security_context {
             self.validate_sender_key_message_context_v1(
@@ -4317,78 +4674,100 @@ impl VeilClient {
                 sender_identity_key,
                 ciphertext,
                 security_context,
-            )?;
+            )
+            .map_err(DirectHistoryMutationError::rejected)?;
         }
 
-        let crypto_snapshot = self.receive_crypto_snapshot();
-
-        self.db
-            .as_ref()
-            .ok_or("database not initialized")?
-            .begin_receive_savepoint()?;
-
-        let operation = (|| {
-            if self
+        let result = self.with_classified_receive_savepoint("receive", |client| {
+            if client
                 .db
                 .as_ref()
-                .ok_or("database not initialized")?
-                .message_exists(message_id)?
+                .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
+                .message_exists(message_id)
+                .map_err(DirectHistoryMutationError::storage)?
             {
                 if let (Some(author_snapshot), Some(author_context)) =
                     (author_snapshot, author_context)
                 {
-                    self.db
+                    client
+                        .db
                         .as_ref()
-                        .ok_or("database not initialized")?
+                        .ok_or_else(|| {
+                            DirectHistoryMutationError::storage("database not initialized")
+                        })?
                         .attach_message_author_with_context(
                             message_id,
                             author_snapshot,
                             author_context,
-                        )?;
+                        )
+                        .map_err(DirectHistoryMutationError::storage)?;
                 }
                 return Ok(ReceiveMessageResult::Duplicate);
             }
-            self.db
+            client
+                .db
                 .as_ref()
-                .ok_or("database not initialized")?
+                .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
                 .ensure_receive_conversation(
                     conversation_id,
                     sender_key_mode,
                     sender_identity_key,
                     fallback_conversation_name,
-                )?;
+                )
+                .map_err(DirectHistoryMutationError::storage)?;
 
-            let decrypted = match self.decrypt_from_with_security_context(
-                sender_identity_key,
-                conversation_id,
-                header,
-                ciphertext,
-                security_context,
-            )? {
-                DecryptedPayload::Text(plaintext) => plaintext,
-                DecryptedPayload::Control => {
-                    return Err(
-                        "control frame is not valid on the chat message receive path".to_string(),
-                    );
+            let decrypted = match decrypt_mode {
+                AtomicReceiveDecryptMode::General => {
+                    match client
+                        .decrypt_from_with_security_context(
+                            sender_identity_key,
+                            conversation_id,
+                            header,
+                            ciphertext,
+                            security_context,
+                        )
+                        .map_err(DirectHistoryMutationError::rejected)?
+                    {
+                        DecryptedPayload::Text(plaintext) => plaintext,
+                        DecryptedPayload::Control => {
+                            return Err(DirectHistoryMutationError::rejected(
+                                "control frame is not valid on the chat message receive path",
+                            ));
+                        }
+                    }
                 }
+                AtomicReceiveDecryptMode::DirectHistory => client
+                    .decrypt_direct_history_text_classified(
+                        sender_identity_key,
+                        conversation_id,
+                        header,
+                        ciphertext,
+                    )?,
             };
             let (plaintext, private_attachments) = if attachments.is_empty() {
                 if crate::attachments::is_attachment_payload_v1(&decrypted) {
-                    return Err(
-                        "attachment payload has no authenticated public descriptors".to_string()
-                    );
+                    return Err(DirectHistoryMutationError::rejected(
+                        "attachment payload has no authenticated public descriptors",
+                    ));
                 }
-                (
-                    String::from_utf8(decrypted)
-                        .map_err(|_| "inbound plaintext is not valid UTF-8".to_string())?,
-                    Vec::new(),
-                )
+                let plaintext = match String::from_utf8(decrypted) {
+                    Ok(plaintext) => plaintext,
+                    Err(error) => {
+                        let mut plaintext = error.into_bytes();
+                        plaintext.zeroize();
+                        return Err(DirectHistoryMutationError::rejected(
+                            "inbound plaintext is not valid UTF-8",
+                        ));
+                    }
+                };
+                (plaintext, Vec::new())
             } else {
                 let opened = crate::attachments::open_attachment_message_v1(
                     conversation_id,
                     &decrypted,
                     attachments,
-                )?;
+                )
+                .map_err(DirectHistoryMutationError::rejected)?;
                 (opened.text, opened.attachments)
             };
             if !sender_key_mode {
@@ -4396,11 +4775,14 @@ impl VeilClient {
                 // evidence that the peer possesses this session. Clearing the
                 // repeatable X3DH header participates in the same savepoint as
                 // the message and ratchet-state commit.
-                self.confirm_peer_session_possession(sender_identity_key)?;
+                client
+                    .confirm_peer_session_possession(sender_identity_key)
+                    .map_err(DirectHistoryMutationError::storage)?;
             }
-            self.db
+            client
+                .db
                 .as_ref()
-                .ok_or("database not initialized")?
+                .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
                 .insert_message(
                     message_id,
                     conversation_id,
@@ -4409,74 +4791,42 @@ impl VeilClient {
                     false,
                     server_timestamp,
                     reply_to_id,
-                )?;
-            self.db
+                )
+                .map_err(DirectHistoryMutationError::storage)?;
+            client
+                .db
                 .as_ref()
-                .ok_or("database not initialized")?
-                .insert_message_attachments(message_id, &private_attachments)?;
+                .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
+                .insert_message_attachments(message_id, &private_attachments)
+                .map_err(DirectHistoryMutationError::storage)?;
             if let (Some(author_snapshot), Some(author_context)) = (author_snapshot, author_context)
             {
-                self.db
+                client
+                    .db
                     .as_ref()
-                    .ok_or("database not initialized")?
-                    .attach_message_author_with_context(
-                        message_id,
-                        author_snapshot,
-                        author_context,
-                    )?;
+                    .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
+                    .attach_message_author_with_context(message_id, author_snapshot, author_context)
+                    .map_err(DirectHistoryMutationError::storage)?;
             }
             if let Some(metadata) = remote_metadata {
-                let db = self.db.as_ref().ok_or("database not initialized")?;
+                let db = client.db.as_ref().ok_or_else(|| {
+                    DirectHistoryMutationError::storage("database not initialized")
+                })?;
                 db.record_remote_message_state(
                     message_id,
                     conversation_id,
                     sender_identity_key,
                     metadata.revision_ms,
                     RemoteMessageStateKind::Active,
-                )?;
+                )
+                .map_err(DirectHistoryMutationError::storage)?;
                 if let Some(reactions) = metadata.reactions {
-                    db.replace_message_reactions(message_id, reactions)?;
+                    db.replace_message_reactions(message_id, reactions)
+                        .map_err(DirectHistoryMutationError::storage)?;
                 }
             }
             Ok(ReceiveMessageResult::Stored { plaintext })
-        })();
-
-        let result = match operation {
-            Ok(result) => {
-                if let Err(commit_error) = self
-                    .db
-                    .as_ref()
-                    .ok_or("database not initialized")?
-                    .commit_receive_savepoint()
-                {
-                    let rollback_error = self
-                        .db
-                        .as_ref()
-                        .and_then(|db| db.rollback_receive_savepoint().err());
-                    self.restore_receive_crypto(crypto_snapshot);
-                    return Err(match rollback_error {
-                        Some(rollback_error) => format!(
-                            "{commit_error}; receive rollback also failed: {rollback_error}"
-                        ),
-                        None => commit_error,
-                    });
-                }
-                result
-            }
-            Err(error) => {
-                let rollback_error = self
-                    .db
-                    .as_ref()
-                    .and_then(|db| db.rollback_receive_savepoint().err());
-                self.restore_receive_crypto(crypto_snapshot);
-                return Err(match rollback_error {
-                    Some(rollback_error) => {
-                        format!("{error}; receive rollback also failed: {rollback_error}")
-                    }
-                    None => error,
-                });
-            }
-        };
+        })?;
 
         if let ReceiveMessageResult::Stored { ref plaintext } = result {
             if let Some(ref idx) = self.indexer {
