@@ -10,6 +10,12 @@ import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import uniffi.veil_ffi.MobileAuthenticatedBinding
 import uniffi.veil_ffi.MobileConnectCancellation
+import uniffi.veil_ffi.MobileDirectConversationData
+import uniffi.veil_ffi.MobileDirectDirectoryPageData
+import uniffi.veil_ffi.MobileDirectPreKeyResult
+import uniffi.veil_ffi.MobileDirectRestRequest
+import uniffi.veil_ffi.MobileDirectSyncLease
+import uniffi.veil_ffi.RestSignatureData
 import uniffi.veil_ffi.VeilMobileSession
 
 internal enum class NativeSessionState {
@@ -31,6 +37,70 @@ internal data class PublicAuthenticatedBinding(
   val canonicalServerOrigin: String,
   val userId: String,
 )
+
+/**
+ * Native-only capability for one authenticated Direct sync generation.
+ *
+ * This type must never be added to [VeilMobileRuntimeSnapshot] or a React
+ * Native bridge payload. The redacted string representation makes accidental
+ * diagnostic logging less dangerous, but callers must still treat the token
+ * as sensitive process-local state.
+ */
+internal data class NativeDirectSyncLease(
+  val leaseToken: String,
+  val canonicalServerOrigin: String,
+  val userId: String,
+) {
+  override fun toString(): String =
+    "NativeDirectSyncLease(canonicalServerOrigin=$canonicalServerOrigin, userId=$userId, leaseToken=[REDACTED])"
+}
+
+/** A prepared request bound to [NativeDirectSyncLease]. Never expose to JS. */
+internal data class NativeDirectRestRequest(
+  val requestToken: String,
+  val requestTarget: String,
+) {
+  override fun toString(): String =
+    "NativeDirectRestRequest(requestTarget=[REDACTED], requestToken=[REDACTED])"
+}
+
+/**
+ * Public directory metadata copied out of a validated native install result.
+ * Peer identity/signing key material is intentionally discarded at this
+ * boundary: Rust has already installed it into the native session.
+ */
+internal data class NativeDirectConversationInstall(
+  val conversationId: String,
+  val name: String,
+  val peerUserId: String,
+  val peerUsername: String,
+  val needsPreKey: Boolean,
+)
+
+/** One validated page result; pagination state itself remains owned by Rust. */
+internal data class NativeDirectDirectoryInstall(
+  val conversations: List<NativeDirectConversationInstall>,
+  val directoryComplete: Boolean,
+)
+
+internal enum class NativeDirectPreKeyInstallStatus {
+  ESTABLISHED,
+  ALREADY_ESTABLISHED,
+}
+
+internal data class NativeDirectPreKeyInstall(
+  val status: NativeDirectPreKeyInstallStatus,
+)
+
+/** Signed REST headers produced by the authenticated native session. */
+internal data class NativeRestSignature(
+  val userId: String,
+  val timestampMs: String,
+  val signatureBase64: String,
+) {
+  override fun toString(): String =
+    "NativeRestSignature(userId=$userId, timestampMs=$timestampMs, signatureBase64=[REDACTED])"
+}
 
 internal data class VeilMobileRuntimeSnapshot(
   val identityExists: Boolean,
@@ -69,6 +139,37 @@ internal interface NativeMobileSession : AutoCloseable {
     nodeAccessPass: ByteArray,
     cancellation: NativeConnectCancellation,
   ): PublicAuthenticatedBinding
+
+  fun beginDirectSync(): NativeDirectSyncLease
+
+  fun prepareDirectDirectoryRequest(leaseToken: String): NativeDirectRestRequest
+
+  fun installDirectDirectoryPage(
+    leaseToken: String,
+    requestToken: String,
+    response: ByteArray,
+  ): NativeDirectDirectoryInstall
+
+  fun prepareDirectPreKeyRequest(
+    leaseToken: String,
+    conversationId: String,
+  ): NativeDirectRestRequest
+
+  fun installDirectPreKeyBundle(
+    leaseToken: String,
+    requestToken: String,
+    conversationId: String,
+    response: ByteArray,
+  ): NativeDirectPreKeyInstall
+
+  fun cancelDirectSync(leaseToken: String)
+
+  fun signRestRequest(
+    canonicalServerOrigin: String,
+    method: String,
+    requestTarget: String,
+    body: ByteArray,
+  ): NativeRestSignature
 
   fun disconnect()
 }
@@ -599,6 +700,46 @@ private class UniFfiMobileSession(
       cancellation.requireUniFfiDelegate(),
     ).toPublicBinding()
 
+  override fun beginDirectSync(): NativeDirectSyncLease =
+    delegate.beginDirectSync().toNativeDirectSyncLease()
+
+  override fun prepareDirectDirectoryRequest(leaseToken: String): NativeDirectRestRequest =
+    delegate.prepareDirectDirectoryRequest(leaseToken).toNativeDirectRestRequest()
+
+  override fun installDirectDirectoryPage(
+    leaseToken: String,
+    requestToken: String,
+    response: ByteArray,
+  ): NativeDirectDirectoryInstall =
+    delegate.installDirectDirectoryPage(leaseToken, requestToken, response).toNativeDirectDirectoryInstall()
+
+  override fun prepareDirectPreKeyRequest(
+    leaseToken: String,
+    conversationId: String,
+  ): NativeDirectRestRequest =
+    delegate.prepareDirectPrekeyRequest(leaseToken, conversationId).toNativeDirectRestRequest()
+
+  override fun installDirectPreKeyBundle(
+    leaseToken: String,
+    requestToken: String,
+    conversationId: String,
+    response: ByteArray,
+  ): NativeDirectPreKeyInstall =
+    delegate.installDirectPrekeyBundle(leaseToken, requestToken, conversationId, response)
+      .toNativeDirectPreKeyInstall()
+
+  override fun cancelDirectSync(leaseToken: String) {
+    delegate.cancelDirectSync(leaseToken)
+  }
+
+  override fun signRestRequest(
+    canonicalServerOrigin: String,
+    method: String,
+    requestTarget: String,
+    body: ByteArray,
+  ): NativeRestSignature =
+    delegate.signRestRequest(canonicalServerOrigin, method, requestTarget, body).toNativeRestSignature()
+
   override fun disconnect() {
     delegate.disconnect()
   }
@@ -624,6 +765,49 @@ private fun NativeConnectCancellation.cancelQuietly() {
 
 private fun MobileAuthenticatedBinding.toPublicBinding(): PublicAuthenticatedBinding =
   PublicAuthenticatedBinding(canonicalServerOrigin = canonicalServerOrigin, userId = userId)
+
+internal fun MobileDirectSyncLease.toNativeDirectSyncLease(): NativeDirectSyncLease =
+  NativeDirectSyncLease(
+    leaseToken = token,
+    canonicalServerOrigin = canonicalServerOrigin,
+    userId = userId,
+  )
+
+internal fun MobileDirectRestRequest.toNativeDirectRestRequest(): NativeDirectRestRequest =
+  NativeDirectRestRequest(requestToken = requestToken, requestTarget = requestTarget)
+
+internal fun MobileDirectConversationData.toNativeDirectConversationInstall(): NativeDirectConversationInstall =
+  NativeDirectConversationInstall(
+    conversationId = conversationId,
+    name = name,
+    peerUserId = peerUserId,
+    peerUsername = peerUsername,
+    needsPreKey = needsPrekey,
+  )
+
+internal fun MobileDirectDirectoryPageData.toNativeDirectDirectoryInstall(): NativeDirectDirectoryInstall =
+  NativeDirectDirectoryInstall(
+    conversations = conversations.map { conversation ->
+      conversation.toNativeDirectConversationInstall()
+    },
+    directoryComplete = directoryComplete,
+  )
+
+internal fun MobileDirectPreKeyResult.toNativeDirectPreKeyInstall(): NativeDirectPreKeyInstall =
+  NativeDirectPreKeyInstall(
+    status = when (status) {
+      "established" -> NativeDirectPreKeyInstallStatus.ESTABLISHED
+      "already_established" -> NativeDirectPreKeyInstallStatus.ALREADY_ESTABLISHED
+      else -> throw IllegalStateException("native Direct prekey install returned an unsupported status")
+    },
+  )
+
+internal fun RestSignatureData.toNativeRestSignature(): NativeRestSignature =
+  NativeRestSignature(
+    userId = userId,
+    timestampMs = timestampMs,
+    signatureBase64 = signatureBase64,
+  )
 
 private fun NativeMobileSession.closeQuietly() {
   try {
