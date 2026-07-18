@@ -99,6 +99,7 @@ const runtimeSnapshot = (
   sessionState: "open",
   connectionState: "connected",
   directoryReady: true,
+  secureSyncState: "directory_synchronized",
   binding: exactBinding,
   pendingAccessPass: null,
   ...overrides,
@@ -211,6 +212,7 @@ describe("App native runtime privacy gate", () => {
       sessionState: "locked",
       connectionState: "disconnected",
       directoryReady: false,
+      secureSyncState: "idle",
       binding: null,
     });
     mockRuntime.getSnapshot.mockResolvedValue(locked);
@@ -229,6 +231,7 @@ describe("App native runtime privacy gate", () => {
       sessionState: "locked",
       connectionState: "disconnected",
       directoryReady: false,
+      secureSyncState: "idle",
       binding: null,
     });
     mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
@@ -250,6 +253,7 @@ describe("App native runtime privacy gate", () => {
       sessionState: "locked",
       connectionState: "disconnected",
       directoryReady: false,
+      secureSyncState: "idle",
       binding: null,
     });
     const confirmed = deferred<VeilMobileRuntimeSnapshot>();

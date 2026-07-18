@@ -12,7 +12,8 @@ use veil_crypto::x3dh;
 use veil_search::Indexer;
 use veil_store::db::{
     DeviceBindingPinV1, DeviceRosterSnapshotV1, HistoricalDeviceBindingProofV1,
-    IncomingSenderKeyRouteV1, LocalPreKey, PendingSenderKeyDeviceEnvelopeV1, VeilDb,
+    IncomingSenderKeyRouteV1, LocalPreKey, LocalPreKeyPublicationV1,
+    PendingSenderKeyDeviceEnvelopeV1, VeilDb,
 };
 use veil_store::models::{
     AccountSnapshot, ConversationType, MessageAuthorContext, RemoteMessageStateKind, RemoteReaction,
@@ -24,6 +25,11 @@ use crate::connection::{ConfirmedMutation, Connection, ConnectionConfig, Connect
 use crate::device_identity::{
     device_binding_signing_bytes, DeviceIdentityV1, DEVICE_BINDING_STATUS_ACTIVE,
     REQUIRED_DEVICE_CAPABILITIES,
+};
+use crate::prekeys::{
+    canonical_own_prekey_request_body, validate_own_prekey_count_response,
+    validate_own_prekey_upload_ack, OwnPreKeyAcknowledgeResult, OwnPreKeyPublication,
+    OWN_PREKEY_BATCH_SIZE, OWN_PREKEY_LOW_WATERMARK,
 };
 use crate::protocol::proto;
 
@@ -349,6 +355,11 @@ pub struct PreKeySet {
     pub otk_publics: Vec<([u8; 32], u32)>,
 }
 
+struct GeneratedPreKeyBatch {
+    prekeys: PreKeySet,
+    local_prekeys: Vec<LocalPreKey>,
+}
+
 /// Main client API — the single entry point for all UI interactions.
 ///
 /// All methods are synchronous from the caller's perspective.
@@ -611,14 +622,7 @@ impl VeilClient {
             // owned value. LocalPreKey's Drop erases the (now empty) field.
             secret.zeroize();
         }
-        self.spk_next_id = db
-            .max_local_prekey_id(0)?
-            .checked_add(1)
-            .ok_or_else(|| "signed prekey id exhausted".to_string())?;
-        self.otk_next_id = db
-            .max_local_prekey_id(1)?
-            .checked_add(1)
-            .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
+        (self.spk_next_id, self.otk_next_id) = db.synchronize_local_prekey_allocator()?;
         self.trusted_signing_keys = db.load_trusted_signing_keys()?.into_iter().collect();
 
         // Restore ratchet material, but never publish bare conversation UUID
@@ -698,6 +702,32 @@ impl VeilClient {
         self.authenticated_user_id
             .clone()
             .ok_or_else(|| "not authenticated".to_string())
+    }
+
+    /// Test-only bridge for native integration fixtures that cannot perform a
+    /// real WebSocket handshake. The feature is disabled in production.
+    /// Durable origin/user/account continuity is checked before process state
+    /// is changed; failure leaves `authenticated_user_id` untouched.
+    #[cfg(feature = "test-utils")]
+    #[doc(hidden)]
+    pub fn test_only_restore_authenticated_user_from_durable_binding(
+        &mut self,
+        canonical_server_origin: &str,
+        user_id: &str,
+    ) -> Result<(), String> {
+        let identity_key = self.identity_key()?;
+        let signing_key = self.signing_key()?;
+        self.db
+            .as_ref()
+            .ok_or("database not initialized")?
+            .bind_authenticated_self(
+                canonical_server_origin,
+                user_id,
+                &identity_key,
+                &signing_key,
+            )?;
+        self.authenticated_user_id = Some(user_id.to_string());
+        Ok(())
     }
 
     /// Stable device key sent during WebSocket auth and used by the prekey API.
@@ -2150,65 +2180,260 @@ impl VeilClient {
 
     // ─── E2E Encryption ──────────────────────────────────
 
+    /// Exact owner-only count endpoint for the currently initialized account.
+    pub fn own_prekey_count_target(&self) -> Result<String, String> {
+        Ok(format!(
+            "/v1/prekeys/{}/count",
+            hex::encode(self.identity_key()?)
+        ))
+    }
+
+    /// Load the exact origin/account/device publication, if one exists.
+    /// A pending row must be POSTed immediately without issuing `/count`.
+    pub fn own_prekey_publication(
+        &self,
+        canonical_server_origin: &str,
+        authenticated_user_id: &str,
+    ) -> Result<Option<OwnPreKeyPublication>, String> {
+        self.require_own_prekey_scope(authenticated_user_id)?;
+        let publication = self
+            .db
+            .as_ref()
+            .ok_or("database not initialized")?
+            .load_local_prekey_publication(
+                canonical_server_origin,
+                authenticated_user_id,
+                &self.device_id,
+            )?;
+        Ok(publication.as_ref().map(OwnPreKeyPublication::from_local))
+    }
+
+    /// Validate the exact local `/count` entry, then select the upload that
+    /// must complete before any authenticated Direct directory is installed.
+    ///
+    /// Pending bytes always win. An acknowledged batch is byte-identically
+    /// reasserted while inventory is healthy; low inventory (or no prior row)
+    /// creates one new immutable batch and persists its keys plus outbox in a
+    /// single SQLCipher transaction before publishing anything in memory.
+    pub fn prepare_own_prekey_publication_after_count(
+        &mut self,
+        canonical_server_origin: &str,
+        authenticated_user_id: &str,
+        count_response: &[u8],
+    ) -> Result<OwnPreKeyPublication, String> {
+        self.require_own_prekey_scope(authenticated_user_id)?;
+        let count = validate_own_prekey_count_response(count_response, &self.device_id)?;
+        let existing = self
+            .db
+            .as_ref()
+            .ok_or("database not initialized")?
+            .load_local_prekey_publication(
+                canonical_server_origin,
+                authenticated_user_id,
+                &self.device_id,
+            )?;
+        if let Some(publication) = existing.as_ref() {
+            if publication.acknowledged
+                && count
+                    .signed_prekey_id
+                    .is_some_and(|server_id| server_id != publication.signed_prekey_id)
+            {
+                return Err(
+                    "own prekey count signed-prekey id differs from the durable publication"
+                        .to_string(),
+                );
+            }
+            if !publication.acknowledged || count.remaining >= OWN_PREKEY_LOW_WATERMARK {
+                return Ok(OwnPreKeyPublication::from_local(publication));
+            }
+        }
+
+        let batch = self.build_prekey_batch()?;
+        let request_body = canonical_own_prekey_request_body(
+            &self.device_id,
+            &batch.prekeys.signing_key,
+            batch.prekeys.spk_id,
+            &batch.prekeys.spk_public,
+            &batch.prekeys.spk_signature,
+            &batch.prekeys.otk_publics,
+        )?;
+        let publication = LocalPreKeyPublicationV1 {
+            canonical_server_origin: canonical_server_origin.to_string(),
+            user_id: authenticated_user_id.to_string(),
+            device_id: self.device_id,
+            signed_prekey_id: batch.prekeys.spk_id,
+            one_time_prekey_count: OWN_PREKEY_BATCH_SIZE as u32,
+            body_sha256: Sha256::digest(&request_body).into(),
+            request_body,
+            acknowledged: false,
+        };
+        self.db
+            .as_ref()
+            .ok_or("database not initialized")?
+            .save_local_prekeys_with_publication(&batch.local_prekeys, &publication)?;
+        self.install_generated_prekey_batch(&batch);
+        Ok(OwnPreKeyPublication::from_local(&publication))
+    }
+
+    /// Strictly validate a successful POST response and acknowledge only the
+    /// exact current origin/account/device/SPK/body-digest outbox row.
+    pub fn acknowledge_own_prekey_publication(
+        &self,
+        canonical_server_origin: &str,
+        authenticated_user_id: &str,
+        expected_signed_prekey_id: u32,
+        expected_body_sha256: &[u8; 32],
+        upload_response: &[u8],
+    ) -> Result<OwnPreKeyAcknowledgeResult, String> {
+        self.require_own_prekey_scope(authenticated_user_id)?;
+        if expected_signed_prekey_id == 0 || *expected_body_sha256 == [0u8; 32] {
+            return Err("own prekey acknowledgement expectation is invalid".to_string());
+        }
+        let validated = validate_own_prekey_upload_ack(upload_response)?;
+        // Inventory is advisory and may already be lower because peers can
+        // claim OPKs concurrently. Parsing it remains mandatory and bounded.
+        let _advisory_remaining = validated.opk_remaining;
+        self.db
+            .as_ref()
+            .ok_or("database not initialized")?
+            .acknowledge_local_prekey_publication(
+                canonical_server_origin,
+                authenticated_user_id,
+                &self.device_id,
+                expected_signed_prekey_id,
+                expected_body_sha256,
+            )?;
+        Ok(OwnPreKeyAcknowledgeResult::Acknowledged)
+    }
+
     /// Generate prekeys for X3DH. Call after identity init, upload result to server.
+    /// Protocol ids are durably reserved first; runtime secret maps are exposed
+    /// only after the immutable key rows commit successfully.
     pub fn generate_prekeys(&mut self) -> Result<PreKeySet, String> {
+        let batch = self.build_prekey_batch()?;
+        if let Some(db) = self.db.as_ref() {
+            db.save_local_prekeys(&batch.local_prekeys)?;
+        }
+        self.install_generated_prekey_batch(&batch);
+        Ok(batch.prekeys)
+    }
+
+    fn require_own_prekey_scope(&self, authenticated_user_id: &str) -> Result<(), String> {
+        if self.identity.is_none() || self.db.is_none() {
+            return Err("own prekey publication requires an unlocked database".to_string());
+        }
+        if self.device_id == [0u8; 16] {
+            return Err("own prekey publication device is invalid".to_string());
+        }
+        if self.authenticated_user_id.as_deref() != Some(authenticated_user_id) {
+            return Err("own prekey publication user differs from authenticated self".to_string());
+        }
+        Ok(())
+    }
+
+    fn build_prekey_batch(&mut self) -> Result<GeneratedPreKeyBatch, String> {
+        if self.identity.is_none() {
+            return Err("not initialized".to_string());
+        }
+        let (spk_id, one_time_prekey_start_id) = self.reserve_prekey_batch_ids()?;
         let identity = self.identity.as_ref().ok_or("not initialized")?;
-
-        let spk_id = self.spk_next_id;
-        self.spk_next_id = self
-            .spk_next_id
-            .checked_add(1)
-            .ok_or_else(|| "signed prekey id exhausted".to_string())?;
         let spk = x3dh::SignedPreKey::generate(identity, spk_id);
-        let spk_pub = *spk.public.as_bytes();
-        let spk_sig = spk.signature;
-        let spk_secret = spk.secret.to_bytes();
-
-        self.spk_secrets.insert(spk_id, (spk_secret, spk_pub));
-
-        let mut otk_publics = Vec::new();
-        let mut local_prekeys = Vec::with_capacity(21);
+        let spk_public = *spk.public.as_bytes();
+        let spk_signature = spk.signature;
+        if !veil_crypto::signature::verify(
+            &identity.ed25519_public_bytes(),
+            &x3dh::signed_prekey_signature_message(&spk_public),
+            &spk_signature,
+        ) {
+            return Err("generated signed prekey failed domain verification".to_string());
+        }
+        let mut spk_secret = spk.secret.to_bytes();
+        let mut local_prekeys = Vec::with_capacity(OWN_PREKEY_BATCH_SIZE + 1);
         local_prekeys.push(LocalPreKey {
             key_type: 0,
             protocol_key_id: spk_id,
             secret_key: spk_secret,
-            public_key: spk_pub,
-            signature: Some(spk_sig),
+            public_key: spk_public,
+            signature: Some(spk_signature),
         });
-        let next_otk_id = self
-            .otk_next_id
-            .checked_add(20)
-            .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
-        for i in 0..20u32 {
-            let id = self
-                .otk_next_id
-                .checked_add(i)
+        // `[u8; 32]` is Copy; erase the named stack copy after the durable
+        // batch received its owned value.
+        spk_secret.zeroize();
+
+        let mut otk_publics = Vec::with_capacity(OWN_PREKEY_BATCH_SIZE);
+        for offset in 0..OWN_PREKEY_BATCH_SIZE as u32 {
+            let key_id = one_time_prekey_start_id
+                .checked_add(offset)
                 .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
-            let otk = x3dh::OneTimePreKey::generate(id);
-            let pub_bytes = *otk.public.as_bytes();
-            let secret_bytes = otk.secret.to_bytes();
-            self.otk_secrets.insert(id, secret_bytes);
-            otk_publics.push((pub_bytes, id));
+            let opk = x3dh::OneTimePreKey::generate(key_id);
+            let public_key = *opk.public.as_bytes();
+            let mut secret_key = opk.secret.to_bytes();
+            otk_publics.push((public_key, key_id));
             local_prekeys.push(LocalPreKey {
                 key_type: 1,
-                protocol_key_id: id,
-                secret_key: secret_bytes,
-                public_key: pub_bytes,
+                protocol_key_id: key_id,
+                secret_key,
+                public_key,
                 signature: None,
             });
+            secret_key.zeroize();
+        }
+
+        Ok(GeneratedPreKeyBatch {
+            prekeys: PreKeySet {
+                spk_public,
+                spk_id,
+                spk_signature,
+                signing_key: identity.ed25519_public_bytes(),
+                otk_publics,
+            },
+            local_prekeys,
+        })
+    }
+
+    /// Reserve protocol ids before generating any private material. SQLCipher
+    /// serializes database-backed reservations across independently opened
+    /// clients; memory-only fixtures retain the same gap-on-failure semantics.
+    fn reserve_prekey_batch_ids(&mut self) -> Result<(u32, u32), String> {
+        if self.spk_next_id == 0 || self.otk_next_id == 0 {
+            return Err("prekey id allocator is invalid".to_string());
         }
         if let Some(db) = self.db.as_ref() {
-            db.save_local_prekeys(&local_prekeys)?;
+            let reservation = db.reserve_local_prekey_batch_ids()?;
+            self.spk_next_id = reservation.next_signed_prekey_id;
+            self.otk_next_id = reservation.next_one_time_prekey_id;
+            return Ok((
+                reservation.signed_prekey_id,
+                reservation.one_time_prekey_start_id,
+            ));
         }
-        self.otk_next_id = next_otk_id;
 
-        Ok(PreKeySet {
-            spk_public: spk_pub,
-            spk_id,
-            spk_signature: spk_sig,
-            signing_key: identity.ed25519_public_bytes(),
-            otk_publics,
-        })
+        let signed_prekey_id = self.spk_next_id;
+        let one_time_prekey_start_id = self.otk_next_id;
+        let next_signed_prekey_id = signed_prekey_id
+            .checked_add(1)
+            .ok_or_else(|| "signed prekey id exhausted".to_string())?;
+        let next_one_time_prekey_id = one_time_prekey_start_id
+            .checked_add(OWN_PREKEY_BATCH_SIZE as u32)
+            .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
+        self.spk_next_id = next_signed_prekey_id;
+        self.otk_next_id = next_one_time_prekey_id;
+        Ok((signed_prekey_id, one_time_prekey_start_id))
+    }
+
+    fn install_generated_prekey_batch(&mut self, batch: &GeneratedPreKeyBatch) {
+        for key in &batch.local_prekeys {
+            match key.key_type {
+                0 => {
+                    self.spk_secrets
+                        .insert(key.protocol_key_id, (key.secret_key, key.public_key));
+                }
+                1 => {
+                    self.otk_secrets.insert(key.protocol_key_id, key.secret_key);
+                }
+                _ => unreachable!("generated prekey batch contains only SPK and OPK rows"),
+            }
+        }
     }
 
     /// Initiate X3DH with a peer's prekey bundle, create ratchet session.
@@ -5145,6 +5370,85 @@ mod tests {
         client
     }
 
+    const PREKEY_TEST_MNEMONIC: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+    const PREKEY_ORIGIN_A: &str = "https://prekeys-a.example.test:443";
+    const PREKEY_ORIGIN_B: &str = "https://prekeys-b.example.test:443";
+    const PREKEY_USER: &str = "00000000-0000-0000-0000-0000000000a1";
+
+    fn file_publication_client(path: &Path, origin: &str) -> VeilClient {
+        let mut client = VeilClient::new();
+        client
+            .init_with_mnemonic(PREKEY_TEST_MNEMONIC, path)
+            .unwrap();
+        client.authenticated_user_id = Some(PREKEY_USER.to_string());
+        client
+            .db()
+            .unwrap()
+            .bind_authenticated_self(
+                origin,
+                PREKEY_USER,
+                &client.identity_key().unwrap(),
+                &client.signing_key().unwrap(),
+            )
+            .unwrap();
+        client
+    }
+
+    fn memory_publication_client(origin: &str) -> VeilClient {
+        let account = IdentityKeyPair::from_mnemonic(PREKEY_TEST_MNEMONIC).unwrap();
+        let device_id = [0xA5; 16];
+        let stored = DeviceIdentityV1::generate_stored(&account, device_id).unwrap();
+        let db = VeilDb::open_memory(&[0x73; 32]).unwrap();
+        db.create_device_identity_v1(&stored).unwrap();
+        db.bind_authenticated_self(
+            origin,
+            PREKEY_USER,
+            &account.x25519_public_bytes(),
+            &account.ed25519_public_bytes(),
+        )
+        .unwrap();
+        let device_identity = DeviceIdentityV1::from_stored(&account, stored).unwrap();
+        let mut client = VeilClient::from_identity(account);
+        client.device_id = device_id;
+        client.device_identity = Some(device_identity);
+        client.db = Some(db);
+        client.authenticated_user_id = Some(PREKEY_USER.to_string());
+        client
+    }
+
+    fn own_prekey_count_response(
+        device_id: [u8; 16],
+        remaining: u32,
+        signed_prekey_id: Option<u32>,
+    ) -> Vec<u8> {
+        let mut device = serde_json::json!({
+            "device_id": hex::encode(device_id),
+            "remaining": remaining,
+        });
+        if let Some(signed_prekey_id) = signed_prekey_id {
+            device["signed_prekey_id"] = serde_json::json!(signed_prekey_id);
+        }
+        serde_json::to_vec(&serde_json::json!({"devices": [device]})).unwrap()
+    }
+
+    fn own_prekey_opk_ids(publication: &OwnPreKeyPublication) -> Vec<u32> {
+        serde_json::from_slice::<serde_json::Value>(&publication.request_body).unwrap()
+            ["one_time_prekeys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["key_id"].as_u64().unwrap() as u32)
+            .collect()
+    }
+
+    fn remove_test_database(path: &Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("db-journal"));
+    }
+
     fn clone_local_device_at_version(client: &VeilClient, version: u64) -> DeviceIdentityV1 {
         let account = client.identity.as_ref().unwrap();
         let current = client.device_identity.as_ref().unwrap();
@@ -5234,6 +5538,295 @@ mod tests {
     #[test]
     fn generated_device_id_is_never_the_legacy_zero_value() {
         assert_ne!(VeilClient::new().device_id, [0u8; 16]);
+    }
+
+    #[test]
+    fn own_prekey_publication_retries_exact_bytes_and_keeps_ids_monotonic() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-client-own-prekeys-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let first_device_id;
+        let first_publication;
+        {
+            let mut client = file_publication_client(&path, PREKEY_ORIGIN_A);
+            first_device_id = client.device_id();
+            assert_eq!(
+                client.own_prekey_count_target().unwrap(),
+                format!(
+                    "/v1/prekeys/{}/count",
+                    hex::encode(client.identity_key().unwrap())
+                )
+            );
+            first_publication = client
+                .prepare_own_prekey_publication_after_count(
+                    PREKEY_ORIGIN_A,
+                    PREKEY_USER,
+                    &own_prekey_count_response(first_device_id, 0, None),
+                )
+                .unwrap();
+            assert!(!first_publication.acknowledged);
+            assert_eq!(first_publication.signed_prekey_id, 1);
+            assert_eq!(
+                own_prekey_opk_ids(&first_publication),
+                (1..=20).collect::<Vec<_>>()
+            );
+            let loaded = client
+                .own_prekey_publication(PREKEY_ORIGIN_A, PREKEY_USER)
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.request_body, first_publication.request_body);
+            assert_eq!(loaded.body_sha256, first_publication.body_sha256);
+            // Simulate a lost HTTP response: no ACK is installed before drop.
+        }
+
+        {
+            let mut client = file_publication_client(&path, PREKEY_ORIGIN_A);
+            assert_eq!(client.device_id(), first_device_id);
+            let pending = client
+                .own_prekey_publication(PREKEY_ORIGIN_A, PREKEY_USER)
+                .unwrap()
+                .unwrap();
+            assert!(!pending.acknowledged);
+            assert_eq!(pending.request_body, first_publication.request_body);
+            assert_eq!(pending.body_sha256, first_publication.body_sha256);
+
+            // Even an accidentally issued count cannot replace pending bytes.
+            let selected = client
+                .prepare_own_prekey_publication_after_count(
+                    PREKEY_ORIGIN_A,
+                    PREKEY_USER,
+                    &own_prekey_count_response(first_device_id, 100, Some(999)),
+                )
+                .unwrap();
+            assert_eq!(selected.request_body, first_publication.request_body);
+            assert_eq!(
+                selected.signed_prekey_id,
+                first_publication.signed_prekey_id
+            );
+
+            assert_eq!(
+                client
+                    .acknowledge_own_prekey_publication(
+                        PREKEY_ORIGIN_A,
+                        PREKEY_USER,
+                        first_publication.signed_prekey_id,
+                        &first_publication.body_sha256,
+                        br#"{"stored":21,"opk_remaining":19}"#,
+                    )
+                    .unwrap(),
+                OwnPreKeyAcknowledgeResult::Acknowledged
+            );
+            let acknowledged = client
+                .own_prekey_publication(PREKEY_ORIGIN_A, PREKEY_USER)
+                .unwrap()
+                .unwrap();
+            assert!(acknowledged.acknowledged);
+
+            // Healthy inventory still performs the mandatory POST, but it
+            // reasserts the exact acknowledged body rather than rotating.
+            let healthy = client
+                .prepare_own_prekey_publication_after_count(
+                    PREKEY_ORIGIN_A,
+                    PREKEY_USER,
+                    &own_prekey_count_response(
+                        first_device_id,
+                        OWN_PREKEY_LOW_WATERMARK,
+                        Some(first_publication.signed_prekey_id),
+                    ),
+                )
+                .unwrap();
+            assert!(healthy.acknowledged);
+            assert_eq!(healthy.request_body, first_publication.request_body);
+
+            // Below the low-water mark, allocate a fresh monotonic batch.
+            let second = client
+                .prepare_own_prekey_publication_after_count(
+                    PREKEY_ORIGIN_A,
+                    PREKEY_USER,
+                    &own_prekey_count_response(
+                        first_device_id,
+                        OWN_PREKEY_LOW_WATERMARK - 1,
+                        Some(first_publication.signed_prekey_id),
+                    ),
+                )
+                .unwrap();
+            assert!(!second.acknowledged);
+            assert_eq!(
+                second.signed_prekey_id,
+                first_publication.signed_prekey_id + 1
+            );
+            assert_eq!(own_prekey_opk_ids(&second), (21..=40).collect::<Vec<_>>());
+            assert_ne!(second.request_body, first_publication.request_body);
+
+            let mut wrong_digest = second.body_sha256;
+            wrong_digest[0] ^= 1;
+            assert!(client
+                .acknowledge_own_prekey_publication(
+                    PREKEY_ORIGIN_A,
+                    PREKEY_USER,
+                    second.signed_prekey_id,
+                    &wrong_digest,
+                    br#"{"stored":21,"opk_remaining":20}"#,
+                )
+                .is_err());
+            assert!(
+                !client
+                    .own_prekey_publication(PREKEY_ORIGIN_A, PREKEY_USER)
+                    .unwrap()
+                    .unwrap()
+                    .acknowledged
+            );
+            assert_eq!(
+                client
+                    .acknowledge_own_prekey_publication(
+                        PREKEY_ORIGIN_A,
+                        PREKEY_USER,
+                        second.signed_prekey_id,
+                        &second.body_sha256,
+                        br#"{"stored":21,"opk_remaining":0}"#,
+                    )
+                    .unwrap(),
+                OwnPreKeyAcknowledgeResult::Acknowledged
+            );
+            assert!(client
+                .prepare_own_prekey_publication_after_count(
+                    PREKEY_ORIGIN_A,
+                    PREKEY_USER,
+                    &own_prekey_count_response(
+                        first_device_id,
+                        OWN_PREKEY_LOW_WATERMARK,
+                        Some(second.signed_prekey_id + 1),
+                    ),
+                )
+                .is_err());
+
+            // A second origin gets a distinct batch; it cannot overwrite the
+            // exact publication retained for the first self-hosted node.
+            client
+                .db()
+                .unwrap()
+                .bind_authenticated_self(
+                    PREKEY_ORIGIN_B,
+                    PREKEY_USER,
+                    &client.identity_key().unwrap(),
+                    &client.signing_key().unwrap(),
+                )
+                .unwrap();
+            let third = client
+                .prepare_own_prekey_publication_after_count(
+                    PREKEY_ORIGIN_B,
+                    PREKEY_USER,
+                    &own_prekey_count_response(first_device_id, 0, None),
+                )
+                .unwrap();
+            assert_eq!(third.signed_prekey_id, second.signed_prekey_id + 1);
+            assert_eq!(own_prekey_opk_ids(&third), (41..=60).collect::<Vec<_>>());
+            assert_ne!(third.request_body, second.request_body);
+            assert_eq!(
+                client
+                    .own_prekey_publication(PREKEY_ORIGIN_A, PREKEY_USER)
+                    .unwrap()
+                    .unwrap()
+                    .request_body,
+                second.request_body
+            );
+        }
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn own_prekey_reservation_skips_ids_inserted_after_client_open() {
+        let mut client = memory_publication_client(PREKEY_ORIGIN_A);
+        client
+            .db()
+            .unwrap()
+            .save_local_prekeys(&[
+                LocalPreKey {
+                    key_type: 0,
+                    protocol_key_id: 1,
+                    secret_key: [0x11; 32],
+                    public_key: [0x22; 32],
+                    signature: Some([0x33; 64]),
+                },
+                LocalPreKey {
+                    key_type: 1,
+                    protocol_key_id: 7,
+                    secret_key: [0x44; 32],
+                    public_key: [0x55; 32],
+                    signature: None,
+                },
+            ])
+            .unwrap();
+        let device_id = client.device_id();
+
+        let publication = client
+            .prepare_own_prekey_publication_after_count(
+                PREKEY_ORIGIN_A,
+                PREKEY_USER,
+                &own_prekey_count_response(device_id, 0, None),
+            )
+            .unwrap();
+        assert_eq!(publication.signed_prekey_id, 2);
+        assert_eq!(
+            own_prekey_opk_ids(&publication),
+            (8..=27).collect::<Vec<_>>()
+        );
+        assert_eq!(client.spk_next_id, 3);
+        assert_eq!(client.otk_next_id, 28);
+        assert_eq!(client.spk_secrets.len(), 1);
+        assert_eq!(client.otk_secrets.len(), OWN_PREKEY_BATCH_SIZE);
+        assert_eq!(
+            client
+                .own_prekey_publication(PREKEY_ORIGIN_A, PREKEY_USER)
+                .unwrap()
+                .unwrap()
+                .request_body,
+            publication.request_body,
+        );
+    }
+
+    #[test]
+    fn generate_prekeys_publishes_runtime_state_only_after_db_commit() {
+        let mut client = memory_publication_client(PREKEY_ORIGIN_A);
+        client
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_test_prekeys BEFORE INSERT ON local_prekeys
+                 BEGIN SELECT RAISE(ABORT, 'test prekey persistence failure'); END;",
+            )
+            .unwrap();
+        assert!(client.generate_prekeys().is_err());
+        // Reservation committed before the failed key write. The gap is
+        // deliberate and prevents a retry from assigning new material to the
+        // ambiguous protocol ids.
+        assert_eq!(client.spk_next_id, 2);
+        assert_eq!(client.otk_next_id, 21);
+        assert!(client.spk_secrets.is_empty());
+        assert!(client.otk_secrets.is_empty());
+
+        client
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch("DROP TRIGGER reject_test_prekeys")
+            .unwrap();
+        let generated = client.generate_prekeys().unwrap();
+        assert_eq!(generated.spk_id, 2);
+        assert_eq!(generated.otk_publics.first().unwrap().1, 21);
+        assert_eq!(generated.otk_publics.last().unwrap().1, 40);
+        assert_eq!(client.spk_next_id, 3);
+        assert_eq!(client.otk_next_id, 41);
+        assert_eq!(
+            client
+                .db()
+                .unwrap()
+                .synchronize_local_prekey_allocator()
+                .unwrap(),
+            (3, 41),
+        );
     }
 
     #[test]

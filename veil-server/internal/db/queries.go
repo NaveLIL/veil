@@ -34,9 +34,19 @@ var (
 	ErrMessageSecurityContext           = errors.New("message security context does not match the conversation")
 	ErrMessageRosterChanged             = errors.New("message roster changed before durable admission")
 	ErrConversationAccessDenied         = errors.New("conversation access denied")
+	ErrPreKeyMaterialConflict           = errors.New("prekey protocol id already has different key material")
+	ErrPreKeyLiveStateFull              = errors.New("prekey live-state capacity reached")
 )
 
-const maxUnusedOneTimePreKeysPerDevice = 100
+// Publication state is constant per device: one current SPK, at most one
+// hundred live OPKs, and one high-watermark/idempotency receipt row. The
+// account caps bound malicious device proliferation without imposing a
+// lifetime limit on legitimate monotonic rotations of an existing device.
+const (
+	MaxUnusedOneTimePreKeysPerDevice = 100
+	MaxPreKeyDevicesPerAccount       = 128
+	MaxPreKeyRowsPerAccount          = MaxPreKeyDevicesPerAccount * (1 + MaxUnusedOneTimePreKeysPerDevice)
+)
 
 const (
 	MaxPendingSenderKeyGenerationsPerStream = 128
@@ -149,80 +159,652 @@ type PreKey struct {
 	Used          bool
 }
 
-// StorePreKeys bulk-inserts prekeys for a device.
+// PreKeyUploadReceipt is the bounded acknowledgement persisted for the latest
+// accepted canonical batch. Replay is process-local metadata and is not stored.
+type PreKeyUploadReceipt struct {
+	Stored int
+	Replay bool
+}
+
+type validatedPreKeyBatch struct {
+	keys       []PreKey
+	signed     PreKey
+	oneTime    []PreKey
+	digest     [sha256.Size]byte
+	maxOneTime uint32
+}
+
+type preKeyPublicationState struct {
+	signedHighWatermark  uint32
+	oneTimeHighWatermark uint32
+	latestDigest         []byte
+	latestStored         int
+}
+
+// StorePreKeys preserves the pre-receipt API for internal callers.
 func (db *DB) StorePreKeys(ctx context.Context, deviceID string, keys []PreKey) error {
+	batch, err := validatePreKeyBatch(keys)
+	if err != nil {
+		return err
+	}
+	digest := digestInternalPreKeyBatch(deviceID, batch.keys)
+	_, err = db.storePreKeysWithReceipt(ctx, deviceID, batch, digest)
+	return err
+}
+
+// StorePreKeysWithReceipt atomically publishes a monotonic prekey batch.
+//
+// Only the latest exact validated upload bytes are replayable. Their digest
+// remains after the corresponding OPKs are claimed and compacted, so a lost
+// HTTP ACK can be retried indefinitely without resurrecting an OPK. Any
+// non-latest protocol id at or below its per-type high watermark is
+// permanently retired.
+func (db *DB) StorePreKeysWithReceipt(
+	ctx context.Context,
+	deviceID string,
+	keys []PreKey,
+	exactUploadDigest [sha256.Size]byte,
+) (PreKeyUploadReceipt, error) {
+	batch, err := validatePreKeyBatch(keys)
+	if err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	batch.digest = exactUploadDigest
+	return db.storePreKeysWithReceipt(ctx, deviceID, batch, exactUploadDigest)
+}
+
+func (db *DB) storePreKeysWithReceipt(
+	ctx context.Context,
+	deviceID string,
+	batch validatedPreKeyBatch,
+	exactUploadDigest [sha256.Size]byte,
+) (PreKeyUploadReceipt, error) {
+	batch.digest = exactUploadDigest
 	tx, err := db.Pool.Begin(ctx)
 	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
+		return PreKeyUploadReceipt{}, fmt.Errorf("begin tx: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
-	for _, k := range keys {
-		// A protocol key id is chosen by the device and refers to local secret
-		// material.  The database BIGSERIAL id is only an internal row id and
-		// must never be sent in an X3DH header.  Re-uploading an SPK updates it;
-		// an already-known OPK is deliberately not resurrected after use.
-		var statement string
-		if k.KeyType == 0 {
-			statement = `INSERT INTO prekeys (device_id, key_type, protocol_key_id, public_key, signature)
-			 VALUES ($1, $2, $3, $4, $5)
-			 ON CONFLICT (device_id, key_type, protocol_key_id)
-			 DO UPDATE SET public_key = EXCLUDED.public_key,
-			               signature = EXCLUDED.signature,
-			               used = false`
-		} else {
-			statement = `INSERT INTO prekeys (device_id, key_type, protocol_key_id, public_key, signature)
-			 VALUES ($1, $2, $3, $4, $5)
-			 ON CONFLICT (device_id, key_type, protocol_key_id) DO NOTHING`
+	// Resolve the owner before taking locks, then serialize every publication
+	// for that account by locking the user first and the target device second.
+	// A stable user -> device lock order makes the account-wide quota exact
+	// even when separate devices publish concurrently, while the device lock
+	// preserves one stable view for retries and unused-key pruning.
+	var ownerID string
+	if err := tx.QueryRow(ctx,
+		`SELECT user_id FROM devices WHERE id = $1::uuid`,
+		deviceID,
+	).Scan(&ownerID); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("resolve prekey device owner: %w", err)
+	}
+	var lockedOwnerID string
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM users WHERE id = $1::uuid FOR UPDATE`,
+		ownerID,
+	).Scan(&lockedOwnerID); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("lock prekey owner: %w", err)
+	}
+	var lockedDeviceID, lockedDeviceOwnerID string
+	if err := tx.QueryRow(ctx,
+		`SELECT id, user_id FROM devices WHERE id = $1::uuid FOR UPDATE`,
+		deviceID,
+	).Scan(&lockedDeviceID, &lockedDeviceOwnerID); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("lock prekey device: %w", err)
+	}
+	if lockedDeviceOwnerID != lockedOwnerID {
+		return PreKeyUploadReceipt{}, errors.New("prekey device owner changed while acquiring publication locks")
+	}
+
+	stateCreated, state, err := lockPreKeyPublicationState(ctx, tx, deviceID)
+	if err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	if stateCreated {
+		var accountStates int
+		if err := tx.QueryRow(ctx,
+			`SELECT COUNT(*)
+			 FROM prekey_publication_state s
+			 JOIN devices d ON d.id = s.device_id
+			 WHERE d.user_id = $1::uuid`,
+			lockedOwnerID,
+		).Scan(&accountStates); err != nil {
+			return PreKeyUploadReceipt{}, fmt.Errorf("count account prekey states: %w", err)
 		}
-		_, err := tx.Exec(ctx, statement,
-			deviceID, k.KeyType, k.ProtocolKeyID, k.PublicKey, k.Signature)
-		if err != nil {
-			return fmt.Errorf("insert prekey: %w", err)
+		if accountStates > MaxPreKeyDevicesPerAccount {
+			return PreKeyUploadReceipt{}, fmt.Errorf(
+				"%w: account=%s device_states=%d",
+				ErrPreKeyLiveStateFull, lockedOwnerID, accountStates,
+			)
 		}
 	}
 
-	// Clients replenish opportunistically on reconnect. Bound only UNUSED
-	// OPKs so repeated uploads cannot grow the table indefinitely; claimed
-	// rows are preserved because they may still be referenced by an in-flight
-	// X3DH initial message and are useful for audit/retention policy.
+	if state.latestDigest != nil && bytes.Equal(state.latestDigest, batch.digest[:]) {
+		if state.latestStored != len(batch.keys) {
+			return PreKeyUploadReceipt{}, errors.New("persisted prekey receipt size does not match its canonical digest")
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return PreKeyUploadReceipt{}, fmt.Errorf("commit prekey replay: %w", err)
+		}
+		return PreKeyUploadReceipt{Stored: state.latestStored, Replay: true}, nil
+	}
+
+	var accountRowsBefore int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*)
+		 FROM prekeys p
+		 JOIN devices d ON d.id = p.device_id
+		 WHERE d.user_id = $1::uuid`,
+		lockedOwnerID,
+	).Scan(&accountRowsBefore); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("count account prekeys before publication: %w", err)
+	}
+
+	allLegacyOneTimeIDs := true
+	for _, key := range batch.oneTime {
+		if key.ProtocolKeyID > state.oneTimeHighWatermark {
+			allLegacyOneTimeIDs = false
+			break
+		}
+	}
+	legacyCandidate := state.latestDigest == nil &&
+		state.signedHighWatermark > 0 &&
+		batch.signed.ProtocolKeyID <= state.signedHighWatermark &&
+		allLegacyOneTimeIDs
+	if legacyCandidate {
+		exact, verifyErr := verifyLegacyPreKeyBatch(ctx, tx, deviceID, batch, state)
+		if verifyErr != nil {
+			return PreKeyUploadReceipt{}, verifyErr
+		}
+		if !exact {
+			return PreKeyUploadReceipt{}, preKeyConflict(deviceID, batch.signed.KeyType, batch.signed.ProtocolKeyID)
+		}
+		if err := compactPublishedPreKeys(ctx, tx, deviceID, batch.signed.ProtocolKeyID); err != nil {
+			return PreKeyUploadReceipt{}, err
+		}
+		if err := persistPreKeyReceipt(
+			ctx, tx, deviceID, state.signedHighWatermark, state.oneTimeHighWatermark,
+			batch.digest, len(batch.keys),
+		); err != nil {
+			return PreKeyUploadReceipt{}, err
+		}
+		if err := enforcePreKeyLiveBounds(ctx, tx, deviceID, lockedOwnerID, accountRowsBefore); err != nil {
+			return PreKeyUploadReceipt{}, err
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return PreKeyUploadReceipt{}, fmt.Errorf("commit legacy prekey receipt: %w", err)
+		}
+		return PreKeyUploadReceipt{Stored: len(batch.keys)}, nil
+	}
+
+	reuseCurrentSignedPreKey := false
+	switch {
+	case batch.signed.ProtocolKeyID < state.signedHighWatermark:
+		return PreKeyUploadReceipt{}, preKeyConflict(deviceID, batch.signed.KeyType, batch.signed.ProtocolKeyID)
+	case batch.signed.ProtocolKeyID == state.signedHighWatermark:
+		exact, exactErr := currentSignedPreKeyExact(ctx, tx, deviceID, batch.signed)
+		if exactErr != nil {
+			return PreKeyUploadReceipt{}, exactErr
+		}
+		if !exact {
+			return PreKeyUploadReceipt{}, preKeyConflict(deviceID, batch.signed.KeyType, batch.signed.ProtocolKeyID)
+		}
+		reuseCurrentSignedPreKey = true
+	}
+	for _, key := range batch.oneTime {
+		if key.ProtocolKeyID <= state.oneTimeHighWatermark {
+			return PreKeyUploadReceipt{}, preKeyConflict(deviceID, key.KeyType, key.ProtocolKeyID)
+		}
+	}
+	hasNewProtocolID := batch.signed.ProtocolKeyID > state.signedHighWatermark || len(batch.oneTime) > 0
+	if !hasNewProtocolID {
+		// A different HTTP body may not replace the sole durable lost-ACK
+		// receipt unless it actually advances publication state.
+		return PreKeyUploadReceipt{}, preKeyConflict(deviceID, batch.signed.KeyType, batch.signed.ProtocolKeyID)
+	}
+
+	for _, key := range batch.keys {
+		if key.KeyType == 0 && reuseCurrentSignedPreKey {
+			continue
+		}
+		commandTag, insertErr := tx.Exec(ctx,
+			`INSERT INTO prekeys
+			    (device_id, key_type, protocol_key_id, public_key, signature)
+			 VALUES ($1::uuid, $2, $3, $4, $5)
+			 ON CONFLICT (device_id, key_type, protocol_key_id) DO NOTHING`,
+			deviceID, key.KeyType, key.ProtocolKeyID, key.PublicKey, key.Signature,
+		)
+		if insertErr != nil {
+			return PreKeyUploadReceipt{}, fmt.Errorf("insert prekey: %w", insertErr)
+		}
+		if commandTag.RowsAffected() != 1 {
+			return PreKeyUploadReceipt{}, preKeyConflict(deviceID, key.KeyType, key.ProtocolKeyID)
+		}
+	}
+
+	if err := compactPublishedPreKeys(ctx, tx, deviceID, batch.signed.ProtocolKeyID); err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	if err := persistPreKeyReceipt(
+		ctx, tx, deviceID, max(state.signedHighWatermark, batch.signed.ProtocolKeyID),
+		max(state.oneTimeHighWatermark, batch.maxOneTime), batch.digest, len(batch.keys),
+	); err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	if err := enforcePreKeyLiveBounds(ctx, tx, deviceID, lockedOwnerID, accountRowsBefore); err != nil {
+		return PreKeyUploadReceipt{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return PreKeyUploadReceipt{}, fmt.Errorf("commit prekey publication: %w", err)
+	}
+	return PreKeyUploadReceipt{Stored: len(batch.keys)}, nil
+}
+
+const internalPreKeyUploadDigestDomain = "veil-internal-prekey-upload-v1\x00"
+
+func validatePreKeyBatch(keys []PreKey) (validatedPreKeyBatch, error) {
+	if len(keys) == 0 || len(keys) > 1001 {
+		return validatedPreKeyBatch{}, errors.New("invalid prekey publication batch size or scope")
+	}
+	canonical := make([]PreKey, 0, len(keys))
+	for _, key := range keys {
+		copyKey := PreKey{
+			KeyType:       key.KeyType,
+			ProtocolKeyID: key.ProtocolKeyID,
+			PublicKey:     bytes.Clone(key.PublicKey),
+			Signature:     bytes.Clone(key.Signature),
+		}
+		if copyKey.ProtocolKeyID == 0 || len(copyKey.PublicKey) != 32 {
+			return validatedPreKeyBatch{}, errors.New("invalid prekey protocol id or public key")
+		}
+		switch copyKey.KeyType {
+		case 0:
+			if len(copyKey.Signature) != 64 {
+				return validatedPreKeyBatch{}, errors.New("invalid signed prekey signature")
+			}
+		case 1:
+			if len(copyKey.Signature) != 0 {
+				return validatedPreKeyBatch{}, errors.New("one-time prekey must not have a signature")
+			}
+		default:
+			return validatedPreKeyBatch{}, errors.New("invalid prekey type")
+		}
+		canonical = append(canonical, copyKey)
+	}
+	sort.Slice(canonical, func(i, j int) bool {
+		if canonical[i].KeyType != canonical[j].KeyType {
+			return canonical[i].KeyType < canonical[j].KeyType
+		}
+		return canonical[i].ProtocolKeyID < canonical[j].ProtocolKeyID
+	})
+
+	batch := validatedPreKeyBatch{keys: canonical}
+	for index, key := range canonical {
+		if index > 0 && key.KeyType == canonical[index-1].KeyType &&
+			key.ProtocolKeyID == canonical[index-1].ProtocolKeyID {
+			return validatedPreKeyBatch{}, errors.New("duplicate prekey protocol id in publication batch")
+		}
+		if key.KeyType == 0 {
+			if batch.signed.ProtocolKeyID != 0 {
+				return validatedPreKeyBatch{}, errors.New("prekey publication must contain exactly one signed prekey")
+			}
+			batch.signed = key
+		} else {
+			batch.oneTime = append(batch.oneTime, key)
+			batch.maxOneTime = max(batch.maxOneTime, key.ProtocolKeyID)
+		}
+	}
+	if batch.signed.ProtocolKeyID == 0 || len(batch.oneTime) > 1000 {
+		return validatedPreKeyBatch{}, errors.New("prekey publication must contain one signed prekey and at most 1000 one-time prekeys")
+	}
+
+	return batch, nil
+}
+
+// StorePreKeys is also used by trusted non-HTTP integration paths. They get a
+// deterministic domain-separated digest; the REST handler always calls
+// StorePreKeysWithReceipt with SHA-256 of the exact validated request bytes.
+func digestInternalPreKeyBatch(deviceID string, canonical []PreKey) [sha256.Size]byte {
+	hash := sha256.New()
+	_, _ = hash.Write([]byte(internalPreKeyUploadDigestDomain))
+	var encoded [4]byte
+	binary.BigEndian.PutUint32(encoded[:], uint32(len(deviceID)))
+	_, _ = hash.Write(encoded[:])
+	_, _ = hash.Write([]byte(deviceID))
+	binary.BigEndian.PutUint32(encoded[:], uint32(len(canonical)))
+	_, _ = hash.Write(encoded[:])
+	for _, key := range canonical {
+		_, _ = hash.Write([]byte{byte(key.KeyType)})
+		binary.BigEndian.PutUint32(encoded[:], key.ProtocolKeyID)
+		_, _ = hash.Write(encoded[:])
+		_, _ = hash.Write(key.PublicKey)
+		if key.Signature == nil {
+			_, _ = hash.Write([]byte{0})
+		} else {
+			_, _ = hash.Write([]byte{1})
+			_, _ = hash.Write(key.Signature)
+		}
+	}
+	var digest [sha256.Size]byte
+	copy(digest[:], hash.Sum(nil))
+	return digest
+}
+
+func lockPreKeyPublicationState(ctx context.Context, tx pgx.Tx, deviceID string) (bool, preKeyPublicationState, error) {
+	commandTag, err := tx.Exec(ctx,
+		`INSERT INTO prekey_publication_state (
+		    device_id, signed_prekey_high_watermark, one_time_prekey_high_watermark
+		 )
+		 SELECT d.id,
+		        COALESCE(MAX(p.protocol_key_id) FILTER (WHERE p.key_type = 0), 0),
+		        COALESCE(MAX(p.protocol_key_id) FILTER (WHERE p.key_type = 1), 0)
+		 FROM devices d
+		 LEFT JOIN prekeys p ON p.device_id = d.id
+		 WHERE d.id = $1::uuid
+		 GROUP BY d.id
+		 ON CONFLICT (device_id) DO NOTHING`,
+		deviceID,
+	)
+	if err != nil {
+		return false, preKeyPublicationState{}, fmt.Errorf("initialize prekey publication state: %w", err)
+	}
+	created := commandTag.RowsAffected() == 1
+	var signedHigh, oneTimeHigh int64
+	var state preKeyPublicationState
+	if err := tx.QueryRow(ctx,
+		`SELECT signed_prekey_high_watermark,
+		        one_time_prekey_high_watermark,
+		        latest_upload_digest,
+		        COALESCE(latest_upload_stored, 0)
+		 FROM prekey_publication_state
+		 WHERE device_id = $1::uuid
+		 FOR UPDATE`,
+		deviceID,
+	).Scan(&signedHigh, &oneTimeHigh, &state.latestDigest, &state.latestStored); err != nil {
+		return false, preKeyPublicationState{}, fmt.Errorf("lock prekey publication state: %w", err)
+	}
+	if signedHigh < 0 || signedHigh > math.MaxUint32 || oneTimeHigh < 0 || oneTimeHigh > math.MaxUint32 {
+		return false, preKeyPublicationState{}, errors.New("prekey publication watermark is invalid")
+	}
+	state.signedHighWatermark = uint32(signedHigh)
+	state.oneTimeHighWatermark = uint32(oneTimeHigh)
+	if state.latestDigest != nil && (len(state.latestDigest) != sha256.Size || state.latestStored <= 0) {
+		return false, preKeyPublicationState{}, errors.New("prekey publication receipt is invalid")
+	}
+	if state.latestDigest == nil && state.latestStored != 0 {
+		return false, preKeyPublicationState{}, errors.New("prekey publication receipt is incomplete")
+	}
+	return created, state, nil
+}
+
+func verifyLegacyPreKeyBatch(
+	ctx context.Context,
+	tx pgx.Tx,
+	deviceID string,
+	batch validatedPreKeyBatch,
+	state preKeyPublicationState,
+) (bool, error) {
+	if state.latestDigest != nil || state.signedHighWatermark == 0 {
+		return false, nil
+	}
+	var signedRowID, signedProtocolID int64
+	var signedPublic, signedSignature []byte
+	if err := tx.QueryRow(ctx,
+		`SELECT id, protocol_key_id, public_key, signature
+		 FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 0
+		 ORDER BY id DESC LIMIT 1`,
+		deviceID,
+	).Scan(&signedRowID, &signedProtocolID, &signedPublic, &signedSignature); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("load legacy current signed prekey: %w", err)
+	}
+	if signedProtocolID != int64(batch.signed.ProtocolKeyID) ||
+		!bytes.Equal(signedPublic, batch.signed.PublicKey) ||
+		!bytes.Equal(signedSignature, batch.signed.Signature) {
+		return false, nil
+	}
+
+	rows, err := tx.Query(ctx,
+		`SELECT protocol_key_id, public_key, signature
+		 FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 1 AND id > $2
+		 ORDER BY protocol_key_id ASC`,
+		deviceID, signedRowID,
+	)
+	if err != nil {
+		return false, fmt.Errorf("load legacy latest OPK batch: %w", err)
+	}
+	defer rows.Close()
+	legacyOneTime := make([]PreKey, 0, len(batch.oneTime))
+	for rows.Next() {
+		var protocolID int64
+		var key PreKey
+		if err := rows.Scan(&protocolID, &key.PublicKey, &key.Signature); err != nil {
+			return false, fmt.Errorf("scan legacy latest OPK batch: %w", err)
+		}
+		if protocolID <= 0 || protocolID > math.MaxUint32 {
+			return false, errors.New("legacy OPK protocol id is invalid")
+		}
+		key.KeyType = 1
+		key.ProtocolKeyID = uint32(protocolID)
+		legacyOneTime = append(legacyOneTime, key)
+	}
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("iterate legacy latest OPK batch: %w", err)
+	}
+	if len(legacyOneTime) != len(batch.oneTime) {
+		return false, nil
+	}
+	for index := range legacyOneTime {
+		if legacyOneTime[index].ProtocolKeyID != batch.oneTime[index].ProtocolKeyID ||
+			!bytes.Equal(legacyOneTime[index].PublicKey, batch.oneTime[index].PublicKey) ||
+			!bytes.Equal(legacyOneTime[index].Signature, batch.oneTime[index].Signature) {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func currentSignedPreKeyExact(ctx context.Context, tx pgx.Tx, deviceID string, expected PreKey) (bool, error) {
+	var protocolID int64
+	var publicKey, signature []byte
+	err := tx.QueryRow(ctx,
+		`SELECT protocol_key_id, public_key, signature
+		 FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 0
+		 ORDER BY id DESC LIMIT 1`,
+		deviceID,
+	).Scan(&protocolID, &publicKey, &signature)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("load current signed prekey: %w", err)
+	}
+	return protocolID == int64(expected.ProtocolKeyID) &&
+		bytes.Equal(publicKey, expected.PublicKey) &&
+		bytes.Equal(signature, expected.Signature), nil
+}
+
+func compactPublishedPreKeys(ctx context.Context, tx pgx.Tx, deviceID string, currentSignedID uint32) error {
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 0 AND protocol_key_id <> $2`,
+		deviceID, currentSignedID,
+	); err != nil {
+		return fmt.Errorf("compact prior signed prekeys: %w", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`DELETE FROM prekeys
+		 WHERE device_id = $1::uuid AND key_type = 1 AND used = true`,
+		deviceID,
+	); err != nil {
+		return fmt.Errorf("compact consumed one-time prekeys: %w", err)
+	}
 	if _, err := tx.Exec(ctx,
 		`DELETE FROM prekeys
 		 WHERE device_id = $1::uuid AND key_type = 1 AND used = false
 		   AND id NOT IN (
 		     SELECT id FROM prekeys
 		     WHERE device_id = $1::uuid AND key_type = 1 AND used = false
-		     ORDER BY id DESC
+		     ORDER BY protocol_key_id DESC, id DESC
 		     LIMIT $2
 		   )`,
-		deviceID, maxUnusedOneTimePreKeysPerDevice,
+		deviceID, MaxUnusedOneTimePreKeysPerDevice,
 	); err != nil {
-		return fmt.Errorf("prune old unused prekeys: %w", err)
+		return fmt.Errorf("compact excess unused one-time prekeys: %w", err)
+	}
+	return nil
+}
+
+func persistPreKeyReceipt(
+	ctx context.Context,
+	tx pgx.Tx,
+	deviceID string,
+	signedHighWatermark uint32,
+	oneTimeHighWatermark uint32,
+	digest [sha256.Size]byte,
+	stored int,
+) error {
+	commandTag, err := tx.Exec(ctx,
+		`UPDATE prekey_publication_state
+		 SET signed_prekey_high_watermark = $2,
+		     one_time_prekey_high_watermark = $3,
+		     latest_upload_digest = $4,
+		     latest_upload_stored = $5,
+		     updated_at = now()
+		 WHERE device_id = $1::uuid`,
+		deviceID, signedHighWatermark, oneTimeHighWatermark, digest[:], stored,
+	)
+	if err != nil {
+		return fmt.Errorf("persist prekey publication receipt: %w", err)
+	}
+	if commandTag.RowsAffected() != 1 {
+		return errors.New("prekey publication state disappeared while storing receipt")
+	}
+	return nil
+}
+
+func enforcePreKeyLiveBounds(
+	ctx context.Context,
+	tx pgx.Tx,
+	deviceID string,
+	ownerID string,
+	accountRowsBefore int,
+) error {
+	var signedRows, unusedRows, consumedRows int
+	if err := tx.QueryRow(ctx,
+		`SELECT
+		   COUNT(*) FILTER (WHERE key_type = 0),
+		   COUNT(*) FILTER (WHERE key_type = 1 AND used = false),
+		   COUNT(*) FILTER (WHERE key_type = 1 AND used = true)
+		 FROM prekeys
+		 WHERE device_id = $1::uuid`,
+		deviceID,
+	).Scan(&signedRows, &unusedRows, &consumedRows); err != nil {
+		return fmt.Errorf("count device live prekeys: %w", err)
+	}
+	if signedRows != 1 || unusedRows > MaxUnusedOneTimePreKeysPerDevice || consumedRows != 0 {
+		return errors.New("prekey compaction invariant failed")
 	}
 
-	return tx.Commit(ctx)
+	var accountRowsAfter int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*)
+		 FROM prekeys p
+		 JOIN devices d ON d.id = p.device_id
+		 WHERE d.user_id = $1::uuid`,
+		ownerID,
+	).Scan(&accountRowsAfter); err != nil {
+		return fmt.Errorf("count account live prekeys: %w", err)
+	}
+	if accountRowsAfter > MaxPreKeyRowsPerAccount && accountRowsAfter > accountRowsBefore {
+		return fmt.Errorf(
+			"%w: account=%s rows=%d",
+			ErrPreKeyLiveStateFull, ownerID, accountRowsAfter,
+		)
+	}
+	return nil
+}
+
+func preKeyConflict(deviceID string, keyType int16, protocolID uint32) error {
+	return fmt.Errorf(
+		"%w: device=%s key_type=%d protocol_key_id=%d",
+		ErrPreKeyMaterialConflict, deviceID, keyType, protocolID,
+	)
 }
 
 // ClaimOneTimePreKey atomically claims an unused one-time prekey for a device.
 // Returns nil if no OPK available (falls back to signed-only X3DH).
 func (db *DB) ClaimOneTimePreKey(ctx context.Context, deviceID string) (*PreKey, error) {
-	var pk PreKey
-	err := db.Pool.QueryRow(ctx,
-		`UPDATE prekeys SET used = true
-		 WHERE id = (
-		   SELECT id FROM prekeys
-		   WHERE device_id = $1 AND key_type = 1 AND used = false
-		   ORDER BY id ASC LIMIT 1
-		   FOR UPDATE SKIP LOCKED
-		 )
-		 RETURNING id, device_id, key_type, protocol_key_id, public_key, signature, used`,
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("begin OPK claim: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	// StorePreKeys takes FOR UPDATE on this row. FOR SHARE lets independent
+	// claims proceed concurrently while ensuring a claim observes either the
+	// complete legacy mode or the complete receipt/compaction cutover.
+	var lockedDeviceID string
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM devices WHERE id = $1::uuid FOR SHARE`,
 		deviceID,
-	).Scan(&pk.ID, &pk.DeviceID, &pk.KeyType, &pk.ProtocolKeyID, &pk.PublicKey, &pk.Signature, &pk.Used)
+	).Scan(&lockedDeviceID); err != nil {
+		return nil, fmt.Errorf("lock OPK device: %w", err)
+	}
+	var receiptEstablished bool
+	err = tx.QueryRow(ctx,
+		`SELECT latest_upload_digest IS NOT NULL
+		 FROM prekey_publication_state
+		 WHERE device_id = $1::uuid`,
+		deviceID,
+	).Scan(&receiptEstablished)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("load OPK publication state: %w", err)
+	}
+
+	var pk PreKey
+	if receiptEstablished {
+		err = tx.QueryRow(ctx,
+			`WITH candidate AS (
+			   SELECT id FROM prekeys
+			   WHERE device_id = $1::uuid AND key_type = 1 AND used = false
+			   ORDER BY protocol_key_id ASC, id ASC LIMIT 1
+			   FOR UPDATE SKIP LOCKED
+			 )
+			 DELETE FROM prekeys selected
+			 USING candidate
+			 WHERE selected.id = candidate.id
+			 RETURNING selected.id, selected.device_id, selected.key_type,
+			           selected.protocol_key_id, selected.public_key,
+			           selected.signature, true`,
+			deviceID,
+		).Scan(&pk.ID, &pk.DeviceID, &pk.KeyType, &pk.ProtocolKeyID, &pk.PublicKey, &pk.Signature, &pk.Used)
+	} else {
+		err = tx.QueryRow(ctx,
+			`UPDATE prekeys SET used = true
+			 WHERE id = (
+			   SELECT id FROM prekeys
+			   WHERE device_id = $1::uuid AND key_type = 1 AND used = false
+			   ORDER BY protocol_key_id ASC, id ASC LIMIT 1
+			   FOR UPDATE SKIP LOCKED
+			 )
+			 RETURNING id, device_id, key_type, protocol_key_id, public_key, signature, used`,
+			deviceID,
+		).Scan(&pk.ID, &pk.DeviceID, &pk.KeyType, &pk.ProtocolKeyID, &pk.PublicKey, &pk.Signature, &pk.Used)
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil // No OPK available, not an error
 		}
 		return nil, fmt.Errorf("claim opk: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit OPK claim: %w", err)
 	}
 	return &pk, nil
 }

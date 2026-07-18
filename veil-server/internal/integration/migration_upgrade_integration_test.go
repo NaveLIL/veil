@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
 	"net/url"
@@ -13,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	veildb "github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -855,18 +857,201 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		requireMigrationError(t, err, "23514", "push_validation_state_consistent")
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 025", func(t *testing.T) {
+	t.Run("027 backfills monotonic prekey state and requires verifiable legacy receipt", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_027")
+		applyMigrationsBefore(t, pool, migrations, 27)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var userID, deviceID, missingDeviceID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users(identity_key, signing_key, username)
+			 VALUES ($1,$2,'prekey-state-upgrade') RETURNING id::text`,
+			bytes.Repeat([]byte{0x81}, 32), bytes.Repeat([]byte{0x82}, 32),
+		).Scan(&userID); err != nil {
+			t.Fatal(err)
+		}
+		for _, fixture := range []struct {
+			marker byte
+			name   string
+			result *string
+		}{
+			{marker: 0x83, name: "legacy-complete", result: &deviceID},
+			{marker: 0x84, name: "legacy-missing", result: &missingDeviceID},
+		} {
+			if err := pool.QueryRow(ctx,
+				`INSERT INTO devices(user_id,device_key,device_name)
+				 VALUES ($1::uuid,$2,$3) RETURNING id::text`,
+				userID, bytes.Repeat([]byte{fixture.marker}, 16), fixture.name,
+			).Scan(fixture.result); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		oldSPK := bytes.Repeat([]byte{0x91}, 32)
+		oldSignature := bytes.Repeat([]byte{0x92}, 64)
+		currentSPK := bytes.Repeat([]byte{0x93}, 32)
+		currentSignature := bytes.Repeat([]byte{0x94}, 64)
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO prekeys(device_id,key_type,protocol_key_id,public_key,signature,used)
+			 VALUES ($1::uuid,0,9,$2,$3,false),
+			        ($1::uuid,1,1,$4,NULL,true)`,
+			deviceID, oldSPK, oldSignature, bytes.Repeat([]byte{0x95}, 32),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO prekeys(device_id,key_type,protocol_key_id,public_key,signature,used)
+			 SELECT $1::uuid,1,n,digest(n::text,'sha256'),NULL,false
+			 FROM generate_series(2,106) n`,
+			deviceID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		opk111 := bytes.Repeat([]byte{0x96}, 32)
+		opk112 := bytes.Repeat([]byte{0x97}, 32)
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO prekeys(device_id,key_type,protocol_key_id,public_key,signature,used)
+			 VALUES ($1::uuid,0,2,$2,$3,false),
+			        ($1::uuid,1,111,$4,NULL,true),
+			        ($1::uuid,1,112,$5,NULL,false)`,
+			deviceID, currentSPK, currentSignature, opk111, opk112,
+		); err != nil {
+			t.Fatal(err)
+		}
+		missingSPK := bytes.Repeat([]byte{0xa1}, 32)
+		missingSignature := bytes.Repeat([]byte{0xa2}, 64)
+		missingOPK := bytes.Repeat([]byte{0xa3}, 32)
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO prekeys(device_id,key_type,protocol_key_id,public_key,signature,used)
+			 VALUES ($1::uuid,0,5,$2,$3,false),
+			        ($1::uuid,1,50,$4,NULL,true)`,
+			missingDeviceID, missingSPK, missingSignature, missingOPK,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := execMigration(t, pool, migrations, 27); err != nil {
+			t.Fatalf("migration 027: %v", err)
+		}
+		var signedHigh, oneTimeHigh, signedRows, unusedRows, usedRows int
+		var latestDigest []byte
+		if err := pool.QueryRow(ctx,
+			`SELECT s.signed_prekey_high_watermark,
+			        s.one_time_prekey_high_watermark,
+			        s.latest_upload_digest,
+			        COUNT(*) FILTER (WHERE p.key_type=0),
+			        COUNT(*) FILTER (WHERE p.key_type=1 AND p.used=false),
+			        COUNT(*) FILTER (WHERE p.key_type=1 AND p.used=true)
+			 FROM prekey_publication_state s
+			 LEFT JOIN prekeys p ON p.device_id=s.device_id
+			 WHERE s.device_id=$1::uuid
+			 GROUP BY s.signed_prekey_high_watermark,
+			          s.one_time_prekey_high_watermark,
+			          s.latest_upload_digest`,
+			deviceID,
+		).Scan(&signedHigh, &oneTimeHigh, &latestDigest, &signedRows, &unusedRows, &usedRows); err != nil {
+			t.Fatal(err)
+		}
+		// The historical protocol allowed non-monotonic SPK ids. The newest
+		// database row is current even though the durable watermark must retain
+		// the larger retired id 9 to prevent resurrection.
+		if signedHigh != 9 || oneTimeHigh != 112 || latestDigest != nil ||
+			signedRows != 1 || unusedRows > 100 || usedRows != 2 {
+			t.Fatalf("027 backfill high=%d/%d digest=%x rows=%d/%d/%d",
+				signedHigh, oneTimeHigh, latestDigest, signedRows, unusedRows, usedRows)
+		}
+
+		database := &veildb.DB{Pool: pool}
+		claimed, err := database.ClaimOneTimePreKey(ctx, deviceID)
+		if err != nil || claimed == nil {
+			t.Fatalf("legacy claim=%#v err=%v", claimed, err)
+		}
+		var claimedRetained bool
+		if err := pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM prekeys WHERE id=$1 AND used=true)`,
+			claimed.ID,
+		).Scan(&claimedRetained); err != nil || !claimedRetained {
+			t.Fatalf("legacy claim retained=%v err=%v", claimedRetained, err)
+		}
+
+		if _, err := pool.Exec(ctx,
+			`DELETE FROM prekeys
+			 WHERE device_id=$1::uuid AND key_type=1 AND protocol_key_id=50`,
+			missingDeviceID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		missingBatch := []veildb.PreKey{
+			{KeyType: 0, ProtocolKeyID: 5, PublicKey: missingSPK, Signature: missingSignature},
+			{KeyType: 1, ProtocolKeyID: 50, PublicKey: missingOPK},
+		}
+		if _, err := database.StorePreKeysWithReceipt(
+			ctx, missingDeviceID, missingBatch, sha256.Sum256([]byte("missing-legacy-body")),
+		); !errors.Is(err, veildb.ErrPreKeyMaterialConflict) {
+			t.Fatalf("missing legacy material error=%v", err)
+		}
+
+		legacyBatch := []veildb.PreKey{
+			{KeyType: 0, ProtocolKeyID: 2, PublicKey: currentSPK, Signature: currentSignature},
+			{KeyType: 1, ProtocolKeyID: 111, PublicKey: opk111},
+			{KeyType: 1, ProtocolKeyID: 112, PublicKey: opk112},
+		}
+		legacyDigest := sha256.Sum256([]byte("exact-legacy-body"))
+		receipt, err := database.StorePreKeysWithReceipt(ctx, deviceID, legacyBatch, legacyDigest)
+		if err != nil || receipt.Stored != len(legacyBatch) {
+			t.Fatalf("verified legacy adoption receipt=%#v err=%v", receipt, err)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM prekeys
+			 WHERE device_id=$1::uuid AND key_type=1 AND used=true`,
+			deviceID,
+		).Scan(&usedRows); err != nil || usedRows != 0 {
+			t.Fatalf("post-adoption legacy used rows=%d err=%v", usedRows, err)
+		}
+		receipt, err = database.StorePreKeysWithReceipt(ctx, deviceID, legacyBatch, legacyDigest)
+		if err != nil || !receipt.Replay || receipt.Stored != len(legacyBatch) {
+			t.Fatalf("legacy exact replay receipt=%#v err=%v", receipt, err)
+		}
+
+		retiredSigned := []veildb.PreKey{{
+			KeyType: 0, ProtocolKeyID: 9, PublicKey: oldSPK, Signature: oldSignature,
+		}}
+		if _, err := database.StorePreKeysWithReceipt(
+			ctx, deviceID, retiredSigned, sha256.Sum256([]byte("retired-signed-body")),
+		); !errors.Is(err, veildb.ErrPreKeyMaterialConflict) {
+			t.Fatalf("retired signed prekey error=%v, want material conflict", err)
+		}
+
+		nextSPK := []veildb.PreKey{{
+			KeyType:       0,
+			ProtocolKeyID: 10,
+			PublicKey:     bytes.Repeat([]byte{0x98}, 32),
+			Signature:     bytes.Repeat([]byte{0x99}, 64),
+		}}
+		if _, err := database.StorePreKeysWithReceipt(
+			ctx, deviceID, nextSPK, sha256.Sum256([]byte("next-monotonic-body")),
+		); err != nil {
+			t.Fatalf("next monotonic signed prekey: %v", err)
+		}
+		current, err := database.GetSignedPreKey(ctx, deviceID)
+		if err != nil || current.ProtocolKeyID != 10 {
+			t.Fatalf("current signed prekey=%#v err=%v, want protocol id 10", current, err)
+		}
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 027", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 25; number++ {
+		for number := 1; number <= 27; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 26)
+		applyMigrationsBefore(t, pool, migrations, 28)
 	})
 }
 

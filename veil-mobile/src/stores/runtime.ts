@@ -205,6 +205,9 @@ export function conservativelyMergeRuntimeSnapshots(
   const directoryReady = identityAgrees
     && confirmed.directoryReady
     && observed.directoryReady;
+  const secureSyncState = identityAgrees
+    ? moreRestrictiveSecureSyncState(confirmed.secureSyncState, observed.secureSyncState)
+    : "idle";
   const bindingMatches = confirmed.binding !== null
     && observed.binding !== null
     && confirmed.binding.canonicalServerOrigin === observed.binding.canonicalServerOrigin
@@ -228,6 +231,7 @@ export function conservativelyMergeRuntimeSnapshots(
     sessionState,
     connectionState,
     directoryReady,
+    secureSyncState,
     binding,
     pendingAccessPass: pendingMatches && confirmed.pendingAccessPass && observed.pendingAccessPass
       ? {
@@ -239,6 +243,21 @@ export function conservativelyMergeRuntimeSnapshots(
         }
       : null,
   };
+}
+
+function moreRestrictiveSecureSyncState(
+  left: VeilMobileRuntimeSnapshot["secureSyncState"],
+  right: VeilMobileRuntimeSnapshot["secureSyncState"],
+): VeilMobileRuntimeSnapshot["secureSyncState"] {
+  if (left === right) return left;
+  const priority: VeilMobileRuntimeSnapshot["secureSyncState"][] = [
+    "idle",
+    "error",
+    "publishing_keys",
+    "syncing_directory",
+    "directory_synchronized",
+  ];
+  return priority.find((candidate) => candidate === left || candidate === right) ?? "idle";
 }
 
 function moreRestrictiveSessionState(

@@ -256,8 +256,14 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 	})
 
-	t.Run("prekey replenishment bounds unused rows without deleting claimed keys", func(t *testing.T) {
-		keys := make([]db.PreKey, 0, 105)
+	t.Run("prekey replenishment bounds unused rows and compacts claimed keys", func(t *testing.T) {
+		keys := make([]db.PreKey, 0, 106)
+		keys = append(keys, db.PreKey{
+			KeyType:       0,
+			ProtocolKeyID: 778,
+			PublicKey:     randomBytes(t, 32),
+			Signature:     randomBytes(t, ed25519.SignatureSize),
+		})
 		for i := 0; i < 105; i++ {
 			keys = append(keys, db.PreKey{
 				KeyType:       1,
@@ -285,8 +291,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		).Scan(&claimedStillPresent); err != nil {
 			t.Fatal(err)
 		}
-		if !claimedStillPresent {
-			t.Fatal("unused-key pruning deleted an already claimed OPK")
+		if claimedStillPresent {
+			t.Fatal("receipt-mode compaction retained an already claimed OPK")
 		}
 	})
 

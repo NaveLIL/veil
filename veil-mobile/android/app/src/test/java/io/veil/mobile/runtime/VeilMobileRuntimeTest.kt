@@ -3,11 +3,13 @@ package io.veil.mobile.runtime
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import org.junit.Assert.assertArrayEquals
@@ -433,8 +435,11 @@ class VeilMobileRuntimeTest {
     try {
       runtime.openSession()
       runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
 
       assertEquals(NativeDirectDirectoryState.SYNCING, runtime.snapshot().directDirectoryState)
+      assertEquals(NativeOwnPreKeyState.PUBLISHED, runtime.snapshot().ownPreKeyState)
+      assertEquals(NativeSecureSyncState.SYNCING_DIRECTORY, runtime.snapshot().secureSyncState)
       assertTrue(runtime.snapshot().directConversations.isEmpty())
       assertFalse(runtime.snapshot().directoryReady)
       assertEquals(1, transport.pendingCount())
@@ -453,13 +458,20 @@ class VeilMobileRuntimeTest {
       val complete = runtime.snapshot()
       assertTrue(secondBody.all { it == 0.toByte() })
       assertEquals(NativeDirectDirectoryState.SYNCHRONIZED, complete.directDirectoryState)
+      assertEquals(NativeSecureSyncState.DIRECTORY_SYNCHRONIZED, complete.secureSyncState)
       assertEquals(listOf(first, second), complete.directConversations)
       assertEquals(NativeConnectionState.CONNECTED, complete.connectionState)
       assertFalse("history is not synchronized yet", complete.directoryReady)
       assertEquals(2, fakeSession.installedResponseCopies.size)
-      assertEquals(2, transport.requests.size)
+      assertEquals(4, transport.requests.size)
       assertTrue(transport.requests.all { it.canonicalServerOrigin == "https://access.example:443" })
-      assertTrue(transport.requests.all { it.responseLimitBytes == NativeDirectHttpLimits.DIRECTORY_BYTES })
+      assertTrue(
+        transport.requests.drop(2).all {
+          it.responseLimitBytes == NativeDirectHttpLimits.DIRECTORY_BYTES &&
+            it.method == NativeDirectHttpMethod.GET &&
+            it.body.isEmpty()
+        },
+      )
     } finally {
       runtime.lockSession()
       executor.shutdownNow()
@@ -476,7 +488,8 @@ class VeilMobileRuntimeTest {
     try {
       runtime.openSession()
       runtime.connect("https://access.example")
-      val pendingCall = transport.calls.single()
+      completeOwnPreKeyBootstrap(runtime, transport)
+      val pendingCall = transport.calls.last()
       fakeSession.lifecycleEvents.clear()
 
       runtime.lockForBackground()
@@ -511,6 +524,8 @@ class VeilMobileRuntimeTest {
       val failed = runtime.snapshot()
       assertEquals(NativeConnectionState.ERROR, failed.connectionState)
       assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
+      assertEquals(NativeOwnPreKeyState.ERROR, failed.ownPreKeyState)
+      assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
       assertNull(failed.binding)
       assertTrue(failed.directConversations.isEmpty())
       assertFalse(failed.directoryReady)
@@ -519,7 +534,9 @@ class VeilMobileRuntimeTest {
       runtime.connect("https://access.example")
       val retried = runtime.snapshot()
       assertEquals(NativeConnectionState.CONNECTED, retried.connectionState)
-      assertEquals(NativeDirectDirectoryState.SYNCING, retried.directDirectoryState)
+      assertEquals(NativeDirectDirectoryState.IDLE, retried.directDirectoryState)
+      assertEquals(NativeOwnPreKeyState.CHECKING, retried.ownPreKeyState)
+      assertEquals(NativeSecureSyncState.PUBLISHING_KEYS, retried.secureSyncState)
       assertEquals(1, transport.pendingCount())
     } finally {
       runtime.lockSession()
@@ -542,7 +559,7 @@ class VeilMobileRuntimeTest {
       }
 
       assertEquals("E_VEIL_SYNC", error.code)
-      assertEquals("Unable to verify the Direct directory", error.message)
+      assertEquals("Unable to complete the secure Direct bootstrap", error.message)
       assertEquals(0, transport.requests.size)
       assertEquals(1, fakeSession.directLeaseCancellations)
       assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
@@ -571,6 +588,7 @@ class VeilMobileRuntimeTest {
     try {
       runtime.openSession()
       runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
       transport.completeNext(NativeDirectHttpResult.Success("page-one".toByteArray()))
       awaitRuntimeIdle(runtime)
       transport.completeNext(NativeDirectHttpResult.Success("page-two".toByteArray()))
@@ -589,10 +607,270 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun ownPreKeyCountAndExactUploadCompleteBeforeTheFirstDirectoryRequest() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+
+      assertEquals(0, fakeSession.directoryRequestCount)
+      assertEquals(NativeOwnPreKeyState.CHECKING, runtime.snapshot().ownPreKeyState)
+      assertEquals(NativeSecureSyncState.PUBLISHING_KEYS, runtime.snapshot().secureSyncState)
+      val count = transport.requests.single()
+      assertEquals(NativeDirectHttpMethod.GET, count.method)
+      assertTrue(count.body.isEmpty())
+      assertEquals("GET", fakeSession.signedRequestCopies.single().method)
+      assertTrue(fakeSession.signedRequestCopies.single().body.isEmpty())
+
+      val countResponse = "{\"device_id\":\"test-device\",\"remaining\":0}".toByteArray()
+      transport.completeNext(NativeDirectHttpResult.Success(countResponse))
+      awaitRuntimeIdle(runtime)
+      assertTrue(countResponse.all { it == 0.toByte() })
+
+      assertEquals(0, fakeSession.directoryRequestCount)
+      assertEquals(NativeOwnPreKeyState.PUBLISHING, runtime.snapshot().ownPreKeyState)
+      val upload = transport.requests.last()
+      val uploadedBody = transport.capturedBodies.last()
+      assertEquals(NativeDirectHttpMethod.POST, upload.method)
+      assertEquals("/v1/prekeys", upload.requestTarget)
+      assertArrayEquals(OWN_PREKEY_PUBLICATION_BODY, uploadedBody)
+      assertTrue(
+        "runtime wire copy must be wiped after transport snapshots it",
+        upload.body.all { it == 0.toByte() },
+      )
+      assertEquals("POST", fakeSession.signedRequestCopies.last().method)
+      assertArrayEquals(uploadedBody, fakeSession.signedRequestCopies.last().body)
+
+      val uploadResponse = "{\"stored\":21,\"device_id\":\"test-device\"}".toByteArray()
+      transport.completeNext(NativeDirectHttpResult.Success(uploadResponse))
+      awaitRuntimeIdle(runtime)
+      assertTrue(uploadResponse.all { it == 0.toByte() })
+
+      assertEquals(1, fakeSession.directoryRequestCount)
+      assertEquals(NativeOwnPreKeyState.PUBLISHED, runtime.snapshot().ownPreKeyState)
+      assertEquals(NativeDirectDirectoryState.SYNCING, runtime.snapshot().directDirectoryState)
+      assertEquals(NativeSecureSyncState.SYNCING_DIRECTORY, runtime.snapshot().secureSyncState)
+      assertEquals(NativeDirectHttpMethod.GET, transport.requests.last().method)
+      assertTrue(transport.requests.last().requestTarget.startsWith("/v1/conversations?"))
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun staleOwnPreKeyCallbackAfterBackgroundLockCannotInstallOrStartDirectory() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val lateCount = "late-count-response".toByteArray()
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      val pendingCall = transport.calls.single()
+
+      runtime.lockForBackground()
+      assertTrue(pendingCall.cancelled.get())
+      transport.completeNext(NativeDirectHttpResult.Success(lateCount))
+      awaitRuntimeIdle(runtime)
+
+      assertTrue(lateCount.all { it == 0.toByte() })
+      assertEquals(0, fakeSession.ownPreKeyInstallCount)
+      assertEquals(0, fakeSession.directoryRequestCount)
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+      assertEquals(NativeOwnPreKeyState.IDLE, runtime.snapshot().ownPreKeyState)
+      assertEquals(NativeSecureSyncState.IDLE, runtime.snapshot().secureSyncState)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundDuringOwnPreKeyCallCreationCancelsItBeforeStart() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val callCreated = CountDownLatch(1)
+    val releaseCreation = CountDownLatch(1)
+    val blockFirstCall = AtomicBoolean(true)
+    val transport = ControllableDirectTransport {
+      if (blockFirstCall.compareAndSet(true, false)) {
+        callCreated.countDown()
+        check(releaseCreation.await(5, TimeUnit.SECONDS)) { "call creation barrier timed out" }
+      }
+    }
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    runtime.openSession()
+    val connectError = AtomicReference<Throwable?>()
+    val connector = thread(name = "own-prekey-create-before-background") {
+      try {
+        runtime.connect("https://access.example")
+      } catch (error: Throwable) {
+        connectError.set(error)
+      }
+    }
+    try {
+      assertTrue("own-prekey call was not created", callCreated.await(5, TimeUnit.SECONDS))
+      val unstarted = transport.calls.single()
+      assertFalse(unstarted.started.get())
+      assertTrue(transport.requests.isEmpty())
+
+      runtime.lockForBackground()
+      releaseCreation.countDown()
+      connector.join(5_000)
+      assertFalse("stale connector did not finish", connector.isAlive)
+      awaitRuntimeIdle(runtime)
+
+      assertNull(connectError.get())
+      assertTrue("detached unstarted call must be cancelled", unstarted.cancelled.get())
+      assertFalse("cancelled own-prekey call must never start", unstarted.started.get())
+      assertTrue("cancelled own-prekey call must never reach transport", transport.requests.isEmpty())
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+    } finally {
+      releaseCreation.countDown()
+      connector.join(5_000)
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun reconnectDuringDirectoryCallCreationCancelsItBeforeStart() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val directoryCallCreated = CountDownLatch(1)
+    val releaseDirectoryCreation = CountDownLatch(1)
+    val createdCalls = AtomicInteger(0)
+    val transport = ControllableDirectTransport {
+      if (createdCalls.incrementAndGet() == 3) {
+        directoryCallCreated.countDown()
+        check(releaseDirectoryCreation.await(5, TimeUnit.SECONDS)) {
+          "directory call creation barrier timed out"
+        }
+      }
+    }
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      transport.completeNext(
+        NativeDirectHttpResult.Success("{\"device_id\":\"test-device\",\"remaining\":0}".toByteArray()),
+      )
+      awaitRuntimeIdle(runtime)
+      transport.completeNext(
+        NativeDirectHttpResult.Success("{\"stored\":21,\"device_id\":\"test-device\"}".toByteArray()),
+      )
+      assertTrue(
+        "directory call was not created",
+        directoryCallCreated.await(5, TimeUnit.SECONDS),
+      )
+      val staleDirectoryCall = transport.calls[2]
+      assertFalse(staleDirectoryCall.started.get())
+
+      runtime.connect("https://access.example")
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      releaseDirectoryCreation.countDown()
+      awaitRuntimeIdle(runtime)
+
+      assertTrue("superseded directory call must be cancelled", staleDirectoryCall.cancelled.get())
+      assertFalse("superseded directory call must never start", staleDirectoryCall.started.get())
+      assertTrue(
+        "superseded directory call must never reach transport",
+        transport.requests.none { request -> request.requestTarget.startsWith("/v1/conversations") },
+      )
+      assertEquals(1, transport.pendingCount())
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+      assertEquals(NativeOwnPreKeyState.CHECKING, runtime.snapshot().ownPreKeyState)
+    } finally {
+      releaseDirectoryCreation.countDown()
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun staleOwnPreKeyCallbackFromSupersededConnectionCannotAffectTheNewGeneration() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val staleCount = "stale-generation-count".toByteArray()
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      val supersededCall = transport.calls.single()
+
+      runtime.connect("https://access.example")
+      assertTrue(supersededCall.cancelled.get())
+      assertEquals(2, transport.pendingCount())
+      assertEquals(1, fakeSession.directLeaseCancellations)
+
+      transport.completeNext(NativeDirectHttpResult.Success(staleCount))
+      awaitRuntimeIdle(runtime)
+
+      assertTrue(staleCount.all { it == 0.toByte() })
+      assertEquals(0, fakeSession.ownPreKeyInstallCount)
+      assertEquals(0, fakeSession.directoryRequestCount)
+      assertEquals(1, transport.pendingCount())
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+      assertEquals(NativeOwnPreKeyState.CHECKING, runtime.snapshot().ownPreKeyState)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun failedOwnPreKeyUploadRetriesTheSameDurableBodyOnAFreshConnection() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    var firstUploadBody = ByteArray(0)
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      transport.completeNext(
+        NativeDirectHttpResult.Success("{\"device_id\":\"test-device\",\"remaining\":0}".toByteArray()),
+      )
+      awaitRuntimeIdle(runtime)
+      firstUploadBody = transport.capturedBodies.last().copyOf()
+      assertEquals(NativeDirectHttpMethod.POST, transport.requests.last().method)
+
+      transport.completeNext(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK))
+      awaitRuntimeIdle(runtime)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertEquals(0, fakeSession.directoryRequestCount)
+
+      runtime.connect("https://access.example")
+      assertEquals(NativeOwnPreKeyState.PUBLISHING, runtime.snapshot().ownPreKeyState)
+      assertEquals(NativeDirectHttpMethod.POST, transport.requests.last().method)
+      assertArrayEquals(firstUploadBody, transport.capturedBodies.last())
+      assertArrayEquals(firstUploadBody, fakeSession.signedRequestCopies.last().body)
+
+      transport.completeNext(
+        NativeDirectHttpResult.Success("{\"stored\":21,\"device_id\":\"test-device\"}".toByteArray()),
+      )
+      awaitRuntimeIdle(runtime)
+      assertEquals(1, fakeSession.directoryRequestCount)
+      assertEquals(NativeOwnPreKeyState.PUBLISHED, runtime.snapshot().ownPreKeyState)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+    } finally {
+      firstUploadBody.fill(0)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun generatedDirectCapabilitiesMapToRedactingNativeOnlyDtos() {
     val leaseToken = "lease-capability-that-must-not-be-logged"
     val requestToken = "request-capability-that-must-not-be-logged"
     val requestTarget = "/v1/prekeys/peer-identity-key-hex-must-not-be-logged"
+    val requestBody = "public-prekey-body-must-not-be-logged".toByteArray()
     val signatureValue = "signed-header-that-must-not-be-logged"
 
     val lease = MobileDirectSyncLease(
@@ -600,10 +878,14 @@ class VeilMobileRuntimeTest {
       canonicalServerOrigin = "https://chat.example:443",
       userId = USER_ID,
     ).toNativeDirectSyncLease()
-    val request = MobileDirectRestRequest(
+    val generatedRequest = MobileDirectRestRequest(
       requestToken = requestToken,
+      method = "POST",
       requestTarget = requestTarget,
-    ).toNativeDirectRestRequest()
+      body = requestBody.copyOf(),
+      responseLimitBytes = NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES.toUInt(),
+    )
+    val request = generatedRequest.toNativeDirectRestRequest()
     val signature = RestSignatureData(
       userId = USER_ID,
       timestampMs = "1712345678901",
@@ -614,13 +896,18 @@ class VeilMobileRuntimeTest {
     assertEquals("https://chat.example:443", lease.canonicalServerOrigin)
     assertEquals(USER_ID, lease.userId)
     assertEquals(requestToken, request.requestToken)
+    assertEquals("POST", request.method)
     assertEquals(requestTarget, request.requestTarget)
+    assertArrayEquals(requestBody, request.body)
+    assertTrue(generatedRequest.body.all { it == 0.toByte() })
+    assertEquals(NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES, request.responseLimitBytes)
     assertEquals(USER_ID, signature.userId)
     assertEquals("1712345678901", signature.timestampMs)
     assertEquals(signatureValue, signature.signatureBase64)
     assertFalse(lease.toString().contains(leaseToken))
     assertFalse(request.toString().contains(requestToken))
     assertFalse(request.toString().contains(requestTarget))
+    assertFalse(request.toString().contains(String(requestBody)))
     assertFalse(signature.toString().contains(signatureValue))
   }
 
@@ -722,6 +1009,31 @@ class VeilMobileRuntimeTest {
     assertTrue("runtime executor did not drain", drained.await(5, TimeUnit.SECONDS))
   }
 
+  /** Complete the mandatory count -> exact publication ACK barrier. */
+  private fun completeOwnPreKeyBootstrap(
+    runtime: VeilMobileRuntime,
+    transport: ControllableDirectTransport,
+  ) {
+    val count = transport.requests.last()
+    assertEquals(NativeDirectHttpMethod.GET, count.method)
+    assertEquals(NativeDirectHttpLimits.OWN_PREKEY_COUNT_BYTES, count.responseLimitBytes)
+    assertTrue(count.body.isEmpty())
+    transport.completeNext(
+      NativeDirectHttpResult.Success("{\"device_id\":\"test-device\",\"remaining\":0}".toByteArray()),
+    )
+    awaitRuntimeIdle(runtime)
+
+    val upload = transport.requests.last()
+    assertEquals(NativeDirectHttpMethod.POST, upload.method)
+    assertEquals("/v1/prekeys", upload.requestTarget)
+    assertEquals(NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES, upload.responseLimitBytes)
+    assertTrue(transport.capturedBodies.last().isNotEmpty())
+    transport.completeNext(
+      NativeDirectHttpResult.Success("{\"stored\":21,\"device_id\":\"test-device\"}".toByteArray()),
+    )
+    awaitRuntimeIdle(runtime)
+  }
+
   private fun awaitCondition(condition: () -> Boolean): Boolean {
     val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
     while (System.nanoTime() < deadline) {
@@ -775,6 +1087,12 @@ class VeilMobileRuntimeTest {
     var directLeaseCancellations = 0
     var directLeaseUserOverride: String? = null
     var directoryRequestCount = 0
+    var ownPreKeyRequestCount = 0
+    var ownPreKeyInstallCount = 0
+    var ownPreKeyPendingPublication: ByteArray? = null
+    val ownPreKeyInstalledResponseCopies = CopyOnWriteArrayList<ByteArray>()
+    val signedRequestCopies = CopyOnWriteArrayList<SignedRequestCopy>()
+    private val preparedRequests = ConcurrentHashMap<String, NativeDirectRestRequest>()
     val directoryInstalls = ArrayDeque<NativeDirectDirectoryInstall>().apply {
       add(NativeDirectDirectoryInstall(emptyList(), directoryComplete = true))
     }
@@ -816,16 +1134,63 @@ class VeilMobileRuntimeTest {
       userId = directLeaseUserOverride ?: USER_ID,
     )
 
+    override fun prepareOwnPreKeyRequest(leaseToken: String): NativeDirectRestRequest {
+      ownPreKeyRequestCount += 1
+      val pendingPublication = ownPreKeyPendingPublication
+      val prepared = if (pendingPublication == null) {
+        NativeDirectRestRequest(
+          requestToken = "test-own-prekey-count-$ownPreKeyRequestCount",
+          method = "GET",
+          requestTarget = "/v1/prekeys/${"ab".repeat(32)}/count",
+          body = byteArrayOf(),
+          responseLimitBytes = NativeDirectHttpLimits.OWN_PREKEY_COUNT_BYTES,
+        )
+      } else {
+        NativeDirectRestRequest(
+          requestToken = "test-own-prekey-upload-$ownPreKeyRequestCount",
+          method = "POST",
+          requestTarget = "/v1/prekeys",
+          body = pendingPublication.copyOf(),
+          responseLimitBytes = NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES,
+        )
+      }
+      return rememberPreparedRequest(prepared)
+    }
+
+    override fun installOwnPreKeyResponse(
+      leaseToken: String,
+      requestToken: String,
+      response: ByteArray,
+    ): NativeDirectOwnPreKeyProgress {
+      ownPreKeyInstallCount += 1
+      ownPreKeyInstalledResponseCopies.add(response.copyOf())
+      preparedRequests.remove(requestToken)?.body?.fill(0)
+      return if (requestToken.startsWith("test-own-prekey-count-")) {
+        check(ownPreKeyPendingPublication == null)
+        ownPreKeyPendingPublication = OWN_PREKEY_PUBLICATION_BODY.copyOf()
+        NativeDirectOwnPreKeyProgress(publicationComplete = false)
+      } else {
+        check(requestToken.startsWith("test-own-prekey-upload-"))
+        check(ownPreKeyPendingPublication != null)
+        ownPreKeyPendingPublication?.fill(0)
+        ownPreKeyPendingPublication = null
+        NativeDirectOwnPreKeyProgress(publicationComplete = true)
+      }
+    }
+
     override fun prepareDirectDirectoryRequest(leaseToken: String): NativeDirectRestRequest {
       directoryRequestCount += 1
-      return NativeDirectRestRequest(
+      return rememberPreparedRequest(NativeDirectRestRequest(
         requestToken = "test-directory-request-$directoryRequestCount",
+        method = "GET",
         requestTarget = if (directoryRequestCount == 1) {
           "/v1/conversations?limit=100"
         } else {
           "/v1/conversations?cursor=cursor-$directoryRequestCount&limit=100"
         },
-      )
+        body = byteArrayOf(),
+        responseLimitBytes = NativeDirectHttpLimits.DIRECTORY_BYTES,
+      ))
     }
 
     override fun installDirectDirectoryPage(
@@ -834,6 +1199,7 @@ class VeilMobileRuntimeTest {
       response: ByteArray,
     ): NativeDirectDirectoryInstall {
       installedResponseCopies.add(response.copyOf())
+      preparedRequests.remove(requestToken)?.body?.fill(0)
       return directoryInstalls.removeFirst()
     }
 
@@ -852,18 +1218,26 @@ class VeilMobileRuntimeTest {
     override fun cancelDirectSync(leaseToken: String) {
       directLeaseCancellations += 1
       lifecycleEvents.add("cancel-direct")
+      preparedRequests.values.forEach { request -> request.body.fill(0) }
+      preparedRequests.clear()
+      signedRequestCopies.forEach { request -> request.body.fill(0) }
     }
 
-    override fun signRestRequest(
-      canonicalServerOrigin: String,
-      method: String,
-      requestTarget: String,
-      body: ByteArray,
-    ): NativeRestSignature = NativeRestSignature(
-      userId = USER_ID,
-      timestampMs = "1712345678901",
-      signatureBase64 = Base64.getEncoder().encodeToString(ByteArray(64)),
-    )
+    override fun signDirectRestRequest(
+      leaseToken: String,
+      requestToken: String,
+    ): NativeRestSignature {
+      check(leaseToken == "test-direct-lease")
+      val prepared = checkNotNull(preparedRequests[requestToken])
+      signedRequestCopies.add(
+        SignedRequestCopy(prepared.method, prepared.requestTarget, prepared.body.copyOf()),
+      )
+      return NativeRestSignature(
+        userId = USER_ID,
+        timestampMs = "1712345678901",
+        signatureBase64 = Base64.getEncoder().encodeToString(ByteArray(64)),
+      )
+    }
 
     override fun disconnect() {
       lifecycleEvents.add("disconnect")
@@ -874,6 +1248,9 @@ class VeilMobileRuntimeTest {
       closed = true
       lifecycleEvents.add("close")
       lastAccessPass?.fill(0)
+      ownPreKeyPendingPublication?.fill(0)
+      preparedRequests.values.forEach { request -> request.body.fill(0) }
+      preparedRequests.clear()
     }
 
     private fun awaitCancellationIfRequested(cancellation: NativeConnectCancellation) {
@@ -890,18 +1267,34 @@ class VeilMobileRuntimeTest {
 
     private fun unexpectedDirectBridgeCall(): Nothing =
       throw AssertionError("Direct bridge must not be invoked by lifecycle-only runtime tests")
+
+    private fun rememberPreparedRequest(request: NativeDirectRestRequest): NativeDirectRestRequest {
+      val retained = request.copy(body = request.body.copyOf())
+      check(preparedRequests.putIfAbsent(request.requestToken, retained) == null)
+      return request
+    }
+
+    data class SignedRequestCopy(
+      val method: String,
+      val requestTarget: String,
+      val body: ByteArray,
+    )
   }
 
   private class PassiveDirectTransport : NativeDirectHttpExecutor {
-    override fun execute(
+    override fun createCall(
       request: NativeDirectHttpRequest,
       callback: NativeDirectHttpCallback,
     ): NativeDirectHttpCall = object : NativeDirectHttpCall {
+      override fun start() = Unit
+
       override fun cancel() = Unit
     }
   }
 
-  private class ControllableDirectTransport : NativeDirectHttpExecutor {
+  private class ControllableDirectTransport(
+    private val onCallCreated: ((TestDirectHttpCall) -> Unit)? = null,
+  ) : NativeDirectHttpExecutor {
     private data class Pending(
       val callback: NativeDirectHttpCallback,
       val call: TestDirectHttpCall,
@@ -909,18 +1302,26 @@ class VeilMobileRuntimeTest {
 
     private val pending = ArrayDeque<Pending>()
     val requests = CopyOnWriteArrayList<NativeDirectHttpRequest>()
+    val capturedBodies = CopyOnWriteArrayList<ByteArray>()
     val calls = CopyOnWriteArrayList<TestDirectHttpCall>()
 
-    override fun execute(
+    override fun createCall(
       request: NativeDirectHttpRequest,
       callback: NativeDirectHttpCallback,
     ): NativeDirectHttpCall {
-      val call = TestDirectHttpCall()
-      synchronized(this) {
-        requests.add(request)
-        calls.add(call)
-        pending.add(Pending(callback, call))
+      val exactBody = request.body.copyOf()
+      lateinit var call: TestDirectHttpCall
+      call = TestDirectHttpCall {
+        synchronized(this) {
+          requests.add(request)
+          pending.add(Pending(callback, call))
+        }
       }
+      synchronized(this) {
+        capturedBodies.add(exactBody)
+        calls.add(call)
+      }
+      onCallCreated?.invoke(call)
       return call
     }
 
@@ -933,11 +1334,23 @@ class VeilMobileRuntimeTest {
       selected.callback.onComplete(result)
     }
 
-    class TestDirectHttpCall : NativeDirectHttpCall {
+    class TestDirectHttpCall(
+      private val onStart: () -> Unit,
+    ) : NativeDirectHttpCall {
       val cancelled = AtomicBoolean(false)
+      val started = AtomicBoolean(false)
+
+      override fun start() {
+        synchronized(this) {
+          if (cancelled.get() || !started.compareAndSet(false, true)) return
+          onStart()
+        }
+      }
 
       override fun cancel() {
-        cancelled.set(true)
+        synchronized(this) {
+          cancelled.set(true)
+        }
       }
     }
   }
@@ -962,6 +1375,8 @@ class VeilMobileRuntimeTest {
   companion object {
     private val TEST_MNEMONIC = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about"
       .toByteArray()
+    private val OWN_PREKEY_PUBLICATION_BODY =
+      "{\"device_id\":\"00112233445566778899aabbccddeeff\",\"signed_prekey\":{}}".toByteArray()
     private const val USER_ID = "550e8400-e29b-41d4-a716-446655440001"
   }
 }

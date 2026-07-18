@@ -832,6 +832,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -899,11 +903,15 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_p
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_response(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request(
 ): Short
-fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_rest_request(
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_own_prekey_request(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilratchet_decrypt(
 ): Short
@@ -1060,11 +1068,15 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_directory_page(`p
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_prekey_bundle(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_directory_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_prekey_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
-fun uniffi_veil_ffi_fn_method_veilmobilesession_sign_rest_request(`ptr`: Pointer,`canonicalServerOrigin`: RustBuffer.ByValue,`method`: RustBuffer.ByValue,`requestTarget`: RustBuffer.ByValue,`body`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_own_prekey_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_sign_direct_rest_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_clone_veilratchet(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
@@ -1340,13 +1352,19 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle() != 30329.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_response() != 26861.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request() != 63870.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request() != 39529.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_rest_request() != 64338.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_own_prekey_request() != 30230.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request() != 25069.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilratchet_decrypt() != 38547.toShort()) {
@@ -2470,6 +2488,13 @@ public interface VeilMobileSessionInterface {
 
     fun `installDirectPrekeyBundle`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `conversationId`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectPreKeyResult
 
+    /**
+     * Install one own-prekey count or upload response under the exact native
+     * lease/request capability. A count never opens the directory; a valid
+     * upload acknowledgement is the sole transition to `publication_complete`.
+     */
+    fun `installOwnPrekeyResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectOwnPreKeyProgress
+
     fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest
 
     /**
@@ -2478,7 +2503,21 @@ public interface VeilMobileSessionInterface {
      */
     fun `prepareDirectPrekeyRequest`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectRestRequest
 
-    fun `signRestRequest`(`canonicalServerOrigin`: kotlin.String, `method`: kotlin.String, `requestTarget`: kotlin.String, `body`: kotlin.ByteArray): RestSignatureData
+    /**
+     * Prepare the next origin-scoped own-prekey bootstrap request. A durable
+     * pending publication is retried immediately; otherwise native first
+     * obtains the exact local-device count and then prepares a persisted POST.
+     * Kotlin receives public wire bytes but never chooses the target, method,
+     * key ids, or whether a fresh batch may be generated.
+     */
+    fun `prepareOwnPrekeyRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest
+
+    /**
+     * Sign only the exact native-owned Direct request identified by the
+     * current lease and request capability. The transport never supplies
+     * method, target, or body to the signing boundary.
+     */
+    fun `signDirectRestRequest`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String): RestSignatureData
 
     companion object
 }
@@ -2725,6 +2764,24 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
+    /**
+     * Install one own-prekey count or upload response under the exact native
+     * lease/request capability. A count never opens the directory; a valid
+     * upload acknowledgement is the sole transition to `publication_complete`.
+     */
+    @Throws(VeilException::class)override fun `installOwnPrekeyResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectOwnPreKeyProgress {
+            return FfiConverterTypeMobileDirectOwnPreKeyProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
     @Throws(VeilException::class)override fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest {
             return FfiConverterTypeMobileDirectRestRequest.lift(
     callWithPointer {
@@ -2755,12 +2812,37 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
-    @Throws(VeilException::class)override fun `signRestRequest`(`canonicalServerOrigin`: kotlin.String, `method`: kotlin.String, `requestTarget`: kotlin.String, `body`: kotlin.ByteArray): RestSignatureData {
+    /**
+     * Prepare the next origin-scoped own-prekey bootstrap request. A durable
+     * pending publication is retried immediately; otherwise native first
+     * obtains the exact local-device count and then prepares a persisted POST.
+     * Kotlin receives public wire bytes but never chooses the target, method,
+     * key ids, or whether a fresh batch may be generated.
+     */
+    @Throws(VeilException::class)override fun `prepareOwnPrekeyRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest {
+            return FfiConverterTypeMobileDirectRestRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_own_prekey_request(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Sign only the exact native-owned Direct request identified by the
+     * current lease and request capability. The transport never supplies
+     * method, target, or body to the signing boundary.
+     */
+    @Throws(VeilException::class)override fun `signDirectRestRequest`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String): RestSignatureData {
             return FfiConverterTypeRestSignatureData.lift(
     callWithPointer {
     uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_sign_rest_request(
-        it, FfiConverterString.lower(`canonicalServerOrigin`),FfiConverterString.lower(`method`),FfiConverterString.lower(`requestTarget`),FfiConverterByteArray.lower(`body`),_status)
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_sign_direct_rest_request(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),_status)
 }
     }
     )
@@ -3835,6 +3917,34 @@ public object FfiConverterTypeMobileDirectDirectoryPageData: FfiConverterRustBuf
 
 
 
+data class MobileDirectOwnPreKeyProgress (
+    var `publicationComplete`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectOwnPreKeyProgress: FfiConverterRustBuffer<MobileDirectOwnPreKeyProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectOwnPreKeyProgress {
+        return MobileDirectOwnPreKeyProgress(
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectOwnPreKeyProgress) = (
+            FfiConverterBoolean.allocationSize(value.`publicationComplete`)
+    )
+
+    override fun write(value: MobileDirectOwnPreKeyProgress, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`publicationComplete`, buf)
+    }
+}
+
+
+
 data class MobileDirectPreKeyResult (
     var `status`: kotlin.String
 ) {
@@ -3865,7 +3975,10 @@ public object FfiConverterTypeMobileDirectPreKeyResult: FfiConverterRustBuffer<M
 
 data class MobileDirectRestRequest (
     var `requestToken`: kotlin.String,
-    var `requestTarget`: kotlin.String
+    var `method`: kotlin.String,
+    var `requestTarget`: kotlin.String,
+    var `body`: kotlin.ByteArray,
+    var `responseLimitBytes`: kotlin.UInt
 ) {
 
     companion object
@@ -3879,17 +3992,26 @@ public object FfiConverterTypeMobileDirectRestRequest: FfiConverterRustBuffer<Mo
         return MobileDirectRestRequest(
             FfiConverterString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
     override fun allocationSize(value: MobileDirectRestRequest) = (
             FfiConverterString.allocationSize(value.`requestToken`) +
-            FfiConverterString.allocationSize(value.`requestTarget`)
+            FfiConverterString.allocationSize(value.`method`) +
+            FfiConverterString.allocationSize(value.`requestTarget`) +
+            FfiConverterByteArray.allocationSize(value.`body`) +
+            FfiConverterUInt.allocationSize(value.`responseLimitBytes`)
     )
 
     override fun write(value: MobileDirectRestRequest, buf: ByteBuffer) {
             FfiConverterString.write(value.`requestToken`, buf)
+            FfiConverterString.write(value.`method`, buf)
             FfiConverterString.write(value.`requestTarget`, buf)
+            FfiConverterByteArray.write(value.`body`, buf)
+            FfiConverterUInt.write(value.`responseLimitBytes`, buf)
     }
 }
 

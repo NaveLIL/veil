@@ -82,6 +82,64 @@ class NativeDirectHttpTransportTest {
   }
 
   @Test
+  fun signedOwnPrekeyPostPreservesExactBodyTargetAndHeadersOnWire() {
+    val body = """{"device_id":"00112233445566778899aabbccddeeff","signed_prekey":{"key_id":7}}"""
+      .toByteArray()
+    val original = body.copyOf()
+    server.enqueue(
+      MockResponse()
+        .setResponseCode(200)
+        .setBody("""{"stored":1,"opk_remaining":12}"""),
+    )
+    val input = signedRequest(
+      target = "/v1/prekeys",
+      responseLimit = NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES,
+      method = NativeDirectHttpMethod.POST,
+      body = body,
+    )
+
+    val result = executeAndAwait(input)
+
+    assertTrue(result is NativeDirectHttpResult.Success)
+    val recorded = server.takeRequest(5, TimeUnit.SECONDS)
+      ?: throw AssertionError("signed prekey POST did not reach MockWebServer")
+    assertEquals("POST", recorded.method)
+    assertEquals("/v1/prekeys", recorded.path)
+    assertArrayEquals(original, recorded.body.readByteArray())
+    assertEquals("application/json", recorded.getHeader("Content-Type"))
+    assertEquals(original.size.toString(), recorded.getHeader("Content-Length"))
+    assertEquals("application/json", recorded.getHeader("Accept"))
+    assertEquals(USER_ID, recorded.getHeader("X-Veil-User"))
+    assertEquals(TIMESTAMP_MS, recorded.getHeader("X-Veil-Timestamp"))
+    assertEquals(SIGNATURE_BASE64, recorded.getHeader("X-Veil-Signature"))
+    assertFalse(input.toString().contains(String(original)))
+    assertFalse(input.toString().contains(SIGNATURE_BASE64))
+  }
+
+  @Test
+  fun preparedOwnPrekeyPostOwnsAnExactBodyCopy() {
+    val body = """{"device_id":"00112233445566778899aabbccddeeff"}""".toByteArray()
+    val original = body.copyOf()
+    val prepared = NativeDirectHttpTransport().prepareRequest(
+      signedRequest(
+        origin = "https://example.test:443",
+        target = "/v1/prekeys",
+        responseLimit = NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES,
+        method = NativeDirectHttpMethod.POST,
+        body = body,
+      ),
+    )
+
+    body.fill(0)
+    val written = Buffer()
+    val preparedBody = prepared.body
+      ?: throw AssertionError("prepared prekey POST body is absent")
+    preparedBody.writeTo(written)
+
+    assertArrayEquals(original, written.readByteArray())
+  }
+
+  @Test
   fun preparedRequestUsesOnlyApprovedHeadersAndKeepsDefaultPortInHost() {
     val localTransport = NativeDirectHttpTransport()
     val target = "/v1/prekeys/0123456789abcdef?b=2&a=1"
@@ -171,7 +229,7 @@ class NativeDirectHttpTransportTest {
     val completed = CountDownLatch(1)
     val input = signedRequest(target = target)
 
-    val call = transport.execute(input) { result ->
+    val call = transport.createCall(input) { result ->
       callbackCount.incrementAndGet()
       callbackResult.set(result)
       completed.countDown()
@@ -179,6 +237,7 @@ class NativeDirectHttpTransportTest {
     assertTrue(input.toString().let { text ->
       !text.contains(target) && !text.contains(signature) && !text.contains(serverOrigin)
     })
+    call.start()
     server.takeRequest(5, TimeUnit.SECONDS)
       ?: throw AssertionError("cancellable request did not reach MockWebServer")
     call.cancel()
@@ -191,6 +250,29 @@ class NativeDirectHttpTransportTest {
     assertEquals(1, callbackCount.get())
     assertFalse(call.toString().contains(target))
     assertFalse(call.toString().contains(signature))
+  }
+
+  @Test
+  fun cancellationBeforeStartNeverReachesNetworkAndStartStaysANoOp() {
+    val callbackResult = AtomicReference<NativeDirectHttpResult?>()
+    val callbackCount = AtomicInteger(0)
+    val completed = CountDownLatch(1)
+    val call = transport.createCall(signedRequest()) { result ->
+      callbackCount.incrementAndGet()
+      callbackResult.set(result)
+      completed.countDown()
+    }
+
+    call.cancel()
+    call.start()
+
+    assertTrue("cancel-before-start callback timed out", completed.await(5, TimeUnit.SECONDS))
+    assertFailure(
+      NativeDirectHttpFailure.CANCELLED,
+      callbackResult.get() ?: throw AssertionError("cancel-before-start returned no result"),
+    )
+    assertEquals(1, callbackCount.get())
+    assertEquals(0, server.requestCount)
   }
 
   @Test
@@ -257,6 +339,46 @@ class NativeDirectHttpTransportTest {
   }
 
   @Test
+  fun invalidMethodPathBodyAndOwnPrekeyLimitsAreRejectedBeforeNetwork() {
+    val invalid = listOf(
+      signedRequest(body = byteArrayOf(1)),
+      signedRequest(
+        target = "/v1/prekeys/peer",
+        responseLimit = NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES,
+        method = NativeDirectHttpMethod.POST,
+        body = byteArrayOf(1),
+      ),
+      signedRequest(
+        target = "/v1/prekeys",
+        responseLimit = NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES,
+        method = NativeDirectHttpMethod.POST,
+      ),
+      signedRequest(
+        target = "/v1/prekeys",
+        responseLimit = NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES,
+        method = NativeDirectHttpMethod.POST,
+        body = ByteArray(64 * 1024 + 1),
+      ),
+      signedRequest(
+        target = "/v1/prekeys",
+        responseLimit = NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES + 1,
+        method = NativeDirectHttpMethod.POST,
+        body = byteArrayOf(1),
+      ),
+      signedRequest(
+        target = "/v1/prekeys/${"ab".repeat(32)}/count",
+        responseLimit = NativeDirectHttpLimits.OWN_PREKEY_COUNT_BYTES + 1,
+      ),
+    )
+
+    invalid.forEach { request ->
+      assertFailure(NativeDirectHttpFailure.INVALID_REQUEST, executeAndAwait(request))
+    }
+
+    assertEquals(0, server.requestCount)
+  }
+
+  @Test
   fun testTlsOverrideGuardFailsClosedForReleaseBuilds() {
     val error = assertThrows(IllegalStateException::class.java) {
       requireNativeDirectHttpTestTlsAllowed(debugBuild = false)
@@ -270,6 +392,8 @@ class NativeDirectHttpTransportTest {
     origin: String = serverOrigin,
     target: String = "/v1/conversations?limit=100",
     responseLimit: Long = NativeDirectHttpLimits.DIRECTORY_BYTES,
+    method: NativeDirectHttpMethod = NativeDirectHttpMethod.GET,
+    body: ByteArray = byteArrayOf(),
   ): NativeDirectHttpRequest = NativeDirectHttpRequest(
     canonicalServerOrigin = origin,
     requestTarget = target,
@@ -279,6 +403,8 @@ class NativeDirectHttpTransportTest {
       signatureBase64 = SIGNATURE_BASE64,
     ),
     responseLimitBytes = responseLimit,
+    method = method,
+    body = body,
   )
 
   private fun executeAndAwait(request: NativeDirectHttpRequest): NativeDirectHttpResult =
@@ -290,10 +416,11 @@ class NativeDirectHttpTransportTest {
   ): NativeDirectHttpResult {
     val result = AtomicReference<NativeDirectHttpResult?>()
     val completed = CountDownLatch(1)
-    selectedTransport.execute(request) { outcome ->
+    val call = selectedTransport.createCall(request) { outcome ->
       result.set(outcome)
       completed.countDown()
     }
+    call.start()
     assertTrue("Direct HTTP callback timed out", completed.await(5, TimeUnit.SECONDS))
     return result.get() ?: throw AssertionError("Direct HTTP callback returned no result")
   }

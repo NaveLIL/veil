@@ -12,8 +12,10 @@ import javax.net.ssl.X509TrustManager
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody
 import okio.ByteString.Companion.decodeBase64
@@ -22,10 +24,17 @@ import okio.ByteString.Companion.decodeBase64
 internal object NativeDirectHttpLimits {
   const val DIRECTORY_BYTES: Long = 8L * 1024L * 1024L
   const val PREKEY_BYTES: Long = 64L * 1024L
+  const val OWN_PREKEY_COUNT_BYTES: Long = 64L * 1024L
+  const val OWN_PREKEY_UPLOAD_BYTES: Long = 4L * 1024L
+}
+
+internal enum class NativeDirectHttpMethod {
+  GET,
+  POST,
 }
 
 /**
- * Native-only signed GET input. Lease/request capabilities are deliberately
+ * Native-only signed HTTP input. Lease/request capabilities are deliberately
  * absent: the runtime retains them and returns raw response bytes to UniFFI.
  */
 internal data class NativeDirectHttpRequest(
@@ -33,12 +42,16 @@ internal data class NativeDirectHttpRequest(
   val requestTarget: String,
   val signature: NativeRestSignature,
   val responseLimitBytes: Long,
+  val method: NativeDirectHttpMethod = NativeDirectHttpMethod.GET,
+  val body: ByteArray = byteArrayOf(),
 ) {
   override fun toString(): String =
     "NativeDirectHttpRequest(" +
+      "method=$method, " +
       "canonicalServerOrigin=[REDACTED], " +
       "requestTarget=[REDACTED], " +
       "signature=[REDACTED], " +
+      "body=[REDACTED], " +
       "responseLimitBytes=$responseLimitBytes)"
 }
 
@@ -66,14 +79,24 @@ internal fun interface NativeDirectHttpCallback {
   fun onComplete(result: NativeDirectHttpResult)
 }
 
+/**
+ * Implementations must synchronously snapshot [NativeDirectHttpRequest.body]
+ * while creating an unstarted call. The runtime wipes its caller-owned wire
+ * buffer as soon as [createCall] returns, atomically attaches the call to the
+ * active lease, and only then invokes [NativeDirectHttpCall.start]. Callbacks
+ * receive only the bounded response bytes.
+ */
 internal fun interface NativeDirectHttpExecutor {
-  fun execute(
+  fun createCall(
     request: NativeDirectHttpRequest,
     callback: NativeDirectHttpCallback,
   ): NativeDirectHttpCall
 }
 
 internal interface NativeDirectHttpCall : AutoCloseable {
+  /** Starts at most once. A call cancelled before this point must never start. */
+  fun start()
+
   fun cancel()
 
   override fun close() = cancel()
@@ -135,7 +158,8 @@ internal class NativeDirectHttpCompletion(
 }
 
 /**
- * Isolated asynchronous HTTP executor for native Direct directory/prekey GETs.
+ * Isolated asynchronous HTTP executor for native Direct directory/prekey
+ * GETs and the exact own-prekey publication POST.
  *
  * Production always starts from a clean OkHttp builder and therefore keeps
  * Android's system trust manager, hostname verifier, DNS, dispatcher, cookie
@@ -165,20 +189,19 @@ internal class NativeDirectHttpTransport private constructor(
     .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .build()
 
-  override fun execute(
+  override fun createCall(
     request: NativeDirectHttpRequest,
     callback: NativeDirectHttpCallback,
   ): NativeDirectHttpCall {
+    val completion = NativeDirectHttpCompletion(callback)
     val prepared = try {
       prepareRequest(request)
     } catch (_: IllegalArgumentException) {
-      return rejectedCall(client.dispatcher.executorService, callback)
+      return RejectedDirectHttpCall(client.dispatcher.executorService, completion)
     }
 
     val call = client.newCall(prepared)
-    val completion = NativeDirectHttpCompletion(callback)
-    val handle = OkHttpDirectCall(call, completion)
-    call.enqueue(object : Callback {
+    val networkCallback = object : Callback {
       override fun onFailure(call: Call, error: java.io.IOException) {
         completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK))
       }
@@ -202,14 +225,35 @@ internal class NativeDirectHttpTransport private constructor(
         }
         completion.complete(result)
       }
-    })
-    return handle
+    }
+    return OkHttpDirectCall(call, networkCallback, completion)
   }
 
   @VisibleForTesting
   internal fun prepareRequest(input: NativeDirectHttpRequest): Request {
     require(input.responseLimitBytes in 1..NativeDirectHttpLimits.DIRECTORY_BYTES) {
       "Direct response limit is invalid"
+    }
+    when (input.method) {
+      NativeDirectHttpMethod.GET -> {
+        require(input.body.isEmpty()) { "Direct GET body must be empty" }
+        if (isOwnPreKeyCountTarget(input.requestTarget)) {
+          require(input.responseLimitBytes <= NativeDirectHttpLimits.OWN_PREKEY_COUNT_BYTES) {
+            "Own prekey count response limit is invalid"
+          }
+        }
+      }
+      NativeDirectHttpMethod.POST -> {
+        require(input.requestTarget == OWN_PREKEY_UPLOAD_TARGET) {
+          "Direct POST target is invalid"
+        }
+        require(input.body.size in 1..MAX_REQUEST_BODY_BYTES) {
+          "Own prekey upload body is empty or oversized"
+        }
+        require(input.responseLimitBytes <= NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES) {
+          "Own prekey upload response limit is invalid"
+        }
+      }
     }
     require(input.canonicalServerOrigin.startsWith("https://")) {
       "Direct transport requires HTTPS"
@@ -243,16 +287,27 @@ internal class NativeDirectHttpTransport private constructor(
     }
     requireValidSignature(input.signature)
 
-    return Request.Builder()
+    val builder = Request.Builder()
       .url(url)
-      .get()
       .header("Host", authority)
       .header("Accept", JSON_MEDIA_TYPE)
       .header("X-Veil-User", input.signature.userId)
       .header("X-Veil-Timestamp", input.signature.timestampMs)
       .header("X-Veil-Signature", input.signature.signatureBase64)
-      .build()
+    when (input.method) {
+      NativeDirectHttpMethod.GET -> builder.get()
+      NativeDirectHttpMethod.POST -> {
+        // OkHttp writes asynchronously. Own an exact copy so the caller can
+        // clear or reuse its buffer without changing the signed wire body.
+        val exactBody = input.body.copyOf()
+        builder.post(exactBody.toRequestBody(JSON_MEDIA_TYPE_VALUE))
+      }
+    }
+    return builder.build()
   }
+
+  private fun isOwnPreKeyCountTarget(target: String): Boolean =
+    OWN_PREKEY_COUNT_TARGET.matches(target)
 
   private fun requireValidRequestTarget(target: String) {
     require(target.isNotEmpty() && target.length <= MAX_REQUEST_TARGET_CHARS) {
@@ -324,37 +379,81 @@ internal class NativeDirectHttpTransport private constructor(
     }
   }
 
-  private fun rejectedCall(
-    callbackExecutor: Executor,
-    callback: NativeDirectHttpCallback,
-  ): NativeDirectHttpCall {
-    val completion = NativeDirectHttpCompletion(callback)
-    val handle = RejectedDirectHttpCall(completion)
-    callbackExecutor.execute {
-      completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.INVALID_REQUEST))
-    }
-    return handle
-  }
-
   private class OkHttpDirectCall(
     private val call: Call,
+    private val callback: Callback,
     private val completion: NativeDirectHttpCompletion,
   ) : NativeDirectHttpCall {
+    private val state = AtomicReference(CallState.CREATED)
+
+    override fun start() {
+      if (!state.compareAndSet(CallState.CREATED, CallState.STARTED)) return
+      try {
+        call.enqueue(callback)
+      } catch (_: RuntimeException) {
+        completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK))
+      }
+    }
+
     override fun cancel() {
-      completion.cancel { call.cancel() }
+      while (true) {
+        when (state.get()) {
+          CallState.CANCELLED -> return
+          CallState.CREATED -> if (state.compareAndSet(CallState.CREATED, CallState.CANCELLED)) {
+            completion.cancel()
+            return
+          }
+          CallState.STARTED -> if (state.compareAndSet(CallState.STARTED, CallState.CANCELLED)) {
+            completion.cancel { call.cancel() }
+            return
+          }
+        }
+      }
     }
 
     override fun toString(): String = "NativeDirectHttpCall($completion)"
   }
 
   private class RejectedDirectHttpCall(
+    private val callbackExecutor: Executor,
     private val completion: NativeDirectHttpCompletion,
   ) : NativeDirectHttpCall {
+    private val state = AtomicReference(CallState.CREATED)
+
+    override fun start() {
+      if (!state.compareAndSet(CallState.CREATED, CallState.STARTED)) return
+      try {
+        callbackExecutor.execute {
+          completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.INVALID_REQUEST))
+        }
+      } catch (_: RuntimeException) {
+        completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.INVALID_REQUEST))
+      }
+    }
+
     override fun cancel() {
-      completion.cancel()
+      while (true) {
+        when (state.get()) {
+          CallState.CANCELLED -> return
+          CallState.CREATED -> if (state.compareAndSet(CallState.CREATED, CallState.CANCELLED)) {
+            completion.cancel()
+            return
+          }
+          CallState.STARTED -> if (state.compareAndSet(CallState.STARTED, CallState.CANCELLED)) {
+            completion.cancel()
+            return
+          }
+        }
+      }
     }
 
     override fun toString(): String = "NativeDirectHttpCall($completion)"
+  }
+
+  private enum class CallState {
+    CREATED,
+    STARTED,
+    CANCELLED,
   }
 
   private data class TestTls(
@@ -374,7 +473,11 @@ internal class NativeDirectHttpTransport private constructor(
 
     const val HTTP_OK = 200
     const val JSON_MEDIA_TYPE = "application/json"
+    val JSON_MEDIA_TYPE_VALUE = JSON_MEDIA_TYPE.toMediaType()
+    const val OWN_PREKEY_UPLOAD_TARGET = "/v1/prekeys"
+    val OWN_PREKEY_COUNT_TARGET = Regex("^/v1/prekeys/[0-9a-f]{64}/count$")
     const val MAX_REQUEST_TARGET_CHARS = 8 * 1024
+    const val MAX_REQUEST_BODY_BYTES = 64 * 1024
     const val ED25519_SIGNATURE_BYTES = 64
     const val READ_CHUNK_BYTES = 8 * 1024
     const val CONNECT_TIMEOUT_SECONDS = 10L

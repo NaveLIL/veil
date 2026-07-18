@@ -3,7 +3,9 @@ use crate::models::{
     HistoricalAccountContinuity, LocalIdentityVerification, Message, MessageAuthorContext,
     NetworkProfile, ProfileLocator,
 };
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -16,6 +18,178 @@ pub struct LocalPreKey {
     pub secret_key: [u8; 32],
     pub public_key: [u8; 32],
     pub signature: Option<[u8; 64]>,
+}
+
+/// Durable, origin-scoped exact-byte outbox for one X3DH publication.
+///
+/// The body contains public material only, but it remains inside SQLCipher so
+/// request capabilities and unpublished device metadata cannot leak through a
+/// renderer cache. `acknowledged` is set only after a strictly validated HTTP
+/// 200 response for the exact body digest and signed-prekey id.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct LocalPreKeyPublicationV1 {
+    pub canonical_server_origin: String,
+    pub user_id: String,
+    pub device_id: [u8; 16],
+    pub signed_prekey_id: u32,
+    pub one_time_prekey_count: u32,
+    pub request_body: Vec<u8>,
+    pub body_sha256: [u8; 32],
+    pub acknowledged: bool,
+}
+
+/// One immutable reservation from the SQLCipher-backed prekey allocator.
+///
+/// Reservations are committed before key generation. Consequently a crash or
+/// persistence failure may leave gaps, but two clients opening the same local
+/// database can never assign one protocol id to different private material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalPreKeyIdReservationV1 {
+    pub signed_prekey_id: u32,
+    pub one_time_prekey_start_id: u32,
+    pub next_signed_prekey_id: u32,
+    pub next_one_time_prekey_id: u32,
+}
+
+const LOCAL_PREKEY_PUBLICATION_BODY_LIMIT: usize = 64 * 1024;
+const LOCAL_PREKEY_PUBLICATION_BATCH_SIZE: usize = 20;
+
+fn begin_immediate<'conn>(
+    conn: &'conn Connection,
+    operation: &str,
+) -> Result<Transaction<'conn>, String> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| format!("begin {operation}: {error}"))
+}
+
+fn max_local_prekey_id_on(conn: &Connection, key_type: u8) -> Result<u32, String> {
+    let value: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(protocol_key_id), 0) FROM local_prekeys WHERE key_type = ?1",
+            rusqlite::params![key_type],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("load local prekey counter: {error}"))?;
+    u32::try_from(value).map_err(|_| "local prekey id exceeds u32".to_string())
+}
+
+fn next_after_max_local_prekey_id(conn: &Connection, key_type: u8) -> Result<u32, String> {
+    max_local_prekey_id_on(conn, key_type)?
+        .checked_add(1)
+        .ok_or_else(|| "local prekey id allocator is exhausted".to_string())
+}
+
+fn synchronize_local_prekey_allocator_on(conn: &Connection) -> Result<(u32, u32), String> {
+    let persisted = conn
+        .query_row(
+            "SELECT next_signed_prekey_id, next_one_time_prekey_id
+             FROM local_prekey_allocator_v1 WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("load local prekey allocator: {error}"))?;
+    let (persisted_signed, persisted_one_time) = match persisted {
+        Some((signed, one_time)) => (
+            u32::try_from(signed)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "persisted signed prekey allocator is invalid".to_string())?,
+            u32::try_from(one_time)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "persisted one-time prekey allocator is invalid".to_string())?,
+        ),
+        None => (1, 1),
+    };
+    let next_signed = persisted_signed.max(next_after_max_local_prekey_id(conn, 0)?);
+    let next_one_time = persisted_one_time.max(next_after_max_local_prekey_id(conn, 1)?);
+    conn.execute(
+        "INSERT INTO local_prekey_allocator_v1
+           (singleton, next_signed_prekey_id, next_one_time_prekey_id, updated_at)
+         VALUES (1, ?1, ?2, datetime('now'))
+         ON CONFLICT(singleton) DO UPDATE SET
+           next_signed_prekey_id = excluded.next_signed_prekey_id,
+           next_one_time_prekey_id = excluded.next_one_time_prekey_id,
+           updated_at = datetime('now')",
+        rusqlite::params![i64::from(next_signed), i64::from(next_one_time)],
+    )
+    .map_err(|error| format!("synchronize local prekey allocator: {error}"))?;
+    Ok((next_signed, next_one_time))
+}
+
+fn validate_local_prekey_publication_record(
+    publication: &LocalPreKeyPublicationV1,
+) -> Result<(), String> {
+    validate_canonical_server_origin(&publication.canonical_server_origin)?;
+    validate_canonical_uuid("local prekey publication user id", &publication.user_id)?;
+    if publication.device_id == [0u8; 16] {
+        return Err("local prekey publication device is invalid".to_string());
+    }
+    if publication.signed_prekey_id == 0 {
+        return Err("local prekey publication SPK id is invalid".to_string());
+    }
+    if publication.one_time_prekey_count as usize != LOCAL_PREKEY_PUBLICATION_BATCH_SIZE {
+        return Err("local prekey publication OPK count is invalid".to_string());
+    }
+    if publication.request_body.is_empty()
+        || publication.request_body.len() > LOCAL_PREKEY_PUBLICATION_BODY_LIMIT
+    {
+        return Err("local prekey publication body is empty or oversized".to_string());
+    }
+    let calculated: [u8; 32] = Sha256::digest(&publication.request_body).into();
+    if calculated != publication.body_sha256 {
+        return Err("local prekey publication body digest is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_local_prekey_publication_input(
+    keys: &[LocalPreKey],
+    publication: &LocalPreKeyPublicationV1,
+) -> Result<(), String> {
+    validate_local_prekey_publication_record(publication)?;
+    if publication.acknowledged {
+        return Err("a newly generated prekey publication cannot be acknowledged".to_string());
+    }
+    if keys.len() != LOCAL_PREKEY_PUBLICATION_BATCH_SIZE + 1 {
+        return Err("local prekey publication must contain one SPK and 20 OPKs".to_string());
+    }
+
+    let mut seen = HashSet::with_capacity(keys.len());
+    let mut signed_count = 0usize;
+    let mut one_time_count = 0usize;
+    for key in keys {
+        if key.protocol_key_id == 0 || !seen.insert((key.key_type, key.protocol_key_id)) {
+            return Err("local prekey publication contains an invalid or duplicate id".to_string());
+        }
+        if key.secret_key == [0u8; 32] || key.public_key == [0u8; 32] {
+            return Err("local prekey publication contains invalid key material".to_string());
+        }
+        match key.key_type {
+            0 => {
+                signed_count += 1;
+                if key.protocol_key_id != publication.signed_prekey_id
+                    || key.signature.is_none_or(|signature| signature == [0u8; 64])
+                {
+                    return Err(
+                        "local prekey publication SPK does not match its outbox".to_string()
+                    );
+                }
+            }
+            1 => {
+                one_time_count += 1;
+                if key.signature.is_some() {
+                    return Err("local one-time prekeys must not contain signatures".to_string());
+                }
+            }
+            _ => return Err("local prekey publication contains an invalid key type".to_string()),
+        }
+    }
+    if signed_count != 1 || one_time_count != LOCAL_PREKEY_PUBLICATION_BATCH_SIZE {
+        return Err("local prekey publication batch shape is invalid".to_string());
+    }
+    Ok(())
 }
 
 /// Private per-install device identity stored only inside SQLCipher. Public
@@ -1384,6 +1558,41 @@ impl VeilDb {
                 PRIMARY KEY (key_type, protocol_key_id),
                 CHECK((consumed = 0 AND length(secret_key) = 32) OR
                       (consumed = 1 AND secret_key IS NULL))
+            );
+
+            -- Persisted protocol-id allocator. Values are the next ids which
+            -- have not yet been reserved. Reservation commits independently
+            -- before generation, so failures create safe gaps instead of id
+            -- reuse. Existing key rows remain the authoritative lower bound.
+            CREATE TABLE IF NOT EXISTS local_prekey_allocator_v1 (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                next_signed_prekey_id INTEGER NOT NULL
+                    CHECK(next_signed_prekey_id BETWEEN 1 AND 4294967295),
+                next_one_time_prekey_id INTEGER NOT NULL
+                    CHECK(next_one_time_prekey_id BETWEEN 1 AND 4294967295),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- Exact-byte X3DH publication outbox. A batch belongs to one
+            -- authenticated node/account/device scope: reusing an OPK batch
+            -- across independent nodes would violate its one-time property.
+            CREATE TABLE IF NOT EXISTS local_prekey_publications_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                device_id BLOB NOT NULL CHECK(length(device_id) = 16),
+                signed_prekey_id INTEGER NOT NULL CHECK(signed_prekey_id > 0),
+                one_time_prekey_count INTEGER NOT NULL
+                    CHECK(one_time_prekey_count = 20),
+                request_body BLOB NOT NULL
+                    CHECK(length(request_body) BETWEEN 1 AND 65536),
+                body_sha256 BLOB NOT NULL CHECK(length(body_sha256) = 32),
+                acknowledged INTEGER NOT NULL DEFAULT 0
+                    CHECK(acknowledged IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                acknowledged_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (canonical_server_origin, user_id, device_id)
             );
 
             CREATE TABLE IF NOT EXISTS trusted_identity_keys (
@@ -4962,23 +5171,17 @@ impl VeilDb {
     }
 
     /// Store freshly generated X3DH prekeys as one transaction. Private bytes
-    /// are protected by SQLCipher and zeroized by `LocalPreKey` on drop.
+    /// are protected by SQLCipher and zeroized by `LocalPreKey` on drop. A
+    /// protocol id is immutable for the lifetime of the installation: a stale
+    /// client must fail instead of replacing or resurrecting key material.
     pub fn save_local_prekeys(&self, keys: &[LocalPreKey]) -> Result<(), String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin local prekey transaction: {e}"))?;
+        let tx = begin_immediate(&self.conn, "local prekey transaction")?;
         for key in keys {
             let signature = key.signature.as_ref().map(|value| value.as_slice());
             tx.execute(
                 "INSERT INTO local_prekeys
                    (key_type, protocol_key_id, secret_key, public_key, signature, consumed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0)
-                 ON CONFLICT(key_type, protocol_key_id) DO UPDATE SET
-                   secret_key=excluded.secret_key,
-                   public_key=excluded.public_key,
-                   signature=excluded.signature,
-                   consumed=0",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
                 rusqlite::params![
                     key.key_type,
                     i64::from(key.protocol_key_id),
@@ -4991,6 +5194,278 @@ impl VeilDb {
         }
         tx.commit()
             .map_err(|e| format!("commit local prekeys: {e}"))
+    }
+
+    /// Initialize or advance the persisted allocator to at least one greater
+    /// than every existing protocol id. The immediate transaction also makes
+    /// opening an older database safe before its first reservation.
+    pub fn synchronize_local_prekey_allocator(&self) -> Result<(u32, u32), String> {
+        let tx = begin_immediate(&self.conn, "local prekey allocator synchronization")?;
+        let next = synchronize_local_prekey_allocator_on(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("commit local prekey allocator synchronization: {error}"))?;
+        Ok(next)
+    }
+
+    /// Atomically reserve one SPK id and twenty contiguous OPK ids.
+    ///
+    /// The reservation is intentionally committed before generation and key
+    /// persistence. Gaps after crashes or failed writes are safe; reuse is not.
+    pub fn reserve_local_prekey_batch_ids(&self) -> Result<LocalPreKeyIdReservationV1, String> {
+        let tx = begin_immediate(&self.conn, "local prekey id reservation")?;
+        let (signed_prekey_id, one_time_prekey_start_id) =
+            synchronize_local_prekey_allocator_on(&tx)?;
+        let next_signed_prekey_id = signed_prekey_id
+            .checked_add(1)
+            .ok_or_else(|| "signed prekey id exhausted".to_string())?;
+        let next_one_time_prekey_id = one_time_prekey_start_id
+            .checked_add(LOCAL_PREKEY_PUBLICATION_BATCH_SIZE as u32)
+            .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE local_prekey_allocator_v1
+                 SET next_signed_prekey_id = ?1,
+                     next_one_time_prekey_id = ?2,
+                     updated_at = datetime('now')
+                 WHERE singleton = 1
+                   AND next_signed_prekey_id = ?3
+                   AND next_one_time_prekey_id = ?4",
+                rusqlite::params![
+                    i64::from(next_signed_prekey_id),
+                    i64::from(next_one_time_prekey_id),
+                    i64::from(signed_prekey_id),
+                    i64::from(one_time_prekey_start_id),
+                ],
+            )
+            .map_err(|error| format!("reserve local prekey ids: {error}"))?;
+        if changed != 1 {
+            return Err("local prekey allocator changed during reservation".to_string());
+        }
+        tx.commit()
+            .map_err(|error| format!("commit local prekey id reservation: {error}"))?;
+        Ok(LocalPreKeyIdReservationV1 {
+            signed_prekey_id,
+            one_time_prekey_start_id,
+            next_signed_prekey_id,
+            next_one_time_prekey_id,
+        })
+    }
+
+    /// Atomically persist a newly generated SPK/OPK batch and its exact-byte
+    /// origin-scoped publication outbox. Existing protocol ids are never
+    /// overwritten: one id must identify one key for the lifetime of an
+    /// installation, including after a failed or ambiguous network attempt.
+    pub fn save_local_prekeys_with_publication(
+        &self,
+        keys: &[LocalPreKey],
+        publication: &LocalPreKeyPublicationV1,
+    ) -> Result<(), String> {
+        validate_local_prekey_publication_input(keys, publication)?;
+
+        let tx = begin_immediate(&self.conn, "local prekey publication transaction")?;
+        let authenticated =
+            load_authenticated_self_binding(&tx, &publication.canonical_server_origin)?
+                .ok_or("authenticated self binding is unavailable for prekey publication")?;
+        if authenticated.user_id != publication.user_id {
+            return Err("prekey publication user differs from authenticated self".to_string());
+        }
+
+        let persisted_device: Vec<u8> = tx
+            .query_row(
+                "SELECT device_id FROM device_identity_v1 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("load local device for prekey publication: {e}"))?;
+        if persisted_device.as_slice() != publication.device_id.as_slice() {
+            return Err(
+                "prekey publication device differs from the local installation".to_string(),
+            );
+        }
+
+        let existing_pending: Option<u8> = tx
+            .query_row(
+                "SELECT acknowledged FROM local_prekey_publications_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2 AND device_id = ?3",
+                rusqlite::params![
+                    publication.canonical_server_origin,
+                    publication.user_id,
+                    publication.device_id.as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("load existing local prekey publication: {e}"))?;
+        if existing_pending == Some(0) {
+            return Err(
+                "an unacknowledged prekey publication already exists for this node".to_string(),
+            );
+        }
+
+        for key in keys {
+            let signature = key.signature.as_ref().map(|value| value.as_slice());
+            tx.execute(
+                "INSERT INTO local_prekeys
+                   (key_type, protocol_key_id, secret_key, public_key, signature, consumed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                rusqlite::params![
+                    key.key_type,
+                    i64::from(key.protocol_key_id),
+                    key.secret_key.as_slice(),
+                    key.public_key.as_slice(),
+                    signature,
+                ],
+            )
+            .map_err(|e| {
+                format!(
+                    "save immutable local publication prekey {}: {e}",
+                    key.protocol_key_id
+                )
+            })?;
+        }
+
+        tx.execute(
+            "INSERT INTO local_prekey_publications_v1
+               (canonical_server_origin, user_id, device_id, signed_prekey_id,
+                one_time_prekey_count, request_body, body_sha256, acknowledged,
+                created_at, acknowledged_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, datetime('now'), NULL, datetime('now'))
+             ON CONFLICT(canonical_server_origin, user_id, device_id) DO UPDATE SET
+                signed_prekey_id=excluded.signed_prekey_id,
+                one_time_prekey_count=excluded.one_time_prekey_count,
+                request_body=excluded.request_body,
+                body_sha256=excluded.body_sha256,
+                acknowledged=0,
+                created_at=datetime('now'),
+                acknowledged_at=NULL,
+                updated_at=datetime('now')",
+            rusqlite::params![
+                publication.canonical_server_origin,
+                publication.user_id,
+                publication.device_id.as_slice(),
+                i64::from(publication.signed_prekey_id),
+                i64::from(publication.one_time_prekey_count),
+                publication.request_body.as_slice(),
+                publication.body_sha256.as_slice(),
+            ],
+        )
+        .map_err(|e| format!("save local prekey publication outbox: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("commit local prekey publication: {e}"))
+    }
+
+    pub fn load_local_prekey_publication(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        device_id: &[u8; 16],
+    ) -> Result<Option<LocalPreKeyPublicationV1>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("local prekey publication user id", user_id)?;
+        if *device_id == [0u8; 16] {
+            return Err("local prekey publication device is invalid".to_string());
+        }
+
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT signed_prekey_id, one_time_prekey_count, request_body,
+                        body_sha256, acknowledged
+                 FROM local_prekey_publications_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2 AND device_id = ?3",
+                rusqlite::params![canonical_server_origin, user_id, device_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, u8>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load local prekey publication: {e}"))?;
+
+        raw.map(
+            |(signed_prekey_id, one_time_prekey_count, request_body, digest, acknowledged)| {
+                let signed_prekey_id = u32::try_from(signed_prekey_id)
+                    .map_err(|_| "persisted publication SPK id is invalid".to_string())?;
+                let one_time_prekey_count = u32::try_from(one_time_prekey_count)
+                    .map_err(|_| "persisted publication OPK count is invalid".to_string())?;
+                let body_sha256 = fixed_bytes::<32>("local prekey publication digest", digest)?;
+                let publication = LocalPreKeyPublicationV1 {
+                    canonical_server_origin: canonical_server_origin.to_string(),
+                    user_id: user_id.to_string(),
+                    device_id: *device_id,
+                    signed_prekey_id,
+                    one_time_prekey_count,
+                    request_body,
+                    body_sha256,
+                    acknowledged: match acknowledged {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(
+                                "persisted publication acknowledgement is invalid".to_string()
+                            )
+                        }
+                    },
+                };
+                validate_local_prekey_publication_record(&publication)?;
+                Ok(publication)
+            },
+        )
+        .transpose()
+    }
+
+    /// Mark only the exact current outbox row acknowledged. Wrong scope,
+    /// digest, or SPK id leaves it pending and returns an error.
+    pub fn acknowledge_local_prekey_publication(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        device_id: &[u8; 16],
+        signed_prekey_id: u32,
+        body_sha256: &[u8; 32],
+    ) -> Result<(), String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("local prekey publication user id", user_id)?;
+        if *device_id == [0u8; 16] || signed_prekey_id == 0 || *body_sha256 == [0u8; 32] {
+            return Err("local prekey publication acknowledgement is invalid".to_string());
+        }
+        let tx = begin_immediate(&self.conn, "local prekey publication acknowledgement")?;
+        // Match and acknowledge in one write-serialized statement. Updating an
+        // already acknowledged exact row is deliberately idempotent, while a
+        // rotation to another SPK/body can never pass this predicate.
+        let changed = tx
+            .execute(
+                "UPDATE local_prekey_publications_v1
+                 SET acknowledged = 1,
+                     acknowledged_at = COALESCE(acknowledged_at, datetime('now')),
+                     updated_at = CASE
+                         WHEN acknowledged = 0 THEN datetime('now')
+                         ELSE updated_at
+                     END
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2 AND device_id = ?3
+                   AND signed_prekey_id = ?4 AND body_sha256 = ?5",
+                rusqlite::params![
+                    canonical_server_origin,
+                    user_id,
+                    device_id.as_slice(),
+                    i64::from(signed_prekey_id),
+                    body_sha256.as_slice(),
+                ],
+            )
+            .map_err(|e| format!("acknowledge local prekey publication: {e}"))?;
+        if changed != 1 {
+            return Err(
+                "local prekey publication acknowledgement does not match the outbox".to_string(),
+            );
+        }
+        tx.commit()
+            .map_err(|error| format!("commit local prekey publication acknowledgement: {error}"))
     }
 
     /// Load only live prekeys. Consumed OTK rows retain their public IDs for
@@ -5054,15 +5529,7 @@ impl VeilDb {
     }
 
     pub fn max_local_prekey_id(&self, key_type: u8) -> Result<u32, String> {
-        let value: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(protocol_key_id), 0) FROM local_prekeys WHERE key_type = ?1",
-                rusqlite::params![key_type],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("load local prekey counter: {e}"))?;
-        u32::try_from(value).map_err(|_| "local prekey id exceeds u32".to_string())
+        max_local_prekey_id_on(&self.conn, key_type)
     }
 
     /// Atomically persist the authenticated first ratchet state and destroy the
@@ -6763,6 +7230,48 @@ mod tests {
             account_identity_key: [0x55; 32],
             account_signing_key: [0x66; 32],
             account_signature: [0x77; 64],
+        }
+    }
+
+    fn sample_prekey_batch(spk_id: u32, first_opk_id: u32) -> Vec<LocalPreKey> {
+        let mut keys = Vec::with_capacity(LOCAL_PREKEY_PUBLICATION_BATCH_SIZE + 1);
+        keys.push(LocalPreKey {
+            key_type: 0,
+            protocol_key_id: spk_id,
+            secret_key: [0x31; 32],
+            public_key: [0x32; 32],
+            signature: Some([0x33; 64]),
+        });
+        for offset in 0..LOCAL_PREKEY_PUBLICATION_BATCH_SIZE as u32 {
+            let id = first_opk_id + offset;
+            let marker = u8::try_from((id % 250) + 1).unwrap();
+            keys.push(LocalPreKey {
+                key_type: 1,
+                protocol_key_id: id,
+                secret_key: [marker; 32],
+                public_key: [marker.wrapping_add(1); 32],
+                signature: None,
+            });
+        }
+        keys
+    }
+
+    fn sample_prekey_publication(
+        origin: &str,
+        user_id: &str,
+        device_id: [u8; 16],
+        spk_id: u32,
+        body: &[u8],
+    ) -> LocalPreKeyPublicationV1 {
+        LocalPreKeyPublicationV1 {
+            canonical_server_origin: origin.to_string(),
+            user_id: user_id.to_string(),
+            device_id,
+            signed_prekey_id: spk_id,
+            one_time_prekey_count: LOCAL_PREKEY_PUBLICATION_BATCH_SIZE as u32,
+            request_body: body.to_vec(),
+            body_sha256: Sha256::digest(body).into(),
+            acknowledged: false,
         }
     }
 
@@ -10392,6 +10901,324 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn prekey_publication_outbox_survives_restart_and_is_origin_scoped() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-prekey-publication-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let key = [0x91u8; 32];
+        let device_id = [0x41u8; 16];
+        let body_a = br#"{"device_id":"41414141414141414141414141414141","batch":"alpha"}"#;
+        let body_b = br#"{"device_id":"41414141414141414141414141414141","batch":"beta"}"#;
+
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            let mut device = sample_device_identity(device_id);
+            device.account_signing_key = test_signing_key(0x68);
+            db.create_device_identity_v1(&device).unwrap();
+            db.bind_authenticated_self(
+                ORIGIN_A,
+                USER_A,
+                &device.account_identity_key,
+                &device.account_signing_key,
+            )
+            .unwrap();
+            db.bind_authenticated_self(
+                ORIGIN_B,
+                USER_B,
+                &device.account_identity_key,
+                &device.account_signing_key,
+            )
+            .unwrap();
+
+            let publication_a = sample_prekey_publication(ORIGIN_A, USER_A, device_id, 1, body_a);
+            db.save_local_prekeys_with_publication(&sample_prekey_batch(1, 1), &publication_a)
+                .unwrap();
+            assert!(db
+                .load_local_prekey_publication(ORIGIN_B, USER_B, &device_id)
+                .unwrap()
+                .is_none());
+        }
+
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            let loaded = db
+                .load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.request_body, body_a);
+            let expected_body_sha256: [u8; 32] = Sha256::digest(body_a).into();
+            assert_eq!(loaded.body_sha256, expected_body_sha256);
+            assert!(!loaded.acknowledged);
+            let mut wrong_digest = loaded.body_sha256;
+            wrong_digest[0] ^= 1;
+            assert!(db
+                .acknowledge_local_prekey_publication(
+                    ORIGIN_A,
+                    USER_A,
+                    &device_id,
+                    loaded.signed_prekey_id,
+                    &wrong_digest,
+                )
+                .is_err());
+            db.acknowledge_local_prekey_publication(
+                ORIGIN_A,
+                USER_A,
+                &device_id,
+                loaded.signed_prekey_id,
+                &loaded.body_sha256,
+            )
+            .unwrap();
+            assert!(
+                db.load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                    .unwrap()
+                    .unwrap()
+                    .acknowledged
+            );
+
+            let publication_b = sample_prekey_publication(ORIGIN_B, USER_B, device_id, 2, body_b);
+            db.save_local_prekeys_with_publication(&sample_prekey_batch(2, 21), &publication_b)
+                .unwrap();
+            assert_eq!(
+                db.load_local_prekey_publication(ORIGIN_B, USER_B, &device_id)
+                    .unwrap()
+                    .unwrap()
+                    .request_body,
+                body_b,
+            );
+            assert_eq!(
+                db.load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                    .unwrap()
+                    .unwrap()
+                    .request_body,
+                body_a,
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn prekey_publication_key_conflict_rolls_back_the_entire_outbox_transaction() {
+        let db = VeilDb::open_memory(&[0x92u8; 32]).unwrap();
+        let device_id = [0x42u8; 16];
+        let mut device = sample_device_identity(device_id);
+        device.account_signing_key = test_signing_key(0x69);
+        db.create_device_identity_v1(&device).unwrap();
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &device.account_identity_key,
+            &device.account_signing_key,
+        )
+        .unwrap();
+        db.save_local_prekeys(&[LocalPreKey {
+            key_type: 1,
+            protocol_key_id: 7,
+            secret_key: [0x51; 32],
+            public_key: [0x52; 32],
+            signature: None,
+        }])
+        .unwrap();
+
+        let publication = sample_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            device_id,
+            1,
+            br#"{"device_id":"42424242424242424242424242424242","batch":"conflict"}"#,
+        );
+        assert!(db
+            .save_local_prekeys_with_publication(&sample_prekey_batch(1, 1), &publication)
+            .is_err());
+        assert!(db
+            .load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(db.load_local_prekeys().unwrap().len(), 1);
+        assert_eq!(db.max_local_prekey_id(0).unwrap(), 0);
+        assert_eq!(db.max_local_prekey_id(1).unwrap(), 7);
+    }
+
+    #[test]
+    fn persisted_prekey_allocator_serializes_preopened_database_handles() {
+        let path =
+            std::env::temp_dir().join(format!("veil-prekey-allocator-{}.db", uuid::Uuid::new_v4()));
+        let key = [0x93u8; 32];
+        let first = VeilDb::open(&path, &key).unwrap();
+        let second = VeilDb::open(&path, &key).unwrap();
+
+        // Simulate an older database whose key rows predate the allocator.
+        first
+            .save_local_prekeys(&[
+                LocalPreKey {
+                    key_type: 0,
+                    protocol_key_id: 7,
+                    secret_key: [0x11; 32],
+                    public_key: [0x12; 32],
+                    signature: Some([0x13; 64]),
+                },
+                LocalPreKey {
+                    key_type: 1,
+                    protocol_key_id: 41,
+                    secret_key: [0x21; 32],
+                    public_key: [0x22; 32],
+                    signature: None,
+                },
+            ])
+            .unwrap();
+
+        let from_second = second.reserve_local_prekey_batch_ids().unwrap();
+        assert_eq!(from_second.signed_prekey_id, 8);
+        assert_eq!(from_second.one_time_prekey_start_id, 42);
+        assert_eq!(from_second.next_signed_prekey_id, 9);
+        assert_eq!(from_second.next_one_time_prekey_id, 62);
+
+        let from_first = first.reserve_local_prekey_batch_ids().unwrap();
+        assert_eq!(from_first.signed_prekey_id, 9);
+        assert_eq!(from_first.one_time_prekey_start_id, 62);
+        assert_eq!(from_first.next_signed_prekey_id, 10);
+        assert_eq!(from_first.next_one_time_prekey_id, 82);
+
+        drop(second);
+        drop(first);
+        let reopened = VeilDb::open(&path, &key).unwrap();
+        assert_eq!(
+            reopened.synchronize_local_prekey_allocator().unwrap(),
+            (10, 82)
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn immutable_prekey_insert_cannot_resurrect_a_consumed_opk() {
+        let db = VeilDb::open_memory(&[0x94u8; 32]).unwrap();
+        let original_public = [0x32u8; 32];
+        db.save_local_prekeys(&[LocalPreKey {
+            key_type: 1,
+            protocol_key_id: 7,
+            secret_key: [0x31; 32],
+            public_key: original_public,
+            signature: None,
+        }])
+        .unwrap();
+        db.commit_initial_ratchet_session(&[0x33; 32], b"session", Some(7))
+            .unwrap();
+
+        assert!(db
+            .save_local_prekeys(&[LocalPreKey {
+                key_type: 1,
+                protocol_key_id: 7,
+                secret_key: [0x41; 32],
+                public_key: [0x42; 32],
+                signature: None,
+            }])
+            .is_err());
+        let (secret, public, consumed): (Option<Vec<u8>>, Vec<u8>, u8) = db
+            .conn
+            .query_row(
+                "SELECT secret_key, public_key, consumed FROM local_prekeys
+                 WHERE key_type = 1 AND protocol_key_id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(secret.is_none());
+        assert_eq!(public, original_public);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn prekey_publication_ack_is_exact_idempotent_and_cannot_cross_rotation() {
+        let db = VeilDb::open_memory(&[0x95u8; 32]).unwrap();
+        let device_id = [0x43u8; 16];
+        let mut device = sample_device_identity(device_id);
+        device.account_signing_key = test_signing_key(0x6A);
+        db.create_device_identity_v1(&device).unwrap();
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &device.account_identity_key,
+            &device.account_signing_key,
+        )
+        .unwrap();
+
+        let first = sample_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            device_id,
+            1,
+            br#"{"device_id":"43434343434343434343434343434343","batch":"first"}"#,
+        );
+        db.save_local_prekeys_with_publication(&sample_prekey_batch(1, 1), &first)
+            .unwrap();
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            first.signed_prekey_id,
+            &first.body_sha256,
+        )
+        .unwrap();
+        // Reinstalling the exact ACK is harmless and does not require a
+        // read-before-write race window.
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            first.signed_prekey_id,
+            &first.body_sha256,
+        )
+        .unwrap();
+
+        let second = sample_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            device_id,
+            2,
+            br#"{"device_id":"43434343434343434343434343434343","batch":"second"}"#,
+        );
+        db.save_local_prekeys_with_publication(&sample_prekey_batch(2, 21), &second)
+            .unwrap();
+        assert!(db
+            .acknowledge_local_prekey_publication(
+                ORIGIN_A,
+                USER_A,
+                &device_id,
+                first.signed_prekey_id,
+                &first.body_sha256,
+            )
+            .is_err());
+        assert!(
+            !db.load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                .unwrap()
+                .unwrap()
+                .acknowledged
+        );
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            second.signed_prekey_id,
+            &second.body_sha256,
+        )
+        .unwrap();
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            second.signed_prekey_id,
+            &second.body_sha256,
+        )
+        .unwrap();
     }
 
     #[test]

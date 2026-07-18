@@ -9,6 +9,12 @@ homepage.workspace = true
 publish.workspace = true
 description = "Protocol engine for Veil messenger — WebSocket, Protobuf, session management"
 
+[features]
+default = []
+# Test-only hooks for cross-crate native integration tests. Never enable in
+# production artifacts.
+test-utils = []
+
 [dependencies]
 veil-crypto = { path = "../veil-crypto" }
 veil-store = { path = "../veil-store" }

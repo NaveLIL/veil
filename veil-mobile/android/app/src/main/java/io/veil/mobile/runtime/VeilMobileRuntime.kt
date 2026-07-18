@@ -13,6 +13,7 @@ import uniffi.veil_ffi.MobileAuthenticatedBinding
 import uniffi.veil_ffi.MobileConnectCancellation
 import uniffi.veil_ffi.MobileDirectConversationData
 import uniffi.veil_ffi.MobileDirectDirectoryPageData
+import uniffi.veil_ffi.MobileDirectOwnPreKeyProgress
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSyncLease
@@ -41,6 +42,27 @@ internal enum class NativeDirectDirectoryState {
   ERROR,
 }
 
+/** Native checkpoint for the authenticated device's public prekey bootstrap. */
+internal enum class NativeOwnPreKeyState {
+  IDLE,
+  CHECKING,
+  PUBLISHING,
+  PUBLISHED,
+  ERROR,
+}
+
+/**
+ * Coarse, non-sensitive progress suitable for the React Native loading gate.
+ * It deliberately reveals neither request targets nor public key material.
+ */
+internal enum class NativeSecureSyncState {
+  IDLE,
+  PUBLISHING_KEYS,
+  SYNCING_DIRECTORY,
+  DIRECTORY_SYNCHRONIZED,
+  ERROR,
+}
+
 internal data class PublicAuthenticatedBinding(
   val canonicalServerOrigin: String,
   val userId: String,
@@ -66,11 +88,21 @@ internal data class NativeDirectSyncLease(
 /** A prepared request bound to [NativeDirectSyncLease]. Never expose to JS. */
 internal data class NativeDirectRestRequest(
   val requestToken: String,
+  val method: String,
   val requestTarget: String,
+  val body: ByteArray,
+  val responseLimitBytes: Long,
 ) {
   override fun toString(): String =
-    "NativeDirectRestRequest(requestTarget=[REDACTED], requestToken=[REDACTED])"
+    "NativeDirectRestRequest(" +
+      "method=$method, requestTarget=[REDACTED], requestToken=[REDACTED], " +
+      "body=[REDACTED], responseLimitBytes=$responseLimitBytes)"
 }
+
+/** Only the terminal publication bit crosses out of the native install call. */
+internal data class NativeDirectOwnPreKeyProgress(
+  val publicationComplete: Boolean,
+)
 
 /**
  * Public directory metadata copied out of a validated native install result.
@@ -118,6 +150,10 @@ internal data class VeilMobileRuntimeSnapshot(
   val sessionState: NativeSessionState,
   val connectionState: NativeConnectionState,
   val directoryReady: Boolean,
+  /** Coarse bootstrap progress; contains no keys, capabilities, targets, or response bytes. */
+  val secureSyncState: NativeSecureSyncState,
+  /** Native-only checkpoint used to enforce prekeys-before-directory ordering. */
+  val ownPreKeyState: NativeOwnPreKeyState,
   /** Native-only checkpoint state; deliberately omitted from the RN payload. */
   val directDirectoryState: NativeDirectDirectoryState,
   /** Published atomically only after the final authenticated directory page. */
@@ -157,6 +193,14 @@ internal interface NativeMobileSession : AutoCloseable {
 
   fun beginDirectSync(): NativeDirectSyncLease
 
+  fun prepareOwnPreKeyRequest(leaseToken: String): NativeDirectRestRequest
+
+  fun installOwnPreKeyResponse(
+    leaseToken: String,
+    requestToken: String,
+    response: ByteArray,
+  ): NativeDirectOwnPreKeyProgress
+
   fun prepareDirectDirectoryRequest(leaseToken: String): NativeDirectRestRequest
 
   fun installDirectDirectoryPage(
@@ -179,11 +223,10 @@ internal interface NativeMobileSession : AutoCloseable {
 
   fun cancelDirectSync(leaseToken: String)
 
-  fun signRestRequest(
-    canonicalServerOrigin: String,
-    method: String,
-    requestTarget: String,
-    body: ByteArray,
+  /** Sign the exact native outstanding request bound to both capabilities. */
+  fun signDirectRestRequest(
+    leaseToken: String,
+    requestToken: String,
   ): NativeRestSignature
 
   fun disconnect()
@@ -223,6 +266,7 @@ internal class VeilMobileRuntime internal constructor(
   private var connectionState = NativeConnectionState.DISCONNECTED
   private var binding: PublicAuthenticatedBinding? = null
   private var directoryReady = false
+  private var ownPreKeyState = NativeOwnPreKeyState.IDLE
   private var directDirectoryState = NativeDirectDirectoryState.IDLE
   private var directConversations: List<NativeDirectConversationInstall> = emptyList()
   // Process-scoped runtimes start without UI authority. Only an Activity
@@ -259,6 +303,7 @@ internal class VeilMobileRuntime internal constructor(
   ) {
     val conversations = LinkedHashMap<String, NativeDirectConversationInstall>()
     var pendingRequest: PendingDirectRequest? = null
+    var ownPreKeyRequestsPrepared = 0
 
     override fun toString(): String =
       "ActiveDirectSync(epoch=$epoch, canonicalServerOrigin=$canonicalServerOrigin, " +
@@ -267,11 +312,33 @@ internal class VeilMobileRuntime internal constructor(
 
   private class PendingDirectRequest(
     val requestToken: String,
+    val stage: DirectRequestStage,
+    val method: NativeDirectHttpMethod,
   ) {
     var call: NativeDirectHttpCall? = null
 
     override fun toString(): String =
-      "PendingDirectRequest(requestToken=[REDACTED], callAttached=${call != null})"
+      "PendingDirectRequest(" +
+        "stage=$stage, method=$method, requestToken=[REDACTED], " +
+        "callAttached=${call != null})"
+  }
+
+  private enum class DirectRequestStage {
+    OWN_PREKEY,
+    DIRECTORY,
+  }
+
+  private class PreparedDirectHttpRequest(
+    val pending: PendingDirectRequest,
+    val httpRequest: NativeDirectHttpRequest,
+    private val wireBody: ByteArray,
+  ) {
+    fun wipeWireBody() {
+      wireBody.fill(0)
+    }
+
+    override fun toString(): String =
+      "PreparedDirectHttpRequest(pending=$pending, httpRequest=$httpRequest, wireBody=[REDACTED])"
   }
 
   private data class DetachedDirectSync(
@@ -328,6 +395,7 @@ internal class VeilMobileRuntime internal constructor(
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
       directoryReady = false
+      ownPreKeyState = NativeOwnPreKeyState.IDLE
       directDirectoryState = NativeDirectDirectoryState.IDLE
       directConversations = emptyList()
       lifecycleEpoch
@@ -345,6 +413,7 @@ internal class VeilMobileRuntime internal constructor(
           connectionState = NativeConnectionState.DISCONNECTED
           binding = null
           directoryReady = false
+          ownPreKeyState = NativeOwnPreKeyState.IDLE
           directDirectoryState = NativeDirectDirectoryState.IDLE
           directConversations = emptyList()
         }
@@ -493,7 +562,7 @@ internal class VeilMobileRuntime internal constructor(
         throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
       }
       if (accessAttempt != null) passStore.clearAfterSuccess(accessAttempt.flowId)
-      startDirectDirectorySync(active, attempt.epoch, authenticated)
+      startDirectSyncBootstrap(active, attempt.epoch, authenticated)
       publishSnapshot()
       authenticated
     } catch (error: Throwable) {
@@ -556,7 +625,7 @@ internal class VeilMobileRuntime internal constructor(
     }
   }
 
-  private fun startDirectDirectorySync(
+  private fun startDirectSyncBootstrap(
     active: NativeMobileSession,
     epoch: Long,
     authenticated: PublicAuthenticatedBinding,
@@ -564,14 +633,14 @@ internal class VeilMobileRuntime internal constructor(
     val lease = try {
       active.beginDirectSync()
     } catch (_: Throwable) {
-      throw VeilMobileRuntimeException("E_VEIL_SYNC", "Unable to verify the Direct directory")
+      throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
     }
     if (
       lease.canonicalServerOrigin != authenticated.canonicalServerOrigin ||
       lease.userId != authenticated.userId
     ) {
       DetachedDirectSync(active, lease.leaseToken, null).cancelLeaseQuietly()
-      throw VeilMobileRuntimeException("E_VEIL_SYNC", "Unable to verify the Direct directory")
+      throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
     }
 
     val sync = ActiveDirectSync(
@@ -592,7 +661,8 @@ internal class VeilMobileRuntime internal constructor(
         activeDirectSync == null
       ) {
         activeDirectSync = sync
-        directDirectoryState = NativeDirectDirectoryState.SYNCING
+        ownPreKeyState = NativeOwnPreKeyState.CHECKING
+        directDirectoryState = NativeDirectDirectoryState.IDLE
         directConversations = emptyList()
         directoryReady = false
         true
@@ -606,68 +676,255 @@ internal class VeilMobileRuntime internal constructor(
     }
 
     try {
-      requestNextDirectDirectoryPage(sync)
+      requestNextOwnPreKeyStep(sync)
     } catch (_: Throwable) {
       failDirectSync(sync)
-      throw VeilMobileRuntimeException("E_VEIL_SYNC", "Unable to verify the Direct directory")
+      throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
+    }
+  }
+
+  /**
+   * Run the native-owned count/outbox protocol before any directory request.
+   * Native chooses every method, target, body, id, and retry. Android only
+   * signs and transports the exact prepared DTO under this generation.
+   */
+  private fun requestNextOwnPreKeyStep(sync: ActiveDirectSync) {
+    val mayPrepare = synchronized(stateLock) {
+      val current = isCurrentDirectSyncLocked(sync) &&
+        sync.pendingRequest == null &&
+        ownPreKeyState != NativeOwnPreKeyState.PUBLISHED
+      if (current) {
+        check(sync.ownPreKeyRequestsPrepared < MAX_OWN_PREKEY_REQUESTS) {
+          "native own-prekey bootstrap exceeded its request bound"
+        }
+      }
+      current
+    }
+    if (!mayPrepare) return
+
+    val prepared = sync.session.prepareOwnPreKeyRequest(sync.leaseToken)
+    val signed = prepareSignedDirectRequest(sync, prepared, DirectRequestStage.OWN_PREKEY)
+    val pending = signed.pending
+    val call = try {
+      directTransport.createCall(signed.httpRequest) { result ->
+        enqueueOwnPreKeyResult(sync, pending, result)
+      }
+    } finally {
+      // NativeDirectHttpExecutor synchronously snapshots request bytes while
+      // creating an unstarted call. Wipe Android's transport copy before the
+      // call can be attached to the active lease or started.
+      signed.wipeWireBody()
+    }
+
+    val registered = try {
+      synchronized(stateLock) {
+        if (
+          isCurrentDirectSyncLocked(sync) &&
+          sync.pendingRequest == null &&
+          ownPreKeyState != NativeOwnPreKeyState.PUBLISHED
+        ) {
+          if (sync.ownPreKeyRequestsPrepared == 1) {
+            check(pending.method == NativeDirectHttpMethod.POST) {
+              "native own-prekey upload did not follow the count request"
+            }
+          }
+          sync.pendingRequest = pending
+          sync.ownPreKeyRequestsPrepared += 1
+          ownPreKeyState = when (pending.method) {
+            NativeDirectHttpMethod.GET -> NativeOwnPreKeyState.CHECKING
+            NativeDirectHttpMethod.POST -> NativeOwnPreKeyState.PUBLISHING
+          }
+          pending.call = call
+          true
+        } else {
+          false
+        }
+      }
+    } catch (error: Throwable) {
+      call.cancelQuietly()
+      throw error
+    }
+    if (!registered) {
+      call.cancelQuietly()
+      return
+    }
+    // Lifecycle/reconnect teardown may cancel between attachment and this
+    // call. NativeDirectHttpCall.start is fail-closed after such cancellation,
+    // so a revoked lease can never launch the prepared request.
+    call.start()
+  }
+
+  private fun enqueueOwnPreKeyResult(
+    sync: ActiveDirectSync,
+    pending: PendingDirectRequest,
+    result: NativeDirectHttpResult,
+  ) {
+    try {
+      executor.execute {
+        handleOwnPreKeyResult(sync, pending, result)
+      }
+    } catch (_: RuntimeException) {
+      result.wipeSensitiveBody()
+    }
+  }
+
+  private fun handleOwnPreKeyResult(
+    sync: ActiveDirectSync,
+    pending: PendingDirectRequest,
+    result: NativeDirectHttpResult,
+  ) {
+    try {
+      val current = synchronized(stateLock) {
+        isCurrentDirectSyncLocked(sync) &&
+          sync.pendingRequest === pending &&
+          pending.stage == DirectRequestStage.OWN_PREKEY
+      }
+      if (!current) return
+      if (result !is NativeDirectHttpResult.Success) {
+        failDirectSync(sync)
+        return
+      }
+
+      val progress = sync.session.installOwnPreKeyResponse(
+        sync.leaseToken,
+        pending.requestToken,
+        result.body,
+      )
+      check(
+        (pending.method == NativeDirectHttpMethod.GET && !progress.publicationComplete) ||
+          (pending.method == NativeDirectHttpMethod.POST && progress.publicationComplete),
+      ) { "native own-prekey progress contradicted the prepared request" }
+
+      val accepted = synchronized(stateLock) {
+        if (!isCurrentDirectSyncLocked(sync) || sync.pendingRequest !== pending) {
+          false
+        } else {
+          sync.pendingRequest = null
+          if (progress.publicationComplete) {
+            ownPreKeyState = NativeOwnPreKeyState.PUBLISHED
+            directDirectoryState = NativeDirectDirectoryState.SYNCING
+          }
+          true
+        }
+      }
+      if (!accepted) return
+
+      if (progress.publicationComplete) {
+        requestNextDirectDirectoryPage(sync)
+      } else {
+        requestNextOwnPreKeyStep(sync)
+      }
+      publishSnapshot()
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+    } finally {
+      result.wipeSensitiveBody()
     }
   }
 
   private fun requestNextDirectDirectoryPage(sync: ActiveDirectSync) {
     val mayPrepare = synchronized(stateLock) {
-      isCurrentDirectSyncLocked(sync) && sync.pendingRequest == null
+      isCurrentDirectSyncLocked(sync) &&
+        sync.pendingRequest == null &&
+        ownPreKeyState == NativeOwnPreKeyState.PUBLISHED
     }
     if (!mayPrepare) return
 
     val prepared = sync.session.prepareDirectDirectoryRequest(sync.leaseToken)
-    val signature = sync.session.signRestRequest(
-      sync.canonicalServerOrigin,
-      HTTP_GET_METHOD,
-      prepared.requestTarget,
-      EMPTY_REQUEST_BODY,
-    )
-    check(signature.userId == sync.userId) { "native Direct signer returned a mismatched account" }
-
-    val pending = PendingDirectRequest(prepared.requestToken)
-    val registered = synchronized(stateLock) {
-      if (isCurrentDirectSyncLocked(sync) && sync.pendingRequest == null) {
-        sync.pendingRequest = pending
-        true
-      } else {
-        false
-      }
-    }
-    if (!registered) return
-
+    val signed = prepareSignedDirectRequest(sync, prepared, DirectRequestStage.DIRECTORY)
+    val pending = signed.pending
     val call = try {
-      directTransport.execute(
-        NativeDirectHttpRequest(
-          canonicalServerOrigin = sync.canonicalServerOrigin,
-          requestTarget = prepared.requestTarget,
-          signature = signature,
-          responseLimitBytes = NativeDirectHttpLimits.DIRECTORY_BYTES,
-        ),
-      ) { result ->
+      directTransport.createCall(signed.httpRequest) { result ->
         enqueueDirectDirectoryResult(sync, pending, result)
       }
-    } catch (error: Throwable) {
-      synchronized(stateLock) {
-        if (activeDirectSync === sync && sync.pendingRequest === pending) {
-          sync.pendingRequest = null
-        }
-      }
-      throw error
+    } finally {
+      signed.wipeWireBody()
     }
 
-    val retained = synchronized(stateLock) {
-      if (isCurrentDirectSyncLocked(sync) && sync.pendingRequest === pending) {
+    val registered = synchronized(stateLock) {
+      if (
+        isCurrentDirectSyncLocked(sync) &&
+        sync.pendingRequest == null &&
+        ownPreKeyState == NativeOwnPreKeyState.PUBLISHED
+      ) {
+        sync.pendingRequest = pending
         pending.call = call
         true
       } else {
         false
       }
     }
-    if (!retained) call.cancelQuietly()
+    if (!registered) {
+      call.cancelQuietly()
+      return
+    }
+    call.start()
+  }
+
+  /** Prepare and sign one exact native DTO, rejecting stage/method drift. */
+  private fun prepareSignedDirectRequest(
+    sync: ActiveDirectSync,
+    prepared: NativeDirectRestRequest,
+    stage: DirectRequestStage,
+  ): PreparedDirectHttpRequest {
+    val method = when (prepared.method) {
+      HTTP_GET_METHOD -> NativeDirectHttpMethod.GET
+      HTTP_POST_METHOD -> NativeDirectHttpMethod.POST
+      else -> throw IllegalStateException("native Direct request method is unsupported")
+    }
+    val exactBody = prepared.body.copyOf()
+    prepared.body.fill(0)
+    try {
+      when (stage) {
+        DirectRequestStage.OWN_PREKEY -> when (method) {
+          NativeDirectHttpMethod.GET -> {
+            check(exactBody.isEmpty()) { "native own-prekey count body is not empty" }
+            check(prepared.responseLimitBytes == NativeDirectHttpLimits.OWN_PREKEY_COUNT_BYTES) {
+              "native own-prekey count response bound changed"
+            }
+          }
+          NativeDirectHttpMethod.POST -> {
+            check(prepared.requestTarget == OWN_PREKEY_UPLOAD_TARGET) {
+              "native own-prekey upload target changed"
+            }
+            check(exactBody.isNotEmpty()) { "native own-prekey upload body is empty" }
+            check(prepared.responseLimitBytes == NativeDirectHttpLimits.OWN_PREKEY_UPLOAD_BYTES) {
+              "native own-prekey upload response bound changed"
+            }
+          }
+        }
+        DirectRequestStage.DIRECTORY -> {
+          check(method == NativeDirectHttpMethod.GET) { "native Direct directory method changed" }
+          check(exactBody.isEmpty()) { "native Direct directory body is not empty" }
+          check(prepared.responseLimitBytes == NativeDirectHttpLimits.DIRECTORY_BYTES) {
+            "native Direct directory response bound changed"
+          }
+        }
+      }
+
+      val signature = sync.session.signDirectRestRequest(sync.leaseToken, prepared.requestToken)
+      check(signature.userId == sync.userId) { "native Direct signer returned a mismatched account" }
+      val pending = PendingDirectRequest(
+        requestToken = prepared.requestToken,
+        stage = stage,
+        method = method,
+      )
+      return PreparedDirectHttpRequest(
+        pending = pending,
+        httpRequest = NativeDirectHttpRequest(
+          canonicalServerOrigin = sync.canonicalServerOrigin,
+          requestTarget = prepared.requestTarget,
+          signature = signature,
+          responseLimitBytes = prepared.responseLimitBytes,
+          method = method,
+          body = exactBody,
+        ),
+        wireBody = exactBody,
+      )
+    } catch (error: Throwable) {
+      exactBody.fill(0)
+      throw error
+    }
   }
 
   private fun enqueueDirectDirectoryResult(
@@ -691,7 +948,9 @@ internal class VeilMobileRuntime internal constructor(
   ) {
     try {
       val current = synchronized(stateLock) {
-        isCurrentDirectSyncLocked(sync) && sync.pendingRequest === pending
+        isCurrentDirectSyncLocked(sync) &&
+          sync.pendingRequest === pending &&
+          pending.stage == DirectRequestStage.DIRECTORY
       }
       if (!current) return
       if (result !is NativeDirectHttpResult.Success) {
@@ -747,6 +1006,7 @@ internal class VeilMobileRuntime internal constructor(
     val detached = synchronized(stateLock) {
       if (activeDirectSync !== sync) return
       val selected = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+      ownPreKeyState = NativeOwnPreKeyState.ERROR
       if (
         foreground &&
         lifecycleEpoch == sync.epoch &&
@@ -786,7 +1046,17 @@ internal class VeilMobileRuntime internal constructor(
     val selected = activeDirectSync
     activeDirectSync = null
     val pendingCall = selected?.pendingRequest?.call
+    // Cancel under the same lock that revokes the generation. This closes the
+    // tiny attach-before-start window: once lifecycle/reconnect has linearized
+    // here, a still-unstarted call is terminal before the requester can start
+    // it. The out-of-lock cancellation below remains an idempotent fallback.
+    pendingCall?.cancelQuietly()
     selected?.pendingRequest = null
+    ownPreKeyState = if (nextState == NativeDirectDirectoryState.ERROR) {
+      NativeOwnPreKeyState.ERROR
+    } else {
+      NativeOwnPreKeyState.IDLE
+    }
     directDirectoryState = nextState
     directConversations = emptyList()
     directoryReady = false
@@ -1012,6 +1282,8 @@ internal class VeilMobileRuntime internal constructor(
       sessionState = sessionState,
       connectionState = connectionState,
       directoryReady = directoryReady,
+      secureSyncState = secureSyncStateLocked(),
+      ownPreKeyState = ownPreKeyState,
       directDirectoryState = directDirectoryState,
       directConversations = directConversations.toList(),
       binding = binding,
@@ -1021,6 +1293,18 @@ internal class VeilMobileRuntime internal constructor(
         null
       },
     )
+  }
+
+  private fun secureSyncStateLocked(): NativeSecureSyncState = when {
+    connectionState == NativeConnectionState.ERROR ||
+      ownPreKeyState == NativeOwnPreKeyState.ERROR ||
+      directDirectoryState == NativeDirectDirectoryState.ERROR -> NativeSecureSyncState.ERROR
+    ownPreKeyState == NativeOwnPreKeyState.CHECKING ||
+      ownPreKeyState == NativeOwnPreKeyState.PUBLISHING -> NativeSecureSyncState.PUBLISHING_KEYS
+    directDirectoryState == NativeDirectDirectoryState.SYNCING -> NativeSecureSyncState.SYNCING_DIRECTORY
+    directDirectoryState == NativeDirectDirectoryState.SYNCHRONIZED ->
+      NativeSecureSyncState.DIRECTORY_SYNCHRONIZED
+    else -> NativeSecureSyncState.IDLE
   }
 
   private fun publicConnectError(error: Throwable): VeilMobileRuntimeException {
@@ -1045,8 +1329,11 @@ internal class VeilMobileRuntime internal constructor(
 
   companion object {
     private const val HTTP_GET_METHOD = "GET"
+    private const val HTTP_POST_METHOD = "POST"
+    private const val OWN_PREKEY_UPLOAD_TARGET = "/v1/prekeys"
+    private const val MAX_OWN_PREKEY_REQUESTS = 2
+    private const val SECURE_DIRECT_BOOTSTRAP_ERROR = "Unable to complete the secure Direct bootstrap"
     private const val MAX_DIRECT_CONVERSATIONS = 10_000
-    private val EMPTY_REQUEST_BODY = ByteArray(0)
 
     private fun newRuntimeExecutor(): ExecutorService =
       Executors.newSingleThreadExecutor { operation ->
@@ -1118,6 +1405,17 @@ private class UniFfiMobileSession(
   override fun beginDirectSync(): NativeDirectSyncLease =
     delegate.beginDirectSync().toNativeDirectSyncLease()
 
+  override fun prepareOwnPreKeyRequest(leaseToken: String): NativeDirectRestRequest =
+    delegate.prepareOwnPrekeyRequest(leaseToken).toNativeDirectRestRequest()
+
+  override fun installOwnPreKeyResponse(
+    leaseToken: String,
+    requestToken: String,
+    response: ByteArray,
+  ): NativeDirectOwnPreKeyProgress =
+    delegate.installOwnPrekeyResponse(leaseToken, requestToken, response)
+      .toNativeDirectOwnPreKeyProgress()
+
   override fun prepareDirectDirectoryRequest(leaseToken: String): NativeDirectRestRequest =
     delegate.prepareDirectDirectoryRequest(leaseToken).toNativeDirectRestRequest()
 
@@ -1147,13 +1445,11 @@ private class UniFfiMobileSession(
     delegate.cancelDirectSync(leaseToken)
   }
 
-  override fun signRestRequest(
-    canonicalServerOrigin: String,
-    method: String,
-    requestTarget: String,
-    body: ByteArray,
+  override fun signDirectRestRequest(
+    leaseToken: String,
+    requestToken: String,
   ): NativeRestSignature =
-    delegate.signRestRequest(canonicalServerOrigin, method, requestTarget, body).toNativeRestSignature()
+    delegate.signDirectRestRequest(leaseToken, requestToken).toNativeRestSignature()
 
   override fun disconnect() {
     delegate.disconnect()
@@ -1188,8 +1484,20 @@ internal fun MobileDirectSyncLease.toNativeDirectSyncLease(): NativeDirectSyncLe
     userId = userId,
   )
 
-internal fun MobileDirectRestRequest.toNativeDirectRestRequest(): NativeDirectRestRequest =
-  NativeDirectRestRequest(requestToken = requestToken, requestTarget = requestTarget)
+internal fun MobileDirectRestRequest.toNativeDirectRestRequest(): NativeDirectRestRequest {
+  val copiedBody = body.copyOf()
+  body.fill(0)
+  return NativeDirectRestRequest(
+    requestToken = requestToken,
+    method = method,
+    requestTarget = requestTarget,
+    body = copiedBody,
+    responseLimitBytes = responseLimitBytes.toLong(),
+  )
+}
+
+internal fun MobileDirectOwnPreKeyProgress.toNativeDirectOwnPreKeyProgress(): NativeDirectOwnPreKeyProgress =
+  NativeDirectOwnPreKeyProgress(publicationComplete = publicationComplete)
 
 internal fun MobileDirectConversationData.toNativeDirectConversationInstall(): NativeDirectConversationInstall =
   NativeDirectConversationInstall(

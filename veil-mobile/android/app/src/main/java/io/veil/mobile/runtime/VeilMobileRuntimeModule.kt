@@ -105,6 +105,7 @@ private fun VeilMobileRuntimeSnapshot.toWritableMap(): WritableMap = Arguments.c
   putString("sessionState", sessionState.name.lowercase())
   putString("connectionState", connectionState.name.lowercase())
   putBoolean("directoryReady", directoryReady)
+  putString("secureSyncState", secureSyncState.name.lowercase())
   putMap("binding", binding?.toWritableMap())
   putMap("pendingAccessPass", pendingAccessPass?.toWritableMap())
 }

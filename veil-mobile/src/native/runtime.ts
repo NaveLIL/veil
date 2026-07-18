@@ -14,6 +14,12 @@ import {
 
 export type NativeSessionState = "locked" | "opening" | "open" | "closing" | "error";
 export type NativeConnectionState = "disconnected" | "connecting" | "connected" | "error";
+export type NativeSecureSyncState =
+  | "idle"
+  | "publishing_keys"
+  | "syncing_directory"
+  | "directory_synchronized"
+  | "error";
 
 export interface AuthenticatedBinding {
   canonicalServerOrigin: string;
@@ -34,6 +40,8 @@ export interface VeilMobileRuntimeSnapshot {
   sessionState: NativeSessionState;
   connectionState: NativeConnectionState;
   directoryReady: boolean;
+  /** Coarse native bootstrap progress. Contains no keys, request data, or capabilities. */
+  secureSyncState: NativeSecureSyncState;
   binding: AuthenticatedBinding | null;
   pendingAccessPass: PendingNodeAccessPass | null;
 }

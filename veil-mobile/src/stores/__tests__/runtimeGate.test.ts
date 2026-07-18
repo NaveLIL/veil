@@ -20,6 +20,7 @@ const snapshot = (
   sessionState: "open",
   connectionState: "connected",
   directoryReady: true,
+  secureSyncState: "directory_synchronized",
   binding: exactBinding,
   pendingAccessPass: null,
   ...overrides,
@@ -81,6 +82,7 @@ describe("chat render authorization", () => {
       sessionState: "locked",
       connectionState: "disconnected",
       directoryReady: false,
+      secureSyncState: "idle",
       binding: null,
     });
 
@@ -91,6 +93,7 @@ describe("chat render authorization", () => {
       expect(merged.sessionState).toBe("locked");
       expect(merged.connectionState).toBe("disconnected");
       expect(merged.directoryReady).toBe(false);
+      expect(merged.secureSyncState).toBe("idle");
       expect(merged.binding).toBeNull();
       expect(canRenderChat(merged, false)).toBe(false);
     }
@@ -101,6 +104,7 @@ describe("chat render authorization", () => {
     );
     expect(disputedIdentity.identityExists).toBe(true);
     expect(disputedIdentity.sessionState).toBe("locked");
+    expect(disputedIdentity.secureSyncState).toBe("idle");
     expect(disputedIdentity.binding).toBeNull();
     expect(canRenderChat(disputedIdentity, false)).toBe(false);
   });
