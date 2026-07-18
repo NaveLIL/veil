@@ -359,11 +359,25 @@ pub struct ChannelInfoLite {
 /// socket channel, the pre-auth retained barrier, and the API's deferred FIFO.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionEventBufferErrorV1 {
-    EventCountLimitExceeded { limit: usize },
-    RetainedSizeLimitExceeded { limit: usize, event_bytes: usize },
+    EventCountLimitExceeded {
+        limit: usize,
+    },
+    RetainedSizeLimitExceeded {
+        limit: usize,
+        event_bytes: usize,
+    },
     RetainedSizeAccountingOverflow,
     TransportEpochEnded,
-    AuthenticationEpochAnomaly { envelope: &'static str },
+    AuthenticationEpochAnomaly {
+        envelope: &'static str,
+    },
+    /// A post-authentication frame used a malformed encoding or an invalid
+    /// representation of an event this client understands. Continuing after
+    /// silently dropping it could skip a Double Ratchet step, so the complete
+    /// authenticated transport epoch becomes terminal instead.
+    ProtocolViolation {
+        envelope: &'static str,
+    },
 }
 
 impl fmt::Display for ConnectionEventBufferErrorV1 {
@@ -386,6 +400,10 @@ impl fmt::Display for ConnectionEventBufferErrorV1 {
             Self::AuthenticationEpochAnomaly { envelope } => write!(
                 formatter,
                 "unexpected authentication envelope {envelope} after the authenticated barrier"
+            ),
+            Self::ProtocolViolation { envelope } => write!(
+                formatter,
+                "malformed {envelope} envelope after the authenticated barrier"
             ),
         }
     }
@@ -1169,6 +1187,7 @@ impl Connection {
         let mut retained_events = VecDeque::with_capacity(retained_before_auth.len());
         for envelope in retained_before_auth {
             let event = connection_event_from_envelope(envelope)
+                .map_err(|_| "invalid retained sender-key event".to_string())?
                 .ok_or_else(|| "invalid retained sender-key event".to_string())?;
             retained_events.push_back(
                 event_budget
@@ -1248,20 +1267,26 @@ impl Connection {
                     }
                     incoming = ws_read.next() => {
                         match incoming {
-                            Some(Ok(WsMessage::Binary(data))) => {
-                                if let Ok(env) = proto::Envelope::decode(data.as_ref()) {
-                                    if let Err(error) = dispatch_event(&evt, env).await {
-                                        signal_event_buffer_failure(
-                                            &read_terminal,
-                                            &read_shutdown,
-                                            error,
-                                        );
-                                        break;
-                                    }
+                            Some(Ok(message)) => match dispatch_authenticated_ws_message(&evt, message).await {
+                                Ok(AuthenticatedWsMessageOutcomeV1::Continue) => continue,
+                                Ok(AuthenticatedWsMessageOutcomeV1::Closed) => {
+                                    signal_disconnected(
+                                        &read_terminal,
+                                        &read_shutdown,
+                                        "server closed".into(),
+                                    );
+                                    break;
                                 }
-                            }
-                            Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
-                            Some(Ok(WsMessage::Close(_))) | None => {
+                                Err(error) => {
+                                    signal_event_buffer_failure(
+                                        &read_terminal,
+                                        &read_shutdown,
+                                        error,
+                                    );
+                                    break;
+                                }
+                            },
+                            None => {
                                 signal_disconnected(
                                     &read_terminal,
                                     &read_shutdown,
@@ -1277,7 +1302,6 @@ impl Connection {
                                 );
                                 break;
                             }
-                            _ => continue,
                         }
                     }
                 }
@@ -1709,7 +1733,19 @@ fn sender_key_ack_from_proto(ack: &proto::MessageAck) -> Option<Option<SenderKey
     }))
 }
 
-fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEvent> {
+fn protocol_violation(envelope: &'static str) -> ConnectionEventBufferErrorV1 {
+    ConnectionEventBufferErrorV1::ProtocolViolation { envelope }
+}
+
+/// Decode a post-authentication envelope which is part of the event contract.
+///
+/// Known payloads that this client intentionally does not consume remain an
+/// explicit `Ok(None)` for protocol forward compatibility. A malformed payload
+/// that *is* handled here is different: dropping it could hide an encrypted
+/// chat or acknowledgement step, so it terminates the authenticated epoch.
+fn connection_event_from_envelope(
+    env: proto::Envelope,
+) -> Result<Option<ConnectionEvent>, ConnectionEventBufferErrorV1> {
     let event = match env.payload {
         Some(proto::envelope::Payload::MessageEvent(me)) => {
             if me.message_id.is_empty()
@@ -1728,13 +1764,15 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
                     .is_some_and(|value| value.len() > MAX_EVENT_HEADER_BYTES)
                 || me.attachments.len() > crate::attachments::MAX_ATTACHMENTS_PER_MESSAGE
             {
-                return None;
+                return Err(protocol_violation("MessageEvent"));
             }
-            let security_context = message_security_context_from_proto(&me)?;
-            let event_type = proto::message_event::EventType::try_from(me.event_type).ok()?;
+            let security_context = message_security_context_from_proto(&me)
+                .ok_or_else(|| protocol_violation("MessageEvent"))?;
+            let event_type = proto::message_event::EventType::try_from(me.event_type)
+                .map_err(|_| protocol_violation("MessageEvent"))?;
             match event_type {
                 proto::message_event::EventType::Edited if !me.attachments.is_empty() => {
-                    return None;
+                    return Err(protocol_violation("MessageEvent"));
                 }
                 proto::message_event::EventType::Edited => ConnectionEvent::MessageEdited {
                     message_id: me.message_id,
@@ -1745,7 +1783,7 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
                     edit_timestamp: me.edit_timestamp.unwrap_or(me.server_timestamp),
                 },
                 proto::message_event::EventType::Deleted if !me.attachments.is_empty() => {
-                    return None;
+                    return Err(protocol_violation("MessageEvent"));
                 }
                 proto::message_event::EventType::Deleted => ConnectionEvent::MessageDeleted {
                     message_id: me.message_id,
@@ -1778,7 +1816,36 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
             }
         }
         Some(proto::envelope::Payload::MessageAck(ack)) => {
-            let sender_key = sender_key_ack_from_proto(&ack)?;
+            // MessageAck is also the generic command ACK and the Sender-Key
+            // distribution/receipt ACK, so an empty message id and timestamp
+            // are valid for those forms. All forms still correlate to a
+            // positive client sequence; chat ACKs additionally require their
+            // complete message result tuple.
+            if ack.ref_seq == 0
+                || ack.message_id.len() > MAX_EVENT_ID_BYTES
+                || (ack.message_id.is_empty() != (ack.server_timestamp == 0))
+            {
+                return Err(protocol_violation("MessageAck"));
+            }
+            let sender_key =
+                sender_key_ack_from_proto(&ack).ok_or_else(|| protocol_violation("MessageAck"))?;
+            let chat_ack = !ack.message_id.is_empty();
+            let valid_shape = match (chat_ack, sender_key.as_ref()) {
+                // Chat ACKs may carry the accepted roster version, but never
+                // the Sender-Key distribution route tuple.
+                (true, None) => true,
+                // Distribution/receipt ACKs use the complete route tuple and
+                // intentionally have no chat message result.
+                (false, Some(_)) => true,
+                // A generic command ACK is only a sequence correlation. A
+                // roster version without either chat or exact route metadata
+                // is ambiguous and must not reach the mutation finalizers.
+                (false, None) => ack.roster_version.is_none(),
+                (true, Some(_)) => false,
+            };
+            if !valid_shape {
+                return Err(protocol_violation("MessageAck"));
+            }
             ConnectionEvent::MessageAcked {
                 message_id: ack.message_id,
                 server_timestamp: ack.server_timestamp,
@@ -1860,12 +1927,13 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
             }
         }
         Some(proto::envelope::Payload::ProfileUpdated(update)) => {
-            let parsed_user_id = Uuid::parse_str(&update.user_id).ok()?;
+            let parsed_user_id = Uuid::parse_str(&update.user_id)
+                .map_err(|_| protocol_violation("ProfileUpdated"))?;
             if parsed_user_id.to_string() != update.user_id
                 || update.profile_version == 0
                 || update.profile_version > i64::MAX as u64
             {
-                return None;
+                return Err(protocol_violation("ProfileUpdated"));
             }
             ConnectionEvent::ProfileUpdated {
                 user_id: update.user_id,
@@ -1912,15 +1980,20 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
             }
         }
         Some(proto::envelope::Payload::SenderKeyDist(skd)) => {
-            let route = sender_key_route_from_proto(&skd)?;
+            let route = sender_key_route_from_proto(&skd)
+                .ok_or_else(|| protocol_violation("SenderKeyDistribution"))?;
             ConnectionEvent::SenderKeyDist {
                 sender_key_message: skd.sender_key_message,
                 route,
             }
         }
-        _ => return None, // Ignore unhandled types for now
+        // Known payloads without a ConnectionEvent consumer are intentionally
+        // ignored. In particular, an absent payload may be a future oneof field
+        // unknown to this generated client, so it is not sufficient evidence
+        // of a protocol violation by itself.
+        _ => return Ok(None),
     };
-    Some(event)
+    Ok(Some(event))
 }
 
 async fn dispatch_event(
@@ -1936,10 +2009,45 @@ async fn dispatch_event(
     if let Some(envelope) = authentication_envelope {
         return Err(ConnectionEventBufferErrorV1::AuthenticationEpochAnomaly { envelope });
     }
-    if let Some(event) = connection_event_from_envelope(env) {
+    if let Some(event) = connection_event_from_envelope(env)? {
         tx.send(event).await?;
     }
     Ok(())
+}
+
+async fn dispatch_authenticated_binary_frame(
+    tx: &ConnectionEventSenderV1,
+    wire: &[u8],
+) -> Result<(), ConnectionEventBufferErrorV1> {
+    let env = proto::Envelope::decode(wire).map_err(|_| protocol_violation("Envelope"))?;
+    dispatch_event(tx, env).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthenticatedWsMessageOutcomeV1 {
+    Continue,
+    Closed,
+}
+
+async fn dispatch_authenticated_ws_message(
+    tx: &ConnectionEventSenderV1,
+    message: WsMessage,
+) -> Result<AuthenticatedWsMessageOutcomeV1, ConnectionEventBufferErrorV1> {
+    match message {
+        WsMessage::Binary(data) => {
+            dispatch_authenticated_binary_frame(tx, data.as_ref()).await?;
+            Ok(AuthenticatedWsMessageOutcomeV1::Continue)
+        }
+        // The authenticated Veil application protocol is protobuf-only.
+        // Ignoring another data-message type can create the same invisible
+        // protocol gap as dropping a malformed binary envelope.
+        WsMessage::Text(_) => Err(protocol_violation("WebSocket Text data frame")),
+        // Tungstenite documents that raw frames are not yielded while reading,
+        // but keep the boundary exhaustive and fail closed if that changes.
+        WsMessage::Frame(_) => Err(protocol_violation("WebSocket raw data frame")),
+        WsMessage::Ping(_) | WsMessage::Pong(_) => Ok(AuthenticatedWsMessageOutcomeV1::Continue),
+        WsMessage::Close(_) => Ok(AuthenticatedWsMessageOutcomeV1::Closed),
+    }
 }
 
 #[cfg(test)]
@@ -2132,6 +2240,265 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn malformed_authenticated_binary_preempts_queued_ciphertext_with_typed_terminal() {
+        let budget = ConnectionEventBudgetV1::with_limits(2, LIVE_EVENT_RETAINED_BYTES);
+        let (raw_tx, raw_rx) = mpsc::channel(2);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget: budget.clone(),
+        };
+        let mut receiver = ConnectionEventReceiverV1 {
+            receiver: raw_rx,
+            terminal: terminal.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Queue an encrypted event first. A later malformed authenticated
+        // frame must preempt it rather than letting a consumer observe an
+        // apparently quiescent FIFO and then advance past a missing ratchet
+        // step.
+        let valid = proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(base_message_event())),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        dispatch_authenticated_binary_frame(&sender, &valid)
+            .await
+            .unwrap();
+
+        let error = dispatch_authenticated_binary_frame(&sender, &[0x80])
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "Envelope"
+            }
+        );
+        signal_event_buffer_failure(&terminal, &shutdown_tx, error.clone());
+
+        let terminal_event = receiver.try_recv_budgeted().unwrap();
+        assert_eq!(terminal_event.terminal_failure(), Some(&error));
+        assert!(matches!(
+            terminal_event.into_event(),
+            ConnectionEvent::Disconnected { reason }
+                if reason == "malformed Envelope envelope after the authenticated barrier"
+        ));
+        assert!(*shutdown_rx.borrow());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        // Terminal preemption drained the earlier ciphertext and released its
+        // shared permit; it can never be delivered after the protocol gap.
+        let replacement = budget.try_wrap(error_event_with_capacity(1)).unwrap();
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn authenticated_text_frame_preempts_queued_event_and_releases_its_permit() {
+        let budget = ConnectionEventBudgetV1::with_limits(1, LIVE_EVENT_RETAINED_BYTES);
+        let (raw_tx, raw_rx) = mpsc::channel(1);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget: budget.clone(),
+        };
+        let mut receiver = ConnectionEventReceiverV1 {
+            receiver: raw_rx,
+            terminal: terminal.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Control frames are legal throughout an authenticated epoch.
+        for control in [WsMessage::Ping(Vec::new()), WsMessage::Pong(Vec::new())] {
+            assert_eq!(
+                dispatch_authenticated_ws_message(&sender, control)
+                    .await
+                    .unwrap(),
+                AuthenticatedWsMessageOutcomeV1::Continue
+            );
+        }
+
+        let valid = proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(base_message_event())),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            dispatch_authenticated_ws_message(&sender, WsMessage::Binary(valid))
+                .await
+                .unwrap(),
+            AuthenticatedWsMessageOutcomeV1::Continue
+        );
+
+        let error =
+            dispatch_authenticated_ws_message(&sender, WsMessage::Text("not protobuf".to_string()))
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error,
+            ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "WebSocket Text data frame"
+            }
+        );
+        signal_event_buffer_failure(&terminal, &shutdown_tx, error.clone());
+
+        let terminal_event = receiver.try_recv_budgeted().unwrap();
+        assert_eq!(terminal_event.terminal_failure(), Some(&error));
+        assert!(matches!(
+            terminal_event.into_event(),
+            ConnectionEvent::Disconnected { reason }
+                if reason.contains("WebSocket Text data frame")
+        ));
+        assert!(*shutdown_rx.borrow());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        // The queued event owned the epoch's only permit. Terminal preemption
+        // drained it, so the same budget can be acquired again immediately.
+        let replacement = budget.try_wrap(error_event_with_capacity(1)).unwrap();
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn malformed_handled_chat_events_are_protocol_terminals() {
+        let budget = ConnectionEventBudgetV1::with_limits(1, LIVE_EVENT_RETAINED_BYTES);
+        let (raw_tx, _raw_rx) = mpsc::channel(1);
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget,
+        };
+
+        let mut invalid_message = base_message_event();
+        invalid_message.event_type = 99;
+        let invalid_message = proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(invalid_message)),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            dispatch_authenticated_binary_frame(&sender, &invalid_message)
+                .await
+                .unwrap_err(),
+            ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "MessageEvent"
+            }
+        );
+
+        let partial_sender_key_ack = proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageAck(proto::MessageAck {
+                message_id: "message-1".to_string(),
+                server_timestamp: 1,
+                ref_seq: 1,
+                target_device_id: vec![0x22; 16],
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        assert_eq!(
+            dispatch_authenticated_binary_frame(&sender, &partial_sender_key_ack)
+                .await
+                .unwrap_err(),
+            ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "MessageAck"
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn mutually_exclusive_ack_shapes_are_enforced_before_enqueue() {
+        let budget = ConnectionEventBudgetV1::with_limits(2, LIVE_EVENT_RETAINED_BYTES);
+        let (raw_tx, mut raw_rx) = mpsc::channel(2);
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget,
+        };
+
+        let combined_chat_and_sender_key = proto::MessageAck {
+            message_id: "message-1".to_string(),
+            server_timestamp: 1,
+            ref_seq: 1,
+            target_device_id: vec![0x22; 16],
+            conversation_id: Some("conversation-1".to_string()),
+            sender_key_generation: Some(1),
+            roster_version: Some(4),
+            envelope_commitment: Some(vec![0x33; 32]),
+        };
+        let generic_with_orphan_roster = proto::MessageAck {
+            ref_seq: 2,
+            roster_version: Some(4),
+            ..Default::default()
+        };
+
+        for ack in [combined_chat_and_sender_key, generic_with_orphan_roster] {
+            let wire = proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageAck(ack)),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            assert_eq!(
+                dispatch_authenticated_binary_frame(&sender, &wire)
+                    .await
+                    .unwrap_err(),
+                ConnectionEventBufferErrorV1::ProtocolViolation {
+                    envelope: "MessageAck"
+                }
+            );
+            assert!(matches!(
+                raw_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn explicitly_unsupported_post_auth_payloads_remain_forward_compatible() {
+        let budget = ConnectionEventBudgetV1::with_limits(1, LIVE_EVENT_RETAINED_BYTES);
+        let (raw_tx, mut raw_rx) = mpsc::channel(1);
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget,
+        };
+        let delivered = proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageDelivered(
+                proto::MessageDelivered {
+                    message_id: "message-1".to_string(),
+                    conversation_id: "conversation-1".to_string(),
+                    timestamp: 1,
+                },
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        dispatch_authenticated_binary_frame(&sender, &delivered)
+            .await
+            .unwrap();
+        assert!(matches!(
+            raw_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        // Prost represents an unknown future oneof field as no known payload.
+        // Absence alone therefore stays ignorable rather than making every
+        // future server event fatal to older clients.
+        let future_payload = proto::Envelope::default().encode_to_vec();
+        dispatch_authenticated_binary_frame(&sender, &future_payload)
+            .await
+            .unwrap();
+        assert!(matches!(
+            raw_rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
     fn base_message_event() -> proto::MessageEvent {
         proto::MessageEvent {
             event_type: proto::message_event::EventType::New as i32,
@@ -2154,7 +2521,7 @@ mod tests {
             payload: Some(proto::envelope::Payload::MessageEvent(unknown)),
             ..Default::default()
         })
-        .is_none());
+        .is_err());
 
         let mut partial = base_message_event();
         partial.crypto_profile = "sender_key_v5".to_string();
@@ -2162,7 +2529,7 @@ mod tests {
             payload: Some(proto::envelope::Payload::MessageEvent(partial)),
             ..Default::default()
         })
-        .is_none());
+        .is_err());
 
         let mut exact = base_message_event();
         exact.crypto_profile = "sender_key_v5".to_string();
@@ -2177,10 +2544,10 @@ mod tests {
                 payload: Some(proto::envelope::Payload::MessageEvent(exact)),
                 ..Default::default()
             }),
-            Some(ConnectionEvent::MessageReceived {
+            Ok(Some(ConnectionEvent::MessageReceived {
                 security_context: Some(crate::api::MessageSecurityContextV1::SenderKeyV5(_)),
                 ..
-            })
+            }))
         ));
     }
 
@@ -2197,10 +2564,10 @@ mod tests {
                 )),
                 ..Default::default()
             }),
-            Some(ConnectionEvent::ProfileUpdated {
+            Ok(Some(ConnectionEvent::ProfileUpdated {
                 user_id: accepted_user_id,
                 profile_version,
-            }) if accepted_user_id == user_id && profile_version == i64::MAX as u64
+            })) if accepted_user_id == user_id && profile_version == i64::MAX as u64
         ));
 
         for update in [
@@ -2221,7 +2588,7 @@ mod tests {
                 payload: Some(proto::envelope::Payload::ProfileUpdated(update)),
                 ..Default::default()
             })
-            .is_none());
+            .is_err());
         }
     }
 
@@ -2285,8 +2652,27 @@ mod tests {
             ..Default::default()
         };
         assert!(sender_key_ack_from_proto(&partial_ack).is_none());
+        let generic_command_ack = proto::MessageAck {
+            ref_seq: 1,
+            ..Default::default()
+        };
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageAck(generic_command_ack)),
+                ..Default::default()
+            }),
+            Ok(Some(ConnectionEvent::MessageAcked {
+                message_id,
+                server_timestamp: 0,
+                ref_seq: 1,
+                sender_key: None,
+                ..
+            })) if message_id.is_empty()
+        ));
         let secure_message_ack = proto::MessageAck {
             message_id: "message-1".to_string(),
+            server_timestamp: 1,
+            ref_seq: 1,
             roster_version: Some(4),
             ..Default::default()
         };
@@ -2295,13 +2681,14 @@ mod tests {
                 payload: Some(proto::envelope::Payload::MessageAck(secure_message_ack)),
                 ..Default::default()
             }),
-            Some(ConnectionEvent::MessageAcked {
+            Ok(Some(ConnectionEvent::MessageAcked {
                 message_id,
                 sender_key: None,
                 ..
-            }) if message_id == "message-1"
+            })) if message_id == "message-1"
         ));
         let exact_ack = proto::MessageAck {
+            ref_seq: 2,
             target_device_id: vec![0x22; 16],
             conversation_id: Some("conversation-1".to_string()),
             sender_key_generation: Some(1),
@@ -2312,6 +2699,17 @@ mod tests {
         assert!(matches!(
             sender_key_ack_from_proto(&exact_ack),
             Some(Some(_))
+        ));
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageAck(exact_ack)),
+                ..Default::default()
+            }),
+            Ok(Some(ConnectionEvent::MessageAcked {
+                ref_seq: 2,
+                sender_key: Some(_),
+                ..
+            }))
         ));
     }
 }

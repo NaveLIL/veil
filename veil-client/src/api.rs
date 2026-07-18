@@ -4982,13 +4982,31 @@ impl VeilClient {
         }
 
         let result = self.with_classified_receive_savepoint("receive", |client| {
-            if client
+            if let Some((
+                bound_conversation_id,
+                bound_sender_key,
+                bound_is_outgoing,
+                bound_server_timestamp,
+            )) = client
                 .db
                 .as_ref()
                 .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
-                .message_exists(message_id)
+                .get_message_binding(message_id)
                 .map_err(DirectHistoryMutationError::storage)?
             {
+                let timestamp_matches = match (bound_server_timestamp, server_timestamp) {
+                    (Some(bound), Some(presented)) => bound == presented,
+                    _ => true,
+                };
+                if bound_conversation_id != conversation_id
+                    || bound_sender_key.as_slice() != sender_identity_key
+                    || bound_is_outgoing
+                    || !timestamp_matches
+                {
+                    return Err(DirectHistoryMutationError::rejected(
+                        "inbound duplicate conflicts with its persisted message binding",
+                    ));
+                }
                 if let (Some(author_snapshot), Some(author_context)) =
                     (author_snapshot, author_context)
                 {
@@ -8871,6 +8889,675 @@ mod tests {
                 .author
                 .as_ref(),
             Some(&author)
+        );
+    }
+
+    struct DuplicateReceiveFixture {
+        bob: VeilClient,
+        alice_key: [u8; 32],
+        bob_key: [u8; 32],
+        bob_signing: [u8; 32],
+        author: AccountSnapshot,
+        header: Vec<u8>,
+        ciphertext: Vec<u8>,
+    }
+
+    fn duplicate_receive_fixture() -> DuplicateReceiveFixture {
+        let alice_identity = IdentityKeyPair::generate();
+        let alice_key = alice_identity.x25519_public_bytes();
+        let alice_signing = alice_identity.ed25519_public_bytes();
+        let bob_identity = IdentityKeyPair::generate();
+        let bob_key = bob_identity.x25519_public_bytes();
+        let bob_signing = bob_identity.ed25519_public_bytes();
+        let mut alice = VeilClient::from_identity(alice_identity);
+        let mut bob = VeilClient::from_identity(bob_identity);
+        bob.db = Some(VeilDb::open_memory(&[0xD7; 32]).unwrap());
+
+        let author = AccountSnapshot {
+            locator: veil_store::models::ProfileLocator {
+                canonical_server_origin: "https://duplicate.test:443".to_string(),
+                user_id: "00000000-0000-0000-0000-0000000000d7".to_string(),
+                identity_key: alice_key,
+            },
+            signing_key: alice_signing,
+            username: Some("Alice".to_string()),
+            display_name: Some("Alice Duplicate".to_string()),
+            profile_version: Some(1),
+            profile_origin: "https://duplicate.test:443".to_string(),
+            source: veil_store::models::AccountSnapshotSource::AuthenticatedConversationDirectory,
+            observed_at: "2026-07-18T00:00:00Z".to_string(),
+        };
+        bob.db()
+            .unwrap()
+            .upsert_identity_directory(std::slice::from_ref(&author))
+            .unwrap();
+        bob.db()
+            .unwrap()
+            .upsert_directory_conversation(
+                "dm-duplicate",
+                0,
+                "https://duplicate.test:443",
+                Some("Alice"),
+                Some("00000000-0000-0000-0000-0000000000d7"),
+                Some(alice_key.as_slice()),
+                None,
+                "2026-07-18T00:00:00Z",
+            )
+            .unwrap();
+        bob.pin_peer_signing_key(alice_key, alice_signing).unwrap();
+
+        let prekeys = bob.generate_prekeys().unwrap();
+        let (opk, opk_id) = prekeys.otk_publics[0];
+        alice
+            .establish_session(
+                &bob_key,
+                &x3dh::PreKeyBundle {
+                    identity_key: bob_key,
+                    signing_key: bob_signing,
+                    signed_prekey: prekeys.spk_public,
+                    signed_prekey_signature: prekeys.spk_signature,
+                    signed_prekey_id: prekeys.spk_id,
+                    one_time_prekey: Some(opk),
+                    one_time_prekey_id: Some(opk_id),
+                },
+            )
+            .unwrap();
+        alice.bind_dm_conversation("dm-duplicate", bob_key).unwrap();
+        let (ciphertext, header) = alice
+            .encrypt_outgoing("dm-duplicate", "duplicate fixture")
+            .unwrap();
+        assert_eq!(
+            bob.receive_and_persist_message(
+                "duplicate-message",
+                "dm-duplicate",
+                &alice_key,
+                Some(&author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
+                false,
+                None,
+                Some("Alice"),
+                &header,
+                &ciphertext,
+                Some(1700),
+                None,
+                None,
+            )
+            .unwrap(),
+            ReceiveMessageResult::Stored {
+                plaintext: "duplicate fixture".to_string(),
+            }
+        );
+
+        DuplicateReceiveFixture {
+            bob,
+            alice_key,
+            bob_key,
+            bob_signing,
+            author,
+            header,
+            ciphertext,
+        }
+    }
+
+    fn duplicate_ratchet_state(client: &VeilClient, peer_key: &[u8; 32]) -> (Vec<u8>, Vec<u8>) {
+        let runtime = serde_json::to_vec(
+            client
+                .ratchet_sessions
+                .get(peer_key)
+                .expect("stored fixture message established a ratchet"),
+        )
+        .unwrap();
+        let persisted = client
+            .db()
+            .unwrap()
+            .load_ratchet_session(peer_key)
+            .unwrap()
+            .expect("stored fixture message persisted its ratchet");
+        (runtime, persisted)
+    }
+
+    fn assert_duplicate_rejected_without_mutation(
+        fixture: &mut DuplicateReceiveFixture,
+        message_id: &str,
+        conversation_id: &str,
+        sender_key: &[u8; 32],
+        server_timestamp: Option<i64>,
+    ) {
+        let binding_before = fixture
+            .bob
+            .db()
+            .unwrap()
+            .get_message_binding(message_id)
+            .unwrap();
+        let ratchet_before = duplicate_ratchet_state(&fixture.bob, &fixture.alice_key);
+        let (messages_before, conversations_before, authors_before): (i64, i64, i64) = fixture
+            .bob
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT
+                    (SELECT COUNT(*) FROM messages),
+                    (SELECT COUNT(*) FROM conversations),
+                    (SELECT COUNT(*) FROM message_author_snapshots_v1)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            fixture
+                .bob
+                .receive_and_persist_message_with_attachments_classified(
+                    message_id,
+                    conversation_id,
+                    sender_key,
+                    Some(&fixture.author),
+                    Some(MessageAuthorContext::DirectoryMemberAtObservation),
+                    false,
+                    None,
+                    Some("Alice"),
+                    &fixture.header,
+                    &fixture.ciphertext,
+                    server_timestamp,
+                    None,
+                    &[],
+                    None,
+                    AtomicReceiveDecryptMode::General,
+                ),
+            Err(DirectHistoryMutationError::ConversationRejected(_))
+        ));
+        assert_eq!(
+            fixture
+                .bob
+                .db()
+                .unwrap()
+                .get_message_binding(message_id)
+                .unwrap(),
+            binding_before
+        );
+        assert_eq!(
+            duplicate_ratchet_state(&fixture.bob, &fixture.alice_key),
+            ratchet_before
+        );
+        assert_eq!(
+            fixture
+                .bob
+                .db()
+                .unwrap()
+                .conn()
+                .query_row(
+                    "SELECT
+                        (SELECT COUNT(*) FROM messages),
+                        (SELECT COUNT(*) FROM conversations),
+                        (SELECT COUNT(*) FROM message_author_snapshots_v1)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap(),
+            (messages_before, conversations_before, authors_before)
+        );
+    }
+
+    fn assert_exact_duplicate_without_mutation(
+        fixture: &mut DuplicateReceiveFixture,
+        presented_server_timestamp: Option<i64>,
+    ) {
+        let binding_before = fixture
+            .bob
+            .db()
+            .unwrap()
+            .get_message_binding("duplicate-message")
+            .unwrap();
+        let ratchet_before = duplicate_ratchet_state(&fixture.bob, &fixture.alice_key);
+        let message_before = serde_json::to_vec(
+            &fixture
+                .bob
+                .db()
+                .unwrap()
+                .get_messages("dm-duplicate", 10)
+                .unwrap()[0],
+        )
+        .unwrap();
+
+        assert_eq!(
+            fixture
+                .bob
+                .receive_and_persist_message_with_attachments_classified(
+                    "duplicate-message",
+                    "dm-duplicate",
+                    &fixture.alice_key,
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some("Alice"),
+                    &fixture.header,
+                    &fixture.ciphertext,
+                    presented_server_timestamp,
+                    None,
+                    &[],
+                    None,
+                    AtomicReceiveDecryptMode::General,
+                )
+                .unwrap(),
+            ReceiveMessageResult::Duplicate
+        );
+        assert_eq!(
+            fixture
+                .bob
+                .db()
+                .unwrap()
+                .get_message_binding("duplicate-message")
+                .unwrap(),
+            binding_before
+        );
+        assert_eq!(
+            duplicate_ratchet_state(&fixture.bob, &fixture.alice_key),
+            ratchet_before
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &fixture
+                    .bob
+                    .db()
+                    .unwrap()
+                    .get_messages("dm-duplicate", 10)
+                    .unwrap()[0],
+            )
+            .unwrap(),
+            message_before
+        );
+    }
+
+    #[test]
+    fn exact_inbound_duplicate_does_not_advance_ratchet_and_attaches_author() {
+        let mut fixture = duplicate_receive_fixture();
+        fixture
+            .bob
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "DELETE FROM message_author_snapshots_v1 WHERE message_id = ?1",
+                rusqlite::params!["duplicate-message"],
+            )
+            .unwrap();
+        let binding_before = fixture
+            .bob
+            .db()
+            .unwrap()
+            .get_message_binding("duplicate-message")
+            .unwrap();
+        let ratchet_before = duplicate_ratchet_state(&fixture.bob, &fixture.alice_key);
+
+        assert_eq!(
+            fixture
+                .bob
+                .receive_and_persist_message_with_attachments_classified(
+                    "duplicate-message",
+                    "dm-duplicate",
+                    &fixture.alice_key,
+                    Some(&fixture.author),
+                    Some(MessageAuthorContext::DirectoryMemberAtObservation),
+                    false,
+                    None,
+                    Some("Alice"),
+                    &fixture.header,
+                    &fixture.ciphertext,
+                    Some(1700),
+                    None,
+                    &[],
+                    None,
+                    AtomicReceiveDecryptMode::General,
+                )
+                .unwrap(),
+            ReceiveMessageResult::Duplicate
+        );
+        assert_eq!(
+            duplicate_ratchet_state(&fixture.bob, &fixture.alice_key),
+            ratchet_before
+        );
+        assert_eq!(
+            fixture
+                .bob
+                .db()
+                .unwrap()
+                .get_message_binding("duplicate-message")
+                .unwrap(),
+            binding_before
+        );
+        assert_eq!(
+            fixture
+                .bob
+                .db()
+                .unwrap()
+                .get_messages("dm-duplicate", 10)
+                .unwrap()[0]
+                .author
+                .as_ref(),
+            Some(&fixture.author)
+        );
+    }
+
+    #[test]
+    fn duplicate_with_persisted_timestamp_accepts_missing_presented_timestamp() {
+        let mut fixture = duplicate_receive_fixture();
+        assert_eq!(
+            fixture
+                .bob
+                .db()
+                .unwrap()
+                .get_message_binding("duplicate-message")
+                .unwrap()
+                .unwrap()
+                .3,
+            Some(1700)
+        );
+        assert_exact_duplicate_without_mutation(&mut fixture, None);
+    }
+
+    #[test]
+    fn duplicate_with_missing_persisted_timestamp_accepts_presented_timestamp() {
+        let mut fixture = duplicate_receive_fixture();
+        fixture
+            .bob
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE messages SET server_timestamp = NULL WHERE id = ?1",
+                rusqlite::params!["duplicate-message"],
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .bob
+                .db()
+                .unwrap()
+                .get_message_binding("duplicate-message")
+                .unwrap()
+                .unwrap()
+                .3,
+            None
+        );
+        assert_exact_duplicate_without_mutation(&mut fixture, Some(1700));
+    }
+
+    #[test]
+    fn conflicting_duplicate_binding_is_rejected_without_any_receive_mutation() {
+        let mut fixture = duplicate_receive_fixture();
+        fixture
+            .bob
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "DELETE FROM message_author_snapshots_v1 WHERE message_id = ?1",
+                rusqlite::params!["duplicate-message"],
+            )
+            .unwrap();
+        let mallory_identity = IdentityKeyPair::generate();
+        let mallory_key = mallory_identity.x25519_public_bytes();
+        fixture
+            .bob
+            .pin_peer_signing_key(mallory_key, mallory_identity.ed25519_public_bytes())
+            .unwrap();
+        let alice_key = fixture.alice_key;
+
+        assert_duplicate_rejected_without_mutation(
+            &mut fixture,
+            "duplicate-message",
+            "dm-other",
+            &alice_key,
+            Some(1700),
+        );
+        assert_duplicate_rejected_without_mutation(
+            &mut fixture,
+            "duplicate-message",
+            "dm-duplicate",
+            &mallory_key,
+            Some(1700),
+        );
+        assert_duplicate_rejected_without_mutation(
+            &mut fixture,
+            "duplicate-message",
+            "dm-duplicate",
+            &alice_key,
+            Some(1701),
+        );
+
+        fixture
+            .bob
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE messages SET is_outgoing = 1 WHERE id = ?1",
+                rusqlite::params!["duplicate-message"],
+            )
+            .unwrap();
+        assert_duplicate_rejected_without_mutation(
+            &mut fixture,
+            "duplicate-message",
+            "dm-duplicate",
+            &alice_key,
+            Some(1700),
+        );
+    }
+
+    #[test]
+    fn outgoing_duplicate_row_collision_is_rejected_by_inbound_receive() {
+        let mut fixture = duplicate_receive_fixture();
+        fixture
+            .bob
+            .pin_peer_signing_key(fixture.bob_key, fixture.bob_signing)
+            .unwrap();
+        fixture
+            .bob
+            .db()
+            .unwrap()
+            .insert_message(
+                "own-duplicate-message",
+                "dm-duplicate",
+                &fixture.bob_key,
+                "already sent",
+                true,
+                Some(1800),
+                None,
+            )
+            .unwrap();
+        let bob_key = fixture.bob_key;
+        assert_duplicate_rejected_without_mutation(
+            &mut fixture,
+            "own-duplicate-message",
+            "dm-duplicate",
+            &bob_key,
+            Some(1800),
+        );
+    }
+
+    #[test]
+    fn same_account_other_device_sender_key_duplicate_is_inbound_and_idempotent() {
+        let user_id = uuid::Uuid::parse_str("00000000-0000-0000-0000-0000000000d8").unwrap();
+        let mut sender = memory_client_with_device(
+            IdentityKeyPair::from_mnemonic(PREKEY_TEST_MNEMONIC).unwrap(),
+            user_id,
+            [0xD8; 16],
+            [0xD9; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::from_mnemonic(PREKEY_TEST_MNEMONIC).unwrap(),
+            user_id,
+            [0xDA; 16],
+            [0xDB; 32],
+        );
+        let account_identity_key = sender.identity_key().unwrap();
+        assert_eq!(recipient.identity_key().unwrap(), account_identity_key);
+        let conversation = "00000000-0000-0000-0000-0000000000d9";
+        let roster = candidate_with_commitment(
+            conversation,
+            1,
+            vec![
+                roster_entry(
+                    *user_id.as_bytes(),
+                    sender.identity.as_ref().unwrap(),
+                    sender.device_identity.as_ref().unwrap().binding(),
+                ),
+                roster_entry(
+                    *user_id.as_bytes(),
+                    recipient.identity.as_ref().unwrap(),
+                    recipient.device_identity.as_ref().unwrap().binding(),
+                ),
+            ],
+        );
+        sender.mark_channel_conversation(conversation);
+        recipient.mark_channel_conversation(conversation);
+        sender.install_device_roster_v1(roster.clone()).unwrap();
+        recipient.install_device_roster_v1(roster).unwrap();
+        let target = sender
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (pending, sealed) = sender.prepare_sender_key_device_envelope(&target).unwrap();
+        let route = route_for_test(&sender, &target, &pending);
+        let sender_device_identity_key = route.sender_device_identity_key;
+        recipient
+            .process_sender_key_distribution_v1(&sealed, &route)
+            .unwrap();
+        sender.mark_sender_key_distributed(conversation).unwrap();
+        let (ciphertext, header) = sender
+            .encrypt_outgoing(conversation, "from my other device")
+            .unwrap();
+        let context = MessageSecurityContextV1::SenderKeyV5(SenderKeyMessageSecurityContextV1 {
+            roster_version: route.roster_version,
+            roster_commitment: route.roster_commitment,
+            sender_device_id: route.sender_device_id,
+            target_device_id: route.target_device_id,
+            sender_binding_version: route.sender_binding_version,
+        });
+        assert_eq!(
+            recipient
+                .receive_and_persist_message(
+                    "same-account-device-message",
+                    conversation,
+                    &account_identity_key,
+                    None,
+                    None,
+                    true,
+                    Some(&context),
+                    Some("Own devices"),
+                    &header,
+                    &ciphertext,
+                    Some(1900),
+                    None,
+                    None,
+                )
+                .unwrap(),
+            ReceiveMessageResult::Stored {
+                plaintext: "from my other device".to_string(),
+            }
+        );
+        let binding_before = recipient
+            .db()
+            .unwrap()
+            .get_message_binding("same-account-device-message")
+            .unwrap();
+        assert_eq!(
+            binding_before,
+            Some((
+                conversation.to_string(),
+                account_identity_key.to_vec(),
+                false,
+                Some(1900),
+            ))
+        );
+        let runtime_sender_key_before = recipient
+            .sender_keys
+            .serialize_incoming(conversation, &sender_device_identity_key)
+            .unwrap();
+        let persisted_sender_keys = |client: &VeilClient| {
+            client
+                .db()
+                .unwrap()
+                .load_incoming_sender_key_generations_for_group(conversation)
+                .unwrap()
+                .into_iter()
+                .map(|generation| {
+                    (
+                        generation.sender_identity_key,
+                        generation.generation,
+                        generation.iteration,
+                        generation.state_revision,
+                        generation.distribution_commitment,
+                        generation.key_data.to_vec(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let persisted_sender_keys_before = persisted_sender_keys(&recipient);
+        let message_before = serde_json::to_vec(
+            &recipient
+                .db()
+                .unwrap()
+                .get_messages(conversation, 10)
+                .unwrap()[0],
+        )
+        .unwrap();
+
+        assert_eq!(
+            recipient
+                .receive_and_persist_message_with_attachments_classified(
+                    "same-account-device-message",
+                    conversation,
+                    &account_identity_key,
+                    None,
+                    None,
+                    true,
+                    Some(&context),
+                    Some("Own devices"),
+                    &header,
+                    &ciphertext,
+                    Some(1900),
+                    None,
+                    &[],
+                    None,
+                    AtomicReceiveDecryptMode::General,
+                )
+                .unwrap(),
+            ReceiveMessageResult::Duplicate
+        );
+        assert_eq!(
+            recipient
+                .db()
+                .unwrap()
+                .get_message_binding("same-account-device-message")
+                .unwrap(),
+            binding_before
+        );
+        assert_eq!(
+            &*recipient
+                .sender_keys
+                .serialize_incoming(conversation, &sender_device_identity_key)
+                .unwrap(),
+            &*runtime_sender_key_before
+        );
+        assert_eq!(
+            persisted_sender_keys(&recipient),
+            persisted_sender_keys_before
+        );
+        assert_eq!(
+            serde_json::to_vec(
+                &recipient
+                    .db()
+                    .unwrap()
+                    .get_messages(conversation, 10)
+                    .unwrap()[0],
+            )
+            .unwrap(),
+            message_before
         );
     }
 
