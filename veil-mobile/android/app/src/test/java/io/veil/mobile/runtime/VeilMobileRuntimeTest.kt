@@ -107,8 +107,19 @@ class VeilMobileRuntimeTest {
       NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
     )
     try {
-      runtime.openSession()
+      val opened = runtime.openSession()
+      assertNull(opened.directGeneration)
+      val nextCapture = runtime.snapshot()
+      assertEquals(opened.runtimeRevision + 1, nextCapture.runtimeRevision)
       val firstBinding = runtime.connect("https://access.example")
+      val firstGenerationSnapshot = runtime.snapshot()
+      val firstGeneration = checkNotNull(firstGenerationSnapshot.directGeneration)
+      val sameGenerationSnapshot = runtime.snapshot()
+      assertEquals(firstGeneration, sameGenerationSnapshot.directGeneration)
+      assertEquals(
+        firstGenerationSnapshot.runtimeRevision + 1,
+        sameGenerationSnapshot.runtimeRevision,
+      )
       completeOwnPreKeyBootstrap(runtime, transport)
       transport.completeNext(NativeDirectHttpResult.Success("directory-a".toByteArray()))
       awaitRuntimeIdle(runtime)
@@ -143,6 +154,8 @@ class VeilMobileRuntimeTest {
       )
       val secondBinding = runtime.connect("https://access.example")
       assertEquals(firstBinding, secondBinding)
+      val secondGeneration = checkNotNull(runtime.snapshot().directGeneration)
+      assertTrue(secondGeneration > firstGeneration)
       completeOwnPreKeyBootstrap(runtime, transport)
       transport.completeNext(NativeDirectHttpResult.Success("directory-b".toByteArray()))
       awaitRuntimeIdle(runtime)
@@ -1586,6 +1599,80 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun publicDirectoryProjectionIsAllowlistedAndRequiresExactReadyAuthority() {
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val ready = readyPublicDirectorySnapshot(listOf(conversation))
+
+    val publication = ready.toPublicDirectDirectoryPublication()
+    assertTrue(publication.ready)
+    assertEquals(1, publication.conversations.size)
+    assertEquals(
+      setOf("conversationId", "name", "peerUserId", "peerUsername"),
+      PublicDirectConversationView::class.java.declaredFields.map { it.name }.toSet(),
+    )
+    assertEquals(conversation.conversationId, publication.conversations.single().conversationId)
+    assertEquals("Alice", publication.conversations.single().name)
+    assertEquals("alice", publication.conversations.single().peerUsername)
+    assertFalse(publication.toString().contains("needsPreKey"))
+    assertFalse(publication.toString().contains("Alice"))
+    assertFalse(publication.conversations.single().toString().contains("Alice"))
+
+    val lifecycleDisagreements = listOf(
+      ready.copy(identityExists = false),
+      ready.copy(sessionState = NativeSessionState.LOCKED),
+      ready.copy(connectionState = NativeConnectionState.DISCONNECTED),
+      ready.copy(directoryReady = false),
+      ready.copy(secureSyncState = NativeSecureSyncState.SYNCING_HISTORY),
+      ready.copy(ownPreKeyState = NativeOwnPreKeyState.CHECKING),
+      ready.copy(directDirectoryState = NativeDirectDirectoryState.SYNCING),
+      ready.copy(directHistoryState = NativeDirectHistoryState.SYNCING),
+      ready.copy(binding = null),
+    )
+    lifecycleDisagreements.forEach { snapshot ->
+      val denied = snapshot.toPublicDirectDirectoryPublication()
+      assertFalse(denied.ready)
+      assertTrue(denied.conversations.isEmpty())
+    }
+  }
+
+  @Test
+  fun publicDirectoryProjectionRejectsMalformedRowsWithoutPublishingAPrefix() {
+    val valid = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+    val invalidDirectories = listOf(
+      listOf(valid, valid.copy(peerUsername = "other")),
+      listOf(
+        valid,
+        directConversation("09", "Earlier", "12", "earlier", needsPreKey = false),
+      ),
+      listOf(valid.copy(conversationId = "00000000-0000-0000-0000-000000000000")),
+      listOf(valid.copy(peerUserId = valid.peerUserId.uppercase())),
+      listOf(valid.copy(peerUserId = "550e8400-e29b-41d4-a716-446655440001")),
+      listOf(valid.copy(name = "Alice\nAdmin")),
+      listOf(valid.copy(peerUsername = "a".repeat(129))),
+      listOf(valid.copy(name = "\uD800")),
+    )
+
+    invalidDirectories.forEach { conversations ->
+      val denied = readyPublicDirectorySnapshot(conversations)
+        .toPublicDirectDirectoryPublication()
+      assertFalse(denied.ready)
+      assertTrue(denied.conversations.isEmpty())
+    }
+
+    val exactFourByteName = "\uD83E\uDD80".repeat(64)
+    assertTrue(
+      readyPublicDirectorySnapshot(listOf(valid.copy(name = exactFourByteName)))
+        .toPublicDirectDirectoryPublication()
+        .ready,
+    )
+    assertFalse(
+      readyPublicDirectorySnapshot(listOf(valid.copy(name = "$exactFourByteName+")))
+        .toPublicDirectDirectoryPublication()
+        .ready,
+    )
+  }
+
+  @Test
   fun preKeyInstallMappingIsClosedOverKnownNativeStatuses() {
     assertEquals(
       NativeDirectPreKeyInstallStatus.ESTABLISHED,
@@ -1710,6 +1797,27 @@ class VeilMobileRuntimeTest {
     peerUserId = "550e8400-e29b-41d4-a716-4466554400$peerSuffix",
     peerUsername = peerUsername,
     needsPreKey = needsPreKey,
+  )
+
+  private fun readyPublicDirectorySnapshot(
+    conversations: List<NativeDirectConversationInstall>,
+  ): VeilMobileRuntimeSnapshot = VeilMobileRuntimeSnapshot(
+    identityExists = true,
+    runtimeRevision = 1L,
+    directGeneration = 1L,
+    sessionState = NativeSessionState.OPEN,
+    connectionState = NativeConnectionState.CONNECTED,
+    directoryReady = true,
+    secureSyncState = NativeSecureSyncState.HISTORY_SYNCHRONIZED,
+    ownPreKeyState = NativeOwnPreKeyState.PUBLISHED,
+    directDirectoryState = NativeDirectDirectoryState.SYNCHRONIZED,
+    directHistoryState = NativeDirectHistoryState.SYNCHRONIZED,
+    directConversations = conversations,
+    binding = PublicAuthenticatedBinding(
+      canonicalServerOrigin = "https://veil.example:443",
+      userId = "550e8400-e29b-41d4-a716-446655440001",
+    ),
+    pendingAccessPass = null,
   )
 
   private class FakeVault : NativeIdentityVaultAccess {

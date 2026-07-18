@@ -53,9 +53,9 @@ export function canonicalIdentityOrigin(value: string | null | undefined): strin
   }
 }
 
-// Syntax is insufficient for a trust statement. A caller must explicitly
-// carry provenance from an authenticated directory; prototype/mock rows stay
-// unavailable until Phase 5 wires that native observation.
+// Syntax and account metadata are insufficient for a cryptographic trust
+// statement. A caller must explicitly carry native authenticated key
+// provenance; the public mobile directory intentionally does not expose it.
 export function authoritativeIdentityLocator(
   candidate: IdentityProofCandidate,
 ): ExactIdentityLocator | null {

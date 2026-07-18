@@ -1,18 +1,22 @@
 import { describe, expect, test } from "@jest/globals";
-import { MEMBERS_BY_SERVER } from "../../../stores/chat";
 import { authoritativeIdentityLocator, canonicalIdentityOrigin } from "../IdentityProof";
 
 describe("mobile identity proof boundary", () => {
   test("requires explicit authenticated provenance before making a TOFU claim", () => {
-    const prototypeRow = MEMBERS_BY_SERVER.veil[0];
-    expect(authoritativeIdentityLocator(prototypeRow)).toBeNull();
+    const presentationOnlyRow = {
+      canonicalServerOrigin: "https://veil.example:443",
+      userId: "10000000-0000-4000-8000-000000000001",
+      identityKey: "11".repeat(32),
+      identityAuthority: "unavailable" as const,
+    };
+    expect(authoritativeIdentityLocator(presentationOnlyRow)).toBeNull();
     expect(authoritativeIdentityLocator({
-      ...prototypeRow,
+      ...presentationOnlyRow,
       identityAuthority: "authenticated-directory",
     })).toEqual({
-      canonicalServerOrigin: prototypeRow.canonicalServerOrigin,
-      userId: prototypeRow.userId,
-      identityKey: prototypeRow.identityKey,
+      canonicalServerOrigin: presentationOnlyRow.canonicalServerOrigin,
+      userId: presentationOnlyRow.userId,
+      identityKey: presentationOnlyRow.identityKey,
     });
   });
 

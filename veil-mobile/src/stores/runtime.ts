@@ -1,8 +1,9 @@
 import { create } from "zustand";
 
-import type {
-  AuthenticatedBinding,
-  VeilMobileRuntimeSnapshot,
+import {
+  isExactAuthenticatedBinding,
+  type AuthenticatedBinding,
+  type VeilMobileRuntimeSnapshot,
 } from "../native/runtime";
 
 export type RuntimeGatePhase = "bootstrapping" | "privacy" | "ready" | "error";
@@ -107,7 +108,21 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
   acceptRuntimeEvent: (epoch, snapshot) => {
     const state = get();
     if (state.epoch !== epoch || state.phase !== "ready" || state.curtainVisible) return;
-    set({ snapshot });
+    const current = state.snapshot;
+    // A structurally malformed native event has unknown capture order. Keep
+    // its zero-revision deny sentinel sticky until an explicit fresh read or
+    // operation completes; a queued older event must not reopen chat.
+    if (current?.runtimeRevision === 0) return;
+    if (
+      current &&
+      snapshot.runtimeRevision > 0 &&
+      current.runtimeRevision > snapshot.runtimeRevision
+    ) return;
+    set({
+      snapshot: current && current.runtimeRevision === snapshot.runtimeRevision
+        ? conservativelyMergeRuntimeSnapshots(current, snapshot)
+        : snapshot,
+    });
   },
 
   failFreshSnapshot: (epoch) => {
@@ -132,8 +147,18 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
   finishOperation: (epoch, snapshot, explicitReopen = false) => {
     const state = get();
     if (state.epoch !== epoch || state.phase !== "ready" || state.curtainVisible) return;
+    const current = state.snapshot;
+    const committed = current
+      && current.runtimeRevision > 0
+      && snapshot.runtimeRevision > 0
+      ? current.runtimeRevision > snapshot.runtimeRevision
+        ? current
+        : current.runtimeRevision === snapshot.runtimeRevision
+          ? conservativelyMergeRuntimeSnapshots(current, snapshot)
+          : snapshot
+      : snapshot;
     set({
-      snapshot,
+      snapshot: committed,
       operation: null,
       publicError: null,
       requiresExplicitReopen: explicitReopen ? false : state.requiresExplicitReopen,
@@ -150,19 +175,9 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
   },
 }));
 
-const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const HTTPS_ORIGIN_PATTERN = /^https:\/\/(?:\[[0-9a-f:]+\]|[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?):([1-9][0-9]{0,4})$/;
-const LOOPBACK_ORIGIN_PATTERN = /^http:\/\/(?:localhost|127\.0\.0\.1|\[::1\]):([1-9][0-9]{0,4})$/;
-
 /** Accept only the exact public origin/user binding emitted by the native runtime. */
 export function hasExactAuthenticatedBinding(binding: AuthenticatedBinding | null): boolean {
-  if (!binding || !UUID_PATTERN.test(binding.userId)) return false;
-  if (binding.userId !== binding.userId.trim()) return false;
-  const match = HTTPS_ORIGIN_PATTERN.exec(binding.canonicalServerOrigin)
-    ?? LOOPBACK_ORIGIN_PATTERN.exec(binding.canonicalServerOrigin);
-  if (!match) return false;
-  const port = Number(match[1]);
-  return Number.isSafeInteger(port) && port >= 1 && port <= 65535;
+  return isExactAuthenticatedBinding(binding);
 }
 
 export function canRenderChat(
@@ -171,9 +186,15 @@ export function canRenderChat(
 ): boolean {
   return Boolean(
     snapshot?.identityExists
+      && Number.isSafeInteger(snapshot.runtimeRevision)
+      && snapshot.runtimeRevision >= 1
+      && snapshot.directGeneration !== null
+      && Number.isSafeInteger(snapshot.directGeneration)
+      && snapshot.directGeneration >= 1
       && !requiresExplicitReopen
       && snapshot.sessionState === "open"
       && snapshot.connectionState === "connected"
+      && snapshot.secureSyncState === "history_synchronized"
       && snapshot.directoryReady
       && hasExactAuthenticatedBinding(snapshot.binding),
   );
@@ -182,15 +203,21 @@ export function canRenderChat(
 /**
  * Merge the confirming read and any event observed during subscription setup.
  *
- * Without a native monotonic revision neither side can be proven newer. The
- * merge therefore grants chat authority only where both snapshots agree. A
- * disagreement can temporarily hide state, but can never resurrect stale
- * OPEN/CONNECTED/directory authority.
+ * Native revisions order real captures, so the later valid snapshot wins.
+ * Equal revisions (or the zero deny sentinel produced for malformed native
+ * data) remain conservative: chat authority survives only exact agreement.
  */
 export function conservativelyMergeRuntimeSnapshots(
   confirmed: VeilMobileRuntimeSnapshot,
   observed: VeilMobileRuntimeSnapshot,
 ): VeilMobileRuntimeSnapshot {
+  if (
+    confirmed.runtimeRevision > 0 &&
+    observed.runtimeRevision > 0 &&
+    confirmed.runtimeRevision !== observed.runtimeRevision
+  ) {
+    return confirmed.runtimeRevision > observed.runtimeRevision ? confirmed : observed;
+  }
   const identityAgrees = confirmed.identityExists === observed.identityExists;
   const mergedSessionState = moreRestrictiveSessionState(
     confirmed.sessionState,
@@ -202,9 +229,6 @@ export function conservativelyMergeRuntimeSnapshots(
   );
   const sessionState = identityAgrees ? mergedSessionState : "locked";
   const connectionState = identityAgrees ? mergedConnectionState : "disconnected";
-  const directoryReady = identityAgrees
-    && confirmed.directoryReady
-    && observed.directoryReady;
   const secureSyncState = identityAgrees
     ? moreRestrictiveSecureSyncState(confirmed.secureSyncState, observed.secureSyncState)
     : "idle";
@@ -217,6 +241,24 @@ export function conservativelyMergeRuntimeSnapshots(
   const binding = sessionState === "open" && connectionState === "connected" && bindingMatches
     ? confirmed.binding
     : null;
+  const directGenerationMatches = confirmed.directGeneration !== null
+    && observed.directGeneration !== null
+    && confirmed.directGeneration === observed.directGeneration;
+  const directGeneration = binding !== null && directGenerationMatches
+    ? confirmed.directGeneration
+    : null;
+  const directoryMatches = exactDirectDirectoryMatch(
+    confirmed.directConversations,
+    observed.directConversations,
+  );
+  const directoryReady = identityAgrees
+    && sessionState === "open"
+    && connectionState === "connected"
+    && binding !== null
+    && directGeneration !== null
+    && confirmed.directoryReady
+    && observed.directoryReady
+    && directoryMatches;
   const pendingMatches = identityAgrees
     && confirmed.pendingAccessPass !== null
     && observed.pendingAccessPass !== null
@@ -228,6 +270,8 @@ export function conservativelyMergeRuntimeSnapshots(
     // Showing the locked-account gate is safer than accidentally offering a
     // second onboarding flow while native identity presence is disputed.
     identityExists: confirmed.identityExists || observed.identityExists,
+    runtimeRevision: Math.min(confirmed.runtimeRevision, observed.runtimeRevision),
+    directGeneration,
     sessionState,
     connectionState,
     directoryReady,
@@ -242,7 +286,22 @@ export function conservativelyMergeRuntimeSnapshots(
           ),
         }
       : null,
+    directConversations: directoryReady ? confirmed.directConversations : [],
   };
+}
+
+function exactDirectDirectoryMatch(
+  left: VeilMobileRuntimeSnapshot["directConversations"],
+  right: VeilMobileRuntimeSnapshot["directConversations"],
+): boolean {
+  return left.length === right.length && left.every((conversation, index) => {
+    const other = right[index];
+    return other !== undefined
+      && conversation.conversationId === other.conversationId
+      && conversation.name === other.name
+      && conversation.peerUserId === other.peerUserId
+      && conversation.peerUsername === other.peerUsername;
+  });
 }
 
 function moreRestrictiveSecureSyncState(

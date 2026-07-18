@@ -9,12 +9,15 @@ const FLOW_ID = "ab".repeat(32);
 
 const lockedSnapshot: VeilMobileRuntimeSnapshot = {
   identityExists: true,
+  runtimeRevision: 1,
+  directGeneration: null,
   sessionState: "locked",
   connectionState: "disconnected",
   directoryReady: false,
   secureSyncState: "idle",
   binding: null,
   pendingAccessPass: null,
+  directConversations: [],
 };
 
 const renderGate = (

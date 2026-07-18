@@ -38,6 +38,10 @@ export interface PendingNodeAccessPass {
 
 export interface VeilMobileRuntimeSnapshot {
   identityExists: boolean;
+  /** Monotonic process-local native capture order; zero is the JS deny sentinel. */
+  runtimeRevision: number;
+  /** Stable for one native Direct sync; changes on reconnect even to the same account. */
+  directGeneration: number | null;
   sessionState: NativeSessionState;
   connectionState: NativeConnectionState;
   directoryReady: boolean;
@@ -45,6 +49,15 @@ export interface VeilMobileRuntimeSnapshot {
   secureSyncState: NativeSecureSyncState;
   binding: AuthenticatedBinding | null;
   pendingAccessPass: PendingNodeAccessPass | null;
+  /** Public metadata from the complete authenticated Direct directory only. */
+  directConversations: DirectConversationView[];
+}
+
+export interface DirectConversationView {
+  conversationId: string;
+  name: string;
+  peerUserId: string;
+  peerUsername: string;
 }
 
 export type DirectMessageDirection = "incoming" | "outgoing";
@@ -64,13 +77,13 @@ export interface DirectMessageProjection {
 }
 
 interface VeilMobileRuntimeNative {
-  getRuntimeSnapshot(): Promise<VeilMobileRuntimeSnapshot>;
-  openSession(): Promise<VeilMobileRuntimeSnapshot>;
-  connect(canonicalOrigin: string): Promise<AuthenticatedBinding>;
-  connectPendingAccessPass(flowId: string): Promise<AuthenticatedBinding>;
-  disconnect(): Promise<VeilMobileRuntimeSnapshot>;
-  lockSession(): Promise<VeilMobileRuntimeSnapshot>;
-  cancelPendingAccessPass(flowId: string): Promise<boolean>;
+  getRuntimeSnapshot(): Promise<unknown>;
+  openSession(): Promise<unknown>;
+  connect(canonicalOrigin: string): Promise<unknown>;
+  connectPendingAccessPass(flowId: string): Promise<unknown>;
+  disconnect(): Promise<unknown>;
+  lockSession(): Promise<unknown>;
+  cancelPendingAccessPass(flowId: string): Promise<unknown>;
   projectDirectMessages(conversationId: string): Promise<unknown>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
@@ -96,10 +109,106 @@ const unavailableDirectProjection = (): DirectMessageProjection => ({
 
 const canonicalUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const nilUuid = "00000000-0000-0000-0000-000000000000";
+const canonicalOriginPattern = /^(https|http):\/\/(\[[0-9a-f:]+\]|[a-z0-9.-]+):([1-9][0-9]{0,4})$/;
+const exactFlowId = /^[0-9a-f]{64}$/;
+const exactTokenRef = /^[0-9a-f]{12}$/;
+const MAX_DIRECT_CONVERSATIONS = 10_000;
+const MAX_DIRECT_NAME_BYTES = 256;
+const MAX_DIRECT_USERNAME_BYTES = 128;
 const MAX_DIRECT_MESSAGE_TEXT_BYTES = 32 * 1024;
 const MAX_DIRECT_PROJECTION_TEXT_BYTES = 1024 * 1024;
 
 const isCanonicalUuid = (value: string): boolean => value !== nilUuid && canonicalUuid.test(value);
+
+function isCanonicalOrigin(value: string, allowLoopbackHttp = true): boolean {
+  const match = canonicalOriginPattern.exec(value);
+  if (!match) return false;
+  const [, scheme, authority, rawPort] = match;
+  if (!scheme || !authority || !rawPort) return false;
+  const port = Number(rawPort);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) return false;
+  const host = authority.startsWith("[")
+    ? authority.slice(1, -1)
+    : authority;
+  if (!isCanonicalHost(host)) return false;
+  if (scheme === "http") {
+    return allowLoopbackHttp && ["localhost", "127.0.0.1", "::1"].includes(host);
+  }
+  return scheme === "https";
+}
+
+function isCanonicalHost(host: string): boolean {
+  if (host.includes(":")) return canonicalizeIpv6(host) === host;
+  if (host.length === 0 || host.length > 253 || host.endsWith(".")) return false;
+  const labels = host.split(".");
+  if (labels.some((label) => (
+    label.length === 0 ||
+    label.length > 63 ||
+    (label.length === 1
+      ? !/^[a-z0-9]$/.test(label)
+      : !/^[a-z0-9][a-z0-9-]*[a-z0-9]$/.test(label))
+  ))) return false;
+  if (/^[0-9.]+$/.test(host)) {
+    return labels.length === 4 && labels.every((octet) => {
+      const parsed = Number(octet);
+      return /^(0|[1-9][0-9]{0,2})$/.test(octet) && parsed >= 0 && parsed <= 255;
+    });
+  }
+  return true;
+}
+
+function canonicalizeIpv6(value: string): string | null {
+  if (!/^[0-9a-f:]+$/.test(value) || value.includes(":::")) return null;
+  const compression = value.indexOf("::");
+  if (compression !== -1 && compression !== value.lastIndexOf("::")) return null;
+  const parseSide = (side: string): number[] | null => {
+    if (side.length === 0) return [];
+    const groups = side.split(":");
+    if (groups.some((group) => !/^[0-9a-f]{1,4}$/.test(group))) return null;
+    return groups.map((group) => Number.parseInt(group, 16));
+  };
+  const left = parseSide(compression === -1 ? value : value.slice(0, compression));
+  const right = parseSide(compression === -1 ? "" : value.slice(compression + 2));
+  if (!left || !right) return null;
+  let groups: number[];
+  if (compression === -1) {
+    if (left.length !== 8) return null;
+    groups = left;
+  } else {
+    const omitted = 8 - left.length - right.length;
+    if (omitted < 2) return null;
+    groups = [...left, ...Array.from({ length: omitted }, () => 0), ...right];
+  }
+
+  let bestStart = -1;
+  let bestLength = 0;
+  for (let index = 0; index < groups.length;) {
+    if (groups[index] !== 0) {
+      index += 1;
+      continue;
+    }
+    const start = index;
+    while (index < groups.length && groups[index] === 0) index += 1;
+    const length = index - start;
+    if (length >= 2 && length > bestLength) {
+      bestStart = start;
+      bestLength = length;
+    }
+  }
+
+  let canonical = "";
+  for (let index = 0; index < groups.length;) {
+    if (index === bestStart) {
+      canonical += "::";
+      index += bestLength;
+      continue;
+    }
+    if (canonical.length > 0 && !canonical.endsWith(":")) canonical += ":";
+    canonical += groups[index]!.toString(16);
+    index += 1;
+  }
+  return canonical;
+}
 
 function boundedUtf8Length(value: string, maxBytes: number): number | null {
   if (value.length === 0) return null;
@@ -121,6 +230,167 @@ function boundedUtf8Length(value: string, maxBytes: number): number | null {
     bytes += additional;
   }
   return bytes;
+}
+
+function containsControl(value: string): boolean {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit <= 0x1f || (codeUnit >= 0x7f && codeUnit <= 0x9f)) return true;
+  }
+  return false;
+}
+
+function authenticatedBinding(value: unknown): AuthenticatedBinding | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.canonicalServerOrigin !== "string" ||
+    !isCanonicalOrigin(record.canonicalServerOrigin) ||
+    typeof record.userId !== "string" ||
+    !isCanonicalUuid(record.userId)
+  ) return null;
+  return {
+    canonicalServerOrigin: record.canonicalServerOrigin,
+    userId: record.userId,
+  };
+}
+
+/** Validate the exact public binding without trusting a TypeScript annotation. */
+export function isExactAuthenticatedBinding(value: AuthenticatedBinding | null): boolean {
+  return authenticatedBinding(value) !== null;
+}
+
+function pendingNodeAccessPass(value: unknown): PendingNodeAccessPass | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.flowId !== "string" ||
+    !exactFlowId.test(record.flowId) ||
+    typeof record.canonicalOrigin !== "string" ||
+    !isCanonicalOrigin(record.canonicalOrigin, false) ||
+    typeof record.tokenRef !== "string" ||
+    !exactTokenRef.test(record.tokenRef) ||
+    typeof record.expiresInSeconds !== "number" ||
+    !Number.isSafeInteger(record.expiresInSeconds) ||
+    record.expiresInSeconds < 0 ||
+    record.expiresInSeconds > 600
+  ) return null;
+  return {
+    flowId: record.flowId,
+    canonicalOrigin: record.canonicalOrigin,
+    tokenRef: record.tokenRef,
+    expiresInSeconds: record.expiresInSeconds,
+  };
+}
+
+function directConversationDirectory(value: unknown): DirectConversationView[] | null {
+  if (!Array.isArray(value) || value.length > MAX_DIRECT_CONVERSATIONS) return null;
+  const conversations: DirectConversationView[] = [];
+  let previousConversationId: string | null = null;
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== "object") return null;
+    const row = candidate as Record<string, unknown>;
+    if (
+      typeof row.conversationId !== "string" ||
+      !isCanonicalUuid(row.conversationId) ||
+      (previousConversationId !== null && previousConversationId >= row.conversationId) ||
+      typeof row.peerUserId !== "string" ||
+      !isCanonicalUuid(row.peerUserId) ||
+      typeof row.name !== "string" ||
+      boundedUtf8Length(row.name, MAX_DIRECT_NAME_BYTES) === null ||
+      containsControl(row.name) ||
+      typeof row.peerUsername !== "string" ||
+      boundedUtf8Length(row.peerUsername, MAX_DIRECT_USERNAME_BYTES) === null ||
+      containsControl(row.peerUsername)
+    ) return null;
+    previousConversationId = row.conversationId;
+    conversations.push({
+      conversationId: row.conversationId,
+      name: row.name,
+      peerUserId: row.peerUserId,
+      peerUsername: row.peerUsername,
+    });
+  }
+  return conversations;
+}
+
+const restrictiveRuntimeSnapshot = (): VeilMobileRuntimeSnapshot => ({
+  // Prefer an account lock/error over accidentally opening a second onboarding
+  // flow when the native payload itself cannot be authenticated structurally.
+  identityExists: true,
+  runtimeRevision: 0,
+  directGeneration: null,
+  sessionState: "error",
+  connectionState: "error",
+  directoryReady: false,
+  secureSyncState: "error",
+  binding: null,
+  pendingAccessPass: null,
+  directConversations: [],
+});
+
+function runtimeSnapshot(value: unknown): VeilMobileRuntimeSnapshot {
+  if (!value || typeof value !== "object") return restrictiveRuntimeSnapshot();
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.identityExists !== "boolean" ||
+    typeof record.runtimeRevision !== "number" ||
+    !Number.isSafeInteger(record.runtimeRevision) ||
+    record.runtimeRevision < 1 ||
+    (record.directGeneration !== null &&
+      (typeof record.directGeneration !== "number" ||
+        !Number.isSafeInteger(record.directGeneration) ||
+        record.directGeneration < 1)) ||
+    !["locked", "opening", "open", "closing", "error"].includes(record.sessionState as string) ||
+    !["disconnected", "connecting", "connected", "error"].includes(record.connectionState as string) ||
+    typeof record.directoryReady !== "boolean" ||
+    ![
+      "idle",
+      "publishing_keys",
+      "syncing_directory",
+      "syncing_history",
+      "history_synchronized",
+      "error",
+    ].includes(record.secureSyncState as string)
+  ) return restrictiveRuntimeSnapshot();
+
+  const binding = record.binding === null ? null : authenticatedBinding(record.binding);
+  const pendingAccessPass = record.pendingAccessPass === null
+    ? null
+    : pendingNodeAccessPass(record.pendingAccessPass);
+  const directConversations = directConversationDirectory(record.directConversations);
+  if (
+    (record.binding !== null && binding === null) ||
+    (record.pendingAccessPass !== null && pendingAccessPass === null) ||
+    directConversations === null
+  ) return restrictiveRuntimeSnapshot();
+
+  const hasDirectGenerationAuthority = record.identityExists === true &&
+    record.sessionState === "open" &&
+    record.connectionState === "connected" &&
+    binding !== null;
+  const hasDirectoryAuthority = hasDirectGenerationAuthority &&
+    record.secureSyncState === "history_synchronized" &&
+    record.directGeneration !== null;
+  if (
+    (record.directGeneration !== null && !hasDirectGenerationAuthority) ||
+    (record.directoryReady === true && !hasDirectoryAuthority) ||
+    (record.directoryReady === false && directConversations.length !== 0) ||
+    (binding !== null && directConversations.some((row) => row.peerUserId === binding.userId))
+  ) return restrictiveRuntimeSnapshot();
+
+  return {
+    identityExists: record.identityExists,
+    runtimeRevision: record.runtimeRevision,
+    directGeneration: record.directGeneration as number | null,
+    sessionState: record.sessionState as NativeSessionState,
+    connectionState: record.connectionState as NativeConnectionState,
+    directoryReady: record.directoryReady,
+    secureSyncState: record.secureSyncState as NativeSecureSyncState,
+    binding,
+    pendingAccessPass,
+    directConversations,
+  };
 }
 
 function directMessageProjection(value: unknown): DirectMessageProjection {
@@ -169,16 +439,26 @@ function directMessageProjection(value: unknown): DirectMessageProjection {
 }
 
 const VeilRuntime = {
-  getSnapshot: (): Promise<VeilMobileRuntimeSnapshot> => requireRuntime().getRuntimeSnapshot(),
-  openSession: (): Promise<VeilMobileRuntimeSnapshot> => requireRuntime().openSession(),
-  connect: (canonicalOrigin: string): Promise<AuthenticatedBinding> =>
-    requireRuntime().connect(canonicalOrigin),
-  connectPendingAccessPass: (flowId: string): Promise<AuthenticatedBinding> =>
-    requireRuntime().connectPendingAccessPass(flowId),
-  disconnect: (): Promise<VeilMobileRuntimeSnapshot> => requireRuntime().disconnect(),
-  lock: (): Promise<VeilMobileRuntimeSnapshot> => requireRuntime().lockSession(),
-  cancelPendingAccessPass: (flowId: string): Promise<boolean> =>
-    requireRuntime().cancelPendingAccessPass(flowId),
+  getSnapshot: async (): Promise<VeilMobileRuntimeSnapshot> =>
+    runtimeSnapshot(await requireRuntime().getRuntimeSnapshot()),
+  openSession: async (): Promise<VeilMobileRuntimeSnapshot> =>
+    runtimeSnapshot(await requireRuntime().openSession()),
+  connect: async (canonicalOrigin: string): Promise<AuthenticatedBinding> => {
+    const binding = authenticatedBinding(await requireRuntime().connect(canonicalOrigin));
+    if (!binding) throw new Error("Native mobile runtime returned an invalid account binding");
+    return binding;
+  },
+  connectPendingAccessPass: async (flowId: string): Promise<AuthenticatedBinding> => {
+    const binding = authenticatedBinding(await requireRuntime().connectPendingAccessPass(flowId));
+    if (!binding) throw new Error("Native mobile runtime returned an invalid account binding");
+    return binding;
+  },
+  disconnect: async (): Promise<VeilMobileRuntimeSnapshot> =>
+    runtimeSnapshot(await requireRuntime().disconnect()),
+  lock: async (): Promise<VeilMobileRuntimeSnapshot> =>
+    runtimeSnapshot(await requireRuntime().lockSession()),
+  cancelPendingAccessPass: async (flowId: string): Promise<boolean> =>
+    await requireRuntime().cancelPendingAccessPass(flowId) === true,
   getDirectMessages: async (conversationId: string): Promise<DirectMessageProjection> => {
     if (!isCanonicalUuid(conversationId)) return unavailableDirectProjection();
     try {
@@ -190,7 +470,9 @@ const VeilRuntime = {
   subscribe(listener: (snapshot: VeilMobileRuntimeSnapshot) => void): EmitterSubscription {
     const emitter = runtimeEmitter;
     if (!emitter) return unavailable();
-    return emitter.addListener("VeilRuntimeStateChanged", listener);
+    return emitter.addListener("VeilRuntimeStateChanged", (value: unknown) => {
+      listener(runtimeSnapshot(value));
+    });
   },
 };
 

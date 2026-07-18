@@ -321,6 +321,10 @@ internal data class NativeRestSignature(
 
 internal data class VeilMobileRuntimeSnapshot(
   val identityExists: Boolean,
+  /** Monotonic process-local capture order for stale RN event rejection. */
+  val runtimeRevision: Long,
+  /** Stable public identity of the current native Direct sync generation. */
+  val directGeneration: Long?,
   val sessionState: NativeSessionState,
   val connectionState: NativeConnectionState,
   val directoryReady: Boolean,
@@ -466,6 +470,8 @@ internal class VeilMobileRuntime internal constructor(
   // encrypted account before any visible Veil surface exists.
   private var foreground = false
   private var lifecycleEpoch = 0L
+  private var publicSnapshotRevision = 0L
+  private var directGenerationCounter = 0L
   private var activeConnect: ActiveConnect? = null
   private var activeDirectSync: ActiveDirectSync? = null
 
@@ -495,6 +501,7 @@ internal class VeilMobileRuntime internal constructor(
   private class ActiveDirectSync(
     val session: NativeMobileSession,
     val epoch: Long,
+    val generation: Long,
     val leaseToken: String,
     val canonicalServerOrigin: String,
     val userId: String,
@@ -504,7 +511,8 @@ internal class VeilMobileRuntime internal constructor(
     var ownPreKeyRequestsPrepared = 0
 
     override fun toString(): String =
-      "ActiveDirectSync(epoch=$epoch, canonicalServerOrigin=$canonicalServerOrigin, " +
+      "ActiveDirectSync(epoch=$epoch, generation=$generation, " +
+        "canonicalServerOrigin=$canonicalServerOrigin, " +
         "userId=$userId, leaseToken=[REDACTED], conversations=${conversations.size})"
   }
 
@@ -933,9 +941,17 @@ internal class VeilMobileRuntime internal constructor(
       throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
     }
 
+    val generation = synchronized(stateLock) {
+      check(directGenerationCounter < MAX_PUBLIC_SNAPSHOT_REVISION) {
+        "public Direct generation exhausted"
+      }
+      directGenerationCounter += 1
+      directGenerationCounter
+    }
     val sync = ActiveDirectSync(
       session = active,
       epoch = epoch,
+      generation = generation,
       leaseToken = lease.leaseToken,
       canonicalServerOrigin = lease.canonicalServerOrigin,
       userId = lease.userId,
@@ -1800,6 +1816,10 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   private fun snapshotLocked(): VeilMobileRuntimeSnapshot {
+    check(publicSnapshotRevision < MAX_PUBLIC_SNAPSHOT_REVISION) {
+      "public mobile runtime snapshot revision exhausted"
+    }
+    publicSnapshotRevision += 1
     val identityExists = session != null || try {
       vault.hasIdentity()
     } catch (_: Throwable) {
@@ -1807,6 +1827,8 @@ internal class VeilMobileRuntime internal constructor(
     }
     return VeilMobileRuntimeSnapshot(
       identityExists = identityExists,
+      runtimeRevision = publicSnapshotRevision,
+      directGeneration = activeDirectSync?.generation,
       sessionState = sessionState,
       connectionState = connectionState,
       directoryReady = directoryReady,
@@ -1867,6 +1889,7 @@ internal class VeilMobileRuntime internal constructor(
     private const val MAX_DIRECT_CONVERSATIONS = 10_000
     private const val MAX_BUFFERED_DIRECT_EVENTS_PER_PUMP = 4_096L
     private const val MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN = 64L
+    private const val MAX_PUBLIC_SNAPSHOT_REVISION = 9_007_199_254_740_991L
 
     private fun newRuntimeExecutor(): ExecutorService =
       Executors.newSingleThreadExecutor { operation ->

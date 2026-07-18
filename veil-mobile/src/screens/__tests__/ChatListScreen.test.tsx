@@ -2,6 +2,7 @@ import React from "react";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
 import TestRenderer, { act, type ReactTestRenderer } from "react-test-renderer";
 import { AccessibilityInfo, View } from "react-native";
+import { resetChatStoreForTests } from "../../stores/chat";
 import ChatListScreen from "../ChatListScreen";
 
 jest.mock("react-native-pager-view", () => {
@@ -92,6 +93,7 @@ describe("ChatListScreen identity modal boundary", () => {
   let setAccessibilityFocus: jest.SpiedFunction<typeof AccessibilityInfo.setAccessibilityFocus>;
 
   beforeEach(() => {
+    resetChatStoreForTests();
     setAccessibilityFocus = jest.spyOn(AccessibilityInfo, "setAccessibilityFocus").mockImplementation(() => undefined);
     setAccessibilityFocus.mockClear();
     jest.spyOn(global, "requestAnimationFrame").mockImplementation((callback: (time: number) => void) => {

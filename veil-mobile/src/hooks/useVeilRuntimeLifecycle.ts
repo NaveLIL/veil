@@ -8,6 +8,7 @@ import {
 import VeilRuntime, { type VeilMobileRuntimeSnapshot } from "../native/runtime";
 import { useChatStore } from "../stores/chat";
 import {
+  canRenderChat,
   conservativelyMergeRuntimeSnapshots,
   useRuntimeGateStore,
   type RuntimeOperation,
@@ -30,7 +31,7 @@ const isActive = (state: AppStateStatus): boolean => state === "active";
  * Owns the React Native side of the native account lifecycle.
  *
  * A background transition invalidates the current epoch synchronously, removes
- * the native event subscription, clears renderable prototype plaintext, and
+ * the native event subscription, clears renderable Direct plaintext, and
  * starts a best-effort native lock. Foreground waits for that lock barrier and
  * a new native snapshot; it never restores an old OPEN snapshot.
  */
@@ -48,6 +49,25 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
   const epochIsCurrent = useCallback((epoch: number): boolean => {
     const state = useRuntimeGateStore.getState();
     return mountedRef.current && state.epoch === epoch && isActive(appStateRef.current);
+  }, []);
+
+  const reconcileRenderableChat = useCallback((
+    epoch: number,
+  ): void => {
+    const gate = useRuntimeGateStore.getState();
+    const committedSnapshot = gate.epoch === epoch
+      && gate.phase === "ready"
+      && !gate.curtainVisible
+      ? gate.snapshot
+      : null;
+    if (
+      committedSnapshot
+      && canRenderChat(committedSnapshot, gate.requiresExplicitReopen)
+    ) {
+      useChatStore.getState().hydrateRuntimeDirectory(committedSnapshot);
+      return;
+    }
+    useChatStore.getState().clearRenderableChat();
   }, []);
 
   const attachAfterFreshSnapshot = useCallback(async (
@@ -75,6 +95,10 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
           return;
         }
         useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot);
+        // Reconcile the snapshot actually committed by the runtime gate. A
+        // lower-revision event may have been ignored and must not clear the
+        // newer directory or plaintext projection.
+        reconcileRenderableChat(epoch);
       });
       if (!epochIsCurrent(epoch)) {
         subscription.remove();
@@ -97,11 +121,13 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
         : confirmed;
       handshaking = false;
       useRuntimeGateStore.getState().commitFreshSnapshot(epoch, latest);
+      reconcileRenderableChat(epoch);
     } catch {
       removeRuntimeSubscription();
+      useChatStore.getState().clearRenderableChat();
       useRuntimeGateStore.getState().failFreshSnapshot(epoch);
     }
-  }, [epochIsCurrent, removeRuntimeSubscription]);
+  }, [epochIsCurrent, reconcileRenderableChat, removeRuntimeSubscription]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -144,6 +170,7 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
       mountedRef.current = false;
       removeRuntimeSubscription();
       appStateSubscription.remove();
+      useChatStore.getState().clearRenderableChat();
     };
   }, [attachAfterFreshSnapshot, removeRuntimeSubscription]);
 
@@ -158,10 +185,12 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
       await action();
       const snapshot = await VeilRuntime.getSnapshot();
       useRuntimeGateStore.getState().finishOperation(epoch, snapshot, explicitReopen);
+      reconcileRenderableChat(epoch);
     } catch {
+      useChatStore.getState().clearRenderableChat();
       useRuntimeGateStore.getState().failOperation(epoch);
     }
-  }, []);
+  }, [reconcileRenderableChat]);
 
   const refresh = useCallback(async (): Promise<void> => {
     await runOperation("refreshing", () => VeilRuntime.getSnapshot());
@@ -178,6 +207,9 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
   }, [runOperation]);
 
   const connect = useCallback(async (canonicalOrigin: string): Promise<void> => {
+    // A reconnect can change the authenticated account/origin binding. Drop
+    // the old directory and plaintext before native work begins.
+    useChatStore.getState().clearRenderableChat();
     await runOperation("connecting", () => VeilRuntime.connect(canonicalOrigin));
   }, [runOperation]);
 
@@ -186,6 +218,7 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
     const pending = current.snapshot?.pendingAccessPass;
     if (!pending || pending.flowId !== flowId) return;
 
+    useChatStore.getState().clearRenderableChat();
     await runOperation("using_access_pass", async () => {
       const state = useRuntimeGateStore.getState();
       if (state.requiresExplicitReopen || state.snapshot?.sessionState !== "open") {

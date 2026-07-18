@@ -13,6 +13,7 @@ import { resetRuntimeGateStoreForTests } from "../stores/runtime";
 
 jest.mock("../native/runtime", () => ({
   __esModule: true,
+  isExactAuthenticatedBinding: (binding: unknown) => Boolean(binding),
   default: {
     getSnapshot: jest.fn(),
     openSession: jest.fn(),
@@ -91,6 +92,12 @@ const exactBinding = {
   canonicalServerOrigin: "https://veil.erez.pro:443",
   userId: "11111111-1111-4111-8111-111111111111",
 };
+const directConversation = {
+  conversationId: "22222222-2222-4222-8222-222222222222",
+  name: "Anya",
+  peerUserId: "33333333-3333-4333-8333-333333333333",
+  peerUsername: "anya",
+};
 
 const runtimeSnapshot = (
   overrides: Partial<VeilMobileRuntimeSnapshot> = {},
@@ -102,6 +109,9 @@ const runtimeSnapshot = (
   secureSyncState: "history_synchronized",
   binding: exactBinding,
   pendingAccessPass: null,
+  runtimeRevision: 1,
+  directGeneration: 1,
+  directConversations: [],
   ...overrides,
 });
 
@@ -121,13 +131,15 @@ describe("App native runtime privacy gate", () => {
     jest.clearAllMocks();
     resetRuntimeGateStoreForTests();
     useChatStore.setState({
-      prototypeFixturesEnabled: true,
       messagesByChannel: {
         secret: [{
           id: "secret",
           author: {} as never,
           text: "renderable plaintext",
           ts: "now",
+          timestampMs: null,
+          direction: "incoming",
+          delivery: "unknown",
         }],
       },
     });
@@ -169,9 +181,9 @@ describe("App native runtime privacy gate", () => {
     expect(view.getByTestId("privacy-curtain")).toBeTruthy();
     expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
     expect(useChatStore.getState().messagesByChannel).toEqual({});
-    expect(useChatStore.getState().prototypeFixturesEnabled).toBe(false);
-    expect(useChatStore.getState().dms.every((dm) => dm.lastMessage === undefined)).toBe(true);
-    useChatStore.getState().selectDm("dm-anya");
+    expect(useChatStore.getState().dms).toEqual([]);
+    expect(useChatStore.getState().runtimeBinding).toBeNull();
+    useChatStore.getState().selectDm("22222222-2222-4222-8222-222222222222");
     expect(useChatStore.getState().messagesByChannel).toEqual({});
 
     await waitFor(() => expect(mockRuntime.lock).toHaveBeenCalledTimes(1));
@@ -203,8 +215,57 @@ describe("App native runtime privacy gate", () => {
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
     expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
 
-    act(() => runtimeListener?.(runtimeSnapshot()));
+    act(() => runtimeListener?.(runtimeSnapshot({ runtimeRevision: 2 })));
     await waitFor(() => expect(view.getByTestId("chat-runtime-ready")).toBeTruthy());
+  });
+
+  it("preserves newer Direct authority on a stale event but clears on the revision-zero deny sentinel", async () => {
+    const ready = runtimeSnapshot({
+      runtimeRevision: 5,
+      directGeneration: 9,
+      directConversations: [directConversation],
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(ready);
+    mockRuntime.lock.mockResolvedValue(ready);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("chat-runtime-ready")).toBeTruthy());
+    expect(useChatStore.getState().directGeneration).toBe(9);
+    useChatStore.setState({
+      messagesByChannel: {
+        [directConversation.conversationId]: [{
+          id: "44444444-4444-4444-8444-444444444444",
+          author: {} as never,
+          text: "newer projection",
+          ts: "12:00",
+          timestampMs: 1_720_000_000_000,
+          direction: "incoming",
+          delivery: "sent",
+        }],
+      },
+    });
+
+    act(() => runtimeListener?.(runtimeSnapshot({
+      runtimeRevision: 4,
+      directGeneration: 8,
+      directConversations: [directConversation],
+    })));
+    expect(useChatStore.getState().directGeneration).toBe(9);
+    expect(useChatStore.getState().messagesByChannel[directConversation.conversationId])
+      .toEqual([expect.objectContaining({ text: "newer projection" })]);
+
+    act(() => runtimeListener?.(runtimeSnapshot({
+      runtimeRevision: 0,
+      directGeneration: null,
+      sessionState: "error",
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      directConversations: [],
+    })));
+    expect(useChatStore.getState().messagesByChannel).toEqual({});
+    expect(useChatStore.getState().directGeneration).toBeNull();
   });
 
   it("routes an existing locked identity to the secure gate, never onboarding", async () => {
