@@ -13,4 +13,5 @@ pub mod api;
 pub mod attachments;
 pub mod connection;
 mod device_identity;
+pub mod direct;
 pub mod protocol;

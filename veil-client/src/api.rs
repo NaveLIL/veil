@@ -1184,6 +1184,20 @@ impl VeilClient {
         conversation_id: &str,
         peer_identity_key: [u8; 32],
     ) -> Result<(), String> {
+        self.ensure_dm_conversation_binding_compatible(conversation_id, peer_identity_key)?;
+        self.dm_conversations
+            .insert(conversation_id.to_string(), peer_identity_key);
+        Ok(())
+    }
+
+    /// Validate an authenticated Direct route without publishing it. A page
+    /// installer uses this to preflight every durable conversation before any
+    /// process-local route from that page becomes addressable.
+    pub fn ensure_dm_conversation_binding_compatible(
+        &self,
+        conversation_id: &str,
+        peer_identity_key: [u8; 32],
+    ) -> Result<(), String> {
         if conversation_id.is_empty() || peer_identity_key == [0u8; 32] {
             return Err("DM binding requires a conversation id and peer identity".to_string());
         }
@@ -1224,8 +1238,6 @@ impl VeilClient {
                 );
             }
         }
-        self.dm_conversations
-            .insert(conversation_id.to_string(), peer_identity_key);
         Ok(())
     }
 

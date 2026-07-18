@@ -1,10 +1,11 @@
 use bip39::Mnemonic;
 use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
 use std::{
+    collections::HashMap,
     future::Future,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -85,6 +86,73 @@ pub struct PreKeyBundleData {
 pub struct MobileAuthenticatedBinding {
     pub canonical_server_origin: String,
     pub user_id: String,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct MobileAuthenticatedEpoch {
+    binding: MobileAuthenticatedBinding,
+    generation: u64,
+}
+
+struct MobileDirectSyncState {
+    token: String,
+    epoch: MobileAuthenticatedEpoch,
+    next_cursor: Option<String>,
+    directory_complete: bool,
+    history: veil_client::direct::DirectDirectorySyncHistory,
+    peers: HashMap<String, MobileDirectPeer>,
+    outstanding_directory_request: Option<MobileDirectOutstandingRequest>,
+    outstanding_prekey_requests: HashMap<String, MobileDirectOutstandingRequest>,
+}
+
+#[derive(Clone)]
+struct MobileDirectPeer {
+    user_id: String,
+    identity_key: [u8; 32],
+    signing_key: [u8; 32],
+}
+
+#[derive(Clone)]
+struct MobileDirectOutstandingRequest {
+    token: String,
+    target: String,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectSyncLease {
+    pub token: String,
+    pub canonical_server_origin: String,
+    pub user_id: String,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectRestRequest {
+    pub request_token: String,
+    pub request_target: String,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectConversationData {
+    pub conversation_id: String,
+    pub name: String,
+    pub peer_user_id: String,
+    pub peer_username: String,
+    pub peer_identity_key_hex: String,
+    pub peer_signing_key_hex: String,
+    pub needs_prekey: bool,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectDirectoryPageData {
+    pub conversations: Vec<MobileDirectConversationData>,
+    pub next_cursor: Option<String>,
+    pub skipped_non_direct: u32,
+    pub directory_complete: bool,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectPreKeyResult {
+    pub status: String,
 }
 
 #[derive(uniffi::Record)]
@@ -577,7 +645,9 @@ impl MobileConnectCancellation {
 pub struct VeilMobileSession {
     client: Mutex<veil_client::api::VeilClient>,
     runtime: tokio::runtime::Runtime,
-    binding: Mutex<Option<MobileAuthenticatedBinding>>,
+    binding: Mutex<Option<MobileAuthenticatedEpoch>>,
+    direct_sync: Mutex<Option<MobileDirectSyncState>>,
+    next_binding_generation: AtomicU64,
     last_rest_timestamp_ms: AtomicI64,
 }
 
@@ -628,6 +698,8 @@ impl VeilMobileSession {
             client: Mutex::new(client),
             runtime,
             binding: Mutex::new(None),
+            direct_sync: Mutex::new(None),
+            next_binding_generation: AtomicU64::new(0),
             last_rest_timestamp_ms: AtomicI64::new(0),
         }))
     }
@@ -694,15 +766,357 @@ impl VeilMobileSession {
     }
 
     pub fn authenticated_binding(&self) -> Result<MobileAuthenticatedBinding, VeilError> {
-        self.binding
+        Ok(self.authenticated_epoch()?.binding)
+    }
+
+    /// Start an object-bound Direct directory sync for the exact current
+    /// WebSocket generation. The random token never crosses into JavaScript;
+    /// Kotlin must return it with every raw REST response.
+    pub fn begin_direct_sync(&self) -> Result<MobileDirectSyncLease, VeilError> {
+        let mut sync = self
+            .direct_sync
             .lock()
             .map_err(|error| VeilError::Session {
-                msg: format!("lock mobile binding: {error}"),
-            })?
-            .clone()
-            .ok_or_else(|| VeilError::Session {
-                msg: "mobile account is not authenticated".to_string(),
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        let epoch = binding.clone().ok_or_else(|| VeilError::Session {
+            msg: "mobile account is not authenticated".to_string(),
+        })?;
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let authenticated_user_id = client
+            .authenticated_user_id()
+            .map_err(|msg| VeilError::Session { msg })?;
+        if authenticated_user_id != epoch.binding.user_id {
+            return Err(VeilError::Session {
+                msg: "mobile authenticated principal changed before Direct sync".to_string(),
+            });
+        }
+
+        client.clear_known_user_identities();
+        client.clear_server_scoped_conversation_routing();
+        client.clear_all_authorized_conversation_senders();
+        let token = new_mobile_sync_token();
+        *sync = Some(MobileDirectSyncState {
+            token: token.clone(),
+            epoch: epoch.clone(),
+            next_cursor: None,
+            directory_complete: false,
+            history: veil_client::direct::DirectDirectorySyncHistory::default(),
+            peers: HashMap::new(),
+            outstanding_directory_request: None,
+            outstanding_prekey_requests: HashMap::new(),
+        });
+        Ok(MobileDirectSyncLease {
+            token,
+            canonical_server_origin: epoch.binding.canonical_server_origin,
+            user_id: epoch.binding.user_id,
+        })
+    }
+
+    pub fn prepare_direct_directory_request(
+        &self,
+        lease_token: String,
+    ) -> Result<MobileDirectRestRequest, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        if state.token != lease_token || state.directory_complete {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale or directory is complete".to_string(),
+            });
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale".to_string(),
+            });
+        }
+        if let Some(request) = state.outstanding_directory_request.as_ref() {
+            return Ok(MobileDirectRestRequest {
+                request_token: request.token.clone(),
+                request_target: request.target.clone(),
+            });
+        }
+        let request = MobileDirectOutstandingRequest {
+            token: new_mobile_sync_token(),
+            target: mobile_direct_directory_target(state.next_cursor.as_deref())?,
+        };
+        let result = MobileDirectRestRequest {
+            request_token: request.token.clone(),
+            request_target: request.target.clone(),
+        };
+        state.outstanding_directory_request = Some(request);
+        Ok(result)
+    }
+
+    /// Validate and install one raw directory response under the exact lease
+    /// that issued its request. Binding and client guards stay held across the
+    /// mutation, making reconnect/disconnect linearize before or after it.
+    pub fn install_direct_directory_page(
+        &self,
+        lease_token: String,
+        request_token: String,
+        response: Vec<u8>,
+    ) -> Result<MobileDirectDirectoryPageData, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        require_mobile_sync_token(&request_token)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        if state.token != lease_token {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale".to_string(),
+            });
+        }
+        if state.directory_complete {
+            return Err(VeilError::Session {
+                msg: "mobile Direct directory is already complete".to_string(),
+            });
+        }
+        if state
+            .outstanding_directory_request
+            .as_ref()
+            .is_none_or(|request| request.token != request_token)
+        {
+            return Err(VeilError::Session {
+                msg: "mobile Direct directory request is stale".to_string(),
+            });
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale".to_string(),
+            });
+        }
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let page = veil_client::direct::install_authenticated_direct_directory_page_tracked(
+            &mut client,
+            &state.epoch.binding.canonical_server_origin,
+            &state.epoch.binding.user_id,
+            state.next_cursor.as_deref(),
+            &mut state.history,
+            &response,
+        )
+        .map_err(|msg| VeilError::Session { msg })?;
+        let skipped_non_direct =
+            page.skipped_non_direct
+                .try_into()
+                .map_err(|_| VeilError::Session {
+                    msg: "mobile Direct skipped conversation count overflow".to_string(),
+                })?;
+        state.outstanding_directory_request = None;
+        let mut conversations = Vec::with_capacity(page.conversations.len());
+        for conversation in page.conversations {
+            state.peers.insert(
+                conversation.conversation_id.clone(),
+                MobileDirectPeer {
+                    user_id: conversation.peer_user_id.clone(),
+                    identity_key: conversation.peer_identity_key,
+                    signing_key: conversation.peer_signing_key,
+                },
+            );
+            conversations.push(MobileDirectConversationData {
+                conversation_id: conversation.conversation_id,
+                name: conversation.name,
+                peer_user_id: conversation.peer_user_id,
+                peer_username: conversation.peer_username,
+                peer_identity_key_hex: hex::encode(conversation.peer_identity_key),
+                peer_signing_key_hex: hex::encode(conversation.peer_signing_key),
+                needs_prekey: conversation.needs_prekey,
+            });
+        }
+        state.next_cursor = page.next_cursor.clone();
+        state.directory_complete = page.next_cursor.is_none();
+        Ok(MobileDirectDirectoryPageData {
+            conversations,
+            next_cursor: page.next_cursor,
+            skipped_non_direct,
+            directory_complete: state.directory_complete,
+        })
+    }
+
+    /// Install a peer bundle by the conversation route learned under this
+    /// lease. Kotlin cannot substitute peer account keys.
+    pub fn prepare_direct_prekey_request(
+        &self,
+        lease_token: String,
+        conversation_id: String,
+    ) -> Result<MobileDirectRestRequest, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        require_canonical_user_id("Direct conversation ID", &conversation_id)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        if state.token != lease_token || !state.directory_complete {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale or directory is incomplete".to_string(),
+            });
+        }
+        let peer =
+            state
+                .peers
+                .get(&conversation_id)
+                .cloned()
+                .ok_or_else(|| VeilError::Session {
+                    msg: "Direct conversation is absent from the authenticated lease".to_string(),
+                })?;
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale".to_string(),
+            });
+        }
+        let client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        if client.has_session(&peer.identity_key) {
+            return Err(VeilError::Session {
+                msg: "Direct session is already established".to_string(),
+            });
+        }
+        if let Some(request) = state.outstanding_prekey_requests.get(&conversation_id) {
+            return Ok(MobileDirectRestRequest {
+                request_token: request.token.clone(),
+                request_target: request.target.clone(),
+            });
+        }
+        let request = MobileDirectOutstandingRequest {
+            token: new_mobile_sync_token(),
+            target: format!("/v1/prekeys/{}", hex::encode(peer.identity_key)),
+        };
+        let result = MobileDirectRestRequest {
+            request_token: request.token.clone(),
+            request_target: request.target.clone(),
+        };
+        state
+            .outstanding_prekey_requests
+            .insert(conversation_id, request);
+        Ok(result)
+    }
+
+    pub fn install_direct_prekey_bundle(
+        &self,
+        lease_token: String,
+        request_token: String,
+        conversation_id: String,
+        response: Vec<u8>,
+    ) -> Result<MobileDirectPreKeyResult, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        require_mobile_sync_token(&request_token)?;
+        require_canonical_user_id("Direct conversation ID", &conversation_id)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        if state.token != lease_token || !state.directory_complete {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale or directory is incomplete".to_string(),
+            });
+        }
+        let peer =
+            state
+                .peers
+                .get(&conversation_id)
+                .cloned()
+                .ok_or_else(|| VeilError::Session {
+                    msg: "Direct conversation is absent from the authenticated lease".to_string(),
+                })?;
+        if state
+            .outstanding_prekey_requests
+            .get(&conversation_id)
+            .is_none_or(|request| request.token != request_token)
+        {
+            return Err(VeilError::Session {
+                msg: "mobile Direct prekey request is stale".to_string(),
+            });
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale".to_string(),
+            });
+        }
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let result = veil_client::direct::install_authenticated_direct_prekey_bundle(
+            &mut client,
+            &peer.user_id,
+            peer.identity_key,
+            peer.signing_key,
+            &response,
+        )
+        .map_err(|msg| VeilError::Session { msg })?;
+        state.outstanding_prekey_requests.remove(&conversation_id);
+        let status = match result {
+            veil_client::direct::DirectPreKeyInstallResult::Established => "established",
+            veil_client::direct::DirectPreKeyInstallResult::AlreadyEstablished => {
+                "already_established"
+            }
+        };
+        Ok(MobileDirectPreKeyResult {
+            status: status.to_string(),
+        })
+    }
+
+    pub fn cancel_direct_sync(&self, lease_token: String) -> Result<(), VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        if sync
+            .as_ref()
+            .is_some_and(|state| state.token == lease_token)
+        {
+            *sync = None;
+            Ok(())
+        } else {
+            Err(VeilError::Session {
+                msg: "mobile Direct sync lease is stale".to_string(),
             })
+        }
     }
 
     pub fn sign_rest_request(
@@ -716,8 +1130,8 @@ impl VeilMobileSession {
         use sha2::{Digest, Sha256};
 
         let origin = require_canonical_server_origin(&canonical_server_origin)?;
-        let binding = self.authenticated_binding()?;
-        if binding.canonical_server_origin != origin {
+        let epoch = self.authenticated_epoch()?;
+        if epoch.binding.canonical_server_origin != origin {
             return Err(VeilError::Session {
                 msg: "REST origin differs from the authenticated mobile binding".to_string(),
             });
@@ -750,19 +1164,20 @@ impl VeilMobileSession {
             .map_err(|msg| VeilError::Session { msg })?;
         // Re-check after signing so a concurrent disconnect cannot publish a
         // signature from an invalidated account/origin epoch.
-        if self.authenticated_binding()? != binding {
+        if self.authenticated_epoch()? != epoch {
             return Err(VeilError::Session {
                 msg: "mobile binding changed while signing REST request".to_string(),
             });
         }
         Ok(RestSignatureData {
-            user_id: binding.user_id,
+            user_id: epoch.binding.user_id,
             timestamp_ms: timestamp_ms.to_string(),
             signature_base64: base64::engine::general_purpose::STANDARD.encode(signature),
         })
     }
 
     pub fn disconnect(&self) -> Result<(), VeilError> {
+        clear_mobile_direct_sync_fail_closed(&self.direct_sync);
         let _client = invalidate_mobile_session(&self.binding, &self.client)?;
         Ok(())
     }
@@ -782,6 +1197,7 @@ impl VeilMobileSession {
         // account/origin epoch before locking or touching the network. The
         // previous transport is closed under the client lock so no old event
         // can race with the new authentication result.
+        clear_mobile_direct_sync_fail_closed(&self.direct_sync);
         let mut client = invalidate_mobile_session(&self.binding, &self.client)?;
         let has_node_access_pass = node_access_pass.is_some();
         let connection = client.connect_with_client_metadata_and_access_pass(
@@ -834,9 +1250,13 @@ impl VeilMobileSession {
                 canonical_server_origin,
                 user_id,
             };
+            let generation = self.next_binding_generation()?;
             *self.binding.lock().map_err(|error| VeilError::Session {
                 msg: format!("lock mobile binding: {error}"),
-            })? = Some(binding.clone());
+            })? = Some(MobileAuthenticatedEpoch {
+                binding: binding.clone(),
+                generation,
+            });
             Ok(binding)
         })();
 
@@ -886,6 +1306,29 @@ impl VeilMobileSession {
                 Err(actual) => previous = actual,
             }
         }
+    }
+
+    fn authenticated_epoch(&self) -> Result<MobileAuthenticatedEpoch, VeilError> {
+        self.binding
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile binding: {error}"),
+            })?
+            .clone()
+            .ok_or_else(|| VeilError::Session {
+                msg: "mobile account is not authenticated".to_string(),
+            })
+    }
+
+    fn next_binding_generation(&self) -> Result<u64, VeilError> {
+        self.next_binding_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map(|previous| previous + 1)
+            .map_err(|_| VeilError::Session {
+                msg: "mobile authenticated generation exhausted".to_string(),
+            })
     }
 }
 
@@ -1239,6 +1682,11 @@ fn require_canonical_server_origin(value: &str) -> Result<String, VeilError> {
         .ok_or_else(|| VeilError::InvalidInput {
             msg: "server origin has no effective port".to_string(),
         })?;
+    if port == 0 {
+        return Err(VeilError::InvalidInput {
+            msg: "server origin port must be non-zero".to_string(),
+        });
+    }
     let canonical = format!(
         "{}://{}:{}",
         parsed.scheme().to_ascii_lowercase(),
@@ -1323,6 +1771,51 @@ fn mobile_node_access_pass_bytes(node_access_pass: &Option<Zeroizing<Vec<u8>>>) 
     node_access_pass.as_ref().map(|pass| pass.as_slice())
 }
 
+fn new_mobile_sync_token() -> String {
+    let mut rng = OsRng;
+    loop {
+        let mut token = [0u8; 32];
+        rng.fill_bytes(&mut token);
+        if token != [0u8; 32] {
+            return hex::encode(token);
+        }
+    }
+}
+
+fn require_mobile_sync_token(token: &str) -> Result<(), VeilError> {
+    if token.len() != 64
+        || token
+            .bytes()
+            .any(|byte| !(byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+        || token.bytes().all(|byte| byte == b'0')
+    {
+        return Err(VeilError::InvalidInput {
+            msg: "mobile Direct sync token is invalid".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn mobile_direct_directory_target(cursor: Option<&str>) -> Result<String, VeilError> {
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair(
+        "limit",
+        &veil_client::direct::DIRECT_DIRECTORY_PAGE_LIMIT.to_string(),
+    );
+    if let Some(cursor) = cursor {
+        if cursor.is_empty()
+            || cursor.len() > veil_client::direct::DIRECT_DIRECTORY_CURSOR_LIMIT
+            || cursor.chars().any(char::is_control)
+        {
+            return Err(VeilError::InvalidInput {
+                msg: "mobile Direct directory cursor is invalid".to_string(),
+            });
+        }
+        query.append_pair("cursor", cursor);
+    }
+    Ok(format!("/v1/conversations?{}", query.finish()))
+}
+
 enum MobileConnectOutcome<T> {
     Completed(T),
     Cancelled,
@@ -1349,7 +1842,7 @@ where
 
 fn fail_closed_mobile_connect_cancellation(
     client: &mut veil_client::api::VeilClient,
-    binding: &Mutex<Option<MobileAuthenticatedBinding>>,
+    binding: &Mutex<Option<MobileAuthenticatedEpoch>>,
 ) -> VeilError {
     clear_mobile_binding_fail_closed(binding);
     client.disconnect();
@@ -1371,12 +1864,19 @@ fn safe_mobile_connect_error(msg: String, has_node_access_pass: bool) -> VeilErr
     VeilError::Session { msg }
 }
 
-fn clear_mobile_binding_fail_closed(binding: &Mutex<Option<MobileAuthenticatedBinding>>) {
+fn clear_mobile_binding_fail_closed(binding: &Mutex<Option<MobileAuthenticatedEpoch>>) {
     clear_mobile_binding_guard(binding.lock());
 }
 
+fn clear_mobile_direct_sync_fail_closed(sync: &Mutex<Option<MobileDirectSyncState>>) {
+    match sync.lock() {
+        Ok(mut guard) => *guard = None,
+        Err(poisoned) => *poisoned.into_inner() = None,
+    }
+}
+
 fn clear_mobile_binding_guard(
-    binding: std::sync::LockResult<std::sync::MutexGuard<'_, Option<MobileAuthenticatedBinding>>>,
+    binding: std::sync::LockResult<std::sync::MutexGuard<'_, Option<MobileAuthenticatedEpoch>>>,
 ) {
     match binding {
         Ok(mut guard) => *guard = None,
@@ -1385,7 +1885,7 @@ fn clear_mobile_binding_guard(
 }
 
 fn invalidate_mobile_session<'a>(
-    binding: &Mutex<Option<MobileAuthenticatedBinding>>,
+    binding: &Mutex<Option<MobileAuthenticatedEpoch>>,
     client: &'a Mutex<veil_client::api::VeilClient>,
 ) -> Result<std::sync::MutexGuard<'a, veil_client::api::VeilClient>, VeilError> {
     clear_mobile_binding_fail_closed(binding);
@@ -1414,7 +1914,7 @@ fn disconnect_mobile_client_guard<'a>(
 
 fn fail_closed_mobile_post_auth<T>(
     disconnect: impl FnOnce(),
-    binding: &Mutex<Option<MobileAuthenticatedBinding>>,
+    binding: &Mutex<Option<MobileAuthenticatedEpoch>>,
     error: VeilError,
 ) -> Result<T, VeilError> {
     clear_mobile_binding_fail_closed(binding);
@@ -1465,6 +1965,7 @@ fn require_rest_target(target: &str) -> Result<(), VeilError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use bip39::Language;
     use sha2::{Digest, Sha256};
 
@@ -1482,6 +1983,88 @@ mod tests {
             let correct = draft.word_index(position).unwrap();
             assert!(draft.confirm_challenge(slot, correct).unwrap());
         }
+    }
+
+    fn mobile_test_epoch(generation: u64) -> MobileAuthenticatedEpoch {
+        MobileAuthenticatedEpoch {
+            binding: MobileAuthenticatedBinding {
+                canonical_server_origin: "https://old.example.test:443".to_string(),
+                user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
+            },
+            generation,
+        }
+    }
+
+    fn mobile_test_session_with_sync(
+        generation: u64,
+    ) -> (VeilMobileSession, std::path::PathBuf, String) {
+        let mut client = veil_client::api::VeilClient::new();
+        let mnemonic = client.generate_mnemonic();
+        let path =
+            std::env::temp_dir().join(format!("veil-mobile-sync-{}.db", uuid::Uuid::new_v4()));
+        client.init_with_mnemonic(&mnemonic, &path).unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let epoch = mobile_test_epoch(generation);
+        let token = "ab".repeat(32);
+        (
+            VeilMobileSession {
+                client: Mutex::new(client),
+                runtime,
+                binding: Mutex::new(Some(epoch.clone())),
+                direct_sync: Mutex::new(Some(MobileDirectSyncState {
+                    token: token.clone(),
+                    epoch,
+                    next_cursor: None,
+                    directory_complete: false,
+                    history: veil_client::direct::DirectDirectorySyncHistory::default(),
+                    peers: HashMap::new(),
+                    outstanding_directory_request: None,
+                    outstanding_prekey_requests: HashMap::new(),
+                })),
+                next_binding_generation: AtomicU64::new(generation),
+                last_rest_timestamp_ms: AtomicI64::new(0),
+            },
+            path,
+            token,
+        )
+    }
+
+    fn mobile_test_directory_response(session: &VeilMobileSession) -> (Vec<u8>, IdentityKeyPair) {
+        let client = session.client.lock().unwrap();
+        let local_identity = client.identity_key().unwrap();
+        let local_signing = client.signing_key().unwrap();
+        drop(client);
+        let peer = IdentityKeyPair::generate();
+        let peer_identity = peer.x25519_public_bytes();
+        let response = serde_json::to_vec(&serde_json::json!({
+            "count": 1,
+            "conversations": [{
+                "id": "20000000-0000-4000-8000-000000000001",
+                "conv_type": 0,
+                "name": null,
+                "server_id": null,
+                "created_at": "2026-07-18T00:00:00Z",
+                "members": [
+                    {
+                        "user_id": "550e8400-e29b-41d4-a716-446655440001",
+                        "username": "self",
+                        "identity_key": hex::encode(local_identity),
+                        "signing_key": hex::encode(local_signing),
+                    },
+                    {
+                        "user_id": "550e8400-e29b-41d4-a716-446655440002",
+                        "username": "peer",
+                        "identity_key": hex::encode(peer_identity),
+                        "signing_key": hex::encode(peer.ed25519_public_bytes()),
+                    }
+                ]
+            }]
+        }))
+        .unwrap();
+        (response, peer)
     }
 
     #[test]
@@ -1992,11 +2575,140 @@ mod tests {
     }
 
     #[test]
+    fn mobile_direct_sync_rejects_a_stale_same_account_generation_before_mutation() {
+        let (session, path, token) = mobile_test_session_with_sync(7);
+        let (response, peer) = mobile_test_directory_response(&session);
+        let request = session
+            .prepare_direct_directory_request(token.clone())
+            .unwrap();
+        // Same public origin/account, different private WebSocket generation.
+        *session.binding.lock().unwrap() = Some(mobile_test_epoch(8));
+
+        let error = session
+            .install_direct_directory_page(token, request.request_token, response)
+            .unwrap_err();
+        assert!(error.to_string().contains("lease is stale"));
+        let client = session.client.lock().unwrap();
+        assert!(client.db().unwrap().get_conversations().unwrap().is_empty());
+        assert_eq!(
+            client.known_user_identity("550e8400-e29b-41d4-a716-446655440002"),
+            None
+        );
+        assert!(!client.has_session(&peer.x25519_public_bytes()));
+        drop(client);
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_sync_installs_only_under_its_object_bound_random_lease() {
+        let (session, path, token) = mobile_test_session_with_sync(9);
+        let (response, peer) = mobile_test_directory_response(&session);
+        let request = session
+            .prepare_direct_directory_request(token.clone())
+            .unwrap();
+        assert_eq!(request.request_target, "/v1/conversations?limit=100");
+        assert!(
+            session
+                .install_direct_directory_page(
+                    token.clone(),
+                    new_mobile_sync_token(),
+                    response.clone(),
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("request is stale")
+        );
+        let page = session
+            .install_direct_directory_page(token.clone(), request.request_token.clone(), response)
+            .unwrap();
+        assert!(page.directory_complete);
+        assert!(page.next_cursor.is_none());
+        assert_eq!(page.conversations.len(), 1);
+        assert_eq!(
+            page.conversations[0].conversation_id,
+            "20000000-0000-4000-8000-000000000001"
+        );
+        assert_eq!(
+            session
+                .install_direct_directory_page(
+                    token.clone(),
+                    request.request_token,
+                    b"{}".to_vec(),
+                )
+                .unwrap_err()
+                .to_string(),
+            "Session error: mobile Direct directory is already complete"
+        );
+
+        let conversation_id = "20000000-0000-4000-8000-000000000001".to_string();
+        let prekey_request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        assert_eq!(
+            prekey_request.request_target,
+            format!("/v1/prekeys/{}", hex::encode(peer.x25519_public_bytes()))
+        );
+        let repeated_request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        assert_eq!(repeated_request.request_token, prekey_request.request_token);
+
+        let peer_identity = peer.x25519_public_bytes();
+        let peer_signing = peer.ed25519_public_bytes();
+        let mut peer_client = veil_client::api::VeilClient::from_identity(peer);
+        let prekeys = peer_client.generate_prekeys().unwrap();
+        let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
+        let b64 = base64::engine::general_purpose::STANDARD;
+        let prekey_response = serde_json::to_vec(&serde_json::json!({
+            "identity_key": b64.encode(peer_identity),
+            "signing_key": b64.encode(peer_signing),
+            "signed_prekey": b64.encode(prekeys.spk_public),
+            "signed_prekey_signature": b64.encode(prekeys.spk_signature),
+            "signed_prekey_id": prekeys.spk_id,
+            "one_time_prekey": b64.encode(one_time_prekey),
+            "one_time_prekey_id": one_time_prekey_id,
+        }))
+        .unwrap();
+        assert!(session
+            .install_direct_prekey_bundle(
+                token.clone(),
+                new_mobile_sync_token(),
+                conversation_id.clone(),
+                prekey_response.clone(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("request is stale"));
+        let installed = session
+            .install_direct_prekey_bundle(
+                token.clone(),
+                prekey_request.request_token,
+                conversation_id.clone(),
+                prekey_response,
+            )
+            .unwrap();
+        assert_eq!(installed.status, "established");
+        assert!(session.client.lock().unwrap().has_session(&peer_identity));
+        assert!(session
+            .prepare_direct_prekey_request(token.clone(), conversation_id)
+            .unwrap_err()
+            .to_string()
+            .contains("already established"));
+
+        let first = new_mobile_sync_token();
+        let second = new_mobile_sync_token();
+        assert_ne!(first, second);
+        assert!(require_mobile_sync_token(&first).is_ok());
+        assert!(require_mobile_sync_token(&first.to_uppercase()).is_err());
+        assert!(require_mobile_sync_token(&"0".repeat(64)).is_err());
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn mobile_connect_cancellation_clears_binding_and_disconnects_fail_closed() {
-        let binding = Mutex::new(Some(MobileAuthenticatedBinding {
-            canonical_server_origin: "https://old.example.test:443".to_string(),
-            user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
-        }));
+        let binding = Mutex::new(Some(mobile_test_epoch(1)));
         let mut client = veil_client::api::VeilClient::new();
 
         let error = fail_closed_mobile_connect_cancellation(&mut client, &binding);
@@ -2011,10 +2723,7 @@ mod tests {
 
     #[test]
     fn mobile_post_auth_failure_disconnects_clears_and_preserves_error() {
-        let binding = Mutex::new(Some(MobileAuthenticatedBinding {
-            canonical_server_origin: "https://old.example.test:443".to_string(),
-            user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
-        }));
+        let binding = Mutex::new(Some(mobile_test_epoch(2)));
         let disconnect_count = std::cell::Cell::new(0);
         let result: Result<(), VeilError> = fail_closed_mobile_post_auth(
             || disconnect_count.set(disconnect_count.get() + 1),
@@ -2034,10 +2743,7 @@ mod tests {
 
     #[test]
     fn mobile_binding_cleanup_recovers_a_poisoned_guard() {
-        let binding = Mutex::new(Some(MobileAuthenticatedBinding {
-            canonical_server_origin: "https://old.example.test:443".to_string(),
-            user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
-        }));
+        let binding = Mutex::new(Some(mobile_test_epoch(3)));
         let guard = binding.lock().unwrap();
         clear_mobile_binding_guard(Err(std::sync::PoisonError::new(guard)));
         assert!(binding.lock().unwrap().is_none());
@@ -2045,10 +2751,7 @@ mod tests {
 
     #[test]
     fn mobile_session_invalidation_clears_binding_and_closes_prior_epoch() {
-        let binding = Mutex::new(Some(MobileAuthenticatedBinding {
-            canonical_server_origin: "https://old.example.test:443".to_string(),
-            user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
-        }));
+        let binding = Mutex::new(Some(mobile_test_epoch(4)));
         let client = Mutex::new(veil_client::api::VeilClient::new());
 
         let client_guard = invalidate_mobile_session(&binding, &client).unwrap();

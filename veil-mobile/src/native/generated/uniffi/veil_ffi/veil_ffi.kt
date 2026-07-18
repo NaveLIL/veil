@@ -820,6 +820,18 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -869,6 +881,10 @@ fun uniffi_veil_ffi_checksum_method_veilidentity_to_key_bundle(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_authenticated_binding(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_begin_direct_sync(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_cancellable(
@@ -878,6 +894,14 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_p
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass_cancellable(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_page(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_rest_request(
 ): Short
@@ -1018,6 +1042,10 @@ fun uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic_bytes(`mnemon
 ): Pointer
 fun uniffi_veil_ffi_fn_method_veilmobilesession_authenticated_binding(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_begin_direct_sync(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_cancel_direct_sync(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_cancellable(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`cancellation`: Pointer,uniffi_out_err: UniffiRustCallStatus,
@@ -1028,6 +1056,14 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass_ca
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_disconnect(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_directory_page(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_prekey_bundle(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_directory_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_prekey_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_sign_rest_request(`ptr`: Pointer,`canonicalServerOrigin`: RustBuffer.ByValue,`method`: RustBuffer.ByValue,`requestTarget`: RustBuffer.ByValue,`body`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_clone_veilratchet(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
@@ -1277,6 +1313,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_authenticated_binding() != 44182.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_begin_direct_sync() != 53699.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync() != 53148.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect() != 62689.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1290,6 +1332,18 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect() != 63203.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_page() != 42994.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle() != 30329.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request() != 63870.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request() != 39529.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_rest_request() != 64338.toShort()) {
@@ -2372,6 +2426,15 @@ public interface VeilMobileSessionInterface {
 
     fun `authenticatedBinding`(): MobileAuthenticatedBinding
 
+    /**
+     * Start an object-bound Direct directory sync for the exact current
+     * WebSocket generation. The random token never crosses into JavaScript;
+     * Kotlin must return it with every raw REST response.
+     */
+    fun `beginDirectSync`(): MobileDirectSyncLease
+
+    fun `cancelDirectSync`(`leaseToken`: kotlin.String)
+
     fun `connect`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String): MobileAuthenticatedBinding
 
     /**
@@ -2397,6 +2460,23 @@ public interface VeilMobileSessionInterface {
     fun `connectWithNodeAccessPassCancellable`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray, `cancellation`: MobileConnectCancellation): MobileAuthenticatedBinding
 
     fun `disconnect`()
+
+    /**
+     * Validate and install one raw directory response under the exact lease
+     * that issued its request. Binding and client guards stay held across the
+     * mutation, making reconnect/disconnect linearize before or after it.
+     */
+    fun `installDirectDirectoryPage`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectDirectoryPageData
+
+    fun `installDirectPrekeyBundle`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `conversationId`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectPreKeyResult
+
+    fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest
+
+    /**
+     * Install a peer bundle by the conversation route learned under this
+     * lease. Kotlin cannot substitute peer account keys.
+     */
+    fun `prepareDirectPrekeyRequest`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectRestRequest
 
     fun `signRestRequest`(`canonicalServerOrigin`: kotlin.String, `method`: kotlin.String, `requestTarget`: kotlin.String, `body`: kotlin.ByteArray): RestSignatureData
 
@@ -2504,6 +2584,36 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
+    /**
+     * Start an object-bound Direct directory sync for the exact current
+     * WebSocket generation. The random token never crosses into JavaScript;
+     * Kotlin must return it with every raw REST response.
+     */
+    @Throws(VeilException::class)override fun `beginDirectSync`(): MobileDirectSyncLease {
+            return FfiConverterTypeMobileDirectSyncLease.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_begin_direct_sync(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `cancelDirectSync`(`leaseToken`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_cancel_direct_sync(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+
+
+
+
     @Throws(VeilException::class)override fun `connect`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String): MobileAuthenticatedBinding {
             return FfiConverterTypeMobileAuthenticatedBinding.lift(
     callWithPointer {
@@ -2581,6 +2691,67 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 }
     }
 
+
+
+
+    /**
+     * Validate and install one raw directory response under the exact lease
+     * that issued its request. Binding and client guards stay held across the
+     * mutation, making reconnect/disconnect linearize before or after it.
+     */
+    @Throws(VeilException::class)override fun `installDirectDirectoryPage`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectDirectoryPageData {
+            return FfiConverterTypeMobileDirectDirectoryPageData.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_directory_page(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `installDirectPrekeyBundle`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `conversationId`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectPreKeyResult {
+            return FfiConverterTypeMobileDirectPreKeyResult.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_prekey_bundle(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterString.lower(`conversationId`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest {
+            return FfiConverterTypeMobileDirectRestRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_directory_request(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Install a peer bundle by the conversation route learned under this
+     * lease. Kotlin cannot substitute peer account keys.
+     */
+    @Throws(VeilException::class)override fun `prepareDirectPrekeyRequest`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectRestRequest {
+            return FfiConverterTypeMobileDirectRestRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_prekey_request(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`conversationId`),_status)
+}
+    }
+    )
+    }
 
 
 
@@ -3572,6 +3743,194 @@ public object FfiConverterTypeMobileAuthenticatedBinding: FfiConverterRustBuffer
 
 
 
+data class MobileDirectConversationData (
+    var `conversationId`: kotlin.String,
+    var `name`: kotlin.String,
+    var `peerUserId`: kotlin.String,
+    var `peerUsername`: kotlin.String,
+    var `peerIdentityKeyHex`: kotlin.String,
+    var `peerSigningKeyHex`: kotlin.String,
+    var `needsPrekey`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectConversationData: FfiConverterRustBuffer<MobileDirectConversationData> {
+    override fun read(buf: ByteBuffer): MobileDirectConversationData {
+        return MobileDirectConversationData(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectConversationData) = (
+            FfiConverterString.allocationSize(value.`conversationId`) +
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterString.allocationSize(value.`peerUserId`) +
+            FfiConverterString.allocationSize(value.`peerUsername`) +
+            FfiConverterString.allocationSize(value.`peerIdentityKeyHex`) +
+            FfiConverterString.allocationSize(value.`peerSigningKeyHex`) +
+            FfiConverterBoolean.allocationSize(value.`needsPrekey`)
+    )
+
+    override fun write(value: MobileDirectConversationData, buf: ByteBuffer) {
+            FfiConverterString.write(value.`conversationId`, buf)
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterString.write(value.`peerUserId`, buf)
+            FfiConverterString.write(value.`peerUsername`, buf)
+            FfiConverterString.write(value.`peerIdentityKeyHex`, buf)
+            FfiConverterString.write(value.`peerSigningKeyHex`, buf)
+            FfiConverterBoolean.write(value.`needsPrekey`, buf)
+    }
+}
+
+
+
+data class MobileDirectDirectoryPageData (
+    var `conversations`: List<MobileDirectConversationData>,
+    var `nextCursor`: kotlin.String?,
+    var `skippedNonDirect`: kotlin.UInt,
+    var `directoryComplete`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectDirectoryPageData: FfiConverterRustBuffer<MobileDirectDirectoryPageData> {
+    override fun read(buf: ByteBuffer): MobileDirectDirectoryPageData {
+        return MobileDirectDirectoryPageData(
+            FfiConverterSequenceTypeMobileDirectConversationData.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectDirectoryPageData) = (
+            FfiConverterSequenceTypeMobileDirectConversationData.allocationSize(value.`conversations`) +
+            FfiConverterOptionalString.allocationSize(value.`nextCursor`) +
+            FfiConverterUInt.allocationSize(value.`skippedNonDirect`) +
+            FfiConverterBoolean.allocationSize(value.`directoryComplete`)
+    )
+
+    override fun write(value: MobileDirectDirectoryPageData, buf: ByteBuffer) {
+            FfiConverterSequenceTypeMobileDirectConversationData.write(value.`conversations`, buf)
+            FfiConverterOptionalString.write(value.`nextCursor`, buf)
+            FfiConverterUInt.write(value.`skippedNonDirect`, buf)
+            FfiConverterBoolean.write(value.`directoryComplete`, buf)
+    }
+}
+
+
+
+data class MobileDirectPreKeyResult (
+    var `status`: kotlin.String
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectPreKeyResult: FfiConverterRustBuffer<MobileDirectPreKeyResult> {
+    override fun read(buf: ByteBuffer): MobileDirectPreKeyResult {
+        return MobileDirectPreKeyResult(
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectPreKeyResult) = (
+            FfiConverterString.allocationSize(value.`status`)
+    )
+
+    override fun write(value: MobileDirectPreKeyResult, buf: ByteBuffer) {
+            FfiConverterString.write(value.`status`, buf)
+    }
+}
+
+
+
+data class MobileDirectRestRequest (
+    var `requestToken`: kotlin.String,
+    var `requestTarget`: kotlin.String
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectRestRequest: FfiConverterRustBuffer<MobileDirectRestRequest> {
+    override fun read(buf: ByteBuffer): MobileDirectRestRequest {
+        return MobileDirectRestRequest(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectRestRequest) = (
+            FfiConverterString.allocationSize(value.`requestToken`) +
+            FfiConverterString.allocationSize(value.`requestTarget`)
+    )
+
+    override fun write(value: MobileDirectRestRequest, buf: ByteBuffer) {
+            FfiConverterString.write(value.`requestToken`, buf)
+            FfiConverterString.write(value.`requestTarget`, buf)
+    }
+}
+
+
+
+data class MobileDirectSyncLease (
+    var `token`: kotlin.String,
+    var `canonicalServerOrigin`: kotlin.String,
+    var `userId`: kotlin.String
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectSyncLease: FfiConverterRustBuffer<MobileDirectSyncLease> {
+    override fun read(buf: ByteBuffer): MobileDirectSyncLease {
+        return MobileDirectSyncLease(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectSyncLease) = (
+            FfiConverterString.allocationSize(value.`token`) +
+            FfiConverterString.allocationSize(value.`canonicalServerOrigin`) +
+            FfiConverterString.allocationSize(value.`userId`)
+    )
+
+    override fun write(value: MobileDirectSyncLease, buf: ByteBuffer) {
+            FfiConverterString.write(value.`token`, buf)
+            FfiConverterString.write(value.`canonicalServerOrigin`, buf)
+            FfiConverterString.write(value.`userId`, buf)
+    }
+}
+
+
+
 data class PreKeyBundleData (
     var `identityKey`: kotlin.ByteArray,
     var `signingKey`: kotlin.ByteArray,
@@ -3959,6 +4318,34 @@ public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteA
         } else {
             buf.put(1)
             FfiConverterByteArray.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeMobileDirectConversationData: FfiConverterRustBuffer<List<MobileDirectConversationData>> {
+    override fun read(buf: ByteBuffer): List<MobileDirectConversationData> {
+        val len = buf.getInt()
+        return List<MobileDirectConversationData>(len) {
+            FfiConverterTypeMobileDirectConversationData.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<MobileDirectConversationData>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMobileDirectConversationData.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<MobileDirectConversationData>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMobileDirectConversationData.write(it, buf)
         }
     }
 }

@@ -1,6 +1,7 @@
 use crate::models::{
-    AccountSnapshot, AccountSnapshotSource, HistoricalAccountContinuity, LocalIdentityVerification,
-    Message, MessageAuthorContext, NetworkProfile, ProfileLocator,
+    AccountSnapshot, AccountSnapshotSource, AuthenticatedDirectDirectoryEntry,
+    HistoricalAccountContinuity, LocalIdentityVerification, Message, MessageAuthorContext,
+    NetworkProfile, ProfileLocator,
 };
 use rusqlite::{Connection, OptionalExtension, Row};
 use std::path::Path;
@@ -3059,6 +3060,76 @@ impl VeilDb {
             Err(e) => return Err(format!("load directory conversation: {e}")),
         }
         Ok(())
+    }
+
+    /// Atomically persist every Direct conversation from one authenticated
+    /// directory page. Duplicate conversation/peer bindings are rejected
+    /// before the transaction so a corrupted page cannot select a winner by
+    /// row order.
+    pub fn upsert_directory_directs(
+        &self,
+        canonical_server_origin: &str,
+        conversations: &[AuthenticatedDirectDirectoryEntry],
+    ) -> Result<(), String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        let mut conversation_ids = std::collections::HashSet::with_capacity(conversations.len());
+        let mut peer_user_ids = std::collections::HashSet::with_capacity(conversations.len());
+        let mut peer_identity_keys = std::collections::HashSet::with_capacity(conversations.len());
+        for conversation in conversations {
+            if !conversation_ids.insert(conversation.conversation_id.as_str()) {
+                return Err("Direct directory batch repeats a conversation id".to_string());
+            }
+            if !peer_user_ids.insert(conversation.peer_user_id.as_str())
+                || !peer_identity_keys.insert(conversation.peer_identity_key)
+            {
+                return Err("Direct directory batch repeats a peer account".to_string());
+            }
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin Direct directory transaction: {error}"))?;
+        for conversation in conversations {
+            let duplicate = self
+                .conn
+                .query_row(
+                    "SELECT id
+                     FROM conversations
+                     WHERE conv_type = 0 AND id <> ?1
+                       AND (
+                         peer_identity_key = ?2
+                         OR (server_origin = ?3 AND peer_user_id = ?4)
+                       )
+                     LIMIT 1",
+                    rusqlite::params![
+                        conversation.conversation_id,
+                        conversation.peer_identity_key.as_slice(),
+                        canonical_server_origin,
+                        conversation.peer_user_id,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| format!("check duplicate Direct directory route: {error}"))?;
+            if let Some(existing_id) = duplicate {
+                return Err(format!(
+                    "Direct peer is already bound to conversation {existing_id}"
+                ));
+            }
+            self.upsert_directory_conversation(
+                &conversation.conversation_id,
+                0,
+                canonical_server_origin,
+                Some(&conversation.name),
+                Some(&conversation.peer_user_id),
+                Some(&conversation.peer_identity_key),
+                None,
+                &conversation.created_at,
+            )?;
+        }
+        tx.commit()
+            .map_err(|error| format!("commit Direct directory transaction: {error}"))
     }
 
     /// Atomically persist the text-channel conversations from one authenticated

@@ -172,6 +172,17 @@ pub struct Conversation {
     pub created_at: String,
 }
 
+/// One Direct conversation accepted from an authenticated, origin-scoped
+/// server directory page and ready for an atomic SQLCipher batch merge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedDirectDirectoryEntry {
+    pub conversation_id: String,
+    pub name: String,
+    pub peer_user_id: String,
+    pub peer_identity_key: [u8; 32],
+    pub created_at: String,
+}
+
 /// A decrypted message (stored locally in SQLCipher).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
