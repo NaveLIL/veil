@@ -22,6 +22,7 @@ var (
 	ErrPreKeyAccessDenied           = errors.New("prekey access requires a shared conversation")
 	ErrMessageConversationMismatch  = errors.New("message does not belong to conversation")
 	ErrAttachmentAccess             = errors.New("attachment is unavailable or not owned by sender")
+	ErrSealedMessageUnsupported     = errors.New("sealed messages are unavailable until live and history storage have matching semantics")
 	ErrSecureMessageEditUnsupported = errors.New("editing Sender-Key group/channel messages requires an exact device-routed edit protocol")
 	ErrInvalidReaction              = errors.New("invalid reaction request")
 	ErrReactionLimitReached         = errors.New("message reaction limit reached")
@@ -65,6 +66,12 @@ func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, ms
 	}
 	if len(msg.Ciphertext) > s.cfg.MaxMessageSize {
 		return "", time.Time{}, nil, ErrMessageTooBig
+	}
+	// MessageEvent historically exposed this flag only on the live path. Until
+	// it is persisted and returned by history, accepting it would let reconnect
+	// replay observe semantics different from the original delivery.
+	if msg.Sealed {
+		return "", time.Time{}, nil, ErrSealedMessageUnsupported
 	}
 
 	// --- Check membership ---
@@ -145,21 +152,53 @@ func (s *Service) handleSendMessage(ctx context.Context, senderUserID string, ms
 		return "", time.Time{}, nil, fmt.Errorf("store message: %w", err)
 	}
 
-	// --- Get recipients for fan-out ---
-	members, err := s.db.GetAuthorizedConversationMembers(ctx, msg.ConversationId, db.ChannelReadPermissions)
+	// Recipient resolution happens after StoreMessage commits. It is therefore
+	// deliberately best-effort: returning an error here would tell the sender
+	// that a durable message failed and could cause a duplicate retry. On a
+	// lookup failure the caller still ACKs the committed row, while live fan-out
+	// is skipped and reconnect/history remains the source of truth.
+	recipients := committedChatRecipients(
+		ctx, s.db, dbMsg.ID, msg.ConversationId, senderUserID,
+	)
+
+	return dbMsg.ID, dbMsg.CreatedAt, recipients, nil
+}
+
+type authorizedConversationMemberLookup interface {
+	GetAuthorizedConversationMembers(context.Context, string, uint64) ([]string, error)
+}
+
+// committedChatRecipients cannot report an error by design. Its caller is
+// already past a durable send/edit/delete/reaction commit boundary and must
+// never turn a fan-out lookup failure into a mutation failure visible to the
+// client.
+func committedChatRecipients(
+	ctx context.Context,
+	store authorizedConversationMemberLookup,
+	messageID string,
+	conversationID string,
+	senderUserID string,
+) []string {
+	members, err := store.GetAuthorizedConversationMembers(
+		ctx, conversationID, db.ChannelReadPermissions,
+	)
 	if err != nil {
-		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
+		log.Printf(
+			"committed chat mutation recipient lookup failed: message_ref=%s conversation_ref=%s class=%s",
+			logsafe.Ref("message", messageID),
+			logsafe.Ref("conversation", conversationID),
+			logsafe.ErrorClass(err),
+		)
+		return nil
 	}
 
-	// Filter out sender
-	var recipients []string
+	recipients := make([]string, 0, len(members))
 	for _, uid := range members {
 		if uid != senderUserID {
 			recipients = append(recipients, uid)
 		}
 	}
-
-	return dbMsg.ID, dbMsg.CreatedAt, recipients, nil
+	return recipients
 }
 
 func validAttachmentFileID(fileID string) bool {
@@ -222,17 +261,9 @@ func (s *Service) HandleEditMessage(ctx context.Context, senderUserID string, ms
 		return "", time.Time{}, nil, fmt.Errorf("edit message: %w", err)
 	}
 
-	members, err := s.db.GetAuthorizedConversationMembers(ctx, convID, db.ChannelReadPermissions)
-	if err != nil {
-		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
-	}
-
-	var recipients []string
-	for _, uid := range members {
-		if uid != senderUserID {
-			recipients = append(recipients, uid)
-		}
-	}
+	recipients := committedChatRecipients(
+		ctx, s.db, msg.MessageId, convID, senderUserID,
+	)
 	return convID, editedAt, recipients, nil
 }
 
@@ -264,17 +295,9 @@ func (s *Service) HandleDeleteMessage(ctx context.Context, senderUserID string, 
 		return "", time.Time{}, nil, fmt.Errorf("delete message: %w", err)
 	}
 
-	members, err := s.db.GetAuthorizedConversationMembers(ctx, convID, db.ChannelReadPermissions)
-	if err != nil {
-		return "", time.Time{}, nil, fmt.Errorf("get members: %w", err)
-	}
-
-	var recipients []string
-	for _, uid := range members {
-		if uid != senderUserID {
-			recipients = append(recipients, uid)
-		}
-	}
+	recipients := committedChatRecipients(
+		ctx, s.db, msg.MessageId, convID, senderUserID,
+	)
 	return convID, deletedAt, recipients, nil
 }
 
@@ -318,17 +341,9 @@ func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *
 		return nil, false, nil
 	}
 
-	members, err := s.db.GetAuthorizedConversationMembers(ctx, msg.ConversationId, db.ChannelReadPermissions)
-	if err != nil {
-		return nil, false, fmt.Errorf("get members: %w", err)
-	}
-
-	var recipients []string
-	for _, uid := range members {
-		if uid != senderUserID {
-			recipients = append(recipients, uid)
-		}
-	}
+	recipients := committedChatRecipients(
+		ctx, s.db, msg.MessageId, msg.ConversationId, senderUserID,
+	)
 	return recipients, true, nil
 }
 

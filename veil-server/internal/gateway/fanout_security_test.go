@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"runtime"
 	"sync"
 	"testing"
@@ -11,6 +13,77 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
+
+func TestAuthenticatedSenderSnapshotIsCompleteAndImmutable(t *testing.T) {
+	t.Parallel()
+
+	identityKey := bytes.Repeat([]byte{0x2a}, 32)
+	client := &Client{
+		authenticated: true,
+		userID:        "authenticated-user",
+		username:      "authenticated-name",
+		identityKey:   identityKey,
+	}
+	snapshot, ok := client.snapshotAuthenticatedSender()
+	if !ok {
+		t.Fatal("complete authenticated sender was rejected")
+	}
+	client.identityKey[0] ^= 0xff
+	client.username = "changed-after-snapshot"
+	if !bytes.Equal(snapshot.identityKey, bytes.Repeat([]byte{0x2a}, 32)) ||
+		snapshot.username != "authenticated-name" {
+		t.Fatalf("snapshot changed with client state: key=%x username=%q", snapshot.identityKey, snapshot.username)
+	}
+
+	for name, invalid := range map[string]*Client{
+		"unauthenticated": {
+			userID: "user", username: "name", identityKey: bytes.Repeat([]byte{1}, 32),
+		},
+		"missing user": {
+			authenticated: true, username: "name", identityKey: bytes.Repeat([]byte{1}, 32),
+		},
+		"missing username": {
+			authenticated: true, userID: "user", identityKey: bytes.Repeat([]byte{1}, 32),
+		},
+		"short identity": {
+			authenticated: true, userID: "user", username: "name", identityKey: bytes.Repeat([]byte{1}, 31),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if snapshot, ok := invalid.snapshotAuthenticatedSender(); ok {
+				t.Fatalf("invalid sender produced snapshot: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestSealedMessageIsRejectedBeforeGatewayDependencies(t *testing.T) {
+	t.Parallel()
+
+	// A nil hub is an intentional poison dependency: reaching ACL, type, or
+	// roster preflight would panic. The unsupported shape must fail first.
+	client := &Client{
+		authenticated: true,
+		userID:        "authenticated-user",
+		username:      "authenticated-name",
+		identityKey:   bytes.Repeat([]byte{0x44}, 32),
+		send:          make(chan outboundBatch, 1),
+	}
+	client.handleSendMessage(context.Background(), 41, &pb.SendMessage{
+		ConversationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		Ciphertext:     []byte("must-not-reach-dependencies"),
+		Sealed:         true,
+	})
+
+	envelope := decodePublicErrorEnvelope(t, <-client.send)
+	got := envelope.GetError()
+	if got == nil || got.GetCode() != http.StatusBadRequest ||
+		got.GetMessage() != "message rejected" || got.GetRefSeq() != 41 ||
+		envelope.GetMessageAck() != nil {
+		t.Fatalf("sealed gateway response = %#v, want generic 400 without ACK", envelope)
+	}
+}
 
 func TestClassifySendMessageErrorRequiresRosterRefresh(t *testing.T) {
 	t.Parallel()

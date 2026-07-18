@@ -186,6 +186,24 @@ type Client struct {
 	authAttempts int
 }
 
+type authenticatedSenderSnapshot struct {
+	identityKey []byte
+	username    string
+}
+
+// snapshotAuthenticatedSender captures the identity authenticated on this
+// transport. Message mutation handlers take it before touching durable state,
+// so live events never depend on a fallible post-ACK directory lookup.
+func (c *Client) snapshotAuthenticatedSender() (authenticatedSenderSnapshot, bool) {
+	if !c.authenticated || c.userID == "" || len(c.identityKey) != 32 || c.username == "" {
+		return authenticatedSenderSnapshot{}, false
+	}
+	return authenticatedSenderSnapshot{
+		identityKey: append([]byte(nil), c.identityKey...),
+		username:    c.username,
+	}, true
+}
+
 // outboundBatch is one indivisible FIFO unit for the single WebSocket writer.
 // Authentication publishes retained control envelopes and the successful
 // AuthResult in one batch so no live event can be written between them.
@@ -898,6 +916,21 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 // --- Chat ---
 
 func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.SendMessage) {
+	sender, authenticated := c.snapshotAuthenticatedSender()
+	if !authenticated {
+		c.sendError(seq, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	// Sealed-message semantics are not persisted in REST history yet. Reject
+	// this globally unsupported shape before any conversation, device, or
+	// roster lookup so every authenticated caller gets the same safe outcome.
+	// The Service repeats the guard as defense in depth for non-WS callers.
+	if msg != nil && msg.Sealed {
+		status, message := classifySendMessageError(chat.ErrSealedMessageUnsupported)
+		c.sendError(seq, uint32(status), message)
+		return
+	}
+
 	var secureRoster *db.ConversationDeviceRoster
 	var messageSecurity *db.MessageSecurityContext
 	if msg != nil && msg.ConversationId != "" {
@@ -988,15 +1021,6 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 		},
 	})
 
-	// Lookup sender info for the event
-	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
-	var senderKey []byte
-	var senderName string
-	if sender != nil {
-		senderKey = sender.IdentityKey
-		senderName = sender.Username
-	}
-
 	// Fan-out MessageEvent to recipients
 	event := &pb.Envelope{
 		Timestamp: uint64(serverTime.UnixNano()),
@@ -1005,8 +1029,8 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 				EventType:         pb.MessageEvent_NEW,
 				MessageId:         msgID,
 				ConversationId:    msg.ConversationId,
-				SenderIdentityKey: senderKey,
-				SenderUsername:    senderName,
+				SenderIdentityKey: sender.identityKey,
+				SenderUsername:    sender.username,
 				ServerTimestamp:   uint64(serverTime.UnixNano()),
 				Ciphertext:        msg.Ciphertext,
 				Header:            msg.Header,
@@ -1039,6 +1063,12 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 // --- Edit Message ---
 
 func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.EditMessage) {
+	sender, authenticated := c.snapshotAuthenticatedSender()
+	if !authenticated {
+		c.sendError(seq, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
 	conversationID, editedAt, recipients, err := c.hub.chatSvc.HandleEditMessage(ctx, c.userID, msg)
 	if err != nil {
 		c.sendPublicError(seq, http.StatusBadRequest, err)
@@ -1058,14 +1088,6 @@ func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.Edit
 		},
 	})
 
-	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
-	var senderKey []byte
-	var senderName string
-	if sender != nil {
-		senderKey = sender.IdentityKey
-		senderName = sender.Username
-	}
-
 	editTs := uint64(editedAt.UnixNano())
 	event := &pb.Envelope{
 		Timestamp: editTs,
@@ -1074,8 +1096,8 @@ func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.Edit
 				EventType:         pb.MessageEvent_EDITED,
 				MessageId:         msg.MessageId,
 				ConversationId:    conversationID,
-				SenderIdentityKey: senderKey,
-				SenderUsername:    senderName,
+				SenderIdentityKey: sender.identityKey,
+				SenderUsername:    sender.username,
 				ServerTimestamp:   editTs,
 				Ciphertext:        msg.NewCiphertext,
 				Header:            msg.NewHeader,
@@ -1092,6 +1114,12 @@ func (c *Client) handleEditMessage(ctx context.Context, seq uint64, msg *pb.Edit
 // --- Delete Message ---
 
 func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.DeleteMessage) {
+	sender, authenticated := c.snapshotAuthenticatedSender()
+	if !authenticated {
+		c.sendError(seq, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
 	conversationID, deletedAt, recipients, err := c.hub.chatSvc.HandleDeleteMessage(ctx, c.userID, msg)
 	if err != nil {
 		c.sendPublicError(seq, http.StatusBadRequest, err)
@@ -1113,14 +1141,6 @@ func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.De
 		},
 	})
 
-	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
-	var senderKey []byte
-	var senderName string
-	if sender != nil {
-		senderKey = sender.IdentityKey
-		senderName = sender.Username
-	}
-
 	event := &pb.Envelope{
 		Timestamp: deletedTimestamp,
 		Payload: &pb.Envelope_MessageEvent{
@@ -1128,8 +1148,8 @@ func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.De
 				EventType:         pb.MessageEvent_DELETED,
 				MessageId:         msg.MessageId,
 				ConversationId:    conversationID,
-				SenderIdentityKey: senderKey,
-				SenderUsername:    senderName,
+				SenderIdentityKey: sender.identityKey,
+				SenderUsername:    sender.username,
 				ServerTimestamp:   deletedTimestamp,
 			},
 		},
@@ -1143,6 +1163,12 @@ func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.De
 // --- Reactions ---
 
 func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.ReactionUpdate) {
+	sender, authenticated := c.snapshotAuthenticatedSender()
+	if !authenticated {
+		c.sendError(seq, http.StatusUnauthorized, "authentication required")
+		return
+	}
+
 	recipients, changed, err := c.hub.chatSvc.HandleReaction(ctx, c.userID, msg)
 	if err != nil {
 		switch {
@@ -1175,13 +1201,6 @@ func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.Reactio
 		return
 	}
 
-	// Lookup sender info
-	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)
-	var senderName string
-	if sender != nil {
-		senderName = sender.Username
-	}
-
 	// Fan-out ReactionEvent to other members
 	event := &pb.Envelope{
 		Timestamp: now,
@@ -1191,7 +1210,7 @@ func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.Reactio
 				ConversationId: msg.ConversationId,
 				Emoji:          msg.Emoji,
 				UserId:         c.userID,
-				Username:       senderName,
+				Username:       sender.username,
 				Add:            msg.Add,
 			},
 		},

@@ -8210,6 +8210,9 @@ mod tests {
             header: vec![HEADER_SENDER_KEY],
             server_timestamp: 1,
             reply_to_id: None,
+            msg_type: Some(0),
+            ttl_seconds: None,
+            sealed: Some(false),
             attachments: Vec::new(),
             security_context: None,
         };

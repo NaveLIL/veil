@@ -210,6 +210,9 @@ pub enum ConnectionEvent {
         header: Vec<u8>,
         server_timestamp: u64,
         reply_to_id: Option<String>,
+        msg_type: Option<i32>,
+        ttl_seconds: Option<u32>,
+        sealed: Option<bool>,
         attachments: Vec<crate::attachments::WireAttachmentV1>,
         security_context: Option<crate::api::MessageSecurityContextV1>,
     },
@@ -1737,6 +1740,10 @@ fn protocol_violation(envelope: &'static str) -> ConnectionEventBufferErrorV1 {
     ConnectionEventBufferErrorV1::ProtocolViolation { envelope }
 }
 
+fn is_canonical_lowercase_uuid(value: &str) -> bool {
+    Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == value)
+}
+
 /// Decode a post-authentication envelope which is part of the event contract.
 ///
 /// Known payloads that this client intentionally does not consume remain an
@@ -1748,10 +1755,12 @@ fn connection_event_from_envelope(
 ) -> Result<Option<ConnectionEvent>, ConnectionEventBufferErrorV1> {
     let event = match env.payload {
         Some(proto::envelope::Payload::MessageEvent(me)) => {
-            if me.message_id.is_empty()
-                || me.message_id.len() > MAX_EVENT_ID_BYTES
-                || me.conversation_id.is_empty()
-                || me.conversation_id.len() > MAX_EVENT_ID_BYTES
+            if !is_canonical_lowercase_uuid(&me.message_id)
+                || !is_canonical_lowercase_uuid(&me.conversation_id)
+                || me
+                    .reply_to_id
+                    .as_deref()
+                    .is_some_and(|value| !is_canonical_lowercase_uuid(value))
                 || me.sender_identity_key.len() != 32
                 || me.sender_username.len() > MAX_EVENT_ID_BYTES
                 || me
@@ -1800,6 +1809,9 @@ fn connection_event_from_envelope(
                     header: me.header.unwrap_or_default(),
                     server_timestamp: me.server_timestamp,
                     reply_to_id: me.reply_to_id,
+                    msg_type: me.msg_type,
+                    ttl_seconds: me.ttl_seconds,
+                    sealed: me.sealed,
                     attachments: me
                         .attachments
                         .into_iter()
@@ -1821,15 +1833,16 @@ fn connection_event_from_envelope(
             // are valid for those forms. All forms still correlate to a
             // positive client sequence; chat ACKs additionally require their
             // complete message result tuple.
+            let chat_ack = !ack.message_id.is_empty();
             if ack.ref_seq == 0
                 || ack.message_id.len() > MAX_EVENT_ID_BYTES
                 || (ack.message_id.is_empty() != (ack.server_timestamp == 0))
+                || (chat_ack && !is_canonical_lowercase_uuid(&ack.message_id))
             {
                 return Err(protocol_violation("MessageAck"));
             }
             let sender_key =
                 sender_key_ack_from_proto(&ack).ok_or_else(|| protocol_violation("MessageAck"))?;
-            let chat_ack = !ack.message_id.is_empty();
             let valid_shape = match (chat_ack, sender_key.as_ref()) {
                 // Chat ACKs may carry the accepted roster version, but never
                 // the Sender-Key distribution route tuple.
@@ -2053,6 +2066,10 @@ async fn dispatch_authenticated_ws_message(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_MESSAGE_ID: &str = "a0000000-0000-4000-8000-000000000001";
+    const TEST_REPLY_ID: &str = "c0000000-0000-4000-8000-000000000002";
+    const TEST_CONVERSATION_ID: &str = "b0000000-0000-4000-8000-000000000001";
 
     fn error_event_with_capacity(capacity: usize) -> ConnectionEvent {
         let mut message = String::with_capacity(capacity);
@@ -2393,7 +2410,7 @@ mod tests {
 
         let partial_sender_key_ack = proto::Envelope {
             payload: Some(proto::envelope::Payload::MessageAck(proto::MessageAck {
-                message_id: "message-1".to_string(),
+                message_id: TEST_MESSAGE_ID.to_string(),
                 server_timestamp: 1,
                 ref_seq: 1,
                 target_device_id: vec![0x22; 16],
@@ -2422,7 +2439,7 @@ mod tests {
         };
 
         let combined_chat_and_sender_key = proto::MessageAck {
-            message_id: "message-1".to_string(),
+            message_id: TEST_MESSAGE_ID.to_string(),
             server_timestamp: 1,
             ref_seq: 1,
             target_device_id: vec![0x22; 16],
@@ -2502,8 +2519,8 @@ mod tests {
     fn base_message_event() -> proto::MessageEvent {
         proto::MessageEvent {
             event_type: proto::message_event::EventType::New as i32,
-            message_id: "message-1".to_string(),
-            conversation_id: "conversation-1".to_string(),
+            message_id: TEST_MESSAGE_ID.to_string(),
+            conversation_id: TEST_CONVERSATION_ID.to_string(),
             sender_identity_key: vec![0x11; 32],
             sender_username: "Alice".to_string(),
             server_timestamp: 1,
@@ -2511,6 +2528,177 @@ mod tests {
             header: Some(vec![0x03]),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn message_event_preserves_optional_policy_metadata_and_absence() {
+        let absent = connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(base_message_event())),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            &absent,
+            ConnectionEvent::MessageReceived {
+                msg_type: None,
+                ttl_seconds: None,
+                sealed: None,
+                ..
+            }
+        ));
+
+        let mut wire = base_message_event();
+        wire.msg_type = Some(proto::MessageType::File as i32);
+        wire.ttl_seconds = Some(0);
+        wire.sealed = Some(false);
+        let present = connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(wire)),
+            ..Default::default()
+        })
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            &present,
+            ConnectionEvent::MessageReceived {
+                msg_type: Some(value),
+                ttl_seconds: Some(0),
+                sealed: Some(false),
+                ..
+            } if *value == proto::MessageType::File as i32
+        ));
+
+        // These optional scalars live inline in the enum. Presence must stay
+        // distinguishable without being double-counted as retained heap data.
+        assert_eq!(
+            connection_event_retained_size_v1(&absent).unwrap(),
+            connection_event_retained_size_v1(&present).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn live_message_and_chat_ack_ids_require_canonical_non_nil_lowercase_uuids_before_enqueue(
+    ) {
+        let budget = ConnectionEventBudgetV1::with_limits(2, LIVE_EVENT_RETAINED_BYTES);
+        let (raw_tx, mut raw_rx) = mpsc::channel(2);
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget,
+        };
+
+        let mut uppercase_message = base_message_event();
+        uppercase_message.message_id = TEST_MESSAGE_ID.to_uppercase();
+        let mut compact_conversation = base_message_event();
+        compact_conversation.conversation_id = TEST_CONVERSATION_ID.replace('-', "");
+        let mut uppercase_reply = base_message_event();
+        uppercase_reply.reply_to_id = Some(TEST_REPLY_ID.to_uppercase());
+        let mut nil_message = base_message_event();
+        nil_message.message_id = Uuid::nil().to_string();
+        let mut nil_conversation = base_message_event();
+        nil_conversation.conversation_id = Uuid::nil().to_string();
+        let mut nil_reply = base_message_event();
+        nil_reply.reply_to_id = Some(Uuid::nil().to_string());
+
+        for invalid in [
+            uppercase_message,
+            compact_conversation,
+            uppercase_reply,
+            nil_message,
+            nil_conversation,
+            nil_reply,
+        ] {
+            let wire = proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageEvent(invalid)),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            assert_eq!(
+                dispatch_authenticated_binary_frame(&sender, &wire)
+                    .await
+                    .unwrap_err(),
+                ConnectionEventBufferErrorV1::ProtocolViolation {
+                    envelope: "MessageEvent"
+                }
+            );
+            assert!(matches!(
+                raw_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        for invalid_message_id in [
+            TEST_MESSAGE_ID.to_uppercase(),
+            TEST_MESSAGE_ID.replace('-', ""),
+            Uuid::nil().to_string(),
+        ] {
+            let wire = proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageAck(proto::MessageAck {
+                    message_id: invalid_message_id,
+                    server_timestamp: 1,
+                    ref_seq: 1,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            assert_eq!(
+                dispatch_authenticated_binary_frame(&sender, &wire)
+                    .await
+                    .unwrap_err(),
+                ConnectionEventBufferErrorV1::ProtocolViolation {
+                    envelope: "MessageAck"
+                }
+            );
+            assert!(matches!(
+                raw_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+
+        let mut valid_message = base_message_event();
+        valid_message.reply_to_id = Some(TEST_REPLY_ID.to_string());
+        let valid_message = proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageEvent(valid_message)),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        dispatch_authenticated_binary_frame(&sender, &valid_message)
+            .await
+            .unwrap();
+        assert!(matches!(
+            raw_rx.try_recv().unwrap().into_event(),
+            ConnectionEvent::MessageReceived {
+                message_id,
+                conversation_id,
+                reply_to_id: Some(reply_to_id),
+                ..
+            } if message_id == TEST_MESSAGE_ID
+                && conversation_id == TEST_CONVERSATION_ID
+                && reply_to_id == TEST_REPLY_ID
+        ));
+
+        let valid_ack = proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageAck(proto::MessageAck {
+                message_id: TEST_MESSAGE_ID.to_string(),
+                server_timestamp: 1,
+                ref_seq: 2,
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+        .encode_to_vec();
+        dispatch_authenticated_binary_frame(&sender, &valid_ack)
+            .await
+            .unwrap();
+        assert!(matches!(
+            raw_rx.try_recv().unwrap().into_event(),
+            ConnectionEvent::MessageAcked {
+                message_id,
+                ref_seq: 2,
+                sender_key: None,
+                ..
+            } if message_id == TEST_MESSAGE_ID
+        ));
     }
 
     #[test]
@@ -2522,6 +2710,22 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+
+        // Protobuf enums are open. Preserve a future message type so policy at
+        // the consumer boundary can quarantine or render it without forcing an
+        // older client into a reconnect loop during a rolling upgrade.
+        let mut unknown_message_type = base_message_event();
+        unknown_message_type.msg_type = Some(i32::MAX);
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageEvent(unknown_message_type)),
+                ..Default::default()
+            }),
+            Ok(Some(ConnectionEvent::MessageReceived {
+                msg_type: Some(i32::MAX),
+                ..
+            }))
+        ));
 
         let mut partial = base_message_event();
         partial.crypto_profile = "sender_key_v5".to_string();
@@ -2670,7 +2874,7 @@ mod tests {
             })) if message_id.is_empty()
         ));
         let secure_message_ack = proto::MessageAck {
-            message_id: "message-1".to_string(),
+            message_id: TEST_MESSAGE_ID.to_string(),
             server_timestamp: 1,
             ref_seq: 1,
             roster_version: Some(4),
@@ -2685,7 +2889,7 @@ mod tests {
                 message_id,
                 sender_key: None,
                 ..
-            })) if message_id == "message-1"
+            })) if message_id == TEST_MESSAGE_ID
         ));
         let exact_ack = proto::MessageAck {
             ref_seq: 2,
