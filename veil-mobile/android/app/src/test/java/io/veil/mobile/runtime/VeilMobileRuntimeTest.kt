@@ -31,6 +31,7 @@ import uniffi.veil_ffi.MobileDirectMessageProjection
 import uniffi.veil_ffi.MobileDirectMessageProjectionAvailability
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
+import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
 import uniffi.veil_ffi.RestSignatureData
 
@@ -1507,6 +1508,563 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun peerPreKeyStartsOnlyFromOneExplicitExactGenerationAction() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestsBeforeAction = transport.requests.size
+      val signaturesBeforeAction = fakeSession.signedRequestCopies.size
+
+      // Directory publication, selection/projection, and the initial live
+      // replay are all non-authoritative hints and never fetch a peer prekey.
+      publishDirectMessagesForTest(runtime, conversation.conversationId)
+      assertEquals(0, fakeSession.peerPreKeyRequestCount)
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(requestsBeforeAction, transport.requests.size)
+
+      val first = DirectSessionActionCapture()
+      runtime.establishDirectSession(conversation.conversationId, generation, first)
+
+      assertEquals(1, fakeSession.directSendReadinessCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(signaturesBeforeAction + 1, fakeSession.signedRequestCopies.size)
+      assertEquals(requestsBeforeAction + 1, transport.requests.size)
+      assertEquals(1, transport.pendingCount())
+      val request = transport.requests.last()
+      assertEquals(NativeDirectHttpMethod.GET, request.method)
+      assertEquals("/v1/prekeys/${"cd".repeat(32)}", request.requestTarget)
+      assertEquals(NativeDirectHttpLimits.PREKEY_BYTES, request.responseLimitBytes)
+      assertTrue(request.body.isEmpty())
+      assertTrue(transport.calls.last().started.get())
+
+      val duplicate = DirectSessionActionCapture()
+      runtime.establishDirectSession(conversation.conversationId, generation, duplicate)
+      assertEquals(NativeDirectSessionActionResult.Unavailable, duplicate.await())
+      assertEquals(1, duplicate.completionCount.get())
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(signaturesBeforeAction + 1, fakeSession.signedRequestCopies.size)
+      assertEquals(requestsBeforeAction + 1, transport.requests.size)
+
+      val response = "authenticated-peer-prekey-bundle".toByteArray()
+      transport.completeNext(NativeDirectHttpResult.Success(response))
+      awaitRuntimeIdle(runtime)
+
+      val success = first.await() as NativeDirectSessionActionResult.Success
+      assertEquals(NativeDirectPreKeyInstallStatus.ESTABLISHED, success.install.status)
+      assertEquals(1, first.completionCount.get())
+      assertTrue(response.all { it == 0.toByte() })
+      assertEquals(1, fakeSession.peerPreKeyInstallCount)
+      assertEquals(
+        listOf(conversation.conversationId),
+        fakeSession.peerPreKeyInstalledConversationIds,
+      )
+      assertTrue(runtime.snapshot().directoryReady)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun alreadyEstablishedNativeReadinessNeverPreparesSignsOrStartsARequest() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      fakeSession.directSendReadiness = NativeDirectSendReadiness.READY
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val result = DirectSessionActionCapture()
+
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      val success = result.await() as NativeDirectSessionActionResult.Success
+      assertEquals(NativeDirectPreKeyInstallStatus.ALREADY_ESTABLISHED, success.install.status)
+      assertEquals(1, result.completionCount.get())
+      assertEquals(1, fakeSession.directSendReadinessCount)
+      assertEquals(0, fakeSession.peerPreKeyRequestCount)
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(signatureCount, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount, transport.requests.size)
+      assertTrue(runtime.snapshot().directoryReady)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun readyRaceAfterSuccessfulPrepareRevokesRetainedUnsignedCapability() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      becomeReadyAfterPeerPreKeyPrepare = true
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val result = DirectSessionActionCapture()
+
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(1, fakeSession.directSendReadinessCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(signatureCount, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount, transport.requests.size)
+      assertEquals(0, fakeSession.preparedRequestCount())
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertNull(runtime.snapshot().directGeneration)
+      assertFalse(runtime.snapshot().directoryReady)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun prepareBridgeFailureAfterRetainAndReadyRevokesWholeLease() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      becomeReadyAfterPeerPreKeyPrepare = true
+      failPeerPreKeyPrepareAfterRetain = true
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val result = DirectSessionActionCapture()
+
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(1, fakeSession.directSendReadinessCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(signatureCount, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount, transport.requests.size)
+      assertEquals(0, fakeSession.preparedRequestCount())
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertNull(runtime.snapshot().directGeneration)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun kotlinValidationFailureAfterPrepareRevokesCapabilityBeforeSigning() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      corruptPeerPreKeyMethodAfterRetain = true
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val result = DirectSessionActionCapture()
+
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(1, fakeSession.directSendReadinessCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(signatureCount, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount, transport.requests.size)
+      assertEquals(0, fakeSession.preparedRequestCount())
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertNull(runtime.snapshot().directGeneration)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun signingFailureAfterPrepareRevokesRetainedCapability() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      failPeerPreKeySign = true
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val result = DirectSessionActionCapture()
+
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(1, fakeSession.directSendReadinessCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(signatureCount, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount, transport.requests.size)
+      assertEquals(0, fakeSession.preparedRequestCount())
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().directGeneration)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun callCreationFailureAfterSignatureRevokesLeaseWithoutStartingGet() {
+    val executor = daemonExecutor()
+    val transport = ControllableDirectTransport()
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val callCount = transport.calls.size
+      val capturedBodyCount = transport.capturedBodies.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val result = DirectSessionActionCapture()
+      transport.failNextCreation()
+
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(signatureCount + 1, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount, transport.requests.size)
+      assertEquals(callCount, transport.calls.size)
+      assertEquals(capturedBodyCount, transport.capturedBodies.size)
+      assertEquals(0, fakeSession.preparedRequestCount())
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().directGeneration)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun lateNativeAlreadyEstablishedResultWipesBodyWithoutKotlinRatchetMutation() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      peerPreKeyInstallStatus = NativeDirectPreKeyInstallStatus.ALREADY_ESTABLISHED
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val response = "late-ready-peer-prekey-response".toByteArray()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val result = DirectSessionActionCapture()
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      transport.completeNext(NativeDirectHttpResult.Success(response))
+      awaitRuntimeIdle(runtime)
+
+      val success = result.await() as NativeDirectSessionActionResult.Success
+      assertEquals(NativeDirectPreKeyInstallStatus.ALREADY_ESTABLISHED, success.install.status)
+      assertTrue(response.all { it == 0.toByte() })
+      assertEquals(1, fakeSession.peerPreKeyInstallCount)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+      assertTrue(runtime.snapshot().directoryReady)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun wrongConversationGenerationAndUnavailableReadinessStayOpaqueAndDoNoWork() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val denied = listOf(
+        "550e8400-e29b-41d4-a716-446655440099" to generation,
+        conversation.conversationId to generation + 1L,
+        "not-a-canonical-conversation" to generation,
+      )
+      denied.forEach { (conversationId, expectedGeneration) ->
+        val result = DirectSessionActionCapture()
+        runtime.establishDirectSession(conversationId, expectedGeneration, result)
+        assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+        assertEquals(1, result.completionCount.get())
+      }
+      assertEquals(0, fakeSession.directSendReadinessCount)
+
+      fakeSession.directSendReadiness = NativeDirectSendReadiness.UNAVAILABLE
+      val unavailable = DirectSessionActionCapture()
+      runtime.establishDirectSession(conversation.conversationId, generation, unavailable)
+      assertEquals(NativeDirectSessionActionResult.Unavailable, unavailable.await())
+      assertEquals(1, fakeSession.directSendReadinessCount)
+      assertEquals(0, fakeSession.peerPreKeyRequestCount)
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(signatureCount, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount, transport.requests.size)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundCancelsExactPeerPreKeyAndLateResponseOnlyGetsWiped() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val lateBody = "late-background-peer-prekey-bundle".toByteArray()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val result = DirectSessionActionCapture()
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+      val pendingCall = transport.calls.last()
+
+      runtime.lockForBackground()
+
+      assertTrue(pendingCall.cancelled.get())
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(1, result.completionCount.get())
+      transport.completeNext(NativeDirectHttpResult.Success(lateBody))
+      awaitRuntimeIdle(runtime)
+      assertTrue(lateBody.all { it == 0.toByte() })
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(1, result.completionCount.get())
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+      assertNull(runtime.snapshot().directGeneration)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundWinningAfterHandlerPrecheckPreventsNativePeerPreKeyInstall() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val installBoundaryEntered = CountDownLatch(1)
+    val releaseInstallBoundary = CountDownLatch(1)
+    val runtime = runtime(
+      executor,
+      fakeSession,
+      directTransport = transport,
+      peerPreKeyInstallBoundary = {
+        installBoundaryEntered.countDown()
+        check(releaseInstallBoundary.await(5, TimeUnit.SECONDS)) {
+          "peer-prekey install boundary timed out"
+        }
+      },
+    )
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val response = "prechecked-then-background-revoked-bundle".toByteArray()
+    val result = DirectSessionActionCapture()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+      transport.completeNext(NativeDirectHttpResult.Success(response))
+      assertTrue(
+        "peer-prekey handler did not pass its first lifecycle check",
+        installBoundaryEntered.await(5, TimeUnit.SECONDS),
+      )
+
+      runtime.lockForBackground()
+
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      releaseInstallBoundary.countDown()
+      awaitRuntimeIdle(runtime)
+      assertTrue(response.all { it == 0.toByte() })
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(1, result.completionCount.get())
+      assertNull(runtime.snapshot().directGeneration)
+    } finally {
+      releaseInstallBoundary.countDown()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundDuringPeerPreKeyCallCreationCancelsBeforeItCanStart() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val callCreated = CountDownLatch(1)
+    val releaseCreation = CountDownLatch(1)
+    val createdCalls = AtomicInteger(0)
+    val transport = ControllableDirectTransport {
+      if (createdCalls.incrementAndGet() == 4) {
+        callCreated.countDown()
+        check(releaseCreation.await(5, TimeUnit.SECONDS)) {
+          "peer-prekey call creation barrier timed out"
+        }
+      }
+    }
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val action = DirectSessionActionCapture()
+    var starter: Thread? = null
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val activeStarter = thread(name = "peer-prekey-create-before-background") {
+        runtime.establishDirectSession(conversation.conversationId, generation, action)
+      }
+      starter = activeStarter
+      assertTrue("peer-prekey call was not created", callCreated.await(5, TimeUnit.SECONDS))
+      val unstarted = transport.calls.last()
+      assertFalse(unstarted.started.get())
+      val networkRequestCount = transport.requests.size
+
+      runtime.lockForBackground()
+      releaseCreation.countDown()
+      activeStarter.join(5_000)
+
+      assertFalse("stale peer-prekey starter did not finish", activeStarter.isAlive)
+      assertTrue(unstarted.cancelled.get())
+      assertFalse(unstarted.started.get())
+      assertEquals(networkRequestCount, transport.requests.size)
+      assertEquals(NativeDirectSessionActionResult.Unavailable, action.await())
+      assertEquals(1, action.completionCount.get())
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+    } finally {
+      releaseCreation.countDown()
+      starter?.join(5_000)
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun reconnectCancelsOldPeerPreKeyGenerationAndRejectsItsLateBody() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val staleBody = "superseded-peer-prekey-bundle".toByteArray()
+    try {
+      val oldGeneration = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val oldResult = DirectSessionActionCapture()
+      runtime.establishDirectSession(conversation.conversationId, oldGeneration, oldResult)
+      val staleCall = transport.calls.last()
+
+      runtime.connect("https://access.example")
+
+      assertTrue(staleCall.cancelled.get())
+      assertEquals(NativeDirectSessionActionResult.Unavailable, oldResult.await())
+      val newGeneration = checkNotNull(runtime.snapshot().directGeneration)
+      assertTrue(newGeneration > oldGeneration)
+      transport.completeNext(NativeDirectHttpResult.Success(staleBody))
+      awaitRuntimeIdle(runtime)
+      assertTrue(staleBody.all { it == 0.toByte() })
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(1, oldResult.completionCount.get())
+
+      val staleSelection = DirectSessionActionCapture()
+      runtime.establishDirectSession(
+        conversation.conversationId,
+        oldGeneration,
+        staleSelection,
+      )
+      assertEquals(NativeDirectSessionActionResult.Unavailable, staleSelection.await())
+      assertEquals(NativeOwnPreKeyState.CHECKING, runtime.snapshot().ownPreKeyState)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun peerPreKeyTransportFailureIsOpaqueAndRevokesTheUncertainLease() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val result = DirectSessionActionCapture()
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      transport.completeNext(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK))
+      awaitRuntimeIdle(runtime)
+
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertNull(runtime.snapshot().directGeneration)
+      assertEquals(1, fakeSession.directLeaseCancellations)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun peerPreKeyInstallFailureWipesBodyAndFailsClosedWithoutDetail() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply { failPeerPreKeyInstall = true }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val rejectedBody = "rejected-peer-prekey-bundle".toByteArray()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val result = DirectSessionActionCapture()
+      runtime.establishDirectSession(conversation.conversationId, generation, result)
+
+      transport.completeNext(NativeDirectHttpResult.Success(rejectedBody))
+      awaitRuntimeIdle(runtime)
+
+      assertTrue(rejectedBody.all { it == 0.toByte() })
+      assertEquals(NativeDirectSessionActionResult.Unavailable, result.await())
+      assertEquals(1, fakeSession.peerPreKeyInstallCount)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().directGeneration)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun generatedDirectCapabilitiesMapToRedactingNativeOnlyDtos() {
     val leaseToken = "lease-capability-that-must-not-be-logged"
     val requestToken = "request-capability-that-must-not-be-logged"
@@ -1825,6 +2383,26 @@ class VeilMobileRuntimeTest {
     }
     assertEquals("native Direct prekey install returned an unsupported status", error.message)
     assertFalse(error.message.orEmpty().contains("unexpected-secret-status"))
+
+    assertEquals(
+      NativeDirectSendReadiness.READY,
+      MobileDirectSendReadiness.READY.toNativeDirectSendReadiness(),
+    )
+    assertEquals(
+      NativeDirectSendReadiness.NEEDS_PRE_KEY,
+      MobileDirectSendReadiness.NEEDS_PRE_KEY.toNativeDirectSendReadiness(),
+    )
+    assertEquals(
+      NativeDirectSendReadiness.UNAVAILABLE,
+      MobileDirectSendReadiness.UNAVAILABLE.toNativeDirectSendReadiness(),
+    )
+
+    assertEquals(1L, 1.0.toSafeDirectGenerationOrNull())
+    assertEquals(9_007_199_254_740_991L, 9_007_199_254_740_991.0.toSafeDirectGenerationOrNull())
+    assertNull(0.0.toSafeDirectGenerationOrNull())
+    assertNull(1.5.toSafeDirectGenerationOrNull())
+    assertNull(Double.NaN.toSafeDirectGenerationOrNull())
+    assertNull(Double.POSITIVE_INFINITY.toSafeDirectGenerationOrNull())
   }
 
   private fun runtime(
@@ -1837,6 +2415,7 @@ class VeilMobileRuntimeTest {
       NativeConnectCancellationFactory { FakeCancellation() },
     directTransport: NativeDirectHttpExecutor = PassiveDirectTransport(),
     directLivePollIntervalMillis: Long = 60_000L,
+    peerPreKeyInstallBoundary: () -> Unit = {},
   ): VeilMobileRuntime = VeilMobileRuntime(
       vault = vault,
       passStore = passStore,
@@ -1850,6 +2429,7 @@ class VeilMobileRuntimeTest {
       executor = executor,
       databasePathProvider = { "/private/veil/account-v1.db" },
       directLivePollIntervalMillis = directLivePollIntervalMillis,
+      peerPreKeyInstallBoundary = peerPreKeyInstallBoundary,
     ).also { runtime ->
       if (markForeground) runtime.markForeground()
     }
@@ -1914,6 +2494,46 @@ class VeilMobileRuntimeTest {
       NativeDirectHttpResult.Success("{\"stored\":21,\"device_id\":\"test-device\"}".toByteArray()),
     )
     awaitRuntimeIdle(runtime)
+  }
+
+  private fun completeDirectReadyBootstrap(
+    runtime: VeilMobileRuntime,
+    session: FakeSession,
+    transport: ControllableDirectTransport,
+    conversation: NativeDirectConversationInstall,
+  ): Long {
+    session.directoryInstalls.clear()
+    session.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+    )
+    runtime.openSession()
+    runtime.connect("https://access.example")
+    completeOwnPreKeyBootstrap(runtime, transport)
+    transport.completeNext(
+      NativeDirectHttpResult.Success("authenticated-explicit-prekey-directory".toByteArray()),
+    )
+    awaitRuntimeIdle(runtime)
+    val ready = runtime.snapshot()
+    assertTrue(ready.directoryReady)
+    assertEquals(NativeDirectHistoryState.SYNCHRONIZED, ready.directHistoryState)
+    return checkNotNull(ready.directGeneration)
+  }
+
+  private class DirectSessionActionCapture : NativeDirectSessionActionCallback {
+    private val completed = CountDownLatch(1)
+    private val value = AtomicReference<NativeDirectSessionActionResult?>()
+    val completionCount = AtomicInteger(0)
+
+    override fun onComplete(result: NativeDirectSessionActionResult) {
+      completionCount.incrementAndGet()
+      value.set(result)
+      completed.countDown()
+    }
+
+    fun await(): NativeDirectSessionActionResult {
+      assertTrue("Direct-session action did not complete", completed.await(5, TimeUnit.SECONDS))
+      return checkNotNull(value.get())
+    }
   }
 
   private fun awaitCondition(condition: () -> Boolean): Boolean {
@@ -2011,6 +2631,18 @@ class VeilMobileRuntimeTest {
     var historySynchronized = false
     var ownPreKeyRequestCount = 0
     var ownPreKeyInstallCount = 0
+    var directSendReadinessCount = 0
+    @Volatile var directSendReadiness = NativeDirectSendReadiness.NEEDS_PRE_KEY
+    var peerPreKeyRequestCount = 0
+    var peerPreKeyInstallCount = 0
+    @Volatile var peerPreKeyInstallStatus = NativeDirectPreKeyInstallStatus.ESTABLISHED
+    @Volatile var failPeerPreKeyInstall = false
+    @Volatile var failPeerPreKeyPrepareAfterRetain = false
+    @Volatile var failPeerPreKeySign = false
+    @Volatile var becomeReadyAfterPeerPreKeyPrepare = false
+    @Volatile var corruptPeerPreKeyMethodAfterRetain = false
+    val peerPreKeyInstalledResponseCopies = CopyOnWriteArrayList<ByteArray>()
+    val peerPreKeyInstalledConversationIds = CopyOnWriteArrayList<String>()
     var ownPreKeyPendingPublication: ByteArray? = null
     val ownPreKeyInstalledResponseCopies = CopyOnWriteArrayList<ByteArray>()
     val signedRequestCopies = CopyOnWriteArrayList<SignedRequestCopy>()
@@ -2213,17 +2845,53 @@ class VeilMobileRuntimeTest {
       return directProjection
     }
 
+    override fun directSendReadiness(
+      leaseToken: String,
+      conversationId: String,
+    ): NativeDirectSendReadiness {
+      check(leaseToken == "test-direct-lease")
+      directSendReadinessCount += 1
+      return directSendReadiness
+    }
+
     override fun prepareDirectPreKeyRequest(
       leaseToken: String,
       conversationId: String,
-    ): NativeDirectRestRequest = unexpectedDirectBridgeCall()
+    ): NativeDirectRestRequest {
+      check(leaseToken == "test-direct-lease")
+      peerPreKeyRequestCount += 1
+      val request = rememberPreparedRequest(
+        NativeDirectRestRequest(
+          requestToken = "test-peer-prekey-request-$peerPreKeyRequestCount",
+          method = "GET",
+          requestTarget = "/v1/prekeys/${"cd".repeat(32)}",
+          body = byteArrayOf(),
+          responseLimitBytes = NativeDirectHttpLimits.PREKEY_BYTES,
+        ),
+      )
+      if (becomeReadyAfterPeerPreKeyPrepare) {
+        directSendReadiness = NativeDirectSendReadiness.READY
+      }
+      if (failPeerPreKeyPrepareAfterRetain) {
+        throw IllegalStateException("synthetic peer-prekey prepare failure after retain")
+      }
+      return if (corruptPeerPreKeyMethodAfterRetain) request.copy(method = "POST") else request
+    }
 
     override fun installDirectPreKeyBundle(
       leaseToken: String,
       requestToken: String,
       conversationId: String,
       response: ByteArray,
-    ): NativeDirectPreKeyInstall = unexpectedDirectBridgeCall()
+    ): NativeDirectPreKeyInstall {
+      check(leaseToken == "test-direct-lease")
+      peerPreKeyInstallCount += 1
+      peerPreKeyInstalledConversationIds.add(conversationId)
+      peerPreKeyInstalledResponseCopies.add(response.copyOf())
+      preparedRequests.remove(requestToken)?.body?.fill(0)
+      if (failPeerPreKeyInstall) throw IllegalStateException("synthetic peer-prekey install failure")
+      return NativeDirectPreKeyInstall(peerPreKeyInstallStatus)
+    }
 
     override fun cancelDirectSync(leaseToken: String) {
       directLeaseCancellations += 1
@@ -2239,6 +2907,13 @@ class VeilMobileRuntimeTest {
     ): NativeRestSignature {
       check(leaseToken == "test-direct-lease")
       val prepared = checkNotNull(preparedRequests[requestToken])
+      if (
+        prepared.requestTarget.startsWith("/v1/prekeys/") &&
+        !prepared.requestTarget.endsWith("/count") &&
+        (failPeerPreKeySign || directSendReadiness != NativeDirectSendReadiness.NEEDS_PRE_KEY)
+      ) {
+        throw IllegalStateException("synthetic peer-prekey signing denied")
+      }
       signedRequestCopies.add(
         SignedRequestCopy(prepared.method, prepared.requestTarget, prepared.body.copyOf()),
       )
@@ -2284,6 +2959,8 @@ class VeilMobileRuntimeTest {
       return request
     }
 
+    fun preparedRequestCount(): Int = preparedRequests.size
+
     data class SignedRequestCopy(
       val method: String,
       val requestTarget: String,
@@ -2314,11 +2991,15 @@ class VeilMobileRuntimeTest {
     val requests = CopyOnWriteArrayList<NativeDirectHttpRequest>()
     val capturedBodies = CopyOnWriteArrayList<ByteArray>()
     val calls = CopyOnWriteArrayList<TestDirectHttpCall>()
+    private val failNextCreation = AtomicBoolean(false)
 
     override fun createCall(
       request: NativeDirectHttpRequest,
       callback: NativeDirectHttpCallback,
     ): NativeDirectHttpCall {
+      if (failNextCreation.compareAndSet(true, false)) {
+        throw IllegalStateException("synthetic all-or-nothing call creation failure")
+      }
       val exactBody = request.body.copyOf()
       lateinit var call: TestDirectHttpCall
       call = TestDirectHttpCall {
@@ -2333,6 +3014,10 @@ class VeilMobileRuntimeTest {
       }
       onCallCreated?.invoke(call)
       return call
+    }
+
+    fun failNextCreation() {
+      check(failNextCreation.compareAndSet(false, true)) { "call creation failure already armed" }
     }
 
     fun pendingCount(): Int = synchronized(this) { pending.size }

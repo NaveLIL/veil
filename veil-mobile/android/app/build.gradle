@@ -101,6 +101,9 @@ android {
         versionCode 1
         versionName "0.1.0"
     }
+    compileOptions {
+        coreLibraryDesugaringEnabled true
+    }
     sourceSets {
         main.java.srcDirs += file('../../src/native/generated/uniffi')
     }
@@ -157,6 +160,7 @@ android {
 }
 
 dependencies {
+    coreLibraryDesugaring('com.android.tools:desugar_jdk_libs:2.1.5')
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
     implementation("net.java.dev.jna:jna:5.17.0@aar")
@@ -194,7 +198,10 @@ dependencies {
 }
 
 gradle.taskGraph.whenReady { graph ->
-    def requestedRelease = graph.allTasks.any { it.project == project && it.name.toLowerCase().contains('release') }
+    def requestedRelease = graph.allTasks.any {
+        def taskName = it.name.toLowerCase()
+        it.project == project && taskName.contains('release') && !taskName.contains('clean')
+    }
     if (requestedRelease && !releaseSigningConfigured) {
         throw new GradleException('Release signing is required. Set VEIL_ANDROID_KEYSTORE, VEIL_ANDROID_KEYSTORE_PASSWORD, VEIL_ANDROID_KEY_ALIAS, and VEIL_ANDROID_KEY_PASSWORD.')
     }

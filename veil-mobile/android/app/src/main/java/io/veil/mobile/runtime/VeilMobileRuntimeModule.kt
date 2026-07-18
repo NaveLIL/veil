@@ -78,6 +78,28 @@ internal class VeilMobileRuntimeModule(
     }
   }
 
+  /**
+   * Explicit UI action only. The caller must bind the selected conversation to
+   * the exact generation published in the same runtime snapshot.
+   */
+  @ReactMethod
+  fun establishDirectSession(
+    conversationId: String,
+    expectedDirectGeneration: Double,
+    promise: Promise,
+  ) = onRuntimePublication(promise) {
+    val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
+      ?: throw VeilMobileRuntimeException(DIRECT_SESSION_ERROR_CODE, DIRECT_SESSION_ERROR)
+    runtime.establishDirectSession(conversationId, generation) { result ->
+      when (result) {
+        is NativeDirectSessionActionResult.Success ->
+          promise.resolve(result.install.toWritableMap())
+        NativeDirectSessionActionResult.Unavailable ->
+          promise.reject(DIRECT_SESSION_ERROR_CODE, DIRECT_SESSION_ERROR)
+      }
+    }
+  }
+
   /** Required by React Native's NativeEventEmitter contract. */
   @ReactMethod
   fun addListener(eventName: String) {
@@ -117,6 +139,8 @@ internal class VeilMobileRuntimeModule(
 
   companion object {
     const val EVENT_STATE_CHANGED = "VeilRuntimeStateChanged"
+    private const val DIRECT_SESSION_ERROR_CODE = "E_VEIL_DIRECT_SESSION"
+    private const val DIRECT_SESSION_ERROR = "Unable to establish the secure Direct session"
   }
 }
 
@@ -298,6 +322,26 @@ private fun NativeDirectMessageView.toWritableMap(): WritableMap = Arguments.cre
   timestampMs?.let { putDouble("timestampMs", it.toDouble()) } ?: putNull("timestampMs")
   putString("direction", direction.name.lowercase())
   putString("delivery", delivery.name.lowercase())
+}
+
+private fun NativeDirectPreKeyInstall.toWritableMap(): WritableMap = Arguments.createMap().apply {
+  putString(
+    "status",
+    when (status) {
+      NativeDirectPreKeyInstallStatus.ESTABLISHED -> "established"
+      NativeDirectPreKeyInstallStatus.ALREADY_ESTABLISHED -> "already_established"
+    },
+  )
+}
+
+internal fun Double.toSafeDirectGenerationOrNull(): Long? {
+  if (
+    !isFinite() ||
+    this < 1.0 ||
+    this > MAX_PUBLIC_SNAPSHOT_REVISION.toDouble() ||
+    this != kotlin.math.floor(this)
+  ) return null
+  return toLong()
 }
 
 private const val MAX_PUBLIC_DIRECT_CONVERSATIONS = 10_000

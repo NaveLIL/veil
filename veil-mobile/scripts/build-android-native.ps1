@@ -140,6 +140,21 @@ Add the matching MSYS2/Cygwin bin directory to PATH (expected near $perlBin)
 and run pnpm native:android again.
 "@
   }
+
+  # cargo-ndk emits Windows-style NDK tool paths unless it knows that its
+  # child build uses an MSYS2/Cygwin shell. OpenSSL's generated Makefile then
+  # passes those paths through /bin/sh, where backslashes are consumed as
+  # escapes (for example C:\Android becomes C:Android). The probe above has
+  # already established that this is a Unix-path Perl; cargo-ndk only checks
+  # for the presence of either marker, so use MSYSTEM as the normalization
+  # signal when the caller did not provide one. This also supports custom or
+  # junctioned MSYS2/Cygwin installation roots.
+  if (
+    [string]::IsNullOrWhiteSpace($env:MSYSTEM) -and
+    [string]::IsNullOrWhiteSpace($env:CYGWIN)
+  ) {
+    $env:MSYSTEM = "MSYS"
+  }
 }
 
 Push-Location $workspaceRoot

@@ -53,7 +53,7 @@
   "jest": {
     "preset": "jest-expo",
     "transformIgnorePatterns": [
-      "node_modules[\\\\/](?!(?:\\.pnpm[\\\\/](?:(?:jest-)?react-native@|@react-native\\+|expo[^@]*@|@expo(?:nent)?\\+|react-navigation@|@react-navigation\\+|react-native-svg@)|(?:jest-)?react-native(?:[\\\\/]|$)|@react-native(?:[\\\\/]|$)|expo[^\\\\/]*(?:[\\\\/]|$)|@expo(?:nent)?(?:[\\\\/]|$)|react-navigation(?:[\\\\/]|$)|@react-navigation(?:[\\\\/]|$)|react-native-svg(?:[\\\\/]|$)))"
+      "node_modules[\\\\/](?!(?:\\.pnpm[\\\\/][^\\\\/]+[\\\\/]node_modules[\\\\/])?(?:(?:jest-)?react-native(?:[\\\\/]|$)|@react-native(?:[\\\\/]|$)|expo[^\\\\/]*(?:[\\\\/]|$)|@expo(?:nent)?(?:[\\\\/]|$)|react-navigation(?:[\\\\/]|$)|@react-navigation(?:[\\\\/]|$)|react-native-svg(?:[\\\\/]|$)))"
     ]
   },
   "pnpm": {

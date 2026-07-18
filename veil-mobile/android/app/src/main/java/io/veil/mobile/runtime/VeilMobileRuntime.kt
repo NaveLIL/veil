@@ -2,6 +2,7 @@ package io.veil.mobile.runtime
 
 import android.content.Context
 import android.os.SystemClock
+import androidx.annotation.VisibleForTesting
 import io.veil.mobile.crypto.NativeIdentityVault
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import java.io.File
@@ -27,6 +28,7 @@ import uniffi.veil_ffi.MobileDirectMessageProjectionAvailability
 import uniffi.veil_ffi.MobileDirectOwnPreKeyProgress
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
+import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
 import uniffi.veil_ffi.RestSignatureData
 import uniffi.veil_ffi.VeilMobileSession
@@ -310,6 +312,24 @@ internal data class NativeDirectPreKeyInstall(
   val status: NativeDirectPreKeyInstallStatus,
 )
 
+/** Native-authoritative readiness; never a Kotlin send capability. */
+internal enum class NativeDirectSendReadiness {
+  READY,
+  NEEDS_PRE_KEY,
+  UNAVAILABLE,
+}
+
+/** Opaque terminal result for one explicit Direct-session user action. */
+internal sealed interface NativeDirectSessionActionResult {
+  data class Success(val install: NativeDirectPreKeyInstall) : NativeDirectSessionActionResult
+
+  data object Unavailable : NativeDirectSessionActionResult
+}
+
+internal fun interface NativeDirectSessionActionCallback {
+  fun onComplete(result: NativeDirectSessionActionResult)
+}
+
 /** Signed REST headers produced by the authenticated native session. */
 internal data class NativeRestSignature(
   val userId: String,
@@ -406,6 +426,11 @@ internal interface NativeMobileSession : AutoCloseable {
 
   fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection
 
+  fun directSendReadiness(
+    leaseToken: String,
+    conversationId: String,
+  ): NativeDirectSendReadiness
+
   fun prepareDirectPreKeyRequest(
     leaseToken: String,
     conversationId: String,
@@ -442,6 +467,8 @@ internal class VeilMobileRuntime internal constructor(
   private val executor: ScheduledExecutorService,
   private val databasePathProvider: () -> String,
   private val directLivePollIntervalMillis: Long = DIRECT_LIVE_IDLE_POLL_MILLIS,
+  @get:VisibleForTesting
+  private val peerPreKeyInstallBoundary: () -> Unit = {},
 ) {
   constructor(context: Context) : this(
     vault = NativeIdentityVault(context.applicationContext),
@@ -518,6 +545,8 @@ internal class VeilMobileRuntime internal constructor(
   ) {
     val conversations = LinkedHashMap<String, NativeDirectConversationInstall>()
     var pendingRequest: PendingDirectRequest? = null
+    /** Exact user action reservation; never created by directory or replay. */
+    var directSessionAction: PendingDirectSessionAction? = null
     var ownPreKeyRequestsPrepared = 0
     /** Guarded by [stateLock]; at most one delayed live turn exists per generation. */
     var liveReplayScheduled = false
@@ -534,19 +563,60 @@ internal class VeilMobileRuntime internal constructor(
     val requestToken: String,
     val stage: DirectRequestStage,
     val method: NativeDirectHttpMethod,
+    val lifecycleEpoch: Long,
+    val generation: Long,
+    val conversationId: String? = null,
+    val directSessionAction: PendingDirectSessionAction? = null,
   ) {
     var call: NativeDirectHttpCall? = null
 
     override fun toString(): String =
       "PendingDirectRequest(" +
-        "stage=$stage, method=$method, requestToken=[REDACTED], " +
+        "stage=$stage, method=$method, lifecycleEpoch=$lifecycleEpoch, " +
+        "generation=$generation, conversationBound=${conversationId != null}, " +
+        "requestToken=[REDACTED], " +
         "callAttached=${call != null})"
+  }
+
+  private class PendingDirectSessionAction(
+    val lifecycleEpoch: Long,
+    val generation: Long,
+    val conversationId: String,
+    val completion: DirectSessionActionCompletion,
+  ) {
+    override fun toString(): String =
+      "PendingDirectSessionAction(" +
+        "lifecycleEpoch=$lifecycleEpoch, generation=$generation, " +
+        "conversationId=[REDACTED])"
+  }
+
+  private class DirectSessionActionCompletion(
+    private val callback: NativeDirectSessionActionCallback,
+  ) {
+    private var completed = false
+
+    fun complete(result: NativeDirectSessionActionResult): Boolean {
+      val ownsCompletion = synchronized(this) {
+        if (completed) false else {
+          completed = true
+          true
+        }
+      }
+      if (!ownsCompletion) return false
+      try {
+        callback.onComplete(result)
+      } catch (_: Throwable) {
+        // A detached React context must not escape the native lifecycle gate.
+      }
+      return true
+    }
   }
 
   private enum class DirectRequestStage {
     OWN_PREKEY,
     DIRECTORY,
     HISTORY,
+    PEER_PREKEY,
   }
 
   private class PreparedDirectHttpRequest(
@@ -566,6 +636,7 @@ internal class VeilMobileRuntime internal constructor(
     val session: NativeMobileSession,
     val leaseToken: String,
     val pendingCall: NativeDirectHttpCall?,
+    val directSessionCompletion: DirectSessionActionCompletion?,
   ) {
     override fun toString(): String =
       "DetachedDirectSync(leaseToken=[REDACTED], pendingCall=${pendingCall != null})"
@@ -685,6 +756,291 @@ internal class VeilMobileRuntime internal constructor(
   ) {
     synchronized(stateLock) {
       publisher(unavailableDirectMessageProjection())
+    }
+  }
+
+  /**
+   * Start one explicit, user-initiated peer-session action for the exact
+   * selected conversation and public Direct generation.
+   *
+   * Directory installation, selection, projection, and live replay never call
+   * this method. Kotlin does not infer readiness from the advisory directory
+   * row and never mutates a ratchet. Native readiness either reports an
+   * already-established session or owns the prepare/sign/install state
+   * machine for one destructive, non-retried peer-prekey GET.
+   */
+  fun establishDirectSession(
+    rawConversationId: String,
+    expectedGeneration: Long,
+    callback: NativeDirectSessionActionCallback,
+  ) {
+    val completion = DirectSessionActionCompletion(callback)
+    val conversationId = try {
+      UUID.fromString(rawConversationId).toString()
+    } catch (_: IllegalArgumentException) {
+      completion.complete(NativeDirectSessionActionResult.Unavailable)
+      return
+    }
+    if (
+      conversationId != rawConversationId ||
+      expectedGeneration !in 1L..MAX_PUBLIC_SNAPSHOT_REVISION
+    ) {
+      completion.complete(NativeDirectSessionActionResult.Unavailable)
+      return
+    }
+
+    val selection = synchronized(stateLock) {
+      val sync = activeDirectSync
+      if (
+        sync == null ||
+        sync.generation != expectedGeneration ||
+        sync.pendingRequest != null ||
+        sync.directSessionAction != null ||
+        !isReadyDirectConversationLocked(sync, conversationId)
+      ) {
+        null
+      } else {
+        val action = PendingDirectSessionAction(
+          lifecycleEpoch = lifecycleEpoch,
+          generation = expectedGeneration,
+          conversationId = conversationId,
+          completion = completion,
+        )
+        sync.directSessionAction = action
+        Pair(sync, action)
+      }
+    }
+    if (selection == null) {
+      completion.complete(NativeDirectSessionActionResult.Unavailable)
+      return
+    }
+    val (sync, selected) = selection
+
+    val readiness = try {
+      sync.session.directSendReadiness(sync.leaseToken, conversationId)
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+      return
+    }
+    when (readiness) {
+      NativeDirectSendReadiness.READY -> completeDirectSessionAction(
+        sync,
+        selected,
+        NativeDirectPreKeyInstall(NativeDirectPreKeyInstallStatus.ALREADY_ESTABLISHED),
+      )
+      NativeDirectSendReadiness.NEEDS_PRE_KEY -> requestPeerPreKey(sync, selected)
+      NativeDirectSendReadiness.UNAVAILABLE -> denyDirectSessionAction(sync, selected)
+    }
+  }
+
+  private fun isReadyDirectConversationLocked(
+    sync: ActiveDirectSync,
+    conversationId: String,
+  ): Boolean =
+    isCurrentDirectSyncLocked(sync) &&
+      sync.epoch == lifecycleEpoch &&
+      ownPreKeyState == NativeOwnPreKeyState.PUBLISHED &&
+      directDirectoryState == NativeDirectDirectoryState.SYNCHRONIZED &&
+      directHistoryState == NativeDirectHistoryState.SYNCHRONIZED &&
+      directoryReady &&
+      sync.conversations.containsKey(conversationId) &&
+      directConversations.any { conversation -> conversation.conversationId == conversationId }
+
+  private fun requestPeerPreKey(
+    sync: ActiveDirectSync,
+    action: PendingDirectSessionAction,
+  ) {
+    val mayPrepare = synchronized(stateLock) {
+      sync.pendingRequest == null &&
+        sync.directSessionAction === action &&
+        isReadyDirectConversationLocked(sync, action.conversationId)
+    }
+    if (!mayPrepare) {
+      denyDirectSessionAction(sync, action)
+      return
+    }
+
+    val prepared = try {
+      sync.session.prepareDirectPreKeyRequest(sync.leaseToken, action.conversationId)
+    } catch (_: Throwable) {
+      // Rust may retain the outstanding capability before UniFFI lifts the
+      // returned DTO. An exception is therefore an ambiguous post-retain
+      // outcome, even when a concurrent incoming message made the ratchet
+      // Ready. Only whole-lease revocation is safe across this bridge.
+      failDirectSync(sync)
+      return
+    }
+    val signed = try {
+      prepareSignedDirectRequest(
+        sync = sync,
+        prepared = prepared,
+        stage = DirectRequestStage.PEER_PREKEY,
+        directSessionAction = action,
+      )
+    } catch (_: Throwable) {
+      // Native prepare already returned an outstanding capability. Kotlin
+      // validation or signing cannot prove that capability was consumed, even
+      // when an incoming message concurrently made the ratchet Ready.
+      failDirectSync(sync)
+      return
+    }
+    val pending = signed.pending
+    val call = try {
+      directTransport.createCall(signed.httpRequest) { result ->
+        enqueuePeerPreKeyResult(sync, pending, action, result)
+      }
+    } catch (_: Throwable) {
+      signed.wipeWireBody()
+      failDirectSync(sync)
+      return
+    } finally {
+      signed.wipeWireBody()
+    }
+
+    val registered = synchronized(stateLock) {
+      if (
+        sync.pendingRequest == null &&
+        sync.directSessionAction === action &&
+        isReadyDirectConversationLocked(sync, action.conversationId) &&
+        pending.lifecycleEpoch == action.lifecycleEpoch &&
+        pending.generation == action.generation &&
+        pending.conversationId == action.conversationId &&
+        pending.directSessionAction === action
+      ) {
+        sync.pendingRequest = pending
+        pending.call = call
+        true
+      } else {
+        false
+      }
+    }
+    if (!registered) {
+      call.cancelQuietly()
+      // The signature has already been released. Even though the call never
+      // started, only whole-lease revocation can prove that the native
+      // outstanding capability will not be reused.
+      failDirectSync(sync)
+      return
+    }
+    try {
+      call.start()
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+    }
+  }
+
+  private fun completeDirectSessionAction(
+    sync: ActiveDirectSync,
+    action: PendingDirectSessionAction,
+    install: NativeDirectPreKeyInstall,
+  ) {
+    val accepted = synchronized(stateLock) {
+      if (
+        sync.directSessionAction !== action ||
+        sync.pendingRequest != null ||
+        !isReadyDirectConversationLocked(sync, action.conversationId)
+      ) {
+        false
+      } else {
+        sync.directSessionAction = null
+        true
+      }
+    }
+    if (accepted) {
+      action.completion.complete(NativeDirectSessionActionResult.Success(install))
+    }
+  }
+
+  private fun denyDirectSessionAction(
+    sync: ActiveDirectSync,
+    action: PendingDirectSessionAction,
+  ) {
+    val accepted = synchronized(stateLock) {
+      if (sync.directSessionAction !== action || sync.pendingRequest != null) {
+        false
+      } else {
+        sync.directSessionAction = null
+        true
+      }
+    }
+    if (accepted) {
+      action.completion.complete(NativeDirectSessionActionResult.Unavailable)
+    }
+  }
+
+  private fun enqueuePeerPreKeyResult(
+    sync: ActiveDirectSync,
+    pending: PendingDirectRequest,
+    action: PendingDirectSessionAction,
+    result: NativeDirectHttpResult,
+  ) {
+    try {
+      executor.execute {
+        handlePeerPreKeyResult(sync, pending, action, result)
+      }
+    } catch (_: Throwable) {
+      result.wipeSensitiveBody()
+      failDirectSync(sync)
+    }
+  }
+
+  private fun handlePeerPreKeyResult(
+    sync: ActiveDirectSync,
+    pending: PendingDirectRequest,
+    action: PendingDirectSessionAction,
+    result: NativeDirectHttpResult,
+  ) {
+    try {
+      val current = synchronized(stateLock) {
+        sync.pendingRequest === pending &&
+          sync.directSessionAction === action &&
+          pending.stage == DirectRequestStage.PEER_PREKEY &&
+          pending.lifecycleEpoch == action.lifecycleEpoch &&
+          pending.generation == action.generation &&
+          pending.conversationId == action.conversationId &&
+          pending.directSessionAction === action &&
+          isReadyDirectConversationLocked(sync, action.conversationId)
+      }
+      if (!current) return
+      if (result !is NativeDirectHttpResult.Success) {
+        // A destructive GET may have claimed the peer OPK before transport
+        // failure. Revoke the whole lease; never retry it automatically.
+        failDirectSync(sync)
+        return
+      }
+
+      // Test-only empty production boundary makes the precheck/install race
+      // deterministic. The second check and native mutation are intentionally
+      // one stateLock critical section: background/reconnect either revokes
+      // first and install never runs, or install completes before lifecycle
+      // revocation can linearize.
+      peerPreKeyInstallBoundary()
+      val install = synchronized(stateLock) {
+        if (
+          sync.pendingRequest !== pending ||
+          sync.directSessionAction !== action ||
+          !isReadyDirectConversationLocked(sync, action.conversationId)
+        ) {
+          null
+        } else {
+          val installed = sync.session.installDirectPreKeyBundle(
+            sync.leaseToken,
+            pending.requestToken,
+            action.conversationId,
+            result.body,
+          )
+          sync.pendingRequest = null
+          sync.directSessionAction = null
+          installed
+        }
+      }
+      if (install != null) {
+        action.completion.complete(NativeDirectSessionActionResult.Success(install))
+      }
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+    } finally {
+      result.wipeSensitiveBody()
     }
   }
 
@@ -951,7 +1307,7 @@ internal class VeilMobileRuntime internal constructor(
       lease.canonicalServerOrigin != authenticated.canonicalServerOrigin ||
       lease.userId != authenticated.userId
     ) {
-      DetachedDirectSync(active, lease.leaseToken, null).cancelLeaseQuietly()
+      DetachedDirectSync(active, lease.leaseToken, null, null).cancelLeaseQuietly()
       throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
     }
 
@@ -992,7 +1348,7 @@ internal class VeilMobileRuntime internal constructor(
       }
     }
     if (!installed) {
-      DetachedDirectSync(active, lease.leaseToken, null).cancelLeaseQuietly()
+      DetachedDirectSync(active, lease.leaseToken, null, null).cancelLeaseQuietly()
       throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
     }
 
@@ -1194,6 +1550,7 @@ internal class VeilMobileRuntime internal constructor(
     sync: ActiveDirectSync,
     prepared: NativeDirectRestRequest,
     stage: DirectRequestStage,
+    directSessionAction: PendingDirectSessionAction? = null,
   ): PreparedDirectHttpRequest {
     val method = when (prepared.method) {
       HTTP_GET_METHOD -> NativeDirectHttpMethod.GET
@@ -1235,7 +1592,27 @@ internal class VeilMobileRuntime internal constructor(
             "native Direct history response bound changed"
           }
         }
+        DirectRequestStage.PEER_PREKEY -> {
+          val action = checkNotNull(directSessionAction) {
+            "native Direct peer-prekey action is absent"
+          }
+          check(method == NativeDirectHttpMethod.GET) { "native Direct peer-prekey method changed" }
+          check(exactBody.isEmpty()) { "native Direct peer-prekey body is not empty" }
+          check(prepared.responseLimitBytes == NativeDirectHttpLimits.PREKEY_BYTES) {
+            "native Direct peer-prekey response bound changed"
+          }
+          check(PEER_PREKEY_TARGET.matches(prepared.requestTarget)) {
+            "native Direct peer-prekey target changed"
+          }
+          check(
+            action.lifecycleEpoch == sync.epoch &&
+              action.generation == sync.generation,
+          ) { "native Direct peer-prekey action changed generation" }
+        }
       }
+      check(
+        (stage == DirectRequestStage.PEER_PREKEY) == (directSessionAction != null),
+      ) { "native Direct request action binding changed" }
 
       val signature = sync.session.signDirectRestRequest(sync.leaseToken, prepared.requestToken)
       check(signature.userId == sync.userId) { "native Direct signer returned a mismatched account" }
@@ -1243,6 +1620,10 @@ internal class VeilMobileRuntime internal constructor(
         requestToken = prepared.requestToken,
         stage = stage,
         method = method,
+        lifecycleEpoch = sync.epoch,
+        generation = sync.generation,
+        conversationId = directSessionAction?.conversationId,
+        directSessionAction = directSessionAction,
       )
       return PreparedDirectHttpRequest(
         pending = pending,
@@ -1692,12 +2073,14 @@ internal class VeilMobileRuntime internal constructor(
     val selected = activeDirectSync
     activeDirectSync = null
     val pendingCall = selected?.pendingRequest?.call
+    val directSessionCompletion = selected?.directSessionAction?.completion
     // Cancel under the same lock that revokes the generation. This closes the
     // tiny attach-before-start window: once lifecycle/reconnect has linearized
     // here, a still-unstarted call is terminal before the requester can start
     // it. The out-of-lock cancellation below remains an idempotent fallback.
     pendingCall?.cancelQuietly()
     selected?.pendingRequest = null
+    selected?.directSessionAction = null
     ownPreKeyState = if (nextState == NativeDirectDirectoryState.ERROR) {
       NativeOwnPreKeyState.ERROR
     } else {
@@ -1712,7 +2095,12 @@ internal class VeilMobileRuntime internal constructor(
     directConversations = emptyList()
     directoryReady = false
     return selected?.let { sync ->
-      DetachedDirectSync(sync.session, sync.leaseToken, pendingCall)
+      DetachedDirectSync(
+        sync.session,
+        sync.leaseToken,
+        pendingCall,
+        directSessionCompletion,
+      )
     }
   }
 
@@ -1722,6 +2110,10 @@ internal class VeilMobileRuntime internal constructor(
       selected.pendingCall?.cancel()
     } catch (_: Throwable) {
       // Detaching remains terminal even if the HTTP call already completed.
+    } finally {
+      selected.directSessionCompletion?.complete(
+        NativeDirectSessionActionResult.Unavailable,
+      )
     }
   }
 
@@ -1992,6 +2384,7 @@ internal class VeilMobileRuntime internal constructor(
     private const val HTTP_GET_METHOD = "GET"
     private const val HTTP_POST_METHOD = "POST"
     private const val OWN_PREKEY_UPLOAD_TARGET = "/v1/prekeys"
+    private val PEER_PREKEY_TARGET = Regex("^/v1/prekeys/[0-9a-f]{64}$")
     private const val MAX_OWN_PREKEY_REQUESTS = 2
     private const val SECURE_DIRECT_BOOTSTRAP_ERROR = "Unable to complete the secure Direct bootstrap"
     private const val MAX_DIRECT_CONVERSATIONS = 10_000
@@ -2111,6 +2504,12 @@ private class UniFfiMobileSession(
 
   override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection =
     delegate.projectDirectMessages(conversationId).toNativeDirectMessageProjection()
+
+  override fun directSendReadiness(
+    leaseToken: String,
+    conversationId: String,
+  ): NativeDirectSendReadiness =
+    delegate.directSendReadiness(leaseToken, conversationId).toNativeDirectSendReadiness()
 
   override fun prepareDirectPreKeyRequest(
     leaseToken: String,
@@ -2279,6 +2678,13 @@ internal fun MobileDirectPreKeyResult.toNativeDirectPreKeyInstall(): NativeDirec
       else -> throw IllegalStateException("native Direct prekey install returned an unsupported status")
     },
   )
+
+internal fun MobileDirectSendReadiness.toNativeDirectSendReadiness(): NativeDirectSendReadiness =
+  when (this) {
+    MobileDirectSendReadiness.READY -> NativeDirectSendReadiness.READY
+    MobileDirectSendReadiness.NEEDS_PRE_KEY -> NativeDirectSendReadiness.NEEDS_PRE_KEY
+    MobileDirectSendReadiness.UNAVAILABLE -> NativeDirectSendReadiness.UNAVAILABLE
+  }
 
 internal fun RestSignatureData.toNativeRestSignature(): NativeRestSignature =
   NativeRestSignature(

@@ -69,6 +69,18 @@ class NodeAccessPassTest {
   }
 
   @Test
+  fun rejectsNonCanonicalBase64UrlTrailingBits() {
+    val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    val finalIndex = alphabet.indexOf(token.last())
+    assertEquals(0, finalIndex and 0x03)
+    val nonCanonical = token.dropLast(1) + alphabet[finalIndex + 1]
+
+    assertThrows(IllegalArgumentException::class.java) {
+      NodeAccessPassParser.parse("https://access.example/enroll#invite=$nonCanonical")
+    }
+  }
+
+  @Test
   fun recognizesMalformedEnrollmentTargetsSoTheyCannotFallThroughToReactNativeLinking() {
     assertTrue(NodeAccessPassParser.isPotentialEnrollment("veil://enroll/%"))
     assertTrue(NodeAccessPassParser.isPotentialEnrollment("https://veil.erez.pro/enroll#%"))

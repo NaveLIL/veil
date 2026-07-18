@@ -176,6 +176,45 @@ class NativeDirectHttpTransportTest {
   }
 
   @Test
+  fun peerPreKeyConnectionFailureIsNeverRetried() {
+    server.enqueue(
+      MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START),
+    )
+    // A second response would make an accidental OkHttp retry look successful.
+    server.enqueue(MockResponse().setResponseCode(200).setBody("must-not-be-used"))
+    val request = signedRequest(
+      target = "/v1/prekeys/${"ab".repeat(32)}",
+      responseLimit = NativeDirectHttpLimits.PREKEY_BYTES,
+    )
+
+    val result = executeAndAwait(request)
+
+    assertFailure(NativeDirectHttpFailure.NETWORK, result)
+    assertEquals(1, server.requestCount)
+  }
+
+  @Test
+  fun peerPreKeyStatusFollowUpIsBlockedBeforeSecondNetworkExchange() {
+    server.enqueue(
+      MockResponse()
+        .setResponseCode(503)
+        .setHeader("Retry-After", "0"),
+    )
+    // OkHttp normally follows this exact response immediately. A second
+    // response would make the destructive peer-prekey GET appear successful.
+    server.enqueue(MockResponse().setResponseCode(200).setBody("must-not-be-used"))
+    val request = signedRequest(
+      target = "/v1/prekeys/${"ab".repeat(32)}",
+      responseLimit = NativeDirectHttpLimits.PREKEY_BYTES,
+    )
+
+    val result = executeAndAwait(request)
+
+    assertFailure(NativeDirectHttpFailure.NETWORK, result)
+    assertEquals(1, server.requestCount)
+  }
+
+  @Test
   fun non200BodyNeverCrossesTheSanitizedFailureBoundary() {
     val secretBody = "server-secret-diagnostic-body"
     server.enqueue(MockResponse().setResponseCode(401).setBody(secretBody))

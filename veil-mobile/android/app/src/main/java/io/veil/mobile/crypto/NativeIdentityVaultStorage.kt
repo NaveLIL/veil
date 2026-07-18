@@ -328,7 +328,7 @@ internal class AndroidDurableIdentityFileOps(baseFile: File) : DurableIdentityFi
         OsConstants.O_WRONLY or
           OsConstants.O_CREAT or
           OsConstants.O_EXCL or
-          OsConstants.O_CLOEXEC,
+          LINUX_O_CLOEXEC,
         OsConstants.S_IRUSR or OsConstants.S_IWUSR,
       )
     return try {
@@ -358,7 +358,7 @@ internal class AndroidDurableIdentityFileOps(baseFile: File) : DurableIdentityFi
     val descriptor =
       Os.open(
         parent.absolutePath,
-        OsConstants.O_RDONLY or OsConstants.O_CLOEXEC,
+        OsConstants.O_RDONLY or LINUX_O_CLOEXEC,
         0,
       )
     var failure: Throwable? = null
@@ -378,6 +378,11 @@ internal class AndroidDurableIdentityFileOps(baseFile: File) : DurableIdentityFi
 
   override fun openBase(): InputStream = FileInputStream(base)
 }
+
+// O_CLOEXEC is part of the Linux UAPI used by every supported Android ABI
+// from API 24, but android.system.OsConstants only exposes the Java field from
+// API 27. Keep the atomic open(2) flag without linking that newer Java field.
+private const val LINUX_O_CLOEXEC = 0x00080000
 
 private class AndroidDurableIdentityTempOutput(
   private val output: FileOutputStream,

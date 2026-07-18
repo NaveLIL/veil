@@ -2,16 +2,19 @@ package io.veil.mobile.runtime
 
 import androidx.annotation.VisibleForTesting
 import io.veil.mobile.BuildConfig
+import java.io.IOException
 import java.net.URI
 import java.util.UUID
 import java.util.concurrent.Executor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.net.ssl.SSLSocketFactory
 import javax.net.ssl.X509TrustManager
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -85,7 +88,9 @@ internal fun interface NativeDirectHttpCallback {
  * while creating an unstarted call. The runtime wipes its caller-owned wire
  * buffer as soon as [createCall] returns, atomically attaches the call to the
  * active lease, and only then invokes [NativeDirectHttpCall.start]. Callbacks
- * receive only the bounded response bytes.
+ * receive only the bounded response bytes. Throwing [createCall] is
+ * all-or-nothing: the implementation must not retain a call or permit any
+ * network work to start when no handle is returned to the runtime.
  */
 internal fun interface NativeDirectHttpExecutor {
   fun createCall(
@@ -164,8 +169,10 @@ internal class NativeDirectHttpCompletion(
  *
  * Production always starts from a clean OkHttp builder and therefore keeps
  * Android's system trust manager, hostname verifier, DNS, dispatcher, cookie
- * policy, authenticators, and empty interceptor lists. Tests can replace only
- * the trust material for a local TLS server; hostname verification stays on.
+ * policy, authenticators, and no application or externally supplied
+ * interceptors. Its sole internal network interceptor enforces exactly one
+ * wire exchange per signed request. Tests can replace only the trust material
+ * for a local TLS server; hostname verification stays on.
  */
 internal class NativeDirectHttpTransport private constructor(
   testTls: TestTls?,
@@ -185,6 +192,7 @@ internal class NativeDirectHttpTransport private constructor(
     .followRedirects(false)
     .followSslRedirects(false)
     .retryOnConnectionFailure(false)
+    .addNetworkInterceptor(ExactNetworkExchangeInterceptor())
     .connectTimeout(CONNECT_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .readTimeout(READ_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
@@ -290,6 +298,7 @@ internal class NativeDirectHttpTransport private constructor(
 
     val builder = Request.Builder()
       .url(url)
+      .tag(ExactNetworkExchangeGuard::class.java, ExactNetworkExchangeGuard())
       .header("Host", authority)
       .header("Accept", JSON_MEDIA_TYPE)
       .header("X-Veil-User", input.signature.userId)
@@ -377,6 +386,30 @@ internal class NativeDirectHttpTransport private constructor(
       // Do not leave a second copy of directory/prekey material in an Okio
       // segment pool or temporary heap buffer after ownership is transferred.
       scratch.fill(0)
+    }
+  }
+
+  /**
+   * OkHttp can perform status-driven follow-ups (notably 503 Retry-After: 0
+   * and coalesced HTTP/2 421) even when connection retries and redirects are
+   * disabled. A network interceptor runs once per actual exchange, so sharing
+   * this request tag across follow-ups prevents a second signed transmission.
+   */
+  private class ExactNetworkExchangeGuard {
+    private val claimed = AtomicBoolean(false)
+
+    fun claim(): Boolean = claimed.compareAndSet(false, true)
+  }
+
+  private class ExactNetworkExchangeInterceptor : Interceptor {
+    @Throws(IOException::class)
+    override fun intercept(chain: Interceptor.Chain): Response {
+      val guard = chain.request().tag(ExactNetworkExchangeGuard::class.java)
+        ?: throw IOException("Direct network exchange guard is missing")
+      if (!guard.claim()) {
+        throw IOException("Direct network exchange already attempted")
+      }
+      return chain.proceed(chain.request())
     }
   }
 
