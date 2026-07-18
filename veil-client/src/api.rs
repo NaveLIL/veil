@@ -3471,6 +3471,17 @@ impl VeilClient {
         self.connection.is_some()
     }
 
+    /// Install an in-memory transport for cross-crate native integration tests.
+    ///
+    /// This method does not exist in production builds.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_install_queued_connection(&mut self) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let (connection, outbound) = crate::connection::Connection::test_only_queued_connection();
+        self.connection = Some(connection);
+        outbound
+    }
+
     // ─── E2E Encryption ──────────────────────────────────
 
     /// Exact owner-only count endpoint for the currently initialized account.

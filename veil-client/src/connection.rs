@@ -1339,7 +1339,7 @@ impl Connection {
             .map_err(|e| format!("send failed: {e}"))
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn test_only_queued_connection() -> (Self, mpsc::Receiver<Vec<u8>>) {
         let write_join = tokio::spawn(std::future::pending::<()>());
         let read_join = tokio::spawn(std::future::pending::<()>());

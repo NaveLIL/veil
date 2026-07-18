@@ -356,6 +356,21 @@ pub enum MobileDirectMessageProjectionAvailability {
     Unavailable,
 }
 
+/// Coarse, advisory send readiness for exactly one Direct conversation under
+/// the caller's current authenticated lease.
+///
+/// `Unavailable` deliberately collapses malformed or stale leases, lifecycle
+/// changes, blocked or unknown routes, storage revocation, and transport loss.
+/// No denial detail or key identifier crosses the FFI boundary. A future send
+/// operation must repeat every authority, storage, transport, and session
+/// guard atomically; this value is never a send capability.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileDirectSendReadiness {
+    Ready,
+    NeedsPreKey,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
 pub enum MobileDirectMessageDirection {
     Incoming,
@@ -497,6 +512,44 @@ fn mobile_direct_projection_scope(
             .ensure_dm_conversation_binding_compatible(conversation_id, peer.identity_key)
             .is_ok();
     matches.then_some((self_identity_key, peer.identity_key))
+}
+
+/// The caller must hold `direct_sync -> binding -> client`; all authority
+/// checks themselves stay centralized here so a future atomic send cannot
+/// accidentally omit the exact token, Ready phase, or epoch binding.
+fn mobile_direct_send_readiness_for_current_lease(
+    client: &veil_client::api::VeilClient,
+    state: &MobileDirectSyncState,
+    current_binding: Option<&MobileAuthenticatedEpoch>,
+    lease_token: &str,
+    conversation_id: &str,
+) -> MobileDirectSendReadiness {
+    if state.token != lease_token
+        || state.phase != MobileDirectSyncPhase::Ready
+        || current_binding != Some(&state.epoch)
+    {
+        return MobileDirectSendReadiness::Unavailable;
+    }
+    if mobile_direct_projection_availability(
+        client.direct_conversation_availability_v1(conversation_id),
+    ) != MobileDirectMessageProjectionAvailability::Available
+        || state.blocked_conversations.contains_key(conversation_id)
+    {
+        return MobileDirectSendReadiness::Unavailable;
+    }
+    let Some((_, peer_identity_key)) =
+        mobile_direct_projection_scope(client, state, conversation_id)
+    else {
+        return MobileDirectSendReadiness::Unavailable;
+    };
+    if !client.is_connected() {
+        return MobileDirectSendReadiness::Unavailable;
+    }
+    if client.has_session(&peer_identity_key) {
+        MobileDirectSendReadiness::Ready
+    } else {
+        MobileDirectSendReadiness::NeedsPreKey
+    }
 }
 
 #[derive(uniffi::Record)]
@@ -1942,6 +1995,47 @@ impl VeilMobileSession {
         })
     }
 
+    /// Return coarse, advisory send readiness for one exact Direct route under
+    /// the current Ready lease.
+    ///
+    /// Every malformed, stale, denied, poisoned, disconnected, or revoked
+    /// state collapses to `Unavailable`. The result exposes neither denial
+    /// detail nor key material and must never be treated as a send capability:
+    /// a future send operation must repeat all guards atomically.
+    pub fn direct_send_readiness(
+        &self,
+        lease_token: String,
+        conversation_id: String,
+    ) -> MobileDirectSendReadiness {
+        if require_mobile_sync_token(&lease_token).is_err() {
+            return MobileDirectSendReadiness::Unavailable;
+        }
+        let Ok(conversation_id) =
+            require_canonical_user_id("Direct conversation ID", &conversation_id)
+        else {
+            return MobileDirectSendReadiness::Unavailable;
+        };
+        let Ok(sync) = self.direct_sync.lock() else {
+            return MobileDirectSendReadiness::Unavailable;
+        };
+        let Some(state) = sync.as_ref() else {
+            return MobileDirectSendReadiness::Unavailable;
+        };
+        let Ok(binding) = self.binding.lock() else {
+            return MobileDirectSendReadiness::Unavailable;
+        };
+        let Ok(client) = self.client.lock() else {
+            return MobileDirectSendReadiness::Unavailable;
+        };
+        mobile_direct_send_readiness_for_current_lease(
+            &client,
+            state,
+            binding.as_ref(),
+            &lease_token,
+            &conversation_id,
+        )
+    }
+
     /// Return a bounded UI projection for exactly one authenticated Direct.
     ///
     /// The caller supplies the conversation id it is about to render. Native
@@ -3304,8 +3398,11 @@ mod tests {
         (response, peer)
     }
 
-    fn mobile_test_install_ready_direct(session: &VeilMobileSession, lease_token: &str) -> String {
-        let (response, _) = mobile_test_directory_response(session);
+    fn mobile_test_install_ready_direct_with_peer(
+        session: &VeilMobileSession,
+        lease_token: &str,
+    ) -> (String, IdentityKeyPair) {
+        let (response, peer) = mobile_test_directory_response(session);
         let request = session
             .prepare_direct_directory_request(lease_token.to_string())
             .unwrap();
@@ -3313,9 +3410,47 @@ mod tests {
             .install_direct_directory_page(lease_token.to_string(), request.request_token, response)
             .unwrap();
         assert_eq!(page.conversations.len(), 1);
+        assert!(page.conversations[0].needs_prekey);
         let conversation_id = page.conversations[0].conversation_id.clone();
         session.direct_sync.lock().unwrap().as_mut().unwrap().phase = MobileDirectSyncPhase::Ready;
-        conversation_id
+        (conversation_id, peer)
+    }
+
+    fn mobile_test_install_ready_direct(session: &VeilMobileSession, lease_token: &str) -> String {
+        mobile_test_install_ready_direct_with_peer(session, lease_token).0
+    }
+
+    fn mobile_test_prekey_bundle(
+        peer: IdentityKeyPair,
+    ) -> ([u8; 32], veil_crypto::x3dh::PreKeyBundle) {
+        let identity_key = peer.x25519_public_bytes();
+        let signing_key = peer.ed25519_public_bytes();
+        let mut peer_client = veil_client::api::VeilClient::from_identity(peer);
+        let prekeys = peer_client.generate_prekeys().unwrap();
+        let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
+        (
+            identity_key,
+            veil_crypto::x3dh::PreKeyBundle {
+                identity_key,
+                signing_key,
+                signed_prekey: prekeys.spk_public,
+                signed_prekey_signature: prekeys.spk_signature,
+                signed_prekey_id: prekeys.spk_id,
+                one_time_prekey: Some(one_time_prekey),
+                one_time_prekey_id: Some(one_time_prekey_id),
+            },
+        )
+    }
+
+    fn mobile_test_install_queued_connection(
+        session: &VeilMobileSession,
+    ) -> tokio::sync::mpsc::Receiver<Vec<u8>> {
+        let _runtime_guard = session.runtime.enter();
+        session
+            .client
+            .lock()
+            .unwrap()
+            .test_only_install_queued_connection()
     }
 
     fn mobile_test_direct_identities(
@@ -4516,6 +4651,298 @@ mod tests {
             );
             assert!(messages.is_empty());
         }
+    }
+
+    #[test]
+    fn mobile_direct_send_readiness_uses_the_live_session_not_directory_snapshot() {
+        let (session, path, token) = mobile_test_session_with_sync(124);
+        let (conversation_id, peer) = mobile_test_install_ready_direct_with_peer(&session, &token);
+        let _outbound = mobile_test_install_queued_connection(&session);
+
+        assert_eq!(
+            session.direct_send_readiness(token.clone(), conversation_id.clone()),
+            MobileDirectSendReadiness::NeedsPreKey
+        );
+
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        assert_eq!(
+            session.direct_send_readiness(token, conversation_id),
+            MobileDirectSendReadiness::Ready
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_send_readiness_collapses_all_route_and_lease_denials() {
+        let (session, path, token) = mobile_test_session_with_sync(125);
+        let (conversation_id, peer) = mobile_test_install_ready_direct_with_peer(&session, &token);
+        let _outbound = mobile_test_install_queued_connection(&session);
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        assert_eq!(
+            session.direct_send_readiness(token.clone(), conversation_id.clone()),
+            MobileDirectSendReadiness::Ready
+        );
+
+        let original_epoch = session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .epoch
+            .clone();
+        let renewed_token = "cd".repeat(32);
+        let renewed_epoch = mobile_test_epoch(126);
+        {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.token = renewed_token.clone();
+            state.epoch = renewed_epoch.clone();
+        }
+        *session.binding.lock().unwrap() = Some(renewed_epoch);
+        assert_eq!(
+            session.direct_send_readiness(token.clone(), conversation_id.clone()),
+            MobileDirectSendReadiness::Unavailable
+        );
+        assert_eq!(
+            session.direct_send_readiness(renewed_token, conversation_id.clone()),
+            MobileDirectSendReadiness::Ready
+        );
+        {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.token = token.clone();
+            state.epoch = original_epoch.clone();
+        }
+        *session.binding.lock().unwrap() = Some(original_epoch);
+
+        for malformed_lease in ["not-a-lease".to_string(), "00".repeat(32)] {
+            assert_eq!(
+                session.direct_send_readiness(malformed_lease, conversation_id.clone()),
+                MobileDirectSendReadiness::Unavailable
+            );
+        }
+        assert_eq!(
+            session.direct_send_readiness("cd".repeat(32), conversation_id.clone()),
+            MobileDirectSendReadiness::Unavailable
+        );
+        for malformed_conversation in [
+            "not-a-conversation".to_string(),
+            "00000000-0000-0000-0000-000000000000".to_string(),
+            "20000000-0000-4000-8000-00000000000A".to_string(),
+        ] {
+            assert_eq!(
+                session.direct_send_readiness(token.clone(), malformed_conversation),
+                MobileDirectSendReadiness::Unavailable
+            );
+        }
+        assert_eq!(
+            session.direct_send_readiness(
+                token.clone(),
+                "20000000-0000-4000-8000-000000000099".to_string(),
+            ),
+            MobileDirectSendReadiness::Unavailable
+        );
+
+        session.direct_sync.lock().unwrap().as_mut().unwrap().phase =
+            MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+        assert_eq!(
+            session.direct_send_readiness(token.clone(), conversation_id.clone()),
+            MobileDirectSendReadiness::Unavailable
+        );
+        session.direct_sync.lock().unwrap().as_mut().unwrap().phase = MobileDirectSyncPhase::Ready;
+
+        let exact_epoch = session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .epoch
+            .clone();
+        *session.binding.lock().unwrap() = Some(mobile_test_epoch(126));
+        assert_eq!(
+            session.direct_send_readiness(token.clone(), conversation_id.clone()),
+            MobileDirectSendReadiness::Unavailable
+        );
+        *session.binding.lock().unwrap() = Some(exact_epoch);
+
+        session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .blocked_conversations
+            .insert(
+                conversation_id.clone(),
+                MobileDirectHistoryOutcome::ConversationRejected,
+            );
+        assert_eq!(
+            session.direct_send_readiness(token.clone(), conversation_id.clone()),
+            MobileDirectSendReadiness::Unavailable
+        );
+        session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .blocked_conversations
+            .remove(&conversation_id);
+
+        let pinned_signing_key = {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let peer = sync
+                .as_mut()
+                .unwrap()
+                .peers
+                .get_mut(&conversation_id)
+                .unwrap();
+            let pinned = peer.signing_key;
+            peer.signing_key = IdentityKeyPair::generate().ed25519_public_bytes();
+            pinned
+        };
+        assert_eq!(
+            session.direct_send_readiness(token.clone(), conversation_id.clone()),
+            MobileDirectSendReadiness::Unavailable
+        );
+        session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .peers
+            .get_mut(&conversation_id)
+            .unwrap()
+            .signing_key = pinned_signing_key;
+
+        session.client.lock().unwrap().disconnect();
+        assert_eq!(
+            session.direct_send_readiness(token, conversation_id),
+            MobileDirectSendReadiness::Unavailable
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_send_readiness_collapses_storage_revocation() {
+        let (session, path, token) = mobile_test_session_with_sync(127);
+        let (conversation_id, peer) = mobile_test_install_ready_direct_with_peer(&session, &token);
+        let _outbound = mobile_test_install_queued_connection(&session);
+        assert_eq!(
+            session.direct_send_readiness(token.clone(), conversation_id.clone()),
+            MobileDirectSendReadiness::NeedsPreKey
+        );
+        session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_readiness_session_persistence
+                 BEFORE INSERT ON ratchet_sessions
+                 BEGIN
+                    SELECT RAISE(ABORT, 'forced readiness storage failure');
+                 END;",
+            )
+            .unwrap();
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        assert!(session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .is_err());
+        assert_eq!(
+            session
+                .client
+                .lock()
+                .unwrap()
+                .direct_conversation_availability_v1(&conversation_id),
+            veil_client::api::DirectConversationAvailabilityV1::RuntimeRevoked
+        );
+        assert_eq!(
+            session.direct_send_readiness(token, conversation_id),
+            MobileDirectSendReadiness::Unavailable
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_send_readiness_collapses_missing_and_poisoned_native_state() {
+        let canonical_conversation = "20000000-0000-4000-8000-000000000001".to_string();
+
+        let (missing, missing_path, token) = mobile_test_session_with_sync(128);
+        *missing.direct_sync.lock().unwrap() = None;
+        assert_eq!(
+            missing.direct_send_readiness(token, canonical_conversation.clone()),
+            MobileDirectSendReadiness::Unavailable
+        );
+        drop(missing);
+        let _ = std::fs::remove_file(missing_path);
+
+        let (sync_poisoned, sync_path, token) = mobile_test_session_with_sync(129);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sync_poisoned.direct_sync.lock().unwrap();
+            panic!("poison Direct sync for readiness test");
+        }))
+        .is_err());
+        assert_eq!(
+            sync_poisoned.direct_send_readiness(token, canonical_conversation.clone()),
+            MobileDirectSendReadiness::Unavailable
+        );
+        drop(sync_poisoned);
+        let _ = std::fs::remove_file(sync_path);
+
+        let (binding_poisoned, binding_path, token) = mobile_test_session_with_sync(130);
+        let conversation_id = mobile_test_install_ready_direct(&binding_poisoned, &token);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = binding_poisoned.binding.lock().unwrap();
+            panic!("poison binding for readiness test");
+        }))
+        .is_err());
+        assert_eq!(
+            binding_poisoned.direct_send_readiness(token, conversation_id),
+            MobileDirectSendReadiness::Unavailable
+        );
+        drop(binding_poisoned);
+        let _ = std::fs::remove_file(binding_path);
+
+        let (client_poisoned, client_path, token) = mobile_test_session_with_sync(131);
+        let conversation_id = mobile_test_install_ready_direct(&client_poisoned, &token);
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = client_poisoned.client.lock().unwrap();
+            panic!("poison client for readiness test");
+        }))
+        .is_err());
+        assert_eq!(
+            client_poisoned.direct_send_readiness(token, conversation_id),
+            MobileDirectSendReadiness::Unavailable
+        );
+        drop(client_poisoned);
+        let _ = std::fs::remove_file(client_path);
     }
 
     #[test]

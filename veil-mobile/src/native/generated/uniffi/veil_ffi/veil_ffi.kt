@@ -858,6 +858,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -930,6 +932,8 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_cancellable(
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass_cancellable(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_direct_send_readiness(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect(
 ): Short
@@ -1119,6 +1123,8 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_cancellable(`ptr`: Point
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`nodeAccessPass`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass_cancellable(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`nodeAccessPass`: RustBuffer.ByValue,`cancellation`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_direct_send_readiness(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_disconnect(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
@@ -1425,6 +1431,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass_cancellable() != 57674.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_direct_send_readiness() != 43278.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect() != 63203.toShort()) {
@@ -2916,6 +2925,17 @@ public interface VeilMobileSessionInterface {
      */
     fun `connectWithNodeAccessPassCancellable`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray, `cancellation`: MobileConnectCancellation): MobileAuthenticatedBinding
 
+    /**
+     * Return coarse, advisory send readiness for one exact Direct route under
+     * the current Ready lease.
+     *
+     * Every malformed, stale, denied, poisoned, disconnected, or revoked
+     * state collapses to `Unavailable`. The result exposes neither denial
+     * detail nor key material and must never be treated as a send capability:
+     * a future send operation must repeat all guards atomically.
+     */
+    fun `directSendReadiness`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectSendReadiness
+
     fun `disconnect`()
 
     /**
@@ -3216,6 +3236,27 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass_cancellable(
         it, FfiConverterString.lower(`websocketUrl`),FfiConverterString.lower(`canonicalServerOrigin`),FfiConverterByteArray.lower(`nodeAccessPass`),FfiConverterTypeMobileConnectCancellation.lower(`cancellation`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Return coarse, advisory send readiness for one exact Direct route under
+     * the current Ready lease.
+     *
+     * Every malformed, stale, denied, poisoned, disconnected, or revoked
+     * state collapses to `Unavailable`. The result exposes neither denial
+     * detail nor key material and must never be treated as a send capability:
+     * a future send operation must repeat all guards atomically.
+     */override fun `directSendReadiness`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectSendReadiness {
+            return FfiConverterTypeMobileDirectSendReadiness.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_direct_send_readiness(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`conversationId`),_status)
 }
     }
     )
@@ -5144,6 +5185,47 @@ public object FfiConverterTypeMobileDirectMessageProjectionAvailability: FfiConv
     override fun allocationSize(value: MobileDirectMessageProjectionAvailability) = 4UL
 
     override fun write(value: MobileDirectMessageProjectionAvailability, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Coarse, advisory send readiness for exactly one Direct conversation under
+ * the caller's current authenticated lease.
+ *
+ * `Unavailable` deliberately collapses malformed or stale leases, lifecycle
+ * changes, blocked or unknown routes, storage revocation, and transport loss.
+ * No denial detail or key identifier crosses the FFI boundary. A future send
+ * operation must repeat every authority, storage, transport, and session
+ * guard atomically; this value is never a send capability.
+ */
+
+enum class MobileDirectSendReadiness {
+
+    READY,
+    NEEDS_PRE_KEY,
+    UNAVAILABLE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectSendReadiness: FfiConverterRustBuffer<MobileDirectSendReadiness> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectSendReadiness.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectSendReadiness) = 4UL
+
+    override fun write(value: MobileDirectSendReadiness, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
