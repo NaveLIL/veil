@@ -16,7 +16,6 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody
-import okio.Buffer
 import okio.ByteString.Companion.decodeBase64
 
 /** Response limits mirrored from the native Direct contract. */
@@ -59,8 +58,19 @@ internal sealed interface NativeDirectHttpResult {
   data class Failure(val reason: NativeDirectHttpFailure) : NativeDirectHttpResult
 }
 
+internal fun NativeDirectHttpResult.wipeSensitiveBody() {
+  if (this is NativeDirectHttpResult.Success) body.fill(0)
+}
+
 internal fun interface NativeDirectHttpCallback {
   fun onComplete(result: NativeDirectHttpResult)
+}
+
+internal fun interface NativeDirectHttpExecutor {
+  fun execute(
+    request: NativeDirectHttpRequest,
+    callback: NativeDirectHttpCallback,
+  ): NativeDirectHttpCall
 }
 
 internal interface NativeDirectHttpCall : AutoCloseable {
@@ -84,7 +94,10 @@ internal class NativeDirectHttpCompletion(
   private val state = AtomicReference(TerminalState.ACTIVE)
 
   fun complete(result: NativeDirectHttpResult): Boolean {
-    if (!state.compareAndSet(TerminalState.ACTIVE, TerminalState.COMPLETED)) return false
+    if (!state.compareAndSet(TerminalState.ACTIVE, TerminalState.COMPLETED)) {
+      result.wipeSensitiveBody()
+      return false
+    }
     publish(result)
     return true
   }
@@ -107,6 +120,7 @@ internal class NativeDirectHttpCompletion(
     try {
       callback.onComplete(result)
     } catch (_: RuntimeException) {
+      result.wipeSensitiveBody()
       // A detached runtime callback must not crash OkHttp's dispatcher.
     }
   }
@@ -130,7 +144,7 @@ internal class NativeDirectHttpCompletion(
  */
 internal class NativeDirectHttpTransport private constructor(
   testTls: TestTls?,
-) {
+) : NativeDirectHttpExecutor {
   constructor() : this(null)
 
   @VisibleForTesting
@@ -151,7 +165,7 @@ internal class NativeDirectHttpTransport private constructor(
     .callTimeout(CALL_TIMEOUT_SECONDS, TimeUnit.SECONDS)
     .build()
 
-  fun execute(
+  override fun execute(
     request: NativeDirectHttpRequest,
     callback: NativeDirectHttpCallback,
   ): NativeDirectHttpCall {
@@ -279,18 +293,35 @@ internal class NativeDirectHttpTransport private constructor(
       return NativeDirectHttpResult.Failure(NativeDirectHttpFailure.RESPONSE_TOO_LARGE)
     }
 
-    val source = body.source()
-    val buffer = Buffer()
-    var remaining = responseLimitBytes + 1L
-    while (remaining > 0L) {
-      val read = source.read(buffer, minOf(READ_CHUNK_BYTES, remaining))
-      if (read == -1L) break
-      remaining -= read
+    val maximumBytes = Math.toIntExact(
+      if (declaredLength >= 0L) {
+        minOf(responseLimitBytes + 1L, declaredLength + 1L)
+      } else {
+        responseLimitBytes + 1L
+      },
+    )
+    val scratch = ByteArray(maximumBytes)
+    var used = 0
+    return try {
+      val input = body.byteStream()
+      while (used < scratch.size) {
+        val read = input.read(scratch, used, minOf(READ_CHUNK_BYTES, scratch.size - used))
+        if (read == -1) break
+        if (read == 0) throw java.io.IOException("Direct response read made no progress")
+        used += read
+      }
+      if (used > responseLimitBytes) {
+        NativeDirectHttpResult.Failure(NativeDirectHttpFailure.RESPONSE_TOO_LARGE)
+      } else if (declaredLength >= 0L && used.toLong() != declaredLength) {
+        NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK)
+      } else {
+        NativeDirectHttpResult.Success(scratch.copyOf(used))
+      }
+    } finally {
+      // Do not leave a second copy of directory/prekey material in an Okio
+      // segment pool or temporary heap buffer after ownership is transferred.
+      scratch.fill(0)
     }
-    if (buffer.size > responseLimitBytes) {
-      return NativeDirectHttpResult.Failure(NativeDirectHttpFailure.RESPONSE_TOO_LARGE)
-    }
-    return NativeDirectHttpResult.Success(buffer.readByteArray())
   }
 
   private fun rejectedCall(
@@ -345,7 +376,7 @@ internal class NativeDirectHttpTransport private constructor(
     const val JSON_MEDIA_TYPE = "application/json"
     const val MAX_REQUEST_TARGET_CHARS = 8 * 1024
     const val ED25519_SIGNATURE_BYTES = 64
-    const val READ_CHUNK_BYTES = 8L * 1024L
+    const val READ_CHUNK_BYTES = 8 * 1024
     const val CONNECT_TIMEOUT_SECONDS = 10L
     const val READ_TIMEOUT_SECONDS = 20L
     const val CALL_TIMEOUT_SECONDS = 30L

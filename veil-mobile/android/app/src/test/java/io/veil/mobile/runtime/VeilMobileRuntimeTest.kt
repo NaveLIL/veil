@@ -3,6 +3,7 @@ package io.veil.mobile.runtime
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import java.util.Base64
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -174,7 +175,7 @@ class VeilMobileRuntimeTest {
     val cancellation = FakeCancellation {
       val field = VeilMobileRuntime::class.java.getDeclaredField("stateLock")
       field.isAccessible = true
-      cancellationObservedUnderStateLock.set(Thread.holdsLock(field.get(runtime)))
+      cancellationObservedUnderStateLock.set(Thread.holdsLock(checkNotNull(field.get(runtime))))
     }
     runtime = runtime(
       executor,
@@ -229,6 +230,68 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun snapshotPublicationCannotReorderConnectedAfterABackgroundLock() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession)
+    val connectedPublicationEntered = CountDownLatch(1)
+    val releaseConnectedPublication = CountDownLatch(1)
+    val connectFinished = CountDownLatch(1)
+    val observed = CopyOnWriteArrayList<VeilMobileRuntimeSnapshot>()
+    runtime.openSession()
+    runtime.addListener { snapshot ->
+      if (snapshot.connectionState == NativeConnectionState.CONNECTED) {
+        connectedPublicationEntered.countDown()
+        check(releaseConnectedPublication.await(5, TimeUnit.SECONDS)) {
+          "connected publication barrier timed out"
+        }
+      }
+    }
+    runtime.addListener { snapshot -> observed.add(snapshot) }
+
+    val connector = thread(name = "veil-connect-publication") {
+      try {
+        runtime.connect("https://access.example")
+      } finally {
+        connectFinished.countDown()
+      }
+    }
+    try {
+      assertTrue(connectedPublicationEntered.await(5, TimeUnit.SECONDS))
+      val background = thread(name = "veil-background-publication") {
+        runtime.lockForBackground()
+      }
+      assertTrue(
+        "background state did not become fail-closed",
+        awaitCondition { runtime.snapshot().sessionState == NativeSessionState.LOCKED },
+      )
+
+      releaseConnectedPublication.countDown()
+      assertTrue(connectFinished.await(5, TimeUnit.SECONDS))
+      connector.join(5_000)
+      background.join(5_000)
+      awaitRuntimeIdle(runtime)
+
+      val connectedIndex = observed.indexOfFirst {
+        it.connectionState == NativeConnectionState.CONNECTED
+      }
+      val terminalIndex = observed.indexOfFirst {
+        it.sessionState == NativeSessionState.CLOSING || it.sessionState == NativeSessionState.LOCKED
+      }
+      assertTrue("CONNECTED was never published", connectedIndex >= 0)
+      assertTrue("fail-closed state must publish after CONNECTED", terminalIndex > connectedIndex)
+      assertFalse(
+        observed.drop(terminalIndex).any { it.connectionState == NativeConnectionState.CONNECTED },
+      )
+      assertEquals(NativeSessionState.LOCKED, observed.last().sessionState)
+    } finally {
+      releaseConnectedPublication.countDown()
+      connector.join(5_000)
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun foregroundResumeCannotResurrectAQueuedBackgroundLock() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession()
@@ -261,6 +324,42 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun supersededBackgroundEpochStillRevokesItsDetachedDirectLease() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession)
+    val blockerEntered = CountDownLatch(1)
+    val releaseBlocker = CountDownLatch(1)
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      fakeSession.lifecycleEvents.clear()
+      runtime.execute {
+        blockerEntered.countDown()
+        check(releaseBlocker.await(5, TimeUnit.SECONDS)) { "runtime executor barrier timed out" }
+      }
+      assertTrue(blockerEntered.await(5, TimeUnit.SECONDS))
+
+      runtime.lockForBackground()
+      runtime.markForeground()
+      runtime.lockForBackground()
+      releaseBlocker.countDown()
+      awaitRuntimeIdle(runtime)
+
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertTrue(fakeSession.closed)
+      assertTrue(
+        fakeSession.lifecycleEvents.indexOf("cancel-direct") <
+          fakeSession.lifecycleEvents.indexOf("close"),
+      )
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+    } finally {
+      releaseBlocker.countDown()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun backgroundDuringOpenRejectsAndClosesTheLateCandidate() {
     val executor = daemonExecutor()
     val candidate = FakeSession()
@@ -280,6 +379,7 @@ class VeilMobileRuntimeTest {
         candidate
       },
       cancellationFactory = NativeConnectCancellationFactory { FakeCancellation() },
+      directTransport = PassiveDirectTransport(),
       executor = executor,
       databasePathProvider = { "/private/veil/account-v1.db" },
     )
@@ -309,6 +409,181 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
     } finally {
       releaseFactory.countDown()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun directDirectoryPublishesOnlyTheCompleteAuthenticatedPaginationResult() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val first = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val second = directConversation("20", "Bob", "21", "bob", needsPreKey = false)
+    fakeSession.directoryInstalls.clear()
+    fakeSession.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(first), directoryComplete = false),
+    )
+    fakeSession.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(second), directoryComplete = true),
+    )
+    val firstBody = "first-page-with-native-key-material".toByteArray()
+    val secondBody = "second-page-with-native-key-material".toByteArray()
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+
+      assertEquals(NativeDirectDirectoryState.SYNCING, runtime.snapshot().directDirectoryState)
+      assertTrue(runtime.snapshot().directConversations.isEmpty())
+      assertFalse(runtime.snapshot().directoryReady)
+      assertEquals(1, transport.pendingCount())
+
+      transport.completeNext(NativeDirectHttpResult.Success(firstBody))
+      awaitRuntimeIdle(runtime)
+
+      assertTrue(firstBody.all { it == 0.toByte() })
+      assertEquals(NativeDirectDirectoryState.SYNCING, runtime.snapshot().directDirectoryState)
+      assertTrue("partial pages must never be published", runtime.snapshot().directConversations.isEmpty())
+      assertEquals(1, transport.pendingCount())
+
+      transport.completeNext(NativeDirectHttpResult.Success(secondBody))
+      awaitRuntimeIdle(runtime)
+
+      val complete = runtime.snapshot()
+      assertTrue(secondBody.all { it == 0.toByte() })
+      assertEquals(NativeDirectDirectoryState.SYNCHRONIZED, complete.directDirectoryState)
+      assertEquals(listOf(first, second), complete.directConversations)
+      assertEquals(NativeConnectionState.CONNECTED, complete.connectionState)
+      assertFalse("history is not synchronized yet", complete.directoryReady)
+      assertEquals(2, fakeSession.installedResponseCopies.size)
+      assertEquals(2, transport.requests.size)
+      assertTrue(transport.requests.all { it.canonicalServerOrigin == "https://access.example:443" })
+      assertTrue(transport.requests.all { it.responseLimitBytes == NativeDirectHttpLimits.DIRECTORY_BYTES })
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundCancelsDirectHttpAndLeaseBeforeClosingAndDropsLateSuccess() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val lateBody = "late-page-with-native-key-material".toByteArray()
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      val pendingCall = transport.calls.single()
+      fakeSession.lifecycleEvents.clear()
+
+      runtime.lockForBackground()
+      assertTrue("HTTP cancellation must be immediate", pendingCall.cancelled.get())
+      transport.completeNext(NativeDirectHttpResult.Success(lateBody))
+      awaitRuntimeIdle(runtime)
+
+      val locked = runtime.snapshot()
+      assertTrue(lateBody.all { it == 0.toByte() })
+      assertEquals(NativeSessionState.LOCKED, locked.sessionState)
+      assertEquals(NativeDirectDirectoryState.IDLE, locked.directDirectoryState)
+      assertTrue(locked.directConversations.isEmpty())
+      assertEquals(0, fakeSession.installedResponseCopies.size)
+      assertEquals(listOf("cancel-direct", "disconnect", "close"), fakeSession.lifecycleEvents)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun directTransportFailureFailsClosedAndAllowsAFreshConnectionGeneration() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      transport.completeNext(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.NETWORK))
+      awaitRuntimeIdle(runtime)
+
+      val failed = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
+      assertNull(failed.binding)
+      assertTrue(failed.directConversations.isEmpty())
+      assertFalse(failed.directoryReady)
+      assertEquals(1, fakeSession.directLeaseCancellations)
+
+      runtime.connect("https://access.example")
+      val retried = runtime.snapshot()
+      assertEquals(NativeConnectionState.CONNECTED, retried.connectionState)
+      assertEquals(NativeDirectDirectoryState.SYNCING, retried.directDirectoryState)
+      assertEquals(1, transport.pendingCount())
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun directLeaseMustMatchTheExactAuthenticatedBindingBeforeAnyHttpRequest() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      directLeaseUserOverride = "550e8400-e29b-41d4-a716-446655440099"
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    try {
+      runtime.openSession()
+      val error = assertThrows(VeilMobileRuntimeException::class.java) {
+        runtime.connect("https://access.example")
+      }
+
+      assertEquals("E_VEIL_SYNC", error.code)
+      assertEquals("Unable to verify the Direct directory", error.message)
+      assertEquals(0, transport.requests.size)
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertEquals(NativeDirectDirectoryState.ERROR, runtime.snapshot().directDirectoryState)
+      assertNull(runtime.snapshot().binding)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun duplicateAcrossDirectoryPagesFailsWithoutPublishingPartialRows() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val duplicate = directConversation("30", "Mallory", "31", "mallory", needsPreKey = true)
+    fakeSession.directoryInstalls.clear()
+    fakeSession.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(duplicate), directoryComplete = false),
+    )
+    fakeSession.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(duplicate), directoryComplete = true),
+    )
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      transport.completeNext(NativeDirectHttpResult.Success("page-one".toByteArray()))
+      awaitRuntimeIdle(runtime)
+      transport.completeNext(NativeDirectHttpResult.Success("page-two".toByteArray()))
+      awaitRuntimeIdle(runtime)
+
+      val failed = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
+      assertTrue(failed.directConversations.isEmpty())
+      assertFalse(failed.directoryReady)
+      assertNull(failed.binding)
+    } finally {
+      runtime.lockSession()
       executor.shutdownNow()
     }
   }
@@ -380,6 +655,8 @@ class VeilMobileRuntimeTest {
     assertFalse(installFields.contains("peerSigningKeyHex"))
     assertFalse(install.toString().contains(peerIdentityKey))
     assertFalse(install.toString().contains(peerSigningKey))
+    assertFalse(install.toString().contains("Alice"))
+    assertFalse(install.toString().contains("alice"))
 
     generatedConversation.name = "mutated-after-mapping"
     generatedRows.clear()
@@ -413,6 +690,7 @@ class VeilMobileRuntimeTest {
     markForeground: Boolean = true,
     cancellationFactory: NativeConnectCancellationFactory =
       NativeConnectCancellationFactory { FakeCancellation() },
+    directTransport: NativeDirectHttpExecutor = PassiveDirectTransport(),
   ): VeilMobileRuntime = VeilMobileRuntime(
       vault = vault,
       passStore = passStore,
@@ -422,6 +700,7 @@ class VeilMobileRuntimeTest {
         session
       },
       cancellationFactory = cancellationFactory,
+      directTransport = directTransport,
       executor = executor,
       databasePathProvider = { "/private/veil/account-v1.db" },
     ).also { runtime ->
@@ -436,6 +715,35 @@ class VeilMobileRuntimeTest {
   private fun daemonExecutor(): ExecutorService = Executors.newSingleThreadExecutor { operation ->
     Thread(operation, "veil-runtime-test").apply { isDaemon = true }
   }
+
+  private fun awaitRuntimeIdle(runtime: VeilMobileRuntime) {
+    val drained = CountDownLatch(1)
+    runtime.execute { drained.countDown() }
+    assertTrue("runtime executor did not drain", drained.await(5, TimeUnit.SECONDS))
+  }
+
+  private fun awaitCondition(condition: () -> Boolean): Boolean {
+    val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+    while (System.nanoTime() < deadline) {
+      if (condition()) return true
+      Thread.yield()
+    }
+    return condition()
+  }
+
+  private fun directConversation(
+    conversationSuffix: String,
+    name: String,
+    peerSuffix: String,
+    peerUsername: String,
+    needsPreKey: Boolean,
+  ): NativeDirectConversationInstall = NativeDirectConversationInstall(
+    conversationId = "550e8400-e29b-41d4-a716-4466554400$conversationSuffix",
+    name = name,
+    peerUserId = "550e8400-e29b-41d4-a716-4466554400$peerSuffix",
+    peerUsername = peerUsername,
+    needsPreKey = needsPreKey,
+  )
 
   private class FakeVault : NativeIdentityVaultAccess {
     var failHasIdentity = false
@@ -461,8 +769,17 @@ class VeilMobileRuntimeTest {
     private val succeedAfterCancellation: Boolean = false,
   ) : NativeMobileSession {
     var websocketUrl: String? = null
+    var canonicalOrigin: String? = null
     var lastAccessPass: ByteArray? = null
     var closed = false
+    var directLeaseCancellations = 0
+    var directLeaseUserOverride: String? = null
+    var directoryRequestCount = 0
+    val directoryInstalls = ArrayDeque<NativeDirectDirectoryInstall>().apply {
+      add(NativeDirectDirectoryInstall(emptyList(), directoryComplete = true))
+    }
+    val installedResponseCopies = CopyOnWriteArrayList<ByteArray>()
+    val lifecycleEvents = CopyOnWriteArrayList<String>()
     val connectStarted = CountDownLatch(1)
     val closedDuringConnect = AtomicBoolean(false)
     private val inConnect = AtomicBoolean(false)
@@ -475,6 +792,7 @@ class VeilMobileRuntimeTest {
       awaitCancellationIfRequested(cancellation)
       connectFailure?.let { throw it }
       this.websocketUrl = websocketUrl
+      this.canonicalOrigin = canonicalOrigin
       return PublicAuthenticatedBinding(canonicalOrigin, USER_ID)
     }
 
@@ -487,20 +805,37 @@ class VeilMobileRuntimeTest {
       awaitCancellationIfRequested(cancellation)
       connectFailure?.let { throw it }
       this.websocketUrl = websocketUrl
+      this.canonicalOrigin = canonicalOrigin
       lastAccessPass = nodeAccessPass.copyOf()
       return PublicAuthenticatedBinding(canonicalOrigin, USER_ID)
     }
 
-    override fun beginDirectSync(): NativeDirectSyncLease = unexpectedDirectBridgeCall()
+    override fun beginDirectSync(): NativeDirectSyncLease = NativeDirectSyncLease(
+      leaseToken = "test-direct-lease",
+      canonicalServerOrigin = checkNotNull(canonicalOrigin),
+      userId = directLeaseUserOverride ?: USER_ID,
+    )
 
-    override fun prepareDirectDirectoryRequest(leaseToken: String): NativeDirectRestRequest =
-      unexpectedDirectBridgeCall()
+    override fun prepareDirectDirectoryRequest(leaseToken: String): NativeDirectRestRequest {
+      directoryRequestCount += 1
+      return NativeDirectRestRequest(
+        requestToken = "test-directory-request-$directoryRequestCount",
+        requestTarget = if (directoryRequestCount == 1) {
+          "/v1/conversations?limit=100"
+        } else {
+          "/v1/conversations?cursor=cursor-$directoryRequestCount&limit=100"
+        },
+      )
+    }
 
     override fun installDirectDirectoryPage(
       leaseToken: String,
       requestToken: String,
       response: ByteArray,
-    ): NativeDirectDirectoryInstall = unexpectedDirectBridgeCall()
+    ): NativeDirectDirectoryInstall {
+      installedResponseCopies.add(response.copyOf())
+      return directoryInstalls.removeFirst()
+    }
 
     override fun prepareDirectPreKeyRequest(
       leaseToken: String,
@@ -515,7 +850,8 @@ class VeilMobileRuntimeTest {
     ): NativeDirectPreKeyInstall = unexpectedDirectBridgeCall()
 
     override fun cancelDirectSync(leaseToken: String) {
-      unexpectedDirectBridgeCall()
+      directLeaseCancellations += 1
+      lifecycleEvents.add("cancel-direct")
     }
 
     override fun signRestRequest(
@@ -523,13 +859,20 @@ class VeilMobileRuntimeTest {
       method: String,
       requestTarget: String,
       body: ByteArray,
-    ): NativeRestSignature = unexpectedDirectBridgeCall()
+    ): NativeRestSignature = NativeRestSignature(
+      userId = USER_ID,
+      timestampMs = "1712345678901",
+      signatureBase64 = Base64.getEncoder().encodeToString(ByteArray(64)),
+    )
 
-    override fun disconnect() = Unit
+    override fun disconnect() {
+      lifecycleEvents.add("disconnect")
+    }
 
     override fun close() {
       closedDuringConnect.set(inConnect.get())
       closed = true
+      lifecycleEvents.add("close")
       lastAccessPass?.fill(0)
     }
 
@@ -547,6 +890,56 @@ class VeilMobileRuntimeTest {
 
     private fun unexpectedDirectBridgeCall(): Nothing =
       throw AssertionError("Direct bridge must not be invoked by lifecycle-only runtime tests")
+  }
+
+  private class PassiveDirectTransport : NativeDirectHttpExecutor {
+    override fun execute(
+      request: NativeDirectHttpRequest,
+      callback: NativeDirectHttpCallback,
+    ): NativeDirectHttpCall = object : NativeDirectHttpCall {
+      override fun cancel() = Unit
+    }
+  }
+
+  private class ControllableDirectTransport : NativeDirectHttpExecutor {
+    private data class Pending(
+      val callback: NativeDirectHttpCallback,
+      val call: TestDirectHttpCall,
+    )
+
+    private val pending = ArrayDeque<Pending>()
+    val requests = CopyOnWriteArrayList<NativeDirectHttpRequest>()
+    val calls = CopyOnWriteArrayList<TestDirectHttpCall>()
+
+    override fun execute(
+      request: NativeDirectHttpRequest,
+      callback: NativeDirectHttpCallback,
+    ): NativeDirectHttpCall {
+      val call = TestDirectHttpCall()
+      synchronized(this) {
+        requests.add(request)
+        calls.add(call)
+        pending.add(Pending(callback, call))
+      }
+      return call
+    }
+
+    fun pendingCount(): Int = synchronized(this) { pending.size }
+
+    fun completeNext(result: NativeDirectHttpResult) {
+      val selected = synchronized(this) { pending.removeFirst() }
+      // Deliberately permit a completion after cancel to model a callback that
+      // already won the transport's terminal CAS before lifecycle detachment.
+      selected.callback.onComplete(result)
+    }
+
+    class TestDirectHttpCall : NativeDirectHttpCall {
+      val cancelled = AtomicBoolean(false)
+
+      override fun cancel() {
+        cancelled.set(true)
+      }
+    }
   }
 
   private class FakeCancellation(

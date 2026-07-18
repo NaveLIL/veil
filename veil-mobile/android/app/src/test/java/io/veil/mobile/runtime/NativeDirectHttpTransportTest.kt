@@ -203,10 +203,11 @@ class NativeDirectHttpTransportTest {
       callbackCount.incrementAndGet()
       callbackResult.set(result)
     }
+    val losingBody = "secret-response".toByteArray()
     val responseThread = thread(name = "direct-http-terminal-race") {
       responseReady.countDown()
       check(allowResponseCompletion.await(5, TimeUnit.SECONDS)) { "race barrier timed out" }
-      completion.complete(NativeDirectHttpResult.Success("secret-response".toByteArray()))
+      completion.complete(NativeDirectHttpResult.Success(losingBody))
     }
 
     assertTrue(responseReady.await(5, TimeUnit.SECONDS))
@@ -223,7 +224,19 @@ class NativeDirectHttpTransportTest {
     assertFalse(
       completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.INVALID_REQUEST)),
     )
+    assertTrue("losing response bytes must be wiped", losingBody.all { it == 0.toByte() })
     assertFalse(completion.toString().contains("secret-response"))
+  }
+
+  @Test
+  fun callbackFailureWipesTheTransferredSuccessBody() {
+    val body = "secret-response".toByteArray()
+    val completion = NativeDirectHttpCompletion {
+      throw IllegalStateException("detached callback")
+    }
+
+    assertTrue(completion.complete(NativeDirectHttpResult.Success(body)))
+    assertTrue("unclaimed response bytes must be wiped", body.all { it == 0.toByte() })
   }
 
   @Test

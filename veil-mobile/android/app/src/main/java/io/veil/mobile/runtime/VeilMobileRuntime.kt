@@ -5,6 +5,7 @@ import android.os.SystemClock
 import io.veil.mobile.crypto.NativeIdentityVault
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import java.io.File
+import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -30,6 +31,13 @@ internal enum class NativeConnectionState {
   DISCONNECTED,
   CONNECTING,
   CONNECTED,
+  ERROR,
+}
+
+internal enum class NativeDirectDirectoryState {
+  IDLE,
+  SYNCING,
+  SYNCHRONIZED,
   ERROR,
 }
 
@@ -75,7 +83,10 @@ internal data class NativeDirectConversationInstall(
   val peerUserId: String,
   val peerUsername: String,
   val needsPreKey: Boolean,
-)
+) {
+  override fun toString(): String =
+    "NativeDirectConversationInstall(metadata=[REDACTED], needsPreKey=$needsPreKey)"
+}
 
 /** One validated page result; pagination state itself remains owned by Rust. */
 internal data class NativeDirectDirectoryInstall(
@@ -107,6 +118,10 @@ internal data class VeilMobileRuntimeSnapshot(
   val sessionState: NativeSessionState,
   val connectionState: NativeConnectionState,
   val directoryReady: Boolean,
+  /** Native-only checkpoint state; deliberately omitted from the RN payload. */
+  val directDirectoryState: NativeDirectDirectoryState,
+  /** Published atomically only after the final authenticated directory page. */
+  val directConversations: List<NativeDirectConversationInstall>,
   val binding: PublicAuthenticatedBinding?,
   val pendingAccessPass: PendingNodeAccessPassView?,
 )
@@ -183,6 +198,7 @@ internal class VeilMobileRuntime internal constructor(
   private val passStore: NodeAccessPassStore,
   private val sessionFactory: NativeMobileSessionFactory,
   private val cancellationFactory: NativeConnectCancellationFactory,
+  private val directTransport: NativeDirectHttpExecutor,
   private val executor: ExecutorService,
   private val databasePathProvider: () -> String,
 ) {
@@ -191,18 +207,24 @@ internal class VeilMobileRuntime internal constructor(
     passStore = NodeAccessPassStore(clockMillis = { SystemClock.elapsedRealtime() }),
     sessionFactory = UniFfiMobileSessionFactory,
     cancellationFactory = UniFfiConnectCancellationFactory,
+    directTransport = NativeDirectHttpTransport(),
     executor = newRuntimeExecutor(),
     databasePathProvider = { resolveDatabasePath(context.applicationContext) },
   )
 
   private val listeners = CopyOnWriteArraySet<(VeilMobileRuntimeSnapshot) -> Unit>()
   private val stateLock = Any()
+  private val publicationLock = Any()
+  private var publicationInProgress = false
+  private var publicationPending = false
 
   private var session: NativeMobileSession? = null
   private var sessionState = NativeSessionState.LOCKED
   private var connectionState = NativeConnectionState.DISCONNECTED
   private var binding: PublicAuthenticatedBinding? = null
   private var directoryReady = false
+  private var directDirectoryState = NativeDirectDirectoryState.IDLE
+  private var directConversations: List<NativeDirectConversationInstall> = emptyList()
   // Process-scoped runtimes start without UI authority. Only an Activity
   // lifecycle transition may grant foreground access; this prevents a cold
   // headless process (for example future push handling) from opening the
@@ -210,6 +232,7 @@ internal class VeilMobileRuntime internal constructor(
   private var foreground = false
   private var lifecycleEpoch = 0L
   private var activeConnect: ActiveConnect? = null
+  private var activeDirectSync: ActiveDirectSync? = null
 
   private data class ActiveConnect(
     val session: NativeMobileSession,
@@ -217,9 +240,48 @@ internal class VeilMobileRuntime internal constructor(
     val epoch: Long,
   )
 
+  private data class ConnectStart(
+    val attempt: ActiveConnect,
+    val detachedDirectSync: DetachedDirectSync?,
+  )
+
   private data class BackgroundLockRequest(
     val epoch: Long,
+    val detachedDirectSync: DetachedDirectSync?,
   )
+
+  private class ActiveDirectSync(
+    val session: NativeMobileSession,
+    val epoch: Long,
+    val leaseToken: String,
+    val canonicalServerOrigin: String,
+    val userId: String,
+  ) {
+    val conversations = LinkedHashMap<String, NativeDirectConversationInstall>()
+    var pendingRequest: PendingDirectRequest? = null
+
+    override fun toString(): String =
+      "ActiveDirectSync(epoch=$epoch, canonicalServerOrigin=$canonicalServerOrigin, " +
+        "userId=$userId, leaseToken=[REDACTED], conversations=${conversations.size})"
+  }
+
+  private class PendingDirectRequest(
+    val requestToken: String,
+  ) {
+    var call: NativeDirectHttpCall? = null
+
+    override fun toString(): String =
+      "PendingDirectRequest(requestToken=[REDACTED], callAttached=${call != null})"
+  }
+
+  private data class DetachedDirectSync(
+    val session: NativeMobileSession,
+    val leaseToken: String,
+    val pendingCall: NativeDirectHttpCall?,
+  ) {
+    override fun toString(): String =
+      "DetachedDirectSync(leaseToken=[REDACTED], pendingCall=${pendingCall != null})"
+  }
 
   fun execute(operation: () -> Unit) {
     executor.execute(operation)
@@ -266,6 +328,8 @@ internal class VeilMobileRuntime internal constructor(
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
       directoryReady = false
+      directDirectoryState = NativeDirectDirectoryState.IDLE
+      directConversations = emptyList()
       lifecycleEpoch
     }
     publishSnapshot()
@@ -281,6 +345,8 @@ internal class VeilMobileRuntime internal constructor(
           connectionState = NativeConnectionState.DISCONNECTED
           binding = null
           directoryReady = false
+          directDirectoryState = NativeDirectDirectoryState.IDLE
+          directConversations = emptyList()
         }
       }
       publishSnapshot()
@@ -353,7 +419,7 @@ internal class VeilMobileRuntime internal constructor(
     origin: CanonicalServerOrigin,
     accessAttempt: NodeAccessPassAttempt?,
   ): PublicAuthenticatedBinding {
-    val attempt = synchronized(stateLock) {
+    val start = synchronized(stateLock) {
       if (!foreground) {
         throw VeilMobileRuntimeException("E_VEIL_LOCKED", "Return to Veil before connecting")
       }
@@ -370,13 +436,16 @@ internal class VeilMobileRuntime internal constructor(
         cancellation = cancellationFactory.create(),
         epoch = lifecycleEpoch,
       )
+      val detachedDirectSync = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
       activeConnect = pending
       connectionState = NativeConnectionState.CONNECTING
       binding = null
-      directoryReady = false
-      pending
+      ConnectStart(pending, detachedDirectSync)
     }
+    val attempt = start.attempt
     val active = attempt.session
+    start.detachedDirectSync.cancelHttpQuietly()
+    start.detachedDirectSync.cancelLeaseQuietly()
     publishSnapshot()
 
     try {
@@ -406,6 +475,7 @@ internal class VeilMobileRuntime internal constructor(
           attempt.cancellation,
         )
       }
+      requireAuthenticatedBinding(authenticated, origin)
 
       val accepted = synchronized(stateLock) {
         val current = foreground &&
@@ -423,27 +493,35 @@ internal class VeilMobileRuntime internal constructor(
         throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
       }
       if (accessAttempt != null) passStore.clearAfterSuccess(accessAttempt.flowId)
+      startDirectDirectorySync(active, attempt.epoch, authenticated)
       publishSnapshot()
       authenticated
     } catch (error: Throwable) {
+      val failedSync = synchronized(stateLock) {
+        val connecting = activeConnect === attempt
+        if (connecting) activeConnect = null
+        val authenticated = binding
+        val current = foreground &&
+          lifecycleEpoch == attempt.epoch &&
+          session === active &&
+          (connecting || authenticated != null)
+        if (
+          current
+        ) {
+          val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+          connectionState = NativeConnectionState.ERROR
+          binding = null
+          detached
+        } else {
+          null
+        }
+      }
+      failedSync.cancelHttpQuietly()
+      failedSync.cancelLeaseQuietly()
       try {
         active.disconnect()
       } catch (_: Throwable) {
         // Preserve the original, sanitized connection failure.
-      }
-      synchronized(stateLock) {
-        val current = activeConnect === attempt
-        if (current) activeConnect = null
-        if (
-          current &&
-          foreground &&
-          lifecycleEpoch == attempt.epoch &&
-          session === active
-        ) {
-          connectionState = NativeConnectionState.ERROR
-          binding = null
-          directoryReady = false
-        }
       }
       publishSnapshot()
       if (error is VeilMobileRuntimeException) throw error
@@ -458,9 +536,302 @@ internal class VeilMobileRuntime internal constructor(
     }
   }
 
+  private fun requireAuthenticatedBinding(
+    authenticated: PublicAuthenticatedBinding,
+    expectedOrigin: CanonicalServerOrigin,
+  ) {
+    val canonicalUserId = try {
+      UUID.fromString(authenticated.userId).toString()
+    } catch (_: IllegalArgumentException) {
+      null
+    }
+    if (
+      authenticated.canonicalServerOrigin != expectedOrigin.value ||
+      canonicalUserId != authenticated.userId
+    ) {
+      throw VeilMobileRuntimeException(
+        "E_VEIL_CONNECT",
+        "Unable to authenticate with the Veil Node",
+      )
+    }
+  }
+
+  private fun startDirectDirectorySync(
+    active: NativeMobileSession,
+    epoch: Long,
+    authenticated: PublicAuthenticatedBinding,
+  ) {
+    val lease = try {
+      active.beginDirectSync()
+    } catch (_: Throwable) {
+      throw VeilMobileRuntimeException("E_VEIL_SYNC", "Unable to verify the Direct directory")
+    }
+    if (
+      lease.canonicalServerOrigin != authenticated.canonicalServerOrigin ||
+      lease.userId != authenticated.userId
+    ) {
+      DetachedDirectSync(active, lease.leaseToken, null).cancelLeaseQuietly()
+      throw VeilMobileRuntimeException("E_VEIL_SYNC", "Unable to verify the Direct directory")
+    }
+
+    val sync = ActiveDirectSync(
+      session = active,
+      epoch = epoch,
+      leaseToken = lease.leaseToken,
+      canonicalServerOrigin = lease.canonicalServerOrigin,
+      userId = lease.userId,
+    )
+    val installed = synchronized(stateLock) {
+      if (
+        foreground &&
+        lifecycleEpoch == epoch &&
+        session === active &&
+        sessionState == NativeSessionState.OPEN &&
+        connectionState == NativeConnectionState.CONNECTED &&
+        binding == authenticated &&
+        activeDirectSync == null
+      ) {
+        activeDirectSync = sync
+        directDirectoryState = NativeDirectDirectoryState.SYNCING
+        directConversations = emptyList()
+        directoryReady = false
+        true
+      } else {
+        false
+      }
+    }
+    if (!installed) {
+      DetachedDirectSync(active, lease.leaseToken, null).cancelLeaseQuietly()
+      throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
+    }
+
+    try {
+      requestNextDirectDirectoryPage(sync)
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+      throw VeilMobileRuntimeException("E_VEIL_SYNC", "Unable to verify the Direct directory")
+    }
+  }
+
+  private fun requestNextDirectDirectoryPage(sync: ActiveDirectSync) {
+    val mayPrepare = synchronized(stateLock) {
+      isCurrentDirectSyncLocked(sync) && sync.pendingRequest == null
+    }
+    if (!mayPrepare) return
+
+    val prepared = sync.session.prepareDirectDirectoryRequest(sync.leaseToken)
+    val signature = sync.session.signRestRequest(
+      sync.canonicalServerOrigin,
+      HTTP_GET_METHOD,
+      prepared.requestTarget,
+      EMPTY_REQUEST_BODY,
+    )
+    check(signature.userId == sync.userId) { "native Direct signer returned a mismatched account" }
+
+    val pending = PendingDirectRequest(prepared.requestToken)
+    val registered = synchronized(stateLock) {
+      if (isCurrentDirectSyncLocked(sync) && sync.pendingRequest == null) {
+        sync.pendingRequest = pending
+        true
+      } else {
+        false
+      }
+    }
+    if (!registered) return
+
+    val call = try {
+      directTransport.execute(
+        NativeDirectHttpRequest(
+          canonicalServerOrigin = sync.canonicalServerOrigin,
+          requestTarget = prepared.requestTarget,
+          signature = signature,
+          responseLimitBytes = NativeDirectHttpLimits.DIRECTORY_BYTES,
+        ),
+      ) { result ->
+        enqueueDirectDirectoryResult(sync, pending, result)
+      }
+    } catch (error: Throwable) {
+      synchronized(stateLock) {
+        if (activeDirectSync === sync && sync.pendingRequest === pending) {
+          sync.pendingRequest = null
+        }
+      }
+      throw error
+    }
+
+    val retained = synchronized(stateLock) {
+      if (isCurrentDirectSyncLocked(sync) && sync.pendingRequest === pending) {
+        pending.call = call
+        true
+      } else {
+        false
+      }
+    }
+    if (!retained) call.cancelQuietly()
+  }
+
+  private fun enqueueDirectDirectoryResult(
+    sync: ActiveDirectSync,
+    pending: PendingDirectRequest,
+    result: NativeDirectHttpResult,
+  ) {
+    try {
+      executor.execute {
+        handleDirectDirectoryResult(sync, pending, result)
+      }
+    } catch (_: RuntimeException) {
+      result.wipeSensitiveBody()
+    }
+  }
+
+  private fun handleDirectDirectoryResult(
+    sync: ActiveDirectSync,
+    pending: PendingDirectRequest,
+    result: NativeDirectHttpResult,
+  ) {
+    try {
+      val current = synchronized(stateLock) {
+        isCurrentDirectSyncLocked(sync) && sync.pendingRequest === pending
+      }
+      if (!current) return
+      if (result !is NativeDirectHttpResult.Success) {
+        failDirectSync(sync)
+        return
+      }
+
+      val installed = sync.session.installDirectDirectoryPage(
+        sync.leaseToken,
+        pending.requestToken,
+        result.body,
+      )
+      var complete = false
+      val accepted = synchronized(stateLock) {
+        if (!isCurrentDirectSyncLocked(sync) || sync.pendingRequest !== pending) {
+          false
+        } else {
+          sync.pendingRequest = null
+          installed.conversations.forEach { conversation ->
+            check(sync.conversations.size < MAX_DIRECT_CONVERSATIONS) {
+              "native Direct directory exceeded the mobile publication bound"
+            }
+            check(sync.conversations.putIfAbsent(conversation.conversationId, conversation) == null) {
+              "native Direct directory returned a duplicate conversation"
+            }
+          }
+          if (installed.directoryComplete) {
+            directConversations = sync.conversations.values.toList()
+            directDirectoryState = NativeDirectDirectoryState.SYNCHRONIZED
+            // History is not yet synchronized. Never open the chat surface on
+            // a directory-only checkpoint, even when the directory is empty.
+            directoryReady = false
+            complete = true
+          }
+          true
+        }
+      }
+      if (!accepted) return
+      if (complete) {
+        publishSnapshot()
+      } else {
+        requestNextDirectDirectoryPage(sync)
+      }
+    } catch (_: Throwable) {
+      result.wipeSensitiveBody()
+      failDirectSync(sync)
+    } finally {
+      result.wipeSensitiveBody()
+    }
+  }
+
+  private fun failDirectSync(sync: ActiveDirectSync) {
+    val detached = synchronized(stateLock) {
+      if (activeDirectSync !== sync) return
+      val selected = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+      if (
+        foreground &&
+        lifecycleEpoch == sync.epoch &&
+        session === sync.session
+      ) {
+        connectionState = NativeConnectionState.ERROR
+        binding = null
+      }
+      selected
+    }
+    detached.cancelHttpQuietly()
+    detached.cancelLeaseQuietly()
+    try {
+      sync.session.disconnect()
+    } catch (_: Throwable) {
+      // The public state is already fail-closed; transport teardown is best effort.
+    }
+    publishSnapshot()
+  }
+
+  private fun isCurrentDirectSyncLocked(sync: ActiveDirectSync): Boolean {
+    val currentBinding = binding
+    return activeDirectSync === sync &&
+      foreground &&
+      lifecycleEpoch == sync.epoch &&
+      session === sync.session &&
+      sessionState == NativeSessionState.OPEN &&
+      connectionState == NativeConnectionState.CONNECTED &&
+      currentBinding != null &&
+      currentBinding.canonicalServerOrigin == sync.canonicalServerOrigin &&
+      currentBinding.userId == sync.userId
+  }
+
+  private fun detachDirectSyncLocked(
+    nextState: NativeDirectDirectoryState,
+  ): DetachedDirectSync? {
+    val selected = activeDirectSync
+    activeDirectSync = null
+    val pendingCall = selected?.pendingRequest?.call
+    selected?.pendingRequest = null
+    directDirectoryState = nextState
+    directConversations = emptyList()
+    directoryReady = false
+    return selected?.let { sync ->
+      DetachedDirectSync(sync.session, sync.leaseToken, pendingCall)
+    }
+  }
+
+  private fun DetachedDirectSync?.cancelHttpQuietly() {
+    val selected = this ?: return
+    try {
+      selected.pendingCall?.cancel()
+    } catch (_: Throwable) {
+      // Detaching remains terminal even if the HTTP call already completed.
+    }
+  }
+
+  private fun DetachedDirectSync?.cancelLeaseQuietly() {
+    val selected = this ?: return
+    try {
+      selected.session.cancelDirectSync(selected.leaseToken)
+    } catch (_: Throwable) {
+      // Native generation checks still reject stale request capabilities.
+    }
+  }
+
+  private fun NativeDirectHttpCall.cancelQuietly() {
+    try {
+      cancel()
+    } catch (_: Throwable) {
+      // The detached generation can no longer publish through the runtime.
+    }
+  }
+
   fun disconnect(): VeilMobileRuntimeSnapshot {
-    val target = synchronized(stateLock) { session to lifecycleEpoch }
+    val target = synchronized(stateLock) {
+      Triple(
+        session,
+        lifecycleEpoch,
+        detachDirectSyncLocked(NativeDirectDirectoryState.IDLE),
+      )
+    }
     val active = target.first
+    target.third.cancelHttpQuietly()
+    target.third.cancelLeaseQuietly()
     try {
       active?.disconnect()
     } catch (_: Throwable) {
@@ -482,14 +853,13 @@ internal class VeilMobileRuntime internal constructor(
       if (lifecycleEpoch == target.second && session === active) {
         connectionState = NativeConnectionState.DISCONNECTED
         binding = null
-        directoryReady = false
       }
     }
     return publishSnapshot()
   }
 
   fun lockSession(): VeilMobileRuntimeSnapshot {
-    val active = synchronized(stateLock) {
+    val target = synchronized(stateLock) {
       lifecycleEpoch += 1
       // Cancel while holding the same lock that owns activeConnect. The
       // connect finalizer cannot clear the attempt and close its UniFFI handle
@@ -500,11 +870,14 @@ internal class VeilMobileRuntime internal constructor(
       sessionState = NativeSessionState.CLOSING
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
-      directoryReady = false
-      session.also { session = null }
+      val detachedDirectSync = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
+      Pair(session.also { session = null }, detachedDirectSync)
     }
+    val active = target.first
+    target.second.cancelHttpQuietly()
     publishSnapshot()
     try {
+      target.second.cancelLeaseQuietly()
       active?.disconnect()
     } catch (_: Throwable) {
       // Lock remains fail-closed even if transport teardown reports an error.
@@ -536,9 +909,10 @@ internal class VeilMobileRuntime internal constructor(
       sessionState = NativeSessionState.CLOSING
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
-      directoryReady = false
-      BackgroundLockRequest(lifecycleEpoch)
+      val detachedDirectSync = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
+      BackgroundLockRequest(lifecycleEpoch, detachedDirectSync)
     }
+    request.detachedDirectSync.cancelHttpQuietly()
     passStore.close()
     publishSnapshot()
     execute {
@@ -547,6 +921,9 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   private fun finalizeBackgroundLock(request: BackgroundLockRequest) {
+    // A superseding lifecycle epoch may own final session teardown, but it
+    // cannot inherit this detached Direct capability. Revoke the lease first.
+    request.detachedDirectSync.cancelLeaseQuietly()
     val active = synchronized(stateLock) {
       if (lifecycleEpoch != request.epoch) return
       activeConnect = null
@@ -564,7 +941,6 @@ internal class VeilMobileRuntime internal constructor(
         sessionState = NativeSessionState.LOCKED
         connectionState = NativeConnectionState.DISCONNECTED
         binding = null
-        directoryReady = false
       }
     }
     publishSnapshot()
@@ -581,15 +957,48 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   private fun publishSnapshot(): VeilMobileRuntimeSnapshot {
-    val snapshot = snapshot()
-    listeners.forEach { listener ->
-      try {
-        listener(snapshot)
-      } catch (_: Throwable) {
-        // One detached React context must not break native state publication.
+    val ownsPublication = synchronized(publicationLock) {
+      publicationPending = true
+      if (publicationInProgress) {
+        false
+      } else {
+        publicationInProgress = true
+        true
       }
     }
-    return snapshot
+    if (!ownsPublication) return snapshot()
+
+    lateinit var lastPublished: VeilMobileRuntimeSnapshot
+    try {
+      while (true) {
+        synchronized(publicationLock) {
+          publicationPending = false
+        }
+        lastPublished = snapshot()
+        listeners.forEach { listener ->
+          try {
+            listener(lastPublished)
+          } catch (_: Throwable) {
+            // One detached React context must not break native state publication.
+          }
+        }
+        val complete = synchronized(publicationLock) {
+          if (publicationPending) {
+            false
+          } else {
+            publicationInProgress = false
+            true
+          }
+        }
+        if (complete) return lastPublished
+      }
+    } catch (error: Throwable) {
+      synchronized(publicationLock) {
+        publicationInProgress = false
+        publicationPending = false
+      }
+      throw error
+    }
   }
 
   private fun snapshotLocked(): VeilMobileRuntimeSnapshot {
@@ -603,6 +1012,8 @@ internal class VeilMobileRuntime internal constructor(
       sessionState = sessionState,
       connectionState = connectionState,
       directoryReady = directoryReady,
+      directDirectoryState = directDirectoryState,
+      directConversations = directConversations.toList(),
       binding = binding,
       pendingAccessPass = try {
         passStore.snapshot()
@@ -633,6 +1044,10 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   companion object {
+    private const val HTTP_GET_METHOD = "GET"
+    private const val MAX_DIRECT_CONVERSATIONS = 10_000
+    private val EMPTY_REQUEST_BODY = ByteArray(0)
+
     private fun newRuntimeExecutor(): ExecutorService =
       Executors.newSingleThreadExecutor { operation ->
         Thread(operation, "veil-mobile-runtime").apply { isDaemon = true }
