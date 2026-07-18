@@ -1,0 +1,306 @@
+package io.veil.mobile.runtime
+
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
+import okhttp3.Protocol
+import okhttp3.mockwebserver.MockResponse
+import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.SocketPolicy
+import okhttp3.tls.HandshakeCertificates
+import okhttp3.tls.HeldCertificate
+import kotlin.concurrent.thread
+import okio.Buffer
+import okio.ByteString.Companion.toByteString
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+
+class NativeDirectHttpTransportTest {
+  private lateinit var server: MockWebServer
+  private lateinit var transport: NativeDirectHttpTransport
+  private lateinit var serverOrigin: String
+
+  @Before
+  fun setUp() {
+    val heldCertificate = HeldCertificate.Builder()
+      .commonName("localhost")
+      .addSubjectAlternativeName("localhost")
+      .addSubjectAlternativeName("127.0.0.1")
+      .build()
+    val serverCertificates = HandshakeCertificates.Builder()
+      .heldCertificate(heldCertificate)
+      .build()
+    val clientCertificates = HandshakeCertificates.Builder()
+      .addTrustedCertificate(heldCertificate.certificate)
+      .build()
+
+    server = MockWebServer()
+    server.useHttps(serverCertificates.sslSocketFactory(), false)
+    server.protocols = listOf(Protocol.HTTP_1_1)
+    server.start()
+    serverOrigin = "https://${server.url("/").host}:${server.port}"
+    transport = NativeDirectHttpTransport(
+      clientCertificates.sslSocketFactory(),
+      clientCertificates.trustManager,
+    )
+  }
+
+  @After
+  fun tearDown() {
+    server.shutdown()
+  }
+
+  @Test
+  fun signedGetPreservesExactTargetHostHeadersAndEmptyBodyOnWire() {
+    val responseBody = """{"conversations":[]}""".toByteArray()
+    server.enqueue(MockResponse().setResponseCode(200).setBody(Buffer().write(responseBody)))
+    val target = "/v1/conversations?limit=100&cursor=z%2B1%2F2&order=first&order=second"
+
+    val result = executeAndAwait(signedRequest(target = target))
+
+    assertArrayEquals(responseBody, result.requireSuccessBody())
+    val recorded = server.takeRequest(5, TimeUnit.SECONDS)
+      ?: throw AssertionError("signed request did not reach MockWebServer")
+    assertEquals("GET", recorded.method)
+    assertEquals(target, recorded.path)
+    assertEquals(0L, recorded.bodySize)
+    assertEquals("${server.url("/").host}:${server.port}", recorded.getHeader("Host"))
+    assertEquals("application/json", recorded.getHeader("Accept"))
+    assertEquals(USER_ID, recorded.getHeader("X-Veil-User"))
+    assertEquals(TIMESTAMP_MS, recorded.getHeader("X-Veil-Timestamp"))
+    assertEquals(SIGNATURE_BASE64, recorded.getHeader("X-Veil-Signature"))
+    assertNull(recorded.getHeader("X-User-ID"))
+    assertNull(recorded.getHeader("Content-Type"))
+  }
+
+  @Test
+  fun preparedRequestUsesOnlyApprovedHeadersAndKeepsDefaultPortInHost() {
+    val localTransport = NativeDirectHttpTransport()
+    val target = "/v1/prekeys/0123456789abcdef?b=2&a=1"
+    val request = signedRequest(
+      origin = "https://example.test:443",
+      target = target,
+      responseLimit = NativeDirectHttpLimits.PREKEY_BYTES,
+    )
+
+    val prepared = localTransport.prepareRequest(request)
+
+    assertEquals("GET", prepared.method)
+    assertNull(prepared.body)
+    assertEquals(target, prepared.url.encodedPath + "?" + prepared.url.encodedQuery)
+    assertEquals("example.test:443", prepared.header("Host"))
+    assertEquals(
+      setOf("Accept", "Host", "X-Veil-Signature", "X-Veil-Timestamp", "X-Veil-User"),
+      prepared.headers.names(),
+    )
+  }
+
+  @Test
+  fun redirectIsReturnedAsGenericFailureAndNeverFollowed() {
+    server.enqueue(
+      MockResponse()
+        .setResponseCode(302)
+        .setHeader("Location", server.url("/must-not-be-followed")),
+    )
+
+    val result = executeAndAwait(signedRequest())
+
+    assertFailure(NativeDirectHttpFailure.UNEXPECTED_STATUS, result)
+    assertEquals(1, server.requestCount)
+  }
+
+  @Test
+  fun non200BodyNeverCrossesTheSanitizedFailureBoundary() {
+    val secretBody = "server-secret-diagnostic-body"
+    server.enqueue(MockResponse().setResponseCode(401).setBody(secretBody))
+
+    val result = executeAndAwait(signedRequest())
+
+    assertFailure(NativeDirectHttpFailure.UNEXPECTED_STATUS, result)
+    assertFalse(result.toString().contains(secretBody))
+  }
+
+  @Test
+  fun declaredOversizeIsRejectedBeforeBodyConsumption() {
+    val limit = 32L
+    server.enqueue(
+      MockResponse()
+        .setResponseCode(200)
+        .setBody("x")
+        .setHeader("Content-Length", limit + 1L),
+    )
+
+    val result = executeAndAwait(signedRequest(responseLimit = limit))
+
+    assertFailure(NativeDirectHttpFailure.RESPONSE_TOO_LARGE, result)
+  }
+
+  @Test
+  fun chunkedOversizeIsDetectedByReadingAtMostLimitPlusOne() {
+    val limit = 1_024L
+    val oversized = ByteArray((limit + 1L).toInt()) { 0x5a }
+    server.enqueue(
+      MockResponse()
+        .setResponseCode(200)
+        .setChunkedBody(Buffer().write(oversized), 127),
+    )
+
+    val result = executeAndAwait(signedRequest(responseLimit = limit))
+
+    assertFailure(NativeDirectHttpFailure.RESPONSE_TOO_LARGE, result)
+  }
+
+  @Test
+  fun cancellationCompletesOnceWithSanitizedFailureAndHandle() {
+    val target = "/v1/prekeys/peer-identity-key-must-not-leak"
+    val signature = SIGNATURE_BASE64
+    server.enqueue(
+      MockResponse()
+        .setSocketPolicy(SocketPolicy.NO_RESPONSE),
+    )
+    val callbackResult = AtomicReference<NativeDirectHttpResult?>()
+    val callbackCount = java.util.concurrent.atomic.AtomicInteger(0)
+    val completed = CountDownLatch(1)
+    val input = signedRequest(target = target)
+
+    val call = transport.execute(input) { result ->
+      callbackCount.incrementAndGet()
+      callbackResult.set(result)
+      completed.countDown()
+    }
+    assertTrue(input.toString().let { text ->
+      !text.contains(target) && !text.contains(signature) && !text.contains(serverOrigin)
+    })
+    server.takeRequest(5, TimeUnit.SECONDS)
+      ?: throw AssertionError("cancellable request did not reach MockWebServer")
+    call.cancel()
+
+    assertTrue("cancelled callback timed out", completed.await(5, TimeUnit.SECONDS))
+    assertFailure(
+      NativeDirectHttpFailure.CANCELLED,
+      callbackResult.get() ?: throw AssertionError("cancelled callback returned no result"),
+    )
+    assertEquals(1, callbackCount.get())
+    assertFalse(call.toString().contains(target))
+    assertFalse(call.toString().contains(signature))
+  }
+
+  @Test
+  fun cancellationAndSuccessRaceThroughOneTerminalCas() {
+    val callbackResult = AtomicReference<NativeDirectHttpResult?>()
+    val callbackCount = AtomicInteger(0)
+    val responseReady = CountDownLatch(1)
+    val allowResponseCompletion = CountDownLatch(1)
+    val completion = NativeDirectHttpCompletion { result ->
+      callbackCount.incrementAndGet()
+      callbackResult.set(result)
+    }
+    val responseThread = thread(name = "direct-http-terminal-race") {
+      responseReady.countDown()
+      check(allowResponseCompletion.await(5, TimeUnit.SECONDS)) { "race barrier timed out" }
+      completion.complete(NativeDirectHttpResult.Success("secret-response".toByteArray()))
+    }
+
+    assertTrue(responseReady.await(5, TimeUnit.SECONDS))
+    assertTrue(completion.cancel())
+    allowResponseCompletion.countDown()
+    responseThread.join(5_000)
+
+    assertFalse(responseThread.isAlive)
+    assertEquals(1, callbackCount.get())
+    assertFailure(
+      NativeDirectHttpFailure.CANCELLED,
+      callbackResult.get() ?: throw AssertionError("terminal race returned no result"),
+    )
+    assertFalse(
+      completion.complete(NativeDirectHttpResult.Failure(NativeDirectHttpFailure.INVALID_REQUEST)),
+    )
+    assertFalse(completion.toString().contains("secret-response"))
+  }
+
+  @Test
+  fun httpAndNonCanonicalBase64AreRejectedWithoutNetworkOrSensitiveDiagnostics() {
+    val unpaddedSignature = SIGNATURE_BASE64.removeSuffix("==")
+    val invalidHttp = signedRequest(origin = "http://127.0.0.1:80")
+    val invalidSignature = signedRequest().copy(
+      signature = NativeRestSignature(USER_ID, TIMESTAMP_MS, unpaddedSignature),
+    )
+
+    val httpResult = executeAndAwait(invalidHttp)
+    val signatureResult = executeAndAwait(invalidSignature)
+
+    assertFailure(NativeDirectHttpFailure.INVALID_REQUEST, httpResult)
+    assertFailure(NativeDirectHttpFailure.INVALID_REQUEST, signatureResult)
+    assertEquals(0, server.requestCount)
+    assertFalse(invalidSignature.toString().contains(unpaddedSignature))
+  }
+
+  @Test
+  fun testTlsOverrideGuardFailsClosedForReleaseBuilds() {
+    val error = assertThrows(IllegalStateException::class.java) {
+      requireNativeDirectHttpTestTlsAllowed(debugBuild = false)
+    }
+
+    assertEquals("Direct HTTP test TLS is unavailable in release builds", error.message)
+    requireNativeDirectHttpTestTlsAllowed(debugBuild = true)
+  }
+
+  private fun signedRequest(
+    origin: String = serverOrigin,
+    target: String = "/v1/conversations?limit=100",
+    responseLimit: Long = NativeDirectHttpLimits.DIRECTORY_BYTES,
+  ): NativeDirectHttpRequest = NativeDirectHttpRequest(
+    canonicalServerOrigin = origin,
+    requestTarget = target,
+    signature = NativeRestSignature(
+      userId = USER_ID,
+      timestampMs = TIMESTAMP_MS,
+      signatureBase64 = SIGNATURE_BASE64,
+    ),
+    responseLimitBytes = responseLimit,
+  )
+
+  private fun executeAndAwait(request: NativeDirectHttpRequest): NativeDirectHttpResult =
+    executeAndAwait(transport, request)
+
+  private fun executeAndAwait(
+    selectedTransport: NativeDirectHttpTransport,
+    request: NativeDirectHttpRequest,
+  ): NativeDirectHttpResult {
+    val result = AtomicReference<NativeDirectHttpResult?>()
+    val completed = CountDownLatch(1)
+    selectedTransport.execute(request) { outcome ->
+      result.set(outcome)
+      completed.countDown()
+    }
+    assertTrue("Direct HTTP callback timed out", completed.await(5, TimeUnit.SECONDS))
+    return result.get() ?: throw AssertionError("Direct HTTP callback returned no result")
+  }
+
+  private fun NativeDirectHttpResult.requireSuccessBody(): ByteArray =
+    (this as? NativeDirectHttpResult.Success)?.body
+      ?: throw AssertionError("expected Direct HTTP success, got $this")
+
+  private fun assertFailure(
+    expected: NativeDirectHttpFailure,
+    actual: NativeDirectHttpResult,
+  ) {
+    assertEquals(expected, (actual as? NativeDirectHttpResult.Failure)?.reason)
+  }
+
+  private companion object {
+    const val USER_ID = "550e8400-e29b-41d4-a716-446655440001"
+    const val TIMESTAMP_MS = "1712345678901"
+    val SIGNATURE_BASE64: String = ByteArray(64) { index -> (index + 1).toByte() }
+      .toByteString()
+      .base64()
+  }
+}
