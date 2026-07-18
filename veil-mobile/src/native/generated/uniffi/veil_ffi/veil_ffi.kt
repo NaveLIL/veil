@@ -30,6 +30,8 @@ import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
+import android.os.Build
+import androidx.annotation.RequiresApi
 import java.util.concurrent.atomic.AtomicBoolean
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
@@ -1454,7 +1456,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request() != 63870.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request() != 39529.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request() != 25222.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_next_direct_history_request() != 13299.toShort()) {
@@ -1469,7 +1471,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_live_events() != 1036.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request() != 25069.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request() != 2886.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilratchet_decrypt() != 38547.toShort()) {
@@ -1667,28 +1669,28 @@ private class UniffiJnaCleanable(
 // using Android or not.
 // There are further runtime checks to chose the correct implementation
 // of the cleaner.
+
+
 private fun UniffiCleaner.Companion.create(): UniffiCleaner =
-    try {
-        // For safety's sake: if the library hasn't been run in android_cleaner = true
-        // mode, but is being run on Android, then we still need to think about
-        // Android API versions.
-        // So we check if java.lang.ref.Cleaner is there, and use that…
-        java.lang.Class.forName("java.lang.ref.Cleaner")
-        JavaLangRefCleaner()
-    } catch (e: ClassNotFoundException) {
-        // … otherwise, fallback to the JNA cleaner.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        AndroidSystemCleaner()
+    } else {
         UniffiJnaCleaner()
     }
 
-private class JavaLangRefCleaner : UniffiCleaner {
-    val cleaner = java.lang.ref.Cleaner.create()
+// The SystemCleaner, available from API Level 33.
+// Some API Level 33 OSes do not support using it, so we require API Level 34.
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+private class AndroidSystemCleaner : UniffiCleaner {
+    val cleaner = android.system.SystemCleaner.cleaner()
 
     override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
-        JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
+        AndroidSystemCleanable(cleaner.register(value, cleanUpTask))
 }
 
-private class JavaLangRefCleanable(
-    val cleanable: java.lang.ref.Cleaner.Cleanable
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+private class AndroidSystemCleanable(
+    private val cleanable: java.lang.ref.Cleaner.Cleanable,
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
 }
@@ -2964,8 +2966,10 @@ public interface VeilMobileSessionInterface {
     fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest
 
     /**
-     * Install a peer bundle by the conversation route learned under this
-     * lease. Kotlin cannot substitute peer account keys.
+     * Prepare one peer-prekey fetch only while the exact live route still
+     * authoritatively needs a session. The advisory readiness result is never
+     * accepted as a capability: every guard is repeated here while retaining
+     * `direct_sync -> binding -> client`.
      */
     fun `prepareDirectPrekeyRequest`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectRestRequest
 
@@ -3010,7 +3014,9 @@ public interface VeilMobileSessionInterface {
     /**
      * Sign only the exact native-owned Direct request identified by the
      * current lease and request capability. The transport never supplies
-     * method, target, or body to the signing boundary.
+     * method, target, or body to the signing boundary. Peer-prekey GETs repeat
+     * the complete live route guard before and after signing and release at
+     * most one signature because each server fetch consumes an OPK.
      */
     fun `signDirectRestRequest`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String): RestSignatureData
 
@@ -3357,8 +3363,10 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
     /**
-     * Install a peer bundle by the conversation route learned under this
-     * lease. Kotlin cannot substitute peer account keys.
+     * Prepare one peer-prekey fetch only while the exact live route still
+     * authoritatively needs a session. The advisory readiness result is never
+     * accepted as a capability: every guard is repeated here while retaining
+     * `direct_sync -> binding -> client`.
      */
     @Throws(VeilException::class)override fun `prepareDirectPrekeyRequest`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectRestRequest {
             return FfiConverterTypeMobileDirectRestRequest.lift(
@@ -3458,7 +3466,9 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
     /**
      * Sign only the exact native-owned Direct request identified by the
      * current lease and request capability. The transport never supplies
-     * method, target, or body to the signing boundary.
+     * method, target, or body to the signing boundary. Peer-prekey GETs repeat
+     * the complete live route guard before and after signing and release at
+     * most one signature because each server fetch consumes an OPK.
      */
     @Throws(VeilException::class)override fun `signDirectRestRequest`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String): RestSignatureData {
             return FfiConverterTypeRestSignatureData.lift(

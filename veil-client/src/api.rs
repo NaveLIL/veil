@@ -3482,6 +3482,14 @@ impl VeilClient {
         outbound
     }
 
+    /// Test-only bridge for cross-crate native guard tests. Production
+    /// quarantine is still owned exclusively by authenticated live replay.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_quarantine_direct_conversation_v1(&mut self, conversation_id: &str) -> bool {
+        self.quarantine_known_direct_live_conversation_v1(conversation_id)
+    }
+
     // ─── E2E Encryption ──────────────────────────────────
 
     /// Exact owner-only count endpoint for the currently initialized account.

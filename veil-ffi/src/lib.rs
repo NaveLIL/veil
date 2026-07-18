@@ -134,6 +134,11 @@ struct MobileDirectOutstandingRequest {
     target: String,
     body: Zeroizing<Vec<u8>>,
     response_limit_bytes: u32,
+    /// A peer prekey GET is destructive at the server because it claims one
+    /// one-time prekey. Native code therefore releases at most one signature
+    /// for that exact request capability. Other request kinds leave this false
+    /// and retain their existing retry behavior.
+    peer_prekey_signature_released: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -549,6 +554,12 @@ fn mobile_direct_send_readiness_for_current_lease(
         MobileDirectSendReadiness::Ready
     } else {
         MobileDirectSendReadiness::NeedsPreKey
+    }
+}
+
+fn mobile_direct_prekey_unavailable_error() -> VeilError {
+    VeilError::Session {
+        msg: "mobile Direct prekey route is unavailable".to_string(),
     }
 }
 
@@ -1054,6 +1065,8 @@ pub struct VeilMobileSession {
     direct_sync: Mutex<Option<MobileDirectSyncState>>,
     next_binding_generation: AtomicU64,
     last_rest_timestamp_ms: AtomicI64,
+    #[cfg(test)]
+    direct_post_sign_pre_postflight_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[uniffi::export]
@@ -1106,6 +1119,8 @@ impl VeilMobileSession {
             direct_sync: Mutex::new(None),
             next_binding_generation: AtomicU64::new(0),
             last_rest_timestamp_ms: AtomicI64::new(0),
+            #[cfg(test)]
+            direct_post_sign_pre_postflight_hook: Mutex::new(None),
         }))
     }
 
@@ -1306,6 +1321,7 @@ impl VeilMobileSession {
                 target: "/v1/prekeys".to_string(),
                 body: Zeroizing::new(publication.request_body.clone()),
                 response_limit_bytes: MOBILE_OWN_PREKEY_UPLOAD_RESPONSE_LIMIT,
+                peer_prekey_signature_released: false,
             }
         } else {
             let target = client
@@ -1320,6 +1336,7 @@ impl VeilMobileSession {
                 target,
                 body: Zeroizing::new(Vec::new()),
                 response_limit_bytes: veil_client::prekeys::OWN_PREKEY_RESPONSE_LIMIT as u32,
+                peer_prekey_signature_released: false,
             }
         };
         let result = mobile_direct_rest_request_data(&request);
@@ -1490,6 +1507,7 @@ impl VeilMobileSession {
             target: mobile_direct_directory_target(state.next_cursor.as_deref())?,
             body: Zeroizing::new(Vec::new()),
             response_limit_bytes: veil_client::direct::DIRECT_DIRECTORY_RESPONSE_LIMIT as u32,
+            peer_prekey_signature_released: false,
         };
         let result = mobile_direct_rest_request_data(&request);
         state.outstanding_request = Some(request);
@@ -1713,6 +1731,7 @@ impl VeilMobileSession {
             target,
             body: Zeroizing::new(Vec::new()),
             response_limit_bytes: veil_client::direct_history::DIRECT_HISTORY_RESPONSE_LIMIT as u32,
+            peer_prekey_signature_released: false,
         };
         let result = mobile_direct_rest_request_data(&request);
         state.outstanding_request = Some(request);
@@ -2158,8 +2177,10 @@ impl VeilMobileSession {
         })
     }
 
-    /// Install a peer bundle by the conversation route learned under this
-    /// lease. Kotlin cannot substitute peer account keys.
+    /// Prepare one peer-prekey fetch only while the exact live route still
+    /// authoritatively needs a session. The advisory readiness result is never
+    /// accepted as a capability: every guard is repeated here while retaining
+    /// `direct_sync -> binding -> client`.
     pub fn prepare_direct_prekey_request(
         &self,
         lease_token: String,
@@ -2173,43 +2194,47 @@ impl VeilMobileSession {
             .map_err(|error| VeilError::Session {
                 msg: format!("lock mobile Direct sync: {error}"),
             })?;
-        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
-            msg: "mobile Direct sync is unavailable".to_string(),
-        })?;
+        let state = sync
+            .as_mut()
+            .ok_or_else(mobile_direct_prekey_unavailable_error)?;
+        // A caller from an older generation must never revoke a capability
+        // owned by the current lease, even when it guesses the public route.
         if state.token != lease_token || state.phase != MobileDirectSyncPhase::Ready {
-            return Err(VeilError::Session {
-                msg: "mobile Direct sync lease is stale or live replay is incomplete".to_string(),
-            });
-        }
-        let peer =
-            state
-                .peers
-                .get(&conversation_id)
-                .cloned()
-                .ok_or_else(|| VeilError::Session {
-                    msg: "Direct conversation is absent from the authenticated lease".to_string(),
-                })?;
-        if state.blocked_conversations.contains_key(&conversation_id) {
-            return Err(VeilError::Session {
-                msg: "Direct conversation is blocked by authenticated history".to_string(),
-            });
+            return Err(mobile_direct_prekey_unavailable_error());
         }
         let binding = self.binding.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile binding: {error}"),
         })?;
         if binding.as_ref() != Some(&state.epoch) {
-            return Err(VeilError::Session {
-                msg: "mobile Direct sync lease is stale".to_string(),
-            });
+            return Err(mobile_direct_prekey_unavailable_error());
         }
         let client = self.client.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile client: {error}"),
         })?;
-        if client.has_session(&peer.identity_key) {
-            return Err(VeilError::Session {
-                msg: "Direct session is already established".to_string(),
+        let readiness = mobile_direct_send_readiness_for_current_lease(
+            &client,
+            state,
+            binding.as_ref(),
+            &lease_token,
+            &conversation_id,
+        );
+        if readiness != MobileDirectSendReadiness::NeedsPreKey {
+            let revoke_exact = state.outstanding_request.as_ref().is_some_and(|request| {
+                request.kind
+                    == (MobileDirectOutstandingRequestKind::PeerPreKey {
+                        conversation_id: conversation_id.clone(),
+                    })
             });
+            if revoke_exact {
+                state.outstanding_request = None;
+            }
+            return Err(mobile_direct_prekey_unavailable_error());
         }
+        let peer = state
+            .peers
+            .get(&conversation_id)
+            .cloned()
+            .expect("prekey readiness preflighted the peer");
         if let Some(request) = state.outstanding_request.as_ref() {
             if request.kind
                 == (MobileDirectOutstandingRequestKind::PeerPreKey {
@@ -2231,6 +2256,7 @@ impl VeilMobileSession {
             target: format!("/v1/prekeys/{}", hex::encode(peer.identity_key)),
             body: Zeroizing::new(Vec::new()),
             response_limit_bytes: veil_client::direct::DIRECT_PREKEY_RESPONSE_LIMIT as u32,
+            peer_prekey_signature_released: false,
         };
         let result = mobile_direct_rest_request_data(&request);
         state.outstanding_request = Some(request);
@@ -2244,6 +2270,9 @@ impl VeilMobileSession {
         conversation_id: String,
         response: Vec<u8>,
     ) -> Result<MobileDirectPreKeyResult, VeilError> {
+        // The server controls these bytes. Guard them before every validation
+        // or late response path so rejected and revoked bodies are wiped too.
+        let response = Zeroizing::new(response);
         require_mobile_sync_token(&lease_token)?;
         require_mobile_sync_token(&request_token)?;
         require_canonical_user_id("Direct conversation ID", &conversation_id)?;
@@ -2253,26 +2282,19 @@ impl VeilMobileSession {
             .map_err(|error| VeilError::Session {
                 msg: format!("lock mobile Direct sync: {error}"),
             })?;
-        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
-            msg: "mobile Direct sync is unavailable".to_string(),
-        })?;
+        let state = sync
+            .as_mut()
+            .ok_or_else(mobile_direct_prekey_unavailable_error)?;
+        // Validate the lease owner before inspecting or consuming any current
+        // request capability. A delayed generation cannot cancel its successor.
         if state.token != lease_token || state.phase != MobileDirectSyncPhase::Ready {
-            return Err(VeilError::Session {
-                msg: "mobile Direct sync lease is stale or live replay is incomplete".to_string(),
-            });
+            return Err(mobile_direct_prekey_unavailable_error());
         }
-        let peer =
-            state
-                .peers
-                .get(&conversation_id)
-                .cloned()
-                .ok_or_else(|| VeilError::Session {
-                    msg: "Direct conversation is absent from the authenticated lease".to_string(),
-                })?;
-        if state.blocked_conversations.contains_key(&conversation_id) {
-            return Err(VeilError::Session {
-                msg: "Direct conversation is blocked by authenticated history".to_string(),
-            });
+        let mut binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(mobile_direct_prekey_unavailable_error());
         }
         let outstanding = state
             .outstanding_request
@@ -2286,23 +2308,62 @@ impl VeilMobileSession {
             })
             .ok_or_else(|| VeilError::Session {
                 msg: "mobile Direct prekey request is stale".to_string(),
-            })?;
-        let response = Zeroizing::new(response);
-        if let Err(error) = require_mobile_direct_response_limit(outstanding, response.as_slice()) {
+            })?
+            .clone();
+        // Preserve the existing bounded-response sticky abort even when a late
+        // response observes Ready or another revoked route state.
+        if let Err(error) = require_mobile_direct_response_limit(&outstanding, response.as_slice())
+        {
             fail_mobile_direct_sync_sticky(state);
             return Err(error);
-        }
-        let mut binding = self.binding.lock().map_err(|error| VeilError::Session {
-            msg: format!("lock mobile binding: {error}"),
-        })?;
-        if binding.as_ref() != Some(&state.epoch) {
-            return Err(VeilError::Session {
-                msg: "mobile Direct sync lease is stale".to_string(),
-            });
         }
         let mut client = self.client.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile client: {error}"),
         })?;
+
+        if !outstanding.peer_prekey_signature_released {
+            // A response without the one native-released signature cannot be
+            // tied to this destructive GET. Consume only its exact capability.
+            state.outstanding_request = None;
+            return Err(mobile_direct_prekey_unavailable_error());
+        }
+
+        let peer = match mobile_direct_send_readiness_for_current_lease(
+            &client,
+            state,
+            binding.as_ref(),
+            &lease_token,
+            &conversation_id,
+        ) {
+            MobileDirectSendReadiness::NeedsPreKey => {
+                let peer = state
+                    .peers
+                    .get(&conversation_id)
+                    .cloned()
+                    .expect("prekey readiness preflighted the peer");
+                // A signed destructive claim is one-shot even when its body is
+                // malformed or cryptographically rejected. Take it before any
+                // response parsing or ratchet mutation.
+                state.outstanding_request = None;
+                peer
+            }
+            MobileDirectSendReadiness::Ready => {
+                // An authenticated incoming message may establish the session
+                // while the destructive GET is in flight. Consume only the
+                // matching capability and never parse or reset that ratchet.
+                state.outstanding_request = None;
+                return Ok(MobileDirectPreKeyResult {
+                    status: "already_established".to_string(),
+                });
+            }
+            MobileDirectSendReadiness::Unavailable => {
+                // A denied route can never resume this server claim safely.
+                // Revoke its exact outstanding/signing capability, but leave
+                // ratchet and durable state untouched.
+                state.outstanding_request = None;
+                return Err(mobile_direct_prekey_unavailable_error());
+            }
+        };
         let result =
             match veil_client::direct::install_authenticated_direct_prekey_bundle_classified_v1(
                 &mut client,
@@ -2312,8 +2373,10 @@ impl VeilMobileSession {
                 response.as_slice(),
             ) {
                 Ok(result) => result,
-                Err(veil_client::direct::DirectPreKeyInstallErrorV1::Rejected(msg)) => {
-                    return Err(VeilError::Session { msg });
+                Err(veil_client::direct::DirectPreKeyInstallErrorV1::Rejected(_)) => {
+                    return Err(VeilError::Session {
+                        msg: "mobile Direct prekey bundle was rejected".to_string(),
+                    });
                 }
                 Err(veil_client::direct::DirectPreKeyInstallErrorV1::StorageUncertain(_)) => {
                     *binding = None;
@@ -2323,7 +2386,6 @@ impl VeilMobileSession {
                     });
                 }
             };
-        state.outstanding_request = None;
         let status = match result {
             veil_client::direct::DirectPreKeyInstallResult::Established => "established",
             veil_client::direct::DirectPreKeyInstallResult::AlreadyEstablished => {
@@ -2358,7 +2420,9 @@ impl VeilMobileSession {
 
     /// Sign only the exact native-owned Direct request identified by the
     /// current lease and request capability. The transport never supplies
-    /// method, target, or body to the signing boundary.
+    /// method, target, or body to the signing boundary. Peer-prekey GETs repeat
+    /// the complete live route guard before and after signing and release at
+    /// most one signature because each server fetch consumes an OPK.
     pub fn sign_direct_rest_request(
         &self,
         lease_token: String,
@@ -2367,13 +2431,13 @@ impl VeilMobileSession {
         require_mobile_sync_token(&lease_token)?;
         require_mobile_sync_token(&request_token)?;
         let (epoch, request) = {
-            let sync = self
+            let mut sync = self
                 .direct_sync
                 .lock()
                 .map_err(|error| VeilError::Session {
                     msg: format!("lock mobile Direct sync: {error}"),
                 })?;
-            let state = sync.as_ref().ok_or_else(|| VeilError::Session {
+            let state = sync.as_mut().ok_or_else(|| VeilError::Session {
                 msg: "mobile Direct sync is unavailable".to_string(),
             })?;
             if state.token != lease_token {
@@ -2381,33 +2445,104 @@ impl VeilMobileSession {
                     msg: "mobile Direct sync lease is stale".to_string(),
                 });
             }
-            (
-                state.epoch.clone(),
-                mobile_direct_outstanding_request(state, &request_token)?.clone(),
-            )
+            let request = mobile_direct_outstanding_request(state, &request_token)?.clone();
+            if let MobileDirectOutstandingRequestKind::PeerPreKey { conversation_id } =
+                &request.kind
+            {
+                let binding = self.binding.lock().map_err(|error| VeilError::Session {
+                    msg: format!("lock mobile binding: {error}"),
+                })?;
+                let client = self.client.lock().map_err(|error| VeilError::Session {
+                    msg: format!("lock mobile client: {error}"),
+                })?;
+                if mobile_direct_send_readiness_for_current_lease(
+                    &client,
+                    state,
+                    binding.as_ref(),
+                    &lease_token,
+                    conversation_id,
+                ) != MobileDirectSendReadiness::NeedsPreKey
+                {
+                    state.outstanding_request = None;
+                    return Err(mobile_direct_prekey_unavailable_error());
+                }
+                if request.peer_prekey_signature_released {
+                    // Retain the winner's outstanding response capability; it
+                    // is no longer signable, but install still needs it.
+                    return Err(mobile_direct_prekey_unavailable_error());
+                }
+            }
+            (state.epoch.clone(), request)
         };
 
         let signature = self.sign_mobile_direct_request(&epoch, &request)?;
 
+        #[cfg(test)]
+        self.run_direct_post_sign_pre_postflight_hook();
+
         // The request capability must still name the same immutable bytes
         // after signing. A concurrent cancel/reconnect consumes the signature
         // inside native code instead of releasing it to the transport.
-        let sync = self
+        let mut sync = self
             .direct_sync
             .lock()
             .map_err(|error| VeilError::Session {
                 msg: format!("lock mobile Direct sync: {error}"),
             })?;
-        let state = sync.as_ref().ok_or_else(|| VeilError::Session {
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
             msg: "mobile Direct sync changed while signing".to_string(),
         })?;
-        if state.token != lease_token
-            || state.epoch != epoch
-            || mobile_direct_outstanding_request(state, &request_token)? != &request
-        {
+        let lease_drifted = state.token != lease_token || state.epoch != epoch;
+        let current_request = state
+            .outstanding_request
+            .as_ref()
+            .filter(|current| current.token == request_token);
+        if lease_drifted || current_request != Some(&request) {
+            if matches!(
+                &request.kind,
+                MobileDirectOutstandingRequestKind::PeerPreKey { .. }
+            ) {
+                let same_peer_prekey_capability = current_request.is_some_and(|current| {
+                    current.kind == request.kind
+                        && current.method == request.method
+                        && current.target == request.target
+                        && current.body == request.body
+                        && current.response_limit_bytes == request.response_limit_bytes
+                });
+                if lease_drifted && same_peer_prekey_capability {
+                    state.outstanding_request = None;
+                }
+                // A concurrent winning signer differs only by its released bit;
+                // never clear the response capability it still owns.
+                return Err(mobile_direct_prekey_unavailable_error());
+            }
             return Err(VeilError::Session {
                 msg: "mobile Direct request changed while signing".to_string(),
             });
+        }
+        if let MobileDirectOutstandingRequestKind::PeerPreKey { conversation_id } = &request.kind {
+            let binding = self.binding.lock().map_err(|error| VeilError::Session {
+                msg: format!("lock mobile binding: {error}"),
+            })?;
+            let client = self.client.lock().map_err(|error| VeilError::Session {
+                msg: format!("lock mobile client: {error}"),
+            })?;
+            if mobile_direct_send_readiness_for_current_lease(
+                &client,
+                state,
+                binding.as_ref(),
+                &lease_token,
+                conversation_id,
+            ) != MobileDirectSendReadiness::NeedsPreKey
+            {
+                state.outstanding_request = None;
+                return Err(mobile_direct_prekey_unavailable_error());
+            }
+            state
+                .outstanding_request
+                .as_mut()
+                .expect("peer prekey request was postflighted")
+                .peer_prekey_signature_released = true;
         }
         Ok(signature)
     }
@@ -2420,6 +2555,18 @@ impl VeilMobileSession {
 }
 
 impl VeilMobileSession {
+    #[cfg(test)]
+    fn run_direct_post_sign_pre_postflight_hook(&self) {
+        let hook = self
+            .direct_post_sign_pre_postflight_hook
+            .lock()
+            .expect("lock mobile Direct post-sign test hook")
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
     fn sign_mobile_direct_request(
         &self,
         expected_epoch: &MobileAuthenticatedEpoch,
@@ -3357,6 +3504,7 @@ mod tests {
                 })),
                 next_binding_generation: AtomicU64::new(generation),
                 last_rest_timestamp_ms: AtomicI64::new(0),
+                direct_post_sign_pre_postflight_hook: Mutex::new(None),
             },
             path,
             token,
@@ -3440,6 +3588,164 @@ mod tests {
                 one_time_prekey_id: Some(one_time_prekey_id),
             },
         )
+    }
+
+    fn mobile_test_prekey_response(peer: IdentityKeyPair) -> ([u8; 32], Vec<u8>) {
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+
+        let identity_key = peer.x25519_public_bytes();
+        let signing_key = peer.ed25519_public_bytes();
+        let mut peer_client = veil_client::api::VeilClient::from_identity(peer);
+        let prekeys = peer_client.generate_prekeys().unwrap();
+        let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
+        let response = serde_json::to_vec(&serde_json::json!({
+            "identity_key": BASE64_STANDARD.encode(identity_key),
+            "signing_key": BASE64_STANDARD.encode(signing_key),
+            "signed_prekey": BASE64_STANDARD.encode(prekeys.spk_public),
+            "signed_prekey_signature": BASE64_STANDARD.encode(prekeys.spk_signature),
+            "signed_prekey_id": prekeys.spk_id,
+            "one_time_prekey": BASE64_STANDARD.encode(one_time_prekey),
+            "one_time_prekey_id": one_time_prekey_id,
+            "opk_low_warning": false,
+            "opk_remaining": 10,
+        }))
+        .unwrap();
+        (identity_key, response)
+    }
+
+    fn mobile_test_ready_prekey_fixture(
+        generation: u64,
+    ) -> (
+        VeilMobileSession,
+        std::path::PathBuf,
+        String,
+        String,
+        IdentityKeyPair,
+        tokio::sync::mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (session, path, token) = mobile_test_session_with_sync(generation);
+        let (conversation_id, peer) = mobile_test_install_ready_direct_with_peer(&session, &token);
+        let outbound = mobile_test_install_queued_connection(&session);
+        (session, path, token, conversation_id, peer, outbound)
+    }
+
+    fn mobile_test_assert_prekey_outstanding(
+        session: &VeilMobileSession,
+        request_token: &str,
+        conversation_id: &str,
+        signature_released: bool,
+    ) {
+        let sync = session.direct_sync.lock().unwrap();
+        let request = sync
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .as_ref()
+            .expect("peer prekey request must remain outstanding");
+        assert_eq!(request.token, request_token);
+        assert_eq!(
+            request.kind,
+            MobileDirectOutstandingRequestKind::PeerPreKey {
+                conversation_id: conversation_id.to_string(),
+            }
+        );
+        assert_eq!(
+            request.peer_prekey_signature_released, signature_released,
+            "peer prekey signature release state diverged"
+        );
+    }
+
+    fn mobile_test_assert_no_direct_session(
+        session: &VeilMobileSession,
+        peer_identity_key: &[u8; 32],
+    ) {
+        let client = session.client.lock().unwrap();
+        assert!(!client.has_session(peer_identity_key));
+        assert!(client
+            .db()
+            .unwrap()
+            .load_ratchet_session(peer_identity_key)
+            .unwrap()
+            .is_none());
+    }
+
+    fn mobile_test_pause_direct_post_sign(
+        session: &VeilMobileSession,
+    ) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let entered_hook = Arc::clone(&entered);
+        let release_hook = Arc::clone(&release);
+        *session.direct_post_sign_pre_postflight_hook.lock().unwrap() = Some(Arc::new(move || {
+            entered_hook.wait();
+            release_hook.wait();
+        }));
+        (entered, release)
+    }
+
+    fn mobile_test_clear_direct_post_sign_hook(session: &VeilMobileSession) {
+        *session.direct_post_sign_pre_postflight_hook.lock().unwrap() = None;
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum MobileTestPreKeyDenial {
+        RuntimeQuarantined,
+        OriginScopeDrift,
+        PeerSigningScopeDrift,
+        Disconnected,
+        HistoryBlocked,
+    }
+
+    fn mobile_test_apply_prekey_denial(
+        session: &VeilMobileSession,
+        conversation_id: &str,
+        denial: MobileTestPreKeyDenial,
+    ) {
+        match denial {
+            MobileTestPreKeyDenial::RuntimeQuarantined => assert!(session
+                .client
+                .lock()
+                .unwrap()
+                .test_only_quarantine_direct_conversation_v1(conversation_id)),
+            MobileTestPreKeyDenial::OriginScopeDrift => {
+                let drifted_epoch = {
+                    let mut sync = session.direct_sync.lock().unwrap();
+                    let state = sync.as_mut().unwrap();
+                    state.epoch.binding.canonical_server_origin =
+                        "https://drift.example.test:443".to_string();
+                    state.epoch.clone()
+                };
+                *session.binding.lock().unwrap() = Some(drifted_epoch);
+            }
+            MobileTestPreKeyDenial::PeerSigningScopeDrift => {
+                session
+                    .direct_sync
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .peers
+                    .get_mut(conversation_id)
+                    .unwrap()
+                    .signing_key = IdentityKeyPair::generate().ed25519_public_bytes();
+            }
+            MobileTestPreKeyDenial::Disconnected => {
+                session.client.lock().unwrap().disconnect();
+            }
+            MobileTestPreKeyDenial::HistoryBlocked => {
+                session
+                    .direct_sync
+                    .lock()
+                    .unwrap()
+                    .as_mut()
+                    .unwrap()
+                    .blocked_conversations
+                    .insert(
+                        conversation_id.to_string(),
+                        MobileDirectHistoryOutcome::ConversationRejected,
+                    );
+            }
+        }
     }
 
     fn mobile_test_install_queued_connection(
@@ -4191,7 +4497,7 @@ mod tests {
             .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
             .unwrap_err()
             .to_string()
-            .contains("live replay is incomplete"));
+            .contains("prekey route is unavailable"));
 
         let history = session
             .prepare_next_direct_history_request(token.clone())
@@ -4237,7 +4543,7 @@ mod tests {
             .prepare_direct_prekey_request(token.clone(), conversation_id)
             .unwrap_err()
             .to_string()
-            .contains("live replay is incomplete"));
+            .contains("prekey route is unavailable"));
         assert!(!session
             .client
             .lock()
@@ -4469,6 +4775,7 @@ mod tests {
             target: format!("/v1/messages/{conversation_id}?limit=25"),
             body: Zeroizing::new(Vec::new()),
             response_limit_bytes: veil_client::direct_history::DIRECT_HISTORY_RESPONSE_LIMIT as u32,
+            peer_prekey_signature_released: false,
         });
 
         fail_mobile_direct_sync_sticky(&mut state);
@@ -4489,6 +4796,7 @@ mod tests {
                 target: "/v1/prekeys/00/count".to_string(),
                 body: Zeroizing::new(Vec::new()),
                 response_limit_bytes: veil_client::prekeys::OWN_PREKEY_RESPONSE_LIMIT as u32,
+                peer_prekey_signature_released: false,
             });
         }
         let error = session
@@ -4503,31 +4811,30 @@ mod tests {
 
     #[test]
     fn mobile_direct_ready_phase_still_denies_history_blocked_conversation() {
-        let (session, path, token) = mobile_test_session_with_sync(15);
-        let conversation_id = "20000000-0000-4000-8000-000000000001".to_string();
-        {
-            let mut sync = session.direct_sync.lock().unwrap();
-            let state = sync.as_mut().unwrap();
-            state.phase = MobileDirectSyncPhase::Ready;
-            state.peers.insert(
-                conversation_id.clone(),
-                MobileDirectPeer {
-                    user_id: "10000000-0000-4000-8000-000000000002".to_string(),
-                    identity_key: [7; 32],
-                    signing_key: [8; 32],
-                },
-            );
-            state.blocked_conversations.insert(
-                conversation_id.clone(),
-                MobileDirectHistoryOutcome::ConversationRejected,
-            );
-        }
+        let (session, path, token, conversation_id, _, _outbound) =
+            mobile_test_ready_prekey_fixture(15);
+        mobile_test_apply_prekey_denial(
+            &session,
+            &conversation_id,
+            MobileTestPreKeyDenial::HistoryBlocked,
+        );
 
         let error = session
             .prepare_direct_prekey_request(token, conversation_id)
             .unwrap_err()
             .to_string();
-        assert!(error.contains("blocked by authenticated history"));
+        assert_eq!(
+            error,
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        assert!(session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .is_none());
 
         drop(session);
         let _ = std::fs::remove_file(path);
@@ -4535,43 +4842,16 @@ mod tests {
 
     #[test]
     fn mobile_direct_prekey_storage_uncertainty_revokes_binding_and_ready_lease() {
-        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
-
-        let (session, path, token) = mobile_test_session_with_sync(16);
-        let (directory_response, peer_identity) = mobile_test_directory_response(&session);
-        let directory_request = session
-            .prepare_direct_directory_request(token.clone())
-            .unwrap();
-        let page = session
-            .install_direct_directory_page(
-                token.clone(),
-                directory_request.request_token,
-                directory_response,
-            )
-            .unwrap();
-        let conversation_id = page.conversations[0].conversation_id.clone();
-        session.direct_sync.lock().unwrap().as_mut().unwrap().phase = MobileDirectSyncPhase::Ready;
+        let (session, path, token, conversation_id, peer_identity, _outbound) =
+            mobile_test_ready_prekey_fixture(16);
         let prekey_request = session
             .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
             .unwrap();
+        session
+            .sign_direct_rest_request(token.clone(), prekey_request.request_token.clone())
+            .unwrap();
 
-        let peer_identity_key = peer_identity.x25519_public_bytes();
-        let peer_signing_key = peer_identity.ed25519_public_bytes();
-        let mut peer = veil_client::api::VeilClient::from_identity(peer_identity);
-        let prekeys = peer.generate_prekeys().unwrap();
-        let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
-        let prekey_response = serde_json::to_vec(&serde_json::json!({
-            "identity_key": BASE64_STANDARD.encode(peer_identity_key),
-            "signing_key": BASE64_STANDARD.encode(peer_signing_key),
-            "signed_prekey": BASE64_STANDARD.encode(prekeys.spk_public),
-            "signed_prekey_signature": BASE64_STANDARD.encode(prekeys.spk_signature),
-            "signed_prekey_id": prekeys.spk_id,
-            "one_time_prekey": BASE64_STANDARD.encode(one_time_prekey),
-            "one_time_prekey_id": one_time_prekey_id,
-            "opk_low_warning": false,
-            "opk_remaining": 10,
-        }))
-        .unwrap();
+        let (peer_identity_key, prekey_response) = mobile_test_prekey_response(peer_identity);
         session
             .client
             .lock()
@@ -4618,7 +4898,749 @@ mod tests {
             .prepare_direct_prekey_request(token, conversation_id)
             .is_err());
 
-        drop(peer);
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_prepare_revalidates_every_live_route_guard() {
+        for (index, denial) in [
+            MobileTestPreKeyDenial::RuntimeQuarantined,
+            MobileTestPreKeyDenial::OriginScopeDrift,
+            MobileTestPreKeyDenial::PeerSigningScopeDrift,
+            MobileTestPreKeyDenial::Disconnected,
+            MobileTestPreKeyDenial::HistoryBlocked,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (session, path, token, conversation_id, peer, _outbound) =
+                mobile_test_ready_prekey_fixture(200 + index as u64);
+            let peer_identity_key = peer.x25519_public_bytes();
+            let request = session
+                .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+                .unwrap();
+            assert_eq!(
+                session
+                    .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+                    .unwrap()
+                    .request_token,
+                request.request_token,
+                "healthy prepare lost idempotence before {denial:?}"
+            );
+
+            mobile_test_apply_prekey_denial(&session, &conversation_id, denial);
+            assert_eq!(
+                session
+                    .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+                    .unwrap_err()
+                    .to_string(),
+                "Session error: mobile Direct prekey route is unavailable",
+                "prepare leaked denial detail for {denial:?}"
+            );
+            assert!(session
+                .direct_sync
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .outstanding_request
+                .is_none());
+            assert!(session
+                .sign_direct_rest_request(token, request.request_token)
+                .is_err());
+            mobile_test_assert_no_direct_session(&session, &peer_identity_key);
+
+            drop(session);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn mobile_direct_prekey_stale_lease_never_consumes_the_current_capability() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(210);
+        let request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        session
+            .sign_direct_rest_request(token.clone(), request.request_token.clone())
+            .unwrap();
+        let (peer_identity_key, response) = mobile_test_prekey_response(peer);
+        let stale_token = "cd".repeat(32);
+
+        assert_eq!(
+            session
+                .prepare_direct_prekey_request(stale_token.clone(), conversation_id.clone())
+                .unwrap_err()
+                .to_string(),
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        mobile_test_assert_prekey_outstanding(
+            &session,
+            &request.request_token,
+            &conversation_id,
+            true,
+        );
+        assert_eq!(
+            session
+                .install_direct_prekey_bundle(
+                    stale_token,
+                    request.request_token.clone(),
+                    conversation_id.clone(),
+                    response.clone(),
+                )
+                .unwrap_err()
+                .to_string(),
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        mobile_test_assert_prekey_outstanding(
+            &session,
+            &request.request_token,
+            &conversation_id,
+            true,
+        );
+        mobile_test_assert_no_direct_session(&session, &peer_identity_key);
+
+        let exact_epoch = session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .epoch
+            .clone();
+        let mut stale_binding = exact_epoch.clone();
+        stale_binding.generation += 1;
+        *session.binding.lock().unwrap() = Some(stale_binding);
+        assert!(session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .is_err());
+        assert!(session
+            .install_direct_prekey_bundle(
+                token.clone(),
+                request.request_token.clone(),
+                conversation_id.clone(),
+                response.clone(),
+            )
+            .is_err());
+        mobile_test_assert_prekey_outstanding(
+            &session,
+            &request.request_token,
+            &conversation_id,
+            true,
+        );
+        mobile_test_assert_no_direct_session(&session, &peer_identity_key);
+
+        *session.binding.lock().unwrap() = Some(exact_epoch);
+        let installed = session
+            .install_direct_prekey_bundle(token, request.request_token, conversation_id, response)
+            .unwrap();
+        assert_eq!(installed.status, "established");
+        assert!(session
+            .client
+            .lock()
+            .unwrap()
+            .has_session(&peer_identity_key));
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_late_denials_cannot_mutate_a_session() {
+        for (index, denial) in [
+            MobileTestPreKeyDenial::RuntimeQuarantined,
+            MobileTestPreKeyDenial::OriginScopeDrift,
+            MobileTestPreKeyDenial::PeerSigningScopeDrift,
+            MobileTestPreKeyDenial::Disconnected,
+            MobileTestPreKeyDenial::HistoryBlocked,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (session, path, token, conversation_id, peer, _outbound) =
+                mobile_test_ready_prekey_fixture(220 + index as u64);
+            let request = session
+                .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+                .unwrap();
+            session
+                .sign_direct_rest_request(token.clone(), request.request_token.clone())
+                .unwrap();
+            let (peer_identity_key, response) = mobile_test_prekey_response(peer);
+
+            mobile_test_apply_prekey_denial(&session, &conversation_id, denial);
+            assert_eq!(
+                session
+                    .install_direct_prekey_bundle(
+                        token.clone(),
+                        request.request_token.clone(),
+                        conversation_id.clone(),
+                        response,
+                    )
+                    .unwrap_err()
+                    .to_string(),
+                "Session error: mobile Direct prekey route is unavailable",
+                "late response leaked denial detail for {denial:?}"
+            );
+            assert!(session
+                .direct_sync
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .outstanding_request
+                .is_none());
+            assert!(session
+                .sign_direct_rest_request(token, request.request_token)
+                .is_err());
+            mobile_test_assert_no_direct_session(&session, &peer_identity_key);
+
+            drop(session);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn mobile_direct_prekey_quarantine_before_sign_revokes_the_fetch_capability() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(230);
+        let peer_identity_key = peer.x25519_public_bytes();
+        let request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        mobile_test_apply_prekey_denial(
+            &session,
+            &conversation_id,
+            MobileTestPreKeyDenial::RuntimeQuarantined,
+        );
+
+        assert_eq!(
+            session
+                .sign_direct_rest_request(token.clone(), request.request_token.clone())
+                .err()
+                .unwrap()
+                .to_string(),
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        assert!(session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .is_none());
+        assert!(session
+            .install_direct_prekey_bundle(
+                token,
+                request.request_token,
+                conversation_id,
+                b"must not parse".to_vec(),
+            )
+            .is_err());
+        mobile_test_assert_no_direct_session(&session, &peer_identity_key);
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_peer_prekey_signature_is_released_exactly_once() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(231);
+        let request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        let session = Arc::new(session);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut signers = Vec::new();
+        for _ in 0..2 {
+            let session = Arc::clone(&session);
+            let barrier = Arc::clone(&barrier);
+            let token = token.clone();
+            let request_token = request.request_token.clone();
+            signers.push(std::thread::spawn(move || {
+                barrier.wait();
+                session
+                    .sign_direct_rest_request(token, request_token)
+                    .is_ok()
+            }));
+        }
+        barrier.wait();
+        let released = signers
+            .into_iter()
+            .map(|signer| signer.join().unwrap() as usize)
+            .sum::<usize>();
+        assert_eq!(released, 1, "a destructive prekey GET was signed twice");
+        mobile_test_assert_prekey_outstanding(
+            &session,
+            &request.request_token,
+            &conversation_id,
+            true,
+        );
+        assert_eq!(
+            session
+                .sign_direct_rest_request(token.clone(), request.request_token.clone())
+                .err()
+                .unwrap()
+                .to_string(),
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        mobile_test_assert_prekey_outstanding(
+            &session,
+            &request.request_token,
+            &conversation_id,
+            true,
+        );
+
+        let (peer_identity_key, response) = mobile_test_prekey_response(peer);
+        let installed = session
+            .install_direct_prekey_bundle(token, request.request_token, conversation_id, response)
+            .unwrap();
+        assert_eq!(installed.status, "established");
+        assert!(session
+            .client
+            .lock()
+            .unwrap()
+            .has_session(&peer_identity_key));
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_ready_during_signing_revokes_without_releasing_signature() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(237);
+        let request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        let (post_sign_entered, release_post_sign) = mobile_test_pause_direct_post_sign(&session);
+        let session = Arc::new(session);
+        let signer_session = Arc::clone(&session);
+        let signer_token = token.clone();
+        let signer_request_token = request.request_token.clone();
+        let signer = std::thread::spawn(move || {
+            signer_session.sign_direct_rest_request(signer_token, signer_request_token)
+        });
+
+        post_sign_entered.wait();
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        release_post_sign.wait();
+
+        let error = match signer.join().unwrap() {
+            Ok(_) => panic!("Ready race released a peer-prekey signature"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        assert!(session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .is_none());
+        assert!(session
+            .sign_direct_rest_request(token, request.request_token)
+            .is_err());
+        assert!(session
+            .client
+            .lock()
+            .unwrap()
+            .has_session(&peer_identity_key));
+        mobile_test_clear_direct_post_sign_hook(&session);
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_old_signer_cannot_consume_replaced_lease_capability() {
+        let (session, path, token, conversation_id, _peer, _outbound) =
+            mobile_test_ready_prekey_fixture(238);
+        let old_request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        let successor_lease_token = new_mobile_sync_token();
+        let mut successor_request = session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .as_ref()
+            .unwrap()
+            .clone();
+        successor_request.token = new_mobile_sync_token();
+        successor_request.peer_prekey_signature_released = false;
+        assert_ne!(successor_lease_token, token);
+        assert_ne!(successor_request.token, old_request.request_token);
+
+        let (post_sign_entered, release_post_sign) = mobile_test_pause_direct_post_sign(&session);
+        let session = Arc::new(session);
+        let signer_session = Arc::clone(&session);
+        let signer_token = token;
+        let signer_request_token = old_request.request_token;
+        let signer = std::thread::spawn(move || {
+            signer_session.sign_direct_rest_request(signer_token, signer_request_token)
+        });
+
+        post_sign_entered.wait();
+        let successor_epoch = {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            let mut epoch = state.epoch.clone();
+            epoch.generation = epoch.generation.checked_add(1).unwrap();
+            state.token = successor_lease_token.clone();
+            state.epoch = epoch.clone();
+            state.outstanding_request = Some(successor_request.clone());
+            epoch
+        };
+        *session.binding.lock().unwrap() = Some(successor_epoch);
+        release_post_sign.wait();
+
+        let error = match signer.join().unwrap() {
+            Ok(_) => panic!("stale signer released a peer-prekey signature"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        {
+            let sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_ref().unwrap();
+            assert_eq!(state.token, successor_lease_token);
+            assert!(
+                state.outstanding_request.as_ref() == Some(&successor_request),
+                "old signer changed the successor request capability"
+            );
+        }
+
+        mobile_test_clear_direct_post_sign_hook(&session);
+        session
+            .sign_direct_rest_request(successor_lease_token, successor_request.token.clone())
+            .unwrap();
+        mobile_test_assert_prekey_outstanding(
+            &session,
+            &successor_request.token,
+            &conversation_id,
+            true,
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_unsigned_and_rejected_installs_are_one_shot() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(232);
+        let first = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        let (peer_identity_key, response) = mobile_test_prekey_response(peer);
+        assert_eq!(
+            session
+                .install_direct_prekey_bundle(
+                    token.clone(),
+                    first.request_token.clone(),
+                    conversation_id.clone(),
+                    response,
+                )
+                .unwrap_err()
+                .to_string(),
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        assert!(session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .is_none());
+        mobile_test_assert_no_direct_session(&session, &peer_identity_key);
+
+        let second = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        assert_ne!(second.request_token, first.request_token);
+        session
+            .sign_direct_rest_request(token.clone(), second.request_token.clone())
+            .unwrap();
+        assert_eq!(
+            session
+                .install_direct_prekey_bundle(
+                    token.clone(),
+                    second.request_token.clone(),
+                    conversation_id.clone(),
+                    b"{}".to_vec(),
+                )
+                .unwrap_err()
+                .to_string(),
+            "Session error: mobile Direct prekey bundle was rejected"
+        );
+        assert!(session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .is_none());
+        mobile_test_assert_no_direct_session(&session, &peer_identity_key);
+        let third = session
+            .prepare_direct_prekey_request(token, conversation_id)
+            .unwrap();
+        assert_ne!(third.request_token, second.request_token);
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_wrong_request_or_conversation_never_consumes_the_exact_one() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(233);
+        let request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        session
+            .sign_direct_rest_request(token.clone(), request.request_token.clone())
+            .unwrap();
+        let (peer_identity_key, response) = mobile_test_prekey_response(peer);
+
+        assert!(session
+            .install_direct_prekey_bundle(
+                token.clone(),
+                new_mobile_sync_token(),
+                conversation_id.clone(),
+                response.clone(),
+            )
+            .is_err());
+        mobile_test_assert_prekey_outstanding(
+            &session,
+            &request.request_token,
+            &conversation_id,
+            true,
+        );
+        assert!(session
+            .install_direct_prekey_bundle(
+                token.clone(),
+                request.request_token.clone(),
+                "20000000-0000-4000-8000-000000000099".to_string(),
+                response.clone(),
+            )
+            .is_err());
+        mobile_test_assert_prekey_outstanding(
+            &session,
+            &request.request_token,
+            &conversation_id,
+            true,
+        );
+        mobile_test_assert_no_direct_session(&session, &peer_identity_key);
+
+        assert_eq!(
+            session
+                .install_direct_prekey_bundle(
+                    token,
+                    request.request_token,
+                    conversation_id,
+                    response,
+                )
+                .unwrap()
+                .status,
+            "established"
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_late_ready_consumes_without_parsing_or_resetting_ratchet() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(234);
+        let request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        session
+            .sign_direct_rest_request(token.clone(), request.request_token.clone())
+            .unwrap();
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        let before = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .load_ratchet_session(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+
+        let result = session
+            .install_direct_prekey_bundle(
+                token.clone(),
+                request.request_token,
+                conversation_id.clone(),
+                vec![0xff, 0x00, 0xfe],
+            )
+            .unwrap();
+        assert_eq!(result.status, "already_established");
+        assert!(session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .is_none());
+        let after = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .load_ratchet_session(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(after, before, "late prekey response reset the live ratchet");
+        assert!(session
+            .prepare_direct_prekey_request(token, conversation_id)
+            .is_err());
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_prepare_consumes_cached_capability_after_session_becomes_ready() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(235);
+        let request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        let before = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .load_ratchet_session(&peer_identity_key)
+            .unwrap();
+
+        assert_eq!(
+            session
+                .prepare_direct_prekey_request(token.clone(), conversation_id)
+                .unwrap_err()
+                .to_string(),
+            "Session error: mobile Direct prekey route is unavailable"
+        );
+        assert!(session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .outstanding_request
+            .is_none());
+        assert!(session
+            .sign_direct_rest_request(token, request.request_token)
+            .is_err());
+        assert_eq!(
+            session
+                .client
+                .lock()
+                .unwrap()
+                .db()
+                .unwrap()
+                .load_ratchet_session(&peer_identity_key)
+                .unwrap(),
+            before
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_oversized_late_ready_response_keeps_sticky_abort_semantics() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(236);
+        let request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+        session
+            .sign_direct_rest_request(token.clone(), request.request_token.clone())
+            .unwrap();
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        let before = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .load_ratchet_session(&peer_identity_key)
+            .unwrap();
+
+        assert!(session
+            .install_direct_prekey_bundle(
+                token,
+                request.request_token,
+                conversation_id,
+                vec![0; veil_client::direct::DIRECT_PREKEY_RESPONSE_LIMIT + 1],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("response exceeds"));
+        let sync = session.direct_sync.lock().unwrap();
+        assert_eq!(sync.as_ref().unwrap().phase, MobileDirectSyncPhase::Failed);
+        assert!(sync.as_ref().unwrap().outstanding_request.is_none());
+        drop(sync);
+        assert_eq!(
+            session
+                .client
+                .lock()
+                .unwrap()
+                .db()
+                .unwrap()
+                .load_ratchet_session(&peer_identity_key)
+                .unwrap(),
+            before
+        );
+
         drop(session);
         let _ = std::fs::remove_file(path);
     }
