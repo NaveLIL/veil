@@ -92,4 +92,9 @@ message Error {
   uint32 code = 1;
   string message = 2;
   optional uint64 ref_seq = 3;  // Ссылка на seq запроса, вызвавшего ошибку
+  // Echoed only when a send supplied a valid canonical client_message_id.
+  optional string client_message_id = 4;
+  // Stable machine-readable send failure classification. Clients must not
+  // infer retry behavior from the numeric HTTP-equivalent code alone.
+  optional string reason = 5;
 }

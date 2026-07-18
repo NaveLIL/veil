@@ -728,10 +728,15 @@ func (*Envelope_SyncBatch) isEnvelope_Payload() {}
 func (*Envelope_Error) isEnvelope_Payload() {}
 
 type Error struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Code          uint32                 `protobuf:"varint,1,opt,name=code,proto3" json:"code,omitempty"`
-	Message       string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
-	RefSeq        *uint64                `protobuf:"varint,3,opt,name=ref_seq,json=refSeq,proto3,oneof" json:"ref_seq,omitempty"` // Ссылка на seq запроса, вызвавшего ошибку
+	state   protoimpl.MessageState `protogen:"open.v1"`
+	Code    uint32                 `protobuf:"varint,1,opt,name=code,proto3" json:"code,omitempty"`
+	Message string                 `protobuf:"bytes,2,opt,name=message,proto3" json:"message,omitempty"`
+	RefSeq  *uint64                `protobuf:"varint,3,opt,name=ref_seq,json=refSeq,proto3,oneof" json:"ref_seq,omitempty"` // Ссылка на seq запроса, вызвавшего ошибку
+	// Echoed only when a send supplied a valid canonical client_message_id.
+	ClientMessageId *string `protobuf:"bytes,4,opt,name=client_message_id,json=clientMessageId,proto3,oneof" json:"client_message_id,omitempty"`
+	// Stable machine-readable send failure classification. Clients must not
+	// infer retry behavior from the numeric HTTP-equivalent code alone.
+	Reason        *string `protobuf:"bytes,5,opt,name=reason,proto3,oneof" json:"reason,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -787,6 +792,20 @@ func (x *Error) GetRefSeq() uint64 {
 	return 0
 }
 
+func (x *Error) GetClientMessageId() string {
+	if x != nil && x.ClientMessageId != nil {
+		return *x.ClientMessageId
+	}
+	return ""
+}
+
+func (x *Error) GetReason() string {
+	if x != nil && x.Reason != nil {
+		return *x.Reason
+	}
+	return ""
+}
+
 var File_veil_v1_envelope_proto protoreflect.FileDescriptor
 
 const file_veil_v1_envelope_proto_rawDesc = "" +
@@ -839,13 +858,17 @@ const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\n" +
 	"sync_batch\x18[ \x01(\v2\x12.veil.v1.SyncBatchH\x00R\tsyncBatch\x12&\n" +
 	"\x05error\x18d \x01(\v2\x0e.veil.v1.ErrorH\x00R\x05errorB\t\n" +
-	"\apayload\"_\n" +
+	"\apayload\"\xce\x01\n" +
 	"\x05Error\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\rR\x04code\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\tR\amessage\x12\x1c\n" +
-	"\aref_seq\x18\x03 \x01(\x04H\x00R\x06refSeq\x88\x01\x01B\n" +
+	"\aref_seq\x18\x03 \x01(\x04H\x00R\x06refSeq\x88\x01\x01\x12/\n" +
+	"\x11client_message_id\x18\x04 \x01(\tH\x01R\x0fclientMessageId\x88\x01\x01\x12\x1b\n" +
+	"\x06reason\x18\x05 \x01(\tH\x02R\x06reason\x88\x01\x01B\n" +
 	"\n" +
-	"\b_ref_seqB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
+	"\b_ref_seqB\x14\n" +
+	"\x12_client_message_idB\t\n" +
+	"\a_reasonB2Z0github.com/NaveLIL/veil/veil-server/pkg/proto/v1b\x06proto3"
 
 var (
 	file_veil_v1_envelope_proto_rawDescOnce sync.Once

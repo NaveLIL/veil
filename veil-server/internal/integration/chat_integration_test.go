@@ -16,6 +16,7 @@ import (
 	"testing"
 
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
+	"github.com/google/uuid"
 )
 
 func TestChat_CreateDMHappyPath(t *testing.T) {
@@ -181,9 +182,10 @@ func TestChat_MessageHistoryCapsLegacyCandidateLimit(t *testing.T) {
 	wantIDs := make(map[string]struct{}, messageCount)
 	for index := 0; index < messageCount; index++ {
 		messageID, _, _, err := h.Chat.HandleSendMessage(t.Context(), alice.ID, &pb.SendMessage{
-			ConversationId: conversationID,
-			Ciphertext:     []byte(fmt.Sprintf("small-ciphertext-%02d", index)),
-			Header:         append([]byte{0x02}, make([]byte, 41)...),
+			ConversationId:  conversationID,
+			ClientMessageId: uuid.NewString(),
+			Ciphertext:      []byte(fmt.Sprintf("small-ciphertext-%02d", index)),
+			Header:          append([]byte{0x02}, make([]byte, 41)...),
 		})
 		if err != nil {
 			t.Fatalf("store small message %d: %v", index, err)
@@ -246,9 +248,10 @@ func TestChat_MessageHistoryPaginatesByExactWireBudget(t *testing.T) {
 	messageIDs := make([]string, 0, messageCount)
 	for index := 0; index < messageCount; index++ {
 		messageID, _, _, err := h.Chat.HandleSendMessage(t.Context(), alice.ID, &pb.SendMessage{
-			ConversationId: conversationID,
-			Ciphertext:     bytes.Repeat([]byte{byte(index + 1)}, 64*1024),
-			Header:         append([]byte{0x02}, make([]byte, 41)...),
+			ConversationId:  conversationID,
+			ClientMessageId: uuid.NewString(),
+			Ciphertext:      bytes.Repeat([]byte{byte(index + 1)}, 64*1024),
+			Header:          append([]byte{0x02}, make([]byte, 41)...),
 		})
 		if err != nil {
 			t.Fatalf("store max ciphertext message %d: %v", index, err)

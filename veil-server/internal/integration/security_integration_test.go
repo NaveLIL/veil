@@ -22,7 +22,9 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/NaveLIL/veil/veil-server/internal/servers"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
+	"github.com/google/uuid"
 	"golang.org/x/crypto/curve25519"
+	"google.golang.org/protobuf/proto"
 )
 
 func integrationPushInput(endpoint, label string) db.NewPushSubscription {
@@ -572,9 +574,10 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 
 		_, _, _, err := h.Chat.HandleSendMessage(context.Background(), bob.ID, &pb.SendMessage{
-			ConversationId: bobMalloryConversationID,
-			Ciphertext:     []byte("encrypted cross-conversation reply"),
-			ReplyToId:      &message.ID,
+			ConversationId:  bobMalloryConversationID,
+			ClientMessageId: uuid.NewString(),
+			Ciphertext:      []byte("encrypted cross-conversation reply"),
+			ReplyToId:       &message.ID,
 		})
 		if !errors.Is(err, chat.ErrMessageConversationMismatch) {
 			t.Fatalf("cross-conversation reply error = %v, want mismatch (gateway maps this to 400)", err)
@@ -825,7 +828,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 
 		_, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
 		})
 		if !errors.Is(err, db.ErrMessageSecurityContext) {
 			t.Fatalf("legacy channel send error=%v, want ErrMessageSecurityContext", err)
@@ -869,14 +873,25 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("authorized directory binding mismatch: %v", members)
 		}
 		security := secureMessageContextForDevice(t, h, conversationID, bob.ID, bobDevice)
-		_, _, recipients, err := h.Chat.HandleSecureSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
-		}, security)
+		secureMessage := &pb.SendMessage{
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("speaker ciphertext"), Header: []byte("speaker header"),
+		}
+		secureResult, err := h.Chat.HandleSecureSendMessageResult(ctx, bob.ID, secureMessage, security)
 		if err != nil {
 			t.Fatalf("VIEW+READ+SEND member could not send securely: %v", err)
 		}
-		if len(recipients) != 1 || recipients[0] != alice.ID {
-			t.Fatalf("unauthorized member entered secure message fanout: %v", recipients)
+		if len(secureResult.Recipients) != 1 || secureResult.Recipients[0] != alice.ID {
+			t.Fatalf("unauthorized member entered secure message fanout: %v", secureResult.Recipients)
+		}
+		if secureResult.AckRosterVersion == nil || *secureResult.AckRosterVersion != security.RosterVersion {
+			t.Fatalf("secure ACK roster=%v, want %d", secureResult.AckRosterVersion, security.RosterVersion)
+		}
+		secureReplay, err := h.Chat.HandleSecureSendMessageResult(ctx, bob.ID, proto.Clone(secureMessage).(*pb.SendMessage), security)
+		if err != nil || !secureReplay.Replayed || secureReplay.MessageID != secureResult.MessageID ||
+			secureReplay.AckRosterVersion == nil || *secureReplay.AckRosterVersion != security.RosterVersion ||
+			secureReplay.Recipients != nil {
+			t.Fatalf("secure replay=%#v err=%v, first=%#v", secureReplay, err, secureResult)
 		}
 
 		capture.reset()
@@ -982,7 +997,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("role-authorized message sync status=%d", status)
 		}
 		if _, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("blocked by role overwrite"),
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("blocked by role overwrite"),
 		}); !errors.Is(err, chat.ErrNotMember) {
 			t.Fatalf("role send deny error=%v, want ErrNotMember", err)
 		}
@@ -1001,7 +1017,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}
 		security := secureMessageContextForDevice(t, h, conversationID, bob.ID, bobDevice)
 		_, _, recipients, err := h.Chat.HandleSecureSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("allowed by member overwrite"),
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("allowed by member overwrite"),
 		}, security)
 		if err != nil || len(recipients) != 1 || recipients[0] != alice.ID {
 			t.Fatalf("member send allow err=%v recipients=%v", err, recipients)
@@ -1124,7 +1141,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("history-denied sender keys were not pruned=%v err=%v", pending, err)
 		}
 		if _, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: conversationID, Ciphertext: []byte("send without history"),
+			ConversationId: conversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("send without history"),
 		}); !errors.Is(err, db.ErrMessageSecurityContext) {
 			t.Fatalf("send-only legacy channel write error=%v, want fail-closed Sender-Key context rejection", err)
 		}
@@ -1304,14 +1322,16 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			Size: 10, ContentType: "application/octet-stream",
 		}
 		_, _, _, err := h.Chat.HandleSendMessage(ctx, bob.ID, &pb.SendMessage{
-			ConversationId: aliceBobConversationID, Ciphertext: []byte("foreign upload"),
+			ConversationId: aliceBobConversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext:  []byte("foreign upload"),
 			Attachments: []*pb.EncryptedAttachment{attachment},
 		})
 		if !errors.Is(err, chat.ErrAttachmentAccess) {
 			t.Fatalf("foreign upload attachment error=%v, want ErrAttachmentAccess", err)
 		}
 		messageID, _, _, err := h.Chat.HandleSendMessage(ctx, alice.ID, &pb.SendMessage{
-			ConversationId: aliceBobConversationID, Ciphertext: []byte("attachment message"), Header: []byte("header"),
+			ConversationId: aliceBobConversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("attachment message"), Header: []byte("header"),
 			Attachments: []*pb.EncryptedAttachment{attachment},
 		})
 		if err != nil {
@@ -1345,7 +1365,8 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("unsafe/incomplete attachment descriptor: %v", attachments)
 		}
 		if _, _, _, err := h.Chat.HandleSendMessage(ctx, alice.ID, &pb.SendMessage{
-			ConversationId: aliceBobConversationID, Ciphertext: []byte("bad size"),
+			ConversationId: aliceBobConversationID, ClientMessageId: uuid.NewString(),
+			Ciphertext: []byte("bad size"),
 			Attachments: []*pb.EncryptedAttachment{{
 				MediaId: fileID, EncryptedKey: []byte("key"), Nonce: []byte("nonce"), Size: 11,
 				ContentType: "application/octet-stream",

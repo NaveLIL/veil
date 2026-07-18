@@ -15,9 +15,10 @@ func TestHandleSendMessageRejectsSealedBeforeDatabaseAccess(t *testing.T) {
 
 	service := &Service{cfg: &config.Config{MaxMessageSize: 1024}}
 	message := &pb.SendMessage{
-		ConversationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-		Ciphertext:     []byte("ciphertext"),
-		Sealed:         true,
+		ConversationId:  "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		ClientMessageId: "11111111-1111-4111-8111-111111111111",
+		Ciphertext:      []byte("ciphertext"),
+		Sealed:          true,
 	}
 
 	for name, send := range map[string]func() error{

@@ -1197,18 +1197,118 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 028", func(t *testing.T) {
+	t.Run("029 adds durable account-scoped message send idempotency", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_029")
+		applyMigrationsBefore(t, pool, migrations, 29)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var senderID, otherSenderID string
+		for index, destination := range []*string{&senderID, &otherSenderID} {
+			if err := pool.QueryRow(ctx,
+				`INSERT INTO users(identity_key,signing_key,username)
+				 VALUES ($1,$2,$3) RETURNING id::text`,
+				bytes.Repeat([]byte{byte(0xc1 + index*2)}, 32),
+				bytes.Repeat([]byte{byte(0xc2 + index*2)}, 32),
+				fmt.Sprintf("send-ledger-%d", index),
+			).Scan(destination); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := execMigration(t, pool, migrations, 29); err != nil {
+			t.Fatalf("migration 029: %v", err)
+		}
+
+		var messageForeignKeys, senderForeignKeys int
+		if err := pool.QueryRow(ctx,
+			`SELECT
+			   count(*) FILTER (WHERE pg_get_constraintdef(oid) LIKE 'FOREIGN KEY (message_id)%'),
+			   count(*) FILTER (WHERE pg_get_constraintdef(oid) LIKE 'FOREIGN KEY (sender_id)%')
+			 FROM pg_constraint
+			 WHERE conrelid='message_send_idempotency'::regclass AND contype='f'`,
+		).Scan(&messageForeignKeys, &senderForeignKeys); err != nil {
+			t.Fatal(err)
+		}
+		if messageForeignKeys != 0 || senderForeignKeys != 1 {
+			t.Fatalf("ledger foreign keys message=%d sender=%d, want 0,1", messageForeignKeys, senderForeignKeys)
+		}
+
+		clientMessageID := "11111111-1111-4111-8111-111111111111"
+		messageID := "22222222-2222-4222-8222-222222222222"
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp)
+			 VALUES ($1::uuid,$2::uuid,$3,$4::uuid,now())`,
+			senderID, clientMessageID, bytes.Repeat([]byte{0xd1}, sha256.Size), messageID,
+		); err != nil {
+			t.Fatalf("insert tombstone-safe ledger row: %v", err)
+		}
+
+		_, err := pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp)
+			 VALUES ($1::uuid,gen_random_uuid(),$2,gen_random_uuid(),now())`,
+			senderID, bytes.Repeat([]byte{0xd2}, sha256.Size-1),
+		)
+		requireMigrationError(t, err, "23514", "message_send_idempotency_digest_length")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp,ack_roster_version)
+			 VALUES ($1::uuid,gen_random_uuid(),$2,gen_random_uuid(),now(),0)`,
+			senderID, bytes.Repeat([]byte{0xd3}, sha256.Size),
+		)
+		requireMigrationError(t, err, "23514", "message_send_idempotency_roster_version")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp)
+			 VALUES ($1::uuid,$2::uuid,$3,gen_random_uuid(),now())`,
+			senderID, clientMessageID, bytes.Repeat([]byte{0xd4}, sha256.Size),
+		)
+		requireMigrationError(t, err, "23505", "message_send_idempotency_pkey")
+
+		// The same client ID belongs to a different account scope, while a
+		// server message ID can never identify two send intents.
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp,ack_roster_version)
+			 VALUES ($1::uuid,$2::uuid,$3,gen_random_uuid(),now(),7)`,
+			otherSenderID, clientMessageID, bytes.Repeat([]byte{0xd5}, sha256.Size),
+		); err != nil {
+			t.Fatalf("account-scoped client ID insert: %v", err)
+		}
+		_, err = pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp)
+			 VALUES ($1::uuid,gen_random_uuid(),$2,$3::uuid,now())`,
+			otherSenderID, bytes.Repeat([]byte{0xd6}, sha256.Size), messageID,
+		)
+		requireMigrationError(t, err, "23505", "message_send_idempotency_message_id_unique")
+
+		if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id=$1::uuid`, senderID); err != nil {
+			t.Fatal(err)
+		}
+		var retained int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM message_send_idempotency WHERE sender_id=$1::uuid`, senderID,
+		).Scan(&retained); err != nil || retained != 0 {
+			t.Fatalf("sender cascade retained=%d err=%v, want 0", retained, err)
+		}
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 029", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 28; number++ {
+		for number := 1; number <= 29; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 29)
+		applyMigrationsBefore(t, pool, migrations, 30)
 	})
 }
 

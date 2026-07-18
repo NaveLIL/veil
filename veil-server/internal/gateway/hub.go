@@ -733,6 +733,7 @@ func envelopeKind(env *pb.Envelope) string {
 
 func (c *Client) handleEnvelope(env *pb.Envelope) {
 	ctx := context.Background()
+	clientMessageID, sendMessageReason := sendMessageEnvelopeContext(env)
 
 	switch payload := env.Payload.(type) {
 
@@ -743,7 +744,12 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 	// === All other messages require authentication ===
 	default:
 		if !c.authenticated {
-			c.sendError(env.Seq, 401, "not authenticated")
+			if clientMessageID != "" {
+				sendMessageReason = sendMessageReasonNotAuthenticated
+			}
+			c.sendErrorWithSendMessageContext(
+				env.Seq, 401, "not authenticated", clientMessageID, sendMessageReason,
+			)
 			return
 		}
 
@@ -752,7 +758,12 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 		// rejected-total metric so ops can see the offender.
 		kind := kindForUserBucket(envelopeKind(env))
 		if !allowEnvelope(c.userID, kind) {
-			c.sendError(env.Seq, 429, "ws rate limit exceeded for "+kind)
+			if clientMessageID != "" {
+				sendMessageReason = sendMessageReasonRateLimited
+			}
+			c.sendErrorWithSendMessageContext(
+				env.Seq, 429, "ws rate limit exceeded for "+kind, clientMessageID, sendMessageReason,
+			)
 			return
 		}
 
@@ -787,6 +798,24 @@ func (c *Client) handleEnvelope(env *pb.Envelope) {
 			c.sendError(env.Seq, 501, "unsupported message type")
 		}
 	}
+}
+
+// sendMessageEnvelopeContext extracts correlation only from send_message.
+// Invalid or absent IDs are never reflected back to the peer; the stable
+// reason lets clients distinguish this wire-contract failure from unrelated
+// authentication and rate-limit errors.
+func sendMessageEnvelopeContext(env *pb.Envelope) (string, string) {
+	if env == nil {
+		return "", ""
+	}
+	payload, ok := env.Payload.(*pb.Envelope_SendMessage)
+	if !ok {
+		return "", ""
+	}
+	if clientMessageID, valid := chat.CanonicalClientMessageID(payload.SendMessage); valid {
+		return clientMessageID, ""
+	}
+	return "", sendMessageReasonInvalidClientMessageID
 }
 
 // --- Auth ---
@@ -916,9 +945,22 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 // --- Chat ---
 
 func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.SendMessage) {
+	clientMessageID, validClientMessageID := chat.CanonicalClientMessageID(msg)
 	sender, authenticated := c.snapshotAuthenticatedSender()
 	if !authenticated {
-		c.sendError(seq, http.StatusUnauthorized, "authentication required")
+		reason := sendMessageReasonNotAuthenticated
+		if !validClientMessageID {
+			reason = sendMessageReasonInvalidClientMessageID
+		}
+		c.sendErrorWithSendMessageContext(
+			seq, http.StatusUnauthorized, "authentication required", clientMessageID, reason,
+		)
+		return
+	}
+	if !validClientMessageID {
+		c.sendErrorWithSendMessageContext(
+			seq, http.StatusBadRequest, "invalid client message id", "", sendMessageReasonInvalidClientMessageID,
+		)
 		return
 	}
 	// Sealed-message semantics are not persisted in REST history yet. Reject
@@ -926,8 +968,23 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 	// roster lookup so every authenticated caller gets the same safe outcome.
 	// The Service repeats the guard as defense in depth for non-WS callers.
 	if msg != nil && msg.Sealed {
-		status, message := classifySendMessageError(chat.ErrSealedMessageUnsupported)
-		c.sendError(seq, uint32(status), message)
+		status, message, reason := classifySendMessageError(chat.ErrSealedMessageUnsupported)
+		c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+		return
+	}
+
+	// An accepted request remains replayable even when mutable conversation or
+	// device state has changed since the original commit. The service compares
+	// the canonical request digest and returns the durable ACK tuple. Replays
+	// are ACKed here and deliberately never reach fan-out.
+	replay, err := c.hub.chatSvc.LookupSendMessageReplay(ctx, c.userID, msg)
+	if err != nil {
+		status, message, reason := classifySendMessageLookupError(err)
+		c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
+		return
+	}
+	if replay != nil {
+		c.sendMessageAck(seq, clientMessageID, replay)
 		return
 	}
 
@@ -938,21 +995,31 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 			ctx, msg.ConversationId, c.userID,
 			db.PermViewChannel|db.PermSendMessages,
 		)
-		if accessErr != nil || !canSend {
-			c.sendError(seq, 403, "not a conversation member")
+		if accessErr != nil {
+			c.sendErrorWithSendMessageContext(
+				seq, http.StatusInternalServerError, "internal error", clientMessageID, sendMessageReasonInternalError,
+			)
+			return
+		}
+		if !canSend {
+			c.sendErrorWithSendMessageContext(
+				seq, http.StatusForbidden, "not a conversation member", clientMessageID, sendMessageReasonNotMember,
+			)
 			return
 		}
 		conversationType, typeErr := c.hub.chatSvc.DB().GetConversationType(ctx, msg.ConversationId)
 		if typeErr != nil {
-			c.sendError(seq, 400, "conversation not found")
+			c.sendErrorWithSendMessageContext(
+				seq, http.StatusBadRequest, "conversation not found", clientMessageID, sendMessageReasonConversationNotFound,
+			)
 			return
 		}
 		if conversationType == 1 || conversationType == 2 {
 			if !c.perDeviceSecure || c.deviceBindingStatus != db.DeviceBindingActive ||
 				c.deviceBindingVersion == 0 || len(c.deviceKey) != 16 {
-				c.sendPublicError(seq, http.StatusConflict, publicerr.New(
+				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
 					http.StatusConflict, "device_not_eligible", "device is not eligible for secure channel traffic", errDeviceNotEligible,
-				))
+				), clientMessageID, sendMessageReasonDeviceNotEligible)
 				return
 			}
 			var rosterErr error
@@ -961,17 +1028,17 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 				msg.GetRosterVersion(), msg.GetRosterCommitment(),
 			)
 			if rosterErr != nil {
-				c.sendPublicError(seq, http.StatusConflict, publicerr.New(
+				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
 					http.StatusConflict, "secure_roster_changed", "secure device roster changed; rotate and redistribute", rosterErr,
-				))
+				), clientMessageID, sendMessageReasonSecureRosterChanged)
 				return
 			}
 			source, sourceErr := findRosterDeviceByDatabaseID(secureRoster, c.deviceID)
 			if sourceErr != nil || !bytes.Equal(source.device.DeviceKey, c.deviceKey) ||
 				source.device.Binding.Version != c.deviceBindingVersion {
-				c.sendPublicError(seq, http.StatusConflict, publicerr.New(
+				c.sendMessagePublicError(seq, http.StatusConflict, publicerr.New(
 					http.StatusConflict, "device_not_eligible", "device is not eligible for secure channel traffic", errDeviceNotEligible,
-				))
+				), clientMessageID, sendMessageReasonDeviceNotEligible)
 				return
 			}
 			messageSecurity = &db.MessageSecurityContext{
@@ -986,52 +1053,38 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 		}
 	}
 
-	var msgID string
-	var serverTime time.Time
-	var recipients []string
-	var err error
+	var result *chat.SendMessageResult
 	if messageSecurity != nil {
-		msgID, serverTime, recipients, err = c.hub.chatSvc.HandleSecureSendMessage(
+		result, err = c.hub.chatSvc.HandleSecureSendMessageResult(
 			ctx, c.userID, msg, messageSecurity,
 		)
 	} else {
-		msgID, serverTime, recipients, err = c.hub.chatSvc.HandleSendMessage(ctx, c.userID, msg)
+		result, err = c.hub.chatSvc.HandleSendMessageResult(ctx, c.userID, msg)
 	}
 	if err != nil {
-		status, message := classifySendMessageError(err)
-		c.sendError(seq, uint32(status), message)
+		status, message, reason := classifySendMessageError(err)
+		c.sendErrorWithSendMessageContext(seq, uint32(status), message, clientMessageID, reason)
 		return
 	}
 
-	// ACK to sender
-	ack := &pb.MessageAck{
-		MessageId:       msgID,
-		ServerTimestamp: uint64(serverTime.UnixNano()),
-		RefSeq:          seq,
+	if !c.sendMessageAck(seq, clientMessageID, result) {
+		return
 	}
-	if secureRoster != nil {
-		version := secureRoster.Version
-		ack.RosterVersion = &version
+	if result.Replayed {
+		return
 	}
-	c.sendEnvelope(&pb.Envelope{
-		Seq:       seq,
-		Timestamp: uint64(serverTime.UnixNano()),
-		Payload: &pb.Envelope_MessageAck{
-			MessageAck: ack,
-		},
-	})
 
 	// Fan-out MessageEvent to recipients
 	event := &pb.Envelope{
-		Timestamp: uint64(serverTime.UnixNano()),
+		Timestamp: uint64(result.ServerTimestamp.UnixNano()),
 		Payload: &pb.Envelope_MessageEvent{
 			MessageEvent: &pb.MessageEvent{
 				EventType:         pb.MessageEvent_NEW,
-				MessageId:         msgID,
+				MessageId:         result.MessageID,
 				ConversationId:    msg.ConversationId,
 				SenderIdentityKey: sender.identityKey,
 				SenderUsername:    sender.username,
-				ServerTimestamp:   uint64(serverTime.UnixNano()),
+				ServerTimestamp:   uint64(result.ServerTimestamp.UnixNano()),
 				Ciphertext:        msg.Ciphertext,
 				Header:            msg.Header,
 				MsgType:           &msg.MsgType,
@@ -1057,7 +1110,34 @@ func (c *Client) handleSendMessage(ctx context.Context, seq uint64, msg *pb.Send
 	}
 	eventData, _ := proto.Marshal(event)
 
-	c.hub.fanoutMessageEvent(ctx, recipients, eventData, event)
+	c.hub.fanoutMessageEvent(ctx, result.Recipients, eventData, event)
+}
+
+func (c *Client) sendMessageAck(seq uint64, clientMessageID string, result *chat.SendMessageResult) bool {
+	if result == nil {
+		c.sendErrorWithSendMessageContext(
+			seq, http.StatusInternalServerError, "internal error", clientMessageID, sendMessageReasonInternalError,
+		)
+		return false
+	}
+	ack := &pb.MessageAck{
+		MessageId:       result.MessageID,
+		ServerTimestamp: uint64(result.ServerTimestamp.UnixNano()),
+		RefSeq:          seq,
+		ClientMessageId: clientMessageID,
+	}
+	if result.AckRosterVersion != nil {
+		version := *result.AckRosterVersion
+		ack.RosterVersion = &version
+	}
+	c.sendEnvelope(&pb.Envelope{
+		Seq:       seq,
+		Timestamp: uint64(result.ServerTimestamp.UnixNano()),
+		Payload: &pb.Envelope_MessageAck{
+			MessageAck: ack,
+		},
+	})
+	return true
 }
 
 // --- Edit Message ---
@@ -1745,23 +1825,49 @@ func (c *Client) enqueueEnvelope(env *pb.Envelope) error {
 }
 
 func (c *Client) sendError(refSeq uint64, code uint32, message string) {
+	c.sendErrorWithSendMessageContext(refSeq, code, message, "", "")
+}
+
+func (c *Client) sendErrorWithSendMessageContext(refSeq uint64, code uint32, message, clientMessageID, reason string) {
 	var refSeqPtr *uint64
 	if refSeq > 0 {
 		refSeqPtr = &refSeq
 	}
+	errorPayload := &pb.Error{
+		Code:    code,
+		Message: message,
+		RefSeq:  refSeqPtr,
+	}
+	if clientMessageID != "" {
+		canonical, valid := chat.CanonicalClientMessageID(&pb.SendMessage{ClientMessageId: clientMessageID})
+		if valid {
+			if reason == "" {
+				reason = sendMessageReasonInternalError
+			}
+			errorPayload.ClientMessageId = &canonical
+		} else {
+			reason = sendMessageReasonInvalidClientMessageID
+		}
+	}
+	if reason != "" {
+		value := reason
+		errorPayload.Reason = &value
+	}
 	c.sendEnvelope(&pb.Envelope{
 		Payload: &pb.Envelope_Error{
-			Error: &pb.Error{
-				Code:    code,
-				Message: message,
-				RefSeq:  refSeqPtr,
-			},
+			Error: errorPayload,
 		},
 	})
 }
 
 func (c *Client) sendPublicError(refSeq uint64, status int, err error) {
 	c.sendError(refSeq, uint32(status), publicerr.Message(status, err))
+}
+
+func (c *Client) sendMessagePublicError(refSeq uint64, status int, err error, clientMessageID, reason string) {
+	c.sendErrorWithSendMessageContext(
+		refSeq, uint32(status), publicerr.Message(status, err), clientMessageID, reason,
+	)
 }
 
 func (c *Client) sendPublicAuthFailure(seq uint64, err error) error {

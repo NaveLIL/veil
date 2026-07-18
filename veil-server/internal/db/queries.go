@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -33,6 +35,7 @@ var (
 	ErrAttachmentScope                  = errors.New("attachment is unavailable or not owned by sender")
 	ErrMessageSecurityContext           = errors.New("message security context does not match the conversation")
 	ErrMessageRosterChanged             = errors.New("message roster changed before durable admission")
+	ErrMessageSendIDConflict            = errors.New("client message id already has different send bytes")
 	ErrConversationAccessDenied         = errors.New("conversation access denied")
 	ErrReactionLimitReached             = errors.New("message reaction limit reached")
 	ErrPreKeyMaterialConflict           = errors.New("prekey protocol id already has different key material")
@@ -887,6 +890,289 @@ type MessageAttachment struct {
 	Nonce        []byte
 	SizeBytes    int64
 	ContentType  string
+}
+
+// MessageSendOutcome is the immutable server identity assigned to one
+// account-scoped client send intent. The ledger deliberately outlives the
+// message row so an exact retry can still be acknowledged after TTL cleanup.
+type MessageSendOutcome struct {
+	MessageID        string
+	ServerTimestamp  time.Time
+	AckRosterVersion *uint64
+	Replayed         bool
+}
+
+func isCanonicalNonNilUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil && parsed.String() == value
+}
+
+// LookupMessageSendOutcome returns the durable result for an exact request
+// digest. A reused client ID with different bytes fails closed.
+func (db *DB) LookupMessageSendOutcome(
+	ctx context.Context,
+	senderID string,
+	clientMessageID string,
+	requestDigest []byte,
+) (*MessageSendOutcome, error) {
+	if !isCanonicalNonNilUUID(senderID) || !isCanonicalNonNilUUID(clientMessageID) ||
+		len(requestDigest) != sha256.Size {
+		return nil, errors.New("invalid message send lookup")
+	}
+	var (
+		storedDigest    []byte
+		messageID       string
+		serverTimestamp time.Time
+		rosterVersion   *int64
+	)
+	err := db.Pool.QueryRow(ctx,
+		`SELECT request_digest, message_id::text, server_timestamp, ack_roster_version
+		 FROM message_send_idempotency
+		 WHERE sender_id = $1::uuid AND client_message_id = $2::uuid`,
+		senderID, clientMessageID,
+	).Scan(&storedDigest, &messageID, &serverTimestamp, &rosterVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !isCanonicalNonNilUUID(messageID) {
+		return nil, errors.New("invalid stored message send outcome")
+	}
+	if len(storedDigest) != sha256.Size ||
+		subtle.ConstantTimeCompare(storedDigest, requestDigest) != 1 {
+		return nil, ErrMessageSendIDConflict
+	}
+	outcome := &MessageSendOutcome{
+		MessageID:       messageID,
+		ServerTimestamp: serverTimestamp,
+		Replayed:        true,
+	}
+	if rosterVersion != nil {
+		version := uint64(*rosterVersion)
+		outcome.AckRosterVersion = &version
+	}
+	return outcome, nil
+}
+
+// StoreMessageIdempotent atomically claims an account-scoped client send ID,
+// validates the current conversation/security snapshot, and inserts the
+// message and attachments. Exact concurrent retries return the first durable
+// result without inserting or fan-out eligibility.
+func (db *DB) StoreMessageIdempotent(
+	ctx context.Context,
+	m *Message,
+	clientMessageID string,
+	requestDigest []byte,
+) (*MessageSendOutcome, error) {
+	if m == nil || m.ConversationID == "" || !isCanonicalNonNilUUID(m.SenderID) ||
+		len(m.Ciphertext) == 0 || !isCanonicalNonNilUUID(clientMessageID) ||
+		len(requestDigest) != sha256.Size {
+		return nil, errors.New("invalid idempotent message")
+	}
+	if m.SecurityContext != nil {
+		if err := validateMessageSecurityContext(m.SecurityContext); err != nil {
+			return nil, err
+		}
+	}
+	attempts := 1
+	if m.SecurityContext != nil {
+		attempts = 3
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
+		outcome, err := db.storeMessageIdempotentOnce(ctx, m, clientMessageID, requestDigest)
+		if !isSenderKeySerializationFailure(err) {
+			return outcome, err
+		}
+	}
+	return nil, ErrMessageRosterChanged
+}
+
+func (db *DB) storeMessageIdempotentOnce(
+	ctx context.Context,
+	m *Message,
+	clientMessageID string,
+	requestDigest []byte,
+) (*MessageSendOutcome, error) {
+	txOptions := pgx.TxOptions{}
+	if m.SecurityContext != nil {
+		txOptions.IsoLevel = pgx.Serializable
+	}
+	tx, err := db.Pool.BeginTx(ctx, txOptions)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	messageID := uuid.NewString()
+	var ackRosterVersion any
+	if m.SecurityContext != nil {
+		ackRosterVersion = int64(m.SecurityContext.RosterVersion)
+	}
+	var (
+		serverTimestamp     time.Time
+		storedRosterVersion *int64
+	)
+	err = tx.QueryRow(ctx,
+		`INSERT INTO message_send_idempotency (
+		   sender_id, client_message_id, request_digest, message_id,
+		   server_timestamp, ack_roster_version
+		 ) VALUES ($1::uuid, $2::uuid, $3, $4::uuid, now(), $5)
+		 ON CONFLICT (sender_id, client_message_id) DO NOTHING
+		 RETURNING message_id::text, server_timestamp, ack_roster_version`,
+		m.SenderID, clientMessageID, requestDigest, messageID, ackRosterVersion,
+	).Scan(&messageID, &serverTimestamp, &storedRosterVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		var storedDigest []byte
+		err = tx.QueryRow(ctx,
+			`SELECT request_digest, message_id::text, server_timestamp, ack_roster_version
+			 FROM message_send_idempotency
+			 WHERE sender_id = $1::uuid AND client_message_id = $2::uuid`,
+			m.SenderID, clientMessageID,
+		).Scan(&storedDigest, &messageID, &serverTimestamp, &storedRosterVersion)
+		if err != nil {
+			return nil, err
+		}
+		if !isCanonicalNonNilUUID(messageID) {
+			return nil, errors.New("invalid stored message send outcome")
+		}
+		if len(storedDigest) != sha256.Size ||
+			subtle.ConstantTimeCompare(storedDigest, requestDigest) != 1 {
+			return nil, ErrMessageSendIDConflict
+		}
+		m.ID = messageID
+		m.CreatedAt = serverTimestamp
+		outcome := &MessageSendOutcome{
+			MessageID:       messageID,
+			ServerTimestamp: serverTimestamp,
+			Replayed:        true,
+		}
+		if storedRosterVersion != nil {
+			version := uint64(*storedRosterVersion)
+			outcome.AckRosterVersion = &version
+		}
+		return outcome, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !isCanonicalNonNilUUID(messageID) {
+		return nil, errors.New("invalid stored message send outcome")
+	}
+
+	var conversationType int16
+	if err := tx.QueryRow(ctx,
+		`SELECT conv_type FROM conversations WHERE id = $1::uuid FOR UPDATE`,
+		m.ConversationID,
+	).Scan(&conversationType); err != nil {
+		return nil, err
+	}
+	if conversationType == 1 || conversationType == 2 {
+		if err := validateMessageSecurityContext(m.SecurityContext); err != nil {
+			return nil, err
+		}
+		var lockedDeviceID string
+		if err := tx.QueryRow(ctx,
+			`SELECT id::text FROM devices
+			 WHERE id = $1::uuid AND user_id = $2::uuid FOR UPDATE`,
+			m.SecurityContext.SenderDeviceDatabaseID, m.SenderID,
+		).Scan(&lockedDeviceID); err != nil {
+			return nil, ErrMessageSecurityContext
+		}
+		roster, err := resolveConversationDeviceRosterSnapshot(
+			ctx, tx, m.ConversationID, RequiredChannelCapabilities,
+		)
+		if err != nil {
+			if errors.Is(err, ErrSenderKeyRosterChanged) {
+				return nil, ErrMessageRosterChanged
+			}
+			return nil, err
+		}
+		if err := validateMessageRosterSnapshot(
+			ctx, tx, roster, m.ConversationID, m.SenderID, m.SecurityContext,
+		); err != nil {
+			return nil, err
+		}
+	} else if m.SecurityContext != nil {
+		return nil, ErrMessageSecurityContext
+	}
+
+	var securityProfile, rosterCommitment, senderDeviceID any
+	var securityEra, rosterVersion, senderBindingVersion any
+	if m.SecurityContext != nil {
+		securityProfile = m.SecurityContext.CryptoProfile
+		securityEra = int64(m.SecurityContext.CryptoEra)
+		rosterVersion = int64(m.SecurityContext.RosterVersion)
+		rosterCommitment = m.SecurityContext.RosterCommitment
+		senderDeviceID = m.SecurityContext.SenderDeviceID
+		senderBindingVersion = int64(m.SecurityContext.SenderBindingVersion)
+	}
+
+	m.ID = messageID
+	m.CreatedAt = serverTimestamp
+	err = tx.QueryRow(ctx,
+		`INSERT INTO messages (
+		   id, conversation_id, sender_id, ciphertext, header, msg_type,
+		   reply_to_id, expires_at, crypto_profile, crypto_era,
+		   roster_version, roster_commitment, sender_device_id,
+		   sender_binding_version, created_at
+		 )
+		 SELECT $1::uuid, $2::uuid, $3::uuid, $4, $5, $6, $7::uuid, $8,
+		        $9, $10, $11, $12, $13, $14, $15
+		 WHERE $7::uuid IS NULL OR EXISTS (
+		   SELECT 1 FROM messages reply
+		   WHERE reply.id = $7::uuid
+		     AND reply.conversation_id = $2::uuid
+		     AND reply.is_deleted = false
+		 )
+		 RETURNING id::text, created_at`,
+		m.ID, m.ConversationID, m.SenderID, m.Ciphertext, m.Header, m.MsgType,
+		m.ReplyToID, m.ExpiresAt, securityProfile, securityEra, rosterVersion,
+		rosterCommitment, senderDeviceID, senderBindingVersion, m.CreatedAt,
+	).Scan(&m.ID, &m.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) && m.ReplyToID != nil {
+		return nil, ErrReplyTargetMismatch
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, attachment := range m.Attachments {
+		var inserted string
+		err = tx.QueryRow(ctx,
+			`INSERT INTO message_attachments
+			   (message_id, file_id, position, encrypted_key, nonce, size_bytes, content_type)
+			 SELECT $1::uuid, upload.file_id, $3, $4, $5, $6, $7
+			 FROM tus_uploads upload
+			 WHERE upload.file_id = $2
+			   AND upload.user_id = $8::uuid
+			   AND upload.finished_at IS NOT NULL
+			   AND upload.received_bytes = upload.size_bytes
+			   AND upload.size_bytes = $6
+			   AND upload.expires_at > now()
+			 RETURNING file_id`,
+			m.ID, attachment.FileID, attachment.Position, attachment.EncryptedKey,
+			attachment.Nonce, attachment.SizeBytes, attachment.ContentType, m.SenderID,
+		).Scan(&inserted)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, ErrAttachmentScope
+		}
+		if err != nil {
+			return nil, fmt.Errorf("store message attachment: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	outcome := &MessageSendOutcome{
+		MessageID:       m.ID,
+		ServerTimestamp: m.CreatedAt,
+	}
+	if storedRosterVersion != nil {
+		version := uint64(*storedRosterVersion)
+		outcome.AckRosterVersion = &version
+	}
+	return outcome, nil
 }
 
 // StoreMessage persists an encrypted message.

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NaveLIL/veil/veil-server/internal/chat"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
@@ -71,15 +72,18 @@ func TestSealedMessageIsRejectedBeforeGatewayDependencies(t *testing.T) {
 		send:          make(chan outboundBatch, 1),
 	}
 	client.handleSendMessage(context.Background(), 41, &pb.SendMessage{
-		ConversationId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-		Ciphertext:     []byte("must-not-reach-dependencies"),
-		Sealed:         true,
+		ClientMessageId: "55555555-5555-4555-8555-555555555555",
+		ConversationId:  "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		Ciphertext:      []byte("must-not-reach-dependencies"),
+		Sealed:          true,
 	})
 
 	envelope := decodePublicErrorEnvelope(t, <-client.send)
 	got := envelope.GetError()
 	if got == nil || got.GetCode() != http.StatusBadRequest ||
 		got.GetMessage() != "message rejected" || got.GetRefSeq() != 41 ||
+		got.GetClientMessageId() != "55555555-5555-4555-8555-555555555555" ||
+		got.GetReason() != sendMessageReasonSealedUnsupported ||
 		envelope.GetMessageAck() != nil {
 		t.Fatalf("sealed gateway response = %#v, want generic 400 without ACK", envelope)
 	}
@@ -92,24 +96,37 @@ func TestClassifySendMessageErrorRequiresRosterRefresh(t *testing.T) {
 		err        error
 		wantStatus int
 		wantText   string
+		wantReason string
 	}{
 		{
+			name: "invalid client message id", err: chat.ErrInvalidClientMessageID,
+			wantStatus: 400, wantText: "invalid client message id", wantReason: sendMessageReasonInvalidClientMessageID,
+		},
+		{
+			name: "client message id conflict", err: chat.ErrClientMessageIDConflict,
+			wantStatus: 409, wantText: "client message id already used for a different request", wantReason: sendMessageReasonClientMessageIDConflict,
+		},
+		{
 			name: "roster changed", err: db.ErrMessageRosterChanged,
-			wantStatus: 409, wantText: errMessageRosterRefresh,
+			wantStatus: 409, wantText: errMessageRosterRefresh, wantReason: sendMessageReasonSecureRosterChanged,
 		},
 		{
 			name: "sender device changed", err: db.ErrMessageSecurityContext,
-			wantStatus: 409, wantText: errMessageDeviceRefresh,
+			wantStatus: 409, wantText: errMessageDeviceRefresh, wantReason: sendMessageReasonDeviceNotEligible,
 		},
 		{
-			name: "ordinary validation", err: errors.New("invalid message"),
-			wantStatus: 400, wantText: "message rejected",
+			name: "ordinary validation", err: chat.ErrInvalidSendMessage,
+			wantStatus: 400, wantText: "message rejected", wantReason: sendMessageReasonInvalidMessage,
+		},
+		{
+			name: "infrastructure failure", err: errors.New("database unavailable"),
+			wantStatus: 500, wantText: "internal error", wantReason: sendMessageReasonInternalError,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			status, text := classifySendMessageError(tc.err)
-			if status != tc.wantStatus || text != tc.wantText {
-				t.Fatalf("classification=(%d, %q), want (%d, %q)", status, text, tc.wantStatus, tc.wantText)
+			status, text, reason := classifySendMessageError(tc.err)
+			if status != tc.wantStatus || text != tc.wantText || reason != tc.wantReason {
+				t.Fatalf("classification=(%d, %q, %q), want (%d, %q, %q)", status, text, reason, tc.wantStatus, tc.wantText, tc.wantReason)
 			}
 		})
 	}
