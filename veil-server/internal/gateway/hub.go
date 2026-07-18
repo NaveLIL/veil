@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -154,7 +155,16 @@ var upgrader = websocket.Upgrader{
 type Client struct {
 	hub  *Hub
 	conn *websocket.Conn
-	send chan []byte
+	send chan outboundBatch
+
+	// closing is set before a saturated client is disconnected. Fan-out skips
+	// such sessions immediately, even while the read pump is still unwinding
+	// and Hub.Run has not removed the indexes yet.
+	closing   atomic.Bool
+	closeOnce sync.Once
+	// closeFn is a deterministic test seam. Production falls back to conn.Close.
+	closeFn    func() error
+	registered chan struct{}
 
 	// Connection ID for challenge tracking (not user-visible)
 	connID string
@@ -174,6 +184,70 @@ type Client struct {
 
 	// Rate limiting
 	authAttempts int
+}
+
+// outboundBatch is one indivisible FIFO unit for the single WebSocket writer.
+// Authentication publishes retained control envelopes and the successful
+// AuthResult in one batch so no live event can be written between them.
+type outboundBatch struct {
+	frames      [][]byte
+	publication *publicationGate
+}
+
+// publicationGate prevents writePump from exposing a successful AuthResult
+// until the Hub has published the authenticated connection in both indexes.
+// Closing ready synchronizes the allowed write with wait().
+type publicationGate struct {
+	once    sync.Once
+	ready   chan struct{}
+	allowed bool
+}
+
+func newPublicationGate() *publicationGate {
+	return &publicationGate{ready: make(chan struct{})}
+}
+
+func (g *publicationGate) resolve(allowed bool) {
+	if g == nil {
+		return
+	}
+	g.once.Do(func() {
+		g.allowed = allowed
+		close(g.ready)
+	})
+}
+
+func (g *publicationGate) wait() bool {
+	if g == nil {
+		return true
+	}
+	<-g.ready
+	return g.allowed
+}
+
+func singleOutbound(data []byte) outboundBatch {
+	return outboundBatch{frames: [][]byte{data}}
+}
+
+func (c *Client) markClosing() bool {
+	return c.closing.CompareAndSwap(false, true)
+}
+
+func (c *Client) closeTransportOnce() {
+	c.closeOnce.Do(func() {
+		if c.closeFn != nil {
+			_ = c.closeFn()
+			return
+		}
+		if c.conn != nil {
+			_ = c.conn.Close()
+		}
+	})
+}
+
+func (c *Client) failClosed() {
+	c.closing.Store(true)
+	c.closeTransportOnce()
 }
 
 // Hub maintains active clients and routes messages.
@@ -258,6 +332,9 @@ func (h *Hub) Run() {
 			h.clients[client] = true
 			n := len(h.clients)
 			h.mu.Unlock()
+			if client.registered != nil {
+				close(client.registered)
+			}
 			metrics.WSConnectionsTotal.Inc()
 			metrics.WSConnectionsActive.Set(float64(n))
 			log.Printf("client connected: %s (total: %d)", client.connID, n)
@@ -298,9 +375,7 @@ func (h *Hub) Run() {
 	}
 }
 
-// indexClient adds a client to the userID index after authentication.
-func (h *Hub) indexClient(client *Client) {
-	h.mu.Lock()
+func (h *Hub) indexClientLocked(client *Client) {
 	if h.userClients[client.userID] == nil {
 		h.userClients[client.userID] = make(map[*Client]bool)
 	}
@@ -312,7 +387,36 @@ func (h *Hub) indexClient(client *Client) {
 		h.deviceClients[client.deviceID] = make(map[*Client]bool)
 	}
 	h.deviceClients[client.deviceID][client] = true
+}
+
+// indexClient adds an already-authenticated test/service client to both
+// indexes. The WebSocket authentication path uses publishAuthenticatedClient
+// so its successful AuthResult is gated on the same publication boundary.
+func (h *Hub) indexClient(client *Client) {
+	h.mu.Lock()
+	h.indexClientLocked(client)
 	h.mu.Unlock()
+}
+
+// publishAuthenticatedClient is the sole successful authentication cutover.
+// The success batch is already queued but writePump is blocked on gate. While
+// holding the write lock we publish identity state and both fan-out indexes,
+// then release the writer. Fan-out takes the matching read lock, so every live
+// envelope accepted after this point is queued strictly behind AuthResult.
+func (h *Hub) publishAuthenticatedClient(client *Client, gate *publicationGate) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if gate == nil || client == nil || !h.clients[client] || client.closing.Load() ||
+		client.userID == "" || client.deviceID == "" {
+		if gate != nil {
+			gate.resolve(false)
+		}
+		return false
+	}
+	client.authenticated = true
+	h.indexClientLocked(client)
+	gate.resolve(true)
+	return true
 }
 
 // enqueueToUser sends a serialized Envelope to every currently indexed
@@ -325,17 +429,25 @@ func (h *Hub) indexClient(client *Client) {
 // connection indexing and removal.
 func (h *Hub) enqueueToUser(userID string, data []byte) bool {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-
 	clients := h.userClients[userID]
 	enqueued := false
+	toClose := make([]*Client, 0)
 	for c := range clients {
+		if c.closing.Load() {
+			continue
+		}
 		select {
-		case c.send <- data:
+		case c.send <- singleOutbound(data):
 			enqueued = true
 		default:
-			// Client too slow, will be cleaned up by writePump.
+			if c.markClosing() {
+				toClose = append(toClose, c)
+			}
 		}
+	}
+	h.mu.RUnlock()
+	for _, client := range toClose {
+		client.closeTransportOnce()
 	}
 	return enqueued
 }
@@ -351,15 +463,25 @@ func (h *Hub) sendToUser(userID string, data []byte) {
 // saturated session is not considered online for push fallback.
 func (h *Hub) enqueueToDevice(deviceID string, data []byte) bool {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
 	clients := h.deviceClients[deviceID]
 	enqueued := false
+	toClose := make([]*Client, 0)
 	for client := range clients {
+		if client.closing.Load() {
+			continue
+		}
 		select {
-		case client.send <- data:
+		case client.send <- singleOutbound(data):
 			enqueued = true
 		default:
+			if client.markClosing() {
+				toClose = append(toClose, client)
+			}
 		}
+	}
+	h.mu.RUnlock()
+	for _, client := range toClose {
+		client.closeTransportOnce()
 	}
 	return enqueued
 }
@@ -494,20 +616,25 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 
 	connID := fmt.Sprintf("%p-%d", conn, time.Now().UnixNano())
 	client := &Client{
-		hub:    hub,
-		conn:   conn,
-		send:   make(chan []byte, 256),
-		connID: connID,
-		ip:     ip,
+		hub:        hub,
+		conn:       conn,
+		send:       make(chan outboundBatch, 256),
+		connID:     connID,
+		ip:         ip,
+		registered: make(chan struct{}),
 	}
 
 	hub.register <- client
+	<-client.registered
 
 	// Send auth challenge immediately
 	nonce, err := hub.authSvc.CreateChallenge(connID)
 	if err != nil {
 		log.Printf("failed to create challenge: class=%s", logsafe.ErrorClass(err))
-		conn.Close()
+		client.failClosed()
+		// Pumps have not started yet, so no readPump defer exists to return the
+		// registered client, IP slot and send channel to Hub.Run.
+		hub.unregister <- client
 		return
 	}
 
@@ -518,7 +645,7 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 		},
 	}
 	data, _ := proto.Marshal(env)
-	client.send <- data
+	client.send <- singleOutbound(data)
 
 	go client.writePump()
 	go client.readPump()
@@ -527,7 +654,7 @@ func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request) {
 func (c *Client) readPump() {
 	defer func() {
 		c.hub.unregister <- c
-		c.conn.Close()
+		c.failClosed()
 	}()
 
 	c.conn.SetReadLimit(maxMessageSize)
@@ -685,7 +812,7 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 	c.authAttempts++
 	if c.authAttempts > 3 {
 		c.sendError(seq, 429, "too many auth attempts")
-		c.conn.Close()
+		c.failClosed()
 		return
 	}
 
@@ -746,34 +873,34 @@ func (c *Client) handleAuth(ctx context.Context, seq uint64, resp *pb.AuthRespon
 			message = "encrypted session contains unsupported legacy sender-key state"
 		}
 		_ = c.sendAuthResult(seq, false, "", message)
-		if c.conn != nil {
-			_ = c.conn.Close()
-		}
+		c.failClosed()
 		return
 	}
-	// Queue retained group-key control state before the AuthResult barrier.
-	// The client buffers these envelopes during its handshake, installs them
-	// as soon as AuthResult succeeds, and can then decrypt REST backlog before
-	// the normal WS poller starts. The connection is published only after all
-	// control envelopes and the barrier are durably queued in FIFO order.
-	for _, data := range pendingSenderKeys {
-		if err := c.enqueueData(data); err != nil {
-			log.Printf("pending sender-key delivery failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
-			if c.conn != nil {
-				_ = c.conn.Close()
-			}
-			return
-		}
+	// Retained device controls and the successful AuthResult are one gated FIFO
+	// batch. writePump may dequeue it, but cannot expose any frame until the Hub
+	// has atomically published this connection in both authenticated indexes.
+	// Once released, live fan-out can only enqueue behind the complete batch.
+	authData, err := marshalEnvelope(authResultEnvelope(seq, true, result.UserID, "", result))
+	if err != nil {
+		log.Printf("auth result encode failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
+		c.failClosed()
+		return
 	}
-	if err := c.sendAuthResult(seq, true, result.UserID, "", result); err != nil {
+	frames := make([][]byte, 0, len(pendingSenderKeys)+1)
+	frames = append(frames, pendingSenderKeys...)
+	frames = append(frames, authData)
+	gate := newPublicationGate()
+	if err := c.enqueueBatch(outboundBatch{frames: frames, publication: gate}); err != nil {
+		gate.resolve(false)
 		log.Printf("auth result queue failed [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
-		if c.conn != nil {
-			_ = c.conn.Close()
-		}
+		c.failClosed()
 		return
 	}
-	c.authenticated = true
-	c.hub.indexClient(c)
+	if !c.hub.publishAuthenticatedClient(c, gate) {
+		log.Printf("auth publication failed [%s]", c.connID)
+		c.failClosed()
+		return
+	}
 	log.Printf("auth success [%s]: user_ref=%s device_ref=%s", c.connID, logsafe.Ref("user", c.userID), logsafe.Ref("device", c.deviceID))
 }
 
@@ -1482,8 +1609,13 @@ func (c *Client) handleFriendListRequest(ctx context.Context, seq uint64) {
 		}
 		// Check if friend is currently online
 		c.hub.mu.RLock()
-		if clients, ok := c.hub.userClients[f.UserID]; ok && len(clients) > 0 {
-			entry.Status = pb.PresenceStatus_PRESENCE_ONLINE
+		if clients, ok := c.hub.userClients[f.UserID]; ok {
+			for client := range clients {
+				if !client.closing.Load() {
+					entry.Status = pb.PresenceStatus_PRESENCE_ONLINE
+					break
+				}
+			}
 		}
 		c.hub.mu.RUnlock()
 		friendEntries = append(friendEntries, entry)
@@ -1531,35 +1663,53 @@ func (c *Client) handleFriendListRequest(ctx context.Context, seq uint64) {
 // --- Helpers ---
 
 func (c *Client) sendEnvelope(env *pb.Envelope) {
-	data, err := proto.Marshal(env)
+	data, err := marshalEnvelope(env)
 	if err != nil {
 		log.Printf("marshal error: class=%s", logsafe.ErrorClass(err))
 		return
 	}
 	select {
-	case c.send <- data:
+	case c.send <- singleOutbound(data):
 	default:
+		c.failClosed()
 	}
 }
 
-// enqueueData is used for authentication state restoration where dropping an
-// envelope would be unsafe. The regular event path remains best-effort.
-func (c *Client) enqueueData(data []byte) error {
-	if len(data) == 0 {
-		return errors.New("empty websocket envelope")
+func marshalEnvelope(env *pb.Envelope) ([]byte, error) {
+	if env == nil {
+		return nil, errors.New("nil websocket envelope")
+	}
+	return proto.Marshal(env)
+}
+
+// enqueueBatch is used for authentication publication where dropping or
+// partially ordering an envelope would be unsafe.
+func (c *Client) enqueueBatch(batch outboundBatch) error {
+	if len(batch.frames) == 0 {
+		return errors.New("empty websocket batch")
+	}
+	for _, frame := range batch.frames {
+		if len(frame) == 0 {
+			return errors.New("empty websocket envelope")
+		}
 	}
 	timer := time.NewTimer(writeWait)
 	defer timer.Stop()
 	select {
-	case c.send <- data:
+	case c.send <- batch:
 		return nil
 	case <-timer.C:
+		c.failClosed()
 		return errors.New("websocket send queue timeout")
 	}
 }
 
+func (c *Client) enqueueData(data []byte) error {
+	return c.enqueueBatch(singleOutbound(data))
+}
+
 func (c *Client) enqueueEnvelope(env *pb.Envelope) error {
-	data, err := proto.Marshal(env)
+	data, err := marshalEnvelope(env)
 	if err != nil {
 		return fmt.Errorf("marshal envelope: %w", err)
 	}
@@ -1632,7 +1782,7 @@ func (c *Client) sendAuthFailure(seq uint64, reason pb.AuthFailureReason, messag
 	})
 }
 
-func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string, authDetails ...*auth.AuthResult) error {
+func authResultEnvelope(seq uint64, success bool, userID, errMsg string, authDetails ...*auth.AuthResult) *pb.Envelope {
 	result := &pb.AuthResult{Success: success}
 	if success {
 		result.UserId = &userID
@@ -1645,32 +1795,41 @@ func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string,
 	if errMsg != "" {
 		result.ErrorMessage = &errMsg
 	}
-	return c.enqueueEnvelope(&pb.Envelope{
+	return &pb.Envelope{
 		Seq: seq,
 		Payload: &pb.Envelope_AuthResult{
 			AuthResult: result,
 		},
-	})
+	}
+}
+
+func (c *Client) sendAuthResult(seq uint64, success bool, userID, errMsg string, authDetails ...*auth.AuthResult) error {
+	return c.enqueueEnvelope(authResultEnvelope(seq, success, userID, errMsg, authDetails...))
 }
 
 func (c *Client) writePump() {
 	ticker := time.NewTicker(pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.conn.Close()
+		c.failClosed()
 	}()
 
 	for {
 		select {
-		case message, ok := <-c.send:
-			c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		case batch, ok := <-c.send:
 			if !ok {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
-				log.Printf("write error [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
+			if !batch.publication.wait() {
 				return
+			}
+			for _, message := range batch.frames {
+				c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+				if err := c.conn.WriteMessage(websocket.BinaryMessage, message); err != nil {
+					log.Printf("write error [%s]: class=%s", c.connID, logsafe.ErrorClass(err))
+					return
+				}
 			}
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(writeWait))

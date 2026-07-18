@@ -17,7 +17,7 @@ const transportSecretCanary = "constraint sender_keys_owner_target_key C:\\veil\
 
 func TestSendPublicErrorDoesNotExposeCause(t *testing.T) {
 	t.Parallel()
-	client := &Client{send: make(chan []byte, 1)}
+	client := &Client{send: make(chan outboundBatch, 1)}
 	client.sendPublicError(71, http.StatusInternalServerError, errors.New(transportSecretCanary))
 	envelope := decodePublicErrorEnvelope(t, <-client.send)
 	got := envelope.GetError()
@@ -31,13 +31,13 @@ func TestSendPublicErrorDoesNotExposeCause(t *testing.T) {
 
 func TestSendPublicAuthFailureDoesNotExposeCause(t *testing.T) {
 	t.Parallel()
-	client := &Client{send: make(chan []byte, 1)}
+	client := &Client{send: make(chan outboundBatch, 1)}
 	err := publicerr.New(http.StatusUnauthorized, "authentication_failed", "authentication failed", errors.New(transportSecretCanary))
 	if queueErr := client.sendPublicAuthFailure(72, err); queueErr != nil {
 		t.Fatalf("queue auth failure: %v", queueErr)
 	}
 	var envelope pb.Envelope
-	if unmarshalErr := proto.Unmarshal(<-client.send, &envelope); unmarshalErr != nil {
+	if unmarshalErr := proto.Unmarshal(requireSingleOutboundFrame(t, <-client.send), &envelope); unmarshalErr != nil {
 		t.Fatalf("decode auth failure: %v", unmarshalErr)
 	}
 	result := envelope.GetAuthResult()
@@ -71,12 +71,12 @@ func TestMappedAuthFailuresExposeOnlySafeEnrollmentReasons(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			client := &Client{send: make(chan []byte, 1)}
+			client := &Client{send: make(chan outboundBatch, 1)}
 			if err := client.sendMappedAuthFailure(73, testCase.err); err != nil {
 				t.Fatal(err)
 			}
 			var envelope pb.Envelope
-			if err := proto.Unmarshal(<-client.send, &envelope); err != nil {
+			if err := proto.Unmarshal(requireSingleOutboundFrame(t, <-client.send), &envelope); err != nil {
 				t.Fatal(err)
 			}
 			result := envelope.GetAuthResult()
@@ -87,11 +87,22 @@ func TestMappedAuthFailuresExposeOnlySafeEnrollmentReasons(t *testing.T) {
 	}
 }
 
-func decodePublicErrorEnvelope(t *testing.T, data []byte) *pb.Envelope {
+func decodePublicErrorEnvelope(t *testing.T, batch outboundBatch) *pb.Envelope {
 	t.Helper()
 	var envelope pb.Envelope
-	if err := proto.Unmarshal(data, &envelope); err != nil {
+	if err := proto.Unmarshal(requireSingleOutboundFrame(t, batch), &envelope); err != nil {
 		t.Fatalf("decode WS error: %v", err)
 	}
 	return &envelope
+}
+
+func requireSingleOutboundFrame(t *testing.T, batch outboundBatch) []byte {
+	t.Helper()
+	if batch.publication != nil {
+		t.Fatal("ordinary response unexpectedly has a publication gate")
+	}
+	if len(batch.frames) != 1 {
+		t.Fatalf("outbound frames = %d, want 1", len(batch.frames))
+	}
+	return batch.frames[0]
 }

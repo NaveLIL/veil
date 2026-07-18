@@ -6,6 +6,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
@@ -71,7 +72,7 @@ func TestConcurrentFanoutAndDisconnectIsSafe(t *testing.T) {
 	}
 
 	for range 2_000 {
-		client := &Client{send: make(chan []byte, 1)}
+		client := &Client{send: make(chan outboundBatch, 1)}
 		hub.mu.Lock()
 		hub.clients[client] = true
 		hub.userClients[userID] = map[*Client]bool{client: true}
@@ -94,8 +95,18 @@ func TestConcurrentFanoutAndDisconnectIsSafe(t *testing.T) {
 
 func TestFullQueuesDoNotSuppressPushFallback(t *testing.T) {
 	hub := NewHub(nil, nil)
-	client := &Client{send: make(chan []byte, 1)}
-	client.send <- []byte("already queued")
+	var closeMu sync.Mutex
+	closeCalls := 0
+	client := &Client{
+		send: make(chan outboundBatch, 1),
+		closeFn: func() error {
+			closeMu.Lock()
+			closeCalls++
+			closeMu.Unlock()
+			return nil
+		},
+	}
+	client.send <- singleOutbound([]byte("already queued"))
 	hub.userClients["online"] = map[*Client]bool{client: true}
 	hub.deviceClients["device-db-id"] = map[*Client]bool{client: true}
 	recorder := &recordingPushNotifier{}
@@ -103,6 +114,9 @@ func TestFullQueuesDoNotSuppressPushFallback(t *testing.T) {
 
 	if enqueued := hub.enqueueToUser("online", []byte("dropped")); enqueued {
 		t.Fatal("a full user queue falsely reported successful enqueue")
+	}
+	if !client.closing.Load() {
+		t.Fatal("a saturated session was not marked closing")
 	}
 	if enqueued := hub.enqueueToDevice("device-db-id", []byte("dropped")); enqueued {
 		t.Fatal("a full device queue falsely reported successful enqueue")
@@ -118,6 +132,110 @@ func TestFullQueuesDoNotSuppressPushFallback(t *testing.T) {
 	}}, envelope)
 	if recorder.calls != 2 {
 		t.Fatalf("push calls = %d, want one user and one device fallback", recorder.calls)
+	}
+	closeMu.Lock()
+	defer closeMu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("transport close calls = %d, want exactly 1", closeCalls)
+	}
+}
+
+func TestAuthenticatedPublicationGatesFIFOUntilBothIndexesExist(t *testing.T) {
+	hub := NewHub(nil, nil)
+	client := &Client{
+		hub:      hub,
+		send:     make(chan outboundBatch, 4),
+		userID:   "published-user",
+		deviceID: "published-device",
+	}
+	hub.clients[client] = true
+
+	gate := newPublicationGate()
+	client.send <- outboundBatch{
+		frames:      [][]byte{[]byte("retained-control"), []byte("auth-result")},
+		publication: gate,
+	}
+
+	dequeued := make(chan struct{})
+	written := make(chan string, 3)
+	go func() {
+		first := <-client.send
+		close(dequeued)
+		if first.publication.wait() {
+			for _, frame := range first.frames {
+				written <- string(frame)
+			}
+		}
+		live := <-client.send
+		if live.publication.wait() {
+			for _, frame := range live.frames {
+				written <- string(frame)
+			}
+		}
+	}()
+
+	<-dequeued
+	select {
+	case frame := <-written:
+		t.Fatalf("publication frame became visible before indexing: %q", frame)
+	default:
+	}
+	if client.authenticated {
+		t.Fatal("client authenticated before publication")
+	}
+
+	if !hub.publishAuthenticatedClient(client, gate) {
+		t.Fatal("authenticated publication failed")
+	}
+	hub.mu.RLock()
+	indexedByUser := hub.userClients[client.userID][client]
+	indexedByDevice := hub.deviceClients[client.deviceID][client]
+	hub.mu.RUnlock()
+	if !client.authenticated || !indexedByUser || !indexedByDevice {
+		t.Fatalf("incomplete publication: authenticated=%v user=%v device=%v",
+			client.authenticated, indexedByUser, indexedByDevice)
+	}
+	if !hub.enqueueToUser(client.userID, []byte("live-event")) {
+		t.Fatal("published client did not accept live fan-out")
+	}
+
+	for index, want := range []string{"retained-control", "auth-result", "live-event"} {
+		select {
+		case got := <-written:
+			if got != want {
+				t.Fatalf("frame %d = %q, want %q", index, got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for frame %d (%q)", index, want)
+		}
+	}
+}
+
+func TestRejectedPublicationNeverExposesSuccessBatch(t *testing.T) {
+	hub := NewHub(nil, nil)
+	client := &Client{
+		send:     make(chan outboundBatch, 1),
+		userID:   "missing-user",
+		deviceID: "missing-device",
+	}
+	gate := newPublicationGate()
+	batch := outboundBatch{frames: [][]byte{[]byte("auth-result")}, publication: gate}
+	client.send <- batch
+
+	written := make(chan []byte, 1)
+	go func() {
+		queued := <-client.send
+		if queued.publication.wait() {
+			written <- queued.frames[0]
+		}
+	}()
+	if hub.publishAuthenticatedClient(client, gate) {
+		t.Fatal("unregistered client was published")
+	}
+	select {
+	case frame := <-written:
+		t.Fatalf("rejected success batch became visible: %q", frame)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 

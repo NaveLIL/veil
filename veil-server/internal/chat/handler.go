@@ -66,17 +66,26 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		return f
 	}
 
-	mux.HandleFunc("GET /v1/messages/{conversationID}", signed(h.GetMessages))
-	mux.HandleFunc("GET /v1/conversations", signed(h.ListConversations))
+	// no-store remains outermost so authenticated chat state cannot be cached
+	// even when signature verification or rate limiting rejects the request.
+	mux.HandleFunc("GET /v1/messages/{conversationID}", chatNoStore(signed(h.GetMessages)))
+	mux.HandleFunc("GET /v1/conversations", chatNoStore(signed(h.ListConversations)))
 	mux.HandleFunc("POST /v1/conversations/dm", signed(h.CreateDM))
-	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", signed(h.GetMembers))
-	mux.HandleFunc("GET /v1/conversations/{conversationID}/device-directory", signed(h.GetDeviceDirectory))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", chatNoStore(signed(h.GetMembers)))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/device-directory", chatNoStore(signed(h.GetDeviceDirectory)))
 
 	// Group endpoints
 	mux.HandleFunc("POST /v1/groups", signed(h.CreateGroup))
 	mux.HandleFunc("POST /v1/groups/{groupID}/members", signed(h.AddGroupMember))
 	mux.HandleFunc("DELETE /v1/groups/{groupID}/members/{userID}", signed(h.RemoveGroupMember))
-	mux.HandleFunc("GET /v1/groups/{groupID}/members", signed(h.GetGroupMembers))
+	mux.HandleFunc("GET /v1/groups/{groupID}/members", chatNoStore(signed(h.GetGroupMembers)))
+}
+
+func chatNoStore(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next(w, r)
+	}
 }
 
 // --- Message Sync (store-and-forward) ---

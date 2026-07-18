@@ -224,11 +224,11 @@ func TestSenderKeyPerDeviceRoutingRestoreAndReceipts(t *testing.T) {
 	// session nor a session whose binding became revoked may replace Sender-Key
 	// ciphertext and trigger account-wide edit fan-out.
 	legacyEditor := &Client{
-		hub: hub, send: make(chan []byte, 4), authenticated: true,
+		hub: hub, send: make(chan outboundBatch, 4), authenticated: true,
 		userID: alice.ID, deviceID: aliceOne.record.ID,
 	}
 	revokedEditor := &Client{
-		hub: hub, send: make(chan []byte, 4), authenticated: true,
+		hub: hub, send: make(chan outboundBatch, 4), authenticated: true,
 		userID: alice.ID, deviceID: aliceOne.record.ID,
 		deviceKey:       append([]byte(nil), aliceOne.record.DeviceKey...),
 		perDeviceSecure: true, deviceBindingVersion: aliceOne.bindingVersion,
@@ -1302,7 +1302,7 @@ func storeGatewayBindingVersion(t *testing.T, h *integrationtest.Harness, device
 func gatewayClientForDevice(hub *Hub, device *gatewayBoundDevice) *Client {
 	return &Client{
 		hub:                  hub,
-		send:                 make(chan []byte, 32),
+		send:                 make(chan outboundBatch, 32),
 		authenticated:        true,
 		userID:               device.user.ID,
 		deviceID:             device.record.ID,
@@ -1392,10 +1392,11 @@ func randomDeviceKey(t *testing.T) []byte {
 	return key
 }
 
-func receiveGatewayEnvelope(t *testing.T, ch <-chan []byte) *pb.Envelope {
+func receiveGatewayEnvelope(t *testing.T, ch <-chan outboundBatch) *pb.Envelope {
 	t.Helper()
 	select {
-	case data := <-ch:
+	case batch := <-ch:
+		data := requireSingleOutboundFrame(t, batch)
 		var envelope pb.Envelope
 		if err := proto.Unmarshal(data, &envelope); err != nil {
 			t.Fatalf("decode gateway envelope: %v", err)
@@ -1407,10 +1408,11 @@ func receiveGatewayEnvelope(t *testing.T, ch <-chan []byte) *pb.Envelope {
 	}
 }
 
-func requireNoGatewayEnvelope(t *testing.T, ch <-chan []byte) {
+func requireNoGatewayEnvelope(t *testing.T, ch <-chan outboundBatch) {
 	t.Helper()
 	select {
-	case data := <-ch:
+	case batch := <-ch:
+		data := requireSingleOutboundFrame(t, batch)
 		var envelope pb.Envelope
 		_ = proto.Unmarshal(data, &envelope)
 		t.Fatalf("unexpected gateway envelope: %v", &envelope)
