@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
@@ -1040,18 +1041,174 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 027", func(t *testing.T) {
+	t.Run("028 cleans legacy scope, prunes deterministically, and guards raw writers", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_028")
+		applyMigrationsBefore(t, pool, migrations, 28)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var userID, messageID, conversationID, otherConversationID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users(identity_key, signing_key, username)
+			 VALUES ($1,$2,'reaction-bound-upgrade') RETURNING id::text`,
+			bytes.Repeat([]byte{0xb1}, 32), bytes.Repeat([]byte{0xb2}, 32),
+		).Scan(&userID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO conversations(conv_type,name)
+			 VALUES (0,'reaction-bound-primary') RETURNING id::text`,
+		).Scan(&conversationID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO conversations(conv_type,name)
+			 VALUES (0,'reaction-bound-other') RETURNING id::text`,
+		).Scan(&otherConversationID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO messages(conversation_id,sender_id,ciphertext)
+			 VALUES ($1::uuid,$2::uuid,'\x01') RETURNING id::text`,
+			conversationID, userID,
+		).Scan(&messageID); err != nil {
+			t.Fatal(err)
+		}
+
+		// Simulate rows that predate migration 009's NOT VALID foreign keys.
+		if _, err := pool.Exec(ctx,
+			`ALTER TABLE reactions DROP CONSTRAINT reactions_message_conversation_fk;
+			 ALTER TABLE reactions DROP CONSTRAINT reactions_user_fk`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji,created_at)
+			 SELECT $1::uuid,$2::uuid,$3::uuid,
+			        'legacy-' || lpad(value::text,3,'0'),
+			        TIMESTAMPTZ '2026-01-01 00:00:00+00' + value * INTERVAL '1 second'
+			 FROM generate_series(1,260) AS value`,
+			messageID, conversationID, userID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji,created_at)
+			 VALUES
+			   ($1::uuid,$2::uuid,$3::uuid,'legacy-invalid-scope',TIMESTAMPTZ '2025-01-01'),
+			   ($1::uuid,$4::uuid,gen_random_uuid(),'legacy-invalid-user',TIMESTAMPTZ '2025-01-02')`,
+			messageID, otherConversationID, userID, conversationID,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := execMigration(t, pool, migrations, 28); err != nil {
+			t.Fatalf("migration 028: %v", err)
+		}
+		var retained []string
+		if err := pool.QueryRow(ctx,
+			`SELECT array_agg(emoji ORDER BY created_at,user_id,emoji COLLATE "C")
+			 FROM reactions WHERE message_id=$1::uuid`,
+			messageID,
+		).Scan(&retained); err != nil {
+			t.Fatal(err)
+		}
+		if len(retained) != veildb.MaxReactionsPerMessage {
+			t.Fatalf("retained reaction count=%d, want %d", len(retained), veildb.MaxReactionsPerMessage)
+		}
+		for index, emoji := range retained {
+			want := "legacy-" + fmt.Sprintf("%03d", index+1)
+			if emoji != want {
+				t.Fatalf("retained reaction[%d]=%q, want %q", index, emoji, want)
+			}
+		}
+		var minSlot, maxSlot, distinctSlots int
+		if err := pool.QueryRow(ctx,
+			`SELECT min(history_slot),max(history_slot),count(DISTINCT history_slot)
+			 FROM reactions WHERE message_id=$1::uuid`,
+			messageID,
+		).Scan(&minSlot, &maxSlot, &distinctSlots); err != nil ||
+			minSlot != 0 || maxSlot != veildb.MaxReactionsPerMessage-1 ||
+			distinctSlots != veildb.MaxReactionsPerMessage {
+			t.Fatalf(
+				"reaction slots min=%d max=%d distinct=%d err=%v",
+				minSlot, maxSlot, distinctSlots, err,
+			)
+		}
+		var validatedCount int
+		if err := pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM pg_constraint
+			 WHERE conrelid='reactions'::regclass
+			   AND conname IN ('reactions_message_conversation_fk','reactions_user_fk')
+			   AND convalidated`,
+		).Scan(&validatedCount); err != nil || validatedCount != 2 {
+			t.Fatalf("validated reaction FK count=%d err=%v, want 2", validatedCount, err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji)
+			 VALUES ($1::uuid,$2::uuid,$3::uuid,'legacy-001')
+			 ON CONFLICT (message_id,user_id,emoji) DO NOTHING`,
+			messageID, conversationID, userID,
+		); err != nil {
+			t.Fatalf("raw exact retry at cap: %v", err)
+		}
+		_, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji)
+			 VALUES ($1::uuid,$2::uuid,$3::uuid,'raw-overflow')`,
+			messageID, conversationID, userID,
+		)
+		requireMigrationError(t, err, "23514", "message reaction limit reached")
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "reactions_per_message_limit" {
+			t.Fatalf("raw overflow constraint=%v, want reactions_per_message_limit", pgErr)
+		}
+
+		var sourceMessageID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO messages(conversation_id,sender_id,ciphertext)
+			 VALUES ($1::uuid,$2::uuid,'\x02') RETURNING id::text`,
+			otherConversationID, userID,
+		).Scan(&sourceMessageID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji)
+			 VALUES ($1::uuid,$2::uuid,$3::uuid,'move-source')`,
+			sourceMessageID, otherConversationID, userID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		_, err = pool.Exec(ctx,
+			`UPDATE reactions
+			 SET message_id=$1::uuid, conversation_id=$2::uuid, emoji='raw-update-overflow'
+			 WHERE message_id=$3::uuid AND user_id=$4::uuid AND emoji='move-source'`,
+			messageID, conversationID, sourceMessageID, userID,
+		)
+		requireMigrationError(t, err, "23514", "reaction identity is immutable")
+		pgErr = nil
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "reactions_identity_immutable" {
+			t.Fatalf("raw update constraint=%v, want reactions_identity_immutable", pgErr)
+		}
+		var targetCount int
+		if err := pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM reactions WHERE message_id=$1::uuid`, messageID,
+		).Scan(&targetCount); err != nil || targetCount != veildb.MaxReactionsPerMessage {
+			t.Fatalf("raw update target count=%d err=%v, want %d", targetCount, err, veildb.MaxReactionsPerMessage)
+		}
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 028", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 27; number++ {
+		for number := 1; number <= 28; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 28)
+		applyMigrationsBefore(t, pool, migrations, 29)
 	})
 }
 

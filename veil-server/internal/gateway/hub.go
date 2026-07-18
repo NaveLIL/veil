@@ -1143,9 +1143,24 @@ func (c *Client) handleDeleteMessage(ctx context.Context, seq uint64, msg *pb.De
 // --- Reactions ---
 
 func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.ReactionUpdate) {
-	recipients, err := c.hub.chatSvc.HandleReaction(ctx, c.userID, msg)
+	recipients, changed, err := c.hub.chatSvc.HandleReaction(ctx, c.userID, msg)
 	if err != nil {
-		c.sendPublicError(seq, http.StatusBadRequest, err)
+		switch {
+		case errors.Is(err, chat.ErrReactionLimitReached):
+			c.sendPublicError(seq, http.StatusConflict, publicerr.New(
+				http.StatusConflict,
+				"reaction_limit_reached",
+				"message reaction limit reached",
+				err,
+			))
+		case errors.Is(err, chat.ErrNotMember):
+			c.sendPublicError(seq, http.StatusForbidden, err)
+		case errors.Is(err, chat.ErrInvalidReaction),
+			errors.Is(err, chat.ErrMessageConversationMismatch):
+			c.sendPublicError(seq, http.StatusBadRequest, err)
+		default:
+			c.sendPublicError(seq, http.StatusInternalServerError, err)
+		}
 		return
 	}
 
@@ -1156,6 +1171,9 @@ func (c *Client) handleReaction(ctx context.Context, seq uint64, msg *pb.Reactio
 		Timestamp: now,
 		Payload:   &pb.Envelope_MessageAck{MessageAck: &pb.MessageAck{MessageId: msg.MessageId, ServerTimestamp: now, RefSeq: seq}},
 	})
+	if !changed {
+		return
+	}
 
 	// Lookup sender info
 	sender, _ := c.hub.chatSvc.LookupUser(ctx, c.userID)

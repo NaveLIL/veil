@@ -11,6 +11,7 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/NaveLIL/veil/veil-server/internal/logsafe"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
+	"github.com/google/uuid"
 )
 
 var (
@@ -22,6 +23,8 @@ var (
 	ErrMessageConversationMismatch  = errors.New("message does not belong to conversation")
 	ErrAttachmentAccess             = errors.New("attachment is unavailable or not owned by sender")
 	ErrSecureMessageEditUnsupported = errors.New("editing Sender-Key group/channel messages requires an exact device-routed edit protocol")
+	ErrInvalidReaction              = errors.New("invalid reaction request")
+	ErrReactionLimitReached         = errors.New("message reaction limit reached")
 )
 
 // Service handles message routing and prekey distribution.
@@ -276,49 +279,48 @@ func (s *Service) HandleDeleteMessage(ctx context.Context, senderUserID string, 
 }
 
 // HandleReaction processes a client's reaction_update request.
-// Returns: list of recipient user IDs for fan-out.
-func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *pb.ReactionUpdate) ([]string, error) {
+// Returns the recipient user IDs and whether durable state changed. Exact
+// retries are acknowledged but must not produce a duplicate fan-out event.
+func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *pb.ReactionUpdate) ([]string, bool, error) {
 	if msg == nil || msg.MessageId == "" || msg.ConversationId == "" {
-		return nil, errors.New("message_id and conversation_id required")
+		return nil, false, fmt.Errorf("%w: message_id and conversation_id required", ErrInvalidReaction)
 	}
 	if msg.Emoji == "" || len(msg.Emoji) > 64 {
-		return nil, errors.New("emoji must be between 1 and 64 bytes")
+		return nil, false, fmt.Errorf("%w: emoji must be between 1 and 64 bytes", ErrInvalidReaction)
+	}
+	if _, err := uuid.Parse(msg.MessageId); err != nil {
+		return nil, false, fmt.Errorf("%w: malformed message_id", ErrInvalidReaction)
+	}
+	if _, err := uuid.Parse(msg.ConversationId); err != nil {
+		return nil, false, fmt.Errorf("%w: malformed conversation_id", ErrInvalidReaction)
 	}
 
-	isMember, err := s.db.CanAccessConversation(
-		ctx,
-		msg.ConversationId,
-		senderUserID,
-		db.PermViewChannel|db.PermSendMessages,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("check membership: %w", err)
-	}
-	if !isMember {
-		return nil, ErrNotMember
-	}
-
-	matches, err := s.db.MessageBelongsToConversation(ctx, msg.MessageId, msg.ConversationId)
-	if err != nil {
-		return nil, fmt.Errorf("check reaction message: %w", err)
-	}
-	if !matches {
-		return nil, ErrMessageConversationMismatch
-	}
-
+	var changed bool
+	var err error
 	if msg.Add {
-		if err := s.db.AddReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji); err != nil {
-			return nil, fmt.Errorf("add reaction: %w", err)
-		}
+		changed, err = s.db.AddReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji)
 	} else {
-		if err := s.db.RemoveReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji); err != nil {
-			return nil, fmt.Errorf("remove reaction: %w", err)
+		changed, err = s.db.RemoveReaction(ctx, msg.MessageId, msg.ConversationId, senderUserID, msg.Emoji)
+	}
+	if err != nil {
+		switch {
+		case errors.Is(err, db.ErrConversationAccessDenied):
+			return nil, false, ErrNotMember
+		case errors.Is(err, db.ErrMessageMutationScope):
+			return nil, false, ErrMessageConversationMismatch
+		case errors.Is(err, db.ErrReactionLimitReached):
+			return nil, false, ErrReactionLimitReached
+		default:
+			return nil, false, fmt.Errorf("mutate reaction: %w", err)
 		}
+	}
+	if !changed {
+		return nil, false, nil
 	}
 
 	members, err := s.db.GetAuthorizedConversationMembers(ctx, msg.ConversationId, db.ChannelReadPermissions)
 	if err != nil {
-		return nil, fmt.Errorf("get members: %w", err)
+		return nil, false, fmt.Errorf("get members: %w", err)
 	}
 
 	var recipients []string
@@ -327,7 +329,7 @@ func (s *Service) HandleReaction(ctx context.Context, senderUserID string, msg *
 			recipients = append(recipients, uid)
 		}
 	}
-	return recipients, nil
+	return recipients, true, nil
 }
 
 // HandlePreKeyRequest fetches a prekey bundle for establishing an X3DH session.

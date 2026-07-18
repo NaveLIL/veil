@@ -480,7 +480,7 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("edit reconciliation fixture: %v", err)
 		}
-		if _, err := h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
+		if _, _, err := h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
 			MessageId: first.ID, ConversationId: aliceBobConversationID, Emoji: "fire", Add: true,
 		}); err != nil {
 			t.Fatalf("reaction reconciliation fixture: %v", err)
@@ -597,18 +597,46 @@ func TestSecurityPrincipalBinding(t *testing.T) {
 			t.Fatalf("cross-conversation delete error = %v, want mismatch", err)
 		}
 
-		_, err = h.Chat.HandleReaction(context.Background(), mallory.ID, &pb.ReactionUpdate{
+		_, _, err = h.Chat.HandleReaction(context.Background(), mallory.ID, &pb.ReactionUpdate{
 			MessageId: message.ID, ConversationId: aliceBobConversationID, Emoji: "👍", Add: true,
 		})
 		if !errors.Is(err, chat.ErrNotMember) {
 			t.Fatalf("non-member reaction error = %v, want ErrNotMember", err)
 		}
 
-		_, err = h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
+		_, _, err = h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
 			MessageId: message.ID, ConversationId: bobMalloryConversationID, Emoji: "👍", Add: true,
 		})
 		if !errors.Is(err, chat.ErrMessageConversationMismatch) {
 			t.Fatalf("cross-conversation reaction error = %v, want mismatch", err)
+		}
+
+		if _, err := h.DB.Pool.Exec(context.Background(),
+			`INSERT INTO reactions (message_id, conversation_id, user_id, emoji)
+			 SELECT $1::uuid, $2::uuid, $3::uuid, 'history-cap-' || value::text
+			 FROM generate_series(1, $4) AS value`,
+			message.ID, aliceBobConversationID, bob.ID, db.MaxReactionsPerMessage,
+		); err != nil {
+			t.Fatalf("prefill reaction boundary: %v", err)
+		}
+		if _, changed, err := h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
+			MessageId: message.ID, ConversationId: aliceBobConversationID, Emoji: "history-cap-1", Add: true,
+		}); err != nil || changed {
+			t.Fatalf("exact reaction add at cap must remain idempotent: %v", err)
+		}
+		if _, _, err := h.Chat.HandleReaction(context.Background(), bob.ID, &pb.ReactionUpdate{
+			MessageId: message.ID, ConversationId: aliceBobConversationID, Emoji: "history-cap-overflow", Add: true,
+		}); !errors.Is(err, chat.ErrReactionLimitReached) {
+			t.Fatalf("reaction overflow error = %v, want ErrReactionLimitReached", err)
+		}
+		var reactionCount int
+		if err := h.DB.Pool.QueryRow(context.Background(),
+			`SELECT COUNT(*) FROM reactions WHERE message_id = $1::uuid`, message.ID,
+		).Scan(&reactionCount); err != nil {
+			t.Fatal(err)
+		}
+		if reactionCount != db.MaxReactionsPerMessage {
+			t.Fatalf("reaction overflow changed count to %d", reactionCount)
 		}
 	})
 

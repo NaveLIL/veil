@@ -215,11 +215,13 @@ dump and archives to separate storage, and verify the PostgreSQL dump with
 `pg_restore --list` before proceeding. A live copy of `veil_pgdata` is not a
 substitute for `pg_dump` or a coordinated filesystem snapshot.
 
-Two migrations are intentionally destructive and require explicit acceptance:
+Three migrations are intentionally destructive and require explicit acceptance:
 
 - `023_veil_links_and_bans.sql` drops/recreates invite data, removes voice-room
   channel rows, and drops `servers.icon_url`;
-- `025_webpush_cutover.sql` deletes all existing push subscriptions.
+- `025_webpush_cutover.sql` deletes all existing push subscriptions;
+- `028_reaction_history_bound.sql` removes invalid legacy reaction-scope rows
+  and deterministically retains only the oldest 256 reactions per message.
 
 If any of that data must survive, stop here and write a conversion migration.
 An application image rollback cannot undo these database changes.

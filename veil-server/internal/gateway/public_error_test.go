@@ -29,6 +29,26 @@ func TestSendPublicErrorDoesNotExposeCause(t *testing.T) {
 	}
 }
 
+func TestReactionLimitErrorIsStaticAndUnderstandable(t *testing.T) {
+	t.Parallel()
+	client := &Client{send: make(chan outboundBatch, 1)}
+	client.sendPublicError(74, http.StatusConflict, publicerr.New(
+		http.StatusConflict,
+		"reaction_limit_reached",
+		"message reaction limit reached",
+		errors.New(transportSecretCanary),
+	))
+	errorEnvelope := decodePublicErrorEnvelope(t, <-client.send).GetError()
+	if errorEnvelope == nil ||
+		errorEnvelope.GetCode() != http.StatusConflict ||
+		errorEnvelope.GetMessage() != "message reaction limit reached" {
+		t.Fatalf("unexpected reaction-limit error: %#v", errorEnvelope)
+	}
+	if strings.Contains(errorEnvelope.GetMessage(), transportSecretCanary) {
+		t.Fatal("private reaction-limit cause leaked through WS error")
+	}
+}
+
 func TestSendPublicAuthFailureDoesNotExposeCause(t *testing.T) {
 	t.Parallel()
 	client := &Client{send: make(chan outboundBatch, 1)}

@@ -34,6 +34,7 @@ var (
 	ErrMessageSecurityContext           = errors.New("message security context does not match the conversation")
 	ErrMessageRosterChanged             = errors.New("message roster changed before durable admission")
 	ErrConversationAccessDenied         = errors.New("conversation access denied")
+	ErrReactionLimitReached             = errors.New("message reaction limit reached")
 	ErrPreKeyMaterialConflict           = errors.New("prekey protocol id already has different key material")
 	ErrPreKeyLiveStateFull              = errors.New("prekey live-state capacity reached")
 )
@@ -59,6 +60,11 @@ const (
 	MessageCryptoProfileSenderKeyV5 = "sender_key_v5"
 	MessageCryptoEraSenderKeyV5     = uint64(1)
 )
+
+// MaxReactionsPerMessage is the shared server/mobile history bound. Admission
+// is serialized per message in AddReaction so a committed row can never make
+// the strict mobile history parser observe a larger set.
+const MaxReactionsPerMessage = 256
 
 // --- Users ---
 
@@ -2821,26 +2827,176 @@ func (db *DB) MessageBelongsToConversation(ctx context.Context, messageID, conve
 	return exists, err
 }
 
-// AddReaction inserts a reaction (idempotent — ignores conflict).
-func (db *DB) AddReaction(ctx context.Context, messageID, conversationID, userID, emoji string) error {
-	_, err := db.Pool.Exec(ctx,
+// AddReaction inserts a reaction idempotently while enforcing the bounded
+// history contract. It returns false for an exact retry. Authorization,
+// message scope and admission are linearized in one transaction so a
+// committed revoke/delete cannot land between validation and storage.
+func (db *DB) AddReaction(ctx context.Context, messageID, conversationID, userID, emoji string) (bool, error) {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := lockAuthorizedReactionAccess(ctx, tx, conversationID, userID); err != nil {
+		return false, err
+	}
+
+	// The database trigger takes the same lock for raw/future writers. Taking
+	// it explicitly here lets us map the cap to a stable domain error before
+	// attempting the INSERT. It must precede the message row lock: raw INSERT
+	// takes advisory first and later obtains an FK KEY SHARE lock on messages.
+	// A hash collision only delays another message.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::uuid::text, 73))`,
+		messageID,
+	); err != nil {
+		return false, fmt.Errorf("lock message reactions: %w", err)
+	}
+	if err := lockActiveReactionMessage(ctx, tx, messageID, conversationID); err != nil {
+		return false, err
+	}
+
+	var exists bool
+	if err := tx.QueryRow(ctx,
+		`SELECT EXISTS(
+		   SELECT 1 FROM reactions
+		   WHERE message_id = $1::uuid AND conversation_id = $2::uuid
+		     AND user_id = $3::uuid AND emoji = $4
+		 )`,
+		messageID, conversationID, userID, emoji,
+	).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check existing reaction: %w", err)
+	}
+	if exists {
+		if err := tx.Commit(ctx); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+
+	var count int
+	if err := tx.QueryRow(ctx,
+		`SELECT COUNT(*) FROM reactions WHERE message_id = $1::uuid`,
+		messageID,
+	).Scan(&count); err != nil {
+		return false, fmt.Errorf("count message reactions: %w", err)
+	}
+	if count >= MaxReactionsPerMessage {
+		return false, ErrReactionLimitReached
+	}
+
+	tag, err := tx.Exec(ctx,
 		`INSERT INTO reactions (message_id, conversation_id, user_id, emoji)
 		 VALUES ($1::uuid, $2::uuid, $3::uuid, $4)
-		 ON CONFLICT DO NOTHING`,
+		 ON CONFLICT (message_id, user_id, emoji) DO NOTHING`,
 		messageID, conversationID, userID, emoji,
 	)
-	return err
+	if err != nil {
+		if isReactionLimitViolation(err) {
+			return false, ErrReactionLimitReached
+		}
+		return false, fmt.Errorf("insert reaction: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
 }
 
-// RemoveReaction deletes a specific reaction.
-func (db *DB) RemoveReaction(ctx context.Context, messageID, conversationID, userID, emoji string) error {
-	_, err := db.Pool.Exec(ctx,
+// RemoveReaction deletes a specific reaction and returns false for an
+// idempotent no-op. It uses the same authoritative scope transaction as add.
+func (db *DB) RemoveReaction(ctx context.Context, messageID, conversationID, userID, emoji string) (bool, error) {
+	tx, err := db.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+	if err := lockAuthorizedReactionAccess(ctx, tx, conversationID, userID); err != nil {
+		return false, err
+	}
+	if err := lockActiveReactionMessage(ctx, tx, messageID, conversationID); err != nil {
+		return false, err
+	}
+	tag, err := tx.Exec(ctx,
 		`DELETE FROM reactions
 		 WHERE message_id = $1::uuid AND conversation_id = $2::uuid
 		   AND user_id = $3::uuid AND emoji = $4`,
 		messageID, conversationID, userID, emoji,
 	)
-	return err
+	if err != nil {
+		return false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// lockAuthorizedReactionAccess linearizes current ACL state against every
+// roster-changing trigger. Access is checked before looking up the message so
+// an unauthorized caller cannot probe message existence.
+func lockAuthorizedReactionAccess(ctx context.Context, tx pgx.Tx, conversationID, userID string) error {
+	var revision int64
+	if err := tx.QueryRow(ctx,
+		`SELECT mutation_revision
+		 FROM conversation_roster_revisions
+		 WHERE conversation_id = $1::uuid
+		 FOR UPDATE`,
+		conversationID,
+	).Scan(&revision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrConversationAccessDenied
+		}
+		return fmt.Errorf("lock conversation roster revision: %w", err)
+	}
+	allowed, err := canAccessConversationWithQuery(
+		ctx,
+		tx,
+		conversationID,
+		userID,
+		PermViewChannel|PermSendMessages,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return ErrConversationAccessDenied
+	}
+	if err != nil {
+		return fmt.Errorf("authorize reaction mutation: %w", err)
+	}
+	if !allowed {
+		return ErrConversationAccessDenied
+	}
+	return nil
+}
+
+// lockActiveReactionMessage linearizes against edits and soft deletes. Add
+// calls this only after the per-message advisory lock, matching the raw INSERT
+// trigger's advisory -> foreign-key parent-lock order and avoiding a cycle.
+func lockActiveReactionMessage(ctx context.Context, tx pgx.Tx, messageID, conversationID string) error {
+	var active bool
+	if err := tx.QueryRow(ctx,
+		`SELECT true
+		 FROM messages
+		 WHERE id = $1::uuid
+		   AND conversation_id = $2::uuid
+		   AND is_deleted = false
+		 FOR UPDATE`,
+		messageID,
+		conversationID,
+	).Scan(&active); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrMessageMutationScope
+		}
+		return fmt.Errorf("lock reaction message: %w", err)
+	}
+	return nil
+}
+
+func isReactionLimitViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) &&
+		pgErr.Code == "23514" &&
+		pgErr.ConstraintName == "reactions_per_message_limit"
 }
 
 // Reaction represents a single stored reaction.
