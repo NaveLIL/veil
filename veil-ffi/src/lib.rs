@@ -107,6 +107,13 @@ struct MobileDirectSyncState {
     current_history: Option<veil_client::direct_history::DirectHistorySyncState>,
     blocked_conversations: BTreeMap<String, MobileDirectHistoryOutcome>,
     outstanding_request: Option<MobileDirectOutstandingRequest>,
+    /// Native-owned FIFO cursor for the exact durable Direct outbox. It is
+    /// born as `None` with every new authenticated lease and never crosses the
+    /// FFI boundary, so Android cannot skip or replay a caller-selected row.
+    outbox_replay_cursor: Option<u64>,
+    /// The renderer and send boundary stay closed after live history reaches
+    /// Ready until this lease has visited the complete durable outbox.
+    outbox_replay_complete: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +217,8 @@ fn fail_mobile_direct_sync_sticky(state: &mut MobileDirectSyncState) {
     state.outstanding_request = None;
     state.current_history = None;
     state.own_prekey_publication = None;
+    state.outbox_replay_cursor = None;
+    state.outbox_replay_complete = false;
 }
 
 fn finish_mobile_direct_history_conversation(
@@ -346,7 +355,36 @@ pub struct MobileDirectLiveReplayProgress {
     pub consumed: u32,
     pub projection_changed: bool,
     pub needs_immediate_pump: bool,
+    /// Live history is quiescent, but the exact durable outbox still owns the
+    /// renderer-opening barrier for this lease.
+    pub outbox_replay_required: bool,
     pub ready: bool,
+}
+
+/// Aggregate-only result of one bounded exact-byte Direct outbox replay turn.
+///
+/// Queue order, message IDs, conversation IDs, ciphertext and plaintext stay
+/// native. Android may only schedule another turn or revoke the connection.
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectOutboxReplayProgress {
+    pub visited: u32,
+    pub enqueued: u32,
+    pub needs_immediate_pump: bool,
+    pub replay_complete: bool,
+}
+
+/// Opaque terminal outcome for one explicit Direct text user intent.
+///
+/// `AcceptedForReplay` still means SQLCipher owns the intent. Android must not
+/// create a second intent; it closes the current lease and reconnects so the
+/// exact persisted bytes/ID can be replayed after the next Ready checkpoint.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileDirectTextSendOutcome {
+    Accepted,
+    AcceptedForReplay,
+    NeedsPreKey,
+    Rejected,
+    Unavailable,
 }
 
 /// Opaque UI availability for one caller-supplied Direct conversation.
@@ -439,6 +477,7 @@ pub struct MobileDirectMessageProjection {
 const MOBILE_DIRECT_MESSAGE_PROJECTION_LIMIT: u32 = 100;
 const MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES: usize = 32 * 1024;
 const MOBILE_DIRECT_MESSAGE_PROJECTION_MAX_PLAINTEXT_BYTES: usize = 1024 * 1024;
+const MOBILE_DIRECT_OUTBOX_REPLAY_MAX_BATCH: usize = 64;
 
 fn unavailable_mobile_direct_message_projection() -> MobileDirectMessageProjection {
     MobileDirectMessageProjection {
@@ -531,6 +570,7 @@ fn mobile_direct_send_readiness_for_current_lease(
 ) -> MobileDirectSendReadiness {
     if state.token != lease_token
         || state.phase != MobileDirectSyncPhase::Ready
+        || !state.outbox_replay_complete
         || current_binding != Some(&state.epoch)
     {
         return MobileDirectSendReadiness::Unavailable;
@@ -561,6 +601,19 @@ fn mobile_direct_prekey_unavailable_error() -> VeilError {
     VeilError::Session {
         msg: "mobile Direct prekey route is unavailable".to_string(),
     }
+}
+
+/// Revoke one already-locked mobile Direct epoch after transport loss or a
+/// native invariant failure. Callers must retain `direct_sync -> binding ->
+/// client` while invoking this helper.
+fn revoke_mobile_direct_epoch_locked(
+    state: &mut MobileDirectSyncState,
+    binding: &mut Option<MobileAuthenticatedEpoch>,
+    client: &mut veil_client::api::VeilClient,
+) {
+    *binding = None;
+    fail_mobile_direct_sync_sticky(state);
+    client.disconnect();
 }
 
 #[derive(uniffi::Record)]
@@ -1234,6 +1287,8 @@ impl VeilMobileSession {
             current_history: None,
             blocked_conversations: BTreeMap::new(),
             outstanding_request: None,
+            outbox_replay_cursor: None,
+            outbox_replay_complete: false,
         });
         Ok(MobileDirectSyncLease {
             token,
@@ -2010,8 +2065,214 @@ impl VeilMobileSession {
                 || report.newly_blocked > 0
                 || report.visible_mutations > 0,
             needs_immediate_pump: !report.quiescent,
-            ready: state.phase == MobileDirectSyncPhase::Ready,
+            outbox_replay_required: state.phase == MobileDirectSyncPhase::Ready
+                && !state.outbox_replay_complete,
+            ready: state.phase == MobileDirectSyncPhase::Ready && state.outbox_replay_complete,
         })
+    }
+
+    /// Replay one native-owned FIFO page of the exact durable Direct outbox.
+    ///
+    /// This barrier is available only after authenticated history/live replay
+    /// reached the exact lease's Ready phase. The cursor never crosses FFI and
+    /// is reset to `None` by construction for every new lease. Renderer and
+    /// send projection guards remain closed until a bounded turn reports the
+    /// end of the queue.
+    pub fn replay_direct_outbox(
+        &self,
+        lease_token: String,
+    ) -> Result<MobileDirectOutboxReplayProgress, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct outbox replay is unavailable".to_string(),
+        })?;
+        if state.token != lease_token
+            || state.phase != MobileDirectSyncPhase::Ready
+            || state.outstanding_request.is_some()
+        {
+            return Err(VeilError::Session {
+                msg: "mobile Direct outbox replay lease is stale or unavailable".to_string(),
+            });
+        }
+
+        let mut binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(VeilError::Session {
+                msg: "mobile Direct outbox replay lease is stale".to_string(),
+            });
+        }
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+
+        if state.outbox_replay_complete {
+            return Ok(MobileDirectOutboxReplayProgress {
+                visited: 0,
+                enqueued: 0,
+                needs_immediate_pump: false,
+                replay_complete: true,
+            });
+        }
+
+        let previous_cursor = state.outbox_replay_cursor;
+        let report = match self.runtime.block_on(
+            client.replay_direct_outbox_v1(previous_cursor, MOBILE_DIRECT_OUTBOX_REPLAY_MAX_BATCH),
+        ) {
+            Ok(report) => report,
+            Err(veil_client::api::DirectSendErrorV1::Rejected(_)) => {
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                return Err(VeilError::Session {
+                    msg: "mobile Direct outbox replay was rejected".to_string(),
+                });
+            }
+            Err(veil_client::api::DirectSendErrorV1::StorageUncertain(_)) => {
+                *binding = None;
+                fail_mobile_direct_sync_sticky(state);
+                return Err(VeilError::Session {
+                    msg: "mobile Direct outbox replay storage is uncertain".to_string(),
+                });
+            }
+        };
+
+        let cursor_is_valid = match (previous_cursor, report.next_queue_order, report.visited) {
+            (previous, next, 0) => previous == next,
+            (None, Some(next), _) => next > 0,
+            (Some(previous), Some(next), _) => next > previous,
+            _ => false,
+        };
+        let report_is_valid = report.visited <= MOBILE_DIRECT_OUTBOX_REPLAY_MAX_BATCH
+            && report.enqueued <= report.visited
+            && report.pending_total <= veil_client::api::DIRECT_OUTBOX_MAX_PENDING_V1
+            && cursor_is_valid
+            && !(report.reached_end && report.transport_blocked)
+            && (report.reached_end
+                || report.transport_blocked
+                || report.visited == MOBILE_DIRECT_OUTBOX_REPLAY_MAX_BATCH);
+        if !report_is_valid {
+            revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+            return Err(VeilError::Session {
+                msg: "mobile Direct outbox replay violated its batch contract".to_string(),
+            });
+        }
+
+        if report.transport_blocked {
+            revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+            return Err(VeilError::Session {
+                msg: "mobile Direct outbox replay transport is unavailable".to_string(),
+            });
+        }
+        let progress = MobileDirectOutboxReplayProgress {
+            visited: report
+                .visited
+                .try_into()
+                .expect("bounded Direct outbox replay count fits u32"),
+            enqueued: report
+                .enqueued
+                .try_into()
+                .expect("bounded Direct outbox enqueue count fits u32"),
+            needs_immediate_pump: !report.reached_end,
+            replay_complete: report.reached_end,
+        };
+        state.outbox_replay_cursor = report.next_queue_order;
+        if report.reached_end {
+            state.outbox_replay_complete = true;
+        }
+        Ok(progress)
+    }
+
+    /// Atomically accept one explicit Direct text intent under the exact Ready
+    /// lease. Every authority guard is repeated while retaining the documented
+    /// `direct_sync -> binding -> client` lock order. No message ID, sequence,
+    /// ciphertext or error detail crosses FFI.
+    pub fn send_direct_text(
+        &self,
+        lease_token: String,
+        conversation_id: String,
+        plaintext_utf8: Vec<u8>,
+    ) -> Result<MobileDirectTextSendOutcome, VeilError> {
+        let plaintext_utf8 = Zeroizing::new(plaintext_utf8);
+        if require_mobile_sync_token(&lease_token).is_err() {
+            return Ok(MobileDirectTextSendOutcome::Unavailable);
+        }
+        let Ok(conversation_id) =
+            require_canonical_user_id("Direct conversation ID", &conversation_id)
+        else {
+            return Ok(MobileDirectTextSendOutcome::Unavailable);
+        };
+        let Ok(plaintext) = std::str::from_utf8(plaintext_utf8.as_slice()) else {
+            return Ok(MobileDirectTextSendOutcome::Rejected);
+        };
+        if plaintext.is_empty() || plaintext.len() > MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES {
+            return Ok(MobileDirectTextSendOutcome::Rejected);
+        }
+
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let Some(state) = sync.as_mut() else {
+            return Ok(MobileDirectTextSendOutcome::Unavailable);
+        };
+        let mut binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        if state.outstanding_request.is_some() {
+            return Ok(MobileDirectTextSendOutcome::Unavailable);
+        }
+        match mobile_direct_send_readiness_for_current_lease(
+            &client,
+            state,
+            binding.as_ref(),
+            &lease_token,
+            &conversation_id,
+        ) {
+            MobileDirectSendReadiness::NeedsPreKey => {
+                return Ok(MobileDirectTextSendOutcome::NeedsPreKey)
+            }
+            MobileDirectSendReadiness::Unavailable => {
+                return Ok(MobileDirectTextSendOutcome::Unavailable)
+            }
+            MobileDirectSendReadiness::Ready => {}
+        }
+
+        match self
+            .runtime
+            .block_on(client.enqueue_direct_text_v1(&conversation_id, plaintext))
+        {
+            Ok(report) if report.transport_enqueued && report.sequence > 0 => {
+                Ok(MobileDirectTextSendOutcome::Accepted)
+            }
+            Ok(_) => {
+                // SQLCipher already owns this exact user intent. Revoke the
+                // transport lease so only a new Ready epoch can replay it.
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                Ok(MobileDirectTextSendOutcome::AcceptedForReplay)
+            }
+            Err(veil_client::api::DirectSendErrorV1::Rejected(_)) => {
+                Ok(MobileDirectTextSendOutcome::Rejected)
+            }
+            Err(veil_client::api::DirectSendErrorV1::StorageUncertain(_)) => {
+                *binding = None;
+                fail_mobile_direct_sync_sticky(state);
+                Err(VeilError::Session {
+                    msg: "mobile Direct send storage is uncertain".to_string(),
+                })
+            }
+        }
     }
 
     /// Return coarse, advisory send readiness for one exact Direct route under
@@ -2077,7 +2338,7 @@ impl VeilMobileSession {
         let Some(state) = sync.as_ref() else {
             return Ok(unavailable_mobile_direct_message_projection());
         };
-        if state.phase != MobileDirectSyncPhase::Ready {
+        if state.phase != MobileDirectSyncPhase::Ready || !state.outbox_replay_complete {
             return Ok(unavailable_mobile_direct_message_projection());
         }
 
@@ -3448,6 +3709,8 @@ mod tests {
             current_history: None,
             blocked_conversations: BTreeMap::new(),
             outstanding_request: None,
+            outbox_replay_cursor: None,
+            outbox_replay_complete: false,
         }
     }
 
@@ -3501,6 +3764,8 @@ mod tests {
                     current_history: None,
                     blocked_conversations: BTreeMap::new(),
                     outstanding_request: None,
+                    outbox_replay_cursor: None,
+                    outbox_replay_complete: false,
                 })),
                 next_binding_generation: AtomicU64::new(generation),
                 last_rest_timestamp_ms: AtomicI64::new(0),
@@ -3561,6 +3826,13 @@ mod tests {
         assert!(page.conversations[0].needs_prekey);
         let conversation_id = page.conversations[0].conversation_id.clone();
         session.direct_sync.lock().unwrap().as_mut().unwrap().phase = MobileDirectSyncPhase::Ready;
+        session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .outbox_replay_complete = true;
         (conversation_id, peer)
     }
 
@@ -4684,20 +4956,53 @@ mod tests {
     }
 
     #[test]
-    fn mobile_direct_live_replay_opens_ready_only_after_explicit_quiescence() {
+    fn mobile_direct_live_replay_requires_exact_outbox_barrier_after_quiescence() {
         let (session, path, token) = mobile_test_session_with_sync(120);
-        session.direct_sync.lock().unwrap().as_mut().unwrap().phase =
-            MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+        let _outbound = mobile_test_install_queued_connection(&session);
+        let _conversation_id = mobile_test_install_ready_direct(&session, &token);
+        {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.history_index = state.history_order.len();
+            state.phase = MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+            state.outbox_replay_cursor = None;
+            state.outbox_replay_complete = false;
+        }
 
-        let progress = session.replay_direct_live_events(token).unwrap();
+        let progress = session.replay_direct_live_events(token.clone()).unwrap();
 
         assert_eq!(progress.consumed, 0);
         assert!(!progress.projection_changed);
         assert!(!progress.needs_immediate_pump);
-        assert!(progress.ready);
+        assert!(progress.outbox_replay_required);
+        assert!(!progress.ready);
         assert_eq!(
             session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
             MobileDirectSyncPhase::Ready
+        );
+        assert!(
+            !session
+                .direct_sync
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .outbox_replay_complete
+        );
+
+        let outbox = session.replay_direct_outbox(token).unwrap();
+        assert_eq!(outbox.visited, 0);
+        assert_eq!(outbox.enqueued, 0);
+        assert!(!outbox.needs_immediate_pump);
+        assert!(outbox.replay_complete);
+        assert!(
+            session
+                .direct_sync
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .outbox_replay_complete
         );
 
         drop(session);
@@ -5697,6 +6002,263 @@ mod tests {
             session.direct_send_readiness(token, conversation_id),
             MobileDirectSendReadiness::Ready
         );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_text_send_is_native_atomic_and_projects_only_the_durable_row() {
+        let (session, path, token, conversation_id, peer, mut outbound) =
+            mobile_test_ready_prekey_fixture(130);
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+
+        assert_eq!(
+            session
+                .send_direct_text(
+                    token,
+                    conversation_id.clone(),
+                    b"durable mobile hello".to_vec(),
+                )
+                .unwrap(),
+            MobileDirectTextSendOutcome::Accepted
+        );
+        let wire = session
+            .runtime
+            .block_on(async { outbound.recv().await })
+            .expect("accepted Direct text must enter the native transport");
+        assert!(!wire.is_empty());
+        let pending_count: i64 = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1 WHERE state = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 1);
+        let projection = session.project_direct_messages(conversation_id).unwrap();
+        assert_eq!(
+            projection.availability,
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        assert_eq!(projection.messages.len(), 1);
+        assert_eq!(projection.messages[0].text(), "durable mobile hello");
+        assert_eq!(
+            projection.messages[0].delivery(),
+            MobileDirectMessageDelivery::Sending
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_text_send_needs_prekey_without_accepting_an_intent() {
+        let (session, path, token, conversation_id, _peer, mut outbound) =
+            mobile_test_ready_prekey_fixture(131);
+
+        assert_eq!(
+            session
+                .send_direct_text(token, conversation_id, b"not accepted yet".to_vec())
+                .unwrap(),
+            MobileDirectTextSendOutcome::NeedsPreKey
+        );
+        let pending_count: i64 = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .query_row("SELECT COUNT(*) FROM direct_message_outbox_v1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(pending_count, 0);
+        assert!(matches!(
+            outbound.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_text_transport_loss_keeps_intent_and_revokes_the_lease() {
+        let (session, path, token, conversation_id, peer, outbound) =
+            mobile_test_ready_prekey_fixture(132);
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        drop(outbound);
+
+        assert_eq!(
+            session
+                .send_direct_text(token, conversation_id, b"replay me exactly".to_vec())
+                .unwrap(),
+            MobileDirectTextSendOutcome::AcceptedForReplay
+        );
+        assert!(session.binding.lock().unwrap().is_none());
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Failed
+        );
+        let pending_count: i64 = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1 WHERE state = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 1);
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_new_ready_lease_replays_the_exact_persisted_payload() {
+        let (session, path, token, conversation_id, peer, mut first_outbound) =
+            mobile_test_ready_prekey_fixture(133);
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        assert_eq!(
+            session
+                .send_direct_text(token, conversation_id, b"survive reconnect".to_vec(),)
+                .unwrap(),
+            MobileDirectTextSendOutcome::Accepted
+        );
+        let first_wire = session
+            .runtime
+            .block_on(async { first_outbound.recv().await })
+            .unwrap();
+        let exact_payload: Vec<u8> = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT exact_send_message_payload FROM direct_message_outbox_v1 WHERE state = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(first_wire.ends_with(&exact_payload));
+
+        let renewed_epoch = mobile_test_epoch(134);
+        let renewed_token = "cd".repeat(32);
+        {
+            let mut client = session.client.lock().unwrap();
+            client.disconnect();
+            client
+                .test_only_reconcile_previous_transport_before_install_v1()
+                .unwrap();
+            client
+                .test_only_restore_authenticated_user_from_durable_binding(
+                    &renewed_epoch.binding.canonical_server_origin,
+                    &renewed_epoch.binding.user_id,
+                )
+                .unwrap();
+        }
+        let mut replay_outbound = mobile_test_install_queued_connection(&session);
+        {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.token = renewed_token.clone();
+            state.epoch = renewed_epoch.clone();
+            state.phase = MobileDirectSyncPhase::Ready;
+            state.outbox_replay_cursor = None;
+            state.outbox_replay_complete = false;
+        }
+        *session.binding.lock().unwrap() = Some(renewed_epoch);
+
+        let replay = session.replay_direct_outbox(renewed_token).unwrap();
+        assert_eq!(replay.visited, 1);
+        assert_eq!(replay.enqueued, 1);
+        assert!(replay.replay_complete);
+        assert!(!replay.needs_immediate_pump);
+        let replay_wire = session
+            .runtime
+            .block_on(async { replay_outbound.recv().await })
+            .unwrap();
+        assert!(replay_wire.ends_with(&exact_payload));
+        assert_eq!(
+            first_wire, replay_wire,
+            "fresh test sockets restart the same outer sequence; the exact frame must match"
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_text_storage_uncertainty_revokes_all_mobile_authority() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(135);
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_mobile_direct_outbox
+                 BEFORE INSERT ON direct_message_outbox_v1
+                 BEGIN
+                    SELECT RAISE(ABORT, 'forced mobile outbox failure');
+                 END;",
+            )
+            .unwrap();
+
+        let error = session
+            .send_direct_text(token, conversation_id, b"uncertain".to_vec())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("send storage is uncertain"));
+        assert!(session.binding.lock().unwrap().is_none());
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Failed
+        );
+        assert!(!session.client.lock().unwrap().is_connected());
 
         drop(session);
         let _ = std::fs::remove_file(path);

@@ -304,6 +304,10 @@ impl DirectSessionEstablishErrorV1 {
 /// authenticated socket events. The caller must schedule another turn when
 /// `quiescent` is false, giving lifecycle/terminal checks a bounded cadence.
 pub const DIRECT_LIVE_REPLAY_MAX_BATCH_V1: usize = 64;
+/// Shared upper bound used by native controllers when validating aggregate
+/// durable Direct outbox replay reports. Individual queue orders and IDs stay
+/// inside the client/store boundary.
+pub const DIRECT_OUTBOX_MAX_PENDING_V1: usize = DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1;
 
 /// Deliberately coarse output from one Direct live-replay turn.
 ///
@@ -4186,6 +4190,15 @@ impl VeilClient {
         let (connection, outbound) = crate::connection::Connection::test_only_queued_connection();
         self.connection = Some(connection);
         outbound
+    }
+
+    /// Test-only equivalent of the production pre-install reconnect barrier.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_reconcile_previous_transport_before_install_v1(
+        &mut self,
+    ) -> Result<(), String> {
+        self.reconcile_previous_transport_before_install_v1()
     }
 
     /// Test-only bridge for cross-crate native guard tests. Production

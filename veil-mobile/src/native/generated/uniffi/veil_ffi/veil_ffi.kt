@@ -862,6 +862,10 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -958,6 +962,10 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_own_prekey_request
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_project_direct_messages(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_live_events(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_outbox(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_send_direct_text(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request(
 ): Short
@@ -1149,6 +1157,10 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_own_prekey_request(`ptr`
 fun uniffi_veil_ffi_fn_method_veilmobilesession_project_direct_messages(`ptr`: Pointer,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_live_events(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_outbox(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_send_direct_text(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,`plaintextUtf8`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_sign_direct_rest_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
@@ -1469,6 +1481,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_live_events() != 1036.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_outbox() != 35205.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_send_direct_text() != 47245.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request() != 2886.toShort()) {
@@ -3012,6 +3030,25 @@ public interface VeilMobileSessionInterface {
     fun `replayDirectLiveEvents`(`leaseToken`: kotlin.String): MobileDirectLiveReplayProgress
 
     /**
+     * Replay one native-owned FIFO page of the exact durable Direct outbox.
+     *
+     * This barrier is available only after authenticated history/live replay
+     * reached the exact lease's Ready phase. The cursor never crosses FFI and
+     * is reset to `None` by construction for every new lease. Renderer and
+     * send projection guards remain closed until a bounded turn reports the
+     * end of the queue.
+     */
+    fun `replayDirectOutbox`(`leaseToken`: kotlin.String): MobileDirectOutboxReplayProgress
+
+    /**
+     * Atomically accept one explicit Direct text intent under the exact Ready
+     * lease. Every authority guard is repeated while retaining the documented
+     * `direct_sync -> binding -> client` lock order. No message ID, sequence,
+     * ciphertext or error detail crosses FFI.
+     */
+    fun `sendDirectText`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String, `plaintextUtf8`: kotlin.ByteArray): MobileDirectTextSendOutcome
+
+    /**
      * Sign only the exact native-owned Direct request identified by the
      * current lease and request capability. The transport never supplies
      * method, target, or body to the signing boundary. Peer-prekey GETs repeat
@@ -3456,6 +3493,47 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_live_events(
         it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Replay one native-owned FIFO page of the exact durable Direct outbox.
+     *
+     * This barrier is available only after authenticated history/live replay
+     * reached the exact lease's Ready phase. The cursor never crosses FFI and
+     * is reset to `None` by construction for every new lease. Renderer and
+     * send projection guards remain closed until a bounded turn reports the
+     * end of the queue.
+     */
+    @Throws(VeilException::class)override fun `replayDirectOutbox`(`leaseToken`: kotlin.String): MobileDirectOutboxReplayProgress {
+            return FfiConverterTypeMobileDirectOutboxReplayProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_outbox(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Atomically accept one explicit Direct text intent under the exact Ready
+     * lease. Every authority guard is repeated while retaining the documented
+     * `direct_sync -> binding -> client` lock order. No message ID, sequence,
+     * ciphertext or error detail crosses FFI.
+     */
+    @Throws(VeilException::class)override fun `sendDirectText`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String, `plaintextUtf8`: kotlin.ByteArray): MobileDirectTextSendOutcome {
+            return FfiConverterTypeMobileDirectTextSendOutcome.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_send_direct_text(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`conversationId`),FfiConverterByteArray.lower(`plaintextUtf8`),_status)
 }
     }
     )
@@ -4657,6 +4735,11 @@ data class MobileDirectLiveReplayProgress (
     var `consumed`: kotlin.UInt,
     var `projectionChanged`: kotlin.Boolean,
     var `needsImmediatePump`: kotlin.Boolean,
+    /**
+     * Live history is quiescent, but the exact durable outbox still owns the
+     * renderer-opening barrier for this lease.
+     */
+    var `outboxReplayRequired`: kotlin.Boolean,
     var `ready`: kotlin.Boolean
 ) {
 
@@ -4673,6 +4756,7 @@ public object FfiConverterTypeMobileDirectLiveReplayProgress: FfiConverterRustBu
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -4680,6 +4764,7 @@ public object FfiConverterTypeMobileDirectLiveReplayProgress: FfiConverterRustBu
             FfiConverterUInt.allocationSize(value.`consumed`) +
             FfiConverterBoolean.allocationSize(value.`projectionChanged`) +
             FfiConverterBoolean.allocationSize(value.`needsImmediatePump`) +
+            FfiConverterBoolean.allocationSize(value.`outboxReplayRequired`) +
             FfiConverterBoolean.allocationSize(value.`ready`)
     )
 
@@ -4687,6 +4772,7 @@ public object FfiConverterTypeMobileDirectLiveReplayProgress: FfiConverterRustBu
             FfiConverterUInt.write(value.`consumed`, buf)
             FfiConverterBoolean.write(value.`projectionChanged`, buf)
             FfiConverterBoolean.write(value.`needsImmediatePump`, buf)
+            FfiConverterBoolean.write(value.`outboxReplayRequired`, buf)
             FfiConverterBoolean.write(value.`ready`, buf)
     }
 }
@@ -4729,6 +4815,52 @@ public object FfiConverterTypeMobileDirectMessageProjection: FfiConverterRustBuf
     override fun write(value: MobileDirectMessageProjection, buf: ByteBuffer) {
             FfiConverterTypeMobileDirectMessageProjectionAvailability.write(value.`availability`, buf)
             FfiConverterSequenceTypeMobileDirectMessageData.write(value.`messages`, buf)
+    }
+}
+
+
+
+/**
+ * Aggregate-only result of one bounded exact-byte Direct outbox replay turn.
+ *
+ * Queue order, message IDs, conversation IDs, ciphertext and plaintext stay
+ * native. Android may only schedule another turn or revoke the connection.
+ */
+data class MobileDirectOutboxReplayProgress (
+    var `visited`: kotlin.UInt,
+    var `enqueued`: kotlin.UInt,
+    var `needsImmediatePump`: kotlin.Boolean,
+    var `replayComplete`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectOutboxReplayProgress: FfiConverterRustBuffer<MobileDirectOutboxReplayProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectOutboxReplayProgress {
+        return MobileDirectOutboxReplayProgress(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectOutboxReplayProgress) = (
+            FfiConverterUInt.allocationSize(value.`visited`) +
+            FfiConverterUInt.allocationSize(value.`enqueued`) +
+            FfiConverterBoolean.allocationSize(value.`needsImmediatePump`) +
+            FfiConverterBoolean.allocationSize(value.`replayComplete`)
+    )
+
+    override fun write(value: MobileDirectOutboxReplayProgress, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`visited`, buf)
+            FfiConverterUInt.write(value.`enqueued`, buf)
+            FfiConverterBoolean.write(value.`needsImmediatePump`, buf)
+            FfiConverterBoolean.write(value.`replayComplete`, buf)
     }
 }
 
@@ -5236,6 +5368,46 @@ public object FfiConverterTypeMobileDirectSendReadiness: FfiConverterRustBuffer<
     override fun allocationSize(value: MobileDirectSendReadiness) = 4UL
 
     override fun write(value: MobileDirectSendReadiness, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Opaque terminal outcome for one explicit Direct text user intent.
+ *
+ * `AcceptedForReplay` still means SQLCipher owns the intent. Android must not
+ * create a second intent; it closes the current lease and reconnects so the
+ * exact persisted bytes/ID can be replayed after the next Ready checkpoint.
+ */
+
+enum class MobileDirectTextSendOutcome {
+
+    ACCEPTED,
+    ACCEPTED_FOR_REPLAY,
+    NEEDS_PRE_KEY,
+    REJECTED,
+    UNAVAILABLE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectTextSendOutcome: FfiConverterRustBuffer<MobileDirectTextSendOutcome> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectTextSendOutcome.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectTextSendOutcome) = 4UL
+
+    override fun write(value: MobileDirectTextSendOutcome, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
