@@ -100,6 +100,31 @@ internal class VeilMobileRuntimeModule(
     }
   }
 
+  /**
+   * Accept one explicit text intent for the exact native Direct generation.
+   * Success is deliberately payload-free: message identity, sequence,
+   * ciphertext, and timestamps remain owned by Rust and SQLCipher.
+   */
+  @ReactMethod
+  fun sendDirectText(
+    conversationId: String,
+    expectedDirectGeneration: Double,
+    text: String,
+    promise: Promise,
+  ) = onRuntimePublication(promise) {
+    val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
+      ?: throw VeilMobileRuntimeException(DIRECT_SEND_UNAVAILABLE_CODE, DIRECT_SEND_UNAVAILABLE)
+    runtime.sendDirectText(conversationId, generation, text) { result ->
+      when (result) {
+        NativeDirectTextSendResult.ACCEPTED -> promise.resolve(null)
+        NativeDirectTextSendResult.REJECTED ->
+          promise.reject(DIRECT_SEND_REJECTED_CODE, DIRECT_SEND_REJECTED)
+        NativeDirectTextSendResult.UNAVAILABLE ->
+          promise.reject(DIRECT_SEND_UNAVAILABLE_CODE, DIRECT_SEND_UNAVAILABLE)
+      }
+    }
+  }
+
   /** Required by React Native's NativeEventEmitter contract. */
   @ReactMethod
   fun addListener(eventName: String) {
@@ -141,6 +166,10 @@ internal class VeilMobileRuntimeModule(
     const val EVENT_STATE_CHANGED = "VeilRuntimeStateChanged"
     private const val DIRECT_SESSION_ERROR_CODE = "E_VEIL_DIRECT_SESSION"
     private const val DIRECT_SESSION_ERROR = "Unable to establish the secure Direct session"
+    private const val DIRECT_SEND_REJECTED_CODE = "E_VEIL_DIRECT_SEND_REJECTED"
+    private const val DIRECT_SEND_REJECTED = "Direct message was rejected"
+    private const val DIRECT_SEND_UNAVAILABLE_CODE = "E_VEIL_DIRECT_SEND_UNAVAILABLE"
+    private const val DIRECT_SEND_UNAVAILABLE = "Direct messaging is unavailable"
   }
 }
 

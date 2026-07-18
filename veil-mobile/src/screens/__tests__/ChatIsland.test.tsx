@@ -1,6 +1,6 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { act, render, waitFor } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
 
 import { ChatIsland } from "../../components/layout/ChatIsland";
 import type {
@@ -14,6 +14,7 @@ jest.mock("../../native/runtime", () => ({
   isExactAuthenticatedBinding: (binding: unknown) => Boolean(binding),
   default: {
     getDirectMessages: jest.fn(),
+    sendDirectText: jest.fn(),
   },
 }));
 
@@ -25,6 +26,11 @@ jest.mock("../../components/identity/UserAvatar", () => {
 
 type RuntimeMock = {
   getDirectMessages: jest.Mock<(conversationId: string) => Promise<DirectMessageProjection>>;
+  sendDirectText: jest.Mock<(
+    conversationId: string,
+    expectedDirectGeneration: number,
+    text: string,
+  ) => Promise<void>>;
 };
 
 const runtime = (jest.requireMock("../../native/runtime") as { default: RuntimeMock }).default;
@@ -54,6 +60,7 @@ const runtimeSnapshot: VeilMobileRuntimeSnapshot = {
 describe("ChatIsland native Direct projection", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    runtime.sendDirectText.mockResolvedValue(undefined);
     resetChatStoreForTests();
     useChatStore.getState().hydrateRuntimeDirectory(runtimeSnapshot);
     useChatStore.getState().selectDm(conversationId);
@@ -83,7 +90,7 @@ describe("ChatIsland native Direct projection", () => {
     expect(useChatStore.getState().messagesByChannel).toEqual({});
   });
 
-  it("renders native immutable text and keeps the composer explicitly read-only", async () => {
+  it("renders native immutable text and enables an empty authoritative composer", async () => {
     runtime.getDirectMessages.mockResolvedValue({
       availability: "available",
       messages: [{
@@ -98,10 +105,11 @@ describe("ChatIsland native Direct projection", () => {
     const view = render(<ChatIsland />);
     await waitFor(() => expect(view.getByText("verified native history")).toBeTruthy());
 
-    const composer = view.getByTestId("direct-read-only-composer");
-    expect(composer.props.editable).toBe(false);
-    expect(composer.props.accessibilityState).toEqual({ disabled: true });
-    expect(view.queryByText("↑")).toBeNull();
+    const composer = view.getByTestId("direct-composer");
+    expect(composer.props.editable).toBe(true);
+    expect(composer.props.accessibilityState).toEqual({ disabled: false });
+    expect(view.getByTestId("direct-send-button").props.accessibilityState)
+      .toEqual({ disabled: true });
   });
 
   it("replaces all rows with an opaque unavailable state", async () => {
@@ -141,5 +149,90 @@ describe("ChatIsland native Direct projection", () => {
 
     expect(view.queryByText("late plaintext")).toBeNull();
     expect(useChatStore.getState().messagesByChannel).toEqual({});
+  });
+
+  it("keeps the draft during native work and clears it only after accepted projection", async () => {
+    runtime.getDirectMessages
+      .mockResolvedValueOnce({ availability: "available", messages: [] })
+      .mockResolvedValueOnce({
+        availability: "available",
+        messages: [{
+          messageId: "66666666-6666-4666-8666-666666666666",
+          text: "native accepted text",
+          timestampMs: null,
+          direction: "outgoing",
+          delivery: "sending",
+        }],
+      });
+    let resolveSend!: () => void;
+    runtime.sendDirectText.mockReturnValue(new Promise<void>((resolve) => {
+      resolveSend = resolve;
+    }));
+
+    const view = render(<ChatIsland />);
+    await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
+    fireEvent.changeText(view.getByTestId("direct-composer"), "native accepted text");
+    fireEvent.press(view.getByTestId("direct-send-button"));
+
+    expect(runtime.sendDirectText).toHaveBeenCalledWith(conversationId, 1, "native accepted text");
+    expect(view.getByTestId("direct-composer").props.value).toBe("native accepted text");
+    expect(view.getByTestId("direct-composer").props.editable).toBe(false);
+    expect(useChatStore.getState().messagesByChannel[conversationId]).toEqual([]);
+
+    await act(async () => {
+      resolveSend();
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(view.getByText("native accepted text")).toBeTruthy());
+    expect(view.getByTestId("direct-composer").props.value).toBe("");
+    expect(runtime.sendDirectText).toHaveBeenCalledTimes(1);
+    expect(runtime.getDirectMessages).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains the draft and shows only a generic rejection", async () => {
+    runtime.getDirectMessages.mockResolvedValue({ availability: "available", messages: [] });
+    runtime.sendDirectText.mockRejectedValue({ reason: "rejected", detail: "must stay hidden" });
+
+    const view = render(<ChatIsland />);
+    await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
+    fireEvent.changeText(view.getByTestId("direct-composer"), "keep this draft");
+    fireEvent.press(view.getByTestId("direct-send-button"));
+
+    await waitFor(() => expect(view.getByTestId("direct-send-error")).toBeTruthy());
+    expect(view.getByTestId("direct-send-error").props.children).toBe("Message was rejected");
+    expect(view.getByTestId("direct-composer").props.value).toBe("keep this draft");
+    expect(runtime.getDirectMessages).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not clear an identical draft entered under a newer generation", async () => {
+    runtime.getDirectMessages.mockResolvedValue({ availability: "available", messages: [] });
+    let resolveOldSend!: () => void;
+    runtime.sendDirectText.mockReturnValue(new Promise<void>((resolve) => {
+      resolveOldSend = resolve;
+    }));
+
+    const view = render(<ChatIsland />);
+    await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
+    fireEvent.changeText(view.getByTestId("direct-composer"), "same draft");
+    fireEvent.press(view.getByTestId("direct-send-button"));
+
+    act(() => {
+      useChatStore.getState().hydrateRuntimeDirectory({
+        ...runtimeSnapshot,
+        runtimeRevision: 2,
+        directGeneration: 2,
+      });
+      useChatStore.getState().selectDm(conversationId);
+    });
+    await waitFor(() => expect(view.getByTestId("direct-composer").props.editable).toBe(true));
+    fireEvent.changeText(view.getByTestId("direct-composer"), "same draft");
+
+    await act(async () => {
+      resolveOldSend();
+      await Promise.resolve();
+    });
+
+    expect(view.getByTestId("direct-composer").props.value).toBe("same draft");
+    expect(runtime.sendDirectText).toHaveBeenCalledTimes(1);
   });
 });

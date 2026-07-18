@@ -877,6 +877,7 @@ class VeilMobileRuntimeTest {
         consumed = 64,
         projectionChanged = true,
         needsImmediatePump = true,
+        outboxReplayRequired = false,
         ready = false,
       ),
     )
@@ -885,7 +886,8 @@ class VeilMobileRuntimeTest {
         consumed = 0,
         projectionChanged = false,
         needsImmediatePump = false,
-        ready = true,
+        outboxReplayRequired = true,
+        ready = false,
       ),
     )
     val directoryBody = "authenticated-directory".toByteArray()
@@ -926,6 +928,102 @@ class VeilMobileRuntimeTest {
       assertEquals(2, fakeSession.liveReplayPumpCount)
       assertEquals(2, fakeSession.historyInstalledResponseCopies.size)
       assertTrue(fakeSession.liveBufferPumpCount >= 5)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun quiescentLiveReplayKeepsDirectClosedUntilEveryBoundedOutboxTurnCompletes() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val secondOutboxTurnEntered = CountDownLatch(1)
+    val releaseSecondOutboxTurn = CountDownLatch(1)
+    fakeSession.outboxReplayProgresses.add(
+      NativeDirectOutboxReplayProgress(
+        visited = 64,
+        enqueued = 63,
+        needsImmediatePump = true,
+        replayComplete = false,
+      ),
+    )
+    fakeSession.outboxReplayProgresses.add(
+      NativeDirectOutboxReplayProgress(
+        visited = 3,
+        enqueued = 2,
+        needsImmediatePump = false,
+        replayComplete = true,
+      ),
+    )
+    fakeSession.blockOutboxReplayOnPump = 2
+    fakeSession.outboxReplayEntered = secondOutboxTurnEntered
+    fakeSession.outboxReplayRelease = releaseSecondOutboxTurn
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+
+      transport.completeNext(
+        NativeDirectHttpResult.Success("directory-before-outbox-barrier".toByteArray()),
+      )
+      assertTrue(
+        "second bounded outbox turn did not start",
+        secondOutboxTurnEntered.await(5, TimeUnit.SECONDS),
+      )
+
+      val draining = runtime.snapshot()
+      assertEquals(NativeConnectionState.CONNECTED, draining.connectionState)
+      assertEquals(NativeDirectHistoryState.SYNCHRONIZED, draining.directHistoryState)
+      assertEquals(1, fakeSession.liveReplayPumpCount)
+      assertEquals(2, fakeSession.outboxReplayPumpCount)
+      assertFalse("an incomplete native outbox cursor must keep Direct closed", draining.directoryReady)
+
+      releaseSecondOutboxTurn.countDown()
+      awaitRuntimeIdle(runtime)
+
+      val ready = runtime.snapshot()
+      assertTrue("only Rust's terminal outbox receipt may publish Ready", ready.directoryReady)
+      assertEquals(NativeSecureSyncState.HISTORY_SYNCHRONIZED, ready.secureSyncState)
+      assertEquals(2, fakeSession.outboxReplayPumpCount)
+      assertTrue(fakeSession.outboxReplayComplete)
+    } finally {
+      releaseSecondOutboxTurn.countDown()
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun terminalOutboxReplayFailureRevokesTheGenerationWithoutPublishingReady() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply { failOutboxReplayPump = true }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+
+      transport.completeNext(
+        NativeDirectHttpResult.Success("directory-before-outbox-failure".toByteArray()),
+      )
+      awaitRuntimeIdle(runtime)
+
+      val failed = runtime.snapshot()
+      assertEquals(1, fakeSession.liveReplayPumpCount)
+      assertEquals(1, fakeSession.outboxReplayPumpCount)
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
+      assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
+      assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertNull(failed.directGeneration)
+      assertNull(failed.directContentRevision)
+      assertNull(failed.binding)
+      assertFalse(failed.directoryReady)
+      assertEquals(1, fakeSession.directLeaseCancellations)
     } finally {
       runtime.lockSession()
       executor.shutdownNow()
@@ -1502,6 +1600,376 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
     } finally {
       firstUploadBody.fill(0)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun invalidDirectTextPlaintextRejectsSynchronouslyWithoutCrossingNativeOrChangingReadyState() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+    val invalidPlaintexts = listOf(
+      "",
+      "\u00e9".repeat((32 * 1024 / 2) + 1),
+      String(charArrayOf(0xD800.toChar())),
+    )
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val readyBefore = runtime.snapshot()
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+
+      invalidPlaintexts.forEach { plaintext ->
+        val result = DirectTextSendCapture()
+        runtime.sendDirectText(conversation.conversationId, generation, plaintext, result)
+
+        assertEquals(
+          "invalid plaintext must complete before sendDirectText returns",
+          1,
+          result.completionCount.get(),
+        )
+        assertEquals(NativeDirectTextSendResult.REJECTED, result.await())
+      }
+
+      assertEquals(0, fakeSession.directTextSendCount)
+      assertTrue(fakeSession.directTextPlaintextReferences.isEmpty())
+      assertTrue(fakeSession.directTextPlaintextCopies.isEmpty())
+      assertEquals(0, fakeSession.peerPreKeyRequestCount)
+      assertEquals(requestCount, transport.requests.size)
+      assertEquals(signatureCount, fakeSession.signedRequestCopies.size)
+      val readyAfter = runtime.snapshot()
+      assertEquals(readyBefore.directGeneration, readyAfter.directGeneration)
+      assertEquals(readyBefore.directContentRevision, readyAfter.directContentRevision)
+      assertEquals(readyBefore.connectionState, readyAfter.connectionState)
+      assertEquals(readyBefore.directConversations, readyAfter.directConversations)
+      assertEquals(generation, readyAfter.directGeneration)
+      assertTrue(readyAfter.directoryReady)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun readyDirectTextSendEnqueuesExactlyOnceAndPublishesOnlyAProjectionInvalidation() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+    val plaintext = "one atomic native Direct message"
+    val expectedUtf8 = plaintext.toByteArray()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val revisionBefore = checkNotNull(runtime.snapshot().directContentRevision)
+      val result = DirectTextSendCapture()
+
+      runtime.sendDirectText(conversation.conversationId, generation, plaintext, result)
+
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(1, fakeSession.directTextSendCount)
+      assertEquals(requestCount, transport.requests.size)
+      assertEquals(signatureCount, fakeSession.signedRequestCopies.size)
+      assertEquals(0, fakeSession.peerPreKeyRequestCount)
+      assertArrayEquals(expectedUtf8, fakeSession.directTextPlaintextCopies.single())
+      assertTrue(
+        "the Kotlin-owned plaintext must be wiped as soon as native accepts it",
+        fakeSession.directTextPlaintextReferences.single().all { it == 0.toByte() },
+      )
+
+      val accepted = runtime.snapshot()
+      assertEquals(revisionBefore + 1, accepted.directContentRevision)
+      assertTrue(accepted.directoryReady)
+      assertEquals(NativeConnectionState.CONNECTED, accepted.connectionState)
+      assertEquals(
+        "send acceptance must invalidate native projection, not fabricate a Kotlin row",
+        0,
+        fakeSession.directProjectionCount,
+      )
+      publishDirectMessagesForTest(runtime, conversation.conversationId)
+      assertEquals(1, fakeSession.directProjectionCount)
+    } finally {
+      expectedUtf8.fill(0)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun needsPreKeyDirectTextSendPerformsOneDestructiveGetAndOneSamePlaintextRetry() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.NEEDS_PRE_KEY)
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val plaintext = "retry this exact plaintext only after peer prekey install"
+    val expectedUtf8 = plaintext.toByteArray()
+    val response = "authenticated-peer-prekey-for-send".toByteArray()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val result = DirectTextSendCapture()
+
+      runtime.sendDirectText(conversation.conversationId, generation, plaintext, result)
+
+      assertEquals(0, result.completionCount.get())
+      assertEquals(1, fakeSession.directTextSendCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(signatureCount + 1, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount + 1, transport.requests.size)
+      assertEquals(1, transport.pendingCount())
+      assertEquals(NativeDirectHttpMethod.GET, transport.requests.last().method)
+      assertEquals("/v1/prekeys/${"cd".repeat(32)}", transport.requests.last().requestTarget)
+      assertEquals(NativeDirectHttpLimits.PREKEY_BYTES, transport.requests.last().responseLimitBytes)
+      assertTrue(transport.requests.last().body.isEmpty())
+      assertArrayEquals(expectedUtf8, fakeSession.directTextPlaintextReferences.single())
+
+      transport.completeNext(NativeDirectHttpResult.Success(response))
+      awaitRuntimeIdle(runtime)
+
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(2, fakeSession.directTextSendCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(1, fakeSession.peerPreKeyInstallCount)
+      assertEquals(signatureCount + 1, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount + 1, transport.requests.size)
+      assertEquals(2, fakeSession.directTextPlaintextCopies.size)
+      fakeSession.directTextPlaintextCopies.forEach { copy ->
+        assertArrayEquals(expectedUtf8, copy)
+      }
+      assertTrue(
+        "both native attempts must borrow one retained plaintext owner",
+        fakeSession.directTextPlaintextReferences[0] ===
+          fakeSession.directTextPlaintextReferences[1],
+      )
+      assertTrue(
+        "the retained plaintext must be wiped after the terminal retry",
+        fakeSession.directTextPlaintextReferences.all { reference ->
+          reference.all { it == 0.toByte() }
+        },
+      )
+      assertTrue(response.all { it == 0.toByte() })
+      assertTrue(runtime.snapshot().directoryReady)
+      assertEquals(1L, runtime.snapshot().directContentRevision)
+    } finally {
+      expectedUtf8.fill(0)
+      response.fill(0)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun secondNeedsPreKeyOutcomeNeverStartsAnotherGetAndFailsClosed() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.NEEDS_PRE_KEY)
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.NEEDS_PRE_KEY)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val expectedUtf8 = "never perform a second destructive prekey GET".toByteArray()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val signatureCount = fakeSession.signedRequestCopies.size
+      val result = DirectTextSendCapture()
+
+      runtime.sendDirectText(
+        conversation.conversationId,
+        generation,
+        expectedUtf8.toString(Charsets.UTF_8),
+        result,
+      )
+      transport.completeNext(
+        NativeDirectHttpResult.Success("peer-prekey-still-did-not-open-ratchet".toByteArray()),
+      )
+      awaitRuntimeIdle(runtime)
+
+      assertEquals(NativeDirectTextSendResult.UNAVAILABLE, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(2, fakeSession.directTextSendCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(1, fakeSession.peerPreKeyInstallCount)
+      assertEquals(signatureCount + 1, fakeSession.signedRequestCopies.size)
+      assertEquals(requestCount + 1, transport.requests.size)
+      assertEquals(0, transport.pendingCount())
+      assertTrue(
+        fakeSession.directTextPlaintextReferences.all { reference ->
+          reference.all { it == 0.toByte() }
+        },
+      )
+      val failed = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertNull(failed.directGeneration)
+      assertNull(failed.directContentRevision)
+      assertNull(failed.binding)
+      assertFalse(failed.directoryReady)
+      assertEquals(1, fakeSession.directLeaseCancellations)
+    } finally {
+      expectedUtf8.fill(0)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun acceptedForReplayCompletesOnceButRevokesTheLostTransportGeneration() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+    val publishedAfterSend = CopyOnWriteArrayList<VeilMobileRuntimeSnapshot>()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val result = DirectTextSendCapture()
+      runtime.addListener(publishedAfterSend::add)
+
+      runtime.sendDirectText(
+        conversation.conversationId,
+        generation,
+        "durable locally even though transport authority was lost",
+        result,
+      )
+
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(1, fakeSession.directTextSendCount)
+      assertEquals(requestCount, transport.requests.size)
+      assertTrue(fakeSession.directTextPlaintextReferences.single().all { it == 0.toByte() })
+      val revoked = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, revoked.connectionState)
+      assertNull(revoked.directGeneration)
+      assertNull(revoked.directContentRevision)
+      assertNull(revoked.binding)
+      assertFalse(revoked.directoryReady)
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertTrue(
+        "React listeners must observe the native generation revoke",
+        publishedAfterSend.any { published ->
+          published.connectionState == NativeConnectionState.ERROR &&
+            published.directGeneration == null &&
+            published.directContentRevision == null &&
+            published.binding == null &&
+            !published.directoryReady
+        },
+      )
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundRevokesPendingDirectTextAndLatePreKeyResponseOnlyWipesItsBody() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.NEEDS_PRE_KEY)
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    val lateBody = "late-peer-prekey-after-background".toByteArray()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val result = DirectTextSendCapture()
+      runtime.sendDirectText(
+        conversation.conversationId,
+        generation,
+        "wipe this pending user plaintext at the lifecycle boundary",
+        result,
+      )
+      val pendingCall = transport.calls.last()
+      assertEquals(1, fakeSession.directTextSendCount)
+      assertEquals(1, transport.pendingCount())
+
+      runtime.lockForBackground()
+
+      assertTrue(pendingCall.cancelled.get())
+      assertEquals(NativeDirectTextSendResult.UNAVAILABLE, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertTrue(fakeSession.directTextPlaintextReferences.single().all { it == 0.toByte() })
+
+      transport.completeNext(NativeDirectHttpResult.Success(lateBody))
+      awaitRuntimeIdle(runtime)
+
+      assertTrue(lateBody.all { it == 0.toByte() })
+      assertEquals(0, fakeSession.peerPreKeyInstallCount)
+      assertEquals(1, fakeSession.directTextSendCount)
+      assertEquals(1, result.completionCount.get())
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+      assertNull(runtime.snapshot().directGeneration)
+    } finally {
+      lateBody.fill(0)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun duplicateDirectTextIntentIsDeniedWhileTheExactFirstActionOwnsPreKeyAuthority() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.NEEDS_PRE_KEY)
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val first = DirectTextSendCapture()
+      runtime.sendDirectText(conversation.conversationId, generation, "first intent", first)
+
+      val duplicate = DirectTextSendCapture()
+      runtime.sendDirectText(conversation.conversationId, generation, "duplicate tap", duplicate)
+
+      assertEquals(NativeDirectTextSendResult.UNAVAILABLE, duplicate.await())
+      assertEquals(1, duplicate.completionCount.get())
+      assertEquals(0, first.completionCount.get())
+      assertEquals(1, fakeSession.directTextSendCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(requestCount + 1, transport.requests.size)
+      assertEquals(1, transport.pendingCount())
+
+      transport.completeNext(
+        NativeDirectHttpResult.Success("peer-prekey-for-the-first-intent-only".toByteArray()),
+      )
+      awaitRuntimeIdle(runtime)
+
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, first.await())
+      assertEquals(1, first.completionCount.get())
+      assertEquals(2, fakeSession.directTextSendCount)
+      assertEquals(1, fakeSession.peerPreKeyRequestCount)
+      assertEquals(requestCount + 1, transport.requests.size)
+      assertTrue(
+        fakeSession.directTextPlaintextReferences.all { reference ->
+          reference.all { it == 0.toByte() }
+        },
+      )
+    } finally {
       runtime.lockSession()
       executor.shutdownNow()
     }
@@ -2149,11 +2617,13 @@ class VeilMobileRuntimeTest {
       consumed = 64u,
       projectionChanged = true,
       needsImmediatePump = true,
+      outboxReplayRequired = false,
       ready = false,
     ).toNativeDirectLiveReplayProgress()
     assertEquals(64L, replay.consumed)
     assertTrue(replay.projectionChanged)
     assertTrue(replay.needsImmediatePump)
+    assertFalse(replay.outboxReplayRequired)
     assertFalse(replay.ready)
   }
 
@@ -2536,6 +3006,23 @@ class VeilMobileRuntimeTest {
     }
   }
 
+  private class DirectTextSendCapture : NativeDirectTextSendCallback {
+    private val completed = CountDownLatch(1)
+    private val value = AtomicReference<NativeDirectTextSendResult?>()
+    val completionCount = AtomicInteger(0)
+
+    override fun onComplete(result: NativeDirectTextSendResult) {
+      completionCount.incrementAndGet()
+      value.set(result)
+      completed.countDown()
+    }
+
+    fun await(): NativeDirectTextSendResult {
+      assertTrue("Direct text send did not complete", completed.await(5, TimeUnit.SECONDS))
+      return checkNotNull(value.get())
+    }
+  }
+
   private fun awaitCondition(condition: () -> Boolean): Boolean {
     val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
     while (System.nanoTime() < deadline) {
@@ -2616,6 +3103,12 @@ class VeilMobileRuntimeTest {
     @Volatile var liveReplayPumpCount = 0
     @Volatile var projectionChangeOnOrAfterReplayPump: Int? = null
     @Volatile var failLiveReplayOnOrAfterPump: Int? = null
+    @Volatile var outboxReplayPumpCount = 0
+    @Volatile var failOutboxReplayPump = false
+    @Volatile var outboxReplayComplete = false
+    @Volatile var blockOutboxReplayOnPump: Int? = null
+    @Volatile var outboxReplayEntered: CountDownLatch? = null
+    @Volatile var outboxReplayRelease: CountDownLatch? = null
     var directProjectionCount = 0
     @Volatile var directProjection = NativeDirectMessageProjection(
       NativeDirectMessageProjectionAvailability.UNAVAILABLE,
@@ -2633,6 +3126,10 @@ class VeilMobileRuntimeTest {
     var ownPreKeyInstallCount = 0
     var directSendReadinessCount = 0
     @Volatile var directSendReadiness = NativeDirectSendReadiness.NEEDS_PRE_KEY
+    @Volatile var directTextSendCount = 0
+    val directTextSendOutcomes = ArrayDeque<NativeDirectTextSendOutcome>()
+    val directTextPlaintextReferences = CopyOnWriteArrayList<ByteArray>()
+    val directTextPlaintextCopies = CopyOnWriteArrayList<ByteArray>()
     var peerPreKeyRequestCount = 0
     var peerPreKeyInstallCount = 0
     @Volatile var peerPreKeyInstallStatus = NativeDirectPreKeyInstallStatus.ESTABLISHED
@@ -2655,6 +3152,7 @@ class VeilMobileRuntimeTest {
     val historyNexts = ArrayDeque<NativeDirectHistoryNext>()
     val historyInstalls = ArrayDeque<NativeDirectHistoryProgress>()
     val liveReplayProgresses = ArrayDeque<NativeDirectLiveReplayProgress>()
+    val outboxReplayProgresses = ArrayDeque<NativeDirectOutboxReplayProgress>()
     val lifecycleEvents = CopyOnWriteArrayList<String>()
     val connectStarted = CountDownLatch(1)
     val closedDuringConnect = AtomicBoolean(false)
@@ -2688,6 +3186,7 @@ class VeilMobileRuntimeTest {
 
     override fun beginDirectSync(): NativeDirectSyncLease {
       historySynchronized = false
+      outboxReplayComplete = false
       return NativeDirectSyncLease(
         leaseToken = "test-direct-lease",
         canonicalServerOrigin = checkNotNull(canonicalOrigin),
@@ -2820,6 +3319,7 @@ class VeilMobileRuntimeTest {
           consumed = 1,
           projectionChanged = true,
           needsImmediatePump = false,
+          outboxReplayRequired = false,
           ready = true,
         )
       }
@@ -2828,11 +3328,36 @@ class VeilMobileRuntimeTest {
           consumed = 0,
           projectionChanged = false,
           needsImmediatePump = false,
-          ready = true,
+          outboxReplayRequired = !outboxReplayComplete,
+          ready = outboxReplayComplete,
         )
       } else {
         liveReplayProgresses.removeFirst()
       }
+    }
+
+    override fun replayDirectOutbox(leaseToken: String): NativeDirectOutboxReplayProgress {
+      check(leaseToken == "test-direct-lease")
+      outboxReplayPumpCount += 1
+      if (blockOutboxReplayOnPump == outboxReplayPumpCount) {
+        outboxReplayEntered?.countDown()
+        outboxReplayRelease?.let { release ->
+          check(release.await(5, TimeUnit.SECONDS)) { "synthetic outbox replay timed out" }
+        }
+      }
+      if (failOutboxReplayPump) throw IllegalStateException("synthetic terminal outbox replay")
+      val progress = if (outboxReplayProgresses.isEmpty()) {
+        NativeDirectOutboxReplayProgress(
+          visited = 0,
+          enqueued = 0,
+          needsImmediatePump = false,
+          replayComplete = true,
+        )
+      } else {
+        outboxReplayProgresses.removeFirst()
+      }
+      if (progress.replayComplete) outboxReplayComplete = true
+      return progress
     }
 
     override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection {
@@ -2852,6 +3377,22 @@ class VeilMobileRuntimeTest {
       check(leaseToken == "test-direct-lease")
       directSendReadinessCount += 1
       return directSendReadiness
+    }
+
+    override fun sendDirectText(
+      leaseToken: String,
+      conversationId: String,
+      plaintextUtf8: ByteArray,
+    ): NativeDirectTextSendOutcome {
+      check(leaseToken == "test-direct-lease")
+      directTextSendCount += 1
+      directTextPlaintextReferences.add(plaintextUtf8)
+      directTextPlaintextCopies.add(plaintextUtf8.copyOf())
+      return if (directTextSendOutcomes.isEmpty()) {
+        NativeDirectTextSendOutcome.UNAVAILABLE
+      } else {
+        directTextSendOutcomes.removeFirst()
+      }
     }
 
     override fun prepareDirectPreKeyRequest(

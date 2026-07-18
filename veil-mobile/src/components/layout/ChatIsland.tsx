@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   Pressable,
   ScrollView,
@@ -31,6 +31,11 @@ export const ChatIsland: React.FC<{
   const loadSelectedDirectMessages = useChatStore(
     (state) => state.loadSelectedDirectMessages,
   );
+  const directGeneration = useChatStore((state) => state.directGeneration);
+  const directSendPending = useChatStore((state) => state.directSendPending);
+  const directSendError = useChatStore((state) => state.directSendError);
+  const sendSelectedDirectText = useChatStore((state) => state.sendSelectedDirectText);
+  const [draft, setDraft] = useState("");
 
   const key = selectedServerId === DM_HOME_ID ? selectedDmId : selectedChannelId;
   const messages = key ? messagesByChannel[key] ?? EMPTY_MESSAGES : EMPTY_MESSAGES;
@@ -45,6 +50,12 @@ export const ChatIsland: React.FC<{
     return channel ? `# ${channel.name}` : "Channel";
   }, [selectedServerId, selectedDmId, selectedChannelId, dms, channels]);
   const scrollRef = useRef<ScrollView>(null);
+  const canCompose = selectedServerId === DM_HOME_ID
+    && selectedDmId !== null
+    && directGeneration !== null
+    && projectionState === "available"
+    && !directSendPending;
+  const canSend = canCompose && draft.length > 0;
 
   useEffect(() => {
     if (selectedServerId !== DM_HOME_ID || !selectedDmId) return;
@@ -59,6 +70,27 @@ export const ChatIsland: React.FC<{
   useEffect(() => {
     requestAnimationFrame(() => scrollRef.current?.scrollToEnd({ animated: false }));
   }, [messages.length]);
+
+  useEffect(() => {
+    // A draft must never follow the user to another peer or Direct generation.
+    setDraft("");
+  }, [directGeneration, selectedDmId]);
+
+  const sendDraft = async () => {
+    if (!canSend) return;
+    const submitted = draft;
+    const submittedConversationId = selectedDmId;
+    const submittedGeneration = directGeneration;
+    const result = await sendSelectedDirectText(submitted);
+    const current = useChatStore.getState();
+    if (
+      result === "accepted"
+      && current.selectedDmId === submittedConversationId
+      && current.directGeneration === submittedGeneration
+    ) {
+      setDraft((current) => current === submitted ? "" : current);
+    }
+  };
 
   return (
     <View style={styles.wrap}>
@@ -138,24 +170,40 @@ export const ChatIsland: React.FC<{
 
         <View style={styles.composer}>
           <TextInput
-            testID="direct-read-only-composer"
-            value=""
-            editable={false}
-            accessibilityLabel="Direct composer unavailable in this preview"
-            accessibilityState={{ disabled: true }}
-            placeholder="Sending arrives in the next Direct preview"
+            testID="direct-composer"
+            value={draft}
+            onChangeText={setDraft}
+            editable={canCompose}
+            accessibilityLabel="Direct message"
+            accessibilityState={{ disabled: !canCompose }}
+            placeholder={canCompose ? "Message securely" : "Direct messaging unavailable"}
             placeholderTextColor={colors.textLo}
             style={styles.input}
-            selectTextOnFocus={false}
+            multiline
           />
-          <View
-            accessibilityElementsHidden
-            importantForAccessibility="no"
-            style={styles.readOnlyBadge}
+          <Pressable
+            testID="direct-send-button"
+            accessibilityRole="button"
+            accessibilityLabel="Send Direct message"
+            accessibilityState={{ disabled: !canSend }}
+            disabled={!canSend}
+            onPress={() => void sendDraft()}
+            style={({ pressed }) => [
+              styles.sendButton,
+              !canSend && styles.sendButtonDisabled,
+              pressed && canSend && styles.sendButtonPressed,
+            ]}
           >
-            <Text style={styles.readOnlyText}>READ ONLY</Text>
-          </View>
+            <Text style={styles.sendButtonText}>{directSendPending ? "..." : "Send"}</Text>
+          </Pressable>
         </View>
+        {directSendError ? (
+          <Text testID="direct-send-error" style={styles.sendError}>
+            {directSendError === "rejected"
+              ? "Message was rejected"
+              : "Direct messaging is unavailable"}
+          </Text>
+        ) : null}
       </Island>
     </View>
   );
@@ -228,20 +276,27 @@ const styles = StyleSheet.create({
     borderRadius: radii.lg,
     backgroundColor: "rgba(255,255,255,0.04)",
   },
-  readOnlyBadge: {
+  sendButton: {
     minHeight: 36,
     paddingHorizontal: spacing.sm,
     borderRadius: radii.pill,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.border,
-    backgroundColor: "rgba(255,255,255,0.035)",
+    backgroundColor: colors.primary,
     alignItems: "center",
     justifyContent: "center",
   },
-  readOnlyText: {
-    color: colors.textLo,
-    fontSize: 9,
+  sendButtonDisabled: { opacity: 0.38 },
+  sendButtonPressed: { opacity: 0.72 },
+  sendButtonText: {
+    color: colors.textHi,
+    fontSize: 11,
     fontWeight: "800",
-    letterSpacing: 0.8,
+  },
+  sendError: {
+    color: colors.destructive,
+    fontSize: 11,
+    paddingHorizontal: spacing.md,
+    paddingBottom: spacing.sm,
   },
 });

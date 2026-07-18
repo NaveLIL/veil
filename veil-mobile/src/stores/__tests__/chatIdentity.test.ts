@@ -15,11 +15,17 @@ jest.mock("../../native/runtime", () => ({
   isExactAuthenticatedBinding: (binding: unknown) => Boolean(binding),
   default: {
     getDirectMessages: jest.fn(),
+    sendDirectText: jest.fn(),
   },
 }));
 
 type RuntimeMock = {
   getDirectMessages: jest.Mock<(conversationId: string) => Promise<DirectMessageProjection>>;
+  sendDirectText: jest.Mock<(
+    conversationId: string,
+    expectedDirectGeneration: number,
+    text: string,
+  ) => Promise<void>>;
 };
 
 const runtime = (jest.requireMock("../../native/runtime") as { default: RuntimeMock }).default;
@@ -89,6 +95,7 @@ const available = (
 describe("production Direct chat store", () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    runtime.sendDirectText.mockResolvedValue(undefined);
     resetChatStoreForTests();
   });
 
@@ -260,5 +267,184 @@ describe("production Direct chat store", () => {
     expect(useChatStore.getState().messagesByChannel).toEqual({});
     expect(useChatStore.getState().projectionStateByConversation[anya.conversationId])
       .toBe("unavailable");
+  });
+
+  test("commits one native intent, suppresses duplicate taps, and publishes only native rows", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya], bindingA, 7));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValueOnce(available(
+      "11111111-aaaa-4aaa-8aaa-111111111111",
+      "before",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+
+    const nativeSend = deferred<void>();
+    runtime.sendDirectText.mockReturnValue(nativeSend.promise);
+    runtime.getDirectMessages.mockResolvedValueOnce(available(
+      "22222222-aaaa-4aaa-8aaa-222222222222",
+      "native committed row",
+      "outgoing",
+    ));
+
+    const send = useChatStore.getState().sendSelectedDirectText("one intent");
+    await expect(useChatStore.getState().sendSelectedDirectText("duplicate tap"))
+      .resolves.toBe("unavailable");
+    expect(runtime.sendDirectText).toHaveBeenCalledTimes(1);
+    expect(runtime.sendDirectText).toHaveBeenCalledWith(anya.conversationId, 7, "one intent");
+    expect(useChatStore.getState().messagesByChannel[anya.conversationId])
+      .toEqual([expect.objectContaining({ text: "before" })]);
+
+    nativeSend.resolve();
+    await expect(send).resolves.toBe("accepted");
+    await Promise.resolve();
+
+    expect(runtime.getDirectMessages).toHaveBeenCalledTimes(2);
+    expect(useChatStore.getState().messagesByChannel[anya.conversationId]).toEqual([
+      expect.objectContaining({
+        id: "22222222-aaaa-4aaa-8aaa-222222222222",
+        text: "native committed row",
+        direction: "outgoing",
+      }),
+    ]);
+  });
+
+  test("keeps the projection unchanged when native rejects", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya]));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValue(available(
+      "33333333-aaaa-4aaa-8aaa-333333333333",
+      "existing native row",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+    runtime.sendDirectText.mockRejectedValue({ reason: "rejected" });
+
+    await expect(useChatStore.getState().sendSelectedDirectText("rejected intent"))
+      .resolves.toBe("rejected");
+
+    expect(runtime.getDirectMessages).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState()).toMatchObject({
+      directSendPending: false,
+      directSendError: "rejected",
+    });
+    expect(useChatStore.getState().messagesByChannel[anya.conversationId])
+      .toEqual([expect.objectContaining({ text: "existing native row" })]);
+  });
+
+  test("never refreshes or publishes an accepted intent after generation replacement", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya], bindingA, 10));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValue(available(
+      "44444444-aaaa-4aaa-8aaa-444444444444",
+      "old generation",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+    const nativeSend = deferred<void>();
+    runtime.sendDirectText.mockReturnValue(nativeSend.promise);
+
+    const send = useChatStore.getState().sendSelectedDirectText("accepted elsewhere");
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya], bindingA, 11));
+    nativeSend.resolve();
+    await expect(send).resolves.toBe("accepted");
+    await Promise.resolve();
+
+    expect(runtime.getDirectMessages).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState()).toMatchObject({
+      directGeneration: 11,
+      selectedDmId: null,
+      messagesByChannel: {},
+    });
+  });
+
+  test("keeps send pending across same-generation content invalidation and reprojects after accepted", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya], bindingA, 15, 100));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValueOnce(available(
+      "55555555-aaaa-4aaa-8aaa-555555555555",
+      "before content race",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+
+    const nativeSend = deferred<void>();
+    const racingProjection = deferred<DirectMessageProjection>();
+    runtime.sendDirectText.mockReturnValue(nativeSend.promise);
+    runtime.getDirectMessages
+      .mockReturnValueOnce(racingProjection.promise)
+      .mockResolvedValueOnce(available(
+        "66666666-aaaa-4aaa-8aaa-666666666666",
+        "accepted authoritative row",
+        "outgoing",
+      ));
+
+    const send = useChatStore.getState().sendSelectedDirectText("content race intent");
+    useChatStore.getState().hydrateRuntimeDirectory({
+      ...snapshot([anya], bindingA, 15, 101),
+      directContentRevision: 1,
+    });
+    expect(useChatStore.getState()).toMatchObject({
+      directGeneration: 15,
+      directContentRevision: 1,
+      directSendPending: true,
+    });
+
+    // Mirrors the lifecycle hook reacting to the higher content revision.
+    const eventRefresh = useChatStore.getState().loadSelectedDirectMessages();
+    nativeSend.resolve();
+    await expect(send).resolves.toBe("accepted");
+    await Promise.resolve();
+    racingProjection.resolve(available(
+      "77777777-aaaa-4aaa-8aaa-777777777777",
+      "stale racing projection",
+    ));
+    await eventRefresh;
+    await Promise.resolve();
+
+    expect(runtime.sendDirectText).toHaveBeenCalledTimes(1);
+    expect(runtime.getDirectMessages).toHaveBeenCalledTimes(3);
+    expect(useChatStore.getState().messagesByChannel[anya.conversationId]).toEqual([
+      expect.objectContaining({
+        id: "66666666-aaaa-4aaa-8aaa-666666666666",
+        text: "accepted authoritative row",
+      }),
+    ]);
+  });
+
+  test("treats accepted followed by a deny snapshot as terminal success without retry", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya], bindingA, 20));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValue(available(
+      "88888888-aaaa-4aaa-8aaa-888888888888",
+      "before replay handoff",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+    const acceptedForReplay = deferred<void>();
+    runtime.sendDirectText.mockReturnValue(acceptedForReplay.promise);
+
+    const send = useChatStore.getState().sendSelectedDirectText("persisted for replay");
+    useChatStore.getState().hydrateRuntimeDirectory({
+      ...snapshot([anya], bindingA, 20, 21),
+      connectionState: "error",
+      directoryReady: false,
+    });
+    acceptedForReplay.resolve();
+
+    await expect(send).resolves.toBe("accepted");
+    await Promise.resolve();
+    expect(runtime.sendDirectText).toHaveBeenCalledTimes(1);
+    expect(runtime.getDirectMessages).toHaveBeenCalledTimes(1);
+    expect(useChatStore.getState()).toMatchObject({
+      directSendPending: false,
+      directSendError: null,
+      selectedDmId: null,
+      messagesByChannel: {},
+    });
+  });
+
+  test("requires an available authoritative projection before invoking native send", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya]));
+    useChatStore.getState().selectDm(anya.conversationId);
+
+    await expect(useChatStore.getState().sendSelectedDirectText("too early"))
+      .resolves.toBe("unavailable");
+    expect(runtime.sendDirectText).not.toHaveBeenCalled();
   });
 });

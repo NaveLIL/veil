@@ -8,6 +8,7 @@ import VeilRuntime, {
   type DirectMessageDirection,
   type DirectMessageProjection,
   type DirectMessageView,
+  type DirectTextSendFailure,
   type VeilMobileRuntimeSnapshot,
 } from "../native/runtime";
 
@@ -74,6 +75,7 @@ export interface Message {
 }
 
 export type DirectProjectionState = "idle" | "loading" | "available" | "unavailable";
+export type DirectTextSendResult = "accepted" | DirectTextSendFailure;
 
 /** Special pseudo-server id representing the native Direct inbox. */
 export const DM_HOME_ID: ServerId = "__dm__";
@@ -114,11 +116,15 @@ interface ChatState {
   directContentRevision: number | null;
   directoryRevision: number;
   projectionRequestRevision: number;
+  directSendPending: boolean;
+  directSendError: DirectTextSendFailure | null;
+  directSendRequestRevision: number;
   hydrateRuntimeDirectory: (snapshot: VeilMobileRuntimeSnapshot) => void;
   selectServer: (id: ServerId) => void;
   selectChannel: (id: ChannelId) => void;
   selectDm: (id: DmId) => void;
   loadSelectedDirectMessages: () => Promise<void>;
+  sendSelectedDirectText: (text: string) => Promise<DirectTextSendResult>;
   clearRenderableChat: () => void;
 }
 
@@ -335,6 +341,9 @@ const initialChatState = {
   directContentRevision: null as number | null,
   directoryRevision: 0,
   projectionRequestRevision: 0,
+  directSendPending: false,
+  directSendError: null as DirectTextSendFailure | null,
+  directSendRequestRevision: 0,
 };
 
 export const useChatStore = create<ChatState>((set, get) => ({
@@ -395,6 +404,9 @@ export const useChatStore = create<ChatState>((set, get) => ({
       directContentRevision: directory.directContentRevision,
       directoryRevision: state.directoryRevision + 1,
       projectionRequestRevision: state.projectionRequestRevision + 1,
+      directSendPending: false,
+      directSendError: null,
+      directSendRequestRevision: state.directSendRequestRevision + 1,
     });
   },
 
@@ -422,6 +434,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       projectionStateByConversation: {},
       dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, ...dm }) => dm),
       projectionRequestRevision: state.projectionRequestRevision + 1,
+      directSendError: null,
     });
   },
 
@@ -514,12 +527,76 @@ export const useChatStore = create<ChatState>((set, get) => ({
     });
   },
 
+  sendSelectedDirectText: async (text) => {
+    const state = get();
+    const conversationId = state.selectedDmId;
+    const binding = state.runtimeBinding;
+    const directGeneration = state.directGeneration;
+    const members = conversationId
+      ? state.directMembersByConversation[conversationId]
+      : undefined;
+    if (
+      state.directSendPending
+      || state.selectedServerId !== DM_HOME_ID
+      || !conversationId
+      || !binding
+      || directGeneration === null
+      || !members
+      || state.projectionStateByConversation[conversationId] !== "available"
+    ) return "unavailable";
+
+    const requestRevision = state.directSendRequestRevision + 1;
+    set({
+      directSendPending: true,
+      directSendError: null,
+      directSendRequestRevision: requestRevision,
+    });
+
+    try {
+      await VeilRuntime.sendDirectText(conversationId, directGeneration, text);
+    } catch (error) {
+      const reason = (
+        error
+        && typeof error === "object"
+        && (error as { reason?: unknown }).reason === "rejected"
+      ) ? "rejected" : "unavailable";
+      const current = get();
+      if (current.directSendRequestRevision === requestRevision) {
+        const stillSelectedAuthority = current.selectedDmId === conversationId
+          && sameBinding(current.runtimeBinding, binding)
+          && current.directGeneration === directGeneration
+          && current.directMembersByConversation[conversationId] === members;
+        set({
+          directSendPending: false,
+          directSendError: stillSelectedAuthority ? reason : null,
+        });
+      }
+      return reason;
+    }
+
+    const current = get();
+    if (current.directSendRequestRevision === requestRevision) {
+      const stillSelectedAuthority = current.selectedDmId === conversationId
+        && sameBinding(current.runtimeBinding, binding)
+        && current.directGeneration === directGeneration
+        && current.directMembersByConversation[conversationId] === members;
+      set({ directSendPending: false, directSendError: null });
+      if (stillSelectedAuthority) {
+        // Only the post-commit native projection may create the visible row.
+        // Never synthesize an ID, sequence, timestamp, or optimistic plaintext.
+        void get().loadSelectedDirectMessages();
+      }
+    }
+    return "accepted";
+  },
+
   clearRenderableChat: () => {
     const state = get();
     set({
       ...initialChatState,
       directoryRevision: state.directoryRevision + 1,
       projectionRequestRevision: state.projectionRequestRevision + 1,
+      directSendRequestRevision: state.directSendRequestRevision + 1,
     });
   },
 }));

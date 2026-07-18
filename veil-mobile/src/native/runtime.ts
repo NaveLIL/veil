@@ -78,6 +78,19 @@ export interface DirectMessageProjection {
   messages: DirectMessageView[];
 }
 
+export type DirectTextSendFailure = "rejected" | "unavailable";
+
+/** Opaque failure category for a payload-free native Direct send. */
+export class DirectTextSendError extends Error {
+  readonly reason: DirectTextSendFailure;
+
+  constructor(reason: DirectTextSendFailure) {
+    super(reason === "rejected" ? "Direct message was rejected" : "Direct messaging is unavailable");
+    this.name = "DirectTextSendError";
+    this.reason = reason;
+  }
+}
+
 interface VeilMobileRuntimeNative {
   getRuntimeSnapshot(): Promise<unknown>;
   openSession(): Promise<unknown>;
@@ -87,6 +100,11 @@ interface VeilMobileRuntimeNative {
   lockSession(): Promise<unknown>;
   cancelPendingAccessPass(flowId: string): Promise<unknown>;
   projectDirectMessages(conversationId: string): Promise<unknown>;
+  sendDirectText(
+    conversationId: string,
+    expectedDirectGeneration: number,
+    text: string,
+  ): Promise<unknown>;
   addListener(eventName: string): void;
   removeListeners(count: number): void;
 }
@@ -119,6 +137,7 @@ const MAX_DIRECT_NAME_BYTES = 256;
 const MAX_DIRECT_USERNAME_BYTES = 128;
 const MAX_DIRECT_MESSAGE_TEXT_BYTES = 32 * 1024;
 const MAX_DIRECT_PROJECTION_TEXT_BYTES = 1024 * 1024;
+const DIRECT_SEND_REJECTED_CODE = "E_VEIL_DIRECT_SEND_REJECTED";
 
 const isCanonicalUuid = (value: string): boolean => value !== nilUuid && canonicalUuid.test(value);
 
@@ -448,6 +467,12 @@ function directMessageProjection(value: unknown): DirectMessageProjection {
   return { availability: "available", messages };
 }
 
+function nativeErrorCode(value: unknown): string | null {
+  if (!value || typeof value !== "object") return null;
+  const code = (value as Record<string, unknown>).code;
+  return typeof code === "string" ? code : null;
+}
+
 const VeilRuntime = {
   getSnapshot: async (): Promise<VeilMobileRuntimeSnapshot> =>
     runtimeSnapshot(await requireRuntime().getRuntimeSnapshot()),
@@ -475,6 +500,35 @@ const VeilRuntime = {
       return directMessageProjection(await requireRuntime().projectDirectMessages(conversationId));
     } catch {
       return unavailableDirectProjection();
+    }
+  },
+  sendDirectText: async (
+    conversationId: string,
+    expectedDirectGeneration: number,
+    text: string,
+  ): Promise<void> => {
+    if (
+      typeof conversationId !== "string"
+      || typeof expectedDirectGeneration !== "number"
+      || typeof text !== "string"
+      || !isCanonicalUuid(conversationId)
+      || !Number.isSafeInteger(expectedDirectGeneration)
+      || expectedDirectGeneration < 1
+    ) throw new DirectTextSendError("unavailable");
+    const textBytes = boundedUtf8Length(text, MAX_DIRECT_MESSAGE_TEXT_BYTES);
+    if (textBytes === null || textBytes < 1) throw new DirectTextSendError("rejected");
+    try {
+      const result = await requireRuntime().sendDirectText(
+        conversationId,
+        expectedDirectGeneration,
+        text,
+      );
+      if (result !== null) throw new DirectTextSendError("unavailable");
+    } catch (error) {
+      if (error instanceof DirectTextSendError) throw error;
+      throw new DirectTextSendError(
+        nativeErrorCode(error) === DIRECT_SEND_REJECTED_CODE ? "rejected" : "unavailable",
+      );
     }
   },
   subscribe(listener: (snapshot: VeilMobileRuntimeSnapshot) => void): EmitterSubscription {

@@ -6,6 +6,10 @@ import androidx.annotation.VisibleForTesting
 import io.veil.mobile.crypto.NativeIdentityVault
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import java.io.File
+import java.nio.CharBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
+import java.nio.charset.StandardCharsets
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
@@ -25,11 +29,13 @@ import uniffi.veil_ffi.MobileDirectMessageDelivery
 import uniffi.veil_ffi.MobileDirectMessageDirection
 import uniffi.veil_ffi.MobileDirectMessageProjection
 import uniffi.veil_ffi.MobileDirectMessageProjectionAvailability
+import uniffi.veil_ffi.MobileDirectOutboxReplayProgress
 import uniffi.veil_ffi.MobileDirectOwnPreKeyProgress
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
+import uniffi.veil_ffi.MobileDirectTextSendOutcome
 import uniffi.veil_ffi.RestSignatureData
 import uniffi.veil_ffi.VeilMobileSession
 
@@ -175,7 +181,16 @@ internal data class NativeDirectLiveReplayProgress(
   val consumed: Long,
   val projectionChanged: Boolean,
   val needsImmediatePump: Boolean,
+  val outboxReplayRequired: Boolean,
   val ready: Boolean,
+)
+
+/** Aggregate-only result of one native-owned exact outbox replay turn. */
+internal data class NativeDirectOutboxReplayProgress(
+  val visited: Long,
+  val enqueued: Long,
+  val needsImmediatePump: Boolean,
+  val replayComplete: Boolean,
 )
 
 internal enum class NativeDirectMessageProjectionAvailability {
@@ -227,6 +242,46 @@ private fun unavailableDirectMessageProjection() = NativeDirectMessageProjection
 
 private const val MAX_DIRECT_MESSAGE_TEXT_BYTES = 32 * 1024
 private const val MAX_DIRECT_PROJECTION_TEXT_BYTES = 1024 * 1024
+
+/** Short-lived, explicitly wiped owner for one native Direct send intent. */
+internal class OwnedDirectPlaintext private constructor(
+  private var bytes: ByteArray?,
+) : AutoCloseable {
+  fun borrow(): ByteArray = synchronized(this) {
+    checkNotNull(bytes) { "Direct plaintext owner is already closed" }
+  }
+
+  override fun close() {
+    synchronized(this) {
+      bytes?.fill(0)
+      bytes = null
+    }
+  }
+
+  override fun toString(): String = "OwnedDirectPlaintext([REDACTED])"
+
+  companion object {
+    fun fromString(value: String): OwnedDirectPlaintext? {
+      if (value.isEmpty()) return null
+      val encoder = StandardCharsets.UTF_8.newEncoder()
+        .onMalformedInput(CodingErrorAction.REPORT)
+        .onUnmappableCharacter(CodingErrorAction.REPORT)
+      var encoded: java.nio.ByteBuffer? = null
+      return try {
+        encoded = encoder.encode(CharBuffer.wrap(value))
+        val size = encoded.remaining()
+        if (size !in 1..MAX_DIRECT_MESSAGE_TEXT_BYTES) return null
+        val owned = ByteArray(size)
+        encoded.get(owned)
+        OwnedDirectPlaintext(owned)
+      } catch (_: CharacterCodingException) {
+        null
+      } finally {
+        if (encoded?.hasArray() == true) encoded.array().fill(0)
+      }
+    }
+  }
+}
 
 private fun String.boundedUtf8Length(maxBytes: Int): Int? {
   if (isEmpty()) return null
@@ -317,6 +372,26 @@ internal enum class NativeDirectSendReadiness {
   READY,
   NEEDS_PRE_KEY,
   UNAVAILABLE,
+}
+
+/** Opaque result of the atomic Rust send boundary; no IDs cross into Kotlin. */
+internal enum class NativeDirectTextSendOutcome {
+  ACCEPTED,
+  ACCEPTED_FOR_REPLAY,
+  NEEDS_PRE_KEY,
+  REJECTED,
+  UNAVAILABLE,
+}
+
+/** Terminal public result for one explicit Direct text user intent. */
+internal enum class NativeDirectTextSendResult {
+  ACCEPTED,
+  REJECTED,
+  UNAVAILABLE,
+}
+
+internal fun interface NativeDirectTextSendCallback {
+  fun onComplete(result: NativeDirectTextSendResult)
 }
 
 /** Opaque terminal result for one explicit Direct-session user action. */
@@ -424,12 +499,20 @@ internal interface NativeMobileSession : AutoCloseable {
 
   fun replayDirectLiveEvents(leaseToken: String): NativeDirectLiveReplayProgress
 
+  fun replayDirectOutbox(leaseToken: String): NativeDirectOutboxReplayProgress
+
   fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection
 
   fun directSendReadiness(
     leaseToken: String,
     conversationId: String,
   ): NativeDirectSendReadiness
+
+  fun sendDirectText(
+    leaseToken: String,
+    conversationId: String,
+    plaintextUtf8: ByteArray,
+  ): NativeDirectTextSendOutcome
 
   fun prepareDirectPreKeyRequest(
     leaseToken: String,
@@ -546,7 +629,7 @@ internal class VeilMobileRuntime internal constructor(
     val conversations = LinkedHashMap<String, NativeDirectConversationInstall>()
     var pendingRequest: PendingDirectRequest? = null
     /** Exact user action reservation; never created by directory or replay. */
-    var directSessionAction: PendingDirectSessionAction? = null
+    var directSessionAction: PendingDirectAction? = null
     var ownPreKeyRequestsPrepared = 0
     /** Guarded by [stateLock]; at most one delayed live turn exists per generation. */
     var liveReplayScheduled = false
@@ -566,7 +649,7 @@ internal class VeilMobileRuntime internal constructor(
     val lifecycleEpoch: Long,
     val generation: Long,
     val conversationId: String? = null,
-    val directSessionAction: PendingDirectSessionAction? = null,
+    val directSessionAction: PendingDirectAction? = null,
   ) {
     var call: NativeDirectHttpCall? = null
 
@@ -578,16 +661,58 @@ internal class VeilMobileRuntime internal constructor(
         "callAttached=${call != null})"
   }
 
-  private class PendingDirectSessionAction(
+  private sealed class PendingDirectAction(
     val lifecycleEpoch: Long,
     val generation: Long,
     val conversationId: String,
-    val completion: DirectSessionActionCompletion,
   ) {
+    abstract fun completeUnavailable(): Boolean
+
+    abstract fun closeSensitive()
+  }
+
+  private class PendingDirectSessionAction(
+    lifecycleEpoch: Long,
+    generation: Long,
+    conversationId: String,
+    val completion: DirectSessionActionCompletion,
+  ) : PendingDirectAction(lifecycleEpoch, generation, conversationId) {
+    override fun completeUnavailable(): Boolean =
+      completion.complete(NativeDirectSessionActionResult.Unavailable)
+
+    override fun closeSensitive() = Unit
+
     override fun toString(): String =
       "PendingDirectSessionAction(" +
         "lifecycleEpoch=$lifecycleEpoch, generation=$generation, " +
         "conversationId=[REDACTED])"
+  }
+
+  private class PendingDirectSendAction(
+    lifecycleEpoch: Long,
+    generation: Long,
+    conversationId: String,
+    val plaintext: OwnedDirectPlaintext,
+    val completion: DirectSendActionCompletion,
+  ) : PendingDirectAction(lifecycleEpoch, generation, conversationId) {
+    var enqueueAttempts = 0
+
+    fun complete(result: NativeDirectTextSendResult): Boolean {
+      plaintext.close()
+      return completion.complete(result)
+    }
+
+    override fun completeUnavailable(): Boolean =
+      complete(NativeDirectTextSendResult.UNAVAILABLE)
+
+    override fun closeSensitive() {
+      plaintext.close()
+    }
+
+    override fun toString(): String =
+      "PendingDirectSendAction(" +
+        "lifecycleEpoch=$lifecycleEpoch, generation=$generation, " +
+        "conversationId=[REDACTED], plaintext=[REDACTED], enqueueAttempts=$enqueueAttempts)"
   }
 
   private class DirectSessionActionCompletion(
@@ -611,6 +736,36 @@ internal class VeilMobileRuntime internal constructor(
       return true
     }
   }
+
+  private class DirectSendActionCompletion(
+    private val callback: NativeDirectTextSendCallback,
+  ) {
+    private var completed = false
+
+    fun complete(result: NativeDirectTextSendResult): Boolean {
+      val ownsCompletion = synchronized(this) {
+        if (completed) false else {
+          completed = true
+          true
+        }
+      }
+      if (!ownsCompletion) return false
+      try {
+        callback.onComplete(result)
+      } catch (_: Throwable) {
+        // A detached React context must not escape the native lifecycle gate.
+      }
+      return true
+    }
+  }
+
+  private class DirectSendTransition(
+    val result: NativeDirectTextSendResult? = null,
+    val requestPreKey: Boolean = false,
+    val detached: DetachedDirectSync? = null,
+    val publishProjection: Boolean = false,
+    val fatal: Boolean = false,
+  )
 
   private enum class DirectRequestStage {
     OWN_PREKEY,
@@ -636,7 +791,7 @@ internal class VeilMobileRuntime internal constructor(
     val session: NativeMobileSession,
     val leaseToken: String,
     val pendingCall: NativeDirectHttpCall?,
-    val directSessionCompletion: DirectSessionActionCompletion?,
+    val directAction: PendingDirectAction?,
   ) {
     override fun toString(): String =
       "DetachedDirectSync(leaseToken=[REDACTED], pendingCall=${pendingCall != null})"
@@ -760,6 +915,174 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   /**
+   * Accept one explicit Direct text intent under the exact public generation.
+   *
+   * The first native attempt either commits atomically, rejects without a
+   * mutation, or authoritatively requests one peer-prekey action. The latter
+   * retains the same wiped-on-detach plaintext owner and performs exactly one
+   * post-install attempt; no ID or provisional row is created in Kotlin.
+   */
+  fun sendDirectText(
+    rawConversationId: String,
+    expectedGeneration: Long,
+    plaintext: String,
+    callback: NativeDirectTextSendCallback,
+  ) {
+    val completion = DirectSendActionCompletion(callback)
+    val ownedPlaintext = OwnedDirectPlaintext.fromString(plaintext)
+    if (ownedPlaintext == null) {
+      completion.complete(NativeDirectTextSendResult.REJECTED)
+      return
+    }
+    val conversationId = try {
+      UUID.fromString(rawConversationId).toString()
+    } catch (_: IllegalArgumentException) {
+      ownedPlaintext.close()
+      completion.complete(NativeDirectTextSendResult.UNAVAILABLE)
+      return
+    }
+    if (
+      conversationId != rawConversationId ||
+      expectedGeneration !in 1L..MAX_PUBLIC_SNAPSHOT_REVISION
+    ) {
+      ownedPlaintext.close()
+      completion.complete(NativeDirectTextSendResult.UNAVAILABLE)
+      return
+    }
+
+    var selectedSync: ActiveDirectSync? = null
+    var selectedAction: PendingDirectSendAction? = null
+    val transition = try {
+      synchronized(stateLock) {
+        val sync = activeDirectSync
+        if (
+          sync == null ||
+          sync.generation != expectedGeneration ||
+          sync.pendingRequest != null ||
+          sync.directSessionAction != null ||
+          !isReadyDirectConversationLocked(sync, conversationId)
+        ) {
+          null
+        } else {
+          val action = PendingDirectSendAction(
+            lifecycleEpoch = lifecycleEpoch,
+            generation = expectedGeneration,
+            conversationId = conversationId,
+            plaintext = ownedPlaintext,
+            completion = completion,
+          )
+          sync.directSessionAction = action
+          selectedSync = sync
+          selectedAction = action
+          advanceDirectSendLocked(sync, action, postPreKeyInstall = false)
+        }
+      }
+    } catch (_: Throwable) {
+      null
+    }
+    val sync = selectedSync
+    val action = selectedAction
+    if (sync == null || action == null || transition == null) {
+      if (sync != null && action != null) {
+        failDirectSync(sync)
+      } else {
+        ownedPlaintext.close()
+        completion.complete(NativeDirectTextSendResult.UNAVAILABLE)
+      }
+      return
+    }
+    finishDirectSendTransition(sync, action, transition)
+  }
+
+  /** Caller must hold [stateLock] and own [action] in [ActiveDirectSync]. */
+  private fun advanceDirectSendLocked(
+    sync: ActiveDirectSync,
+    action: PendingDirectSendAction,
+    postPreKeyInstall: Boolean,
+  ): DirectSendTransition {
+    check(sync.directSessionAction === action)
+    check(sync.pendingRequest == null)
+    check(isReadyDirectConversationLocked(sync, action.conversationId))
+    check(action.enqueueAttempts in 0..1)
+    action.enqueueAttempts += 1
+    val outcome = sync.session.sendDirectText(
+      sync.leaseToken,
+      action.conversationId,
+      action.plaintext.borrow(),
+    )
+    return when (outcome) {
+      NativeDirectTextSendOutcome.ACCEPTED -> {
+        sync.directSessionAction = null
+        if (sync.contentRevision >= MAX_PUBLIC_SNAPSHOT_REVISION) {
+          val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+          connectionState = NativeConnectionState.ERROR
+          binding = null
+          DirectSendTransition(
+            result = NativeDirectTextSendResult.ACCEPTED,
+            detached = detached,
+          )
+        } else {
+          sync.contentRevision += 1
+          DirectSendTransition(
+            result = NativeDirectTextSendResult.ACCEPTED,
+            publishProjection = true,
+          )
+        }
+      }
+      NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY -> {
+        // Rust has already committed and revoked its transport authority. Drop
+        // the action before detaching so cancellation cannot turn acceptance
+        // into an unavailable result and invite a duplicate user intent.
+        sync.directSessionAction = null
+        val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+        connectionState = NativeConnectionState.ERROR
+        binding = null
+        DirectSendTransition(
+          result = NativeDirectTextSendResult.ACCEPTED,
+          detached = detached,
+        )
+      }
+      NativeDirectTextSendOutcome.NEEDS_PRE_KEY -> if (
+        !postPreKeyInstall && action.enqueueAttempts == 1
+      ) {
+        DirectSendTransition(requestPreKey = true)
+      } else {
+        DirectSendTransition(fatal = true)
+      }
+      NativeDirectTextSendOutcome.REJECTED -> {
+        sync.directSessionAction = null
+        DirectSendTransition(result = NativeDirectTextSendResult.REJECTED)
+      }
+      NativeDirectTextSendOutcome.UNAVAILABLE -> if (postPreKeyInstall) {
+        DirectSendTransition(fatal = true)
+      } else {
+        sync.directSessionAction = null
+        DirectSendTransition(result = NativeDirectTextSendResult.UNAVAILABLE)
+      }
+    }
+  }
+
+  private fun finishDirectSendTransition(
+    sync: ActiveDirectSync,
+    action: PendingDirectSendAction,
+    transition: DirectSendTransition,
+  ) {
+    if (transition.fatal) {
+      failDirectSync(sync)
+      return
+    }
+    transition.result?.let(action::complete)
+    transition.detached.cancelHttpQuietly()
+    transition.detached.cancelLeaseQuietly()
+    // AcceptedForReplay and the revision-exhaustion edge revoke the public
+    // generation inside the send linearization point. Publish that fail-closed
+    // state even though no projection is available, otherwise React could
+    // keep rendering a stale Ready generation after native authority is gone.
+    if (transition.detached != null || transition.publishProjection) publishSnapshot()
+    if (transition.requestPreKey) requestPeerPreKey(sync, action)
+  }
+
+  /**
    * Start one explicit, user-initiated peer-session action for the exact
    * selected conversation and public Direct generation.
    *
@@ -848,7 +1171,7 @@ internal class VeilMobileRuntime internal constructor(
 
   private fun requestPeerPreKey(
     sync: ActiveDirectSync,
-    action: PendingDirectSessionAction,
+    action: PendingDirectAction,
   ) {
     val mayPrepare = synchronized(stateLock) {
       sync.pendingRequest == null &&
@@ -953,7 +1276,7 @@ internal class VeilMobileRuntime internal constructor(
 
   private fun denyDirectSessionAction(
     sync: ActiveDirectSync,
-    action: PendingDirectSessionAction,
+    action: PendingDirectAction,
   ) {
     val accepted = synchronized(stateLock) {
       if (sync.directSessionAction !== action || sync.pendingRequest != null) {
@@ -964,14 +1287,14 @@ internal class VeilMobileRuntime internal constructor(
       }
     }
     if (accepted) {
-      action.completion.complete(NativeDirectSessionActionResult.Unavailable)
+      action.completeUnavailable()
     }
   }
 
   private fun enqueuePeerPreKeyResult(
     sync: ActiveDirectSync,
     pending: PendingDirectRequest,
-    action: PendingDirectSessionAction,
+    action: PendingDirectAction,
     result: NativeDirectHttpResult,
   ) {
     try {
@@ -987,7 +1310,7 @@ internal class VeilMobileRuntime internal constructor(
   private fun handlePeerPreKeyResult(
     sync: ActiveDirectSync,
     pending: PendingDirectRequest,
-    action: PendingDirectSessionAction,
+    action: PendingDirectAction,
     result: NativeDirectHttpResult,
   ) {
     try {
@@ -1015,13 +1338,15 @@ internal class VeilMobileRuntime internal constructor(
       // first and install never runs, or install completes before lifecycle
       // revocation can linearize.
       peerPreKeyInstallBoundary()
-      val install = synchronized(stateLock) {
+      var sessionInstall: NativeDirectPreKeyInstall? = null
+      var sendTransition: DirectSendTransition? = null
+      val accepted = synchronized(stateLock) {
         if (
           sync.pendingRequest !== pending ||
           sync.directSessionAction !== action ||
           !isReadyDirectConversationLocked(sync, action.conversationId)
         ) {
-          null
+          false
         } else {
           val installed = sync.session.installDirectPreKeyBundle(
             sync.leaseToken,
@@ -1030,12 +1355,32 @@ internal class VeilMobileRuntime internal constructor(
             result.body,
           )
           sync.pendingRequest = null
-          sync.directSessionAction = null
-          installed
+          when (action) {
+            is PendingDirectSessionAction -> {
+              sync.directSessionAction = null
+              sessionInstall = installed
+            }
+            is PendingDirectSendAction -> {
+              sendTransition = advanceDirectSendLocked(
+                sync,
+                action,
+                postPreKeyInstall = true,
+              )
+            }
+          }
+          true
         }
       }
-      if (install != null) {
-        action.completion.complete(NativeDirectSessionActionResult.Success(install))
+      if (!accepted) return
+      when (action) {
+        is PendingDirectSessionAction -> action.completion.complete(
+          NativeDirectSessionActionResult.Success(checkNotNull(sessionInstall)),
+        )
+        is PendingDirectSendAction -> finishDirectSendTransition(
+          sync,
+          action,
+          checkNotNull(sendTransition),
+        )
       }
     } catch (_: Throwable) {
       failDirectSync(sync)
@@ -1550,7 +1895,7 @@ internal class VeilMobileRuntime internal constructor(
     sync: ActiveDirectSync,
     prepared: NativeDirectRestRequest,
     stage: DirectRequestStage,
-    directSessionAction: PendingDirectSessionAction? = null,
+    directSessionAction: PendingDirectAction? = null,
   ): PreparedDirectHttpRequest {
     val method = when (prepared.method) {
       HTTP_GET_METHOD -> NativeDirectHttpMethod.GET
@@ -1907,6 +2252,13 @@ internal class VeilMobileRuntime internal constructor(
         "native Direct live replay count exceeded its shared bound"
       }
       if (!progress.ready) {
+        if (progress.outboxReplayRequired) {
+          check(!progress.needsImmediatePump) {
+            "native Direct live replay mixed FIFO and outbox pump requests"
+          }
+          continueDirectOutboxReplay(sync)
+          return
+        }
         check(
           progress.needsImmediatePump &&
             progress.consumed == MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN,
@@ -1916,6 +2268,61 @@ internal class VeilMobileRuntime internal constructor(
       }
       check(!progress.needsImmediatePump) {
         "initial native Direct live replay reached Ready before quiescence"
+      }
+
+      val accepted = synchronized(stateLock) {
+        if (
+          !isCurrentDirectSyncLocked(sync) ||
+          sync.pendingRequest != null ||
+          directHistoryState != NativeDirectHistoryState.SYNCHRONIZED
+        ) {
+          false
+        } else {
+          directoryReady = true
+          true
+        }
+      }
+      if (accepted) publishSnapshot()
+      if (accepted) scheduleContinuousDirectLiveReplay(sync)
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+    }
+  }
+
+  /**
+   * Drain one bounded native-owned exact outbox page before publishing Ready.
+   * Kotlin receives no cursor and cannot skip a row or carry pagination across
+   * generations; only Rust's reached-end receipt opens the renderer boundary.
+   */
+  private fun continueDirectOutboxReplay(sync: ActiveDirectSync) {
+    try {
+      val current = synchronized(stateLock) {
+        isCurrentDirectSyncLocked(sync) &&
+          sync.pendingRequest == null &&
+          ownPreKeyState == NativeOwnPreKeyState.PUBLISHED &&
+          directDirectoryState == NativeDirectDirectoryState.SYNCHRONIZED &&
+          directHistoryState == NativeDirectHistoryState.SYNCHRONIZED &&
+          !directoryReady
+      }
+      if (!current) return
+
+      val progress = sync.session.replayDirectOutbox(sync.leaseToken)
+      check(progress.visited in 0..MAX_DIRECT_OUTBOX_REPLAY_ROWS_PER_TURN) {
+        "native Direct outbox replay count exceeded its shared bound"
+      }
+      check(progress.enqueued in 0..progress.visited) {
+        "native Direct outbox enqueue count exceeded visited rows"
+      }
+      if (!progress.replayComplete) {
+        check(
+          progress.needsImmediatePump &&
+            progress.visited == MAX_DIRECT_OUTBOX_REPLAY_ROWS_PER_TURN,
+        ) { "native Direct outbox replay returned an invalid draining checkpoint" }
+        executor.execute { continueDirectOutboxReplay(sync) }
+        return
+      }
+      check(!progress.needsImmediatePump) {
+        "native Direct outbox replay reached its end with another pump requested"
       }
 
       val accepted = synchronized(stateLock) {
@@ -2073,12 +2480,13 @@ internal class VeilMobileRuntime internal constructor(
     val selected = activeDirectSync
     activeDirectSync = null
     val pendingCall = selected?.pendingRequest?.call
-    val directSessionCompletion = selected?.directSessionAction?.completion
+    val directAction = selected?.directSessionAction
     // Cancel under the same lock that revokes the generation. This closes the
     // tiny attach-before-start window: once lifecycle/reconnect has linearized
     // here, a still-unstarted call is terminal before the requester can start
     // it. The out-of-lock cancellation below remains an idempotent fallback.
     pendingCall?.cancelQuietly()
+    directAction?.closeSensitive()
     selected?.pendingRequest = null
     selected?.directSessionAction = null
     ownPreKeyState = if (nextState == NativeDirectDirectoryState.ERROR) {
@@ -2099,7 +2507,7 @@ internal class VeilMobileRuntime internal constructor(
         sync.session,
         sync.leaseToken,
         pendingCall,
-        directSessionCompletion,
+        directAction,
       )
     }
   }
@@ -2111,9 +2519,7 @@ internal class VeilMobileRuntime internal constructor(
     } catch (_: Throwable) {
       // Detaching remains terminal even if the HTTP call already completed.
     } finally {
-      selected.directSessionCompletion?.complete(
-        NativeDirectSessionActionResult.Unavailable,
-      )
+      selected.directAction?.completeUnavailable()
     }
   }
 
@@ -2390,6 +2796,7 @@ internal class VeilMobileRuntime internal constructor(
     private const val MAX_DIRECT_CONVERSATIONS = 10_000
     private const val MAX_BUFFERED_DIRECT_EVENTS_PER_PUMP = 4_096L
     private const val MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN = 64L
+    private const val MAX_DIRECT_OUTBOX_REPLAY_ROWS_PER_TURN = 64L
     private const val MAX_PUBLIC_SNAPSHOT_REVISION = 9_007_199_254_740_991L
 
     private const val DIRECT_LIVE_IDLE_POLL_MILLIS = 250L
@@ -2502,6 +2909,9 @@ private class UniFfiMobileSession(
   override fun replayDirectLiveEvents(leaseToken: String): NativeDirectLiveReplayProgress =
     delegate.replayDirectLiveEvents(leaseToken).toNativeDirectLiveReplayProgress()
 
+  override fun replayDirectOutbox(leaseToken: String): NativeDirectOutboxReplayProgress =
+    delegate.replayDirectOutbox(leaseToken).toNativeDirectOutboxReplayProgress()
+
   override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection =
     delegate.projectDirectMessages(conversationId).toNativeDirectMessageProjection()
 
@@ -2510,6 +2920,13 @@ private class UniFfiMobileSession(
     conversationId: String,
   ): NativeDirectSendReadiness =
     delegate.directSendReadiness(leaseToken, conversationId).toNativeDirectSendReadiness()
+
+  override fun sendDirectText(
+    leaseToken: String,
+    conversationId: String,
+    plaintextUtf8: ByteArray,
+  ): NativeDirectTextSendOutcome =
+    delegate.sendDirectText(leaseToken, conversationId, plaintextUtf8).toNativeDirectTextSendOutcome()
 
   override fun prepareDirectPreKeyRequest(
     leaseToken: String,
@@ -2632,7 +3049,16 @@ internal fun MobileDirectLiveReplayProgress.toNativeDirectLiveReplayProgress(): 
     consumed = consumed.toLong(),
     projectionChanged = projectionChanged,
     needsImmediatePump = needsImmediatePump,
+    outboxReplayRequired = outboxReplayRequired,
     ready = ready,
+  )
+
+internal fun MobileDirectOutboxReplayProgress.toNativeDirectOutboxReplayProgress(): NativeDirectOutboxReplayProgress =
+  NativeDirectOutboxReplayProgress(
+    visited = visited.toLong(),
+    enqueued = enqueued.toLong(),
+    needsImmediatePump = needsImmediatePump,
+    replayComplete = replayComplete,
   )
 
 internal fun MobileDirectMessageProjection.toNativeDirectMessageProjection(): NativeDirectMessageProjection {
@@ -2684,6 +3110,16 @@ internal fun MobileDirectSendReadiness.toNativeDirectSendReadiness(): NativeDire
     MobileDirectSendReadiness.READY -> NativeDirectSendReadiness.READY
     MobileDirectSendReadiness.NEEDS_PRE_KEY -> NativeDirectSendReadiness.NEEDS_PRE_KEY
     MobileDirectSendReadiness.UNAVAILABLE -> NativeDirectSendReadiness.UNAVAILABLE
+  }
+
+internal fun MobileDirectTextSendOutcome.toNativeDirectTextSendOutcome(): NativeDirectTextSendOutcome =
+  when (this) {
+    MobileDirectTextSendOutcome.ACCEPTED -> NativeDirectTextSendOutcome.ACCEPTED
+    MobileDirectTextSendOutcome.ACCEPTED_FOR_REPLAY ->
+      NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY
+    MobileDirectTextSendOutcome.NEEDS_PRE_KEY -> NativeDirectTextSendOutcome.NEEDS_PRE_KEY
+    MobileDirectTextSendOutcome.REJECTED -> NativeDirectTextSendOutcome.REJECTED
+    MobileDirectTextSendOutcome.UNAVAILABLE -> NativeDirectTextSendOutcome.UNAVAILABLE
   }
 
 internal fun RestSignatureData.toNativeRestSignature(): NativeRestSignature =
