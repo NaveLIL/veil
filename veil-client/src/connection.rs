@@ -1,12 +1,13 @@
 use std::collections::{HashSet, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::fmt;
+use std::mem::size_of;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::sync::{mpsc, watch, Mutex};
+use tokio::sync::{mpsc, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::{
     connect_async_with_config,
     tungstenite::{protocol::WebSocketConfig, Message as WsMessage},
@@ -30,7 +31,9 @@ const MAX_RETAINED_SKDM_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_RETAINED_SKDM_WIRE_BYTES: usize = 4_096;
 const AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 const OUTBOUND_QUEUE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-const LIVE_EVENT_QUEUE_CAPACITY: usize = 4_096;
+pub(crate) const LIVE_EVENT_QUEUE_CAPACITY: usize = 4_096;
+pub(crate) const LIVE_EVENT_RETAINED_BYTES: usize = 32 * 1024 * 1024;
+const MAX_TERMINAL_REASON_BYTES: usize = 4 * 1024;
 const MAX_EVENT_ID_BYTES: usize = 256;
 const MAX_EVENT_CIPHERTEXT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_HEADER_BYTES: usize = 512;
@@ -352,6 +355,601 @@ pub struct ChannelInfoLite {
     pub topic: Option<String>,
 }
 
+/// A fail-closed outcome from the single live-event budget shared by the
+/// socket channel, the pre-auth retained barrier, and the API's deferred FIFO.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionEventBufferErrorV1 {
+    EventCountLimitExceeded { limit: usize },
+    RetainedSizeLimitExceeded { limit: usize, event_bytes: usize },
+    RetainedSizeAccountingOverflow,
+    TransportEpochEnded,
+    AuthenticationEpochAnomaly { envelope: &'static str },
+}
+
+impl fmt::Display for ConnectionEventBufferErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::EventCountLimitExceeded { limit } => write!(
+                formatter,
+                "authenticated live-event buffer exceeded its {limit}-event limit"
+            ),
+            Self::RetainedSizeLimitExceeded { limit, event_bytes } => write!(
+                formatter,
+                "authenticated live-event buffer exceeded its {limit}-byte retained-size limit (next event retains {event_bytes} bytes)"
+            ),
+            Self::RetainedSizeAccountingOverflow => formatter.write_str(
+                "authenticated live-event retained-size accounting overflowed",
+            ),
+            Self::TransportEpochEnded => {
+                formatter.write_str("authenticated WebSocket epoch has ended")
+            }
+            Self::AuthenticationEpochAnomaly { envelope } => write!(
+                formatter,
+                "unexpected authentication envelope {envelope} after the authenticated barrier"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ConnectionEventBufferErrorV1 {}
+
+#[derive(Default)]
+struct RetainedSizeCounterV1(usize);
+
+impl RetainedSizeCounterV1 {
+    fn add(&mut self, bytes: usize) -> Result<(), ConnectionEventBufferErrorV1> {
+        self.0 = self
+            .0
+            .checked_add(bytes)
+            .ok_or(ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow)?;
+        Ok(())
+    }
+
+    fn add_items<T>(&mut self, capacity: usize) -> Result<(), ConnectionEventBufferErrorV1> {
+        self.add(
+            capacity
+                .checked_mul(size_of::<T>())
+                .ok_or(ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow)?,
+        )
+    }
+
+    fn add_string(&mut self, value: &String) -> Result<(), ConnectionEventBufferErrorV1> {
+        self.add(value.capacity())
+    }
+
+    fn add_bytes(&mut self, value: &Vec<u8>) -> Result<(), ConnectionEventBufferErrorV1> {
+        self.add(value.capacity())
+    }
+
+    fn add_optional_string(
+        &mut self,
+        value: &Option<String>,
+    ) -> Result<(), ConnectionEventBufferErrorV1> {
+        if let Some(value) = value {
+            self.add_string(value)?;
+        }
+        Ok(())
+    }
+}
+
+/// Counts the complete retained allocation owned by an event: the enum's
+/// inline storage plus every heap allocation reachable from it. Capacities,
+/// rather than logical lengths, are used so spare allocation is never hidden
+/// from the global 32 MiB limit.
+pub(crate) fn connection_event_retained_size_v1(
+    event: &ConnectionEvent,
+) -> Result<usize, ConnectionEventBufferErrorV1> {
+    // Events are queued inside `BudgetedConnectionEventV1`; count that complete
+    // inline wrapper once, then add every allocation reachable from the event.
+    let mut size = RetainedSizeCounterV1(size_of::<BudgetedConnectionEventV1>());
+    match event {
+        ConnectionEvent::Authenticated { user_id } => size.add_string(user_id)?,
+        ConnectionEvent::AuthFailed { reason } | ConnectionEvent::Disconnected { reason } => {
+            size.add_string(reason)?
+        }
+        ConnectionEvent::MessageReceived {
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            sender_username,
+            ciphertext,
+            header,
+            reply_to_id,
+            attachments,
+            ..
+        } => {
+            size.add_string(message_id)?;
+            size.add_string(conversation_id)?;
+            size.add_bytes(sender_identity_key)?;
+            size.add_string(sender_username)?;
+            size.add_bytes(ciphertext)?;
+            size.add_bytes(header)?;
+            size.add_optional_string(reply_to_id)?;
+            size.add_items::<crate::attachments::WireAttachmentV1>(attachments.capacity())?;
+            for attachment in attachments {
+                size.add_string(&attachment.media_id)?;
+                size.add_bytes(&attachment.encrypted_key)?;
+                size.add_bytes(&attachment.nonce)?;
+                size.add_string(&attachment.content_type)?;
+            }
+        }
+        ConnectionEvent::MessageEdited {
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            ciphertext,
+            header,
+            ..
+        } => {
+            size.add_string(message_id)?;
+            size.add_string(conversation_id)?;
+            size.add_bytes(sender_identity_key)?;
+            size.add_bytes(ciphertext)?;
+            size.add_bytes(header)?;
+        }
+        ConnectionEvent::MessageDeleted {
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            ..
+        } => {
+            size.add_string(message_id)?;
+            size.add_string(conversation_id)?;
+            size.add_bytes(sender_identity_key)?;
+        }
+        ConnectionEvent::TypingEvent {
+            conversation_id,
+            identity_key,
+            ..
+        } => {
+            size.add_string(conversation_id)?;
+            size.add_bytes(identity_key)?;
+        }
+        ConnectionEvent::ReactionEvent {
+            message_id,
+            conversation_id,
+            emoji,
+            user_id,
+            username,
+            ..
+        } => {
+            size.add_string(message_id)?;
+            size.add_string(conversation_id)?;
+            size.add_string(emoji)?;
+            size.add_string(user_id)?;
+            size.add_string(username)?;
+        }
+        ConnectionEvent::PresenceUpdate {
+            identity_key,
+            status_text,
+            ..
+        } => {
+            size.add_bytes(identity_key)?;
+            size.add_optional_string(status_text)?;
+        }
+        ConnectionEvent::FriendRequestReceived {
+            request_id,
+            from_user_id,
+            from_username,
+            message,
+            ..
+        } => {
+            size.add_string(request_id)?;
+            size.add_string(from_user_id)?;
+            size.add_string(from_username)?;
+            size.add_optional_string(message)?;
+        }
+        ConnectionEvent::FriendAccepted { user_id, username } => {
+            size.add_string(user_id)?;
+            size.add_string(username)?;
+        }
+        ConnectionEvent::FriendRemoved { user_id }
+        | ConnectionEvent::ProfileUpdated { user_id, .. } => size.add_string(user_id)?,
+        ConnectionEvent::FriendListReceived {
+            friends,
+            pending_requests,
+        } => {
+            size.add_items::<FriendInfo>(friends.capacity())?;
+            for friend in friends {
+                size.add_string(&friend.user_id)?;
+                size.add_string(&friend.username)?;
+            }
+            size.add_items::<FriendRequestInfo>(pending_requests.capacity())?;
+            for request in pending_requests {
+                size.add_string(&request.request_id)?;
+                size.add_string(&request.from_user_id)?;
+                size.add_string(&request.from_username)?;
+                size.add_optional_string(&request.message)?;
+            }
+        }
+        ConnectionEvent::ServerEvent {
+            server_id,
+            server_info,
+            member_info,
+            role_info,
+            ..
+        } => {
+            size.add_string(server_id)?;
+            if let Some(server) = server_info {
+                size.add_string(&server.id)?;
+                size.add_string(&server.name)?;
+                size.add_optional_string(&server.icon_url)?;
+                size.add_bytes(&server.owner_identity_key)?;
+            }
+            if let Some(member) = member_info {
+                size.add_bytes(&member.identity_key)?;
+                size.add_string(&member.username)?;
+                size.add_items::<String>(member.role_ids.capacity())?;
+                for role_id in &member.role_ids {
+                    size.add_string(role_id)?;
+                }
+                size.add_optional_string(&member.reason)?;
+            }
+            if let Some(role) = role_info {
+                size.add_string(&role.id)?;
+                size.add_string(&role.name)?;
+            }
+        }
+        ConnectionEvent::ChannelEvent {
+            server_id, channel, ..
+        } => {
+            size.add_string(server_id)?;
+            size.add_string(&channel.id)?;
+            size.add_string(&channel.server_id)?;
+            size.add_string(&channel.name)?;
+            size.add_optional_string(&channel.category_id)?;
+            size.add_optional_string(&channel.topic)?;
+        }
+        ConnectionEvent::MessageAcked {
+            message_id,
+            local_message_id,
+            mutation,
+            sender_key,
+            ..
+        } => {
+            size.add_string(message_id)?;
+            size.add_optional_string(local_message_id)?;
+            if let Some(mutation) = mutation {
+                match mutation {
+                    ConfirmedMutation::Edit {
+                        message_id,
+                        conversation_id,
+                        new_text,
+                    } => {
+                        size.add_string(message_id)?;
+                        size.add_string(conversation_id)?;
+                        size.add_string(new_text)?;
+                    }
+                    ConfirmedMutation::Delete {
+                        message_id,
+                        conversation_id,
+                    } => {
+                        size.add_string(message_id)?;
+                        size.add_string(conversation_id)?;
+                    }
+                    ConfirmedMutation::Reaction {
+                        message_id,
+                        conversation_id,
+                        emoji,
+                        user_id,
+                        ..
+                    } => {
+                        size.add_string(message_id)?;
+                        size.add_string(conversation_id)?;
+                        size.add_string(emoji)?;
+                        size.add_string(user_id)?;
+                    }
+                }
+            }
+            if let Some(sender_key) = sender_key {
+                size.add_string(&sender_key.conversation_id)?;
+            }
+        }
+        ConnectionEvent::SenderKeyDist {
+            sender_key_message,
+            route,
+        } => {
+            size.add_bytes(sender_key_message)?;
+            size.add_string(&route.conversation_id)?;
+        }
+        ConnectionEvent::Error {
+            message,
+            local_message_id,
+            conversation_id,
+            ..
+        } => {
+            size.add_string(message)?;
+            size.add_optional_string(local_message_id)?;
+            size.add_optional_string(conversation_id)?;
+        }
+    }
+    Ok(size.0)
+}
+
+#[derive(Clone)]
+pub(crate) struct ConnectionEventBudgetV1 {
+    event_slots: Arc<Semaphore>,
+    retained_bytes: Arc<Semaphore>,
+    event_limit: usize,
+    retained_byte_limit: usize,
+}
+
+impl ConnectionEventBudgetV1 {
+    fn production() -> Self {
+        Self::with_limits(LIVE_EVENT_QUEUE_CAPACITY, LIVE_EVENT_RETAINED_BYTES)
+    }
+
+    pub(crate) fn with_limits(event_limit: usize, retained_byte_limit: usize) -> Self {
+        assert!(retained_byte_limit <= Semaphore::MAX_PERMITS);
+        Self {
+            event_slots: Arc::new(Semaphore::new(event_limit)),
+            retained_bytes: Arc::new(Semaphore::new(retained_byte_limit)),
+            event_limit,
+            retained_byte_limit,
+        }
+    }
+
+    pub(crate) fn try_wrap(
+        &self,
+        event: ConnectionEvent,
+    ) -> Result<BudgetedConnectionEventV1, ConnectionEventBufferErrorV1> {
+        let retained_bytes = connection_event_retained_size_v1(&event)?;
+        if retained_bytes > self.retained_byte_limit || retained_bytes > u32::MAX as usize {
+            return Err(ConnectionEventBufferErrorV1::RetainedSizeLimitExceeded {
+                limit: self.retained_byte_limit,
+                event_bytes: retained_bytes,
+            });
+        }
+        let event_slot = self.event_slots.clone().try_acquire_owned().map_err(|_| {
+            ConnectionEventBufferErrorV1::EventCountLimitExceeded {
+                limit: self.event_limit,
+            }
+        })?;
+        let retained_byte_permit = self
+            .retained_bytes
+            .clone()
+            .try_acquire_many_owned(retained_bytes as u32)
+            .map_err(
+                |_| ConnectionEventBufferErrorV1::RetainedSizeLimitExceeded {
+                    limit: self.retained_byte_limit,
+                    event_bytes: retained_bytes,
+                },
+            )?;
+        Ok(BudgetedConnectionEventV1 {
+            event,
+            retained_bytes,
+            budget: Some(ConnectionEventBudgetGuardV1 {
+                _event_slot: event_slot,
+                _retained_bytes: retained_byte_permit,
+            }),
+            terminal_failure: None,
+        })
+    }
+}
+
+pub(crate) struct ConnectionEventBudgetGuardV1 {
+    _event_slot: OwnedSemaphorePermit,
+    _retained_bytes: OwnedSemaphorePermit,
+}
+
+pub(crate) struct BudgetedConnectionEventV1 {
+    pub(crate) event: ConnectionEvent,
+    retained_bytes: usize,
+    budget: Option<ConnectionEventBudgetGuardV1>,
+    terminal_failure: Option<ConnectionEventBufferErrorV1>,
+}
+
+impl BudgetedConnectionEventV1 {
+    fn terminal(
+        event: ConnectionEvent,
+        terminal_failure: Option<ConnectionEventBufferErrorV1>,
+    ) -> Self {
+        let retained_bytes = connection_event_retained_size_v1(&event)
+            .unwrap_or(size_of::<ConnectionEvent>() + MAX_TERMINAL_REASON_BYTES);
+        Self {
+            event,
+            retained_bytes,
+            budget: None,
+            terminal_failure,
+        }
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.retained_bytes
+    }
+
+    pub(crate) fn into_event(self) -> ConnectionEvent {
+        self.event
+    }
+
+    pub(crate) fn terminal_failure(&self) -> Option<&ConnectionEventBufferErrorV1> {
+        self.terminal_failure.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_failure_for_test(error: ConnectionEventBufferErrorV1) -> Self {
+        Self::terminal(
+            ConnectionEvent::Disconnected {
+                reason: error.to_string(),
+            },
+            Some(error),
+        )
+    }
+
+    pub(crate) fn into_parts(self) -> (ConnectionEvent, Option<ConnectionEventBudgetGuardV1>) {
+        (self.event, self.budget)
+    }
+}
+
+#[derive(Default)]
+struct ConnectionTerminalInnerV1 {
+    cause: Option<ConnectionTerminalCauseV1>,
+    delivered: bool,
+}
+
+#[derive(Clone)]
+enum ConnectionTerminalCauseV1 {
+    Transport(String),
+    Buffer(ConnectionEventBufferErrorV1),
+}
+
+#[derive(Default)]
+struct ConnectionTerminalStateV1 {
+    inner: StdMutex<ConnectionTerminalInnerV1>,
+    notify: Notify,
+}
+
+impl ConnectionTerminalStateV1 {
+    fn report_transport(&self, mut reason: String) -> bool {
+        if reason.len() > MAX_TERMINAL_REASON_BYTES {
+            let mut boundary = MAX_TERMINAL_REASON_BYTES;
+            while !reason.is_char_boundary(boundary) {
+                boundary -= 1;
+            }
+            reason.truncate(boundary);
+        }
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.cause.is_some() {
+            return false;
+        }
+        state.cause = Some(ConnectionTerminalCauseV1::Transport(reason));
+        drop(state);
+        // There is exactly one receiver. `notify_one` retains a permit when
+        // termination races the receiver between its state check and await.
+        self.notify.notify_one();
+        true
+    }
+
+    fn report_buffer_failure(&self, error: ConnectionEventBufferErrorV1) -> bool {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.cause.is_some() {
+            return false;
+        }
+        state.cause = Some(ConnectionTerminalCauseV1::Buffer(error));
+        drop(state);
+        // There is exactly one receiver. `notify_one` retains a permit when
+        // termination races the receiver between its state check and await.
+        self.notify.notify_one();
+        true
+    }
+
+    fn is_reported(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .cause
+            .is_some()
+    }
+
+    fn take_for_delivery(&self) -> Option<ConnectionTerminalCauseV1> {
+        let mut state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if state.delivered {
+            return None;
+        }
+        let cause = state.cause.clone()?;
+        state.delivered = true;
+        Some(cause)
+    }
+}
+
+#[derive(Clone)]
+struct ConnectionEventSenderV1 {
+    sender: mpsc::Sender<BudgetedConnectionEventV1>,
+    budget: ConnectionEventBudgetV1,
+}
+
+impl ConnectionEventSenderV1 {
+    async fn send(&self, event: ConnectionEvent) -> Result<(), ConnectionEventBufferErrorV1> {
+        let event = self.budget.try_wrap(event)?;
+        self.sender
+            .send(event)
+            .await
+            .map_err(|_| ConnectionEventBufferErrorV1::TransportEpochEnded)
+    }
+}
+
+pub struct ConnectionEventReceiverV1 {
+    receiver: mpsc::Receiver<BudgetedConnectionEventV1>,
+    terminal: Arc<ConnectionTerminalStateV1>,
+}
+
+impl ConnectionEventReceiverV1 {
+    fn terminal_event(&mut self) -> Option<BudgetedConnectionEventV1> {
+        if !self.terminal.is_reported() {
+            return None;
+        }
+        self.receiver.close();
+        while self.receiver.try_recv().is_ok() {}
+        self.terminal.take_for_delivery().map(|cause| match cause {
+            ConnectionTerminalCauseV1::Transport(reason) => {
+                BudgetedConnectionEventV1::terminal(ConnectionEvent::Disconnected { reason }, None)
+            }
+            ConnectionTerminalCauseV1::Buffer(error) => BudgetedConnectionEventV1::terminal(
+                ConnectionEvent::Disconnected {
+                    reason: error.to_string(),
+                },
+                Some(error),
+            ),
+        })
+    }
+
+    pub(crate) fn try_recv_budgeted(
+        &mut self,
+    ) -> Result<BudgetedConnectionEventV1, mpsc::error::TryRecvError> {
+        if let Some(event) = self.terminal_event() {
+            return Ok(event);
+        }
+        if self.terminal.is_reported() {
+            return Err(mpsc::error::TryRecvError::Disconnected);
+        }
+        let candidate = self.receiver.try_recv();
+        if let Some(event) = self.terminal_event() {
+            drop(candidate);
+            return Ok(event);
+        }
+        candidate
+    }
+
+    pub(crate) fn try_recv_terminal(&mut self) -> Option<BudgetedConnectionEventV1> {
+        self.terminal_event()
+    }
+
+    pub fn try_recv(&mut self) -> Result<ConnectionEvent, mpsc::error::TryRecvError> {
+        self.try_recv_budgeted()
+            .map(BudgetedConnectionEventV1::into_event)
+    }
+
+    pub async fn recv(&mut self) -> Option<ConnectionEvent> {
+        loop {
+            if let Some(event) = self.terminal_event() {
+                return Some(event.into_event());
+            }
+            if self.terminal.is_reported() {
+                return None;
+            }
+            tokio::select! {
+                event = self.receiver.recv() => {
+                    if let Some(terminal) = self.terminal_event() {
+                        drop(event);
+                        return Some(terminal.into_event());
+                    }
+                    return event.map(BudgetedConnectionEventV1::into_event);
+                }
+                _ = self.terminal.notify.notified() => continue,
+            }
+        }
+    }
+}
+
 /// Sender half — used to send protobuf envelopes to the server.
 pub type WsSender = mpsc::Sender<Vec<u8>>;
 
@@ -360,30 +958,35 @@ pub struct Connection {
     /// Send raw protobuf bytes to the WS write loop.
     pub sender: WsSender,
     /// Receive application-level events.
-    pub events: mpsc::Receiver<ConnectionEvent>,
+    pub events: ConnectionEventReceiverV1,
     /// Authenticated retained controls observed before the AuthResult FIFO
     /// barrier. They are kept outside the bounded live-event channel so the
     /// handshake cannot deadlock before the caller can drain that channel.
-    pub(crate) retained_events: VecDeque<ConnectionEvent>,
+    pub(crate) retained_events: VecDeque<BudgetedConnectionEventV1>,
     /// Current sequence number for outgoing messages.
     seq: Arc<Mutex<u64>>,
     write_task: tokio::task::AbortHandle,
     read_task: tokio::task::AbortHandle,
 }
 
-async fn signal_disconnected(
-    events: &mpsc::Sender<ConnectionEvent>,
+fn signal_disconnected(
+    terminal: &ConnectionTerminalStateV1,
     shutdown: &watch::Sender<bool>,
-    reported: &AtomicBool,
     reason: String,
 ) {
     // Closing either half makes the split WebSocket unusable. Stop its peer
     // immediately and emit exactly one terminal event for the connection.
-    let first_report = !reported.swap(true, Ordering::AcqRel);
     let _ = shutdown.send(true);
-    if first_report {
-        let _ = events.send(ConnectionEvent::Disconnected { reason }).await;
-    }
+    terminal.report_transport(reason);
+}
+
+fn signal_event_buffer_failure(
+    terminal: &ConnectionTerminalStateV1,
+    shutdown: &watch::Sender<bool>,
+    error: ConnectionEventBufferErrorV1,
+) {
+    let _ = shutdown.send(true);
+    terminal.report_buffer_failure(error);
 }
 
 impl Connection {
@@ -562,33 +1165,48 @@ impl Connection {
 
         info!("authenticated WebSocket session");
 
-        let retained_events = retained_before_auth
-            .into_iter()
-            .filter_map(connection_event_from_envelope)
-            .collect();
+        let event_budget = ConnectionEventBudgetV1::production();
+        let mut retained_events = VecDeque::with_capacity(retained_before_auth.len());
+        for envelope in retained_before_auth {
+            let event = connection_event_from_envelope(envelope)
+                .ok_or_else(|| "invalid retained sender-key event".to_string())?;
+            retained_events.push_back(
+                event_budget
+                    .try_wrap(event)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
         // Channel: WS read loop → app. Retained controls live in their own
         // bounded buffer above, so this capacity remains a live backpressure
         // limit even for accounts with many channel memberships.
-        let (event_tx, event_rx) = mpsc::channel::<ConnectionEvent>(LIVE_EVENT_QUEUE_CAPACITY);
+        let (raw_event_tx, raw_event_rx) =
+            mpsc::channel::<BudgetedConnectionEventV1>(LIVE_EVENT_QUEUE_CAPACITY);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let event_tx = ConnectionEventSenderV1 {
+            sender: raw_event_tx,
+            budget: event_budget,
+        };
+        let event_rx = ConnectionEventReceiverV1 {
+            receiver: raw_event_rx,
+            terminal: terminal.clone(),
+        };
 
         // Notify app about successful auth
-        let _ = event_tx
+        event_tx
             .send(ConnectionEvent::Authenticated {
                 user_id: user_id.clone(),
             })
-            .await;
+            .await
+            .map_err(|error| error.to_string())?;
 
         // Both halves share a terminal signal. A write failure must stop the
         // reader as well (and vice versa), otherwise the application can keep
         // treating a half-dead socket as connected indefinitely.
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let disconnect_reported = Arc::new(AtomicBool::new(false));
-
         // --- Background write loop ---
-        let write_events = event_tx.clone();
+        let write_terminal = terminal.clone();
         let write_shutdown = shutdown_tx.clone();
         let mut write_shutdown_rx = shutdown_rx.clone();
-        let write_disconnect_reported = disconnect_reported.clone();
         let write_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -603,12 +1221,10 @@ impl Connection {
                         };
                         if let Err(error) = ws_write.send(WsMessage::Binary(data)).await {
                             signal_disconnected(
-                                &write_events,
+                                &write_terminal,
                                 &write_shutdown,
-                                &write_disconnect_reported,
                                 format!("ws write error: {error}"),
-                            )
-                            .await;
+                            );
                             break;
                         }
                     }
@@ -619,9 +1235,9 @@ impl Connection {
 
         // --- Background read loop ---
         let evt = event_tx.clone();
+        let read_terminal = terminal;
         let read_shutdown = shutdown_tx;
         let mut read_shutdown_rx = shutdown_rx;
-        let read_disconnect_reported = disconnect_reported;
         let read_task = tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -634,28 +1250,31 @@ impl Connection {
                         match incoming {
                             Some(Ok(WsMessage::Binary(data))) => {
                                 if let Ok(env) = proto::Envelope::decode(data.as_ref()) {
-                                    dispatch_event(&evt, env).await;
+                                    if let Err(error) = dispatch_event(&evt, env).await {
+                                        signal_event_buffer_failure(
+                                            &read_terminal,
+                                            &read_shutdown,
+                                            error,
+                                        );
+                                        break;
+                                    }
                                 }
                             }
                             Some(Ok(WsMessage::Ping(_))) | Some(Ok(WsMessage::Pong(_))) => continue,
                             Some(Ok(WsMessage::Close(_))) | None => {
                                 signal_disconnected(
-                                    &evt,
+                                    &read_terminal,
                                     &read_shutdown,
-                                    &read_disconnect_reported,
                                     "server closed".into(),
-                                )
-                                .await;
+                                );
                                 break;
                             }
                             Some(Err(error)) => {
                                 signal_disconnected(
-                                    &evt,
+                                    &read_terminal,
                                     &read_shutdown,
-                                    &read_disconnect_reported,
                                     format!("ws read error: {error}"),
-                                )
-                                .await;
+                                );
                                 break;
                             }
                             _ => continue,
@@ -713,12 +1332,13 @@ mod url_policy_tests {
     use super::{
         client_version, node_access_invite_wire_value, signal_disconnected,
         validate_per_device_auth_result, validate_websocket_url, websocket_auth_signature,
-        Connection, ConnectionEvent,
+        Connection, ConnectionEvent, ConnectionEventReceiverV1, ConnectionTerminalStateV1,
     };
     use crate::device_identity::{
         DeviceBindingPublicV1, DEVICE_BINDING_STATUS_ACTIVE, REQUIRED_DEVICE_CAPABILITIES,
     };
     use crate::protocol::proto;
+    use std::sync::Arc;
     use veil_crypto::keys::IdentityKeyPair;
 
     #[test]
@@ -766,7 +1386,12 @@ mod url_policy_tests {
         let write_join = tokio::spawn(std::future::pending::<()>());
         let read_join = tokio::spawn(std::future::pending::<()>());
         let (sender, _send_rx) = tokio::sync::mpsc::channel(1);
-        let (_event_tx, events) = tokio::sync::mpsc::channel(1);
+        let (_event_tx, event_rx) = tokio::sync::mpsc::channel(1);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let events = ConnectionEventReceiverV1 {
+            receiver: event_rx,
+            terminal,
+        };
         let connection = Connection {
             sender,
             events,
@@ -784,26 +1409,22 @@ mod url_policy_tests {
 
     #[tokio::test]
     async fn terminal_signal_stops_peer_and_emits_disconnected_once() {
-        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(2);
+        let (_event_tx, event_rx) = tokio::sync::mpsc::channel(2);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let mut event_rx = ConnectionEventReceiverV1 {
+            receiver: event_rx,
+            terminal: terminal.clone(),
+        };
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
-        let reported = std::sync::atomic::AtomicBool::new(false);
 
         signal_disconnected(
-            &event_tx,
+            &terminal,
             &shutdown_tx,
-            &reported,
             "ws write error: closed".to_string(),
-        )
-        .await;
+        );
         // A concurrent failure in the reader cannot create a second terminal
         // event for the same socket epoch.
-        signal_disconnected(
-            &event_tx,
-            &shutdown_tx,
-            &reported,
-            "ws read error: closed".to_string(),
-        )
-        .await;
+        signal_disconnected(&terminal, &shutdown_tx, "ws read error: closed".to_string());
 
         shutdown_rx.changed().await.unwrap();
         assert!(*shutdown_rx.borrow());
@@ -814,7 +1435,7 @@ mod url_policy_tests {
         ));
         assert!(matches!(
             event_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         ));
     }
 
@@ -1302,15 +1923,214 @@ fn connection_event_from_envelope(env: proto::Envelope) -> Option<ConnectionEven
     Some(event)
 }
 
-async fn dispatch_event(tx: &mpsc::Sender<ConnectionEvent>, env: proto::Envelope) {
-    if let Some(event) = connection_event_from_envelope(env) {
-        let _ = tx.send(event).await;
+async fn dispatch_event(
+    tx: &ConnectionEventSenderV1,
+    env: proto::Envelope,
+) -> Result<(), ConnectionEventBufferErrorV1> {
+    let authentication_envelope = match env.payload.as_ref() {
+        Some(proto::envelope::Payload::AuthChallenge(_)) => Some("AuthChallenge"),
+        Some(proto::envelope::Payload::AuthResponse(_)) => Some("AuthResponse"),
+        Some(proto::envelope::Payload::AuthResult(_)) => Some("AuthResult"),
+        _ => None,
+    };
+    if let Some(envelope) = authentication_envelope {
+        return Err(ConnectionEventBufferErrorV1::AuthenticationEpochAnomaly { envelope });
     }
+    if let Some(event) = connection_event_from_envelope(env) {
+        tx.send(event).await?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn error_event_with_capacity(capacity: usize) -> ConnectionEvent {
+        let mut message = String::with_capacity(capacity);
+        message.push('x');
+        ConnectionEvent::Error {
+            code: 500,
+            message,
+            ref_seq: None,
+            local_message_id: None,
+            conversation_id: None,
+            stale_roster_context: false,
+        }
+    }
+
+    #[test]
+    fn global_event_budget_accepts_exact_boundaries_and_rejects_one_more() {
+        let event = error_event_with_capacity(128);
+        let retained = connection_event_retained_size_v1(&event).unwrap();
+
+        let exact_bytes = ConnectionEventBudgetV1::with_limits(1, retained);
+        let exact = exact_bytes.try_wrap(event).unwrap();
+        assert_eq!(exact.retained_bytes(), retained);
+        assert!(matches!(
+            exact_bytes.try_wrap(error_event_with_capacity(1)),
+            Err(ConnectionEventBufferErrorV1::EventCountLimitExceeded { limit: 1 })
+        ));
+        drop(exact);
+
+        let one_byte_short = ConnectionEventBudgetV1::with_limits(1, retained - 1);
+        assert!(matches!(
+            one_byte_short.try_wrap(error_event_with_capacity(128)),
+            Err(ConnectionEventBufferErrorV1::RetainedSizeLimitExceeded {
+                limit,
+                event_bytes,
+            }) if limit == retained - 1 && event_bytes == retained
+        ));
+
+        let two_events = ConnectionEventBudgetV1::with_limits(2, retained * 2);
+        let first = two_events.try_wrap(error_event_with_capacity(128)).unwrap();
+        let second = two_events.try_wrap(error_event_with_capacity(128)).unwrap();
+        assert!(matches!(
+            two_events.try_wrap(error_event_with_capacity(1)),
+            Err(ConnectionEventBufferErrorV1::EventCountLimitExceeded { limit: 2 })
+        ));
+        drop((first, second));
+    }
+
+    #[test]
+    fn retained_size_counts_huge_nested_friend_and_server_allocations() {
+        let mut username = String::with_capacity(2 * 1024 * 1024);
+        username.push('a');
+        let mut message = String::with_capacity(1024 * 1024);
+        message.push('b');
+        let mut friends = Vec::with_capacity(7);
+        friends.push(FriendInfo {
+            user_id: "friend".to_string(),
+            username,
+            status: 1,
+            last_seen: None,
+        });
+        let mut pending_requests = Vec::with_capacity(9);
+        pending_requests.push(FriendRequestInfo {
+            request_id: "request".to_string(),
+            from_user_id: "from".to_string(),
+            from_username: "sender".to_string(),
+            message: Some(message),
+            timestamp: 1,
+            outgoing: false,
+        });
+        let friend_list = ConnectionEvent::FriendListReceived {
+            friends,
+            pending_requests,
+        };
+        let friend_bytes = connection_event_retained_size_v1(&friend_list).unwrap();
+        assert!(friend_bytes > 3 * 1024 * 1024);
+
+        let mut role_id = String::with_capacity(2 * 1024 * 1024);
+        role_id.push('r');
+        let mut role_ids = Vec::with_capacity(16);
+        role_ids.push(role_id);
+        let server = ConnectionEvent::ServerEvent {
+            event_type: 1,
+            server_id: "server".to_string(),
+            server_info: Some(ServerInfoLite {
+                id: "server".to_string(),
+                name: "name".to_string(),
+                icon_url: Some("icon".to_string()),
+                owner_identity_key: vec![1; 32],
+            }),
+            member_info: Some(MemberInfoLite {
+                identity_key: vec![2; 32],
+                username: "member".to_string(),
+                role_ids,
+                reason: Some("reason".to_string()),
+            }),
+            role_info: Some(RoleInfoLite {
+                id: "role".to_string(),
+                name: "role name".to_string(),
+                permissions: 1,
+                position: 1,
+                color: None,
+            }),
+        };
+        assert!(connection_event_retained_size_v1(&server).unwrap() > 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn retained_size_accounting_uses_checked_arithmetic() {
+        let mut counter = RetainedSizeCounterV1::default();
+        counter.add(usize::MAX).unwrap();
+        assert_eq!(
+            counter.add(1).unwrap_err(),
+            ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow
+        );
+
+        let mut counter = RetainedSizeCounterV1::default();
+        assert_eq!(
+            counter.add_items::<u64>(usize::MAX).unwrap_err(),
+            ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_preempts_a_full_channel_drops_permits_and_is_delivered_once() {
+        let probe = error_event_with_capacity(32);
+        let bytes = connection_event_retained_size_v1(&probe).unwrap();
+        let budget = ConnectionEventBudgetV1::with_limits(2, bytes * 2);
+        let (raw_tx, raw_rx) = mpsc::channel(2);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget: budget.clone(),
+        };
+        let mut receiver = ConnectionEventReceiverV1 {
+            receiver: raw_rx,
+            terminal: terminal.clone(),
+        };
+
+        sender.send(error_event_with_capacity(32)).await.unwrap();
+        sender.send(error_event_with_capacity(32)).await.unwrap();
+        assert!(matches!(
+            sender.send(error_event_with_capacity(1)).await,
+            Err(ConnectionEventBufferErrorV1::EventCountLimitExceeded { limit: 2 })
+        ));
+
+        let terminal_error = ConnectionEventBufferErrorV1::EventCountLimitExceeded { limit: 2 };
+        assert!(terminal.report_buffer_failure(terminal_error.clone()));
+        let terminal_event = receiver.try_recv_budgeted().unwrap();
+        assert_eq!(terminal_event.terminal_failure(), Some(&terminal_error));
+        assert!(matches!(
+            terminal_event.into_event(),
+            ConnectionEvent::Disconnected { reason }
+                if reason.contains("2-event limit")
+        ));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        // Draining the stale full channel dropped both guards. A fresh epoch
+        // budget user can acquire the exact same two slots and bytes again.
+        let first = budget.try_wrap(error_event_with_capacity(32)).unwrap();
+        let second = budget.try_wrap(error_event_with_capacity(32)).unwrap();
+        drop((first, second));
+    }
+
+    #[tokio::test]
+    async fn terminal_notification_cannot_be_lost_by_async_recv_race() {
+        let (_raw_tx, raw_rx) = mpsc::channel(1);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let mut receiver = ConnectionEventReceiverV1 {
+            receiver: raw_rx,
+            terminal: terminal.clone(),
+        };
+        let receive = tokio::spawn(async move { receiver.recv().await });
+        tokio::task::yield_now().await;
+        assert!(terminal.report_transport("closed during wait".to_string()));
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), receive)
+            .await
+            .expect("terminal notification was lost")
+            .unwrap();
+        assert!(matches!(
+            event,
+            Some(ConnectionEvent::Disconnected { reason }) if reason == "closed during wait"
+        ));
+    }
 
     fn base_message_event() -> proto::MessageEvent {
         proto::MessageEvent {

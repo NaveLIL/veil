@@ -21,7 +21,11 @@ use veil_store::models::{
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::connection::{ConfirmedMutation, Connection, ConnectionConfig, ConnectionEvent};
+use crate::connection::{
+    BudgetedConnectionEventV1, ConfirmedMutation, Connection, ConnectionConfig, ConnectionEvent,
+    ConnectionEventBudgetGuardV1, ConnectionEventBufferErrorV1, LIVE_EVENT_QUEUE_CAPACITY,
+    LIVE_EVENT_RETAINED_BYTES,
+};
 use crate::device_identity::{
     device_binding_signing_bytes, DeviceIdentityV1, DEVICE_BINDING_STATUS_ACTIVE,
     REQUIRED_DEVICE_CAPABILITIES,
@@ -397,6 +401,201 @@ struct GeneratedPreKeyBatch {
 ///
 /// All methods are synchronous from the caller's perspective.
 /// Crypto operations happen in Rust, never exposed to UI layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeferredConnectionEventStateV1 {
+    Open,
+    Terminal,
+    Failed(ConnectionEventBufferErrorV1),
+}
+
+struct DeferredConnectionEventQueueV1 {
+    events: VecDeque<BudgetedConnectionEventV1>,
+    retained_bytes: usize,
+    state: DeferredConnectionEventStateV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeferredConnectionEventAppendV1 {
+    buffered: usize,
+    terminal: bool,
+}
+
+impl Default for DeferredConnectionEventQueueV1 {
+    fn default() -> Self {
+        Self {
+            events: VecDeque::new(),
+            retained_bytes: 0,
+            state: DeferredConnectionEventStateV1::Open,
+        }
+    }
+}
+
+impl DeferredConnectionEventQueueV1 {
+    fn reset_for_new_epoch(&mut self) {
+        self.events.clear();
+        self.retained_bytes = 0;
+        self.state = DeferredConnectionEventStateV1::Open;
+    }
+
+    fn failure(&self) -> Option<ConnectionEventBufferErrorV1> {
+        match &self.state {
+            DeferredConnectionEventStateV1::Failed(error) => Some(error.clone()),
+            _ => None,
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        !matches!(self.state, DeferredConnectionEventStateV1::Open)
+    }
+
+    fn fail(&mut self, error: ConnectionEventBufferErrorV1) {
+        self.events.clear();
+        self.retained_bytes = 0;
+        self.state = DeferredConnectionEventStateV1::Failed(error);
+    }
+
+    fn close_epoch(&mut self) {
+        self.events.clear();
+        self.retained_bytes = 0;
+        self.state = DeferredConnectionEventStateV1::Terminal;
+    }
+
+    fn try_extend(
+        &mut self,
+        incoming: Vec<BudgetedConnectionEventV1>,
+    ) -> Result<DeferredConnectionEventAppendV1, ConnectionEventBufferErrorV1> {
+        match &self.state {
+            DeferredConnectionEventStateV1::Failed(error) => return Err(error.clone()),
+            DeferredConnectionEventStateV1::Terminal => {
+                return Err(ConnectionEventBufferErrorV1::TransportEpochEnded)
+            }
+            DeferredConnectionEventStateV1::Open => {}
+        }
+
+        if let Some(error) = incoming
+            .iter()
+            .find_map(BudgetedConnectionEventV1::terminal_failure)
+            .cloned()
+        {
+            self.fail(error.clone());
+            return Err(error);
+        }
+
+        let first_control = incoming.iter().position(|queued| {
+            matches!(
+                queued.event,
+                ConnectionEvent::Authenticated { .. }
+                    | ConnectionEvent::AuthFailed { .. }
+                    | ConnectionEvent::Disconnected { .. }
+            )
+        });
+        if let Some(position) = first_control {
+            let control = &incoming[position].event;
+            if matches!(
+                control,
+                ConnectionEvent::Authenticated { .. } | ConnectionEvent::AuthFailed { .. }
+            ) {
+                let error = ConnectionEventBufferErrorV1::AuthenticationEpochAnomaly {
+                    envelope: match control {
+                        ConnectionEvent::Authenticated { .. } => "Authenticated event",
+                        ConnectionEvent::AuthFailed { .. } => "AuthFailed event",
+                        _ => unreachable!(),
+                    },
+                };
+                self.fail(error.clone());
+                return Err(error);
+            }
+
+            let terminal = incoming
+                .into_iter()
+                .nth(position)
+                .ok_or(ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow)?;
+            let retained_bytes = terminal.retained_bytes();
+            if retained_bytes > LIVE_EVENT_RETAINED_BYTES {
+                let error = ConnectionEventBufferErrorV1::RetainedSizeLimitExceeded {
+                    limit: LIVE_EVENT_RETAINED_BYTES,
+                    event_bytes: retained_bytes,
+                };
+                self.fail(error.clone());
+                return Err(error);
+            }
+            self.events.clear();
+            self.retained_bytes = retained_bytes;
+            self.events.push_back(terminal);
+            self.state = DeferredConnectionEventStateV1::Terminal;
+            return Ok(DeferredConnectionEventAppendV1 {
+                buffered: 1,
+                terminal: true,
+            });
+        }
+
+        let final_count = self
+            .events
+            .len()
+            .checked_add(incoming.len())
+            .ok_or(ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow);
+        let incoming_bytes = incoming.iter().try_fold(0usize, |total, event| {
+            total
+                .checked_add(event.retained_bytes())
+                .ok_or(ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow)
+        });
+        let final_bytes = incoming_bytes.and_then(|incoming_bytes| {
+            self.retained_bytes
+                .checked_add(incoming_bytes)
+                .ok_or(ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow)
+        });
+        let final_count = match final_count {
+            Ok(count) => count,
+            Err(error) => {
+                self.fail(error.clone());
+                return Err(error);
+            }
+        };
+        let final_bytes = match final_bytes {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.fail(error.clone());
+                return Err(error);
+            }
+        };
+        if final_count > LIVE_EVENT_QUEUE_CAPACITY {
+            let error = ConnectionEventBufferErrorV1::EventCountLimitExceeded {
+                limit: LIVE_EVENT_QUEUE_CAPACITY,
+            };
+            self.fail(error.clone());
+            return Err(error);
+        }
+        if final_bytes > LIVE_EVENT_RETAINED_BYTES {
+            let error = ConnectionEventBufferErrorV1::RetainedSizeLimitExceeded {
+                limit: LIVE_EVENT_RETAINED_BYTES,
+                event_bytes: incoming
+                    .last()
+                    .map(BudgetedConnectionEventV1::retained_bytes)
+                    .unwrap_or(0),
+            };
+            self.fail(error.clone());
+            return Err(error);
+        }
+
+        let buffered = incoming.len();
+        self.events.extend(incoming);
+        self.retained_bytes = final_bytes;
+        Ok(DeferredConnectionEventAppendV1 {
+            buffered,
+            terminal: false,
+        })
+    }
+
+    fn pop_front(&mut self) -> Option<BudgetedConnectionEventV1> {
+        let event = self.events.pop_front()?;
+        self.retained_bytes = self
+            .retained_bytes
+            .checked_sub(event.retained_bytes())
+            .expect("deferred live-event byte invariant");
+        Some(event)
+    }
+}
+
 pub struct VeilClient {
     identity: Option<IdentityKeyPair>,
     /// Independent per-install keypair loaded only after SQLCipher unlock.
@@ -406,7 +605,7 @@ pub struct VeilClient {
     connection: Option<Connection>,
     /// Non-control events observed while installing the authenticated retained
     /// SKDM barrier are replayed to the normal live dispatcher afterwards.
-    deferred_connection_events: VecDeque<ConnectionEvent>,
+    deferred_connection_events: DeferredConnectionEventQueueV1,
     /// Server-assigned UUID from the authenticated WebSocket session.
     authenticated_user_id: Option<String>,
     device_id: [u8; 16],
@@ -512,7 +711,7 @@ impl VeilClient {
             device_identity: None,
             db: None,
             connection: None,
-            deferred_connection_events: VecDeque::new(),
+            deferred_connection_events: DeferredConnectionEventQueueV1::default(),
             authenticated_user_id: None,
             device_id,
             ratchet_sessions: HashMap::new(),
@@ -553,7 +752,7 @@ impl VeilClient {
             device_identity: None,
             db: None,
             connection: None,
-            deferred_connection_events: VecDeque::new(),
+            deferred_connection_events: DeferredConnectionEventQueueV1::default(),
             authenticated_user_id: None,
             device_id,
             ratchet_sessions: HashMap::new(),
@@ -1447,7 +1646,7 @@ impl VeilClient {
         self.mark_all_pending_sequences_unknown()?;
         // REST backlog is authoritative for anything not processed from the
         // previous socket. Never replay its deferred events in the new epoch.
-        self.deferred_connection_events.clear();
+        self.deferred_connection_events.reset_for_new_epoch();
         self.authenticated_user_id = Some(user_id.clone());
         self.connection = Some(conn);
         Ok(user_id)
@@ -1461,7 +1660,7 @@ impl VeilClient {
             connection.disconnect();
         }
         self.authenticated_user_id = None;
-        self.deferred_connection_events.clear();
+        self.deferred_connection_events.reset_for_new_epoch();
     }
 
     /// Install retained SKDMs that were authenticated before the WS AuthResult
@@ -1477,7 +1676,7 @@ impl VeilClient {
             // AuthResult is the protocol barrier. Everything in the live
             // channel arrived after it and must later pass the exact-current
             // live route checks, even when SenderKeyDist is the first event.
-            while let Ok(event) = connection.events.try_recv() {
+            while let Ok(event) = connection.events.try_recv_budgeted() {
                 live.push(event);
             }
         }
@@ -1486,11 +1685,35 @@ impl VeilClient {
 
     fn process_retained_and_defer_live_events_v1(
         &mut self,
-        retained: Vec<ConnectionEvent>,
-        live: Vec<ConnectionEvent>,
+        retained: Vec<BudgetedConnectionEventV1>,
+        live: Vec<BudgetedConnectionEventV1>,
     ) -> Result<RetainedSenderKeyProcessReportV1, String> {
-        self.deferred_connection_events.extend(live);
-        self.process_retained_sender_key_events_v1(retained)
+        let append = match self.deferred_connection_events.try_extend(live) {
+            Ok(append) => append,
+            Err(error) => {
+                self.terminate_connection_after_deferred_failure_v1();
+                return Err(error.to_string());
+            }
+        };
+        if append.terminal {
+            self.terminate_connection_after_deferred_failure_v1();
+            return Err(ConnectionEventBufferErrorV1::TransportEpochEnded.to_string());
+        }
+
+        // The guards remain alive while retained SKDMs are authenticated and
+        // installed, so the socket cannot refill the shared budget behind the
+        // still-owned event allocations.
+        let mut retained_events = Vec::with_capacity(retained.len());
+        let mut retained_guards: Vec<Option<ConnectionEventBudgetGuardV1>> =
+            Vec::with_capacity(retained.len());
+        for event in retained {
+            let (event, guard) = event.into_parts();
+            retained_events.push(event);
+            retained_guards.push(guard);
+        }
+        let result = self.process_retained_sender_key_events_v1(retained_events);
+        drop(retained_guards);
+        result
     }
 
     fn process_retained_sender_key_events_v1(
@@ -1605,27 +1828,105 @@ impl VeilClient {
     /// while an ordered REST backlog or large Sender-Key refresh is running.
     /// They remain FIFO and are reconciled by `poll_event` once sync enables
     /// the dispatcher; no ratchet/ACK side effect is applied early.
-    pub fn buffer_connection_events_during_sync(&mut self) -> usize {
-        let mut buffered = 0usize;
+    pub fn buffer_connection_events_during_sync(
+        &mut self,
+    ) -> Result<usize, ConnectionEventBufferErrorV1> {
+        let mut incoming = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
-            while let Ok(event) = connection.events.try_recv() {
-                self.deferred_connection_events.push_back(event);
-                buffered += 1;
+            while let Ok(event) = connection.events.try_recv_budgeted() {
+                incoming.push(event);
             }
         }
-        buffered
+        match self.deferred_connection_events.try_extend(incoming) {
+            Ok(append) if !append.terminal => Ok(append.buffered),
+            Ok(_) => {
+                self.terminate_connection_after_deferred_failure_v1();
+                Err(ConnectionEventBufferErrorV1::TransportEpochEnded)
+            }
+            Err(error) => {
+                self.terminate_connection_after_deferred_failure_v1();
+                Err(error)
+            }
+        }
+    }
+
+    fn terminate_connection_after_deferred_failure_v1(&mut self) {
+        if let Some(connection) = self.connection.take() {
+            connection.disconnect();
+        }
+        self.authenticated_user_id = None;
+        // A fail-closed buffer terminal is transport loss. Keep any durable
+        // persistence failure for the next connect/startup retry; never clear
+        // the in-memory pending maps as if delivery had been rejected.
+        let _ = self.mark_all_pending_sequences_unknown();
+    }
+
+    fn resolve_budgeted_connection_event_v1(
+        &mut self,
+        queued_event: Option<BudgetedConnectionEventV1>,
+    ) -> Result<Option<ConnectionEvent>, String> {
+        if let Some(error) = queued_event
+            .as_ref()
+            .and_then(BudgetedConnectionEventV1::terminal_failure)
+            .cloned()
+        {
+            self.deferred_connection_events.fail(error.clone());
+            self.terminate_connection_after_deferred_failure_v1();
+            return Err(error.to_string());
+        }
+        Ok(queued_event.map(BudgetedConnectionEventV1::into_event))
     }
 
     /// Poll for the next incoming event from the server.
     /// Returns None if no event is available (non-blocking).
     pub async fn poll_event(&mut self) -> Result<Option<ConnectionEvent>, String> {
-        let mut event = if let Some(event) = self.deferred_connection_events.pop_front() {
+        if let Some(error) = self.deferred_connection_events.failure() {
+            return Err(error.to_string());
+        }
+
+        // A transport terminal preempts every earlier deferred item. Query it
+        // before the FIFO so an ended epoch can never drain stale ciphertext.
+        let transport_terminal = self
+            .connection
+            .as_mut()
+            .and_then(|connection| connection.events.try_recv_terminal());
+        if let Some(terminal) = transport_terminal {
+            if let Err(error) = self.deferred_connection_events.try_extend(vec![terminal]) {
+                self.terminate_connection_after_deferred_failure_v1();
+                return Err(error.to_string());
+            }
+        }
+
+        let queued_event = if let Some(event) = self.deferred_connection_events.pop_front() {
             Some(event)
+        } else if self.deferred_connection_events.is_terminal() {
+            None
         } else if let Some(ref mut conn) = self.connection {
-            conn.events.try_recv().ok()
+            conn.events.try_recv_budgeted().ok()
         } else {
             None
         };
+
+        // The terminal may publish after the explicit precheck above but
+        // before the fallback receive. Preserve its typed failure metadata
+        // instead of degrading an overflow/auth anomaly into Disconnected.
+        let mut event = self.resolve_budgeted_connection_event_v1(queued_event)?;
+
+        if matches!(
+            event.as_ref(),
+            Some(ConnectionEvent::Authenticated { .. } | ConnectionEvent::AuthFailed { .. })
+        ) {
+            let error = ConnectionEventBufferErrorV1::AuthenticationEpochAnomaly {
+                envelope: match event.as_ref() {
+                    Some(ConnectionEvent::Authenticated { .. }) => "Authenticated event",
+                    Some(ConnectionEvent::AuthFailed { .. }) => "AuthFailed event",
+                    _ => unreachable!(),
+                },
+            };
+            self.deferred_connection_events.fail(error.clone());
+            self.terminate_connection_after_deferred_failure_v1();
+            return Err(error.to_string());
+        }
         match event.as_mut() {
             Some(ConnectionEvent::MessageAcked {
                 message_id,
@@ -1676,6 +1977,8 @@ impl VeilClient {
                 // DeliveryUnknown instead of deleting it or inviting a blind
                 // retry that could duplicate the message.
                 self.connection = None;
+                self.authenticated_user_id = None;
+                self.deferred_connection_events.close_epoch();
                 if let Err(error) = self.mark_all_pending_sequences_unknown() {
                     // The transport terminal event must still reach the UI so
                     // it stops claiming that the socket is connected. Keep
@@ -7892,20 +8195,30 @@ mod tests {
             attachments: Vec::new(),
             security_context: None,
         };
+        let live_budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
         let report = recipient
             .process_retained_and_defer_live_events_v1(
                 Vec::new(),
                 vec![
-                    ConnectionEvent::SenderKeyDist {
-                        sender_key_message: sealed.clone(),
-                        route: stale_route.clone(),
-                    },
-                    next_live,
+                    live_budget
+                        .try_wrap(ConnectionEvent::SenderKeyDist {
+                            sender_key_message: sealed.clone(),
+                            route: stale_route.clone(),
+                        })
+                        .unwrap(),
+                    live_budget.try_wrap(next_live).unwrap(),
                 ],
             )
             .unwrap();
         assert_eq!(report, RetainedSenderKeyProcessReportV1::default());
-        let first = recipient.deferred_connection_events.pop_front().unwrap();
+        let first = recipient
+            .deferred_connection_events
+            .pop_front()
+            .unwrap()
+            .into_event();
         match first {
             ConnectionEvent::SenderKeyDist {
                 sender_key_message,
@@ -7917,11 +8230,170 @@ mod tests {
             _ => panic!("first post-barrier event was reordered"),
         }
         assert!(matches!(
-            recipient.deferred_connection_events.pop_front(),
+            recipient
+                .deferred_connection_events
+                .pop_front()
+                .map(BudgetedConnectionEventV1::into_event),
             Some(ConnectionEvent::MessageReceived { message_id, .. })
                 if message_id == "next-live-message"
         ));
         assert!(recipient.pending_sender_key_receipts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn live_overflow_is_atomic_before_any_retained_sender_key_side_effect() {
+        let sender_user = uuid::Uuid::from_bytes([0xD1; 16]);
+        let recipient_user = uuid::Uuid::from_bytes([0xD2; 16]);
+        let mut sender = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            sender_user,
+            [0xD3; 16],
+            [0xD4; 32],
+        );
+        let mut recipient = memory_client_with_device(
+            IdentityKeyPair::generate(),
+            recipient_user,
+            [0xD5; 16],
+            [0xD6; 32],
+        );
+        let conversation = "00000000-0000-0000-0000-000000000314";
+        let roster = candidate_with_commitment(
+            conversation,
+            1,
+            vec![
+                roster_entry(
+                    *sender_user.as_bytes(),
+                    sender.identity.as_ref().unwrap(),
+                    sender.device_identity.as_ref().unwrap().binding(),
+                ),
+                roster_entry(
+                    *recipient_user.as_bytes(),
+                    recipient.identity.as_ref().unwrap(),
+                    recipient.device_identity.as_ref().unwrap().binding(),
+                ),
+            ],
+        );
+        sender.mark_channel_conversation(conversation);
+        recipient.mark_channel_conversation(conversation);
+        sender.install_device_roster_v1(roster.clone()).unwrap();
+        recipient.install_device_roster_v1(roster).unwrap();
+        let target = sender
+            .sender_key_device_targets(conversation)
+            .unwrap()
+            .into_iter()
+            .find(|target| target.device_id == recipient.device_id)
+            .unwrap();
+        let (pending, sealed) = sender.prepare_sender_key_device_envelope(&target).unwrap();
+        let route = route_for_test(&sender, &target, &pending);
+
+        let test_budget =
+            crate::connection::ConnectionEventBudgetV1::with_limits(2, 64 * 1024 * 1024);
+        let retained = test_budget
+            .try_wrap(ConnectionEvent::SenderKeyDist {
+                sender_key_message: sealed,
+                route,
+            })
+            .unwrap();
+        let mut oversized_reason = String::with_capacity(LIVE_EVENT_RETAINED_BYTES + 1);
+        oversized_reason.push('x');
+        let live = test_budget
+            .try_wrap(ConnectionEvent::Error {
+                code: 500,
+                message: oversized_reason,
+                ref_seq: None,
+                local_message_id: None,
+                conversation_id: None,
+                stale_roster_context: false,
+            })
+            .unwrap();
+
+        let error = recipient
+            .process_retained_and_defer_live_events_v1(vec![retained], vec![live])
+            .unwrap_err();
+        assert!(error.contains("retained-size limit"));
+        assert!(!recipient.sender_keys.has_incoming_generation(
+            conversation,
+            &sender.identity_key().unwrap(),
+            pending.generation,
+        ));
+        assert!(recipient.pending_sender_key_receipts.is_empty());
+        assert!(recipient
+            .poll_event()
+            .await
+            .unwrap_err()
+            .contains("retained-size limit"));
+    }
+
+    #[test]
+    fn deferred_fifo_epoch_reset_drops_stale_events_and_sticky_failure() {
+        let budget =
+            crate::connection::ConnectionEventBudgetV1::with_limits(2, LIVE_EVENT_RETAINED_BYTES);
+        let event = |id: &str| ConnectionEvent::FriendRemoved {
+            user_id: id.to_string(),
+        };
+        let first = budget.try_wrap(event("first")).unwrap();
+        let second = budget.try_wrap(event("second")).unwrap();
+        let mut queue = DeferredConnectionEventQueueV1::default();
+        queue.try_extend(vec![first, second]).unwrap();
+        assert!(matches!(
+            queue.pop_front().map(BudgetedConnectionEventV1::into_event),
+            Some(ConnectionEvent::FriendRemoved { user_id }) if user_id == "first"
+        ));
+        assert!(matches!(
+            queue.pop_front().map(BudgetedConnectionEventV1::into_event),
+            Some(ConnectionEvent::FriendRemoved { user_id }) if user_id == "second"
+        ));
+
+        let anomaly = budget
+            .try_wrap(ConnectionEvent::Authenticated {
+                user_id: "unexpected".to_string(),
+            })
+            .unwrap();
+        assert!(matches!(
+            queue.try_extend(vec![anomaly]),
+            Err(ConnectionEventBufferErrorV1::AuthenticationEpochAnomaly { .. })
+        ));
+        assert!(queue.failure().is_some());
+
+        // Successful reconnect calls this exact reset before installing its
+        // new Connection, so neither stale FIFO data nor a prior sticky error
+        // can cross the epoch boundary.
+        queue.reset_for_new_epoch();
+        assert!(queue.failure().is_none());
+        queue
+            .try_extend(vec![budget.try_wrap(event("new epoch")).unwrap()])
+            .unwrap();
+        assert!(matches!(
+            queue.pop_front().map(BudgetedConnectionEventV1::into_event),
+            Some(ConnectionEvent::FriendRemoved { user_id }) if user_id == "new epoch"
+        ));
+    }
+
+    #[tokio::test]
+    async fn fallback_receive_preserves_racing_typed_terminal_failure() {
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        let terminal_error = ConnectionEventBufferErrorV1::RetainedSizeLimitExceeded {
+            limit: LIVE_EVENT_RETAINED_BYTES,
+            event_bytes: LIVE_EVENT_RETAINED_BYTES + 1,
+        };
+        let racing_terminal =
+            BudgetedConnectionEventV1::terminal_failure_for_test(terminal_error.clone());
+
+        // Models a terminal published after poll_event's precheck but before
+        // its fallback receiver call. Metadata must survive that exact path.
+        let error = client
+            .resolve_budgeted_connection_event_v1(Some(racing_terminal))
+            .unwrap_err();
+        assert!(error.contains("retained-size limit"));
+        assert_eq!(
+            client.deferred_connection_events.failure(),
+            Some(terminal_error)
+        );
+        assert!(client
+            .poll_event()
+            .await
+            .unwrap_err()
+            .contains("retained-size limit"));
     }
 
     #[test]
@@ -9224,11 +9696,18 @@ mod tests {
             );
         }
         client.db = Some(db);
+        let event_budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
         client
             .deferred_connection_events
-            .push_back(ConnectionEvent::Disconnected {
-                reason: "ws write error: connection reset".to_string(),
-            });
+            .try_extend(vec![event_budget
+                .try_wrap(ConnectionEvent::Disconnected {
+                    reason: "ws write error: connection reset".to_string(),
+                })
+                .unwrap()])
+            .unwrap();
 
         assert!(matches!(
             client.poll_event().await.unwrap(),

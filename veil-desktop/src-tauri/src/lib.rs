@@ -11083,7 +11083,10 @@ fn distribute_pinned_sender_key(
     let mut seen = std::collections::HashSet::new();
     let mut sent = 0u32;
     let started = Instant::now();
-    client.buffer_connection_events_during_sync();
+    if let Err(error) = client.buffer_connection_events_during_sync() {
+        client.mark_sender_key_distribution_failed(conversation_id);
+        return Err(error.to_string());
+    }
     for target in targets {
         if let Some(binding) = live_action_binding {
             if let Err(error) = require_confirmed_live_action_binding_current(state, binding) {
@@ -11117,7 +11120,10 @@ fn distribute_pinned_sender_key(
         }
         sent += 1;
         if sent.is_multiple_of(128) {
-            client.buffer_connection_events_during_sync();
+            if let Err(error) = client.buffer_connection_events_during_sync() {
+                client.mark_sender_key_distribution_failed(conversation_id);
+                return Err(error.to_string());
+            }
         }
     }
     if sent == 0 {
