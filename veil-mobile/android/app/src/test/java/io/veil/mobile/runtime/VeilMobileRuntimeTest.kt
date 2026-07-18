@@ -25,6 +25,7 @@ import uniffi.veil_ffi.MobileDirectHistoryNext
 import uniffi.veil_ffi.MobileDirectHistoryOutcome
 import uniffi.veil_ffi.MobileDirectHistoryProgress
 import uniffi.veil_ffi.MobileDirectLiveBufferProgress
+import uniffi.veil_ffi.MobileDirectLiveReplayProgress
 import uniffi.veil_ffi.MobileDirectMessageData
 import uniffi.veil_ffi.MobileDirectMessageProjection
 import uniffi.veil_ffi.MobileDirectMessageProjectionAvailability
@@ -658,7 +659,8 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeSecureSyncState.HISTORY_SYNCHRONIZED, complete.secureSyncState)
       assertEquals(listOf(first, second), complete.directConversations)
       assertEquals(NativeConnectionState.CONNECTED, complete.connectionState)
-      assertFalse("deferred live events are not replayed yet", complete.directoryReady)
+      assertTrue("quiescent authenticated live replay must open Direct", complete.directoryReady)
+      assertEquals(1, fakeSession.liveReplayPumpCount)
       assertEquals(2, fakeSession.installedResponseCopies.size)
       assertEquals(4, transport.requests.size)
       assertTrue(transport.requests.all { it.canonicalServerOrigin == "https://access.example:443" })
@@ -676,7 +678,7 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
-  fun directHistoryRunsOneExactRequestAtATimeAndNeverOpensReadyBeforeLiveReplay() {
+  fun directHistoryRunsOneExactRequestAtATimeAndRequiresBoundedLiveReplayBeforeReady() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession()
     val transport = ControllableDirectTransport()
@@ -719,6 +721,22 @@ class VeilMobileRuntimeTest {
         historiesTerminal = true,
       ),
     )
+    fakeSession.liveReplayProgresses.add(
+      NativeDirectLiveReplayProgress(
+        consumed = 64,
+        projectionChanged = true,
+        needsImmediatePump = true,
+        ready = false,
+      ),
+    )
+    fakeSession.liveReplayProgresses.add(
+      NativeDirectLiveReplayProgress(
+        consumed = 0,
+        projectionChanged = false,
+        needsImmediatePump = false,
+        ready = true,
+      ),
+    )
     val directoryBody = "authenticated-directory".toByteArray()
     val firstHistoryBody = "encrypted-history-page-one".toByteArray()
     val secondHistoryBody = "rejected-history-page-two".toByteArray()
@@ -747,15 +765,83 @@ class VeilMobileRuntimeTest {
 
       transport.completeNext(NativeDirectHttpResult.Success(secondHistoryBody))
       awaitRuntimeIdle(runtime)
+      awaitRuntimeIdle(runtime)
       val terminal = runtime.snapshot()
       assertTrue(secondHistoryBody.all { it == 0.toByte() })
       assertEquals(NativeDirectHistoryState.SYNCHRONIZED, terminal.directHistoryState)
       assertEquals(NativeSecureSyncState.HISTORY_SYNCHRONIZED, terminal.secureSyncState)
       assertEquals(NativeConnectionState.CONNECTED, terminal.connectionState)
-      assertFalse("stage 5 must wait for live FIFO replay", terminal.directoryReady)
+      assertTrue("Direct must open only after the second quiescent replay turn", terminal.directoryReady)
+      assertEquals(2, fakeSession.liveReplayPumpCount)
       assertEquals(2, fakeSession.historyInstalledResponseCopies.size)
       assertTrue(fakeSession.liveBufferPumpCount >= 5)
     } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun terminalDirectLiveReplayFailsClosedWithoutPublishingReady() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    fakeSession.failLiveReplayPump = true
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+
+      transport.completeNext(NativeDirectHttpResult.Success("directory-before-live-stop".toByteArray()))
+      awaitRuntimeIdle(runtime)
+
+      val failed = runtime.snapshot()
+      assertEquals(1, fakeSession.liveReplayPumpCount)
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
+      assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
+      assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertNull(failed.binding)
+      assertFalse(failed.directoryReady)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundRevocationWinsAgainstAnInFlightReadyReplay() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val replayEntered = CountDownLatch(1)
+    val releaseReplay = CountDownLatch(1)
+    fakeSession.directReplayEntered = replayEntered
+    fakeSession.directReplayRelease = releaseReplay
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+
+      transport.completeNext(NativeDirectHttpResult.Success("directory-before-background".toByteArray()))
+      assertTrue("native live replay did not start", replayEntered.await(5, TimeUnit.SECONDS))
+      assertFalse(runtime.snapshot().directoryReady)
+
+      runtime.lockForBackground()
+      assertFalse(runtime.snapshot().directoryReady)
+      assertEquals(NativeConnectionState.DISCONNECTED, runtime.snapshot().connectionState)
+
+      releaseReplay.countDown()
+      awaitRuntimeIdle(runtime)
+      val locked = runtime.snapshot()
+      assertEquals(NativeSessionState.LOCKED, locked.sessionState)
+      assertFalse(locked.directoryReady)
+      assertNull(locked.binding)
+      assertTrue(fakeSession.directLeaseCancellations >= 1)
+    } finally {
+      releaseReplay.countDown()
       runtime.lockSession()
       executor.shutdownNow()
     }
@@ -1350,6 +1436,17 @@ class VeilMobileRuntimeTest {
       .toNativeDirectLiveBufferProgress()
     assertEquals(17L, live.bufferedEvents)
     assertTrue(live.historySynchronized)
+
+    val replay = MobileDirectLiveReplayProgress(
+      consumed = 64u,
+      projectionChanged = true,
+      needsImmediatePump = true,
+      ready = false,
+    ).toNativeDirectLiveReplayProgress()
+    assertEquals(64L, replay.consumed)
+    assertTrue(replay.projectionChanged)
+    assertTrue(replay.needsImmediatePump)
+    assertFalse(replay.ready)
   }
 
   @Test
@@ -1647,6 +1744,7 @@ class VeilMobileRuntimeTest {
     var directoryRequestCount = 0
     var historyRequestCount = 0
     var liveBufferPumpCount = 0
+    var liveReplayPumpCount = 0
     var directProjectionCount = 0
     @Volatile var directProjection = NativeDirectMessageProjection(
       NativeDirectMessageProjectionAvailability.UNAVAILABLE,
@@ -1655,7 +1753,10 @@ class VeilMobileRuntimeTest {
     @Volatile var directProjectionEntered: CountDownLatch? = null
     @Volatile var directProjectionRelease: CountDownLatch? = null
     @Volatile var directProjectionFailure: Throwable? = null
+    @Volatile var directReplayEntered: CountDownLatch? = null
+    @Volatile var directReplayRelease: CountDownLatch? = null
     var failLiveBufferPump = false
+    var failLiveReplayPump = false
     var historySynchronized = false
     var ownPreKeyRequestCount = 0
     var ownPreKeyInstallCount = 0
@@ -1670,6 +1771,7 @@ class VeilMobileRuntimeTest {
     val historyInstalledResponseCopies = CopyOnWriteArrayList<ByteArray>()
     val historyNexts = ArrayDeque<NativeDirectHistoryNext>()
     val historyInstalls = ArrayDeque<NativeDirectHistoryProgress>()
+    val liveReplayProgresses = ArrayDeque<NativeDirectLiveReplayProgress>()
     val lifecycleEvents = CopyOnWriteArrayList<String>()
     val connectStarted = CountDownLatch(1)
     val closedDuringConnect = AtomicBoolean(false)
@@ -1814,6 +1916,26 @@ class VeilMobileRuntimeTest {
         bufferedEvents = 0,
         historySynchronized = historySynchronized,
       )
+    }
+
+    override fun replayDirectLiveEvents(leaseToken: String): NativeDirectLiveReplayProgress {
+      liveReplayPumpCount += 1
+      directReplayEntered?.countDown()
+      directReplayRelease?.let { release ->
+        check(release.await(5, TimeUnit.SECONDS)) { "synthetic Direct live replay timed out" }
+      }
+      if (failLiveReplayPump) throw IllegalStateException("synthetic terminal live replay")
+      check(historySynchronized) { "synthetic live replay started before history completion" }
+      return if (liveReplayProgresses.isEmpty()) {
+        NativeDirectLiveReplayProgress(
+          consumed = 0,
+          projectionChanged = false,
+          needsImmediatePump = false,
+          ready = true,
+        )
+      } else {
+        liveReplayProgresses.removeFirst()
+      }
     }
 
     override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection {

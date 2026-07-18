@@ -17,6 +17,7 @@ import uniffi.veil_ffi.MobileDirectHistoryNext
 import uniffi.veil_ffi.MobileDirectHistoryOutcome
 import uniffi.veil_ffi.MobileDirectHistoryProgress
 import uniffi.veil_ffi.MobileDirectLiveBufferProgress
+import uniffi.veil_ffi.MobileDirectLiveReplayProgress
 import uniffi.veil_ffi.MobileDirectMessageData
 import uniffi.veil_ffi.MobileDirectMessageDelivery
 import uniffi.veil_ffi.MobileDirectMessageDirection
@@ -164,6 +165,14 @@ internal data class NativeDirectHistoryProgress(
 internal data class NativeDirectLiveBufferProgress(
   val bufferedEvents: Long,
   val historySynchronized: Boolean,
+)
+
+/** Aggregate-only result of one bounded native Direct live-replay turn. */
+internal data class NativeDirectLiveReplayProgress(
+  val consumed: Long,
+  val projectionChanged: Boolean,
+  val needsImmediatePump: Boolean,
+  val ready: Boolean,
 )
 
 internal enum class NativeDirectMessageProjectionAvailability {
@@ -385,6 +394,8 @@ internal interface NativeMobileSession : AutoCloseable {
   ): NativeDirectHistoryProgress
 
   fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress
+
+  fun replayDirectLiveEvents(leaseToken: String): NativeDirectLiveReplayProgress
 
   fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection
 
@@ -1325,18 +1336,15 @@ internal class VeilMobileRuntime internal constructor(
           false
         } else {
           directHistoryState = NativeDirectHistoryState.SYNCHRONIZED
-          // Stage 5 has not replayed the deferred FIFO. Even an empty history
-          // must remain behind the same readiness barrier as a full history.
+          // Even an empty history remains behind the authenticated live-replay
+          // barrier until Rust explicitly observes the shared FIFO quiescent.
           directoryReady = false
           true
         }
       }
       if (accepted) {
-        val buffered = pumpDirectLiveEvents(sync)
-        check(buffered.historySynchronized) {
-          "native Direct history terminal checkpoint was not retained"
-        }
         publishSnapshot()
+        continueDirectLiveReplay(sync)
       }
       return
     }
@@ -1430,13 +1438,11 @@ internal class VeilMobileRuntime internal constructor(
       }
       if (!accepted) return
 
-      val buffered = pumpDirectLiveEvents(sync)
       if (progress.historiesTerminal) {
-        check(buffered.historySynchronized) {
-          "native Direct history terminal checkpoint was not retained"
-        }
         publishSnapshot()
+        continueDirectLiveReplay(sync)
       } else {
+        pumpDirectLiveEvents(sync)
         requestNextDirectHistoryPage(sync)
       }
     } catch (_: Throwable) {
@@ -1465,6 +1471,58 @@ internal class VeilMobileRuntime internal constructor(
       "native Direct live pump count exceeded its shared bound"
     }
     return progress
+  }
+
+  /**
+   * Advance exactly one bounded history-to-live replay turn. Full native
+   * batches are rescheduled onto the serialized runtime executor, keeping a
+   * lifecycle check between every 64 authenticated events. Direct projections
+   * remain closed until native explicitly observes quiescence.
+   */
+  private fun continueDirectLiveReplay(sync: ActiveDirectSync) {
+    try {
+      val current = synchronized(stateLock) {
+        isCurrentDirectSyncLocked(sync) &&
+          sync.pendingRequest == null &&
+          ownPreKeyState == NativeOwnPreKeyState.PUBLISHED &&
+          directDirectoryState == NativeDirectDirectoryState.SYNCHRONIZED &&
+          directHistoryState == NativeDirectHistoryState.SYNCHRONIZED &&
+          !directoryReady
+      }
+      if (!current) return
+
+      val progress = sync.session.replayDirectLiveEvents(sync.leaseToken)
+      check(progress.consumed in 0..MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN) {
+        "native Direct live replay count exceeded its shared bound"
+      }
+      if (!progress.ready) {
+        check(
+          progress.needsImmediatePump &&
+            progress.consumed == MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN,
+        ) { "native Direct live replay returned an invalid draining checkpoint" }
+        executor.execute { continueDirectLiveReplay(sync) }
+        return
+      }
+      check(!progress.needsImmediatePump) {
+        "initial native Direct live replay reached Ready before quiescence"
+      }
+
+      val accepted = synchronized(stateLock) {
+        if (
+          !isCurrentDirectSyncLocked(sync) ||
+          sync.pendingRequest != null ||
+          directHistoryState != NativeDirectHistoryState.SYNCHRONIZED
+        ) {
+          false
+        } else {
+          directoryReady = true
+          true
+        }
+      }
+      if (accepted) publishSnapshot()
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+    }
   }
 
   private fun failDirectSync(sync: ActiveDirectSync) {
@@ -1808,6 +1866,7 @@ internal class VeilMobileRuntime internal constructor(
     private const val SECURE_DIRECT_BOOTSTRAP_ERROR = "Unable to complete the secure Direct bootstrap"
     private const val MAX_DIRECT_CONVERSATIONS = 10_000
     private const val MAX_BUFFERED_DIRECT_EVENTS_PER_PUMP = 4_096L
+    private const val MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN = 64L
 
     private fun newRuntimeExecutor(): ExecutorService =
       Executors.newSingleThreadExecutor { operation ->
@@ -1913,6 +1972,9 @@ private class UniFfiMobileSession(
 
   override fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress =
     delegate.bufferDirectLiveEventsDuringSync(leaseToken).toNativeDirectLiveBufferProgress()
+
+  override fun replayDirectLiveEvents(leaseToken: String): NativeDirectLiveReplayProgress =
+    delegate.replayDirectLiveEvents(leaseToken).toNativeDirectLiveReplayProgress()
 
   override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection =
     delegate.projectDirectMessages(conversationId).toNativeDirectMessageProjection()
@@ -2031,6 +2093,14 @@ internal fun MobileDirectLiveBufferProgress.toNativeDirectLiveBufferProgress(): 
   NativeDirectLiveBufferProgress(
     bufferedEvents = bufferedEvents.toLong(),
     historySynchronized = historySynchronized,
+  )
+
+internal fun MobileDirectLiveReplayProgress.toNativeDirectLiveReplayProgress(): NativeDirectLiveReplayProgress =
+  NativeDirectLiveReplayProgress(
+    consumed = consumed.toLong(),
+    projectionChanged = projectionChanged,
+    needsImmediatePump = needsImmediatePump,
+    ready = ready,
   )
 
 internal fun MobileDirectMessageProjection.toNativeDirectMessageProjection(): NativeDirectMessageProjection {

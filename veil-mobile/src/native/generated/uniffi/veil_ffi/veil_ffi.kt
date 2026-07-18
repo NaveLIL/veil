@@ -856,6 +856,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -948,6 +950,8 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_next_direct_histor
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_own_prekey_request(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_project_direct_messages(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_live_events(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request(
 ): Short
@@ -1135,6 +1139,8 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_next_direct_history_requ
 fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_own_prekey_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_project_direct_messages(`ptr`: Pointer,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_live_events(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_sign_direct_rest_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
@@ -1403,7 +1409,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_begin_direct_sync() != 53699.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_buffer_direct_live_events_during_sync() != 59584.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_buffer_direct_live_events_during_sync() != 50158.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync() != 53148.toShort()) {
@@ -1449,6 +1455,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_project_direct_messages() != 54664.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_live_events() != 1036.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request() != 25069.toShort()) {
@@ -2875,8 +2884,9 @@ public interface VeilMobileSessionInterface {
 
     /**
      * Pump authenticated WebSocket events into the shared bounded deferred
-     * FIFO while history is synchronized. Stage 5 deliberately never drains
-     * or publishes that FIFO and therefore cannot transition to Ready.
+     * FIFO while REST bootstrap/history is still in progress. This method
+     * never drains or publishes the FIFO; the separate bounded replay method
+     * owns the only history-to-live transition to Ready.
      */
     fun `bufferDirectLiveEventsDuringSync`(`leaseToken`: kotlin.String): MobileDirectLiveBufferProgress
 
@@ -2966,6 +2976,16 @@ public interface VeilMobileSessionInterface {
      * state is collapsed to the same opaque result with no identifiers.
      */
     fun `projectDirectMessages`(`conversationId`: kotlin.String): MobileDirectMessageProjection
+
+    /**
+     * Drain one bounded, authenticated Direct live-replay turn.
+     *
+     * The history-to-live handoff reaches `Ready` only after the shared FIFO
+     * explicitly reports quiescence. A full batch must be scheduled again;
+     * terminal transport or uncertain SQLCipher state poisons this lease and
+     * never opens the renderer projection boundary.
+     */
+    fun `replayDirectLiveEvents`(`leaseToken`: kotlin.String): MobileDirectLiveReplayProgress
 
     /**
      * Sign only the exact native-owned Direct request identified by the
@@ -3106,8 +3126,9 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
     /**
      * Pump authenticated WebSocket events into the shared bounded deferred
-     * FIFO while history is synchronized. Stage 5 deliberately never drains
-     * or publishes that FIFO and therefore cannot transition to Ready.
+     * FIFO while REST bootstrap/history is still in progress. This method
+     * never drains or publishes the FIFO; the separate bounded replay method
+     * owns the only history-to-live transition to Ready.
      */
     @Throws(VeilException::class)override fun `bufferDirectLiveEventsDuringSync`(`leaseToken`: kotlin.String): MobileDirectLiveBufferProgress {
             return FfiConverterTypeMobileDirectLiveBufferProgress.lift(
@@ -3365,6 +3386,27 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_project_direct_messages(
         it, FfiConverterString.lower(`conversationId`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Drain one bounded, authenticated Direct live-replay turn.
+     *
+     * The history-to-live handoff reaches `Ready` only after the shared FIFO
+     * explicitly reports quiescence. A full batch must be scheduled again;
+     * terminal transport or uncertain SQLCipher state poisons this lease and
+     * never opens the renderer projection boundary.
+     */
+    @Throws(VeilException::class)override fun `replayDirectLiveEvents`(`leaseToken`: kotlin.String): MobileDirectLiveReplayProgress {
+            return FfiConverterTypeMobileDirectLiveReplayProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_live_events(
+        it, FfiConverterString.lower(`leaseToken`),_status)
 }
     }
     )
@@ -4548,6 +4590,53 @@ public object FfiConverterTypeMobileDirectLiveBufferProgress: FfiConverterRustBu
     override fun write(value: MobileDirectLiveBufferProgress, buf: ByteBuffer) {
             FfiConverterUInt.write(value.`bufferedEvents`, buf)
             FfiConverterBoolean.write(value.`historySynchronized`, buf)
+    }
+}
+
+
+
+/**
+ * Aggregate-only result of one bounded authenticated Direct live-replay turn.
+ *
+ * No message, conversation, account, ciphertext, plaintext, or key identifier
+ * crosses this boundary. Android schedules another turn when requested and
+ * may expose Direct projections only after `ready` becomes true.
+ */
+data class MobileDirectLiveReplayProgress (
+    var `consumed`: kotlin.UInt,
+    var `projectionChanged`: kotlin.Boolean,
+    var `needsImmediatePump`: kotlin.Boolean,
+    var `ready`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectLiveReplayProgress: FfiConverterRustBuffer<MobileDirectLiveReplayProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectLiveReplayProgress {
+        return MobileDirectLiveReplayProgress(
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectLiveReplayProgress) = (
+            FfiConverterUInt.allocationSize(value.`consumed`) +
+            FfiConverterBoolean.allocationSize(value.`projectionChanged`) +
+            FfiConverterBoolean.allocationSize(value.`needsImmediatePump`) +
+            FfiConverterBoolean.allocationSize(value.`ready`)
+    )
+
+    override fun write(value: MobileDirectLiveReplayProgress, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`consumed`, buf)
+            FfiConverterBoolean.write(value.`projectionChanged`, buf)
+            FfiConverterBoolean.write(value.`needsImmediatePump`, buf)
+            FfiConverterBoolean.write(value.`ready`, buf)
     }
 }
 

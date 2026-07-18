@@ -331,6 +331,19 @@ pub struct MobileDirectLiveBufferProgress {
     pub history_synchronized: bool,
 }
 
+/// Aggregate-only result of one bounded authenticated Direct live-replay turn.
+///
+/// No message, conversation, account, ciphertext, plaintext, or key identifier
+/// crosses this boundary. Android schedules another turn when requested and
+/// may expose Direct projections only after `ready` becomes true.
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectLiveReplayProgress {
+    pub consumed: u32,
+    pub projection_changed: bool,
+    pub needs_immediate_pump: bool,
+    pub ready: bool,
+}
+
 /// Opaque UI availability for one caller-supplied Direct conversation.
 ///
 /// The unavailable state deliberately does not distinguish a quarantined
@@ -1780,8 +1793,9 @@ impl VeilMobileSession {
     }
 
     /// Pump authenticated WebSocket events into the shared bounded deferred
-    /// FIFO while history is synchronized. Stage 5 deliberately never drains
-    /// or publishes that FIFO and therefore cannot transition to Ready.
+    /// FIFO while REST bootstrap/history is still in progress. This method
+    /// never drains or publishes the FIFO; the separate bounded replay method
+    /// owns the only history-to-live transition to Ready.
     pub fn buffer_direct_live_events_during_sync(
         &self,
         lease_token: String,
@@ -1802,7 +1816,6 @@ impl VeilMobileSession {
                 MobileDirectSyncPhase::OwnPreKeys
                     | MobileDirectSyncPhase::Directory
                     | MobileDirectSyncPhase::DirectHistory
-                    | MobileDirectSyncPhase::HistorySynchronizedAwaitingLive
             )
         {
             return Err(VeilError::Session {
@@ -1835,6 +1848,97 @@ impl VeilMobileSession {
             })?,
             history_synchronized: state.phase
                 == MobileDirectSyncPhase::HistorySynchronizedAwaitingLive,
+        })
+    }
+
+    /// Drain one bounded, authenticated Direct live-replay turn.
+    ///
+    /// The history-to-live handoff reaches `Ready` only after the shared FIFO
+    /// explicitly reports quiescence. A full batch must be scheduled again;
+    /// terminal transport or uncertain SQLCipher state poisons this lease and
+    /// never opens the renderer projection boundary.
+    pub fn replay_direct_live_events(
+        &self,
+        lease_token: String,
+    ) -> Result<MobileDirectLiveReplayProgress, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        if state.token != lease_token
+            || !matches!(
+                state.phase,
+                MobileDirectSyncPhase::HistorySynchronizedAwaitingLive
+                    | MobileDirectSyncPhase::Ready
+            )
+        {
+            return Err(VeilError::Session {
+                msg: "mobile Direct live replay lease is stale or unavailable".to_string(),
+            });
+        }
+        if state.phase == MobileDirectSyncPhase::HistorySynchronizedAwaitingLive
+            && (state.outstanding_request.is_some()
+                || state.current_history.is_some()
+                || state.history_index != state.history_order.len())
+        {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(VeilError::Session {
+                msg: "mobile Direct history-to-live checkpoint diverged".to_string(),
+            });
+        }
+
+        let mut binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(VeilError::Session {
+                msg: "mobile Direct live replay lease is stale".to_string(),
+            });
+        }
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let report = match self.runtime.block_on(client.replay_direct_live_events_v1()) {
+            Ok(report) => report,
+            Err(_) => {
+                *binding = None;
+                fail_mobile_direct_sync_sticky(state);
+                return Err(VeilError::Session {
+                    msg: "mobile Direct live replay terminated".to_string(),
+                });
+            }
+        };
+        if report.consumed > veil_client::api::DIRECT_LIVE_REPLAY_MAX_BATCH_V1
+            || (!report.quiescent
+                && report.consumed != veil_client::api::DIRECT_LIVE_REPLAY_MAX_BATCH_V1)
+        {
+            *binding = None;
+            fail_mobile_direct_sync_sticky(state);
+            return Err(VeilError::Session {
+                msg: "mobile Direct live replay violated its batch contract".to_string(),
+            });
+        }
+        if report.quiescent {
+            state.phase = MobileDirectSyncPhase::Ready;
+        }
+        Ok(MobileDirectLiveReplayProgress {
+            consumed: report
+                .consumed
+                .try_into()
+                .expect("Direct live replay batch fits u32"),
+            projection_changed: report.stored > 0
+                || report.duplicates > 0
+                || report.newly_blocked > 0
+                || report.visible_mutations > 0,
+            needs_immediate_pump: !report.quiescent,
+            ready: state.phase == MobileDirectSyncPhase::Ready,
         })
     }
 
@@ -4124,6 +4228,76 @@ mod tests {
             state.blocked_conversations.get(second),
             Some(&MobileDirectHistoryOutcome::ConversationRejected)
         );
+    }
+
+    #[test]
+    fn mobile_direct_live_replay_opens_ready_only_after_explicit_quiescence() {
+        let (session, path, token) = mobile_test_session_with_sync(120);
+        session.direct_sync.lock().unwrap().as_mut().unwrap().phase =
+            MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+
+        let progress = session.replay_direct_live_events(token).unwrap();
+
+        assert_eq!(progress.consumed, 0);
+        assert!(!progress.projection_changed);
+        assert!(!progress.needs_immediate_pump);
+        assert!(progress.ready);
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Ready
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_live_replay_rejects_a_nonterminal_history_checkpoint() {
+        let (session, path, token) = mobile_test_session_with_sync(121);
+        {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.phase = MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+            state
+                .history_order
+                .push("20000000-0000-4000-8000-000000000001".to_string());
+        }
+
+        let error = session
+            .replay_direct_live_events(token)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("history-to-live checkpoint diverged"));
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Failed
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_live_terminal_never_opens_ready() {
+        let (session, path, token) = mobile_test_session_with_sync(122);
+        session.direct_sync.lock().unwrap().as_mut().unwrap().phase =
+            MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+        session.client.lock().unwrap().disconnect();
+
+        let error = session
+            .replay_direct_live_events(token)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("live replay terminated"));
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Failed
+        );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
