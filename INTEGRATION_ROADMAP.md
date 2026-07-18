@@ -40,9 +40,10 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 5. Phase 3B и 4P сохраняются отдельными незакрытыми product scopes: имеющийся
    desktop/transport foundation не заменяет physical attachment и native mobile
    push device matrices.
-6. Продолжить Android Direct Preview: foundation/runtime 5A, receive/read и
-   one-shot peer-prekey уже опубликованы; ближайший незакрытый gate — shared
-   idempotent send/outbox и reconnect. Точный checkpoint приведён в Phase 5.
+6. Продолжить Android Direct Preview: foundation/runtime 5A, receive/read,
+   one-shot peer-prekey и shared idempotent send/outbox уже опубликованы;
+   ближайший незакрытый gate — typed ACK deadline и transient-only reconnect.
+   Точный checkpoint приведён в Phase 5.
 7. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
@@ -59,7 +60,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
 | 5A | Android foundation | core runtime подключён: Keystore/SQLCipher, Node Access Pass, authenticated origin-bound sync; signed standalone APK и physical matrix открыты |
-| 5B | Android messaging | receive/read и one-shot peer-prekey опубликованы; send/outbox/reconnect не реализованы |
+| 5B | Android messaging | receive/read, one-shot peer-prekey и idempotent native send/outbox опубликованы; reconnect/process-death открыт |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -1188,9 +1189,9 @@ desktop↔desktop матрицы зелёные; полный installer соби
 React Native shell подключён к fail-closed `VeilMobileRuntime` на Rust/UniFFI;
 identity хранится через Android Keystore, account/runtime state — в SQLCipher,
 а Node Access Pass, authenticated WebSocket, own prekeys, Direct directory,
-history-to-live handoff и read-only message projection принадлежат native
-boundary. Это всё ещё закрытый Direct Preview: безопасная отправка, polished
-reconnect и подписанный standalone tester APK пока не готовы.
+history-to-live handoff, message projection и idempotent Direct text send/outbox
+принадлежат native boundary. Это всё ещё закрытый Direct Preview: ACK deadline,
+polished reconnect и подписанный standalone tester APK пока не готовы.
 
 ### Peer-prekey checkpoint 2026-07-19
 
@@ -1200,8 +1201,9 @@ worktree после публикации отсутствует.
 
 **Опубликовано и проверено в `codex/mobile-direct-preview`:**
 
-- authoritative published head — `f21c9c0` (`feat(android): add explicit peer
-  prekey transport`), его обязательный Rust predecessor — `029d1e3`
+- authoritative head этого peer-prekey checkpoint — `f21c9c0`
+  (`feat(android): add explicit peer prekey transport`), его обязательный Rust
+  predecessor — `029d1e3`
   (`feat(mobile): guard peer prekey capability in Rust`); `master` этими
   checkpoint не изменялся;
 - mobile-only registration по Node Access Pass, Keystore-wrapped identity,
@@ -1243,28 +1245,83 @@ worktree после публикации отсутствует.
   `P0/P1/P2: none`. Debug APK остаётся build evidence с debug key, а не tester
   release и не physical-device evidence.
 
+### Idempotent Direct send/outbox checkpoint 2026-07-19
+
+Shared protocol/server/client core и Android send slice опубликованы четырьмя
+раздельными checkpoint. `master` не изменялся.
+
+**Опубликовано в `codex/mobile-direct-preview`:**
+
+- `6e128b3` (`feat(protocol): make Direct sends idempotent`) добавляет
+  `client_message_id` в Send/ACK/Error и серверную unique scope + exact request
+  digest. Повтор тех же bytes/ID возвращает прежние message ID/time без второго
+  insert или fan-out; конфликт reuse отклоняется;
+- `6a979ee` (`feat(client): persist exact Direct outbox`) атомарно сохраняет
+  advanced ratchet, local Sending row и exact serialized ciphertext outbox в
+  одной SQLCipher-транзакции. ACK/definite rejection reconcile-ятся атомарно,
+  retryable transport loss сохраняет исходные bytes/ID;
+- `9b11100` (`feat(ffi): bridge durable Direct send`) держит replay cursor только
+  в Rust, повторяет lock/authority guards в порядке `direct_sync → binding →
+  client` и не переносит message ID, sequence, ciphertext или timestamp через
+  FFI. Live quiescence больше не открывает Ready до bounded replay, который
+  подтвердил конец durable outbox;
+- `5d62f95` (`feat(android): enable native Direct text send`) добавляет один
+  lifecycle/generation-bound user intent, atomic native enqueue, ровно один
+  destructive peer-prekey GET и ровно один post-install retry. Kotlin plaintext
+  buffer стирается на accepted/rejected/revoke/background/late callback;
+- `AcceptedForReplay` означает успешное durable принятие ровно один раз, после
+  чего старая generation и binding немедленно отзываются. Отдельно исправлена и
+  listener-тестом закреплена публикация fail-closed snapshot после revoke;
+- React Native composer не создаёт optimistic UUID/row/time и не получает
+  protocol identifiers. Он очищает draft только после native accepted и затем
+  перечитывает authoritative SQLCipher projection; stale generation и второй
+  tap ничего не публикуют.
+
+**Completion evidence:**
+
+- полный `cargo test --workspace --all-targets`: 505 passed, 0 failed,
+  12 ignored; `veil-ffi` 70/70; workspace clippy с `-D warnings`, fmt и
+  `git diff --check` зелёные;
+- полный Go suite и race-набор `chat/db/gateway` прошли для protocol/server
+  checkpoint; свежая PostgreSQL migration/idempotency/concurrency матрица
+  проверена до публикации core;
+- native libraries воспроизводимо пересобраны для `arm64-v8a` и `x86_64`;
+  `verifyVeilRustLibraries`, полный JVM 151/151, `lintDebug` с 0 errors и
+  `assembleDebug` прошли без исключения `.so` preflight;
+- повторная UniFFI generation byte-for-byte стабильна, SHA-256 generated Kotlin
+  `A010945BFA506516D1F47CB36EACE3D6F48D8AF0ED59AD0C44B530204908053A`;
+- TypeScript, ESLint и Jest 80/80 зелёные. Adversarial tests покрывают bounded
+  outbox turns, storage/transport revoke, prekey one-shot, duplicate tap,
+  plaintext bounds/wipe, contentRevision races и отсутствие optimistic row;
+- независимый exact-diff review обнаружил и помог закрыть один Android P1
+  (непубликуемый revoke snapshot); повторный review вернул `P0/P1/P2: none`.
+
+Debug APK остаётся только build evidence с debug key. Он не является
+подписанным tester release и не заменяет physical-device evidence.
+
 **Не реализовано и не считается готовым:**
 
-- production Direct send из Android; composer остаётся read-only;
-- wire-level `client_message_id`, серверная idempotency/digest uniqueness и ACK,
-  который безопасно подтверждает точный повтор без второго fan-out;
-- атомарная SQLCipher-транзакция `advanced ratchet + local row + exact ciphertext
-  outbox`, а также ACK reconciliation и безопасный повтор exact bytes после
-  reconnect. До появления idempotency текущий `Sending → Unknown` безопаснее
-  слепого retry;
-- airplane-mode/process-death/reconnect matrix, push publication, Circle,
-  Space/Rooms, attachments, multi-device enrollment/revoke;
+- monotonic ACK deadline для live transport correlation;
+- typed разделение ordinary transport loss, retryable connect failure,
+  protocol/auth anomaly и storage uncertainty. Строковые ошибки намеренно не
+  используются для решения о retry;
+- transient-only reconnect с full-jitter exponential backoff, reset только
+  после полного Ready + outbox barrier, lifecycle cancellation и проверкой
+  неизменного account ID;
+- process-death origin recovery и airplane-mode/reconnect physical matrix;
+- push publication, Circle, Space/Rooms, attachments, multi-device
+  enrollment/revoke;
 - release signing, standalone tester APK, чистая установка и physical-device
-  matrix. Ни текущий CI APK, ни старый debug APK не являются tester release.
+  matrix. Ни текущий CI APK, ни локальный debug APK не являются tester release.
 
 **Следующий порядок:**
 
-1. Добавить shared `client_message_id`/digest idempotency contract на wire и
-   серверную exact-replay семантику без второго insert/fan-out.
-2. Сохранить advanced ratchet, local row и exact serialized ciphertext outbox в
-   одной SQLCipher-транзакции; ACK reconciliation также сделать атомарным.
-3. Reconnect повторяет только те же bytes/ID после нового exact Ready lease;
-   composer включается без optimistic JS row только после native projection.
+1. Ввести typed connect/live/outbox stop taxonomy и native monotonic ACK
+   deadline, не retry-я protocol/storage/security failures.
+2. Добавить Kotlin-owned single reconnect plan с full jitter, exact lifecycle /
+   session/origin/account guards и отменой при background/lock/manual connect.
+3. Сохранять выбранный canonical origin native-side для безопасного
+   process-death recovery без Node Access Pass replay.
 4. Пройти airplane-mode/process-death/physical matrix и только после этого
    собрать подписанный standalone tester APK.
 
@@ -1288,7 +1345,7 @@ AES-GCM vault, backup отключён, secret screens используют `FLA
 clipboard удалён и добавлено подтверждение слов. Состояния local identity и
 native failure разделены. Это закрывает первый пункт и часть пунктов 3–5 ниже,
 а SQLCipher, lifecycle lock policy и authenticated mobile runtime теперь
-подключены. Standalone signing/physical matrix и end-to-end send/reconnect gate
+подключены. Standalone signing/physical matrix и end-to-end reconnect gate
 остаются открыты и не позволяют считать 5A завершённой.
 
 1. Воспроизводимый Rust build для `arm64-v8a` и `x86_64`, Expo config plugin
@@ -1302,8 +1359,9 @@ native failure разделены. Это закрывает первый пун
    secret screens, скрывать preview в Recents и подтверждать несколько слов.
 5. Разделить состояния `identityExists`, `unlocked`, `connected`,
    `directoryReady`; текущий `isAuthenticated` слишком грубый.
-6. Реальный endpoint config, certificate validation, signed REST/WS,
-   reconnect/offline outbox и атомарные crypto+message SQLCipher transactions.
+6. Реальный endpoint config, certificate validation, signed REST/WS, offline
+   outbox и атомарные crypto+message SQLCipher transactions подключены;
+   transient-only reconnect и process-death recovery остаются открыты.
 7. Enrollment второго устройства и revoke flow как prerequisite для групп,
    server channels и MLS.
 8. Android Back закрывает dialog/sheet, затем возвращает к Rooms/Spaces либо
@@ -1322,11 +1380,11 @@ native failure разделены. Это закрывает первый пун
 
 ### Phase 5B — Android messaging
 
-**Receive/read + peer-prekey checkpoint 2026-07-19: частично готов.** Настоящие
-Direct list, authenticated history, bounded live receive и native read-only
-projection уже заменили demo chat data. X3DH one-shot peer-prekey transport
-опубликован в `029d1e3` + `f21c9c0`. ACK/outbox/send, reconnect/process-death
-matrix, private groups и остальные пункты 5B не готовы.
+**Direct text checkpoint 2026-07-19: частично готов.** Настоящие Direct list,
+authenticated history, bounded live receive, native projection, X3DH one-shot
+peer-prekey и idempotent SQLCipher-owned send/outbox опубликованы в цепочке
+`029d1e3`…`5d62f95`. ACK deadline, reconnect/process-death matrix, private
+groups и остальные пункты 5B не готовы.
 
 1. Сначала один честный Desktop ↔ Android DM: X3DH/Double Ratchet, history sync,
    ack/outbox, reconnect, airplane mode и process death.
