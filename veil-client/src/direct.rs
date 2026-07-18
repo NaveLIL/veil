@@ -59,6 +59,27 @@ pub enum DirectPreKeyInstallResult {
     AlreadyEstablished,
 }
 
+/// Typed result for the native initiator-session persistence boundary.
+/// Validation failures are definite and leave the active epoch usable;
+/// SQLCipher failures revoke the client before this error is returned.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DirectPreKeyInstallErrorV1 {
+    Rejected(String),
+    StorageUncertain(String),
+}
+
+impl DirectPreKeyInstallErrorV1 {
+    fn rejected(error: impl Into<String>) -> Self {
+        Self::Rejected(error.into())
+    }
+
+    fn into_detail(self) -> String {
+        match self {
+            Self::Rejected(detail) | Self::StorageUncertain(detail) => detail,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ConversationPageWire {
     conversations: Vec<ConversationWire>,
@@ -356,64 +377,114 @@ pub fn install_authenticated_direct_prekey_bundle(
     expected_peer_signing_key: [u8; 32],
     response: &[u8],
 ) -> Result<DirectPreKeyInstallResult, String> {
+    install_authenticated_direct_prekey_bundle_classified_v1(
+        client,
+        peer_user_id,
+        expected_peer_identity_key,
+        expected_peer_signing_key,
+        response,
+    )
+    .map_err(DirectPreKeyInstallErrorV1::into_detail)
+}
+
+/// Classified variant used by native runtimes which must invalidate their
+/// outer authenticated lease when SQLCipher cannot prove whether the initial
+/// ratchet/header transaction committed.
+pub fn install_authenticated_direct_prekey_bundle_classified_v1(
+    client: &mut VeilClient,
+    peer_user_id: &str,
+    expected_peer_identity_key: [u8; 32],
+    expected_peer_signing_key: [u8; 32],
+    response: &[u8],
+) -> Result<DirectPreKeyInstallResult, DirectPreKeyInstallErrorV1> {
     if response.len() > DIRECT_PREKEY_RESPONSE_LIMIT {
-        return Err("Direct prekey response exceeds the client limit".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct prekey response exceeds the client limit",
+        ));
     }
-    decode_canonical_uuid("Direct prekey peer user id", peer_user_id)?;
+    decode_canonical_uuid("Direct prekey peer user id", peer_user_id)
+        .map_err(DirectPreKeyInstallErrorV1::rejected)?;
     if expected_peer_identity_key == [0u8; 32]
-        || expected_peer_identity_key == client.identity_key()?
+        || expected_peer_identity_key
+            == client
+                .identity_key()
+                .map_err(DirectPreKeyInstallErrorV1::rejected)?
     {
-        return Err("Direct prekey peer identity is invalid".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct prekey peer identity is invalid",
+        ));
     }
     if client.known_user_identity(peer_user_id) != Some(expected_peer_identity_key) {
-        return Err("Direct prekey peer is absent from the authenticated directory".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct prekey peer is absent from the authenticated directory",
+        ));
     }
     if !client.peer_signing_key_is_pinned(&expected_peer_identity_key, &expected_peer_signing_key) {
-        return Err(
-            "Direct prekey signing key is not pinned by the authenticated directory".to_string(),
-        );
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct prekey signing key is not pinned by the authenticated directory",
+        ));
     }
     if client.has_session(&expected_peer_identity_key) {
         return Ok(DirectPreKeyInstallResult::AlreadyEstablished);
     }
 
-    let wire: PreKeyBundleWire = serde_json::from_slice(response)
-        .map_err(|error| format!("invalid Direct prekey response: {error}"))?;
+    let wire: PreKeyBundleWire = serde_json::from_slice(response).map_err(|error| {
+        DirectPreKeyInstallErrorV1::rejected(format!("invalid Direct prekey response: {error}"))
+    })?;
     let identity_key =
-        decode_canonical_b64_fixed::<32>("Direct prekey identity_key", &wire.identity_key)?;
+        decode_canonical_b64_fixed::<32>("Direct prekey identity_key", &wire.identity_key)
+            .map_err(DirectPreKeyInstallErrorV1::rejected)?;
     if identity_key != expected_peer_identity_key {
-        return Err("Direct prekey identity does not match the authenticated peer".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct prekey identity does not match the authenticated peer",
+        ));
     }
     let signing_key =
-        decode_canonical_b64_fixed::<32>("Direct prekey signing_key", &wire.signing_key)?;
+        decode_canonical_b64_fixed::<32>("Direct prekey signing_key", &wire.signing_key)
+            .map_err(DirectPreKeyInstallErrorV1::rejected)?;
     if signing_key != expected_peer_signing_key {
-        return Err("Direct prekey signing key does not match the authenticated peer".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct prekey signing key does not match the authenticated peer",
+        ));
     }
     if wire.signed_prekey_id == 0 {
-        return Err("Direct signed prekey id must be non-zero".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct signed prekey id must be non-zero",
+        ));
     }
     let signed_prekey =
-        decode_canonical_b64_fixed::<32>("Direct signed_prekey", &wire.signed_prekey)?;
+        decode_canonical_b64_fixed::<32>("Direct signed_prekey", &wire.signed_prekey)
+            .map_err(DirectPreKeyInstallErrorV1::rejected)?;
     if signed_prekey == [0u8; 32] {
-        return Err("Direct signed prekey must not be all zero".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct signed prekey must not be all zero",
+        ));
     }
     let signed_prekey_signature = decode_canonical_b64_fixed::<64>(
         "Direct signed_prekey_signature",
         &wire.signed_prekey_signature,
-    )?;
+    )
+    .map_err(DirectPreKeyInstallErrorV1::rejected)?;
     let one_time_prekey = wire
         .one_time_prekey
         .as_deref()
         .map(|value| decode_canonical_b64_fixed::<32>("Direct one_time_prekey", value))
-        .transpose()?;
+        .transpose()
+        .map_err(DirectPreKeyInstallErrorV1::rejected)?;
     if one_time_prekey.is_some() != wire.one_time_prekey_id.is_some() {
-        return Err("Direct prekey response contains an incomplete one-time prekey".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct prekey response contains an incomplete one-time prekey",
+        ));
     }
     if one_time_prekey == Some([0u8; 32]) {
-        return Err("Direct one-time prekey must not be all zero".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct one-time prekey must not be all zero",
+        ));
     }
     if wire.one_time_prekey_id == Some(0) {
-        return Err("Direct one-time prekey id must be non-zero".to_string());
+        return Err(DirectPreKeyInstallErrorV1::rejected(
+            "Direct one-time prekey id must be non-zero",
+        ));
     }
 
     let bundle = veil_crypto::x3dh::PreKeyBundle {
@@ -425,8 +496,16 @@ pub fn install_authenticated_direct_prekey_bundle(
         one_time_prekey,
         one_time_prekey_id: wire.one_time_prekey_id,
     };
-    client.establish_session(&expected_peer_identity_key, &bundle)?;
-    Ok(DirectPreKeyInstallResult::Established)
+    match client.establish_session_classified_v1(&expected_peer_identity_key, &bundle) {
+        Ok(()) => Ok(DirectPreKeyInstallResult::Established),
+        Err(crate::api::DirectSessionEstablishErrorV1::Rejected(detail)) => {
+            Err(DirectPreKeyInstallErrorV1::Rejected(detail))
+        }
+        Err(crate::api::DirectSessionEstablishErrorV1::StorageUncertain(detail)) => {
+            client.revoke_storage_uncertain_epoch_v1();
+            Err(DirectPreKeyInstallErrorV1::StorageUncertain(detail))
+        }
+    }
 }
 
 fn validate_conversation(
@@ -1515,6 +1594,50 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, DirectPreKeyInstallResult::AlreadyEstablished);
+
+        drop(client);
+        drop(peer);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(peer_path);
+    }
+
+    #[test]
+    fn uncertain_initiator_persistence_revokes_instead_of_permitting_a_retry() {
+        let (mut client, path) = initialized_client();
+        let (mut peer, peer_path) = initialized_client();
+        let peer_identity = peer.identity_key().unwrap();
+        let peer_signing = peer.signing_key().unwrap();
+        let prekeys = peer.generate_prekeys().unwrap();
+        install_peer_directory(&mut client, peer_identity, peer_signing);
+        client
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_initiator_ratchet_persistence
+                 BEFORE INSERT ON ratchet_sessions
+                 BEGIN SELECT RAISE(ABORT, 'forced initiator persistence failure'); END;",
+            )
+            .unwrap();
+
+        let error = install_authenticated_direct_prekey_bundle_classified_v1(
+            &mut client,
+            PEER_USER,
+            peer_identity,
+            peer_signing,
+            &prekey_response(peer_identity, peer_signing, &prekeys),
+        )
+        .unwrap_err();
+        let DirectPreKeyInstallErrorV1::StorageUncertain(detail) = error else {
+            panic!("SQLCipher failure was not classified as storage-uncertain");
+        };
+        assert!(detail.contains("forced initiator persistence failure"));
+        assert_eq!(
+            client.direct_conversation_availability_v1(CONVERSATION),
+            crate::api::DirectConversationAvailabilityV1::RuntimeRevoked
+        );
+        assert!(client.db().is_none());
+        assert!(!client.has_session(&peer_identity));
 
         drop(client);
         drop(peer);

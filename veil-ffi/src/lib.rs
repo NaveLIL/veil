@@ -2198,7 +2198,7 @@ impl VeilMobileSession {
             fail_mobile_direct_sync_sticky(state);
             return Err(error);
         }
-        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+        let mut binding = self.binding.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile binding: {error}"),
         })?;
         if binding.as_ref() != Some(&state.epoch) {
@@ -2209,14 +2209,26 @@ impl VeilMobileSession {
         let mut client = self.client.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile client: {error}"),
         })?;
-        let result = veil_client::direct::install_authenticated_direct_prekey_bundle(
-            &mut client,
-            &peer.user_id,
-            peer.identity_key,
-            peer.signing_key,
-            response.as_slice(),
-        )
-        .map_err(|msg| VeilError::Session { msg })?;
+        let result =
+            match veil_client::direct::install_authenticated_direct_prekey_bundle_classified_v1(
+                &mut client,
+                &peer.user_id,
+                peer.identity_key,
+                peer.signing_key,
+                response.as_slice(),
+            ) {
+                Ok(result) => result,
+                Err(veil_client::direct::DirectPreKeyInstallErrorV1::Rejected(msg)) => {
+                    return Err(VeilError::Session { msg });
+                }
+                Err(veil_client::direct::DirectPreKeyInstallErrorV1::StorageUncertain(_)) => {
+                    *binding = None;
+                    fail_mobile_direct_sync_sticky(state);
+                    return Err(VeilError::Session {
+                        msg: "mobile Direct prekey storage terminated".to_string(),
+                    });
+                }
+            };
         state.outstanding_request = None;
         let status = match result {
             veil_client::direct::DirectPreKeyInstallResult::Established => "established",
@@ -4382,6 +4394,96 @@ mod tests {
             .to_string();
         assert!(error.contains("blocked by authenticated history"));
 
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_prekey_storage_uncertainty_revokes_binding_and_ready_lease() {
+        use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+
+        let (session, path, token) = mobile_test_session_with_sync(16);
+        let (directory_response, peer_identity) = mobile_test_directory_response(&session);
+        let directory_request = session
+            .prepare_direct_directory_request(token.clone())
+            .unwrap();
+        let page = session
+            .install_direct_directory_page(
+                token.clone(),
+                directory_request.request_token,
+                directory_response,
+            )
+            .unwrap();
+        let conversation_id = page.conversations[0].conversation_id.clone();
+        session.direct_sync.lock().unwrap().as_mut().unwrap().phase = MobileDirectSyncPhase::Ready;
+        let prekey_request = session
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
+            .unwrap();
+
+        let peer_identity_key = peer_identity.x25519_public_bytes();
+        let peer_signing_key = peer_identity.ed25519_public_bytes();
+        let mut peer = veil_client::api::VeilClient::from_identity(peer_identity);
+        let prekeys = peer.generate_prekeys().unwrap();
+        let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
+        let prekey_response = serde_json::to_vec(&serde_json::json!({
+            "identity_key": BASE64_STANDARD.encode(peer_identity_key),
+            "signing_key": BASE64_STANDARD.encode(peer_signing_key),
+            "signed_prekey": BASE64_STANDARD.encode(prekeys.spk_public),
+            "signed_prekey_signature": BASE64_STANDARD.encode(prekeys.spk_signature),
+            "signed_prekey_id": prekeys.spk_id,
+            "one_time_prekey": BASE64_STANDARD.encode(one_time_prekey),
+            "one_time_prekey_id": one_time_prekey_id,
+            "opk_low_warning": false,
+            "opk_remaining": 10,
+        }))
+        .unwrap();
+        session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_mobile_initiator_persistence
+                 BEFORE INSERT ON ratchet_sessions
+                 BEGIN SELECT RAISE(ABORT, 'secret storage diagnostic'); END;",
+            )
+            .unwrap();
+
+        let error = session
+            .install_direct_prekey_bundle(
+                token.clone(),
+                prekey_request.request_token,
+                conversation_id.clone(),
+                prekey_response,
+            )
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error,
+            "Session error: mobile Direct prekey storage terminated"
+        );
+        assert!(!error.contains("secret storage diagnostic"));
+        assert!(session.binding.lock().unwrap().is_none());
+        let sync = session.direct_sync.lock().unwrap();
+        let state = sync.as_ref().unwrap();
+        assert_eq!(state.phase, MobileDirectSyncPhase::Failed);
+        assert!(state.outstanding_request.is_none());
+        drop(sync);
+        let client = session.client.lock().unwrap();
+        assert_eq!(
+            client.direct_conversation_availability_v1(&conversation_id),
+            veil_client::api::DirectConversationAvailabilityV1::RuntimeRevoked
+        );
+        assert!(client.db().is_none());
+        assert!(!client.has_session(&peer_identity_key));
+        drop(client);
+        assert!(session
+            .prepare_direct_prekey_request(token, conversation_id)
+            .is_err());
+
+        drop(peer);
         drop(session);
         let _ = std::fs::remove_file(path);
     }

@@ -1339,6 +1339,29 @@ impl Connection {
             .map_err(|e| format!("send failed: {e}"))
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_only_queued_connection() -> (Self, mpsc::Receiver<Vec<u8>>) {
+        let write_join = tokio::spawn(std::future::pending::<()>());
+        let read_join = tokio::spawn(std::future::pending::<()>());
+        let (sender, outbound) = mpsc::channel(4);
+        let (_event_sender, event_receiver) = mpsc::channel(1);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        (
+            Self {
+                sender,
+                events: ConnectionEventReceiverV1 {
+                    receiver: event_receiver,
+                    terminal,
+                },
+                retained_events: VecDeque::new(),
+                seq: Arc::new(Mutex::new(1)),
+                write_task: write_join.abort_handle(),
+                read_task: read_join.abort_handle(),
+            },
+            outbound,
+        )
+    }
+
     /// Stop background I/O immediately. Dropping the client calls this through
     /// `Drop`, so a native app lock cannot leave a detached authenticated socket.
     pub fn disconnect(&self) {

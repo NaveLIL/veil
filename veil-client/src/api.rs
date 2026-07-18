@@ -213,6 +213,47 @@ impl DirectHistoryMutationError {
     }
 }
 
+/// Typed failure boundary for one outgoing Direct message attempt.
+///
+/// Callers may present `Rejected` as a definite, not-accepted failure. A
+/// `StorageUncertain` result means SQLCipher may have advanced the send ratchet
+/// or published the pending local row; the active native epoch must be revoked
+/// before any retry can be considered.
+#[derive(Debug, PartialEq, Eq)]
+pub enum DirectSendErrorV1 {
+    Rejected(String),
+    StorageUncertain(String),
+}
+
+impl DirectSendErrorV1 {
+    fn rejected(error: impl Into<String>) -> Self {
+        Self::Rejected(error.into())
+    }
+
+    fn storage(error: impl Into<String>) -> Self {
+        Self::StorageUncertain(error.into())
+    }
+}
+
+/// Internal classification for initiator-side X3DH persistence. Cryptographic
+/// or peer-bundle rejection is definite; a SQLCipher error is not, because the
+/// ratchet/header transaction may already have committed.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DirectSessionEstablishErrorV1 {
+    Rejected(String),
+    StorageUncertain(String),
+}
+
+impl DirectSessionEstablishErrorV1 {
+    fn rejected(error: impl Into<String>) -> Self {
+        Self::Rejected(error.into())
+    }
+
+    fn storage(error: impl Into<String>) -> Self {
+        Self::StorageUncertain(error.into())
+    }
+}
+
 /// One native Direct live-replay turn never consumes more than this many
 /// authenticated socket events. The caller must schedule another turn when
 /// `quiescent` is false, giving lifecycle/terminal checks a bounded cadence.
@@ -2453,6 +2494,20 @@ impl VeilClient {
         }
     }
 
+    fn resolve_public_direct_send_v1<T>(
+        &mut self,
+        result: Result<T, DirectSendErrorV1>,
+    ) -> Result<T, String> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(DirectSendErrorV1::Rejected(detail)) => Err(detail),
+            Err(DirectSendErrorV1::StorageUncertain(detail)) => {
+                self.revoke_after_storage_uncertain_v1();
+                Err(detail)
+            }
+        }
+    }
+
     /// Check sticky global state before every individual FIFO receive. This is
     /// intentionally repeated inside the bounded loop so a terminal published
     /// between two events preempts the next ratchet step.
@@ -3207,61 +3262,82 @@ impl VeilClient {
         reply_to_id: Option<&str>,
         attachments: Vec<crate::attachments::OutgoingAttachmentV1>,
     ) -> Result<u64, String> {
-        self.require_direct_conversation_available_v1(conversation_id)?;
+        let result = self
+            .send_message_with_attachments_classified_v1(
+                conversation_id,
+                plaintext,
+                reply_to_id,
+                attachments,
+            )
+            .await;
+        self.resolve_public_direct_send_v1(result)
+    }
+
+    async fn send_message_with_attachments_classified_v1(
+        &mut self,
+        conversation_id: &str,
+        plaintext: &str,
+        reply_to_id: Option<&str>,
+        attachments: Vec<crate::attachments::OutgoingAttachmentV1>,
+    ) -> Result<u64, DirectSendErrorV1> {
+        self.require_direct_conversation_available_v1(conversation_id)
+            .map_err(DirectSendErrorV1::rejected)?;
         if plaintext.is_empty() && attachments.is_empty() {
-            return Err("message plaintext must not be empty".to_string());
-        }
-        if plaintext.len() > MAX_PLAINTEXT_BYTES {
-            return Err(format!(
-                "message plaintext exceeds {MAX_PLAINTEXT_BYTES} bytes"
+            return Err(DirectSendErrorV1::rejected(
+                "message plaintext must not be empty",
             ));
         }
-        if self.connection.is_none() {
-            return Err("not connected".to_string());
+        if plaintext.len() > MAX_PLAINTEXT_BYTES {
+            return Err(DirectSendErrorV1::rejected(format!(
+                "message plaintext exceeds {MAX_PLAINTEXT_BYTES} bytes"
+            )));
         }
-        let (encrypted_plaintext, wire_attachments, stored_attachments) =
-            if attachments.is_empty() {
-                (
-                    Zeroizing::new(plaintext.to_string()),
-                    Vec::new(),
-                    Vec::new(),
-                )
-            } else {
-                let (payload, wire, stored) =
-                    crate::attachments::build_outgoing_attachment_message_v1(
-                        conversation_id,
-                        plaintext,
-                        attachments,
-                    )?;
-                (
-                    Zeroizing::new(String::from_utf8(payload.to_vec()).map_err(|_| {
-                        "attachment payload is not valid protocol UTF-8".to_string()
-                    })?),
-                    wire,
-                    stored,
-                )
-            };
+        if self.connection.is_none() {
+            return Err(DirectSendErrorV1::rejected("not connected"));
+        }
+        let (encrypted_plaintext, wire_attachments, stored_attachments) = if attachments.is_empty()
+        {
+            (
+                Zeroizing::new(plaintext.to_string()),
+                Vec::new(),
+                Vec::new(),
+            )
+        } else {
+            let (payload, wire, stored) = crate::attachments::build_outgoing_attachment_message_v1(
+                conversation_id,
+                plaintext,
+                attachments,
+            )
+            .map_err(DirectSendErrorV1::rejected)?;
+            (
+                Zeroizing::new(String::from_utf8(payload.to_vec()).map_err(|_| {
+                    DirectSendErrorV1::rejected("attachment payload is not valid protocol UTF-8")
+                })?),
+                wire,
+                stored,
+            )
+        };
         let seq = self
             .connection
             .as_ref()
-            .ok_or("not connected")?
+            .ok_or_else(|| DirectSendErrorV1::rejected("not connected"))?
             .next_seq()
             .await;
 
         // Encrypt first (needs mutable borrow)
         let (ciphertext, header_bytes) =
-            self.encrypt_outgoing(conversation_id, &encrypted_plaintext)?;
+            self.encrypt_outgoing_classified_v1(conversation_id, &encrypted_plaintext)?;
         let initial_peer = (header_bytes.first() == Some(&HEADER_INITIAL))
             .then(|| self.dm_conversations.get(conversation_id).copied())
             .flatten();
-        let our_key = self.identity_key()?;
+        let our_key = self.identity_key().map_err(DirectSendErrorV1::rejected)?;
         let local_message_id = uuid::Uuid::new_v4().to_string();
         let local_timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .map_err(|_| "system clock is before Unix epoch".to_string())?
+            .map_err(|_| DirectSendErrorV1::rejected("system clock is before Unix epoch"))?
             .as_millis()
             .try_into()
-            .map_err(|_| "local message timestamp exceeds i64".to_string())?;
+            .map_err(|_| DirectSendErrorV1::rejected("local message timestamp exceeds i64"))?;
 
         if let Some(db) = self.db.as_ref() {
             db.insert_outgoing_pending_message_with_attachments(
@@ -3271,17 +3347,16 @@ impl VeilClient {
                 plaintext,
                 reply_to_id,
                 &stored_attachments,
-            )?;
+            )
+            .map_err(DirectSendErrorV1::storage)?;
             match db.resolve_account_by_conversation_sender(conversation_id, &our_key) {
                 Ok(Some(author_snapshot)) => {
-                    if let Err(error) =
-                        db.attach_message_author(&local_message_id, &author_snapshot)
-                    {
-                        db.mark_outgoing_message_failed(&local_message_id)?;
-                        return Err(format!(
-                            "persist outgoing message author attribution: {error}"
-                        ));
-                    }
+                    db.attach_message_author(&local_message_id, &author_snapshot)
+                        .map_err(|error| {
+                            DirectSendErrorV1::storage(format!(
+                                "persist outgoing message author attribution: {error}"
+                            ))
+                        })?;
                 }
                 Ok(None) => {
                     // Legacy unscoped conversations remain usable; their own
@@ -3289,10 +3364,9 @@ impl VeilClient {
                     // an origin or account locator.
                 }
                 Err(error) => {
-                    db.mark_outgoing_message_failed(&local_message_id)?;
-                    return Err(format!(
+                    return Err(DirectSendErrorV1::storage(format!(
                         "resolve outgoing message author attribution: {error}"
-                    ));
+                    )));
                 }
             }
         }
@@ -3306,19 +3380,21 @@ impl VeilClient {
                     local_timestamp,
                 ) {
                     if let Some(db) = self.db.as_ref() {
-                        db.mark_outgoing_message_failed(&local_message_id)?;
+                        db.mark_outgoing_message_failed(&local_message_id)
+                            .map_err(DirectSendErrorV1::storage)?;
                     }
                     let _ = indexer.delete(&local_message_id);
-                    return Err(format!("index pending outgoing message: {error}"));
+                    return Err(DirectSendErrorV1::rejected(format!(
+                        "index pending outgoing message: {error}"
+                    )));
                 }
             }
         }
 
         let roster_proof = if self.channel_conversations.contains(conversation_id) {
-            let roster = self
-                .device_rosters
-                .get(conversation_id)
-                .ok_or("validated current device roster is unavailable")?;
+            let roster = self.device_rosters.get(conversation_id).ok_or_else(|| {
+                DirectSendErrorV1::rejected("validated current device roster is unavailable")
+            })?;
             Some((roster.version, roster.commitment))
         } else {
             None
@@ -3361,16 +3437,17 @@ impl VeilClient {
         if let Err(error) = self
             .connection
             .as_ref()
-            .ok_or("not connected")?
+            .ok_or_else(|| DirectSendErrorV1::rejected("not connected"))?
             .send_envelope(&env)
             .await
         {
             if let Some(db) = self.db.as_ref() {
-                db.mark_outgoing_message_failed(&local_message_id)?;
+                db.mark_outgoing_message_failed(&local_message_id)
+                    .map_err(DirectSendErrorV1::storage)?;
             } else if let Some(indexer) = self.indexer.as_ref() {
                 let _ = indexer.delete(&local_message_id);
             }
-            return Err(error);
+            return Err(DirectSendErrorV1::rejected(error));
         }
         if let Some(peer_identity_key) = initial_peer {
             self.pending_initial_sequences
@@ -3661,9 +3738,30 @@ impl VeilClient {
         peer_identity_key: &[u8; 32],
         bundle: &x3dh::PreKeyBundle,
     ) -> Result<(), String> {
-        self.require_crypto_runtime_active_v1()?;
-        let identity = self.identity.as_ref().ok_or("not initialized")?;
-        let result = x3dh::initiate(identity, bundle)?;
+        let result = self.establish_session_classified_v1(peer_identity_key, bundle);
+        match result {
+            Ok(()) => Ok(()),
+            Err(DirectSessionEstablishErrorV1::Rejected(detail)) => Err(detail),
+            Err(DirectSessionEstablishErrorV1::StorageUncertain(detail)) => {
+                self.revoke_after_storage_uncertain_v1();
+                Err(detail)
+            }
+        }
+    }
+
+    pub(crate) fn establish_session_classified_v1(
+        &mut self,
+        peer_identity_key: &[u8; 32],
+        bundle: &x3dh::PreKeyBundle,
+    ) -> Result<(), DirectSessionEstablishErrorV1> {
+        self.require_crypto_runtime_active_v1()
+            .map_err(DirectSessionEstablishErrorV1::rejected)?;
+        let identity = self
+            .identity
+            .as_ref()
+            .ok_or_else(|| DirectSessionEstablishErrorV1::rejected("not initialized"))?;
+        let result =
+            x3dh::initiate(identity, bundle).map_err(DirectSessionEstablishErrorV1::rejected)?;
 
         let session = RatchetSession::init_initiator(&result.shared_secret, &bundle.signed_prekey);
 
@@ -3675,13 +3773,18 @@ impl VeilClient {
             one_time_prekey_id: bundle.one_time_prekey_id,
         };
         if let Some(db) = self.db.as_ref() {
-            let session_data = Zeroizing::new(
-                serde_json::to_vec(&session)
-                    .map_err(|e| format!("serialize initiator ratchet session: {e}"))?,
-            );
-            let header_data = serde_json::to_vec(&pending_header)
-                .map_err(|e| format!("serialize pending X3DH header: {e}"))?;
-            db.save_initiator_session(peer_identity_key, &session_data, &header_data)?;
+            let session_data = Zeroizing::new(serde_json::to_vec(&session).map_err(|e| {
+                DirectSessionEstablishErrorV1::rejected(format!(
+                    "serialize initiator ratchet session: {e}"
+                ))
+            })?);
+            let header_data = serde_json::to_vec(&pending_header).map_err(|e| {
+                DirectSessionEstablishErrorV1::rejected(format!(
+                    "serialize pending X3DH header: {e}"
+                ))
+            })?;
+            db.save_initiator_session(peer_identity_key, &session_data, &header_data)
+                .map_err(DirectSessionEstablishErrorV1::storage)?;
         }
         self.pending_initial_headers
             .insert(*peer_identity_key, pending_header);
@@ -3785,43 +3888,57 @@ impl VeilClient {
         conversation_id: &str,
         plaintext: &str,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        self.require_direct_conversation_available_v1(conversation_id)?;
-        if self.channel_conversations.contains(conversation_id) {
-            if self
-                .sender_key_distribution_pending
-                .contains(conversation_id)
-            {
-                return Err(
-                    "sender-key distribution is incomplete; channel send is blocked".to_string(),
-                );
-            }
-            // Creating a fresh generation is itself a distribution event. It
-            // must never fall through to encryption in the same call: no
-            // recipient has durably received that generation yet. Keeping the
-            // pending flag set also makes retries distribute this exact state
-            // instead of rotating again.
-            if !self.sender_keys.has_outgoing(conversation_id)
-                || self.sender_keys.needs_rotation(conversation_id)
-            {
-                self.rotate_sender_key(conversation_id)?;
-                return Err(
-                    "sender-key rotation requires distribution; channel send is blocked"
-                        .to_string(),
-                );
-            }
+        let result = self.encrypt_outgoing_classified_v1(conversation_id, plaintext);
+        self.resolve_public_direct_send_v1(result)
+    }
 
-            let device = self
-                .device_identity
-                .as_ref()
-                .ok_or("per-device identity is required for Sender-Key v5")?;
-            let ct = self.sender_keys.encrypt_signed_with_device(
-                conversation_id,
-                &device.binding().device_identity_key,
-                device.ed25519_signing_key(),
-                plaintext.as_bytes(),
-            )?;
-            self.persist_outgoing_sender_key(conversation_id)?;
-            return Ok((ct, vec![HEADER_SENDER_KEY]));
+    fn encrypt_outgoing_classified_v1(
+        &mut self,
+        conversation_id: &str,
+        plaintext: &str,
+    ) -> Result<(Vec<u8>, Vec<u8>), DirectSendErrorV1> {
+        self.require_direct_conversation_available_v1(conversation_id)
+            .map_err(DirectSendErrorV1::rejected)?;
+        if self.channel_conversations.contains(conversation_id) {
+            // Stage-5 classification is deliberately pairwise-only. Preserve
+            // the established desktop Sender-Key error surface until the group
+            // send transaction receives its own typed boundary.
+            let channel_result = (|| -> Result<(Vec<u8>, Vec<u8>), String> {
+                if self
+                    .sender_key_distribution_pending
+                    .contains(conversation_id)
+                {
+                    return Err(
+                        "sender-key distribution is incomplete; channel send is blocked"
+                            .to_string(),
+                    );
+                }
+                // Creating a fresh generation is itself a distribution event.
+                // It must never fall through to encryption in the same call.
+                if !self.sender_keys.has_outgoing(conversation_id)
+                    || self.sender_keys.needs_rotation(conversation_id)
+                {
+                    self.rotate_sender_key(conversation_id)?;
+                    return Err(
+                        "sender-key rotation requires distribution; channel send is blocked"
+                            .to_string(),
+                    );
+                }
+
+                let device = self
+                    .device_identity
+                    .as_ref()
+                    .ok_or("per-device identity is required for Sender-Key v5")?;
+                let ct = self.sender_keys.encrypt_signed_with_device(
+                    conversation_id,
+                    &device.binding().device_identity_key,
+                    device.ed25519_signing_key(),
+                    plaintext.as_bytes(),
+                )?;
+                self.persist_outgoing_sender_key(conversation_id)?;
+                Ok((ct, vec![HEADER_SENDER_KEY]))
+            })();
+            return channel_result.map_err(DirectSendErrorV1::rejected);
         }
 
         // No automatic pairwise lookup yet — callers use `encrypt_for` directly
@@ -3831,12 +3948,12 @@ impl VeilClient {
             .get(conversation_id)
             .copied()
             .ok_or_else(|| {
-                format!(
+                DirectSendErrorV1::rejected(format!(
                     "E2E session unavailable: conversation {conversation_id} is not bound to a peer"
-                )
+                ))
             })?;
         let inner = Self::wrap_text_inner(plaintext);
-        self.encrypt_for_conversation(&peer_identity_key, conversation_id, &inner)
+        self.encrypt_for_conversation_classified_v1(&peer_identity_key, conversation_id, &inner)
     }
 
     #[cfg(test)]
@@ -3861,14 +3978,15 @@ impl VeilClient {
         )
     }
 
-    fn encrypt_for_conversation(
+    fn encrypt_for_conversation_classified_v1(
         &mut self,
         peer_identity_key: &[u8; 32],
         conversation_id: &str,
         plaintext: &[u8],
-    ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        self.require_direct_conversation_available_v1(conversation_id)?;
-        let our_identity_key = self.identity_key()?;
+    ) -> Result<(Vec<u8>, Vec<u8>), DirectSendErrorV1> {
+        self.require_direct_conversation_available_v1(conversation_id)
+            .map_err(DirectSendErrorV1::rejected)?;
+        let our_identity_key = self.identity_key().map_err(DirectSendErrorV1::rejected)?;
         let pending = self.pending_initial_headers.get(peer_identity_key).copied();
         let mut wire_prefix = Vec::with_capacity(1 + 32 + 4 + 4);
         if let Some(initial) = pending {
@@ -3885,15 +4003,17 @@ impl VeilClient {
             &our_identity_key,
             peer_identity_key,
             &wire_prefix,
-        )?;
+        )
+        .map_err(DirectSendErrorV1::rejected)?;
         let mut candidate = self
             .ratchet_sessions
             .get(peer_identity_key)
             .cloned()
-            .ok_or("no ratchet session with this peer")?;
+            .ok_or_else(|| DirectSendErrorV1::rejected("no ratchet session with this peer"))?;
 
-        let (ratchet_header, ciphertext) =
-            candidate.encrypt_with_ad(plaintext, &associated_data)?;
+        let (ratchet_header, ciphertext) = candidate
+            .encrypt_with_ad(plaintext, &associated_data)
+            .map_err(DirectSendErrorV1::rejected)?;
         let rh_bytes = ratchet_header.to_bytes();
 
         // Every message carries the same X3DH metadata until an authenticated
@@ -3906,11 +4026,11 @@ impl VeilClient {
         // key after an ACK-loss/crash would be worse than skipping an unsent
         // chain step, which Double Ratchet is designed to tolerate.
         if let Some(ref db) = self.db {
-            let data = Zeroizing::new(
-                serde_json::to_vec(&candidate)
-                    .map_err(|e| format!("serialize ratchet session: {e}"))?,
-            );
-            db.save_ratchet_session(peer_identity_key, &data)?;
+            let data = Zeroizing::new(serde_json::to_vec(&candidate).map_err(|e| {
+                DirectSendErrorV1::rejected(format!("serialize ratchet session: {e}"))
+            })?);
+            db.save_ratchet_session(peer_identity_key, &data)
+                .map_err(DirectSendErrorV1::storage)?;
         }
         self.ratchet_sessions.insert(*peer_identity_key, candidate);
 
@@ -10199,6 +10319,100 @@ mod tests {
         assert!(!client
             .sender_keys
             .has_incoming("scrubbed-sender-key-probe", peer_identity_key));
+    }
+
+    #[tokio::test]
+    async fn direct_send_sqlcipher_failures_revoke_before_a_retry_can_reuse_the_epoch() {
+        for fault in ["ratchet", "pending"] {
+            let mut fixture = DirectLiveReplayFixture::new();
+            let peer = fixture.add_peer();
+            let peer_identity_key = fixture.peers[peer].sender_identity_key;
+            let conversation_id = fixture.peers[peer].conversation_id.clone();
+            let initial = fixture.peers[peer].next_event("establish responder session");
+            fixture.enqueue(vec![initial]);
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap();
+            assert!(fixture.receiver.has_session(&peer_identity_key));
+
+            let trigger = match fault {
+                "ratchet" => {
+                    "CREATE TRIGGER reject_direct_send_ratchet
+                     BEFORE INSERT ON ratchet_sessions
+                     BEGIN SELECT RAISE(ABORT, 'forced Direct send ratchet failure'); END;"
+                }
+                "pending" => {
+                    "CREATE TRIGGER reject_direct_send_pending
+                     BEFORE INSERT ON messages
+                     BEGIN SELECT RAISE(ABORT, 'forced Direct send pending failure'); END;"
+                }
+                _ => unreachable!(),
+            };
+            fixture
+                .receiver
+                .db()
+                .unwrap()
+                .conn()
+                .execute_batch(trigger)
+                .unwrap();
+            let (connection, mut outbound) =
+                crate::connection::Connection::test_only_queued_connection();
+            fixture.receiver.connection = Some(connection);
+
+            let error = fixture
+                .receiver
+                .send_message(&conversation_id, "must not become retryable", None)
+                .await
+                .unwrap_err();
+            assert!(error.contains(&format!("forced Direct send {fault} failure")));
+            assert_failed_initialization_epoch_is_scrubbed_v1(
+                &fixture.receiver,
+                &peer_identity_key,
+            );
+            assert!(outbound.try_recv().is_err());
+        }
+
+        // A closed bounded transport queue is a definite local rejection: no
+        // envelope was accepted. If the compensating SQLCipher status update
+        // succeeds, the ratchet may safely skip its consumed key and the epoch
+        // must remain usable instead of being over-classified as uncertain.
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let peer_identity_key = fixture.peers[peer].sender_identity_key;
+        let conversation_id = fixture.peers[peer].conversation_id.clone();
+        let initial = fixture.peers[peer].next_event("establish responder session");
+        fixture.enqueue(vec![initial]);
+        fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        let (connection, outbound) = crate::connection::Connection::test_only_queued_connection();
+        drop(outbound);
+        fixture.receiver.connection = Some(connection);
+
+        let error = fixture
+            .receiver
+            .send_message(&conversation_id, "definitely not queued", None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("send failed"));
+        assert!(!fixture.receiver.direct_live_storage_uncertain);
+        assert!(fixture.receiver.db().is_some());
+        assert!(fixture.receiver.has_session(&peer_identity_key));
+        let messages = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .get_messages(&conversation_id, 10)
+            .unwrap();
+        let rejected = messages
+            .iter()
+            .find(|message| message.is_outgoing && message.plaintext == "definitely not queued")
+            .expect("definitely rejected outgoing row is durable");
+        assert_eq!(rejected.status, veil_store::models::MessageStatus::Failed);
     }
 
     #[test]
