@@ -28,6 +28,120 @@ $CargoTargetDir = [System.IO.Path]::GetFullPath($CargoTargetDir)
 [System.IO.Directory]::CreateDirectory($CargoTargetDir) | Out-Null
 $env:CARGO_TARGET_DIR = $CargoTargetDir
 
+# SQLCipher's vendored OpenSSL build uses OpenSSL's Unix Android target even
+# when Cargo runs on Windows. It therefore needs a full MSYS2/Cygwin Perl, not
+# Strawberry Perl (Windows paths) or Git for Windows' intentionally trimmed
+# Perl distribution (missing core modules used by OpenSSL).
+if ($env:OS -eq "Windows_NT") {
+  $perlProbe = @'
+use strict;
+use warnings;
+use Config;
+use File::Spec::Functions qw(rel2abs);
+
+my $absolute = rel2abs(q(.));
+if (index($absolute, q(/)) < 0) {
+    print q(File::Spec does not produce Unix-style paths);
+    exit 41;
+}
+
+eval {
+    require Locale::Maketext::Simple;
+    require ExtUtils::MakeMaker;
+    require Pod::Usage;
+    require IPC::Cmd;
+    1;
+} or do {
+    print q(required Perl module unavailable: ) . $@;
+    exit 42;
+};
+'@
+
+  $perlCandidates = @()
+  if (-not [string]::IsNullOrWhiteSpace($env:OPENSSL_SRC_PERL)) {
+    $perlCandidates += $env:OPENSSL_SRC_PERL
+  } else {
+    if (-not [string]::IsNullOrWhiteSpace($env:MSYS2_ROOT)) {
+      $perlCandidates += (Join-Path $env:MSYS2_ROOT "usr/bin/perl.exe")
+    }
+    $perlCandidates += @(
+      "C:/msys64/usr/bin/perl.exe",
+      "C:/tools/msys64/usr/bin/perl.exe",
+      "C:/cygwin64/bin/perl.exe"
+    )
+
+    $pathPerl = Get-Command perl -ErrorAction SilentlyContinue
+    if ($null -ne $pathPerl) {
+      $perlCandidates += $pathPerl.Source
+    }
+  }
+
+  $perlFailures = @()
+  $selectedPerl = $null
+  foreach ($candidate in ($perlCandidates | Select-Object -Unique)) {
+    if (-not (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+      $perlFailures += "  - ${candidate}: executable not found"
+      continue
+    }
+
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+      $probeOutput = (& $candidate -e $perlProbe 2>&1 | Out-String).Trim()
+      $probeExitCode = $LASTEXITCODE
+    } finally {
+      $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if ($probeExitCode -eq 0) {
+      $selectedPerl = [System.IO.Path]::GetFullPath($candidate)
+      break
+    }
+
+    if ([string]::IsNullOrWhiteSpace($probeOutput)) {
+      $probeOutput = "compatibility probe failed with exit code $probeExitCode"
+    } else {
+      $probeOutput = $probeOutput -replace "\r?\n", " | "
+    }
+    $perlFailures += "  - ${candidate}: $probeOutput"
+  }
+
+  if ($null -eq $selectedPerl) {
+    $checkedPerl = if ($perlFailures.Count -gt 0) {
+      $perlFailures -join [Environment]::NewLine
+    } else {
+      "  - no Perl candidates were found"
+    }
+
+    throw @"
+Android native build requires a full Unix-compatible Perl because SQLCipher
+builds vendored OpenSSL for Android. Strawberry Perl and Git for Windows Perl
+are not compatible with this build.
+
+Install MSYS2, then install its complete Perl and make packages:
+  pacman -S --needed perl make
+
+Set OPENSSL_SRC_PERL to the full executable path (for example
+C:\msys64\usr\bin\perl.exe), ensure the matching make.exe is on PATH, and run
+pnpm native:android again. The Linux Mobile CI build is also supported.
+
+Checked Perl candidates:
+$checkedPerl
+"@
+  }
+
+  $env:OPENSSL_SRC_PERL = $selectedPerl
+  $makeCommand = Get-Command make -ErrorAction SilentlyContinue
+  if ($null -eq $makeCommand) {
+    $perlBin = Split-Path $selectedPerl -Parent
+    throw @"
+Compatible Perl found at $selectedPerl, but make.exe is not on PATH.
+Add the matching MSYS2/Cygwin bin directory to PATH (expected near $perlBin)
+and run pnpm native:android again.
+"@
+  }
+}
+
 Push-Location $workspaceRoot
 try {
   cargo build -p veil-ffi --release
