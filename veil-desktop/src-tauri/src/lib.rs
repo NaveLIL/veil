@@ -3635,7 +3635,7 @@ enum SenderKeyHistoryInspectionOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn reconcile_sender_key_history_inspection(
-    client: &VeilClient,
+    client: &mut VeilClient,
     inspection: &veil_client::api::SenderKeyMessageContextInspectionV1,
     current_target_admission: Option<&CurrentTargetAdmissionEvidence>,
     message_created_at: &str,
@@ -4773,7 +4773,7 @@ fn sync_conversation_messages(
                                     .ok_or("Sender-Key message context conversion failed")?,
                             )?;
                             if reconcile_sender_key_history_inspection(
-                                &client,
+                                &mut client,
                                 &validation,
                                 current_target_admission,
                                 &message.created_at,
@@ -14302,7 +14302,7 @@ mod e2ee_rest_tests {
 
         assert_eq!(
             super::reconcile_sender_key_history_inspection(
-                &client,
+                &mut client,
                 &missing,
                 Some(&evidence),
                 "2026-07-13T19:05:17.714128999Z",
@@ -14346,7 +14346,7 @@ mod e2ee_rest_tests {
 
         assert_eq!(
             super::reconcile_sender_key_history_inspection(
-                &client,
+                &mut client,
                 &SenderKeyMessageContextInspectionV1::Verified,
                 Some(&evidence),
                 "2026-07-13T19:05:18Z",
