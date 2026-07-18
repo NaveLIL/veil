@@ -11,6 +11,7 @@ const lockedSnapshot: VeilMobileRuntimeSnapshot = {
   identityExists: true,
   runtimeRevision: 1,
   directGeneration: null,
+  directContentRevision: null,
   sessionState: "locked",
   connectionState: "disconnected",
   directoryReady: false,

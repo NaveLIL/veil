@@ -72,11 +72,16 @@ any value is missing.
   install. A terminal epoch observed at that boundary aborts before install; a
   concurrent terminal event linearizes before or after the boundary, and any
   committed prefix remains duplicate-safe when reconnect restarts history.
+- After the gap-free history handoff reaches `Ready`, Android continuously asks
+  Rust for bounded 64-event replay turns. Full batches continue immediately;
+  an idle authenticated generation polls every 250 ms. Only a native aggregate
+  content revision can refresh the conversation the user explicitly selected;
+  ordinary snapshot reads never trigger another plaintext projection.
 - UnifiedPush still accepts only decrypted 2048-byte generic wake records.
 
 This remains a closed Direct Preview, not a tester release or production-ready
-mobile messenger. Stage 5 intentionally stops at `history_synchronized`:
-deferred live replay, real Direct send/receive/history UI, polished reconnect,
-push publication, Circle/Space/attachments, signed standalone APK distribution,
-and physical-device tests remain gated. `directoryReady` therefore stays false
-even for an empty or fully validated history.
+mobile messenger. Authenticated Direct directory/history, bounded live receive,
+and a read-only real-message UI are present. Native per-conversation prekey
+readiness, guarded send/outbox UI, polished reconnect, push publication,
+Circle/Space/attachments, signed standalone APK distribution, and physical-device
+tests remain gated.

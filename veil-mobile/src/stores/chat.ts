@@ -95,6 +95,7 @@ type RuntimeDirectConversation = VeilMobileRuntimeSnapshot["directConversations"
 interface RuntimeDirectory {
   binding: AuthenticatedBinding;
   directGeneration: number;
+  directContentRevision: number;
   conversations: RuntimeDirectConversation[];
 }
 
@@ -110,6 +111,7 @@ interface ChatState {
   projectionStateByConversation: Record<DmId, DirectProjectionState>;
   runtimeBinding: AuthenticatedBinding | null;
   directGeneration: number | null;
+  directContentRevision: number | null;
   directoryRevision: number;
   projectionRequestRevision: number;
   hydrateRuntimeDirectory: (snapshot: VeilMobileRuntimeSnapshot) => void;
@@ -180,6 +182,9 @@ function normalizeDirectory(snapshot: VeilMobileRuntimeSnapshot): RuntimeDirecto
     || snapshot.directGeneration === null
     || !Number.isSafeInteger(snapshot.directGeneration)
     || snapshot.directGeneration < 1
+    || snapshot.directContentRevision === null
+    || !Number.isSafeInteger(snapshot.directContentRevision)
+    || snapshot.directContentRevision < 0
     || !Array.isArray(snapshot.directConversations)
     || snapshot.directConversations.length > MAX_DIRECT_CONVERSATIONS
   ) return null;
@@ -205,6 +210,7 @@ function normalizeDirectory(snapshot: VeilMobileRuntimeSnapshot): RuntimeDirecto
   return {
     binding,
     directGeneration: snapshot.directGeneration,
+    directContentRevision: snapshot.directContentRevision,
     conversations,
   };
 }
@@ -326,6 +332,7 @@ const initialChatState = {
   projectionStateByConversation: {} as Record<DmId, DirectProjectionState>,
   runtimeBinding: null as AuthenticatedBinding | null,
   directGeneration: null as number | null,
+  directContentRevision: null as number | null,
   directoryRevision: 0,
   projectionRequestRevision: 0,
 };
@@ -346,6 +353,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       ? {
           binding: state.runtimeBinding,
           directGeneration: state.directGeneration,
+          directContentRevision: state.directContentRevision ?? 0,
           conversations: state.dms.map((dm) => ({
             conversationId: dm.id,
             name: dm.name,
@@ -354,11 +362,22 @@ export const useChatStore = create<ChatState>((set, get) => ({
           })),
         }
       : null;
-    if (
+    const sameDirectory =
       currentDirectory
       && sameBinding(currentDirectory.binding, directory.binding)
-      && directoryFingerprint(currentDirectory) === directoryFingerprint(directory)
-    ) return;
+      && directoryFingerprint(currentDirectory) === directoryFingerprint(directory);
+    if (sameDirectory) {
+      if (
+        state.directContentRevision === null
+        || directory.directContentRevision < state.directContentRevision
+      ) {
+        get().clearRenderableChat();
+        return;
+      }
+      if (directory.directContentRevision === state.directContentRevision) return;
+      set({ directContentRevision: directory.directContentRevision });
+      return;
+    }
 
     const projected = projectDirectory(directory);
     set({
@@ -373,6 +392,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
       projectionStateByConversation: {},
       runtimeBinding: directory.binding,
       directGeneration: directory.directGeneration,
+      directContentRevision: directory.directContentRevision,
       directoryRevision: state.directoryRevision + 1,
       projectionRequestRevision: state.projectionRequestRevision + 1,
     });
@@ -418,14 +438,39 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const requestRevision = state.projectionRequestRevision + 1;
     set({
       projectionRequestRevision: requestRevision,
+      // An aggregate native invalidation can represent an incoming message or
+      // ACK, but it can also revoke a quarantined projection. Clear plaintext
+      // synchronously before crossing the async native boundary so a blocked
+      // conversation cannot remain visible behind a stalled Promise.
       messagesByChannel: {},
       dms: state.dms.map(({ lastMessage: _lastMessage, lastAt: _lastAt, ...dm }) => dm),
-      projectionStateByConversation: {
-        [conversationId]: "loading",
-      },
+      projectionStateByConversation: { [conversationId]: "loading" },
     });
 
-    const projection = await VeilRuntime.getDirectMessages(conversationId);
+    let projection: DirectMessageProjection;
+    try {
+      projection = await VeilRuntime.getDirectMessages(conversationId);
+    } catch {
+      const current = get();
+      if (
+        current.projectionRequestRevision === requestRevision
+        && current.selectedDmId === conversationId
+        && sameBinding(current.runtimeBinding, binding)
+        && current.directGeneration === directGeneration
+        && current.directMembersByConversation[conversationId] === members
+      ) {
+        const nextMessages = { ...current.messagesByChannel };
+        delete nextMessages[conversationId];
+        set({
+          messagesByChannel: nextMessages,
+          projectionStateByConversation: {
+            ...current.projectionStateByConversation,
+            [conversationId]: "unavailable",
+          },
+        });
+      }
+      return;
+    }
     const current = get();
     if (
       current.projectionRequestRevision !== requestRevision

@@ -64,7 +64,24 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
       committedSnapshot
       && canRenderChat(committedSnapshot, gate.requiresExplicitReopen)
     ) {
-      useChatStore.getState().hydrateRuntimeDirectory(committedSnapshot);
+      const before = useChatStore.getState();
+      const selectedBefore = before.selectedDmId;
+      const contentRevisionBefore = before.directContentRevision;
+      before.hydrateRuntimeDirectory(committedSnapshot);
+      const after = useChatStore.getState();
+      if (
+        selectedBefore !== null
+        && after.selectedDmId === selectedBefore
+        && contentRevisionBefore !== null
+        && after.directContentRevision !== null
+        && after.directContentRevision > contentRevisionBefore
+      ) {
+        // Native emitted an aggregate visible-content invalidation for this
+        // exact Direct generation. It may represent a quarantine revocation,
+        // so the store clears the explicitly selected projection immediately
+        // before asking native for an authoritative replacement.
+        void after.loadSelectedDirectMessages();
+      }
       return;
     }
     useChatStore.getState().clearRenderableChat();

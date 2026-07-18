@@ -17,6 +17,7 @@ const readySnapshot = (overrides: Record<string, unknown> = {}) => ({
   identityExists: true,
   runtimeRevision: 1,
   directGeneration: 1,
+  directContentRevision: 0,
   sessionState: "open",
   connectionState: "connected",
   directoryReady: true,
@@ -50,6 +51,7 @@ const restrictiveSnapshot = {
   identityExists: true,
   runtimeRevision: 0,
   directGeneration: null,
+  directContentRevision: null,
   sessionState: "error",
   connectionState: "error",
   directoryReady: false,
@@ -112,6 +114,9 @@ describe("native runtime snapshot projection", () => {
       readySnapshot({ connectionState: "disconnected" }),
       readySnapshot({ secureSyncState: "syncing_history" }),
       readySnapshot({ binding: null }),
+      readySnapshot({ directContentRevision: null }),
+      readySnapshot({ directContentRevision: -1 }),
+      readySnapshot({ directGeneration: null }),
       readySnapshot({
         directConversations: [{ ...conversation, peerUserId: binding.userId }],
       }),
@@ -151,6 +156,7 @@ describe("native runtime snapshot projection", () => {
       secureSyncState: "idle",
       binding: null,
       directGeneration: null,
+      directContentRevision: null,
       directConversations: [],
     });
     await expect(installRuntime(locked).getSnapshot()).resolves.toEqual(locked);

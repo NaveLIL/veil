@@ -7,7 +7,10 @@ import {
 } from "react-native";
 
 import App from "../../App";
-import type { VeilMobileRuntimeSnapshot } from "../native/runtime";
+import type {
+  DirectMessageProjection,
+  VeilMobileRuntimeSnapshot,
+} from "../native/runtime";
 import { useChatStore } from "../stores/chat";
 import { resetRuntimeGateStoreForTests } from "../stores/runtime";
 
@@ -22,6 +25,7 @@ jest.mock("../native/runtime", () => ({
     disconnect: jest.fn(),
     lock: jest.fn(),
     cancelPendingAccessPass: jest.fn(),
+    getDirectMessages: jest.fn(),
     subscribe: jest.fn(),
   },
 }));
@@ -81,6 +85,9 @@ type RuntimeMock = {
   disconnect: jest.Mock;
   lock: jest.Mock<() => Promise<VeilMobileRuntimeSnapshot>>;
   cancelPendingAccessPass: jest.Mock;
+  getDirectMessages: jest.Mock<
+    (conversationId: string) => Promise<DirectMessageProjection>
+  >;
   subscribe: jest.Mock<(
     listener: (snapshot: VeilMobileRuntimeSnapshot) => void,
   ) => { remove: () => void }>;
@@ -111,6 +118,7 @@ const runtimeSnapshot = (
   pendingAccessPass: null,
   runtimeRevision: 1,
   directGeneration: 1,
+  directContentRevision: 0,
   directConversations: [],
   ...overrides,
 });
@@ -223,6 +231,7 @@ describe("App native runtime privacy gate", () => {
     const ready = runtimeSnapshot({
       runtimeRevision: 5,
       directGeneration: 9,
+      directContentRevision: 0,
       directConversations: [directConversation],
     });
     mockRuntime.getSnapshot.mockResolvedValue(ready);
@@ -248,6 +257,7 @@ describe("App native runtime privacy gate", () => {
     act(() => runtimeListener?.(runtimeSnapshot({
       runtimeRevision: 4,
       directGeneration: 8,
+      directContentRevision: 0,
       directConversations: [directConversation],
     })));
     expect(useChatStore.getState().directGeneration).toBe(9);
@@ -257,6 +267,7 @@ describe("App native runtime privacy gate", () => {
     act(() => runtimeListener?.(runtimeSnapshot({
       runtimeRevision: 0,
       directGeneration: null,
+      directContentRevision: null,
       sessionState: "error",
       connectionState: "error",
       directoryReady: false,
@@ -266,6 +277,71 @@ describe("App native runtime privacy gate", () => {
     })));
     expect(useChatStore.getState().messagesByChannel).toEqual({});
     expect(useChatStore.getState().directGeneration).toBeNull();
+  });
+
+  it("refreshes only the explicitly selected Direct on a native content revision", async () => {
+    const ready = runtimeSnapshot({ directConversations: [directConversation] });
+    const replacement = deferred<DirectMessageProjection>();
+    mockRuntime.getSnapshot.mockResolvedValue(ready);
+    mockRuntime.lock.mockResolvedValue(ready);
+    mockRuntime.getDirectMessages
+      .mockResolvedValueOnce({
+        availability: "available",
+        messages: [{
+          messageId: "44444444-4444-4444-8444-444444444444",
+          text: "before live event",
+          timestampMs: 1_720_000_000_000,
+          direction: "incoming",
+          delivery: "sent",
+        }],
+      })
+      .mockReturnValueOnce(replacement.promise);
+    const replacementProjection: DirectMessageProjection = {
+      availability: "available",
+      messages: [{
+        messageId: "55555555-5555-4555-8555-555555555555",
+        text: "after live event",
+        timestampMs: 1_720_000_000_001,
+        direction: "incoming",
+        delivery: "sent",
+      }],
+    };
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("chat-runtime-ready")).toBeTruthy());
+    useChatStore.getState().selectDm(directConversation.conversationId);
+    await act(async () => {
+      await useChatStore.getState().loadSelectedDirectMessages();
+    });
+    expect(useChatStore.getState().messagesByChannel[directConversation.conversationId]?.[0]?.text)
+      .toBe("before live event");
+
+    act(() => runtimeListener?.(runtimeSnapshot({
+      runtimeRevision: 2,
+      directContentRevision: 1,
+      directConversations: [directConversation],
+    })));
+
+    // A content invalidation can be a quarantine event. Previously rendered
+    // plaintext must disappear synchronously, even if native never resolves
+    // the replacement projection.
+    expect(useChatStore.getState().messagesByChannel).toEqual({});
+    expect(useChatStore.getState().projectionStateByConversation[directConversation.conversationId])
+      .toBe("loading");
+
+    await act(async () => {
+      replacement.resolve(replacementProjection);
+      await replacement.promise;
+    });
+
+    await waitFor(() => {
+      expect(mockRuntime.getDirectMessages).toHaveBeenCalledTimes(2);
+      expect(useChatStore.getState().messagesByChannel[directConversation.conversationId]?.[0]?.text)
+        .toBe("after live event");
+    });
+    expect(useChatStore.getState().selectedDmId).toBe(directConversation.conversationId);
+    expect(useChatStore.getState().projectionStateByConversation[directConversation.conversationId])
+      .toBe("available");
   });
 
   it("routes an existing locked identity to the secure gate, never onboarding", async () => {

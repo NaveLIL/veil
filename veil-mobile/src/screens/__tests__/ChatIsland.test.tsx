@@ -42,6 +42,7 @@ const runtimeSnapshot: VeilMobileRuntimeSnapshot = {
   pendingAccessPass: null,
   runtimeRevision: 1,
   directGeneration: 1,
+  directContentRevision: 0,
   directConversations: [{
     conversationId,
     name: "Anya",
@@ -72,6 +73,7 @@ describe("ChatIsland native Direct projection", () => {
       ...runtimeSnapshot,
       runtimeRevision: 2,
       directGeneration: 2,
+      directContentRevision: 0,
     });
 
     const view = render(<ChatIsland />);

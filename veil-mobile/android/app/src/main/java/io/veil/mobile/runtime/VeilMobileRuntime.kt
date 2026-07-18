@@ -7,8 +7,9 @@ import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
-import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.TimeUnit
 import uniffi.veil_ffi.MobileAuthenticatedBinding
 import uniffi.veil_ffi.MobileConnectCancellation
 import uniffi.veil_ffi.MobileDirectConversationData
@@ -325,6 +326,8 @@ internal data class VeilMobileRuntimeSnapshot(
   val runtimeRevision: Long,
   /** Stable public identity of the current native Direct sync generation. */
   val directGeneration: Long?,
+  /** Aggregate UI invalidation counter scoped to [directGeneration]. */
+  val directContentRevision: Long?,
   val sessionState: NativeSessionState,
   val connectionState: NativeConnectionState,
   val directoryReady: Boolean,
@@ -436,8 +439,9 @@ internal class VeilMobileRuntime internal constructor(
   private val sessionFactory: NativeMobileSessionFactory,
   private val cancellationFactory: NativeConnectCancellationFactory,
   private val directTransport: NativeDirectHttpExecutor,
-  private val executor: ExecutorService,
+  private val executor: ScheduledExecutorService,
   private val databasePathProvider: () -> String,
+  private val directLivePollIntervalMillis: Long = DIRECT_LIVE_IDLE_POLL_MILLIS,
 ) {
   constructor(context: Context) : this(
     vault = NativeIdentityVault(context.applicationContext),
@@ -448,6 +452,12 @@ internal class VeilMobileRuntime internal constructor(
     executor = newRuntimeExecutor(),
     databasePathProvider = { resolveDatabasePath(context.applicationContext) },
   )
+
+  init {
+    require(directLivePollIntervalMillis in 10L..60_000L) {
+      "Direct live poll interval is outside the supported bound"
+    }
+  }
 
   private val listeners = CopyOnWriteArraySet<(VeilMobileRuntimeSnapshot) -> Unit>()
   private val stateLock = Any()
@@ -509,6 +519,10 @@ internal class VeilMobileRuntime internal constructor(
     val conversations = LinkedHashMap<String, NativeDirectConversationInstall>()
     var pendingRequest: PendingDirectRequest? = null
     var ownPreKeyRequestsPrepared = 0
+    /** Guarded by [stateLock]; at most one delayed live turn exists per generation. */
+    var liveReplayScheduled = false
+    /** Guarded by [stateLock]; meaningful only within this exact generation. */
+    var contentRevision = 0L
 
     override fun toString(): String =
       "ActiveDirectSync(epoch=$epoch, generation=$generation, " +
@@ -1536,6 +1550,99 @@ internal class VeilMobileRuntime internal constructor(
         }
       }
       if (accepted) publishSnapshot()
+      if (accepted) scheduleContinuousDirectLiveReplay(sync)
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+    }
+  }
+
+  /**
+   * Keep the authenticated Direct FIFO draining after the history handoff.
+   *
+   * Rust remains the sole event/ACK reconciler and consumes at most 64 entries
+   * per turn. Kotlin only schedules another exact-generation turn. Lifecycle
+   * revocation makes an already scheduled task a no-op, while a full batch is
+   * continued immediately so the shared bounded queue cannot be starved.
+   */
+  private fun scheduleContinuousDirectLiveReplay(
+    sync: ActiveDirectSync,
+    delayMillis: Long = directLivePollIntervalMillis,
+  ) {
+    val shouldSchedule = synchronized(stateLock) {
+      if (
+        !isCurrentDirectSyncLocked(sync) ||
+        !directoryReady ||
+        ownPreKeyState != NativeOwnPreKeyState.PUBLISHED ||
+        directDirectoryState != NativeDirectDirectoryState.SYNCHRONIZED ||
+        directHistoryState != NativeDirectHistoryState.SYNCHRONIZED ||
+        sync.liveReplayScheduled
+      ) {
+        false
+      } else {
+        sync.liveReplayScheduled = true
+        true
+      }
+    }
+    if (!shouldSchedule) return
+
+    try {
+      executor.schedule(
+        { runContinuousDirectLiveReplay(sync) },
+        delayMillis.coerceAtLeast(0L),
+        TimeUnit.MILLISECONDS,
+      )
+    } catch (_: RuntimeException) {
+      synchronized(stateLock) {
+        if (activeDirectSync === sync) sync.liveReplayScheduled = false
+      }
+      failDirectSync(sync)
+    }
+  }
+
+  private fun runContinuousDirectLiveReplay(sync: ActiveDirectSync) {
+    val current = synchronized(stateLock) {
+      if (activeDirectSync === sync) sync.liveReplayScheduled = false
+      isCurrentDirectSyncLocked(sync) &&
+        directoryReady &&
+        ownPreKeyState == NativeOwnPreKeyState.PUBLISHED &&
+        directDirectoryState == NativeDirectDirectoryState.SYNCHRONIZED &&
+        directHistoryState == NativeDirectHistoryState.SYNCHRONIZED
+    }
+    if (!current) return
+
+    try {
+      val progress = sync.session.replayDirectLiveEvents(sync.leaseToken)
+      check(progress.consumed in 0..MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN) {
+        "continuous native Direct replay count exceeded its shared bound"
+      }
+      check(progress.ready) {
+        "continuous native Direct replay revoked the Ready checkpoint"
+      }
+      if (progress.needsImmediatePump) {
+        check(progress.consumed == MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN) {
+          "continuous native Direct replay requested an invalid immediate turn"
+        }
+      }
+
+      val stillCurrent = synchronized(stateLock) {
+        if (!isCurrentDirectSyncLocked(sync) || !directoryReady) {
+          false
+        } else {
+          if (progress.projectionChanged) {
+            check(sync.contentRevision < MAX_PUBLIC_SNAPSHOT_REVISION) {
+              "public Direct content revision exhausted"
+            }
+            sync.contentRevision += 1
+          }
+          true
+        }
+      }
+      if (!stillCurrent) return
+      if (progress.projectionChanged) publishSnapshot()
+      scheduleContinuousDirectLiveReplay(
+        sync,
+        if (progress.needsImmediatePump) 0L else directLivePollIntervalMillis,
+      )
     } catch (_: Throwable) {
       failDirectSync(sync)
     }
@@ -1829,6 +1936,7 @@ internal class VeilMobileRuntime internal constructor(
       identityExists = identityExists,
       runtimeRevision = publicSnapshotRevision,
       directGeneration = activeDirectSync?.generation,
+      directContentRevision = activeDirectSync?.contentRevision,
       sessionState = sessionState,
       connectionState = connectionState,
       directoryReady = directoryReady,
@@ -1891,8 +1999,10 @@ internal class VeilMobileRuntime internal constructor(
     private const val MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN = 64L
     private const val MAX_PUBLIC_SNAPSHOT_REVISION = 9_007_199_254_740_991L
 
-    private fun newRuntimeExecutor(): ExecutorService =
-      Executors.newSingleThreadExecutor { operation ->
+    private const val DIRECT_LIVE_IDLE_POLL_MILLIS = 250L
+
+    private fun newRuntimeExecutor(): ScheduledExecutorService =
+      Executors.newSingleThreadScheduledExecutor { operation ->
         Thread(operation, "veil-mobile-runtime").apply { isDaemon = true }
       }
 

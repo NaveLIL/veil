@@ -191,6 +191,9 @@ export function canRenderChat(
       && snapshot.directGeneration !== null
       && Number.isSafeInteger(snapshot.directGeneration)
       && snapshot.directGeneration >= 1
+      && snapshot.directContentRevision !== null
+      && Number.isSafeInteger(snapshot.directContentRevision)
+      && snapshot.directContentRevision >= 0
       && !requiresExplicitReopen
       && snapshot.sessionState === "open"
       && snapshot.connectionState === "connected"
@@ -247,6 +250,12 @@ export function conservativelyMergeRuntimeSnapshots(
   const directGeneration = binding !== null && directGenerationMatches
     ? confirmed.directGeneration
     : null;
+  const directContentRevisionMatches = confirmed.directContentRevision !== null
+    && observed.directContentRevision !== null
+    && confirmed.directContentRevision === observed.directContentRevision;
+  const directContentRevision = directGeneration !== null && directContentRevisionMatches
+    ? confirmed.directContentRevision
+    : null;
   const directoryMatches = exactDirectDirectoryMatch(
     confirmed.directConversations,
     observed.directConversations,
@@ -256,6 +265,7 @@ export function conservativelyMergeRuntimeSnapshots(
     && connectionState === "connected"
     && binding !== null
     && directGeneration !== null
+    && directContentRevision !== null
     && confirmed.directoryReady
     && observed.directoryReady
     && directoryMatches;
@@ -272,6 +282,7 @@ export function conservativelyMergeRuntimeSnapshots(
     identityExists: confirmed.identityExists || observed.identityExists,
     runtimeRevision: Math.min(confirmed.runtimeRevision, observed.runtimeRevision),
     directGeneration,
+    directContentRevision,
     sessionState,
     connectionState,
     directoryReady,

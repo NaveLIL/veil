@@ -42,6 +42,8 @@ export interface VeilMobileRuntimeSnapshot {
   runtimeRevision: number;
   /** Stable for one native Direct sync; changes on reconnect even to the same account. */
   directGeneration: number | null;
+  /** Aggregate visible-message invalidation counter, scoped to directGeneration. */
+  directContentRevision: number | null;
   sessionState: NativeSessionState;
   connectionState: NativeConnectionState;
   directoryReady: boolean;
@@ -320,6 +322,7 @@ const restrictiveRuntimeSnapshot = (): VeilMobileRuntimeSnapshot => ({
   identityExists: true,
   runtimeRevision: 0,
   directGeneration: null,
+  directContentRevision: null,
   sessionState: "error",
   connectionState: "error",
   directoryReady: false,
@@ -341,6 +344,10 @@ function runtimeSnapshot(value: unknown): VeilMobileRuntimeSnapshot {
       (typeof record.directGeneration !== "number" ||
         !Number.isSafeInteger(record.directGeneration) ||
         record.directGeneration < 1)) ||
+    (record.directContentRevision !== null &&
+      (typeof record.directContentRevision !== "number" ||
+        !Number.isSafeInteger(record.directContentRevision) ||
+        record.directContentRevision < 0)) ||
     !["locked", "opening", "open", "closing", "error"].includes(record.sessionState as string) ||
     !["disconnected", "connecting", "connected", "error"].includes(record.connectionState as string) ||
     typeof record.directoryReady !== "boolean" ||
@@ -371,9 +378,11 @@ function runtimeSnapshot(value: unknown): VeilMobileRuntimeSnapshot {
     binding !== null;
   const hasDirectoryAuthority = hasDirectGenerationAuthority &&
     record.secureSyncState === "history_synchronized" &&
-    record.directGeneration !== null;
+    record.directGeneration !== null &&
+    record.directContentRevision !== null;
   if (
     (record.directGeneration !== null && !hasDirectGenerationAuthority) ||
+    ((record.directGeneration === null) !== (record.directContentRevision === null)) ||
     (record.directoryReady === true && !hasDirectoryAuthority) ||
     (record.directoryReady === false && directConversations.length !== 0) ||
     (binding !== null && directConversations.some((row) => row.peerUserId === binding.userId))
@@ -383,6 +392,7 @@ function runtimeSnapshot(value: unknown): VeilMobileRuntimeSnapshot {
     identityExists: record.identityExists,
     runtimeRevision: record.runtimeRevision,
     directGeneration: record.directGeneration as number | null,
+    directContentRevision: record.directContentRevision as number | null,
     sessionState: record.sessionState as NativeSessionState,
     connectionState: record.connectionState as NativeConnectionState,
     directoryReady: record.directoryReady,

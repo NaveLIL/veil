@@ -156,6 +156,7 @@ internal fun VeilMobileRuntimeSnapshot.toPublicDirectDirectoryPublication():
   val hasPublishAuthority = identityExists &&
     runtimeRevision in 1L..MAX_PUBLIC_SNAPSHOT_REVISION &&
     directGeneration?.let { it in 1L..MAX_PUBLIC_SNAPSHOT_REVISION } == true &&
+    directContentRevision?.let { it in 0L..MAX_PUBLIC_SNAPSHOT_REVISION } == true &&
     sessionState == NativeSessionState.OPEN &&
     connectionState == NativeConnectionState.CONNECTED &&
     directoryReady &&
@@ -250,6 +251,8 @@ private fun VeilMobileRuntimeSnapshot.toWritableMap(): WritableMap = Arguments.c
   putDouble("runtimeRevision", runtimeRevision.toDouble())
   directGeneration?.let { putDouble("directGeneration", it.toDouble()) }
     ?: putNull("directGeneration")
+  directContentRevision?.let { putDouble("directContentRevision", it.toDouble()) }
+    ?: putNull("directContentRevision")
   putString("sessionState", sessionState.name.lowercase())
   putString("connectionState", connectionState.name.lowercase())
   putBoolean("directoryReady", publicDirectory.ready)

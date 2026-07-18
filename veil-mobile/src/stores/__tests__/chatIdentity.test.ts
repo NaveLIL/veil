@@ -59,6 +59,7 @@ const snapshot = (
   pendingAccessPass: null,
   runtimeRevision,
   directGeneration,
+  directContentRevision: 0,
   directConversations,
 });
 

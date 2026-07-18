@@ -19,6 +19,7 @@ const snapshot = (
   identityExists: true,
   runtimeRevision: 1,
   directGeneration: 1,
+  directContentRevision: 0,
   sessionState: "open",
   connectionState: "connected",
   directoryReady: true,
@@ -65,6 +66,7 @@ describe("runtime privacy epochs", () => {
     useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({
       runtimeRevision: 11,
       directGeneration: null,
+      directContentRevision: null,
       sessionState: "locked",
       connectionState: "disconnected",
       directoryReady: false,
@@ -81,6 +83,7 @@ describe("runtime privacy epochs", () => {
     useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({
       runtimeRevision: 0,
       directGeneration: null,
+      directContentRevision: null,
       sessionState: "error",
       connectionState: "error",
       directoryReady: false,
@@ -103,6 +106,7 @@ describe("runtime privacy epochs", () => {
     useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({
       runtimeRevision: 12,
       directGeneration: null,
+      directContentRevision: null,
       sessionState: "locked",
       connectionState: "disconnected",
       directoryReady: false,
