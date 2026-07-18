@@ -1,3 +1,4 @@
+use prost::Message as ProstMessage;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -11,9 +12,10 @@ use veil_crypto::sender_key::{SenderKeyDistribution, SenderKeyStore};
 use veil_crypto::x3dh;
 use veil_search::Indexer;
 use veil_store::db::{
-    DeviceBindingPinV1, DeviceRosterSnapshotV1, HistoricalDeviceBindingProofV1,
-    IncomingSenderKeyRouteV1, LocalPreKey, LocalPreKeyPublicationV1,
-    PendingSenderKeyDeviceEnvelopeV1, VeilDb,
+    DeviceBindingPinV1, DeviceRosterSnapshotV1, DirectMessageOutboxEnqueueV1,
+    DirectMessageOutboxScopeV1, HistoricalDeviceBindingProofV1, IncomingSenderKeyRouteV1,
+    LocalPreKey, LocalPreKeyPublicationV1, PendingDirectMessageOutboxV1,
+    PendingSenderKeyDeviceEnvelopeV1, VeilDb, DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1,
 };
 use veil_store::models::{
     AccountSnapshot, ConversationType, Message, MessageAuthorContext, RemoteMessageStateKind,
@@ -49,6 +51,7 @@ const INNER_SKDM: u8 = 0x01; // Sender Key Distribution Message (JSON)
 const RATCHET_AD_DOMAIN: &[u8] = b"veil-ratchet-message-v1";
 const MAX_PLAINTEXT_BYTES: usize = 32 * 1024;
 const DEVICE_ROSTER_COMMITMENT_DOMAIN: &[u8] = b"veil-conversation-device-roster-v1\0";
+const SEND_MESSAGE_REQUEST_DIGEST_DOMAIN_V1: &[u8] = b"veil.message.send.v1\0";
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
 struct PendingInitialHeader {
@@ -63,6 +66,17 @@ struct PendingOutgoingMessage {
     conversation_id: String,
     sender_identity_key: [u8; 32],
     plaintext: String,
+    /// True only when SQLCipher owns the exact retry bytes and the ratchet
+    /// step in `direct_message_outbox_v1`. ACK/Error reconciliation must use
+    /// that durable receipt instead of the legacy message-only helpers.
+    durable_direct_outbox: bool,
+}
+
+struct PreparedDirectCiphertextV1 {
+    peer_identity_key: [u8; 32],
+    candidate: RatchetSession,
+    ciphertext: Vec<u8>,
+    header: Vec<u8>,
 }
 
 impl Drop for PendingOutgoingMessage {
@@ -225,6 +239,27 @@ pub enum DirectSendErrorV1 {
     StorageUncertain(String),
 }
 
+/// Durable enqueue result for one native Direct user intent. A false
+/// `transport_enqueued` still means the SQLCipher outbox owns the intent and a
+/// later Ready lease must replay it; callers must not create a second intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectMessageEnqueueReportV1 {
+    pub sequence: u64,
+    pub transport_enqueued: bool,
+}
+
+/// One bounded pass over the durable Direct outbox. Queue cursors are opaque
+/// monotonic integers and expose no conversation, account, or message IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DirectOutboxReplayReportV1 {
+    pub visited: usize,
+    pub enqueued: usize,
+    pub pending_total: usize,
+    pub next_queue_order: Option<u64>,
+    pub reached_end: bool,
+    pub transport_blocked: bool,
+}
+
 impl DirectSendErrorV1 {
     fn rejected(error: impl Into<String>) -> Self {
         Self::Rejected(error.into())
@@ -233,6 +268,17 @@ impl DirectSendErrorV1 {
     fn storage(error: impl Into<String>) -> Self {
         Self::StorageUncertain(error.into())
     }
+}
+
+fn send_message_request_digest_v1(exact_send_message_payload: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(SEND_MESSAGE_REQUEST_DIGEST_DOMAIN_V1);
+    digest.update(exact_send_message_payload);
+    digest.finalize().into()
+}
+
+fn is_retryable_correlated_send_error_v1(code: u32, reason: Option<&str>) -> bool {
+    code == 429 || code >= 500 || (code == 401 && reason == Some("not_authenticated"))
 }
 
 /// Internal classification for initiator-side X3DH persistence. Cryptographic
@@ -2173,12 +2219,17 @@ impl VeilClient {
                     message_id,
                     server_timestamp,
                     ref_seq,
+                    client_message_id,
                     local_message_id,
                     mutation,
                     sender_key,
                 }) => {
-                    *local_message_id =
-                        self.finalize_outgoing_message(*ref_seq, message_id, *server_timestamp)?;
+                    *local_message_id = self.finalize_outgoing_message(
+                        *ref_seq,
+                        client_message_id.as_deref(),
+                        message_id,
+                        *server_timestamp,
+                    )?;
                     self.confirm_initial_message(*ref_seq)?;
                     self.confirm_sender_key_distribution(*ref_seq, sender_key.as_ref())?;
                     // Move a confirmed edit (and its plaintext) into the
@@ -2192,11 +2243,18 @@ impl VeilClient {
                 Some(ConnectionEvent::Error {
                     code,
                     ref_seq: Some(ref_seq),
+                    client_message_id,
+                    reason,
                     local_message_id,
                     conversation_id,
                     stale_roster_context,
                     ..
                 }) => {
+                    let retryable_direct_error = self
+                        .pending_outgoing_messages
+                        .get(ref_seq)
+                        .is_some_and(|pending| pending.durable_direct_outbox)
+                        && is_retryable_correlated_send_error_v1(*code, reason.as_deref());
                     let pending_conversation = self
                         .pending_sender_key_sequences
                         .get(ref_seq)
@@ -2206,7 +2264,11 @@ impl VeilClient {
                                 .get(ref_seq)
                                 .map(|pending| pending.conversation_id.clone())
                         });
-                    if *code == 409 {
+                    let roster_invalidated = matches!(
+                        reason.as_deref(),
+                        Some("secure_roster_changed" | "device_not_eligible")
+                    );
+                    if *code == 409 && roster_invalidated {
                         if let Some(pending_conversation) = pending_conversation.as_ref() {
                             if self.channel_conversations.contains(pending_conversation) {
                                 self.invalidate_device_roster_v1(pending_conversation);
@@ -2215,14 +2277,34 @@ impl VeilClient {
                             }
                         }
                     }
-                    *local_message_id = self.reject_pending_sequence(*ref_seq)?;
+                    *local_message_id = self.reconcile_outgoing_error_v1(
+                        *ref_seq,
+                        *code,
+                        client_message_id.as_deref(),
+                        reason.as_deref(),
+                    )?;
+                    if retryable_direct_error {
+                        self.mark_all_pending_sequences_unknown().map_err(|error| {
+                            format!("persist retryable Direct transport loss: {error}")
+                        })?;
+                        if let Some(connection) = self.connection.take() {
+                            connection.disconnect();
+                        }
+                        if let Some(mut user_id) = self.authenticated_user_id.take() {
+                            user_id.zeroize();
+                        }
+                        if let Some(mut origin) = self.authenticated_server_origin.take() {
+                            origin.zeroize();
+                        }
+                        self.deferred_connection_events.close_epoch();
+                    }
                 }
                 Some(ConnectionEvent::Disconnected { .. }) => {
                     // There can be no trustworthy delivery conclusion once the
-                    // socket epoch ends: a frame may have reached the gateway and
-                    // only its ACK may have been lost. Preserve every local row as
-                    // DeliveryUnknown instead of deleting it or inviting a blind
-                    // retry that could duplicate the message.
+                    // socket epoch ends: a frame may have reached the gateway
+                    // and only its ACK may have been lost. Legacy rows become
+                    // DeliveryUnknown; exact Direct outbox rows remain Sending
+                    // and may replay only their original protobuf payload.
                     self.connection = None;
                     self.authenticated_user_id = None;
                     self.authenticated_server_origin = None;
@@ -2506,6 +2588,120 @@ impl VeilClient {
                 Err(detail)
             }
         }
+    }
+
+    fn current_direct_outbox_scope_v1(
+        &self,
+    ) -> Result<DirectMessageOutboxScopeV1, DirectSendErrorV1> {
+        self.require_crypto_runtime_active_v1()
+            .map_err(DirectSendErrorV1::rejected)?;
+        if self.connection.is_none() {
+            return Err(DirectSendErrorV1::rejected(
+                "authenticated transport is unavailable",
+            ));
+        }
+        if self.db.is_none() {
+            return Err(DirectSendErrorV1::rejected(
+                "SQLCipher database is unavailable",
+            ));
+        }
+        let canonical_server_origin = self
+            .authenticated_server_origin
+            .clone()
+            .ok_or_else(|| DirectSendErrorV1::rejected("server origin is not authenticated"))?;
+        crate::direct::validate_canonical_origin(&canonical_server_origin)
+            .map_err(DirectSendErrorV1::rejected)?;
+        let user_id = self
+            .authenticated_user_id
+            .clone()
+            .ok_or_else(|| DirectSendErrorV1::rejected("account is not authenticated"))?;
+        if !Self::is_canonical_live_uuid_v1(&user_id) {
+            return Err(DirectSendErrorV1::rejected(
+                "authenticated account id is not canonical",
+            ));
+        }
+        let device = self
+            .device_identity
+            .as_ref()
+            .ok_or_else(|| DirectSendErrorV1::rejected("device identity is unavailable"))?;
+        if self.device_id == [0u8; 16]
+            || device.binding().device_id != self.device_id
+            || device.binding().status != DEVICE_BINDING_STATUS_ACTIVE
+        {
+            return Err(DirectSendErrorV1::rejected(
+                "active device binding does not match this installation",
+            ));
+        }
+        Ok(DirectMessageOutboxScopeV1 {
+            canonical_server_origin,
+            user_id,
+            device_id: self.device_id,
+        })
+    }
+
+    fn validate_pending_direct_outbox_payload_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        pending: &PendingDirectMessageOutboxV1,
+    ) -> Result<proto::SendMessage, DirectSendErrorV1> {
+        if pending.scope.canonical_server_origin != scope.canonical_server_origin
+            || pending.scope.user_id != scope.user_id
+            || pending.scope.device_id != scope.device_id
+            || pending.client_message_id != pending.local_message_id
+            || !Self::is_canonical_live_uuid_v1(&pending.client_message_id)
+            || !Self::is_canonical_live_uuid_v1(&pending.conversation_id)
+        {
+            return Err(DirectSendErrorV1::storage(
+                "durable Direct outbox scope or UUID binding is invalid",
+            ));
+        }
+        self.require_direct_conversation_available_v1(&pending.conversation_id)
+            .map_err(DirectSendErrorV1::rejected)?;
+        if self
+            .channel_conversations
+            .contains(&pending.conversation_id)
+            || self.dm_conversations.get(&pending.conversation_id)
+                != Some(&pending.peer_identity_key)
+            || self.trusted_signing_keys.get(&pending.peer_identity_key)
+                != Some(&pending.peer_signing_key)
+        {
+            return Err(DirectSendErrorV1::storage(
+                "durable Direct outbox route differs from the authenticated runtime",
+            ));
+        }
+        if send_message_request_digest_v1(&pending.exact_send_message_payload)
+            != pending.request_digest
+        {
+            return Err(DirectSendErrorV1::storage(
+                "durable Direct outbox request digest is invalid",
+            ));
+        }
+        let decoded = proto::SendMessage::decode(pending.exact_send_message_payload.as_slice())
+            .map_err(|_| {
+                DirectSendErrorV1::storage("durable Direct outbox payload is not SendMessage")
+            })?;
+        if decoded.encode_to_vec() != pending.exact_send_message_payload
+            || decoded.conversation_id != pending.conversation_id
+            || decoded.client_message_id != pending.client_message_id
+            || decoded.ciphertext.is_empty()
+            || decoded.header.is_empty()
+            || !matches!(
+                decoded.header.first(),
+                Some(&HEADER_INITIAL) | Some(&HEADER_RATCHET)
+            )
+            || decoded.msg_type != proto::MessageType::Text as i32
+            || decoded.reply_to_id.is_some()
+            || decoded.ttl_seconds.is_some()
+            || !decoded.attachments.is_empty()
+            || decoded.sealed
+            || decoded.roster_version != 0
+            || !decoded.roster_commitment.is_empty()
+        {
+            return Err(DirectSendErrorV1::storage(
+                "durable Direct outbox payload violates the Direct text contract",
+            ));
+        }
+        Ok(decoded)
     }
 
     /// Check sticky global state before every individual FIFO receive. This is
@@ -2933,7 +3129,7 @@ impl VeilClient {
             })
             .collect();
         if let Some(db) = self.db.as_ref() {
-            db.mark_outgoing_messages_unknown(&local_message_ids)?;
+            db.reconcile_outgoing_transport_loss_v1(&local_message_ids)?;
         }
         for sequence in stale_sequences {
             self.pending_initial_sequences.remove(&sequence);
@@ -2949,6 +3145,22 @@ impl VeilClient {
             self.pending_outgoing_messages.remove(&sequence);
         }
         Ok(())
+    }
+
+    fn pending_outgoing_sequence_for_client_id_v1(
+        &self,
+        client_message_id: &str,
+    ) -> Result<Option<u64>, String> {
+        let mut matched = None;
+        for (sequence, pending) in &self.pending_outgoing_messages {
+            if pending.local_message_id == client_message_id && matched.replace(*sequence).is_some()
+            {
+                return Err(
+                    "client message id has multiple live transport correlations".to_string()
+                );
+            }
+        }
+        Ok(matched)
     }
 
     fn reconcile_previous_transport_before_install_v1(&mut self) -> Result<(), String> {
@@ -2967,17 +3179,103 @@ impl VeilClient {
     fn finalize_outgoing_message(
         &mut self,
         sequence: u64,
+        client_message_id: Option<&str>,
         server_message_id: &str,
         server_timestamp: u64,
     ) -> Result<Option<String>, String> {
-        let Some(pending) = self.pending_outgoing_messages.get(&sequence).cloned() else {
+        let pending = self.pending_outgoing_messages.get(&sequence).cloned();
+        if pending.is_none() && client_message_id.is_none() {
+            // Generic, mutation and Sender-Key acknowledgements are
+            // reconciled by their dedicated sequence maps below. Their wire
+            // contract deliberately has no chat-message id/timestamp tuple.
             return Ok(None);
-        };
+        }
+        if let Some(client_message_id) = client_message_id {
+            if self
+                .pending_outgoing_sequence_for_client_id_v1(client_message_id)?
+                .is_some_and(|authoritative_sequence| authoritative_sequence != sequence)
+            {
+                return Err(
+                    "message ACK sequence does not match its live client message correlation"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(pending) = pending.as_ref() {
+            if client_message_id != Some(pending.local_message_id.as_str()) {
+                return Err("message ACK client id does not match the pending send".to_string());
+            }
+        }
         if server_message_id.is_empty() {
             return Err("message ACK is missing the server message id".to_string());
         }
         let timestamp_ms = i64::try_from(server_timestamp / 1_000_000)
             .map_err(|_| "server message timestamp exceeds i64".to_string())?;
+
+        // A durable Direct ACK is authoritative by client_message_id, not by
+        // the ephemeral socket sequence. This also makes an identical ACK
+        // after process death harmless: SQLCipher retains the compact receipt.
+        if let Some(client_message_id) = client_message_id {
+            let use_direct_outbox = pending
+                .as_ref()
+                .is_none_or(|pending| pending.durable_direct_outbox);
+            if use_direct_outbox {
+                let scope = self
+                    .current_direct_outbox_scope_v1()
+                    .map_err(|error| match error {
+                        DirectSendErrorV1::Rejected(detail)
+                        | DirectSendErrorV1::StorageUncertain(detail) => detail,
+                    })?;
+                let db = self.db.as_ref().ok_or("database not initialized")?;
+                let acknowledged = if pending.is_some() {
+                    db.acknowledge_direct_message_outbox_v1(
+                        &scope,
+                        client_message_id,
+                        server_message_id,
+                        timestamp_ms,
+                    )?
+                } else {
+                    db.validate_repeated_direct_message_outbox_ack_v1(
+                        &scope,
+                        client_message_id,
+                        server_message_id,
+                        timestamp_ms,
+                    )?
+                };
+                if acknowledged.client_message_id != client_message_id
+                    || acknowledged.server_message_id != server_message_id
+                    || acknowledged.server_timestamp_ms != timestamp_ms
+                    || pending.as_ref().is_some_and(|pending| {
+                        pending.local_message_id != acknowledged.local_message_id
+                    })
+                {
+                    return Err(
+                        "Direct outbox ACK receipt conflicts with the transport event".to_string(),
+                    );
+                }
+                self.pending_outgoing_messages.remove(&sequence);
+                if let Some(indexer) = self.indexer.as_ref() {
+                    let _ = indexer.delete(&acknowledged.local_message_id);
+                    if let Some(pending) = pending
+                        .as_ref()
+                        .filter(|pending| !pending.plaintext.is_empty())
+                    {
+                        let _ = indexer.index_message(
+                            server_message_id,
+                            &pending.conversation_id,
+                            &hex::encode(pending.sender_identity_key),
+                            &pending.plaintext,
+                            timestamp_ms,
+                        );
+                    }
+                }
+                return Ok(Some(acknowledged.local_message_id.clone()));
+            }
+        }
+
+        let Some(pending) = pending else {
+            return Ok(None);
+        };
         if let Some(db) = self.db.as_ref() {
             db.acknowledge_outgoing_message(
                 &pending.local_message_id,
@@ -3199,6 +3497,90 @@ impl VeilClient {
         let local_message_id = pending.local_message_id.clone();
         self.pending_outgoing_messages.remove(&sequence);
         Ok(Some(local_message_id))
+    }
+
+    fn reconcile_outgoing_error_v1(
+        &mut self,
+        sequence: u64,
+        code: u32,
+        client_message_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let pending = self.pending_outgoing_messages.get(&sequence).cloned();
+        if let Some(client_message_id) = client_message_id {
+            if self
+                .pending_outgoing_sequence_for_client_id_v1(client_message_id)?
+                .is_some_and(|authoritative_sequence| authoritative_sequence != sequence)
+            {
+                return Err(
+                    "send error sequence does not match its live client message correlation"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(pending) = pending.as_ref() {
+            if client_message_id != Some(pending.local_message_id.as_str()) || reason.is_none() {
+                return Err("send error does not match its exact client message id".to_string());
+            }
+        }
+        if reason == Some("client_message_id_conflict") {
+            return Err("server rejected a reused client message id".to_string());
+        }
+
+        if let Some(client_message_id) = client_message_id {
+            let use_direct_outbox = pending
+                .as_ref()
+                .is_none_or(|pending| pending.durable_direct_outbox);
+            if use_direct_outbox {
+                if is_retryable_correlated_send_error_v1(code, reason) {
+                    // Keep both the SQLCipher exact payload and its current
+                    // sequence correlation until the event dispatcher closes
+                    // this socket epoch below. The reconnect barrier clears
+                    // the sequence while preserving the Sending row for exact
+                    // replay on the next Ready lease.
+                    return pending
+                        .map(|pending| Some(pending.local_message_id.clone()))
+                        .ok_or_else(|| {
+                            "retryable send error references no current Direct outbox sequence"
+                                .to_string()
+                        });
+                }
+                let rejection_reason = reason
+                    .ok_or("correlated Direct send error omitted its stable rejection reason")?;
+                let scope = self
+                    .current_direct_outbox_scope_v1()
+                    .map_err(|error| match error {
+                        DirectSendErrorV1::Rejected(detail)
+                        | DirectSendErrorV1::StorageUncertain(detail) => detail,
+                    })?;
+                let db = self.db.as_ref().ok_or("database not initialized")?;
+                let rejected = if pending.is_some() {
+                    db.reject_direct_message_outbox_v1(&scope, client_message_id, rejection_reason)?
+                } else {
+                    db.validate_repeated_direct_message_outbox_rejection_v1(
+                        &scope,
+                        client_message_id,
+                        rejection_reason,
+                    )?
+                };
+                if rejected.client_message_id != client_message_id
+                    || rejected.rejection_reason != rejection_reason
+                    || pending.as_ref().is_some_and(|pending| {
+                        pending.local_message_id != rejected.local_message_id
+                    })
+                {
+                    return Err(
+                        "Direct outbox rejection receipt conflicts with the transport event"
+                            .to_string(),
+                    );
+                }
+                self.pending_outgoing_messages.remove(&sequence);
+                self.pending_initial_sequences.remove(&sequence);
+                return Ok(Some(rejected.local_message_id.clone()));
+            }
+        }
+
+        self.reject_pending_sequence(sequence)
     }
 
     #[cfg(test)]
@@ -3426,6 +3808,7 @@ impl VeilClient {
             // does not carry an exact authenticated roster proof.
             roster_version: roster_proof.map_or(0, |proof| proof.0),
             roster_commitment: roster_proof.map_or_else(Vec::new, |proof| proof.1.to_vec()),
+            client_message_id: local_message_id.clone(),
         };
 
         let env = proto::Envelope {
@@ -3460,10 +3843,333 @@ impl VeilClient {
                 conversation_id: conversation_id.to_string(),
                 sender_identity_key: our_key,
                 plaintext: plaintext.to_string(),
+                durable_direct_outbox: false,
             },
         );
 
         Ok(seq)
+    }
+
+    /// Atomically accept one Direct text intent into SQLCipher before any
+    /// network write. A successful result always means the native outbox owns
+    /// the intent, even when the bounded transport queue could not accept it.
+    pub async fn enqueue_direct_text_v1(
+        &mut self,
+        conversation_id: &str,
+        plaintext: &str,
+    ) -> Result<DirectMessageEnqueueReportV1, DirectSendErrorV1> {
+        let result = self
+            .enqueue_direct_text_inner_v1(conversation_id, plaintext)
+            .await;
+        if matches!(result, Err(DirectSendErrorV1::StorageUncertain(_))) {
+            self.revoke_after_storage_uncertain_v1();
+        }
+        result
+    }
+
+    async fn enqueue_direct_text_inner_v1(
+        &mut self,
+        conversation_id: &str,
+        plaintext: &str,
+    ) -> Result<DirectMessageEnqueueReportV1, DirectSendErrorV1> {
+        let scope = self.current_direct_outbox_scope_v1()?;
+        let pending_count = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectSendErrorV1::rejected("SQLCipher database is unavailable"))?
+            .count_pending_direct_message_outbox_v1(&scope)
+            .map_err(DirectSendErrorV1::storage)?;
+        if pending_count >= DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1 {
+            return Err(DirectSendErrorV1::rejected(
+                "Direct outbox is full; reconnect and wait for pending sends",
+            ));
+        }
+        self.require_direct_conversation_available_v1(conversation_id)
+            .map_err(DirectSendErrorV1::rejected)?;
+        if !Self::is_canonical_live_uuid_v1(conversation_id) {
+            return Err(DirectSendErrorV1::rejected(
+                "Direct conversation id is not canonical",
+            ));
+        }
+        if plaintext.is_empty() {
+            return Err(DirectSendErrorV1::rejected(
+                "message plaintext must not be empty",
+            ));
+        }
+        if plaintext.len() > MAX_PLAINTEXT_BYTES {
+            return Err(DirectSendErrorV1::rejected(format!(
+                "message plaintext exceeds {MAX_PLAINTEXT_BYTES} bytes"
+            )));
+        }
+        if self.channel_conversations.contains(conversation_id) {
+            return Err(DirectSendErrorV1::rejected(
+                "atomic Direct text send cannot select a channel route",
+            ));
+        }
+        let peer_identity_key = self
+            .dm_conversations
+            .get(conversation_id)
+            .copied()
+            .ok_or_else(|| {
+                DirectSendErrorV1::rejected("Direct conversation has no authenticated peer route")
+            })?;
+        if !self.trusted_signing_keys.contains_key(&peer_identity_key) {
+            return Err(DirectSendErrorV1::rejected(
+                "Direct peer signing key is not pinned",
+            ));
+        }
+        let our_identity_key = self.identity_key().map_err(DirectSendErrorV1::rejected)?;
+        let local_timestamp_ms: i64 = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| DirectSendErrorV1::rejected("system clock is before Unix epoch"))?
+            .as_millis()
+            .try_into()
+            .map_err(|_| DirectSendErrorV1::rejected("local message timestamp exceeds i64"))?;
+
+        let current_ratchet = self
+            .ratchet_sessions
+            .get(&peer_identity_key)
+            .ok_or_else(|| DirectSendErrorV1::rejected("no ratchet session with this peer"))?;
+        let persisted_ratchet = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectSendErrorV1::rejected("SQLCipher database is unavailable"))?
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .map_err(DirectSendErrorV1::storage)?
+            .ok_or_else(|| {
+                DirectSendErrorV1::storage("Direct ratchet session is absent from SQLCipher")
+            })?;
+        if !current_ratchet
+            .matches_serialized_v1(&persisted_ratchet.session_data)
+            .map_err(DirectSendErrorV1::storage)?
+        {
+            return Err(DirectSendErrorV1::storage(
+                "in-memory Direct ratchet differs from its SQLCipher revision",
+            ));
+        }
+
+        let inner_plaintext = Zeroizing::new(Self::wrap_text_inner(plaintext));
+        let prepared = self.prepare_direct_ciphertext_v1(
+            &peer_identity_key,
+            conversation_id,
+            inner_plaintext.as_slice(),
+        )?;
+        if prepared.peer_identity_key != peer_identity_key {
+            return Err(DirectSendErrorV1::storage(
+                "prepared Direct ciphertext changed its peer binding",
+            ));
+        }
+        let advanced_ratchet_session =
+            Zeroizing::new(serde_json::to_vec(&prepared.candidate).map_err(|error| {
+                DirectSendErrorV1::storage(format!(
+                    "serialize advanced Direct ratchet session: {error}"
+                ))
+            })?);
+        let client_message_id = uuid::Uuid::new_v4().hyphenated().to_string();
+        let send_message = proto::SendMessage {
+            conversation_id: conversation_id.to_string(),
+            ciphertext: prepared.ciphertext.clone(),
+            header: prepared.header.clone(),
+            msg_type: proto::MessageType::Text.into(),
+            reply_to_id: None,
+            ttl_seconds: None,
+            attachments: Vec::new(),
+            sealed: false,
+            roster_version: 0,
+            roster_commitment: Vec::new(),
+            client_message_id: client_message_id.clone(),
+        };
+        let exact_send_message_payload = send_message.encode_to_vec();
+        let request_digest = send_message_request_digest_v1(&exact_send_message_payload);
+        let author_snapshot = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectSendErrorV1::rejected("SQLCipher database is unavailable"))?
+            .resolve_account_by_conversation_sender(conversation_id, &our_identity_key)
+            .map_err(DirectSendErrorV1::storage)?
+            .ok_or_else(|| {
+                DirectSendErrorV1::storage("authenticated self is absent from the Direct directory")
+            })?;
+        let enqueue = DirectMessageOutboxEnqueueV1 {
+            scope: scope.clone(),
+            conversation_id: conversation_id.to_string(),
+            client_message_id: client_message_id.clone(),
+            local_message_id: client_message_id.clone(),
+            request_digest,
+            exact_send_message_payload: exact_send_message_payload.clone(),
+            expected_ratchet_revision: persisted_ratchet.revision,
+            advanced_ratchet_session: advanced_ratchet_session.to_vec(),
+            plaintext: plaintext.to_string(),
+            reply_to_id: None,
+            attachments: Vec::new(),
+            author_snapshot: Some(author_snapshot),
+        };
+        let committed = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectSendErrorV1::rejected("SQLCipher database is unavailable"))?
+            .enqueue_direct_message_outbox_v1(&enqueue)
+            .map_err(DirectSendErrorV1::storage)?;
+        if committed.client_message_id != client_message_id
+            || committed.local_message_id != client_message_id
+            || committed.queue_order == 0
+            || committed.ratchet_revision
+                != persisted_ratchet.revision.checked_add(1).ok_or_else(|| {
+                    DirectSendErrorV1::storage("Direct ratchet revision is exhausted")
+                })?
+        {
+            return Err(DirectSendErrorV1::storage(
+                "SQLCipher returned an inconsistent Direct outbox commit receipt",
+            ));
+        }
+
+        // Publish the already-committed candidate only after SQLCipher owns
+        // the corresponding exact payload. From here on transport failure is
+        // retryable and must never roll the ratchet or local row back.
+        self.ratchet_sessions
+            .insert(peer_identity_key, prepared.candidate);
+        if let Some(indexer) = self.indexer.as_ref() {
+            let _ = indexer.index_message(
+                &client_message_id,
+                conversation_id,
+                &hex::encode(our_identity_key),
+                plaintext,
+                local_timestamp_ms,
+            );
+        }
+
+        let connection = self
+            .connection
+            .as_ref()
+            .expect("Direct outbox scope requires a live connection handle");
+        let sequence = connection.next_seq().await;
+        let transport_enqueued = connection
+            .send_preencoded_send_message_with_seq_v1(sequence, &exact_send_message_payload)
+            .await
+            .is_ok();
+        if transport_enqueued {
+            self.pending_outgoing_messages.insert(
+                sequence,
+                PendingOutgoingMessage {
+                    local_message_id: client_message_id,
+                    conversation_id: conversation_id.to_string(),
+                    sender_identity_key: our_identity_key,
+                    plaintext: plaintext.to_string(),
+                    durable_direct_outbox: true,
+                },
+            );
+        }
+        Ok(DirectMessageEnqueueReportV1 {
+            sequence,
+            transport_enqueued,
+        })
+    }
+
+    /// Replay a bounded FIFO page of exact Direct payloads after a new Ready
+    /// lease. The cursor is valid only for that native lease and advances only
+    /// past rows already represented on the current transport.
+    pub async fn replay_direct_outbox_v1(
+        &mut self,
+        after_queue_order: Option<u64>,
+        limit: usize,
+    ) -> Result<DirectOutboxReplayReportV1, DirectSendErrorV1> {
+        let result = self
+            .replay_direct_outbox_inner_v1(after_queue_order, limit)
+            .await;
+        if matches!(result, Err(DirectSendErrorV1::StorageUncertain(_))) {
+            self.revoke_after_storage_uncertain_v1();
+        }
+        result
+    }
+
+    async fn replay_direct_outbox_inner_v1(
+        &mut self,
+        after_queue_order: Option<u64>,
+        limit: usize,
+    ) -> Result<DirectOutboxReplayReportV1, DirectSendErrorV1> {
+        if limit == 0 || limit > 256 {
+            return Err(DirectSendErrorV1::rejected(
+                "Direct outbox replay limit is invalid",
+            ));
+        }
+        let scope = self.current_direct_outbox_scope_v1()?;
+        let pending_rows = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectSendErrorV1::rejected("SQLCipher database is unavailable"))?
+            .load_pending_direct_message_outbox_after_v1(&scope, after_queue_order, limit)
+            .map_err(DirectSendErrorV1::storage)?;
+        let page_len = pending_rows.len();
+        let our_identity_key = self.identity_key().map_err(DirectSendErrorV1::rejected)?;
+        let mut report = DirectOutboxReplayReportV1 {
+            next_queue_order: after_queue_order,
+            ..DirectOutboxReplayReportV1::default()
+        };
+
+        for pending in pending_rows {
+            report.visited = report
+                .visited
+                .checked_add(1)
+                .ok_or_else(|| DirectSendErrorV1::storage("Direct replay counter overflow"))?;
+            let _decoded = self.validate_pending_direct_outbox_payload_v1(&scope, &pending)?;
+            if let Some(existing) = self
+                .pending_outgoing_messages
+                .values()
+                .find(|candidate| candidate.local_message_id == pending.client_message_id)
+            {
+                if !existing.durable_direct_outbox
+                    || existing.conversation_id != pending.conversation_id
+                    || existing.sender_identity_key != our_identity_key
+                {
+                    return Err(DirectSendErrorV1::storage(
+                        "current transport has a conflicting Direct outbox correlation",
+                    ));
+                }
+                report.next_queue_order = Some(pending.queue_order);
+                continue;
+            }
+
+            let connection = self.connection.as_ref().ok_or_else(|| {
+                DirectSendErrorV1::rejected("authenticated transport is unavailable")
+            })?;
+            let sequence = connection.next_seq().await;
+            if connection
+                .send_preencoded_send_message_with_seq_v1(
+                    sequence,
+                    &pending.exact_send_message_payload,
+                )
+                .await
+                .is_err()
+            {
+                report.transport_blocked = true;
+                break;
+            }
+            self.pending_outgoing_messages.insert(
+                sequence,
+                PendingOutgoingMessage {
+                    local_message_id: pending.client_message_id.clone(),
+                    conversation_id: pending.conversation_id.clone(),
+                    sender_identity_key: our_identity_key,
+                    // Native-only copy used to repair the local search index
+                    // if the ACK renames the provisional UUID.
+                    plaintext: pending.plaintext.clone(),
+                    durable_direct_outbox: true,
+                },
+            );
+            report.enqueued = report
+                .enqueued
+                .checked_add(1)
+                .ok_or_else(|| DirectSendErrorV1::storage("Direct replay counter overflow"))?;
+            report.next_queue_order = Some(pending.queue_order);
+        }
+        report.pending_total = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectSendErrorV1::rejected("SQLCipher database is unavailable"))?
+            .count_pending_direct_message_outbox_v1(&scope)
+            .map_err(DirectSendErrorV1::storage)?;
+        report.reached_end = !report.transport_blocked && page_len < limit;
+        Ok(report)
     }
 
     /// Check if we're connected to the server.
@@ -4003,6 +4709,31 @@ impl VeilClient {
         conversation_id: &str,
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), DirectSendErrorV1> {
+        let prepared =
+            self.prepare_direct_ciphertext_v1(peer_identity_key, conversation_id, plaintext)?;
+
+        // Legacy callers which are not yet using the exact-byte outbox still
+        // persist before transport. The idempotent Direct send path commits
+        // this same candidate together with its local row and payload instead.
+        if let Some(ref db) = self.db {
+            let data = Zeroizing::new(serde_json::to_vec(&prepared.candidate).map_err(|e| {
+                DirectSendErrorV1::rejected(format!("serialize ratchet session: {e}"))
+            })?);
+            db.save_ratchet_session(peer_identity_key, &data)
+                .map_err(DirectSendErrorV1::storage)?;
+        }
+        self.ratchet_sessions
+            .insert(*peer_identity_key, prepared.candidate);
+
+        Ok((prepared.ciphertext, prepared.header))
+    }
+
+    fn prepare_direct_ciphertext_v1(
+        &self,
+        peer_identity_key: &[u8; 32],
+        conversation_id: &str,
+        plaintext: &[u8],
+    ) -> Result<PreparedDirectCiphertextV1, DirectSendErrorV1> {
         self.require_direct_conversation_available_v1(conversation_id)
             .map_err(DirectSendErrorV1::rejected)?;
         let our_identity_key = self.identity_key().map_err(DirectSendErrorV1::rejected)?;
@@ -4041,19 +4772,12 @@ impl VeilClient {
         let mut header = wire_prefix;
         header.extend_from_slice(&rh_bytes);
 
-        // Persist before the packet can reach the transport. Reusing a message
-        // key after an ACK-loss/crash would be worse than skipping an unsent
-        // chain step, which Double Ratchet is designed to tolerate.
-        if let Some(ref db) = self.db {
-            let data = Zeroizing::new(serde_json::to_vec(&candidate).map_err(|e| {
-                DirectSendErrorV1::rejected(format!("serialize ratchet session: {e}"))
-            })?);
-            db.save_ratchet_session(peer_identity_key, &data)
-                .map_err(DirectSendErrorV1::storage)?;
-        }
-        self.ratchet_sessions.insert(*peer_identity_key, candidate);
-
-        Ok((ciphertext, header))
+        Ok(PreparedDirectCiphertextV1 {
+            peer_identity_key: *peer_identity_key,
+            candidate,
+            ciphertext,
+            header,
+        })
     }
 
     /// Decrypt an incoming message from a peer.
@@ -9489,6 +10213,8 @@ mod tests {
                 code: 500,
                 message: oversized_reason,
                 ref_seq: None,
+                client_message_id: None,
+                reason: None,
                 local_message_id: None,
                 conversation_id: None,
                 stale_roster_context: false,
@@ -9585,6 +10311,871 @@ mod tests {
     }
 
     const DIRECT_LIVE_TEST_ORIGIN: &str = "https://live-replay.example.test:443";
+
+    struct DirectOutboxClientFixture {
+        client: VeilClient,
+        outbound: tokio::sync::mpsc::Receiver<Vec<u8>>,
+        conversation_id: String,
+        peer_identity_key: [u8; 32],
+        peer_signing_key: [u8; 32],
+        self_user_id: String,
+        peer_user_id: String,
+    }
+
+    impl DirectOutboxClientFixture {
+        fn new() -> Self {
+            Self::new_with_identity_and_db(
+                IdentityKeyPair::generate(),
+                VeilDb::open_memory(&[0xD8; 32]).unwrap(),
+            )
+        }
+
+        fn new_with_identity_and_db(self_identity: IdentityKeyPair, db: VeilDb) -> Self {
+            let self_identity_key = self_identity.x25519_public_bytes();
+            let self_signing_key = self_identity.ed25519_public_bytes();
+            let self_user_id =
+                uuid::Uuid::from_u128(0x7100_0000_0000_0000_0000_0000_0000_0001).to_string();
+            let peer_user_id =
+                uuid::Uuid::from_u128(0x7200_0000_0000_0000_0000_0000_0000_0002).to_string();
+            let conversation_id =
+                uuid::Uuid::from_u128(0x7300_0000_0000_0000_0000_0000_0000_0003).to_string();
+            let device_id = [0xD7; 16];
+            let stored_device =
+                DeviceIdentityV1::generate_stored(&self_identity, device_id).unwrap();
+            db.create_device_identity_v1(&stored_device).unwrap();
+            let device_identity = DeviceIdentityV1::from_stored(
+                &self_identity,
+                db.load_device_identity_v1().unwrap().unwrap(),
+            )
+            .unwrap();
+            db.bind_authenticated_self(
+                DIRECT_LIVE_TEST_ORIGIN,
+                &self_user_id,
+                &self_identity_key,
+                &self_signing_key,
+            )
+            .unwrap();
+
+            let peer_identity = IdentityKeyPair::generate();
+            let peer_identity_key = peer_identity.x25519_public_bytes();
+            let peer_signing_key = peer_identity.ed25519_public_bytes();
+            let snapshots = [
+                AccountSnapshot {
+                    locator: veil_store::models::ProfileLocator {
+                        canonical_server_origin: DIRECT_LIVE_TEST_ORIGIN.to_string(),
+                        user_id: self_user_id.clone(),
+                        identity_key: self_identity_key,
+                    },
+                    signing_key: self_signing_key,
+                    username: Some("Outbox Self".to_string()),
+                    display_name: None,
+                    profile_version: Some(1),
+                    profile_origin: DIRECT_LIVE_TEST_ORIGIN.to_string(),
+                    source: veil_store::models::AccountSnapshotSource::AuthenticatedConversationDirectory,
+                    observed_at: "2026-07-19T00:00:00Z".to_string(),
+                },
+                AccountSnapshot {
+                    locator: veil_store::models::ProfileLocator {
+                        canonical_server_origin: DIRECT_LIVE_TEST_ORIGIN.to_string(),
+                        user_id: peer_user_id.clone(),
+                        identity_key: peer_identity_key,
+                    },
+                    signing_key: peer_signing_key,
+                    username: Some("Outbox Peer".to_string()),
+                    display_name: None,
+                    profile_version: Some(1),
+                    profile_origin: DIRECT_LIVE_TEST_ORIGIN.to_string(),
+                    source: veil_store::models::AccountSnapshotSource::AuthenticatedConversationDirectory,
+                    observed_at: "2026-07-19T00:00:00Z".to_string(),
+                },
+            ];
+            db.upsert_identity_directory(&snapshots).unwrap();
+            db.upsert_directory_conversation(
+                &conversation_id,
+                ConversationType::DM as u8,
+                DIRECT_LIVE_TEST_ORIGIN,
+                Some("Outbox Peer"),
+                Some(&peer_user_id),
+                Some(&peer_identity_key),
+                None,
+                "2026-07-19T00:00:00Z",
+            )
+            .unwrap();
+
+            let mut client = VeilClient::from_identity(self_identity);
+            client.device_id = device_id;
+            client.device_identity = Some(device_identity);
+            client.db = Some(db);
+            client.authenticated_user_id = Some(self_user_id.clone());
+            client.authenticated_server_origin = Some(DIRECT_LIVE_TEST_ORIGIN.to_string());
+            client
+                .remember_user_identity(&self_user_id, self_identity_key)
+                .unwrap();
+            client
+                .remember_user_identity(&peer_user_id, peer_identity_key)
+                .unwrap();
+            client
+                .pin_peer_signing_key(peer_identity_key, peer_signing_key)
+                .unwrap();
+            client
+                .replace_authorized_conversation_senders(
+                    &conversation_id,
+                    [self_identity_key, peer_identity_key],
+                )
+                .unwrap();
+            client
+                .bind_dm_conversation(&conversation_id, peer_identity_key)
+                .unwrap();
+
+            let mut peer = VeilClient::from_identity(peer_identity);
+            let peer_prekeys = peer.generate_prekeys().unwrap();
+            let (one_time_prekey, one_time_prekey_id) = peer_prekeys.otk_publics[0];
+            client
+                .establish_session(
+                    &peer_identity_key,
+                    &x3dh::PreKeyBundle {
+                        identity_key: peer_identity_key,
+                        signing_key: peer_signing_key,
+                        signed_prekey: peer_prekeys.spk_public,
+                        signed_prekey_signature: peer_prekeys.spk_signature,
+                        signed_prekey_id: peer_prekeys.spk_id,
+                        one_time_prekey: Some(one_time_prekey),
+                        one_time_prekey_id: Some(one_time_prekey_id),
+                    },
+                )
+                .unwrap();
+            let outbound = client.test_only_install_queued_connection();
+            Self {
+                client,
+                outbound,
+                conversation_id,
+                peer_identity_key,
+                peer_signing_key,
+                self_user_id,
+                peer_user_id,
+            }
+        }
+
+        fn decode_send(wire: &[u8]) -> (u64, proto::SendMessage) {
+            let envelope = <proto::Envelope as prost::Message>::decode(wire).unwrap();
+            let Some(proto::envelope::Payload::SendMessage(send)) = envelope.payload else {
+                panic!("expected SendMessage envelope")
+            };
+            (envelope.seq, send)
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_direct_outbox_replays_exact_payload_and_ack_is_restart_idempotent() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let enqueue = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "atomic exact retry")
+            .await
+            .unwrap();
+        assert!(enqueue.transport_enqueued);
+        let first_wire = fixture.outbound.recv().await.unwrap();
+        let (first_sequence, first_send) = DirectOutboxClientFixture::decode_send(&first_wire);
+        assert_eq!(first_sequence, enqueue.sequence);
+        assert!(VeilClient::is_canonical_live_uuid_v1(
+            &first_send.client_message_id
+        ));
+        let exact_payload = first_send.encode_to_vec();
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            1
+        );
+        assert!(fixture
+            .client
+            .ratchet_sessions
+            .get(&fixture.peer_identity_key)
+            .unwrap()
+            .matches_serialized_v1(
+                &fixture
+                    .client
+                    .db()
+                    .unwrap()
+                    .load_ratchet_session_with_revision_v1(&fixture.peer_identity_key)
+                    .unwrap()
+                    .unwrap()
+                    .session_data
+            )
+            .unwrap());
+
+        fixture.client.mark_all_pending_sequences_unknown().unwrap();
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .get_messages(&fixture.conversation_id, 10)
+                .unwrap()[0]
+                .status,
+            veil_store::models::MessageStatus::Sending
+        );
+        fixture.outbound = fixture.client.test_only_install_queued_connection();
+        let replay = fixture
+            .client
+            .replay_direct_outbox_v1(None, 10)
+            .await
+            .unwrap();
+        assert_eq!(replay.visited, 1);
+        assert_eq!(replay.enqueued, 1);
+        assert_eq!(replay.pending_total, 1);
+        assert!(replay.next_queue_order.is_some());
+        assert!(replay.reached_end);
+        assert!(!replay.transport_blocked);
+        let replay_wire = fixture.outbound.recv().await.unwrap();
+        let (replay_sequence, replay_send) = DirectOutboxClientFixture::decode_send(&replay_wire);
+        assert!(replay_sequence > 0);
+        assert_eq!(replay_send.encode_to_vec(), exact_payload);
+
+        let server_message_id =
+            uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_0004).to_string();
+        let server_timestamp = 1_700_000_000_123_000_000u64;
+        assert!(fixture
+            .client
+            .finalize_outgoing_message(
+                replay_sequence + 1,
+                Some(&first_send.client_message_id),
+                &server_message_id,
+                server_timestamp,
+            )
+            .unwrap_err()
+            .contains("sequence does not match"));
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .client
+                .finalize_outgoing_message(
+                    replay_sequence,
+                    Some(&first_send.client_message_id),
+                    &server_message_id,
+                    server_timestamp,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(first_send.client_message_id.as_str())
+        );
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            0
+        );
+        let sent = fixture
+            .client
+            .db()
+            .unwrap()
+            .get_messages(&fixture.conversation_id, 10)
+            .unwrap();
+        assert_eq!(sent[0].id, server_message_id);
+        assert_eq!(sent[0].status, veil_store::models::MessageStatus::Sent);
+        assert_eq!(
+            fixture
+                .client
+                .finalize_outgoing_message(
+                    replay_sequence + 100,
+                    Some(&first_send.client_message_id),
+                    &server_message_id,
+                    server_timestamp,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(first_send.client_message_id.as_str())
+        );
+        fixture
+            .client
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "DELETE FROM messages WHERE id = ?1",
+                rusqlite::params![server_message_id],
+            )
+            .unwrap();
+        fixture
+            .client
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "DELETE FROM conversations WHERE id = ?1",
+                rusqlite::params![fixture.conversation_id],
+            )
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .finalize_outgoing_message(
+                    replay_sequence + 101,
+                    Some(&first_send.client_message_id),
+                    &server_message_id,
+                    server_timestamp,
+                )
+                .unwrap()
+                .as_deref(),
+            Some(first_send.client_message_id.as_str())
+        );
+        let compact: (i64, bool) = fixture
+            .client
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT state, exact_send_message_payload IS NULL
+                 FROM direct_message_outbox_v1 WHERE client_message_id = ?1",
+                rusqlite::params![first_send.client_message_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(compact, (1, true));
+    }
+
+    #[tokio::test]
+    async fn direct_outbox_error_keeps_retryable_bytes_and_compacts_definite_rejection() {
+        let mut retryable = DirectOutboxClientFixture::new();
+        let queued = retryable
+            .client
+            .enqueue_direct_text_v1(&retryable.conversation_id, "retry after reconnect")
+            .await
+            .unwrap();
+        let wire = retryable.outbound.recv().await.unwrap();
+        let (_, send) = DirectOutboxClientFixture::decode_send(&wire);
+        for (code, reason) in [
+            (500, "internal_error"),
+            (429, "rate_limited"),
+            (401, "not_authenticated"),
+        ] {
+            assert_eq!(
+                retryable
+                    .client
+                    .reconcile_outgoing_error_v1(
+                        queued.sequence,
+                        code,
+                        Some(&send.client_message_id),
+                        Some(reason),
+                    )
+                    .unwrap()
+                    .as_deref(),
+                Some(send.client_message_id.as_str())
+            );
+        }
+        assert!(retryable
+            .client
+            .pending_outgoing_messages
+            .contains_key(&queued.sequence));
+        let retry_scope = retryable.client.current_direct_outbox_scope_v1().unwrap();
+        assert_eq!(
+            retryable
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&retry_scope)
+                .unwrap(),
+            1
+        );
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        let retryable_event = budget
+            .try_wrap(ConnectionEvent::Error {
+                code: 429,
+                message: "retry later".to_string(),
+                ref_seq: Some(queued.sequence),
+                client_message_id: Some(send.client_message_id.clone()),
+                reason: Some("rate_limited".to_string()),
+                local_message_id: None,
+                conversation_id: None,
+                stale_roster_context: false,
+            })
+            .unwrap();
+        retryable
+            .client
+            .deferred_connection_events
+            .try_extend(vec![retryable_event])
+            .unwrap();
+        assert!(matches!(
+            retryable.client.poll_event().await.unwrap(),
+            Some(ConnectionEvent::Error {
+                local_message_id: Some(ref local_message_id),
+                ..
+            }) if local_message_id == &send.client_message_id
+        ));
+        assert!(retryable.client.connection.is_none());
+        assert!(retryable.client.authenticated_user_id.is_none());
+        assert!(retryable.client.authenticated_server_origin.is_none());
+        assert!(retryable.client.pending_outgoing_messages.is_empty());
+        assert_eq!(
+            retryable
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&retry_scope)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            retryable
+                .client
+                .db()
+                .unwrap()
+                .get_messages(&retryable.conversation_id, 10)
+                .unwrap()[0]
+                .status,
+            veil_store::models::MessageStatus::Sending
+        );
+
+        let mut rejected = DirectOutboxClientFixture::new();
+        let queued = rejected
+            .client
+            .enqueue_direct_text_v1(&rejected.conversation_id, "definite rejection")
+            .await
+            .unwrap();
+        let wire = rejected.outbound.recv().await.unwrap();
+        let (_, send) = DirectOutboxClientFixture::decode_send(&wire);
+        let reject_scope = rejected.client.current_direct_outbox_scope_v1().unwrap();
+        assert!(rejected
+            .client
+            .reconcile_outgoing_error_v1(
+                queued.sequence + 1,
+                400,
+                Some(&send.client_message_id),
+                Some("invalid_message"),
+            )
+            .unwrap_err()
+            .contains("sequence does not match"));
+        assert_eq!(
+            rejected
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&reject_scope)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            rejected
+                .client
+                .reconcile_outgoing_error_v1(
+                    queued.sequence,
+                    400,
+                    Some(&send.client_message_id),
+                    Some("invalid_message"),
+                )
+                .unwrap()
+                .as_deref(),
+            Some(send.client_message_id.as_str())
+        );
+        assert_eq!(
+            rejected
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&reject_scope)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            rejected
+                .client
+                .db()
+                .unwrap()
+                .get_messages(&rejected.conversation_id, 10)
+                .unwrap()[0]
+                .status,
+            veil_store::models::MessageStatus::Failed
+        );
+        let compact: (i64, bool, String) = rejected
+            .client
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT state, exact_send_message_payload IS NULL, rejection_reason
+                 FROM direct_message_outbox_v1 WHERE client_message_id = ?1",
+                rusqlite::params![send.client_message_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(compact, (2, true, "invalid_message".to_string()));
+    }
+
+    #[tokio::test]
+    async fn direct_outbox_owns_commit_when_transport_is_closed_and_requires_live_correlation() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        fixture.outbound.close();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "committed before wire")
+            .await
+            .unwrap();
+        assert!(!queued.transport_enqueued);
+        assert!(queued.sequence > 0);
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        let pending = fixture
+            .client
+            .db()
+            .unwrap()
+            .load_pending_direct_message_outbox_v1(&scope, 10)
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        let send =
+            proto::SendMessage::decode(pending[0].exact_send_message_payload.as_slice()).unwrap();
+        let server_message_id =
+            uuid::Uuid::from_u128(0x7500_0000_0000_0000_0000_0000_0000_0005).to_string();
+        let server_timestamp = 1_700_000_000_456_000_000u64;
+        assert!(fixture
+            .client
+            .finalize_outgoing_message(
+                queued.sequence,
+                Some(&send.client_message_id),
+                &server_message_id,
+                server_timestamp,
+            )
+            .unwrap_err()
+            .contains("current transport sequence correlation"));
+        assert!(fixture
+            .client
+            .reconcile_outgoing_error_v1(
+                queued.sequence,
+                400,
+                Some(&send.client_message_id),
+                Some("invalid_message"),
+            )
+            .unwrap_err()
+            .contains("current transport sequence correlation"));
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .get_messages(&fixture.conversation_id, 10)
+                .unwrap()[0]
+                .status,
+            veil_store::models::MessageStatus::Sending
+        );
+        assert!(fixture
+            .client
+            .ratchet_sessions
+            .get(&fixture.peer_identity_key)
+            .unwrap()
+            .matches_serialized_v1(
+                &fixture
+                    .client
+                    .db()
+                    .unwrap()
+                    .load_ratchet_session_with_revision_v1(&fixture.peer_identity_key)
+                    .unwrap()
+                    .unwrap()
+                    .session_data
+            )
+            .unwrap());
+
+        fixture.outbound = fixture.client.test_only_install_queued_connection();
+        let replay = fixture
+            .client
+            .replay_direct_outbox_v1(None, 10)
+            .await
+            .unwrap();
+        assert_eq!(replay.enqueued, 1);
+        let replay_wire = fixture.outbound.recv().await.unwrap();
+        let (_, replay_send) = DirectOutboxClientFixture::decode_send(&replay_wire);
+        assert_eq!(
+            replay_send.encode_to_vec(),
+            pending[0].exact_send_message_payload
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_outbox_survives_real_sqlcipher_process_reopen_before_first_wire() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path = std::env::temp_dir().join(format!(
+            "veil-direct-outbox-reopen-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = Zeroizing::new(kdf::derive_db_key(&mnemonic).unwrap());
+        let identity = IdentityKeyPair::from_mnemonic(&mnemonic).unwrap();
+        let db = VeilDb::open(&path, &db_key).unwrap();
+        let mut fixture = DirectOutboxClientFixture::new_with_identity_and_db(identity, db);
+        fixture.outbound.close();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "survive real reopen")
+            .await
+            .unwrap();
+        assert!(!queued.transport_enqueued);
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        let pending = fixture
+            .client
+            .db()
+            .unwrap()
+            .load_pending_direct_message_outbox_v1(&scope, 1)
+            .unwrap();
+        let exact_payload = pending[0].exact_send_message_payload.clone();
+        let client_message_id = pending[0].client_message_id.clone();
+        let conversation_id = fixture.conversation_id.clone();
+        let peer_identity_key = fixture.peer_identity_key;
+        let peer_signing_key = fixture.peer_signing_key;
+        let self_user_id = fixture.self_user_id.clone();
+        let peer_user_id = fixture.peer_user_id.clone();
+        drop(pending);
+        drop(fixture);
+
+        let mut restored = VeilClient::new();
+        restored.init_with_mnemonic(&mnemonic, &path).unwrap();
+        restored
+            .test_only_restore_authenticated_user_from_durable_binding(
+                DIRECT_LIVE_TEST_ORIGIN,
+                &self_user_id,
+            )
+            .unwrap();
+        let self_identity_key = restored.identity_key().unwrap();
+        restored
+            .remember_user_identity(&self_user_id, self_identity_key)
+            .unwrap();
+        restored
+            .remember_user_identity(&peer_user_id, peer_identity_key)
+            .unwrap();
+        restored
+            .pin_peer_signing_key(peer_identity_key, peer_signing_key)
+            .unwrap();
+        restored
+            .replace_authorized_conversation_senders(
+                &conversation_id,
+                [self_identity_key, peer_identity_key],
+            )
+            .unwrap();
+        restored
+            .bind_dm_conversation(&conversation_id, peer_identity_key)
+            .unwrap();
+        let mut outbound = restored.test_only_install_queued_connection();
+        let replay = restored.replay_direct_outbox_v1(None, 10).await.unwrap();
+        assert_eq!(replay.enqueued, 1);
+        assert_eq!(replay.pending_total, 1);
+        let wire = outbound.recv().await.unwrap();
+        let (_, send) = DirectOutboxClientFixture::decode_send(&wire);
+        assert_eq!(send.client_message_id, client_message_id);
+        assert_eq!(send.encode_to_vec(), exact_payload);
+        assert_eq!(
+            restored
+                .db()
+                .unwrap()
+                .get_messages(&conversation_id, 10)
+                .unwrap()[0]
+                .status,
+            veil_store::models::MessageStatus::Sending
+        );
+
+        drop(outbound);
+        drop(restored);
+        for candidate in [
+            path.clone(),
+            std::path::PathBuf::from(format!("{}-wal", path.display())),
+            std::path::PathBuf::from(format!("{}-shm", path.display())),
+        ] {
+            let _ = std::fs::remove_file(candidate);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_outbox_cursor_is_fifo_deduplicated_and_stops_before_blocked_row() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let first = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "fifo first")
+            .await
+            .unwrap();
+        let first_wire = fixture.outbound.recv().await.unwrap();
+        let (_, first_send) = DirectOutboxClientFixture::decode_send(&first_wire);
+        let second = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "fifo second")
+            .await
+            .unwrap();
+        let second_wire = fixture.outbound.recv().await.unwrap();
+        let (_, second_send) = DirectOutboxClientFixture::decode_send(&second_wire);
+        assert_ne!(first.sequence, second.sequence);
+        assert_ne!(first_send.client_message_id, second_send.client_message_id);
+
+        let first_skip = fixture
+            .client
+            .replay_direct_outbox_v1(None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first_skip.visited, 1);
+        assert_eq!(first_skip.enqueued, 0);
+        assert!(!first_skip.reached_end);
+        assert!(!first_skip.transport_blocked);
+        assert!(fixture.outbound.try_recv().is_err());
+        let first_cursor = first_skip.next_queue_order.unwrap();
+        let second_skip = fixture
+            .client
+            .replay_direct_outbox_v1(Some(first_cursor), 1)
+            .await
+            .unwrap();
+        assert_eq!(second_skip.visited, 1);
+        assert_eq!(second_skip.enqueued, 0);
+        let second_cursor = second_skip.next_queue_order.unwrap();
+        assert!(second_cursor > first_cursor);
+        assert!(fixture.outbound.try_recv().is_err());
+
+        fixture.client.mark_all_pending_sequences_unknown().unwrap();
+        fixture.outbound = fixture.client.test_only_install_queued_connection();
+        let first_page = fixture
+            .client
+            .replay_direct_outbox_v1(None, 1)
+            .await
+            .unwrap();
+        assert_eq!(first_page.enqueued, 1);
+        assert_eq!(first_page.next_queue_order, Some(first_cursor));
+        assert!(!first_page.reached_end);
+        let wire = fixture.outbound.recv().await.unwrap();
+        let (_, replayed_first) = DirectOutboxClientFixture::decode_send(&wire);
+        assert_eq!(
+            replayed_first.client_message_id,
+            first_send.client_message_id
+        );
+        let second_page = fixture
+            .client
+            .replay_direct_outbox_v1(Some(first_cursor), 1)
+            .await
+            .unwrap();
+        assert_eq!(second_page.enqueued, 1);
+        assert_eq!(second_page.next_queue_order, Some(second_cursor));
+        assert!(!second_page.reached_end);
+        let wire = fixture.outbound.recv().await.unwrap();
+        let (_, replayed_second) = DirectOutboxClientFixture::decode_send(&wire);
+        assert_eq!(
+            replayed_second.client_message_id,
+            second_send.client_message_id
+        );
+        let end = fixture
+            .client
+            .replay_direct_outbox_v1(Some(second_cursor), 1)
+            .await
+            .unwrap();
+        assert_eq!(end.visited, 0);
+        assert_eq!(end.enqueued, 0);
+        assert_eq!(end.next_queue_order, Some(second_cursor));
+        assert!(end.reached_end);
+
+        fixture.client.mark_all_pending_sequences_unknown().unwrap();
+        fixture.outbound = fixture.client.test_only_install_queued_connection();
+        fixture.outbound.close();
+        let blocked = fixture
+            .client
+            .replay_direct_outbox_v1(None, 1)
+            .await
+            .unwrap();
+        assert_eq!(blocked.visited, 1);
+        assert_eq!(blocked.enqueued, 0);
+        assert_eq!(blocked.next_queue_order, None);
+        assert!(blocked.transport_blocked);
+        assert!(!blocked.reached_end);
+    }
+
+    #[tokio::test]
+    async fn direct_outbox_capacity_is_a_definite_rejection_not_a_runtime_revoke() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        let ratchet_before = Zeroizing::new(
+            serde_json::to_vec(
+                fixture
+                    .client
+                    .ratchet_sessions
+                    .get(&fixture.peer_identity_key)
+                    .unwrap(),
+            )
+            .unwrap(),
+        );
+        let peer_user_id =
+            uuid::Uuid::from_u128(0x7700_0000_0000_0000_0000_0000_0000_0007).to_string();
+        let tx = fixture
+            .client
+            .db()
+            .unwrap()
+            .conn()
+            .unchecked_transaction()
+            .unwrap();
+        for index in 0..DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1 {
+            let client_message_id =
+                uuid::Uuid::from_u128(0x7800_0000_0000_0000_0000_0000_0000_0000 + index as u128)
+                    .to_string();
+            tx.execute(
+                "INSERT INTO direct_message_outbox_v1
+                   (canonical_server_origin, user_id, device_id, conversation_id,
+                    peer_user_id, peer_identity_key, peer_signing_key,
+                    client_message_id, local_message_id, request_digest,
+                    exact_send_message_payload, ratchet_revision, state)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8, ?9, ?10, ?11, 0)",
+                rusqlite::params![
+                    &scope.canonical_server_origin,
+                    &scope.user_id,
+                    scope.device_id.as_slice(),
+                    &fixture.conversation_id,
+                    &peer_user_id,
+                    [0x51u8; 32].as_slice(),
+                    [0x52u8; 32].as_slice(),
+                    &client_message_id,
+                    [0x53u8; 32].as_slice(),
+                    [0x01u8].as_slice(),
+                    i64::try_from(index + 1).unwrap(),
+                ],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let error = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "must not advance ratchet")
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            DirectSendErrorV1::Rejected(ref detail) if detail.contains("outbox is full")
+        ));
+        assert!(!fixture.client.direct_live_storage_uncertain);
+        assert!(fixture.client.connection.is_some());
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        assert!(fixture
+            .client
+            .ratchet_sessions
+            .get(&fixture.peer_identity_key)
+            .unwrap()
+            .matches_serialized_v1(&ratchet_before)
+            .unwrap());
+    }
 
     struct DirectLivePeerFixture {
         sender: VeilClient,
@@ -10088,6 +11679,7 @@ mod tests {
                     conversation_id: conversation_id.clone(),
                     sender_identity_key: fixture.receiver_identity_key,
                     plaintext: plaintext.to_string(),
+                    durable_direct_outbox: false,
                 },
             );
         }
@@ -10096,6 +11688,7 @@ mod tests {
                 message_id: server_message_id.clone(),
                 server_timestamp: ack_timestamp_ns,
                 ref_seq: ack_sequence,
+                client_message_id: Some(ack_local_id.clone()),
                 local_message_id: None,
                 mutation: None,
                 sender_key: None,
@@ -10104,6 +11697,8 @@ mod tests {
                 code: 500,
                 message: "rejected".to_string(),
                 ref_seq: Some(failed_sequence),
+                client_message_id: Some(failed_local_id.clone()),
+                reason: Some("internal_error".to_string()),
                 local_message_id: None,
                 conversation_id: None,
                 stale_roster_context: false,
@@ -10194,6 +11789,7 @@ mod tests {
             message_id: uuid::Uuid::new_v4().to_string(),
             server_timestamp: 1_700_000_000_000_000_000,
             ref_seq: 0xB1,
+            client_message_id: None,
             local_message_id: None,
             mutation: None,
             sender_key: None,
@@ -10274,6 +11870,7 @@ mod tests {
             message_id: uuid::Uuid::new_v4().to_string(),
             server_timestamp: 1_700_000_000_000_000_000,
             ref_seq: sequence,
+            client_message_id: None,
             local_message_id: None,
             mutation: None,
             sender_key: None,
@@ -10638,6 +12235,7 @@ mod tests {
                 conversation_id,
                 sender_identity_key: fixture.receiver_identity_key,
                 plaintext: "ambiguous reconnect draft".to_string(),
+                durable_direct_outbox: false,
             },
         );
         fixture
@@ -10947,6 +12545,7 @@ mod tests {
                 conversation_id: conversation_id.clone(),
                 sender_identity_key: fixture.receiver_identity_key,
                 plaintext: "pending plaintext must be erased".to_string(),
+                durable_direct_outbox: false,
             },
         );
         fixture.receiver.pending_mutations.insert(
@@ -13610,6 +15209,7 @@ mod tests {
                 conversation_id: "dm-rejected".to_string(),
                 sender_identity_key: our_identity,
                 plaintext: "do not lose this".to_string(),
+                durable_direct_outbox: false,
             },
         );
 
@@ -13652,6 +15252,7 @@ mod tests {
                 conversation_id: "dm-unknown".to_string(),
                 sender_identity_key: our_identity,
                 plaintext: "may already be delivered".to_string(),
+                durable_direct_outbox: false,
             },
         );
 
@@ -13677,8 +15278,16 @@ mod tests {
         db.insert_conversation("dm-disconnected", 0, None, Some(&[0x39u8; 32]), None)
             .unwrap();
         for (sequence, local_id, plaintext) in [
-            (93, "local-disconnected-a", "possibly sent a"),
-            (94, "local-disconnected-b", "possibly sent b"),
+            (
+                93,
+                "10000000-0000-0000-0000-000000000093",
+                "possibly sent a",
+            ),
+            (
+                94,
+                "10000000-0000-0000-0000-000000000094",
+                "possibly sent b",
+            ),
         ] {
             db.insert_outgoing_pending_message(
                 local_id,
@@ -13695,6 +15304,7 @@ mod tests {
                     conversation_id: "dm-disconnected".to_string(),
                     sender_identity_key: our_identity,
                     plaintext: plaintext.to_string(),
+                    durable_direct_outbox: false,
                 },
             );
         }
@@ -13881,12 +15491,13 @@ mod tests {
                 conversation_id: "dm-ack".to_string(),
                 sender_identity_key: our_key,
                 plaintext: "hello".to_string(),
+                durable_direct_outbox: false,
             },
         );
 
         assert_eq!(
             client
-                .finalize_outgoing_message(77, "server-message", 2_000_000)
+                .finalize_outgoing_message(77, Some("local-message"), "server-message", 2_000_000)
                 .unwrap(),
             Some("local-message".to_string())
         );

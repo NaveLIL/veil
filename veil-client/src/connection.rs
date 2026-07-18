@@ -37,6 +37,8 @@ const MAX_TERMINAL_REASON_BYTES: usize = 4 * 1024;
 const MAX_EVENT_ID_BYTES: usize = 256;
 const MAX_EVENT_CIPHERTEXT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_HEADER_BYTES: usize = 512;
+const MAX_SEND_MESSAGE_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_ERROR_REASON_BYTES: usize = 64;
 
 fn client_version(client_id: &str) -> String {
     format!("{client_id}/{}", env!("CARGO_PKG_VERSION"))
@@ -296,6 +298,9 @@ pub enum ConnectionEvent {
         message_id: String,
         server_timestamp: u64,
         ref_seq: u64,
+        /// Stable native-generated idempotency key for new-message ACKs.
+        /// Mutation, generic command, and Sender-Key ACKs carry no such id.
+        client_message_id: Option<String>,
         /// Filled by VeilClient after reconciling its local pending row.
         local_message_id: Option<String>,
         /// Filled by VeilClient after committing an ACK-gated local mutation.
@@ -315,6 +320,8 @@ pub enum ConnectionEvent {
         code: u32,
         message: String,
         ref_seq: Option<u64>,
+        client_message_id: Option<String>,
+        reason: Option<String>,
         local_message_id: Option<String>,
         conversation_id: Option<String>,
         stale_roster_context: bool,
@@ -623,12 +630,14 @@ pub(crate) fn connection_event_retained_size_v1(
         }
         ConnectionEvent::MessageAcked {
             message_id,
+            client_message_id,
             local_message_id,
             mutation,
             sender_key,
             ..
         } => {
             size.add_string(message_id)?;
+            size.add_optional_string(client_message_id)?;
             size.add_optional_string(local_message_id)?;
             if let Some(mutation) = mutation {
                 match mutation {
@@ -675,11 +684,15 @@ pub(crate) fn connection_event_retained_size_v1(
         }
         ConnectionEvent::Error {
             message,
+            client_message_id,
+            reason,
             local_message_id,
             conversation_id,
             ..
         } => {
             size.add_string(message)?;
+            size.add_optional_string(client_message_id)?;
+            size.add_optional_string(reason)?;
             size.add_optional_string(local_message_id)?;
             size.add_optional_string(conversation_id)?;
         }
@@ -1339,6 +1352,56 @@ impl Connection {
             .map_err(|e| format!("send failed: {e}"))
     }
 
+    /// Wrap an already-persisted, canonical SendMessage payload in a fresh
+    /// connection-local Envelope without decoding and re-encoding the nested
+    /// bytes. The payload is the idempotent outbox record; only `seq` changes
+    /// between socket epochs.
+    pub async fn send_preencoded_send_message_v1(
+        &self,
+        exact_send_message_bytes: &[u8],
+    ) -> Result<u64, String> {
+        validate_preencoded_send_message_payload_v1(exact_send_message_bytes)?;
+        let seq = self.next_seq().await;
+        self.send_preencoded_send_message_with_seq_v1(seq, exact_send_message_bytes)
+            .await?;
+        Ok(seq)
+    }
+
+    /// Crate-internal form used only after an atomic outbox commit, where the
+    /// caller must retain the allocated sequence even if bounded enqueue fails.
+    pub(crate) async fn send_preencoded_send_message_with_seq_v1(
+        &self,
+        seq: u64,
+        exact_send_message_bytes: &[u8],
+    ) -> Result<(), String> {
+        if seq == 0 {
+            return Err("SendMessage envelope sequence must be positive".to_string());
+        }
+        validate_preencoded_send_message_payload_v1(exact_send_message_bytes)?;
+        let payload_len = u64::try_from(exact_send_message_bytes.len())
+            .map_err(|_| "SendMessage payload length overflow".to_string())?;
+        let capacity = 1usize
+            .checked_add(protobuf_varint_len(seq))
+            .and_then(|size| size.checked_add(2))
+            .and_then(|size| size.checked_add(protobuf_varint_len(payload_len)))
+            .and_then(|size| size.checked_add(exact_send_message_bytes.len()))
+            .ok_or_else(|| "SendMessage envelope size overflow".to_string())?;
+        let mut envelope = Vec::with_capacity(capacity);
+        // Envelope.seq = field 1, wire type varint.
+        envelope.push(0x08);
+        append_protobuf_varint(&mut envelope, seq);
+        // Envelope.send_message = field 20, wire type length-delimited.
+        envelope.extend_from_slice(&[0xa2, 0x01]);
+        append_protobuf_varint(&mut envelope, payload_len);
+        envelope.extend_from_slice(exact_send_message_bytes);
+        debug_assert_eq!(envelope.len(), capacity);
+
+        tokio::time::timeout(OUTBOUND_QUEUE_TIMEOUT, self.sender.send(envelope))
+            .await
+            .map_err(|_| "send timed out waiting for the bounded WebSocket queue".to_string())?
+            .map_err(|error| format!("send failed: {error}"))
+    }
+
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn test_only_queued_connection() -> (Self, mpsc::Receiver<Vec<u8>>) {
         let write_join = tokio::spawn(std::future::pending::<()>());
@@ -1368,6 +1431,42 @@ impl Connection {
         self.write_task.abort();
         self.read_task.abort();
     }
+}
+
+fn protobuf_varint_len(mut value: u64) -> usize {
+    let mut length = 1usize;
+    while value >= 0x80 {
+        value >>= 7;
+        length += 1;
+    }
+    length
+}
+
+fn append_protobuf_varint(output: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        output.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+    output.push(value as u8);
+}
+
+fn validate_preencoded_send_message_payload_v1(
+    exact_send_message_bytes: &[u8],
+) -> Result<(), String> {
+    if exact_send_message_bytes.is_empty()
+        || exact_send_message_bytes.len() > MAX_SEND_MESSAGE_PAYLOAD_BYTES
+    {
+        return Err("persisted SendMessage payload is empty or oversized".to_string());
+    }
+    let decoded = proto::SendMessage::decode(exact_send_message_bytes)
+        .map_err(|_| "persisted SendMessage payload is malformed".to_string())?;
+    if !is_canonical_lowercase_uuid(&decoded.client_message_id) {
+        return Err("persisted SendMessage has an invalid client message id".to_string());
+    }
+    if decoded.encode_to_vec() != exact_send_message_bytes {
+        return Err("persisted SendMessage payload is not canonical".to_string());
+    }
+    Ok(())
 }
 
 impl Drop for Connection {
@@ -1767,6 +1866,14 @@ fn is_canonical_lowercase_uuid(value: &str) -> bool {
     Uuid::parse_str(value).is_ok_and(|parsed| !parsed.is_nil() && parsed.to_string() == value)
 }
 
+fn is_valid_error_reason(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_ERROR_REASON_BYTES
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
 /// Decode a post-authentication envelope which is part of the event contract.
 ///
 /// Known payloads that this client intentionally does not consume remain an
@@ -1851,16 +1958,19 @@ fn connection_event_from_envelope(
             }
         }
         Some(proto::envelope::Payload::MessageAck(ack)) => {
-            // MessageAck is also the generic command ACK and the Sender-Key
-            // distribution/receipt ACK, so an empty message id and timestamp
-            // are valid for those forms. All forms still correlate to a
-            // positive client sequence; chat ACKs additionally require their
-            // complete message result tuple.
+            // MessageAck is also used for edit/delete/reaction mutations,
+            // generic commands, and Sender-Key control traffic. Only a new
+            // SendMessage ACK carries client_message_id. The connection layer
+            // validates any id that is present; VeilClient then requires it
+            // when the ref_seq belongs to an outgoing new-message intent.
             let chat_ack = !ack.message_id.is_empty();
+            let send_ack = !ack.client_message_id.is_empty();
             if ack.ref_seq == 0
                 || ack.message_id.len() > MAX_EVENT_ID_BYTES
                 || (ack.message_id.is_empty() != (ack.server_timestamp == 0))
                 || (chat_ack && !is_canonical_lowercase_uuid(&ack.message_id))
+                || (send_ack && !is_canonical_lowercase_uuid(&ack.client_message_id))
+                || (send_ack && !chat_ack)
             {
                 return Err(protocol_violation("MessageAck"));
             }
@@ -1886,19 +1996,37 @@ fn connection_event_from_envelope(
                 message_id: ack.message_id,
                 server_timestamp: ack.server_timestamp,
                 ref_seq: ack.ref_seq,
+                client_message_id: send_ack.then_some(ack.client_message_id),
                 local_message_id: None,
                 mutation: None,
                 sender_key,
             }
         }
-        Some(proto::envelope::Payload::Error(e)) => ConnectionEvent::Error {
-            code: e.code,
-            message: e.message,
-            ref_seq: e.ref_seq,
-            local_message_id: None,
-            conversation_id: None,
-            stale_roster_context: false,
-        },
+        Some(proto::envelope::Payload::Error(e)) => {
+            if e.message.len() > MAX_TERMINAL_REASON_BYTES
+                || e.ref_seq == Some(0)
+                || e.client_message_id
+                    .as_deref()
+                    .is_some_and(|value| !is_canonical_lowercase_uuid(value))
+                || e.reason
+                    .as_deref()
+                    .is_some_and(|value| !is_valid_error_reason(value))
+                || (e.client_message_id.is_some() && e.reason.is_none())
+                || (e.client_message_id.is_some() && e.ref_seq.is_none())
+            {
+                return Err(protocol_violation("Error"));
+            }
+            ConnectionEvent::Error {
+                code: e.code,
+                message: e.message,
+                ref_seq: e.ref_seq,
+                client_message_id: e.client_message_id,
+                reason: e.reason,
+                local_message_id: None,
+                conversation_id: None,
+                stale_roster_context: false,
+            }
+        }
         Some(proto::envelope::Payload::TypingEvent(te)) => ConnectionEvent::TypingEvent {
             conversation_id: te.conversation_id,
             identity_key: te.identity_key,
@@ -2091,6 +2219,7 @@ mod tests {
     use super::*;
 
     const TEST_MESSAGE_ID: &str = "a0000000-0000-4000-8000-000000000001";
+    const TEST_CLIENT_MESSAGE_ID: &str = "d0000000-0000-4000-8000-000000000001";
     const TEST_REPLY_ID: &str = "c0000000-0000-4000-8000-000000000002";
     const TEST_CONVERSATION_ID: &str = "b0000000-0000-4000-8000-000000000001";
 
@@ -2101,6 +2230,8 @@ mod tests {
             code: 500,
             message,
             ref_seq: None,
+            client_message_id: None,
+            reason: None,
             local_message_id: None,
             conversation_id: None,
             stale_roster_context: false,
@@ -2436,6 +2567,7 @@ mod tests {
                 message_id: TEST_MESSAGE_ID.to_string(),
                 server_timestamp: 1,
                 ref_seq: 1,
+                client_message_id: TEST_CLIENT_MESSAGE_ID.to_string(),
                 target_device_id: vec![0x22; 16],
                 ..Default::default()
             })),
@@ -2470,6 +2602,7 @@ mod tests {
             sender_key_generation: Some(1),
             roster_version: Some(4),
             envelope_commitment: Some(vec![0x33; 32]),
+            client_message_id: TEST_CLIENT_MESSAGE_ID.to_string(),
         };
         let generic_with_orphan_roster = proto::MessageAck {
             ref_seq: 2,
@@ -2659,6 +2792,7 @@ mod tests {
                     message_id: invalid_message_id,
                     server_timestamp: 1,
                     ref_seq: 1,
+                    client_message_id: TEST_CLIENT_MESSAGE_ID.to_string(),
                     ..Default::default()
                 })),
                 ..Default::default()
@@ -2705,6 +2839,7 @@ mod tests {
                 message_id: TEST_MESSAGE_ID.to_string(),
                 server_timestamp: 1,
                 ref_seq: 2,
+                client_message_id: TEST_CLIENT_MESSAGE_ID.to_string(),
                 ..Default::default()
             })),
             ..Default::default()
@@ -2820,6 +2955,182 @@ mod tests {
     }
 
     #[test]
+    fn chat_ack_and_error_idempotency_metadata_are_strict() {
+        for invalid_client_id in [
+            TEST_CLIENT_MESSAGE_ID.to_uppercase(),
+            Uuid::nil().to_string(),
+        ] {
+            let result = connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::MessageAck(proto::MessageAck {
+                    message_id: TEST_MESSAGE_ID.to_string(),
+                    server_timestamp: 1,
+                    ref_seq: 7,
+                    client_message_id: invalid_client_id,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            assert!(matches!(
+                result,
+                Err(ConnectionEventBufferErrorV1::ProtocolViolation {
+                    envelope: "MessageAck"
+                })
+            ));
+        }
+
+        assert!(connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::MessageAck(proto::MessageAck {
+                ref_seq: 8,
+                client_message_id: TEST_CLIENT_MESSAGE_ID.to_string(),
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .is_err());
+
+        let valid = connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::Error(proto::Error {
+                code: 409,
+                message: "request conflicts with an earlier send".to_string(),
+                ref_seq: Some(9),
+                client_message_id: Some(TEST_CLIENT_MESSAGE_ID.to_string()),
+                reason: Some("client_message_id_conflict".to_string()),
+            })),
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            valid,
+            Some(ConnectionEvent::Error {
+                code: 409,
+                ref_seq: Some(9),
+                client_message_id: Some(client_id),
+                reason: Some(reason),
+                ..
+            }) if client_id == TEST_CLIENT_MESSAGE_ID
+                && reason == "client_message_id_conflict"
+        ));
+
+        for (client_message_id, reason) in [
+            (
+                Some(TEST_CLIENT_MESSAGE_ID.to_uppercase()),
+                Some("client_message_id_conflict".to_string()),
+            ),
+            (Some(TEST_CLIENT_MESSAGE_ID.to_string()), None),
+            (
+                Some(TEST_CLIENT_MESSAGE_ID.to_string()),
+                Some("INVALID REASON".to_string()),
+            ),
+        ] {
+            assert!(connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::Error(proto::Error {
+                    code: 409,
+                    message: "rejected".to_string(),
+                    ref_seq: Some(10),
+                    client_message_id,
+                    reason,
+                })),
+                ..Default::default()
+            })
+            .is_err());
+        }
+        assert!(connection_event_from_envelope(proto::Envelope {
+            payload: Some(proto::envelope::Payload::Error(proto::Error {
+                code: 429,
+                message: "retry later".to_string(),
+                ref_seq: None,
+                client_message_id: Some(TEST_CLIENT_MESSAGE_ID.to_string()),
+                reason: Some("rate_limited".to_string()),
+            })),
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn preencoded_send_reuses_exact_nested_bytes_with_fresh_sequence() {
+        fn take_varint(input: &[u8], offset: &mut usize) -> u64 {
+            let mut value = 0u64;
+            let mut shift = 0u32;
+            loop {
+                let byte = input[*offset];
+                *offset += 1;
+                value |= u64::from(byte & 0x7f) << shift;
+                if byte & 0x80 == 0 {
+                    return value;
+                }
+                shift += 7;
+                assert!(shift < 64);
+            }
+        }
+
+        fn assert_exact_payload(frame: &[u8], expected_seq: u64, expected: &[u8]) {
+            let mut offset = 0usize;
+            assert_eq!(frame[offset], 0x08);
+            offset += 1;
+            assert_eq!(take_varint(frame, &mut offset), expected_seq);
+            assert_eq!(&frame[offset..offset + 2], &[0xa2, 0x01]);
+            offset += 2;
+            assert_eq!(
+                usize::try_from(take_varint(frame, &mut offset)).unwrap(),
+                expected.len()
+            );
+            assert_eq!(&frame[offset..], expected);
+        }
+
+        let message = proto::SendMessage {
+            conversation_id: TEST_CONVERSATION_ID.to_string(),
+            ciphertext: vec![0x11; 32],
+            header: vec![0x22; 8],
+            client_message_id: TEST_CLIENT_MESSAGE_ID.to_string(),
+            ..Default::default()
+        };
+        let exact = message.encode_to_vec();
+        let (connection, mut outbound) = Connection::test_only_queued_connection();
+
+        assert_eq!(
+            connection
+                .send_preencoded_send_message_v1(&exact)
+                .await
+                .unwrap(),
+            1
+        );
+        let first = outbound.recv().await.unwrap();
+        assert_exact_payload(&first, 1, &exact);
+
+        assert_eq!(
+            connection
+                .send_preencoded_send_message_v1(&exact)
+                .await
+                .unwrap(),
+            2
+        );
+        let second = outbound.recv().await.unwrap();
+        assert_exact_payload(&second, 2, &exact);
+        assert_ne!(first, second);
+
+        let mut unknown_field = exact.clone();
+        unknown_field.extend_from_slice(&[0x98, 0x06, 0x01]);
+        assert!(connection
+            .send_preencoded_send_message_v1(&unknown_field)
+            .await
+            .unwrap_err()
+            .contains("not canonical"));
+
+        let invalid = proto::SendMessage {
+            client_message_id: TEST_CLIENT_MESSAGE_ID.to_uppercase(),
+            ..message
+        }
+        .encode_to_vec();
+        assert!(connection
+            .send_preencoded_send_message_v1(&invalid)
+            .await
+            .unwrap_err()
+            .contains("invalid client message id"));
+        assert!(outbound.try_recv().is_err());
+    }
+
+    #[test]
     fn sender_key_route_and_ack_require_exact_metadata_and_aligned_bounds() {
         assert_eq!(MAX_RETAINED_SKDM_EVENTS, 2_048);
         assert_eq!(MAX_RETAINED_SKDM_WIRE_TOTAL_BYTES, 4 * 1024 * 1024);
@@ -2901,6 +3212,7 @@ mod tests {
             server_timestamp: 1,
             ref_seq: 1,
             roster_version: Some(4),
+            client_message_id: TEST_CLIENT_MESSAGE_ID.to_string(),
             ..Default::default()
         };
         assert!(matches!(

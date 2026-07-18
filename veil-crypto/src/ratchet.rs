@@ -1,6 +1,7 @@
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::Zeroize;
 
@@ -128,6 +129,53 @@ impl Drop for RatchetSession {
 }
 
 impl RatchetSession {
+    /// Compare this live ratchet with one SQLCipher serialization without
+    /// relying on JSON object order. Secret fields and message-key values are
+    /// compared in constant time; public counters/map keys may select shape.
+    /// The decoded candidate zeroizes its secrets on drop.
+    pub fn matches_serialized_v1(&self, serialized: &[u8]) -> Result<bool, String> {
+        let persisted: Self = serde_json::from_slice(serialized)
+            .map_err(|error| format!("decode persisted ratchet session: {error}"))?;
+        Ok(self.same_state_v1(&persisted))
+    }
+
+    fn same_state_v1(&self, other: &Self) -> bool {
+        fn optional_secret_bytes_equal(left: &Option<Vec<u8>>, right: &Option<Vec<u8>>) -> bool {
+            match (left.as_deref(), right.as_deref()) {
+                (Some(left), Some(right)) => {
+                    left.len() == right.len() && bool::from(left.ct_eq(right))
+                }
+                (None, None) => true,
+                _ => false,
+            }
+        }
+
+        fn optional_secret_array_equal(left: &Option<[u8; 32]>, right: &Option<[u8; 32]>) -> bool {
+            match (left, right) {
+                (Some(left), Some(right)) => bool::from(left.ct_eq(right)),
+                (None, None) => true,
+                _ => false,
+            }
+        }
+
+        optional_secret_bytes_equal(&self.dh_sending_secret, &other.dh_sending_secret)
+            && self.dh_sending_public == other.dh_sending_public
+            && self.dh_receiving == other.dh_receiving
+            && bool::from(self.root_key.ct_eq(&other.root_key))
+            && optional_secret_array_equal(&self.sending_chain_key, &other.sending_chain_key)
+            && optional_secret_array_equal(&self.receiving_chain_key, &other.receiving_chain_key)
+            && self.send_count == other.send_count
+            && self.recv_count == other.recv_count
+            && self.prev_send_count == other.prev_send_count
+            && self.skipped_keys.len() == other.skipped_keys.len()
+            && self.skipped_keys.iter().all(|(key, message_key)| {
+                other
+                    .skipped_keys
+                    .get(key)
+                    .is_some_and(|persisted| bool::from(message_key.ct_eq(persisted)))
+            })
+    }
+
     /// Initialize as the initiator (Alice) after X3DH.
     ///
     /// - `shared_secret`: the SK from X3DH
@@ -591,6 +639,27 @@ mod tests {
         let actual: serde_json::Value = serde_json::from_slice(&actual).unwrap();
         let expected: serde_json::Value = serde_json::from_slice(&expected).unwrap();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn persisted_state_match_is_independent_of_skipped_key_map_order() {
+        let (mut live, _) = setup_sessions();
+        let first = ([0x31; 32], 7);
+        let second = ([0x42; 32], 9);
+        live.skipped_keys.insert(first, [0xA1; 32]);
+        live.skipped_keys.insert(second, [0xB2; 32]);
+
+        let mut persisted = live.clone();
+        persisted.skipped_keys.clear();
+        persisted.skipped_keys.insert(second, [0xB2; 32]);
+        persisted.skipped_keys.insert(first, [0xA1; 32]);
+        let serialized = serde_json::to_vec(&persisted).unwrap();
+        assert!(live.matches_serialized_v1(&serialized).unwrap());
+
+        persisted.skipped_keys.insert(first, [0xFF; 32]);
+        let changed = serde_json::to_vec(&persisted).unwrap();
+        assert!(!live.matches_serialized_v1(&changed).unwrap());
+        assert!(live.matches_serialized_v1(b"not-json").is_err());
     }
 
     #[test]
