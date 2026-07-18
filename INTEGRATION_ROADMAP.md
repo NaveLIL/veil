@@ -1,6 +1,6 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-07-14. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-07-18. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
@@ -40,8 +40,9 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 5. Phase 3B и 4P сохраняются отдельными незакрытыми product scopes: имеющийся
    desktop/transport foundation не заменяет physical attachment и native mobile
    push device matrices.
-6. На стабильном desktop/profile фундаменте продолжить Android foundation (5A),
-   после per-device модели подключить боевые сообщения Android (5B).
+6. Продолжить Android Direct Preview: foundation/runtime 5A и receive/read часть
+   5B уже подключены; ближайший незакрытый gate — one-shot peer-prekey, затем
+   idempotent send/outbox и reconnect. Точный pause checkpoint приведён в Phase 5.
 7. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
@@ -57,8 +58,8 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
-| 5A | Android foundation | визуальный прототип есть, runtime не подключён |
-| 5B | Android messaging | не начато |
+| 5A | Android foundation | core runtime подключён: Keystore/SQLCipher, Node Access Pass, authenticated origin-bound sync; signed standalone APK и physical matrix открыты |
+| 5B | Android messaging | receive/read foundation реализован; peer-prekey в незакоммиченном checkpoint, send/outbox/reconnect не реализованы |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -1183,34 +1184,100 @@ desktop↔desktop матрицы зелёные; полный installer соби
 
 ## Phase 5 — Android
 
-**Текущее состояние:** существует качественный четырёхстраничный visual prototype
-`servers → channels/DM → chat → members` на React Navigation + PagerView и
-готовая modal Identity sheet. Это полезный визуальный фундамент, но старая
-четырёхколоночная последовательность не является целевой IA после Phase 4E.
-Chat/server data захардкожены, сеть и SQLCipher отсутствуют, auth живёт только в
-Zustand, а `VeilCrypto` в dev возвращает mock identity/signatures.
+**Текущее состояние:** Android уже не является изолированным visual prototype.
+React Native shell подключён к fail-closed `VeilMobileRuntime` на Rust/UniFFI;
+identity хранится через Android Keystore, account/runtime state — в SQLCipher,
+а Node Access Pass, authenticated WebSocket, own prekeys, Direct directory,
+history-to-live handoff и read-only message projection принадлежат native
+boundary. Это всё ещё закрытый Direct Preview: безопасная отправка, polished
+reconnect и подписанный standalone tester APK пока не готовы.
 
-Текущие обязательные исправления проекта:
+### Pause checkpoint 2026-07-18
 
-- Исправить TypeScript config (`module: commonjs` несовместим с
-  `moduleResolution: bundler`).
-- Добавить реальный ESLint dependency/config и первые unit/component tests.
-- Mock crypto разрешён только в изолированном demo mode без сети/persistence;
-  production и connected dev обязаны fail closed.
-- Не мигрировать на NativeWind/Expo Router только ради совпадения со старым
-  планом. React Navigation + StyleSheet допустимы; общими должны быть semantic
-  tokens и поведение, а не конкретная CSS-библиотека.
+Работа остановлена на проверяемой границе по просьбе владельца проекта. Статусы
+ниже намеренно разделяют опубликованный код, незакоммиченный worktree и ещё не
+реализованный scope.
+
+**Опубликовано и проверено в `codex/mobile-direct-preview`:**
+
+- authoritative published head — `c9f2d06` (`feat(mobile): gate Direct send
+  readiness`); `master` этим checkpoint не изменялся;
+- mobile-only registration по Node Access Pass, Keystore-wrapped identity,
+  native SQLCipher/session runtime и exact origin/account binding;
+- own-prekey bootstrap, authenticated Direct directory, immutable history,
+  bounded gap-free history-to-live handoff, continuous FIFO replay и read-only
+  projection только явно выбранного Direct;
+- native advisory send readiness повторно проверяет live ratchet, lease/epoch,
+  durable scope, identity pin, quarantine/history, storage и connection state;
+- exact `c9f2d06` прошёл Go, Coverage, Rust и Mobile CI. Security workflow красный
+  только на прежнем Cargo Audit baseline (те же 7 advisories и 19 разрешённых
+  warnings, без новой регрессии). CI debug APK является build evidence, а не
+  подписанным tester release и не physical-device evidence.
+
+**Сохранено локально, но не закоммичено и не опубликовано:**
+
+- `veil-client/src/api.rs` и `veil-ffi/src/lib.rs`: one-shot peer-prekey
+  capability, единственная released signature, authoritative prepare/sign/
+  install guards, response limits/zeroization и late-Ready semantics. Успешны
+  11 adversarial prekey tests, 3 live tests, scoped fmt/diff-check и FFI clippy;
+  полный 63-test FFI run был остановлен до итогового summary и остаётся gate;
+- Android runtime/module и их JVM tests: явное exact-generation действие
+  `establishDirectSession`, `PEER_PREKEY` transport без redirect/retry,
+  lifecycle-bound pending request, callback-once и late-body wipe. Последний
+  полный прогон **до** audit-правок: 135/135 JVM tests. Текущий audit-fix worktree
+  после исправления install/background race ещё не компилировался и не
+  перезапускался;
+- известный блокирующий P1 текущего Android worktree: после успешного native
+  prepare ошибка Kotlin validation/sign при одновременно наступившем `Ready`
+  может оставить unsigned outstanding capability. До коммита нужно разделить
+  ошибки до/после prepare; любая ошибка после успешного prepare отзывает всю
+  Direct lease. Обязателен deterministic retained-outstanding + Ready test.
+
+**Не реализовано и не считается готовым:**
+
+- production Direct send из Android; composer остаётся read-only;
+- wire-level `client_message_id`, серверная idempotency/digest uniqueness и ACK,
+  который безопасно подтверждает точный повтор без второго fan-out;
+- атомарная SQLCipher-транзакция `advanced ratchet + local row + exact ciphertext
+  outbox`, а также ACK reconciliation и безопасный повтор exact bytes после
+  reconnect. До появления idempotency текущий `Sending → Unknown` безопаснее
+  слепого retry;
+- airplane-mode/process-death/reconnect matrix, push publication, Circle,
+  Space/Rooms, attachments, multi-device enrollment/revoke;
+- release signing, standalone tester APK, чистая установка и physical-device
+  matrix. Ни текущий CI APK, ни старый debug APK не являются tester release.
+
+**Порядок возобновления:**
+
+1. Закрыть Android post-prepare P1 и запустить новые race/capability tests.
+2. Повторить полный Rust FFI/workspace и Android JVM/lint gates.
+3. Независимо проверить diff; закоммитить и опубликовать Rust и Android
+   checkpoints раздельно.
+4. Добавить shared idempotent send contract и атомарный native outbox до
+   включения composer; затем polished reconnect и только после этого signed APK.
+
+Ранее обязательные исправления проекта — текущий статус:
+
+- Закрыто: TypeScript использует совместимые `module: esnext` и
+  `moduleResolution: bundler`.
+- Закрыто: ESLint/Jest dependencies и unit/component/runtime suites подключены.
+- Закрыто для production boundary: raw JS crypto mock/sign/AEAD surface удалён;
+  отсутствие native module приводит к fail-closed ошибке.
+- Решение сохранено: React Navigation + StyleSheet остаются оболочкой; миграция
+  на NativeWind/Expo Router без измеримой пользы не планируется.
 
 ### Phase 5A — Android foundation
 
-**Foundation checkpoint 2026-07-14: в работе.** Android project теперь
+**Foundation checkpoint 2026-07-18: в работе.** Android project теперь
 versioned; Rust/UniFFI воспроизводимо собирается для `arm64-v8a` и `x86_64`.
 Удалён runtime crypto mock и raw sign/AEAD JS surface, release больше не может
 подписываться debug key. Recovery phrase хранится через Android Keystore-wrapped
 AES-GCM vault, backup отключён, secret screens используют `FLAG_SECURE`, copy в
 clipboard удалён и добавлено подтверждение слов. Состояния local identity и
 native failure разделены. Это закрывает первый пункт и часть пунктов 3–5 ниже,
-но не заменяет SQLCipher, lock policy и authenticated mobile runtime.
+а SQLCipher, lifecycle lock policy и authenticated mobile runtime теперь
+подключены. Standalone signing/physical matrix и end-to-end send/reconnect gate
+остаются открыты и не позволяют считать 5A завершённой.
 
 1. Воспроизводимый Rust build для `arm64-v8a` и `x86_64`, Expo config plugin
    либо versioned native Android project, плюс mobile CI.
@@ -1242,6 +1309,12 @@ native failure разделены. Это закрывает первый пун
 соединяется с тестовым gateway без доступа JS к секретному состоянию.
 
 ### Phase 5B — Android messaging
+
+**Receive/read checkpoint 2026-07-18: частично готов.** Настоящие Direct list,
+authenticated history, bounded live receive и native read-only projection уже
+заменили demo chat data. X3DH peer-prekey transport находится в локальном
+незакоммиченном checkpoint выше. ACK/outbox/send, reconnect/process-death matrix,
+private groups и остальные пункты 5B не готовы.
 
 1. Сначала один честный Desktop ↔ Android DM: X3DH/Double Ratchet, history sync,
    ack/outbox, reconnect, airplane mode и process death.
