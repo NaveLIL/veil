@@ -83,16 +83,45 @@ export function SecureRuntimeGate({
       };
     }
     if (snapshot.connectionState === "connected" && !snapshot.directoryReady) {
-      return {
-        title: "Secure sync is not ready",
-        body: "The account is authenticated, but the verified conversation directory has not finished loading.",
-      };
+      switch (snapshot.secureSyncState) {
+        case "publishing_keys":
+          return {
+            title: "Publishing device keys",
+            body: "Preparing this device for authenticated encrypted conversations.",
+          };
+        case "syncing_directory":
+          return {
+            title: "Verifying conversations",
+            body: "Loading the authenticated conversation directory into encrypted local storage.",
+          };
+        case "syncing_history":
+          return {
+            title: "Restoring encrypted history",
+            body: "Validating and storing supported Direct messages before live chat can open.",
+          };
+        case "history_synchronized":
+          return {
+            title: "Reconciling live messages",
+            body: "History is synchronized. Veil is still waiting for safe live-message reconciliation.",
+          };
+        default:
+          return {
+            title: "Secure sync is not ready",
+            body: "The account is authenticated, but native secure synchronization is still incomplete.",
+          };
+      }
     }
     return {
       title: "Connect to your Veil Node",
       body: "Only the canonical server origin crosses this UI boundary. Authentication remains native.",
     };
-  }, [requiresExplicitReopen, snapshot.connectionState, snapshot.directoryReady, snapshot.sessionState]);
+  }, [
+    requiresExplicitReopen,
+    snapshot.connectionState,
+    snapshot.directoryReady,
+    snapshot.secureSyncState,
+    snapshot.sessionState,
+  ]);
 
   const needsUnlock = requiresExplicitReopen || snapshot.sessionState !== "open";
   const canEnterOrigin = !needsUnlock

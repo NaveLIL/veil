@@ -21,6 +21,10 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.veil_ffi.MobileDirectConversationData
 import uniffi.veil_ffi.MobileDirectDirectoryPageData
+import uniffi.veil_ffi.MobileDirectHistoryNext
+import uniffi.veil_ffi.MobileDirectHistoryOutcome
+import uniffi.veil_ffi.MobileDirectHistoryProgress
+import uniffi.veil_ffi.MobileDirectLiveBufferProgress
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSyncLease
@@ -458,10 +462,11 @@ class VeilMobileRuntimeTest {
       val complete = runtime.snapshot()
       assertTrue(secondBody.all { it == 0.toByte() })
       assertEquals(NativeDirectDirectoryState.SYNCHRONIZED, complete.directDirectoryState)
-      assertEquals(NativeSecureSyncState.DIRECTORY_SYNCHRONIZED, complete.secureSyncState)
+      assertEquals(NativeDirectHistoryState.SYNCHRONIZED, complete.directHistoryState)
+      assertEquals(NativeSecureSyncState.HISTORY_SYNCHRONIZED, complete.secureSyncState)
       assertEquals(listOf(first, second), complete.directConversations)
       assertEquals(NativeConnectionState.CONNECTED, complete.connectionState)
-      assertFalse("history is not synchronized yet", complete.directoryReady)
+      assertFalse("deferred live events are not replayed yet", complete.directoryReady)
       assertEquals(2, fakeSession.installedResponseCopies.size)
       assertEquals(4, transport.requests.size)
       assertTrue(transport.requests.all { it.canonicalServerOrigin == "https://access.example:443" })
@@ -472,6 +477,214 @@ class VeilMobileRuntimeTest {
             it.body.isEmpty()
         },
       )
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun directHistoryRunsOneExactRequestAtATimeAndNeverOpensReadyBeforeLiveReplay() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = true)
+    fakeSession.directoryInstalls.clear()
+    fakeSession.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+    )
+    fakeSession.historyNexts.add(
+      NativeDirectHistoryNext(
+        request = NativeDirectRestRequest(
+          requestToken = "history-page-one",
+          method = "GET",
+          requestTarget = "/v1/messages/${conversation.conversationId}?limit=25",
+          body = byteArrayOf(),
+          responseLimitBytes = NativeDirectHttpLimits.HISTORY_BYTES,
+        ),
+        historiesTerminal = false,
+      ),
+    )
+    fakeSession.historyNexts.add(
+      NativeDirectHistoryNext(
+        request = NativeDirectRestRequest(
+          requestToken = "history-page-two",
+          method = "GET",
+          requestTarget = "/v1/messages/${conversation.conversationId}?limit=25&cursor=opaque",
+          body = byteArrayOf(),
+          responseLimitBytes = NativeDirectHttpLimits.HISTORY_BYTES,
+        ),
+        historiesTerminal = false,
+      ),
+    )
+    fakeSession.historyInstalls.add(
+      NativeDirectHistoryProgress(NativeDirectHistoryOutcome.IN_PROGRESS, historiesTerminal = false),
+    )
+    fakeSession.historyInstalls.add(
+      NativeDirectHistoryProgress(
+        NativeDirectHistoryOutcome.CONVERSATION_REJECTED,
+        historiesTerminal = true,
+      ),
+    )
+    val directoryBody = "authenticated-directory".toByteArray()
+    val firstHistoryBody = "encrypted-history-page-one".toByteArray()
+    val secondHistoryBody = "rejected-history-page-two".toByteArray()
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+
+      transport.completeNext(NativeDirectHttpResult.Success(directoryBody))
+      awaitRuntimeIdle(runtime)
+      assertTrue(directoryBody.all { it == 0.toByte() })
+      assertEquals(NativeDirectDirectoryState.SYNCHRONIZED, runtime.snapshot().directDirectoryState)
+      assertEquals(NativeDirectHistoryState.SYNCING, runtime.snapshot().directHistoryState)
+      assertEquals(NativeSecureSyncState.SYNCING_HISTORY, runtime.snapshot().secureSyncState)
+      assertFalse(runtime.snapshot().directoryReady)
+      assertEquals(1, transport.pendingCount())
+      assertEquals(NativeDirectHttpLimits.HISTORY_BYTES, transport.requests.last().responseLimitBytes)
+      assertEquals(NativeDirectHttpMethod.GET, transport.requests.last().method)
+      assertTrue(transport.requests.last().body.isEmpty())
+
+      transport.completeNext(NativeDirectHttpResult.Success(firstHistoryBody))
+      awaitRuntimeIdle(runtime)
+      assertTrue(firstHistoryBody.all { it == 0.toByte() })
+      assertEquals(NativeDirectHistoryState.SYNCING, runtime.snapshot().directHistoryState)
+      assertEquals(1, transport.pendingCount())
+
+      transport.completeNext(NativeDirectHttpResult.Success(secondHistoryBody))
+      awaitRuntimeIdle(runtime)
+      val terminal = runtime.snapshot()
+      assertTrue(secondHistoryBody.all { it == 0.toByte() })
+      assertEquals(NativeDirectHistoryState.SYNCHRONIZED, terminal.directHistoryState)
+      assertEquals(NativeSecureSyncState.HISTORY_SYNCHRONIZED, terminal.secureSyncState)
+      assertEquals(NativeConnectionState.CONNECTED, terminal.connectionState)
+      assertFalse("stage 5 must wait for live FIFO replay", terminal.directoryReady)
+      assertEquals(2, fakeSession.historyInstalledResponseCopies.size)
+      assertTrue(fakeSession.liveBufferPumpCount >= 5)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun terminalLiveEpochRejectsInFlightHttpBeforeDirectoryMutationAndWipesBody() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val response = "directory-response-that-must-not-install".toByteArray()
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+      assertEquals(1, transport.pendingCount())
+
+      fakeSession.failLiveBufferPump = true
+      transport.completeNext(NativeDirectHttpResult.Success(response))
+      awaitRuntimeIdle(runtime)
+
+      assertTrue(response.all { it == 0.toByte() })
+      assertTrue(fakeSession.installedResponseCopies.isEmpty())
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertEquals(NativeDirectDirectoryState.ERROR, runtime.snapshot().directDirectoryState)
+      assertFalse(runtime.snapshot().directoryReady)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun contradictoryInProgressTerminalHistoryFailsClosedAndWipesBody() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    fakeSession.historyNexts.add(
+      NativeDirectHistoryNext(
+        request = NativeDirectRestRequest(
+          requestToken = "history-contradictory-progress",
+          method = "GET",
+          requestTarget = "/v1/messages/550e8400-e29b-41d4-a716-446655440010?limit=25",
+          body = byteArrayOf(),
+          responseLimitBytes = NativeDirectHttpLimits.HISTORY_BYTES,
+        ),
+        historiesTerminal = false,
+      ),
+    )
+    fakeSession.historyInstalls.add(
+      NativeDirectHistoryProgress(
+        NativeDirectHistoryOutcome.IN_PROGRESS,
+        historiesTerminal = true,
+      ),
+    )
+    val directoryBody = "directory-before-contradiction".toByteArray()
+    val historyBody = "history-with-contradictory-progress".toByteArray()
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success(directoryBody))
+      awaitRuntimeIdle(runtime)
+      assertEquals(NativeDirectHistoryState.SYNCING, runtime.snapshot().directHistoryState)
+
+      transport.completeNext(NativeDirectHttpResult.Success(historyBody))
+      awaitRuntimeIdle(runtime)
+      val failed = runtime.snapshot()
+      assertTrue(historyBody.all { it == 0.toByte() })
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
+      assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertFalse(failed.directoryReady)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundRevokesHistoryRequestAndLateCallbackOnlyWipesItsBody() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    fakeSession.historyNexts.add(
+      NativeDirectHistoryNext(
+        request = NativeDirectRestRequest(
+          requestToken = "history-late-callback",
+          method = "GET",
+          requestTarget = "/v1/messages/550e8400-e29b-41d4-a716-446655440010?limit=25",
+          body = byteArrayOf(),
+          responseLimitBytes = NativeDirectHttpLimits.HISTORY_BYTES,
+        ),
+        historiesTerminal = false,
+      ),
+    )
+    val directoryBody = "directory-before-background".toByteArray()
+    val lateHistoryBody = "late-history-after-background".toByteArray()
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success(directoryBody))
+      awaitRuntimeIdle(runtime)
+      assertEquals(NativeDirectHistoryState.SYNCING, runtime.snapshot().directHistoryState)
+      val historyCall = transport.calls.last()
+      assertTrue(historyCall.started.get())
+
+      runtime.lockForBackground()
+      assertTrue(historyCall.cancelled.get())
+      transport.completeNext(NativeDirectHttpResult.Success(lateHistoryBody))
+      awaitRuntimeIdle(runtime)
+
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+      assertTrue(lateHistoryBody.all { it == 0.toByte() })
+      assertTrue(fakeSession.historyInstalledResponseCopies.isEmpty())
+      assertTrue(fakeSession.directLeaseCancellations >= 1)
+      assertFalse(runtime.snapshot().directoryReady)
     } finally {
       runtime.lockSession()
       executor.shutdownNow()
@@ -912,6 +1125,42 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun generatedHistoryBridgeMapsOnlyTypedCoarseProgress() {
+    val request = MobileDirectRestRequest(
+      requestToken = "history-capability",
+      method = "GET",
+      requestTarget = "/v1/messages/550e8400-e29b-41d4-a716-446655440010?limit=25",
+      body = byteArrayOf(),
+      responseLimitBytes = NativeDirectHttpLimits.HISTORY_BYTES.toUInt(),
+    )
+    val next = MobileDirectHistoryNext(request, historiesTerminal = false).toNativeDirectHistoryNext()
+    assertFalse(next.historiesTerminal)
+    assertEquals(NativeDirectHttpLimits.HISTORY_BYTES, next.request?.responseLimitBytes)
+
+    val expected = listOf(
+      MobileDirectHistoryOutcome.IN_PROGRESS to NativeDirectHistoryOutcome.IN_PROGRESS,
+      MobileDirectHistoryOutcome.COMPLETE to NativeDirectHistoryOutcome.COMPLETE,
+      MobileDirectHistoryOutcome.INCOMPLETE_SELF_HISTORY to
+        NativeDirectHistoryOutcome.INCOMPLETE_SELF_HISTORY,
+      MobileDirectHistoryOutcome.CONVERSATION_REJECTED to
+        NativeDirectHistoryOutcome.CONVERSATION_REJECTED,
+      MobileDirectHistoryOutcome.STORAGE_UNCERTAIN to NativeDirectHistoryOutcome.STORAGE_UNCERTAIN,
+    )
+    expected.forEach { (generated, native) ->
+      assertEquals(
+        native,
+        MobileDirectHistoryProgress(generated, historiesTerminal = false)
+          .toNativeDirectHistoryProgress()
+          .outcome,
+      )
+    }
+    val live = MobileDirectLiveBufferProgress(17u, historySynchronized = true)
+      .toNativeDirectLiveBufferProgress()
+    assertEquals(17L, live.bufferedEvents)
+    assertTrue(live.historySynchronized)
+  }
+
+  @Test
   fun directoryInstallMappingCopiesOnlyPublicRowsAndDropsPeerKeyMaterial() {
     val peerIdentityKey = "identity-key-hex-must-remain-native"
     val peerSigningKey = "signing-key-hex-must-remain-native"
@@ -1087,6 +1336,10 @@ class VeilMobileRuntimeTest {
     var directLeaseCancellations = 0
     var directLeaseUserOverride: String? = null
     var directoryRequestCount = 0
+    var historyRequestCount = 0
+    var liveBufferPumpCount = 0
+    var failLiveBufferPump = false
+    var historySynchronized = false
     var ownPreKeyRequestCount = 0
     var ownPreKeyInstallCount = 0
     var ownPreKeyPendingPublication: ByteArray? = null
@@ -1097,6 +1350,9 @@ class VeilMobileRuntimeTest {
       add(NativeDirectDirectoryInstall(emptyList(), directoryComplete = true))
     }
     val installedResponseCopies = CopyOnWriteArrayList<ByteArray>()
+    val historyInstalledResponseCopies = CopyOnWriteArrayList<ByteArray>()
+    val historyNexts = ArrayDeque<NativeDirectHistoryNext>()
+    val historyInstalls = ArrayDeque<NativeDirectHistoryProgress>()
     val lifecycleEvents = CopyOnWriteArrayList<String>()
     val connectStarted = CountDownLatch(1)
     val closedDuringConnect = AtomicBoolean(false)
@@ -1128,11 +1384,14 @@ class VeilMobileRuntimeTest {
       return PublicAuthenticatedBinding(canonicalOrigin, USER_ID)
     }
 
-    override fun beginDirectSync(): NativeDirectSyncLease = NativeDirectSyncLease(
-      leaseToken = "test-direct-lease",
-      canonicalServerOrigin = checkNotNull(canonicalOrigin),
-      userId = directLeaseUserOverride ?: USER_ID,
-    )
+    override fun beginDirectSync(): NativeDirectSyncLease {
+      historySynchronized = false
+      return NativeDirectSyncLease(
+        leaseToken = "test-direct-lease",
+        canonicalServerOrigin = checkNotNull(canonicalOrigin),
+        userId = directLeaseUserOverride ?: USER_ID,
+      )
+    }
 
     override fun prepareOwnPreKeyRequest(leaseToken: String): NativeDirectRestRequest {
       ownPreKeyRequestCount += 1
@@ -1201,6 +1460,43 @@ class VeilMobileRuntimeTest {
       installedResponseCopies.add(response.copyOf())
       preparedRequests.remove(requestToken)?.body?.fill(0)
       return directoryInstalls.removeFirst()
+    }
+
+    override fun prepareNextDirectHistoryRequest(leaseToken: String): NativeDirectHistoryNext {
+      historyRequestCount += 1
+      val next = if (historyNexts.isEmpty()) {
+        NativeDirectHistoryNext(request = null, historiesTerminal = true)
+      } else {
+        historyNexts.removeFirst()
+      }
+      if (next.historiesTerminal) historySynchronized = true
+      next.request?.let(::rememberPreparedRequest)
+      return next
+    }
+
+    override fun installDirectHistoryResponse(
+      leaseToken: String,
+      requestToken: String,
+      response: ByteArray,
+    ): NativeDirectHistoryProgress {
+      historyInstalledResponseCopies.add(response.copyOf())
+      preparedRequests.remove(requestToken)?.body?.fill(0)
+      val progress = if (historyInstalls.isEmpty()) {
+        NativeDirectHistoryProgress(NativeDirectHistoryOutcome.COMPLETE, historiesTerminal = true)
+      } else {
+        historyInstalls.removeFirst()
+      }
+      if (progress.historiesTerminal) historySynchronized = true
+      return progress
+    }
+
+    override fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress {
+      liveBufferPumpCount += 1
+      if (failLiveBufferPump) throw IllegalStateException("synthetic terminal live buffer")
+      return NativeDirectLiveBufferProgress(
+        bufferedEvents = 0,
+        historySynchronized = historySynchronized,
+      )
     }
 
     override fun prepareDirectPreKeyRequest(

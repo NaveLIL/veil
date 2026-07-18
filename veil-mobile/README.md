@@ -12,6 +12,8 @@ Prerequisites:
 - Android SDK 35 and NDK `27.1.12297006`;
 - Rust targets `aarch64-linux-android` and `x86_64-linux-android`;
 - `cargo-ndk`;
+- a complete Unix-compatible Perl and `make` (MSYS2 on Windows) for vendored
+  OpenSSL/SQLCipher;
 - an ASCII-only Cargo target directory on Windows.
 
 The full Windows Android build must run from an actual ASCII-only checkout or
@@ -55,10 +57,26 @@ any value is missing.
   and several recovery words must be confirmed before identity creation.
 - JavaScript receives the public identity key only. It does not receive the seed,
   private signing key, ratchet state, database key, or a raw signing/AEAD oracle.
-- UnifiedPush accepts only decrypted 2048-byte generic wake records. Endpoint
-  publication and sync remain dormant until the account/origin-bound native
-  authenticated runtime is implemented.
+- Node Access Pass registration, the authenticated WebSocket generation,
+  per-device prekey publication, the origin-bound Direct directory, and
+  immutable legacy Direct-text history are owned by Rust/Kotlin. JavaScript sees
+  only coarse `publishing_keys`, `syncing_directory`, `syncing_history`, and
+  `history_synchronized` progress.
+- History uses one native-owned HTTP capability at a time, a deterministic UUID
+  order, a 4 MiB response ceiling, and a single in-memory conversation state.
+  Unsupported or incomplete history blocks only that Direct conversation;
+  uncertain SQLCipher state aborts the complete authenticated generation.
+- Authenticated live events retain the same shared 4096-event/32 MiB permits as
+  they move from the socket queue to the deferred FIFO. The Android boundary
+  pumps at every HTTP/lifecycle boundary, including immediately before durable
+  install. A terminal epoch observed at that boundary aborts before install; a
+  concurrent terminal event linearizes before or after the boundary, and any
+  committed prefix remains duplicate-safe when reconnect restarts history.
+- UnifiedPush still accepts only decrypted 2048-byte generic wake records.
 
-This is a Phase 5A foundation, not a production-ready mobile messenger. SQLCipher,
-native session/network orchestration, lock/PIN/biometric policy and physical device
-tests are still required.
+This remains a closed Direct Preview, not a tester release or production-ready
+mobile messenger. Stage 5 intentionally stops at `history_synchronized`:
+deferred live replay, real Direct send/receive/history UI, polished reconnect,
+push publication, Circle/Space/attachments, signed standalone APK distribution,
+and physical-device tests remain gated. `directoryReady` therefore stays false
+even for an empty or fully validated history.

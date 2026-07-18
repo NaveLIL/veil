@@ -836,6 +836,12 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -887,6 +893,8 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_authenticated_binding(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_begin_direct_sync(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_buffer_direct_live_events_during_sync(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect(
@@ -901,6 +909,8 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_page(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_history_response(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_response(
@@ -908,6 +918,8 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_respons
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_next_direct_history_request(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_own_prekey_request(
 ): Short
@@ -1052,6 +1064,8 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_authenticated_binding(`ptr`: Poi
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_begin_direct_sync(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_buffer_direct_live_events_during_sync(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_cancel_direct_sync(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1066,6 +1080,8 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_disconnect(`ptr`: Pointer,uniffi
 ): Unit
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_directory_page(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_history_response(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_prekey_bundle(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1073,6 +1089,8 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(`ptr
 fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_directory_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_prekey_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_next_direct_history_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_own_prekey_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
@@ -1328,6 +1346,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_begin_direct_sync() != 53699.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_buffer_direct_live_events_during_sync() != 59584.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync() != 53148.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1349,6 +1370,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_page() != 42994.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_history_response() != 7731.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle() != 30329.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1359,6 +1383,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request() != 39529.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_next_direct_history_request() != 13299.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_own_prekey_request() != 30230.toShort()) {
@@ -2439,6 +2466,14 @@ public object FfiConverterTypeVeilIdentity: FfiConverter<VeilIdentity, Pointer> 
  * Native mobile session backed by the same SQLCipher/per-device engine as
  * desktop. Account authentication and request signatures never cross into
  * JavaScript; Kotlin receives only bounded public binding metadata.
+ *
+ * Any operation needing more than one guard must acquire them in this order:
+ * `direct_sync` -> `binding` -> `client`. Lifecycle invalidation never waits
+ * for `direct_sync` while retaining `client`, preventing a reconnect/history
+ * callback inversion from deadlocking the serialized Android runtime. Initial
+ * authentication is the deliberate exception: it holds `client` while
+ * publishing a previously invalidated `binding`; no current Direct lease can
+ * exist until that publication has completed.
  */
 public interface VeilMobileSessionInterface {
 
@@ -2450,6 +2485,13 @@ public interface VeilMobileSessionInterface {
      * Kotlin must return it with every raw REST response.
      */
     fun `beginDirectSync`(): MobileDirectSyncLease
+
+    /**
+     * Pump authenticated WebSocket events into the shared bounded deferred
+     * FIFO while history is synchronized. Stage 5 deliberately never drains
+     * or publishes that FIFO and therefore cannot transition to Ready.
+     */
+    fun `bufferDirectLiveEventsDuringSync`(`leaseToken`: kotlin.String): MobileDirectLiveBufferProgress
 
     fun `cancelDirectSync`(`leaseToken`: kotlin.String)
 
@@ -2486,6 +2528,13 @@ public interface VeilMobileSessionInterface {
      */
     fun `installDirectDirectoryPage`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectDirectoryPageData
 
+    /**
+     * Install one bounded history page and return only a coarse typed
+     * scheduler outcome. Conversation rejection is isolated; uncertain local
+     * storage is a sticky global abort for this authenticated generation.
+     */
+    fun `installDirectHistoryResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectHistoryProgress
+
     fun `installDirectPrekeyBundle`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `conversationId`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectPreKeyResult
 
     /**
@@ -2502,6 +2551,14 @@ public interface VeilMobileSessionInterface {
      * lease. Kotlin cannot substitute peer account keys.
      */
     fun `prepareDirectPrekeyRequest`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectRestRequest
+
+    /**
+     * Prepare exactly one immutable Direct-history GET. The scheduler owns
+     * conversation order and cursors; Android can only transport the returned
+     * capability. Repeating this operation before installation returns the
+     * same immutable request token and bytes.
+     */
+    fun `prepareNextDirectHistoryRequest`(`leaseToken`: kotlin.String): MobileDirectHistoryNext
 
     /**
      * Prepare the next origin-scoped own-prekey bootstrap request. A durable
@@ -2526,6 +2583,14 @@ public interface VeilMobileSessionInterface {
  * Native mobile session backed by the same SQLCipher/per-device engine as
  * desktop. Account authentication and request signatures never cross into
  * JavaScript; Kotlin receives only bounded public binding metadata.
+ *
+ * Any operation needing more than one guard must acquire them in this order:
+ * `direct_sync` -> `binding` -> `client`. Lifecycle invalidation never waits
+ * for `direct_sync` while retaining `client`, preventing a reconnect/history
+ * callback inversion from deadlocking the serialized Android runtime. Initial
+ * authentication is the deliberate exception: it holds `client` while
+ * publishing a previously invalidated `binding`; no current Direct lease can
+ * exist until that publication has completed.
  */
 open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterface
 {
@@ -2634,6 +2699,24 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_begin_direct_sync(
         it, _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Pump authenticated WebSocket events into the shared bounded deferred
+     * FIFO while history is synchronized. Stage 5 deliberately never drains
+     * or publishes that FIFO and therefore cannot transition to Ready.
+     */
+    @Throws(VeilException::class)override fun `bufferDirectLiveEventsDuringSync`(`leaseToken`: kotlin.String): MobileDirectLiveBufferProgress {
+            return FfiConverterTypeMobileDirectLiveBufferProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_buffer_direct_live_events_during_sync(
+        it, FfiConverterString.lower(`leaseToken`),_status)
 }
     }
     )
@@ -2751,6 +2834,24 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
+    /**
+     * Install one bounded history page and return only a coarse typed
+     * scheduler outcome. Conversation rejection is isolated; uncertain local
+     * storage is a sticky global abort for this authenticated generation.
+     */
+    @Throws(VeilException::class)override fun `installDirectHistoryResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectHistoryProgress {
+            return FfiConverterTypeMobileDirectHistoryProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_history_response(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
     @Throws(VeilException::class)override fun `installDirectPrekeyBundle`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `conversationId`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectPreKeyResult {
             return FfiConverterTypeMobileDirectPreKeyResult.lift(
     callWithPointer {
@@ -2805,6 +2906,25 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_prekey_request(
         it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`conversationId`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Prepare exactly one immutable Direct-history GET. The scheduler owns
+     * conversation order and cursors; Android can only transport the returned
+     * capability. Repeating this operation before installation returns the
+     * same immutable request token and bytes.
+     */
+    @Throws(VeilException::class)override fun `prepareNextDirectHistoryRequest`(`leaseToken`: kotlin.String): MobileDirectHistoryNext {
+            return FfiConverterTypeMobileDirectHistoryNext.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_next_direct_history_request(
+        it, FfiConverterString.lower(`leaseToken`),_status)
 }
     }
     )
@@ -3917,6 +4037,102 @@ public object FfiConverterTypeMobileDirectDirectoryPageData: FfiConverterRustBuf
 
 
 
+data class MobileDirectHistoryNext (
+    var `request`: MobileDirectRestRequest?,
+    var `historiesTerminal`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectHistoryNext: FfiConverterRustBuffer<MobileDirectHistoryNext> {
+    override fun read(buf: ByteBuffer): MobileDirectHistoryNext {
+        return MobileDirectHistoryNext(
+            FfiConverterOptionalTypeMobileDirectRestRequest.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectHistoryNext) = (
+            FfiConverterOptionalTypeMobileDirectRestRequest.allocationSize(value.`request`) +
+            FfiConverterBoolean.allocationSize(value.`historiesTerminal`)
+    )
+
+    override fun write(value: MobileDirectHistoryNext, buf: ByteBuffer) {
+            FfiConverterOptionalTypeMobileDirectRestRequest.write(value.`request`, buf)
+            FfiConverterBoolean.write(value.`historiesTerminal`, buf)
+    }
+}
+
+
+
+data class MobileDirectHistoryProgress (
+    var `outcome`: MobileDirectHistoryOutcome,
+    var `historiesTerminal`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectHistoryProgress: FfiConverterRustBuffer<MobileDirectHistoryProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectHistoryProgress {
+        return MobileDirectHistoryProgress(
+            FfiConverterTypeMobileDirectHistoryOutcome.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectHistoryProgress) = (
+            FfiConverterTypeMobileDirectHistoryOutcome.allocationSize(value.`outcome`) +
+            FfiConverterBoolean.allocationSize(value.`historiesTerminal`)
+    )
+
+    override fun write(value: MobileDirectHistoryProgress, buf: ByteBuffer) {
+            FfiConverterTypeMobileDirectHistoryOutcome.write(value.`outcome`, buf)
+            FfiConverterBoolean.write(value.`historiesTerminal`, buf)
+    }
+}
+
+
+
+data class MobileDirectLiveBufferProgress (
+    var `bufferedEvents`: kotlin.UInt,
+    var `historySynchronized`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectLiveBufferProgress: FfiConverterRustBuffer<MobileDirectLiveBufferProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectLiveBufferProgress {
+        return MobileDirectLiveBufferProgress(
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectLiveBufferProgress) = (
+            FfiConverterUInt.allocationSize(value.`bufferedEvents`) +
+            FfiConverterBoolean.allocationSize(value.`historySynchronized`)
+    )
+
+    override fun write(value: MobileDirectLiveBufferProgress, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`bufferedEvents`, buf)
+            FfiConverterBoolean.write(value.`historySynchronized`, buf)
+    }
+}
+
+
+
 data class MobileDirectOwnPreKeyProgress (
     var `publicationComplete`: kotlin.Boolean
 ) {
@@ -4250,6 +4466,39 @@ public object FfiConverterTypeX3dhResultData: FfiConverterRustBuffer<X3dhResultD
 
 
 
+enum class MobileDirectHistoryOutcome {
+
+    IN_PROGRESS,
+    COMPLETE,
+    INCOMPLETE_SELF_HISTORY,
+    CONVERSATION_REJECTED,
+    STORAGE_UNCERTAIN;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectHistoryOutcome: FfiConverterRustBuffer<MobileDirectHistoryOutcome> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectHistoryOutcome.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectHistoryOutcome) = 4UL
+
+    override fun write(value: MobileDirectHistoryOutcome, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
 
 sealed class VeilException: kotlin.Exception() {
 
@@ -4440,6 +4689,38 @@ public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteA
         } else {
             buf.put(1)
             FfiConverterByteArray.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeMobileDirectRestRequest: FfiConverterRustBuffer<MobileDirectRestRequest?> {
+    override fun read(buf: ByteBuffer): MobileDirectRestRequest? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeMobileDirectRestRequest.read(buf)
+    }
+
+    override fun allocationSize(value: MobileDirectRestRequest?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeMobileDirectRestRequest.allocationSize(value)
+        }
+    }
+
+    override fun write(value: MobileDirectRestRequest?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeMobileDirectRestRequest.write(value, buf)
         }
     }
 }

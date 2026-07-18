@@ -255,7 +255,8 @@ function moreRestrictiveSecureSyncState(
     "error",
     "publishing_keys",
     "syncing_directory",
-    "directory_synchronized",
+    "syncing_history",
+    "history_synchronized",
   ];
   return priority.find((candidate) => candidate === left || candidate === right) ?? "idle";
 }

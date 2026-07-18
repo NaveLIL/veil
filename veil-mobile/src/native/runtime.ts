@@ -18,7 +18,8 @@ export type NativeSecureSyncState =
   | "idle"
   | "publishing_keys"
   | "syncing_directory"
-  | "directory_synchronized"
+  | "syncing_history"
+  | "history_synchronized"
   | "error";
 
 export interface AuthenticatedBinding {

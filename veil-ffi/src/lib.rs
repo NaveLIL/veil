@@ -1,7 +1,7 @@
 use bip39::Mnemonic;
 use rand::{rngs::OsRng, seq::SliceRandom, RngCore};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     future::Future,
     path::PathBuf,
     sync::{
@@ -97,15 +97,26 @@ struct MobileAuthenticatedEpoch {
 struct MobileDirectSyncState {
     token: String,
     epoch: MobileAuthenticatedEpoch,
-    own_prekeys_complete: bool,
+    phase: MobileDirectSyncPhase,
     own_prekey_publication: Option<veil_client::prekeys::OwnPreKeyPublication>,
     next_cursor: Option<String>,
-    directory_complete: bool,
-    history: veil_client::direct::DirectDirectorySyncHistory,
+    directory_history: veil_client::direct::DirectDirectorySyncHistory,
     peers: HashMap<String, MobileDirectPeer>,
-    outstanding_own_prekey_request: Option<MobileDirectOwnPreKeyOutstandingRequest>,
-    outstanding_directory_request: Option<MobileDirectOutstandingRequest>,
-    outstanding_prekey_requests: HashMap<String, MobileDirectOutstandingRequest>,
+    history_order: Vec<String>,
+    history_index: usize,
+    current_history: Option<veil_client::direct_history::DirectHistorySyncState>,
+    blocked_conversations: BTreeMap<String, MobileDirectHistoryOutcome>,
+    outstanding_request: Option<MobileDirectOutstandingRequest>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MobileDirectSyncPhase {
+    OwnPreKeys,
+    Directory,
+    DirectHistory,
+    HistorySynchronizedAwaitingLive,
+    Ready,
+    Failed,
 }
 
 #[derive(Clone)]
@@ -117,6 +128,7 @@ struct MobileDirectPeer {
 
 #[derive(Clone, Eq, PartialEq)]
 struct MobileDirectOutstandingRequest {
+    kind: MobileDirectOutstandingRequestKind,
     token: String,
     method: &'static str,
     target: String,
@@ -124,16 +136,13 @@ struct MobileDirectOutstandingRequest {
     response_limit_bytes: u32,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum MobileDirectOwnPreKeyRequestKind {
-    Count,
-    Upload,
-}
-
-#[derive(Clone)]
-struct MobileDirectOwnPreKeyOutstandingRequest {
-    kind: MobileDirectOwnPreKeyRequestKind,
-    request: MobileDirectOutstandingRequest,
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MobileDirectOutstandingRequestKind {
+    OwnPreKeyCount,
+    OwnPreKeyUpload,
+    Directory,
+    History { conversation_id: String },
+    PeerPreKey { conversation_id: String },
 }
 
 const MOBILE_OWN_PREKEY_UPLOAD_RESPONSE_LIMIT: u32 = 4 * 1024;
@@ -170,32 +179,13 @@ fn mobile_direct_outstanding_request<'a>(
     state: &'a MobileDirectSyncState,
     request_token: &str,
 ) -> Result<&'a MobileDirectOutstandingRequest, VeilError> {
-    let mut found = None;
-    let mut duplicate = false;
-    let mut consider = |request: &'a MobileDirectOutstandingRequest| {
-        if request.token == request_token && found.replace(request).is_some() {
-            duplicate = true;
-        }
-    };
-
-    if let Some(outstanding) = state.outstanding_own_prekey_request.as_ref() {
-        consider(&outstanding.request);
-    }
-    if let Some(request) = state.outstanding_directory_request.as_ref() {
-        consider(request);
-    }
-    for request in state.outstanding_prekey_requests.values() {
-        consider(request);
-    }
-
-    if duplicate {
-        return Err(VeilError::Session {
-            msg: "mobile Direct request token is ambiguous".to_string(),
-        });
-    }
-    found.ok_or_else(|| VeilError::Session {
-        msg: "mobile Direct request is stale".to_string(),
-    })
+    state
+        .outstanding_request
+        .as_ref()
+        .filter(|request| request.token == request_token)
+        .ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct request is stale".to_string(),
+        })
 }
 
 fn require_mobile_direct_response_limit(
@@ -207,6 +197,81 @@ fn require_mobile_direct_response_limit(
             msg: "mobile Direct response exceeds the native request limit".to_string(),
         });
     }
+    Ok(())
+}
+
+fn fail_mobile_direct_sync_sticky(state: &mut MobileDirectSyncState) {
+    state.phase = MobileDirectSyncPhase::Failed;
+    state.outstanding_request = None;
+    state.current_history = None;
+    state.own_prekey_publication = None;
+}
+
+fn finish_mobile_direct_history_conversation(
+    state: &mut MobileDirectSyncState,
+    conversation_id: &str,
+    outcome: MobileDirectHistoryOutcome,
+) -> Result<(), VeilError> {
+    if state.phase != MobileDirectSyncPhase::DirectHistory
+        || state
+            .history_order
+            .get(state.history_index)
+            .map(String::as_str)
+            != Some(conversation_id)
+    {
+        fail_mobile_direct_sync_sticky(state);
+        return Err(VeilError::Session {
+            msg: "mobile Direct history scheduler diverged".to_string(),
+        });
+    }
+    if outcome != MobileDirectHistoryOutcome::Complete {
+        if state.blocked_conversations.len()
+            >= veil_client::direct::DIRECT_DIRECTORY_MAX_CONVERSATIONS
+        {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(VeilError::Session {
+                msg: "mobile Direct blocked-conversation bound exceeded".to_string(),
+            });
+        }
+        state
+            .blocked_conversations
+            .insert(conversation_id.to_string(), outcome);
+    }
+    state.current_history = None;
+    state.history_index = state
+        .history_index
+        .checked_add(1)
+        .ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct history index overflow".to_string(),
+        })?;
+    if state.history_index == state.history_order.len() {
+        state.phase = MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+    } else if state.history_index > state.history_order.len() {
+        fail_mobile_direct_sync_sticky(state);
+        return Err(VeilError::Session {
+            msg: "mobile Direct history index exceeded its order".to_string(),
+        });
+    }
+    Ok(())
+}
+
+fn begin_mobile_direct_history_phase(state: &mut MobileDirectSyncState) -> Result<(), VeilError> {
+    if state.phase != MobileDirectSyncPhase::Directory
+        || state.outstanding_request.is_some()
+        || state.next_cursor.is_some()
+        || !state.history_order.is_empty()
+        || state.history_index != 0
+        || state.current_history.is_some()
+        || !state.blocked_conversations.is_empty()
+    {
+        fail_mobile_direct_sync_sticky(state);
+        return Err(VeilError::Session {
+            msg: "mobile Direct history phase transition is invalid".to_string(),
+        });
+    }
+    state.history_order = state.peers.keys().cloned().collect();
+    state.history_order.sort_unstable();
+    state.phase = MobileDirectSyncPhase::DirectHistory;
     Ok(())
 }
 
@@ -237,6 +302,33 @@ pub struct MobileDirectDirectoryPageData {
 #[derive(Debug, uniffi::Record)]
 pub struct MobileDirectPreKeyResult {
     pub status: String,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileDirectHistoryOutcome {
+    InProgress,
+    Complete,
+    IncompleteSelfHistory,
+    ConversationRejected,
+    StorageUncertain,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectHistoryNext {
+    pub request: Option<MobileDirectRestRequest>,
+    pub histories_terminal: bool,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectHistoryProgress {
+    pub outcome: MobileDirectHistoryOutcome,
+    pub histories_terminal: bool,
+}
+
+#[derive(Debug, uniffi::Record)]
+pub struct MobileDirectLiveBufferProgress {
+    pub buffered_events: u32,
+    pub history_synchronized: bool,
 }
 
 #[derive(uniffi::Record)]
@@ -725,6 +817,14 @@ impl MobileConnectCancellation {
 /// Native mobile session backed by the same SQLCipher/per-device engine as
 /// desktop. Account authentication and request signatures never cross into
 /// JavaScript; Kotlin receives only bounded public binding metadata.
+///
+/// Any operation needing more than one guard must acquire them in this order:
+/// `direct_sync` -> `binding` -> `client`. Lifecycle invalidation never waits
+/// for `direct_sync` while retaining `client`, preventing a reconnect/history
+/// callback inversion from deadlocking the serialized Android runtime. Initial
+/// authentication is the deliberate exception: it holds `client` while
+/// publishing a previously invalidated `binding`; no current Direct lease can
+/// exist until that publication has completed.
 #[derive(uniffi::Object)]
 pub struct VeilMobileSession {
     client: Mutex<veil_client::api::VeilClient>,
@@ -888,15 +988,16 @@ impl VeilMobileSession {
         *sync = Some(MobileDirectSyncState {
             token: token.clone(),
             epoch: epoch.clone(),
-            own_prekeys_complete: false,
+            phase: MobileDirectSyncPhase::OwnPreKeys,
             own_prekey_publication: None,
             next_cursor: None,
-            directory_complete: false,
-            history: veil_client::direct::DirectDirectorySyncHistory::default(),
+            directory_history: veil_client::direct::DirectDirectorySyncHistory::default(),
             peers: HashMap::new(),
-            outstanding_own_prekey_request: None,
-            outstanding_directory_request: None,
-            outstanding_prekey_requests: HashMap::new(),
+            history_order: Vec::new(),
+            history_index: 0,
+            current_history: None,
+            blocked_conversations: BTreeMap::new(),
+            outstanding_request: None,
         });
         Ok(MobileDirectSyncLease {
             token,
@@ -924,16 +1025,12 @@ impl VeilMobileSession {
         let state = sync.as_mut().ok_or_else(|| VeilError::Session {
             msg: "mobile Direct sync is unavailable".to_string(),
         })?;
-        if state.token != lease_token || state.own_prekeys_complete {
+        if state.token != lease_token || state.phase != MobileDirectSyncPhase::OwnPreKeys {
             return Err(VeilError::Session {
                 msg: "mobile own-prekey lease is stale or complete".to_string(),
             });
         }
-        if state.outstanding_directory_request.is_some()
-            || state.next_cursor.is_some()
-            || state.directory_complete
-            || !state.peers.is_empty()
-        {
+        if state.next_cursor.is_some() || !state.peers.is_empty() {
             return Err(VeilError::Session {
                 msg: "mobile Direct directory started before own-prekey publication".to_string(),
             });
@@ -946,8 +1043,17 @@ impl VeilMobileSession {
                 msg: "mobile own-prekey lease is stale".to_string(),
             });
         }
-        if let Some(outstanding) = state.outstanding_own_prekey_request.as_ref() {
-            return Ok(mobile_direct_rest_request_data(&outstanding.request));
+        if let Some(outstanding) = state.outstanding_request.as_ref() {
+            if matches!(
+                outstanding.kind,
+                MobileDirectOutstandingRequestKind::OwnPreKeyCount
+                    | MobileDirectOutstandingRequestKind::OwnPreKeyUpload
+            ) {
+                return Ok(mobile_direct_rest_request_data(outstanding));
+            }
+            return Err(VeilError::Session {
+                msg: "another mobile Direct request is already outstanding".to_string(),
+            });
         }
 
         let client = self.client.lock().map_err(|error| VeilError::Session {
@@ -971,37 +1077,32 @@ impl VeilMobileSession {
             }
         }
 
-        let (kind, request) = if let Some(publication) = state.own_prekey_publication.as_ref() {
-            (
-                MobileDirectOwnPreKeyRequestKind::Upload,
-                MobileDirectOutstandingRequest {
-                    token: new_mobile_sync_token(),
-                    method: "POST",
-                    target: "/v1/prekeys".to_string(),
-                    body: Zeroizing::new(publication.request_body.clone()),
-                    response_limit_bytes: MOBILE_OWN_PREKEY_UPLOAD_RESPONSE_LIMIT,
-                },
-            )
+        let request = if let Some(publication) = state.own_prekey_publication.as_ref() {
+            MobileDirectOutstandingRequest {
+                kind: MobileDirectOutstandingRequestKind::OwnPreKeyUpload,
+                token: new_mobile_sync_token(),
+                method: "POST",
+                target: "/v1/prekeys".to_string(),
+                body: Zeroizing::new(publication.request_body.clone()),
+                response_limit_bytes: MOBILE_OWN_PREKEY_UPLOAD_RESPONSE_LIMIT,
+            }
         } else {
             let target = client
                 .own_prekey_count_target()
                 .map_err(|_| VeilError::Session {
                     msg: "mobile own-prekey count request is unavailable".to_string(),
                 })?;
-            (
-                MobileDirectOwnPreKeyRequestKind::Count,
-                MobileDirectOutstandingRequest {
-                    token: new_mobile_sync_token(),
-                    method: "GET",
-                    target,
-                    body: Zeroizing::new(Vec::new()),
-                    response_limit_bytes: veil_client::prekeys::OWN_PREKEY_RESPONSE_LIMIT as u32,
-                },
-            )
+            MobileDirectOutstandingRequest {
+                kind: MobileDirectOutstandingRequestKind::OwnPreKeyCount,
+                token: new_mobile_sync_token(),
+                method: "GET",
+                target,
+                body: Zeroizing::new(Vec::new()),
+                response_limit_bytes: veil_client::prekeys::OWN_PREKEY_RESPONSE_LIMIT as u32,
+            }
         };
         let result = mobile_direct_rest_request_data(&request);
-        state.outstanding_own_prekey_request =
-            Some(MobileDirectOwnPreKeyOutstandingRequest { kind, request });
+        state.outstanding_request = Some(request);
         Ok(result)
     }
 
@@ -1025,20 +1126,32 @@ impl VeilMobileSession {
         let state = sync.as_mut().ok_or_else(|| VeilError::Session {
             msg: "mobile Direct sync is unavailable".to_string(),
         })?;
-        if state.token != lease_token || state.own_prekeys_complete {
+        if state.token != lease_token || state.phase != MobileDirectSyncPhase::OwnPreKeys {
             return Err(VeilError::Session {
                 msg: "mobile own-prekey lease is stale or complete".to_string(),
             });
         }
         let outstanding = state
-            .outstanding_own_prekey_request
+            .outstanding_request
             .as_ref()
-            .filter(|outstanding| outstanding.request.token == request_token)
+            .filter(|outstanding| {
+                outstanding.token == request_token
+                    && matches!(
+                        outstanding.kind,
+                        MobileDirectOutstandingRequestKind::OwnPreKeyCount
+                            | MobileDirectOutstandingRequestKind::OwnPreKeyUpload
+                    )
+            })
             .cloned()
             .ok_or_else(|| VeilError::Session {
                 msg: "mobile own-prekey request is stale".to_string(),
             })?;
-        require_mobile_direct_response_limit(&outstanding.request, &response)?;
+        let response = Zeroizing::new(response);
+        if let Err(error) = require_mobile_direct_response_limit(&outstanding, response.as_slice())
+        {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(error);
+        }
         let binding = self.binding.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile binding: {error}"),
         })?;
@@ -1051,11 +1164,11 @@ impl VeilMobileSession {
             msg: format!("lock mobile client: {error}"),
         })?;
 
-        match outstanding.kind {
-            MobileDirectOwnPreKeyRequestKind::Count => {
+        match &outstanding.kind {
+            MobileDirectOutstandingRequestKind::OwnPreKeyCount => {
                 if state.own_prekey_publication.is_some()
-                    || outstanding.request.method != "GET"
-                    || !outstanding.request.body.is_empty()
+                    || outstanding.method != "GET"
+                    || !outstanding.body.is_empty()
                 {
                     return Err(VeilError::Session {
                         msg: "mobile own-prekey count state is invalid".to_string(),
@@ -1065,18 +1178,18 @@ impl VeilMobileSession {
                     .prepare_own_prekey_publication_after_count(
                         &state.epoch.binding.canonical_server_origin,
                         &state.epoch.binding.user_id,
-                        &response,
+                        response.as_slice(),
                     )
                     .map_err(|_| VeilError::Session {
                         msg: "mobile own-prekey count response was rejected".to_string(),
                     })?;
                 state.own_prekey_publication = Some(publication);
-                state.outstanding_own_prekey_request = None;
+                state.outstanding_request = None;
                 Ok(MobileDirectOwnPreKeyProgress {
                     publication_complete: false,
                 })
             }
-            MobileDirectOwnPreKeyRequestKind::Upload => {
+            MobileDirectOutstandingRequestKind::OwnPreKeyUpload => {
                 let publication =
                     state
                         .own_prekey_publication
@@ -1084,9 +1197,9 @@ impl VeilMobileSession {
                         .ok_or_else(|| VeilError::Session {
                             msg: "mobile own-prekey upload state is invalid".to_string(),
                         })?;
-                if outstanding.request.method != "POST"
-                    || outstanding.request.target != "/v1/prekeys"
-                    || outstanding.request.body.as_slice() != publication.request_body.as_slice()
+                if outstanding.method != "POST"
+                    || outstanding.target != "/v1/prekeys"
+                    || outstanding.body.as_slice() != publication.request_body.as_slice()
                 {
                     return Err(VeilError::Session {
                         msg: "mobile own-prekey upload request changed".to_string(),
@@ -1098,18 +1211,19 @@ impl VeilMobileSession {
                         &state.epoch.binding.user_id,
                         publication.signed_prekey_id,
                         &publication.body_sha256,
-                        &response,
+                        response.as_slice(),
                     )
                     .map_err(|_| VeilError::Session {
                         msg: "mobile own-prekey upload response was rejected".to_string(),
                     })?;
-                state.own_prekeys_complete = true;
+                state.phase = MobileDirectSyncPhase::Directory;
                 state.own_prekey_publication = None;
-                state.outstanding_own_prekey_request = None;
+                state.outstanding_request = None;
                 Ok(MobileDirectOwnPreKeyProgress {
                     publication_complete: true,
                 })
             }
+            _ => unreachable!("own-prekey request kind was preflighted"),
         }
     }
 
@@ -1127,14 +1241,9 @@ impl VeilMobileSession {
         let state = sync.as_mut().ok_or_else(|| VeilError::Session {
             msg: "mobile Direct sync is unavailable".to_string(),
         })?;
-        if state.token != lease_token || state.directory_complete {
+        if state.token != lease_token || state.phase != MobileDirectSyncPhase::Directory {
             return Err(VeilError::Session {
                 msg: "mobile Direct sync lease is stale or directory is complete".to_string(),
-            });
-        }
-        if !state.own_prekeys_complete || state.outstanding_own_prekey_request.is_some() {
-            return Err(VeilError::Session {
-                msg: "mobile own-prekey publication is incomplete".to_string(),
             });
         }
         let binding = self.binding.lock().map_err(|error| VeilError::Session {
@@ -1145,10 +1254,16 @@ impl VeilMobileSession {
                 msg: "mobile Direct sync lease is stale".to_string(),
             });
         }
-        if let Some(request) = state.outstanding_directory_request.as_ref() {
-            return Ok(mobile_direct_rest_request_data(request));
+        if let Some(request) = state.outstanding_request.as_ref() {
+            if request.kind == MobileDirectOutstandingRequestKind::Directory {
+                return Ok(mobile_direct_rest_request_data(request));
+            }
+            return Err(VeilError::Session {
+                msg: "another mobile Direct request is already outstanding".to_string(),
+            });
         }
         let request = MobileDirectOutstandingRequest {
+            kind: MobileDirectOutstandingRequestKind::Directory,
             token: new_mobile_sync_token(),
             method: "GET",
             target: mobile_direct_directory_target(state.next_cursor.as_deref())?,
@@ -1156,7 +1271,7 @@ impl VeilMobileSession {
             response_limit_bytes: veil_client::direct::DIRECT_DIRECTORY_RESPONSE_LIMIT as u32,
         };
         let result = mobile_direct_rest_request_data(&request);
-        state.outstanding_directory_request = Some(request);
+        state.outstanding_request = Some(request);
         Ok(result)
     }
 
@@ -1185,24 +1300,26 @@ impl VeilMobileSession {
                 msg: "mobile Direct sync lease is stale".to_string(),
             });
         }
-        if !state.own_prekeys_complete || state.outstanding_own_prekey_request.is_some() {
-            return Err(VeilError::Session {
-                msg: "mobile own-prekey publication is incomplete".to_string(),
-            });
-        }
-        if state.directory_complete {
+        if state.phase != MobileDirectSyncPhase::Directory {
             return Err(VeilError::Session {
                 msg: "mobile Direct directory is already complete".to_string(),
             });
         }
         let outstanding = state
-            .outstanding_directory_request
+            .outstanding_request
             .as_ref()
-            .filter(|request| request.token == request_token)
+            .filter(|request| {
+                request.token == request_token
+                    && request.kind == MobileDirectOutstandingRequestKind::Directory
+            })
             .ok_or_else(|| VeilError::Session {
                 msg: "mobile Direct directory request is stale".to_string(),
             })?;
-        require_mobile_direct_response_limit(outstanding, &response)?;
+        let response = Zeroizing::new(response);
+        if let Err(error) = require_mobile_direct_response_limit(outstanding, response.as_slice()) {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(error);
+        }
         let binding = self.binding.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile binding: {error}"),
         })?;
@@ -1219,8 +1336,8 @@ impl VeilMobileSession {
             &state.epoch.binding.canonical_server_origin,
             &state.epoch.binding.user_id,
             state.next_cursor.as_deref(),
-            &mut state.history,
-            &response,
+            &mut state.directory_history,
+            response.as_slice(),
         )
         .map_err(|msg| VeilError::Session { msg })?;
         let skipped_non_direct =
@@ -1229,7 +1346,7 @@ impl VeilMobileSession {
                 .map_err(|_| VeilError::Session {
                     msg: "mobile Direct skipped conversation count overflow".to_string(),
                 })?;
-        state.outstanding_directory_request = None;
+        state.outstanding_request = None;
         let mut conversations = Vec::with_capacity(page.conversations.len());
         for conversation in page.conversations {
             state.peers.insert(
@@ -1251,12 +1368,318 @@ impl VeilMobileSession {
             });
         }
         state.next_cursor = page.next_cursor.clone();
-        state.directory_complete = page.next_cursor.is_none();
+        let directory_complete = page.next_cursor.is_none();
+        if directory_complete {
+            begin_mobile_direct_history_phase(state)?;
+        }
         Ok(MobileDirectDirectoryPageData {
             conversations,
             next_cursor: page.next_cursor,
             skipped_non_direct,
-            directory_complete: state.directory_complete,
+            directory_complete,
+        })
+    }
+
+    /// Prepare exactly one immutable Direct-history GET. The scheduler owns
+    /// conversation order and cursors; Android can only transport the returned
+    /// capability. Repeating this operation before installation returns the
+    /// same immutable request token and bytes.
+    pub fn prepare_next_direct_history_request(
+        &self,
+        lease_token: String,
+    ) -> Result<MobileDirectHistoryNext, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        if state.token != lease_token {
+            return Err(VeilError::Session {
+                msg: "mobile Direct history lease is stale".to_string(),
+            });
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct history lease is stale".to_string(),
+            });
+        }
+        if state.phase == MobileDirectSyncPhase::HistorySynchronizedAwaitingLive {
+            return Ok(MobileDirectHistoryNext {
+                request: None,
+                histories_terminal: true,
+            });
+        }
+        if state.phase != MobileDirectSyncPhase::DirectHistory {
+            return Err(VeilError::Session {
+                msg: "mobile Direct history is unavailable in this phase".to_string(),
+            });
+        }
+
+        if state.history_index >= state.history_order.len() {
+            state.phase = MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
+            state.current_history = None;
+            return Ok(MobileDirectHistoryNext {
+                request: None,
+                histories_terminal: true,
+            });
+        }
+        let conversation_id = state.history_order[state.history_index].clone();
+        if let Some(request) = state.outstanding_request.as_ref() {
+            if request.kind
+                == (MobileDirectOutstandingRequestKind::History {
+                    conversation_id: conversation_id.clone(),
+                })
+            {
+                return Ok(MobileDirectHistoryNext {
+                    request: Some(mobile_direct_rest_request_data(request)),
+                    histories_terminal: false,
+                });
+            }
+            return Err(VeilError::Session {
+                msg: "another mobile Direct request is already outstanding".to_string(),
+            });
+        }
+
+        if state.current_history.is_none() {
+            let history = match veil_client::direct_history::DirectHistorySyncState::new(
+                &state.epoch.binding.canonical_server_origin,
+                &state.epoch.binding.user_id,
+                &conversation_id,
+            ) {
+                Ok(history) => history,
+                Err(_) => {
+                    fail_mobile_direct_sync_sticky(state);
+                    return Err(VeilError::Session {
+                        msg: "mobile Direct history scope is invalid".to_string(),
+                    });
+                }
+            };
+            state.current_history = Some(history);
+        }
+        let history = state
+            .current_history
+            .as_ref()
+            .ok_or_else(|| VeilError::Session {
+                msg: "mobile Direct history state is unavailable".to_string(),
+            })?;
+        if history.conversation_id() != conversation_id {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(VeilError::Session {
+                msg: "mobile Direct history scheduler diverged".to_string(),
+            });
+        }
+        let target = match veil_client::direct_history::direct_history_request_target(history) {
+            Ok(target) => target,
+            Err(_) => {
+                fail_mobile_direct_sync_sticky(state);
+                return Err(VeilError::Session {
+                    msg: "mobile Direct history request is unavailable".to_string(),
+                });
+            }
+        };
+        let request = MobileDirectOutstandingRequest {
+            kind: MobileDirectOutstandingRequestKind::History { conversation_id },
+            token: new_mobile_sync_token(),
+            method: "GET",
+            target,
+            body: Zeroizing::new(Vec::new()),
+            response_limit_bytes: veil_client::direct_history::DIRECT_HISTORY_RESPONSE_LIMIT as u32,
+        };
+        let result = mobile_direct_rest_request_data(&request);
+        state.outstanding_request = Some(request);
+        Ok(MobileDirectHistoryNext {
+            request: Some(result),
+            histories_terminal: false,
+        })
+    }
+
+    /// Install one bounded history page and return only a coarse typed
+    /// scheduler outcome. Conversation rejection is isolated; uncertain local
+    /// storage is a sticky global abort for this authenticated generation.
+    pub fn install_direct_history_response(
+        &self,
+        lease_token: String,
+        request_token: String,
+        response: Vec<u8>,
+    ) -> Result<MobileDirectHistoryProgress, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        require_mobile_sync_token(&request_token)?;
+        let response = Zeroizing::new(response);
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        if state.token != lease_token || state.phase != MobileDirectSyncPhase::DirectHistory {
+            return Err(VeilError::Session {
+                msg: "mobile Direct history lease is stale or terminal".to_string(),
+            });
+        }
+        let outstanding = state
+            .outstanding_request
+            .as_ref()
+            .filter(|request| request.token == request_token)
+            .cloned()
+            .ok_or_else(|| VeilError::Session {
+                msg: "mobile Direct history request is stale".to_string(),
+            })?;
+        let conversation_id = match &outstanding.kind {
+            MobileDirectOutstandingRequestKind::History { conversation_id } => {
+                conversation_id.clone()
+            }
+            _ => {
+                return Err(VeilError::Session {
+                    msg: "mobile Direct request stage changed".to_string(),
+                })
+            }
+        };
+        if let Err(error) = require_mobile_direct_response_limit(&outstanding, response.as_slice())
+        {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(error);
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct history lease is stale".to_string(),
+            });
+        }
+        if state.history_order.get(state.history_index) != Some(&conversation_id)
+            || state
+                .current_history
+                .as_ref()
+                .is_none_or(|history| history.conversation_id() != conversation_id)
+        {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(VeilError::Session {
+                msg: "mobile Direct history scheduler diverged".to_string(),
+            });
+        }
+
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let install = veil_client::direct_history::install_authenticated_direct_history_page(
+            &mut client,
+            state
+                .current_history
+                .as_mut()
+                .expect("history state preflighted"),
+            response.as_slice(),
+        );
+        state.outstanding_request = None;
+
+        use veil_client::direct_history::{DirectHistoryInstallError, DirectHistorySyncOutcome};
+        let outcome = match install {
+            Ok(page) => match page.outcome {
+                DirectHistorySyncOutcome::InProgress => MobileDirectHistoryOutcome::InProgress,
+                DirectHistorySyncOutcome::Complete => {
+                    finish_mobile_direct_history_conversation(
+                        state,
+                        &conversation_id,
+                        MobileDirectHistoryOutcome::Complete,
+                    )?;
+                    MobileDirectHistoryOutcome::Complete
+                }
+                DirectHistorySyncOutcome::IncompleteSelfHistory => {
+                    finish_mobile_direct_history_conversation(
+                        state,
+                        &conversation_id,
+                        MobileDirectHistoryOutcome::IncompleteSelfHistory,
+                    )?;
+                    MobileDirectHistoryOutcome::IncompleteSelfHistory
+                }
+            },
+            Err(DirectHistoryInstallError::ConversationRejected { .. }) => {
+                finish_mobile_direct_history_conversation(
+                    state,
+                    &conversation_id,
+                    MobileDirectHistoryOutcome::ConversationRejected,
+                )?;
+                MobileDirectHistoryOutcome::ConversationRejected
+            }
+            Err(DirectHistoryInstallError::StorageUncertain) => {
+                fail_mobile_direct_sync_sticky(state);
+                MobileDirectHistoryOutcome::StorageUncertain
+            }
+        };
+        Ok(MobileDirectHistoryProgress {
+            outcome,
+            histories_terminal: state.phase
+                == MobileDirectSyncPhase::HistorySynchronizedAwaitingLive,
+        })
+    }
+
+    /// Pump authenticated WebSocket events into the shared bounded deferred
+    /// FIFO while history is synchronized. Stage 5 deliberately never drains
+    /// or publishes that FIFO and therefore cannot transition to Ready.
+    pub fn buffer_direct_live_events_during_sync(
+        &self,
+        lease_token: String,
+    ) -> Result<MobileDirectLiveBufferProgress, VeilError> {
+        require_mobile_sync_token(&lease_token)?;
+        let mut sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let state = sync.as_mut().ok_or_else(|| VeilError::Session {
+            msg: "mobile Direct sync is unavailable".to_string(),
+        })?;
+        if state.token != lease_token
+            || !matches!(
+                state.phase,
+                MobileDirectSyncPhase::OwnPreKeys
+                    | MobileDirectSyncPhase::Directory
+                    | MobileDirectSyncPhase::DirectHistory
+                    | MobileDirectSyncPhase::HistorySynchronizedAwaitingLive
+            )
+        {
+            return Err(VeilError::Session {
+                msg: "mobile Direct live buffer lease is stale or unavailable".to_string(),
+            });
+        }
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Err(VeilError::Session {
+                msg: "mobile Direct live buffer lease is stale".to_string(),
+            });
+        }
+        let mut client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let buffered = match client.buffer_connection_events_during_sync() {
+            Ok(buffered) => buffered,
+            Err(_) => {
+                fail_mobile_direct_sync_sticky(state);
+                return Err(VeilError::Session {
+                    msg: "mobile Direct live buffer terminated".to_string(),
+                });
+            }
+        };
+        Ok(MobileDirectLiveBufferProgress {
+            buffered_events: buffered.try_into().map_err(|_| VeilError::Session {
+                msg: "mobile Direct live buffer count overflow".to_string(),
+            })?,
+            history_synchronized: state.phase
+                == MobileDirectSyncPhase::HistorySynchronizedAwaitingLive,
         })
     }
 
@@ -1278,9 +1701,9 @@ impl VeilMobileSession {
         let state = sync.as_mut().ok_or_else(|| VeilError::Session {
             msg: "mobile Direct sync is unavailable".to_string(),
         })?;
-        if state.token != lease_token || !state.directory_complete {
+        if state.token != lease_token || state.phase != MobileDirectSyncPhase::Ready {
             return Err(VeilError::Session {
-                msg: "mobile Direct sync lease is stale or directory is incomplete".to_string(),
+                msg: "mobile Direct sync lease is stale or live replay is incomplete".to_string(),
             });
         }
         let peer =
@@ -1291,6 +1714,11 @@ impl VeilMobileSession {
                 .ok_or_else(|| VeilError::Session {
                     msg: "Direct conversation is absent from the authenticated lease".to_string(),
                 })?;
+        if state.blocked_conversations.contains_key(&conversation_id) {
+            return Err(VeilError::Session {
+                msg: "Direct conversation is blocked by authenticated history".to_string(),
+            });
+        }
         let binding = self.binding.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile binding: {error}"),
         })?;
@@ -1307,10 +1735,22 @@ impl VeilMobileSession {
                 msg: "Direct session is already established".to_string(),
             });
         }
-        if let Some(request) = state.outstanding_prekey_requests.get(&conversation_id) {
-            return Ok(mobile_direct_rest_request_data(request));
+        if let Some(request) = state.outstanding_request.as_ref() {
+            if request.kind
+                == (MobileDirectOutstandingRequestKind::PeerPreKey {
+                    conversation_id: conversation_id.clone(),
+                })
+            {
+                return Ok(mobile_direct_rest_request_data(request));
+            }
+            return Err(VeilError::Session {
+                msg: "another mobile Direct request is already outstanding".to_string(),
+            });
         }
         let request = MobileDirectOutstandingRequest {
+            kind: MobileDirectOutstandingRequestKind::PeerPreKey {
+                conversation_id: conversation_id.clone(),
+            },
             token: new_mobile_sync_token(),
             method: "GET",
             target: format!("/v1/prekeys/{}", hex::encode(peer.identity_key)),
@@ -1318,9 +1758,7 @@ impl VeilMobileSession {
             response_limit_bytes: veil_client::direct::DIRECT_PREKEY_RESPONSE_LIMIT as u32,
         };
         let result = mobile_direct_rest_request_data(&request);
-        state
-            .outstanding_prekey_requests
-            .insert(conversation_id, request);
+        state.outstanding_request = Some(request);
         Ok(result)
     }
 
@@ -1343,9 +1781,9 @@ impl VeilMobileSession {
         let state = sync.as_mut().ok_or_else(|| VeilError::Session {
             msg: "mobile Direct sync is unavailable".to_string(),
         })?;
-        if state.token != lease_token || !state.directory_complete {
+        if state.token != lease_token || state.phase != MobileDirectSyncPhase::Ready {
             return Err(VeilError::Session {
-                msg: "mobile Direct sync lease is stale or directory is incomplete".to_string(),
+                msg: "mobile Direct sync lease is stale or live replay is incomplete".to_string(),
             });
         }
         let peer =
@@ -1356,14 +1794,29 @@ impl VeilMobileSession {
                 .ok_or_else(|| VeilError::Session {
                     msg: "Direct conversation is absent from the authenticated lease".to_string(),
                 })?;
+        if state.blocked_conversations.contains_key(&conversation_id) {
+            return Err(VeilError::Session {
+                msg: "Direct conversation is blocked by authenticated history".to_string(),
+            });
+        }
         let outstanding = state
-            .outstanding_prekey_requests
-            .get(&conversation_id)
-            .filter(|request| request.token == request_token)
+            .outstanding_request
+            .as_ref()
+            .filter(|request| {
+                request.token == request_token
+                    && request.kind
+                        == (MobileDirectOutstandingRequestKind::PeerPreKey {
+                            conversation_id: conversation_id.clone(),
+                        })
+            })
             .ok_or_else(|| VeilError::Session {
                 msg: "mobile Direct prekey request is stale".to_string(),
             })?;
-        require_mobile_direct_response_limit(outstanding, &response)?;
+        let response = Zeroizing::new(response);
+        if let Err(error) = require_mobile_direct_response_limit(outstanding, response.as_slice()) {
+            fail_mobile_direct_sync_sticky(state);
+            return Err(error);
+        }
         let binding = self.binding.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile binding: {error}"),
         })?;
@@ -1380,10 +1833,10 @@ impl VeilMobileSession {
             &peer.user_id,
             peer.identity_key,
             peer.signing_key,
-            &response,
+            response.as_slice(),
         )
         .map_err(|msg| VeilError::Session { msg })?;
-        state.outstanding_prekey_requests.remove(&conversation_id);
+        state.outstanding_request = None;
         let status = match result {
             veil_client::direct::DirectPreKeyInstallResult::Established => "established",
             veil_client::direct::DirectPreKeyInstallResult::AlreadyEstablished => {
@@ -2315,7 +2768,6 @@ fn require_rest_target(target: &str) -> Result<(), VeilError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine;
     use bip39::Language;
     use sha2::{Digest, Sha256};
 
@@ -2342,6 +2794,26 @@ mod tests {
                 user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
             },
             generation,
+        }
+    }
+
+    fn mobile_test_sync_state(
+        generation: u64,
+        phase: MobileDirectSyncPhase,
+    ) -> MobileDirectSyncState {
+        MobileDirectSyncState {
+            token: "ab".repeat(32),
+            epoch: mobile_test_epoch(generation),
+            phase,
+            own_prekey_publication: None,
+            next_cursor: None,
+            directory_history: veil_client::direct::DirectDirectorySyncHistory::default(),
+            peers: HashMap::new(),
+            history_order: Vec::new(),
+            history_index: 0,
+            current_history: None,
+            blocked_conversations: BTreeMap::new(),
+            outstanding_request: None,
         }
     }
 
@@ -2385,15 +2857,16 @@ mod tests {
                 direct_sync: Mutex::new(Some(MobileDirectSyncState {
                     token: token.clone(),
                     epoch,
-                    own_prekeys_complete: true,
+                    phase: MobileDirectSyncPhase::Directory,
                     own_prekey_publication: None,
                     next_cursor: None,
-                    directory_complete: false,
-                    history: veil_client::direct::DirectDirectorySyncHistory::default(),
+                    directory_history: veil_client::direct::DirectDirectorySyncHistory::default(),
                     peers: HashMap::new(),
-                    outstanding_own_prekey_request: None,
-                    outstanding_directory_request: None,
-                    outstanding_prekey_requests: HashMap::new(),
+                    history_order: Vec::new(),
+                    history_index: 0,
+                    current_history: None,
+                    blocked_conversations: BTreeMap::new(),
+                    outstanding_request: None,
                 })),
                 next_binding_generation: AtomicU64::new(generation),
                 last_rest_timestamp_ms: AtomicI64::new(0),
@@ -2977,7 +3450,7 @@ mod tests {
         {
             let mut sync = session.direct_sync.lock().unwrap();
             let state = sync.as_mut().unwrap();
-            state.own_prekeys_complete = false;
+            state.phase = MobileDirectSyncPhase::OwnPreKeys;
         }
 
         assert_eq!(
@@ -2985,7 +3458,7 @@ mod tests {
                 .prepare_direct_directory_request(token.clone())
                 .unwrap_err()
                 .to_string(),
-            "Session error: mobile own-prekey publication is incomplete"
+            "Session error: mobile Direct sync lease is stale or directory is complete"
         );
 
         let count = session.prepare_own_prekey_request(token.clone()).unwrap();
@@ -3058,17 +3531,6 @@ mod tests {
                 .install_own_prekey_response(
                     token.clone(),
                     upload.request_token.clone(),
-                    vec![b' '; MOBILE_OWN_PREKEY_UPLOAD_RESPONSE_LIMIT as usize + 1],
-                )
-                .unwrap_err()
-                .to_string(),
-            "Session error: mobile Direct response exceeds the native request limit"
-        );
-        assert_eq!(
-            session
-                .install_own_prekey_response(
-                    token.clone(),
-                    upload.request_token.clone(),
                     br#"{"stored":20,"opk_remaining":20}"#.to_vec(),
                 )
                 .unwrap_err()
@@ -3098,7 +3560,7 @@ mod tests {
     }
 
     #[test]
-    fn mobile_direct_sync_installs_only_under_its_object_bound_random_lease() {
+    fn mobile_direct_history_is_object_bound_repeated_and_blocks_prekeys_until_live_replay() {
         let (session, path, token) = mobile_test_session_with_sync(9);
         let (response, peer) = mobile_test_directory_response(&session);
         let request = session
@@ -3139,59 +3601,62 @@ mod tests {
         );
 
         let conversation_id = "20000000-0000-4000-8000-000000000001".to_string();
-        let prekey_request = session
-            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
-            .unwrap();
-        assert_eq!(
-            prekey_request.request_target,
-            format!("/v1/prekeys/{}", hex::encode(peer.x25519_public_bytes()))
-        );
-        let repeated_request = session
-            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
-            .unwrap();
-        assert_eq!(repeated_request.request_token, prekey_request.request_token);
-
-        let peer_identity = peer.x25519_public_bytes();
-        let peer_signing = peer.ed25519_public_bytes();
-        let mut peer_client = veil_client::api::VeilClient::from_identity(peer);
-        let prekeys = peer_client.generate_prekeys().unwrap();
-        let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
-        let b64 = base64::engine::general_purpose::STANDARD;
-        let prekey_response = serde_json::to_vec(&serde_json::json!({
-            "identity_key": b64.encode(peer_identity),
-            "signing_key": b64.encode(peer_signing),
-            "signed_prekey": b64.encode(prekeys.spk_public),
-            "signed_prekey_signature": b64.encode(prekeys.spk_signature),
-            "signed_prekey_id": prekeys.spk_id,
-            "one_time_prekey": b64.encode(one_time_prekey),
-            "one_time_prekey_id": one_time_prekey_id,
-        }))
-        .unwrap();
         assert!(session
-            .install_direct_prekey_bundle(
-                token.clone(),
-                new_mobile_sync_token(),
-                conversation_id.clone(),
-                prekey_response.clone(),
-            )
+            .prepare_direct_prekey_request(token.clone(), conversation_id.clone())
             .unwrap_err()
             .to_string()
-            .contains("request is stale"));
+            .contains("live replay is incomplete"));
+
+        let history = session
+            .prepare_next_direct_history_request(token.clone())
+            .unwrap();
+        assert!(!history.histories_terminal);
+        let history_request = history.request.unwrap();
+        assert_eq!(
+            history_request.request_target,
+            format!("/v1/messages/{conversation_id}?limit=25")
+        );
+        assert_eq!(history_request.method, "GET");
+        assert!(history_request.body.is_empty());
+        assert_eq!(
+            history_request.response_limit_bytes,
+            veil_client::direct_history::DIRECT_HISTORY_RESPONSE_LIMIT as u32
+        );
+        let repeated = session
+            .prepare_next_direct_history_request(token.clone())
+            .unwrap()
+            .request
+            .unwrap();
+        assert_eq!(repeated.request_token, history_request.request_token);
+        assert!(session
+            .prepare_direct_directory_request(token.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("directory is complete"));
         let installed = session
-            .install_direct_prekey_bundle(
+            .install_direct_history_response(
                 token.clone(),
-                prekey_request.request_token,
-                conversation_id.clone(),
-                prekey_response,
+                history_request.request_token,
+                br#"{"messages":[],"count":0}"#.to_vec(),
             )
             .unwrap();
-        assert_eq!(installed.status, "established");
-        assert!(session.client.lock().unwrap().has_session(&peer_identity));
+        assert_eq!(installed.outcome, MobileDirectHistoryOutcome::Complete);
+        assert!(installed.histories_terminal);
+        let terminal = session
+            .prepare_next_direct_history_request(token.clone())
+            .unwrap();
+        assert!(terminal.histories_terminal);
+        assert!(terminal.request.is_none());
         assert!(session
             .prepare_direct_prekey_request(token.clone(), conversation_id)
             .unwrap_err()
             .to_string()
-            .contains("already established"));
+            .contains("live replay is incomplete"));
+        assert!(!session
+            .client
+            .lock()
+            .unwrap()
+            .has_session(&peer.x25519_public_bytes()));
 
         let first = new_mobile_sync_token();
         let second = new_mobile_sync_token();
@@ -3199,6 +3664,207 @@ mod tests {
         assert!(require_mobile_sync_token(&first).is_ok());
         assert!(require_mobile_sync_token(&first.to_uppercase()).is_err());
         assert!(require_mobile_sync_token(&"0".repeat(64)).is_err());
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_history_oversize_is_a_sticky_epoch_abort() {
+        let (session, path, token) = mobile_test_session_with_sync(10);
+        let (directory_response, _) = mobile_test_directory_response(&session);
+        let directory_request = session
+            .prepare_direct_directory_request(token.clone())
+            .unwrap();
+        session
+            .install_direct_directory_page(
+                token.clone(),
+                directory_request.request_token,
+                directory_response,
+            )
+            .unwrap();
+        let history_request = session
+            .prepare_next_direct_history_request(token.clone())
+            .unwrap()
+            .request
+            .unwrap();
+        assert!(session
+            .install_direct_history_response(
+                token.clone(),
+                history_request.request_token.clone(),
+                vec![b' '; veil_client::direct_history::DIRECT_HISTORY_RESPONSE_LIMIT + 1],
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("response exceeds"));
+        assert!(session
+            .install_direct_history_response(
+                token.clone(),
+                history_request.request_token,
+                br#"{"messages":[],"count":0}"#.to_vec(),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("stale or terminal"));
+        assert!(session
+            .prepare_next_direct_history_request(token)
+            .unwrap_err()
+            .to_string()
+            .contains("unavailable in this phase"));
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_history_order_is_deterministic_and_lexicographic() {
+        let mut state = mobile_test_sync_state(11, MobileDirectSyncPhase::Directory);
+        for (conversation_id, marker) in [
+            ("20000000-0000-4000-8000-000000000003", 3_u8),
+            ("20000000-0000-4000-8000-000000000001", 1_u8),
+            ("20000000-0000-4000-8000-000000000002", 2_u8),
+        ] {
+            state.peers.insert(
+                conversation_id.to_string(),
+                MobileDirectPeer {
+                    user_id: format!("10000000-0000-4000-8000-{marker:012}"),
+                    identity_key: [marker; 32],
+                    signing_key: [marker.saturating_add(10); 32],
+                },
+            );
+        }
+
+        begin_mobile_direct_history_phase(&mut state).unwrap();
+        assert_eq!(state.phase, MobileDirectSyncPhase::DirectHistory);
+        assert_eq!(
+            state.history_order,
+            vec![
+                "20000000-0000-4000-8000-000000000001",
+                "20000000-0000-4000-8000-000000000002",
+                "20000000-0000-4000-8000-000000000003",
+            ]
+        );
+    }
+
+    #[test]
+    fn mobile_direct_history_blocks_only_current_conversation_and_advances() {
+        let mut state = mobile_test_sync_state(12, MobileDirectSyncPhase::DirectHistory);
+        let first = "20000000-0000-4000-8000-000000000001";
+        let second = "20000000-0000-4000-8000-000000000002";
+        state.history_order = vec![first.to_string(), second.to_string()];
+
+        finish_mobile_direct_history_conversation(
+            &mut state,
+            first,
+            MobileDirectHistoryOutcome::IncompleteSelfHistory,
+        )
+        .unwrap();
+        assert_eq!(state.phase, MobileDirectSyncPhase::DirectHistory);
+        assert_eq!(state.history_index, 1);
+        assert_eq!(
+            state.blocked_conversations.get(first),
+            Some(&MobileDirectHistoryOutcome::IncompleteSelfHistory)
+        );
+        assert!(!state.blocked_conversations.contains_key(second));
+
+        finish_mobile_direct_history_conversation(
+            &mut state,
+            second,
+            MobileDirectHistoryOutcome::ConversationRejected,
+        )
+        .unwrap();
+        assert_eq!(
+            state.phase,
+            MobileDirectSyncPhase::HistorySynchronizedAwaitingLive
+        );
+        assert_eq!(state.history_index, 2);
+        assert_eq!(
+            state.blocked_conversations.get(second),
+            Some(&MobileDirectHistoryOutcome::ConversationRejected)
+        );
+    }
+
+    #[test]
+    fn mobile_direct_sticky_failure_clears_current_and_global_outstanding() {
+        let mut state = mobile_test_sync_state(13, MobileDirectSyncPhase::DirectHistory);
+        let conversation_id = "20000000-0000-4000-8000-000000000001";
+        state.history_order.push(conversation_id.to_string());
+        state.current_history = Some(
+            veil_client::direct_history::DirectHistorySyncState::new(
+                &state.epoch.binding.canonical_server_origin,
+                &state.epoch.binding.user_id,
+                conversation_id,
+            )
+            .unwrap(),
+        );
+        state.outstanding_request = Some(MobileDirectOutstandingRequest {
+            kind: MobileDirectOutstandingRequestKind::History {
+                conversation_id: conversation_id.to_string(),
+            },
+            token: "cd".repeat(32),
+            method: "GET",
+            target: format!("/v1/messages/{conversation_id}?limit=25"),
+            body: Zeroizing::new(Vec::new()),
+            response_limit_bytes: veil_client::direct_history::DIRECT_HISTORY_RESPONSE_LIMIT as u32,
+        });
+
+        fail_mobile_direct_sync_sticky(&mut state);
+        assert_eq!(state.phase, MobileDirectSyncPhase::Failed);
+        assert!(state.current_history.is_none());
+        assert!(state.outstanding_request.is_none());
+    }
+
+    #[test]
+    fn mobile_direct_global_outstanding_rejects_cross_stage_prepare() {
+        let (session, path, token) = mobile_test_session_with_sync(14);
+        {
+            let mut sync = session.direct_sync.lock().unwrap();
+            sync.as_mut().unwrap().outstanding_request = Some(MobileDirectOutstandingRequest {
+                kind: MobileDirectOutstandingRequestKind::OwnPreKeyCount,
+                token: "cd".repeat(32),
+                method: "GET",
+                target: "/v1/prekeys/00/count".to_string(),
+                body: Zeroizing::new(Vec::new()),
+                response_limit_bytes: veil_client::prekeys::OWN_PREKEY_RESPONSE_LIMIT as u32,
+            });
+        }
+        let error = session
+            .prepare_direct_directory_request(token)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("another mobile Direct request is already outstanding"));
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_ready_phase_still_denies_history_blocked_conversation() {
+        let (session, path, token) = mobile_test_session_with_sync(15);
+        let conversation_id = "20000000-0000-4000-8000-000000000001".to_string();
+        {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.phase = MobileDirectSyncPhase::Ready;
+            state.peers.insert(
+                conversation_id.clone(),
+                MobileDirectPeer {
+                    user_id: "10000000-0000-4000-8000-000000000002".to_string(),
+                    identity_key: [7; 32],
+                    signing_key: [8; 32],
+                },
+            );
+            state.blocked_conversations.insert(
+                conversation_id.clone(),
+                MobileDirectHistoryOutcome::ConversationRejected,
+            );
+        }
+
+        let error = session
+            .prepare_direct_prekey_request(token, conversation_id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("blocked by authenticated history"));
+
         drop(session);
         let _ = std::fs::remove_file(path);
     }

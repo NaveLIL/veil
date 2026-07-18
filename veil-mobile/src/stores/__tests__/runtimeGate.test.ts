@@ -20,7 +20,7 @@ const snapshot = (
   sessionState: "open",
   connectionState: "connected",
   directoryReady: true,
-  secureSyncState: "directory_synchronized",
+  secureSyncState: "history_synchronized",
   binding: exactBinding,
   pendingAccessPass: null,
   ...overrides,

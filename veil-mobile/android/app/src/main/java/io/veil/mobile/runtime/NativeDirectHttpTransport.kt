@@ -23,6 +23,7 @@ import okio.ByteString.Companion.decodeBase64
 /** Response limits mirrored from the native Direct contract. */
 internal object NativeDirectHttpLimits {
   const val DIRECTORY_BYTES: Long = 8L * 1024L * 1024L
+  const val HISTORY_BYTES: Long = 4L * 1024L * 1024L
   const val PREKEY_BYTES: Long = 64L * 1024L
   const val OWN_PREKEY_COUNT_BYTES: Long = 64L * 1024L
   const val OWN_PREKEY_UPLOAD_BYTES: Long = 4L * 1024L

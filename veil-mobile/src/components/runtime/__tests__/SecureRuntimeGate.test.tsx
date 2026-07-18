@@ -79,4 +79,32 @@ describe("SecureRuntimeGate", () => {
     expect(onUsePendingAccessPass).toHaveBeenCalledWith(FLOW_ID);
     expect(onDiscardPendingAccessPass).toHaveBeenCalledWith(FLOW_ID);
   });
+
+  it.each(([
+    ["publishing_keys", "Publishing device keys"],
+    ["syncing_directory", "Verifying conversations"],
+    ["syncing_history", "Restoring encrypted history"],
+    ["history_synchronized", "Reconciling live messages"],
+  ] as [VeilMobileRuntimeSnapshot["secureSyncState"], string][]))(
+    "shows truthful coarse progress for %s",
+    (secureSyncState, title) => {
+      const snapshot: VeilMobileRuntimeSnapshot = {
+        ...lockedSnapshot,
+        sessionState: "open",
+        connectionState: "connected",
+        directoryReady: false,
+        secureSyncState,
+        binding: {
+          canonicalServerOrigin: "https://veil.erez.pro:443",
+          userId: "550e8400-e29b-41d4-a716-446655440001",
+        },
+      };
+      const view = renderGate(snapshot);
+
+      expect(view.getByText(title)).toBeTruthy();
+      const rendered = JSON.stringify(view.toJSON());
+      expect(rendered).not.toContain("cursor");
+      expect(rendered).not.toContain("550e8400");
+    },
+  );
 });

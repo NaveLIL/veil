@@ -13,6 +13,10 @@ import uniffi.veil_ffi.MobileAuthenticatedBinding
 import uniffi.veil_ffi.MobileConnectCancellation
 import uniffi.veil_ffi.MobileDirectConversationData
 import uniffi.veil_ffi.MobileDirectDirectoryPageData
+import uniffi.veil_ffi.MobileDirectHistoryNext
+import uniffi.veil_ffi.MobileDirectHistoryOutcome
+import uniffi.veil_ffi.MobileDirectHistoryProgress
+import uniffi.veil_ffi.MobileDirectLiveBufferProgress
 import uniffi.veil_ffi.MobileDirectOwnPreKeyProgress
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
@@ -42,6 +46,13 @@ internal enum class NativeDirectDirectoryState {
   ERROR,
 }
 
+internal enum class NativeDirectHistoryState {
+  IDLE,
+  SYNCING,
+  SYNCHRONIZED,
+  ERROR,
+}
+
 /** Native checkpoint for the authenticated device's public prekey bootstrap. */
 internal enum class NativeOwnPreKeyState {
   IDLE,
@@ -59,7 +70,8 @@ internal enum class NativeSecureSyncState {
   IDLE,
   PUBLISHING_KEYS,
   SYNCING_DIRECTORY,
-  DIRECTORY_SYNCHRONIZED,
+  SYNCING_HISTORY,
+  HISTORY_SYNCHRONIZED,
   ERROR,
 }
 
@@ -126,6 +138,29 @@ internal data class NativeDirectDirectoryInstall(
   val directoryComplete: Boolean,
 )
 
+internal data class NativeDirectHistoryNext(
+  val request: NativeDirectRestRequest?,
+  val historiesTerminal: Boolean,
+)
+
+internal enum class NativeDirectHistoryOutcome {
+  IN_PROGRESS,
+  COMPLETE,
+  INCOMPLETE_SELF_HISTORY,
+  CONVERSATION_REJECTED,
+  STORAGE_UNCERTAIN,
+}
+
+internal data class NativeDirectHistoryProgress(
+  val outcome: NativeDirectHistoryOutcome,
+  val historiesTerminal: Boolean,
+)
+
+internal data class NativeDirectLiveBufferProgress(
+  val bufferedEvents: Long,
+  val historySynchronized: Boolean,
+)
+
 internal enum class NativeDirectPreKeyInstallStatus {
   ESTABLISHED,
   ALREADY_ESTABLISHED,
@@ -156,6 +191,8 @@ internal data class VeilMobileRuntimeSnapshot(
   val ownPreKeyState: NativeOwnPreKeyState,
   /** Native-only checkpoint state; deliberately omitted from the RN payload. */
   val directDirectoryState: NativeDirectDirectoryState,
+  /** Native-only history checkpoint; no cursors, message IDs, or errors cross to JS. */
+  val directHistoryState: NativeDirectHistoryState,
   /** Published atomically only after the final authenticated directory page. */
   val directConversations: List<NativeDirectConversationInstall>,
   val binding: PublicAuthenticatedBinding?,
@@ -208,6 +245,16 @@ internal interface NativeMobileSession : AutoCloseable {
     requestToken: String,
     response: ByteArray,
   ): NativeDirectDirectoryInstall
+
+  fun prepareNextDirectHistoryRequest(leaseToken: String): NativeDirectHistoryNext
+
+  fun installDirectHistoryResponse(
+    leaseToken: String,
+    requestToken: String,
+    response: ByteArray,
+  ): NativeDirectHistoryProgress
+
+  fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress
 
   fun prepareDirectPreKeyRequest(
     leaseToken: String,
@@ -268,6 +315,7 @@ internal class VeilMobileRuntime internal constructor(
   private var directoryReady = false
   private var ownPreKeyState = NativeOwnPreKeyState.IDLE
   private var directDirectoryState = NativeDirectDirectoryState.IDLE
+  private var directHistoryState = NativeDirectHistoryState.IDLE
   private var directConversations: List<NativeDirectConversationInstall> = emptyList()
   // Process-scoped runtimes start without UI authority. Only an Activity
   // lifecycle transition may grant foreground access; this prevents a cold
@@ -326,6 +374,7 @@ internal class VeilMobileRuntime internal constructor(
   private enum class DirectRequestStage {
     OWN_PREKEY,
     DIRECTORY,
+    HISTORY,
   }
 
   private class PreparedDirectHttpRequest(
@@ -397,6 +446,7 @@ internal class VeilMobileRuntime internal constructor(
       directoryReady = false
       ownPreKeyState = NativeOwnPreKeyState.IDLE
       directDirectoryState = NativeDirectDirectoryState.IDLE
+      directHistoryState = NativeDirectHistoryState.IDLE
       directConversations = emptyList()
       lifecycleEpoch
     }
@@ -415,6 +465,7 @@ internal class VeilMobileRuntime internal constructor(
           directoryReady = false
           ownPreKeyState = NativeOwnPreKeyState.IDLE
           directDirectoryState = NativeDirectDirectoryState.IDLE
+          directHistoryState = NativeDirectHistoryState.IDLE
           directConversations = emptyList()
         }
       }
@@ -663,6 +714,7 @@ internal class VeilMobileRuntime internal constructor(
         activeDirectSync = sync
         ownPreKeyState = NativeOwnPreKeyState.CHECKING
         directDirectoryState = NativeDirectDirectoryState.IDLE
+        directHistoryState = NativeDirectHistoryState.IDLE
         directConversations = emptyList()
         directoryReady = false
         true
@@ -702,6 +754,7 @@ internal class VeilMobileRuntime internal constructor(
     }
     if (!mayPrepare) return
 
+    pumpDirectLiveEvents(sync)
     val prepared = sync.session.prepareOwnPreKeyRequest(sync.leaseToken)
     val signed = prepareSignedDirectRequest(sync, prepared, DirectRequestStage.OWN_PREKEY)
     val pending = signed.pending
@@ -785,6 +838,10 @@ internal class VeilMobileRuntime internal constructor(
         return
       }
 
+      // Re-observe the shared socket/deferred budget before this response can
+      // mutate SQLCipher. A terminal epoch observed at this boundary aborts;
+      // a concurrent terminal linearizes before/after the durable prefix.
+      pumpDirectLiveEvents(sync)
       val progress = sync.session.installOwnPreKeyResponse(
         sync.leaseToken,
         pending.requestToken,
@@ -803,6 +860,7 @@ internal class VeilMobileRuntime internal constructor(
           if (progress.publicationComplete) {
             ownPreKeyState = NativeOwnPreKeyState.PUBLISHED
             directDirectoryState = NativeDirectDirectoryState.SYNCING
+            directHistoryState = NativeDirectHistoryState.IDLE
           }
           true
         }
@@ -830,6 +888,7 @@ internal class VeilMobileRuntime internal constructor(
     }
     if (!mayPrepare) return
 
+    pumpDirectLiveEvents(sync)
     val prepared = sync.session.prepareDirectDirectoryRequest(sync.leaseToken)
     val signed = prepareSignedDirectRequest(sync, prepared, DirectRequestStage.DIRECTORY)
     val pending = signed.pending
@@ -900,6 +959,13 @@ internal class VeilMobileRuntime internal constructor(
             "native Direct directory response bound changed"
           }
         }
+        DirectRequestStage.HISTORY -> {
+          check(method == NativeDirectHttpMethod.GET) { "native Direct history method changed" }
+          check(exactBody.isEmpty()) { "native Direct history body is not empty" }
+          check(prepared.responseLimitBytes == NativeDirectHttpLimits.HISTORY_BYTES) {
+            "native Direct history response bound changed"
+          }
+        }
       }
 
       val signature = sync.session.signDirectRestRequest(sync.leaseToken, prepared.requestToken)
@@ -958,6 +1024,7 @@ internal class VeilMobileRuntime internal constructor(
         return
       }
 
+      pumpDirectLiveEvents(sync)
       val installed = sync.session.installDirectDirectoryPage(
         sync.leaseToken,
         pending.requestToken,
@@ -978,8 +1045,11 @@ internal class VeilMobileRuntime internal constructor(
             }
           }
           if (installed.directoryComplete) {
-            directConversations = sync.conversations.values.toList()
+            directConversations = sync.conversations.values.sortedBy { conversation ->
+              conversation.conversationId
+            }
             directDirectoryState = NativeDirectDirectoryState.SYNCHRONIZED
+            directHistoryState = NativeDirectHistoryState.SYNCING
             // History is not yet synchronized. Never open the chat surface on
             // a directory-only checkpoint, even when the directory is empty.
             directoryReady = false
@@ -990,8 +1060,10 @@ internal class VeilMobileRuntime internal constructor(
       }
       if (!accepted) return
       if (complete) {
-        publishSnapshot()
+        pumpDirectLiveEvents(sync)
+        requestNextDirectHistoryPage(sync)
       } else {
+        pumpDirectLiveEvents(sync)
         requestNextDirectDirectoryPage(sync)
       }
     } catch (_: Throwable) {
@@ -1000,6 +1072,171 @@ internal class VeilMobileRuntime internal constructor(
     } finally {
       result.wipeSensitiveBody()
     }
+  }
+
+  private fun requestNextDirectHistoryPage(sync: ActiveDirectSync) {
+    val mayPrepare = synchronized(stateLock) {
+      isCurrentDirectSyncLocked(sync) &&
+        sync.pendingRequest == null &&
+        ownPreKeyState == NativeOwnPreKeyState.PUBLISHED &&
+        directDirectoryState == NativeDirectDirectoryState.SYNCHRONIZED &&
+        directHistoryState == NativeDirectHistoryState.SYNCING
+    }
+    if (!mayPrepare) return
+
+    pumpDirectLiveEvents(sync)
+    val next = sync.session.prepareNextDirectHistoryRequest(sync.leaseToken)
+    if (next.historiesTerminal) {
+      check(next.request == null) { "terminal native Direct history returned a request" }
+      val accepted = synchronized(stateLock) {
+        if (
+          !isCurrentDirectSyncLocked(sync) ||
+          sync.pendingRequest != null ||
+          directHistoryState != NativeDirectHistoryState.SYNCING
+        ) {
+          false
+        } else {
+          directHistoryState = NativeDirectHistoryState.SYNCHRONIZED
+          // Stage 5 has not replayed the deferred FIFO. Even an empty history
+          // must remain behind the same readiness barrier as a full history.
+          directoryReady = false
+          true
+        }
+      }
+      if (accepted) {
+        val buffered = pumpDirectLiveEvents(sync)
+        check(buffered.historySynchronized) {
+          "native Direct history terminal checkpoint was not retained"
+        }
+        publishSnapshot()
+      }
+      return
+    }
+
+    val prepared = checkNotNull(next.request) { "in-progress native Direct history omitted its request" }
+    val signed = prepareSignedDirectRequest(sync, prepared, DirectRequestStage.HISTORY)
+    val pending = signed.pending
+    val call = try {
+      directTransport.createCall(signed.httpRequest) { result ->
+        enqueueDirectHistoryResult(sync, pending, result)
+      }
+    } finally {
+      signed.wipeWireBody()
+    }
+    val registered = synchronized(stateLock) {
+      if (
+        isCurrentDirectSyncLocked(sync) &&
+        sync.pendingRequest == null &&
+        directHistoryState == NativeDirectHistoryState.SYNCING
+      ) {
+        sync.pendingRequest = pending
+        pending.call = call
+        true
+      } else {
+        false
+      }
+    }
+    if (!registered) {
+      call.cancelQuietly()
+      return
+    }
+    call.start()
+  }
+
+  private fun enqueueDirectHistoryResult(
+    sync: ActiveDirectSync,
+    pending: PendingDirectRequest,
+    result: NativeDirectHttpResult,
+  ) {
+    try {
+      executor.execute {
+        handleDirectHistoryResult(sync, pending, result)
+      }
+    } catch (_: RuntimeException) {
+      result.wipeSensitiveBody()
+    }
+  }
+
+  private fun handleDirectHistoryResult(
+    sync: ActiveDirectSync,
+    pending: PendingDirectRequest,
+    result: NativeDirectHttpResult,
+  ) {
+    try {
+      val current = synchronized(stateLock) {
+        isCurrentDirectSyncLocked(sync) &&
+          sync.pendingRequest === pending &&
+          pending.stage == DirectRequestStage.HISTORY &&
+          directHistoryState == NativeDirectHistoryState.SYNCING
+      }
+      if (!current) return
+      if (result !is NativeDirectHttpResult.Success) {
+        failDirectSync(sync)
+        return
+      }
+
+      pumpDirectLiveEvents(sync)
+      val progress = sync.session.installDirectHistoryResponse(
+        sync.leaseToken,
+        pending.requestToken,
+        result.body,
+      )
+      check(progress.outcome != NativeDirectHistoryOutcome.STORAGE_UNCERTAIN) {
+        "native Direct history storage became uncertain"
+      }
+      check(
+        progress.outcome != NativeDirectHistoryOutcome.IN_PROGRESS ||
+          !progress.historiesTerminal,
+      ) { "native Direct history progress contradicted its terminal checkpoint" }
+      val accepted = synchronized(stateLock) {
+        if (!isCurrentDirectSyncLocked(sync) || sync.pendingRequest !== pending) {
+          false
+        } else {
+          sync.pendingRequest = null
+          if (progress.historiesTerminal) {
+            directHistoryState = NativeDirectHistoryState.SYNCHRONIZED
+          }
+          directoryReady = false
+          true
+        }
+      }
+      if (!accepted) return
+
+      val buffered = pumpDirectLiveEvents(sync)
+      if (progress.historiesTerminal) {
+        check(buffered.historySynchronized) {
+          "native Direct history terminal checkpoint was not retained"
+        }
+        publishSnapshot()
+      } else {
+        requestNextDirectHistoryPage(sync)
+      }
+    } catch (_: Throwable) {
+      failDirectSync(sync)
+    } finally {
+      result.wipeSensitiveBody()
+    }
+  }
+
+  /**
+   * Explicit bounded pump at every native HTTP/lifecycle boundary.
+   *
+   * Socket and deferred entries retain one shared Rust permit, so a periodic
+   * timer cannot create capacity; it would only observe an already-terminal
+   * epoch sooner while adding another lifecycle race. Boundary pumps provide
+   * the mutation linearization point, and producer-side limits remain active
+   * continuously while HTTP is in flight.
+   */
+  private fun pumpDirectLiveEvents(sync: ActiveDirectSync): NativeDirectLiveBufferProgress {
+    val current = synchronized(stateLock) { isCurrentDirectSyncLocked(sync) }
+    if (!current) {
+      throw IllegalStateException("native Direct live pump used after lifecycle revocation")
+    }
+    val progress = sync.session.bufferDirectLiveEventsDuringSync(sync.leaseToken)
+    check(progress.bufferedEvents in 0..MAX_BUFFERED_DIRECT_EVENTS_PER_PUMP) {
+      "native Direct live pump count exceeded its shared bound"
+    }
+    return progress
   }
 
   private fun failDirectSync(sync: ActiveDirectSync) {
@@ -1058,6 +1295,11 @@ internal class VeilMobileRuntime internal constructor(
       NativeOwnPreKeyState.IDLE
     }
     directDirectoryState = nextState
+    directHistoryState = if (nextState == NativeDirectDirectoryState.ERROR) {
+      NativeDirectHistoryState.ERROR
+    } else {
+      NativeDirectHistoryState.IDLE
+    }
     directConversations = emptyList()
     directoryReady = false
     return selected?.let { sync ->
@@ -1285,6 +1527,7 @@ internal class VeilMobileRuntime internal constructor(
       secureSyncState = secureSyncStateLocked(),
       ownPreKeyState = ownPreKeyState,
       directDirectoryState = directDirectoryState,
+      directHistoryState = directHistoryState,
       directConversations = directConversations.toList(),
       binding = binding,
       pendingAccessPass = try {
@@ -1298,12 +1541,14 @@ internal class VeilMobileRuntime internal constructor(
   private fun secureSyncStateLocked(): NativeSecureSyncState = when {
     connectionState == NativeConnectionState.ERROR ||
       ownPreKeyState == NativeOwnPreKeyState.ERROR ||
-      directDirectoryState == NativeDirectDirectoryState.ERROR -> NativeSecureSyncState.ERROR
+      directDirectoryState == NativeDirectDirectoryState.ERROR ||
+      directHistoryState == NativeDirectHistoryState.ERROR -> NativeSecureSyncState.ERROR
     ownPreKeyState == NativeOwnPreKeyState.CHECKING ||
       ownPreKeyState == NativeOwnPreKeyState.PUBLISHING -> NativeSecureSyncState.PUBLISHING_KEYS
     directDirectoryState == NativeDirectDirectoryState.SYNCING -> NativeSecureSyncState.SYNCING_DIRECTORY
-    directDirectoryState == NativeDirectDirectoryState.SYNCHRONIZED ->
-      NativeSecureSyncState.DIRECTORY_SYNCHRONIZED
+    directHistoryState == NativeDirectHistoryState.SYNCING -> NativeSecureSyncState.SYNCING_HISTORY
+    directHistoryState == NativeDirectHistoryState.SYNCHRONIZED ->
+      NativeSecureSyncState.HISTORY_SYNCHRONIZED
     else -> NativeSecureSyncState.IDLE
   }
 
@@ -1334,6 +1579,7 @@ internal class VeilMobileRuntime internal constructor(
     private const val MAX_OWN_PREKEY_REQUESTS = 2
     private const val SECURE_DIRECT_BOOTSTRAP_ERROR = "Unable to complete the secure Direct bootstrap"
     private const val MAX_DIRECT_CONVERSATIONS = 10_000
+    private const val MAX_BUFFERED_DIRECT_EVENTS_PER_PUMP = 4_096L
 
     private fun newRuntimeExecutor(): ExecutorService =
       Executors.newSingleThreadExecutor { operation ->
@@ -1426,6 +1672,20 @@ private class UniFfiMobileSession(
   ): NativeDirectDirectoryInstall =
     delegate.installDirectDirectoryPage(leaseToken, requestToken, response).toNativeDirectDirectoryInstall()
 
+  override fun prepareNextDirectHistoryRequest(leaseToken: String): NativeDirectHistoryNext =
+    delegate.prepareNextDirectHistoryRequest(leaseToken).toNativeDirectHistoryNext()
+
+  override fun installDirectHistoryResponse(
+    leaseToken: String,
+    requestToken: String,
+    response: ByteArray,
+  ): NativeDirectHistoryProgress =
+    delegate.installDirectHistoryResponse(leaseToken, requestToken, response)
+      .toNativeDirectHistoryProgress()
+
+  override fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress =
+    delegate.bufferDirectLiveEventsDuringSync(leaseToken).toNativeDirectLiveBufferProgress()
+
   override fun prepareDirectPreKeyRequest(
     leaseToken: String,
     conversationId: String,
@@ -1514,6 +1774,32 @@ internal fun MobileDirectDirectoryPageData.toNativeDirectDirectoryInstall(): Nat
       conversation.toNativeDirectConversationInstall()
     },
     directoryComplete = directoryComplete,
+  )
+
+internal fun MobileDirectHistoryNext.toNativeDirectHistoryNext(): NativeDirectHistoryNext =
+  NativeDirectHistoryNext(
+    request = request?.toNativeDirectRestRequest(),
+    historiesTerminal = historiesTerminal,
+  )
+
+internal fun MobileDirectHistoryProgress.toNativeDirectHistoryProgress(): NativeDirectHistoryProgress =
+  NativeDirectHistoryProgress(
+    outcome = when (outcome) {
+      MobileDirectHistoryOutcome.IN_PROGRESS -> NativeDirectHistoryOutcome.IN_PROGRESS
+      MobileDirectHistoryOutcome.COMPLETE -> NativeDirectHistoryOutcome.COMPLETE
+      MobileDirectHistoryOutcome.INCOMPLETE_SELF_HISTORY ->
+        NativeDirectHistoryOutcome.INCOMPLETE_SELF_HISTORY
+      MobileDirectHistoryOutcome.CONVERSATION_REJECTED ->
+        NativeDirectHistoryOutcome.CONVERSATION_REJECTED
+      MobileDirectHistoryOutcome.STORAGE_UNCERTAIN -> NativeDirectHistoryOutcome.STORAGE_UNCERTAIN
+    },
+    historiesTerminal = historiesTerminal,
+  )
+
+internal fun MobileDirectLiveBufferProgress.toNativeDirectLiveBufferProgress(): NativeDirectLiveBufferProgress =
+  NativeDirectLiveBufferProgress(
+    bufferedEvents = bufferedEvents.toLong(),
+    historySynchronized = historySynchronized,
   )
 
 internal fun MobileDirectPreKeyResult.toNativeDirectPreKeyInstall(): NativeDirectPreKeyInstall =

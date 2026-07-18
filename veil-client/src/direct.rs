@@ -19,6 +19,7 @@ use crate::api::VeilClient;
 pub const DIRECT_DIRECTORY_PAGE_LIMIT: usize = 100;
 pub const DIRECT_DIRECTORY_RESPONSE_LIMIT: usize = 8 * 1024 * 1024;
 pub const DIRECT_DIRECTORY_MAX_PAGES: usize = 10_000;
+pub const DIRECT_DIRECTORY_MAX_CONVERSATIONS: usize = 10_000;
 pub const DIRECT_DIRECTORY_CURSOR_LIMIT: usize = 4_096;
 pub const DIRECT_PREKEY_RESPONSE_LIMIT: usize = 64 * 1024;
 const MAX_DIRECTORY_MEMBERS: usize = 1_024;
@@ -243,6 +244,21 @@ fn install_authenticated_direct_directory_page_inner(
         )?);
     }
     validate_page_account_consistency(&validated)?;
+
+    // This is a physical sync-epoch bound, not merely an Android publication
+    // limit. Reject the first page that would cross it after validating the
+    // complete page, but before binding the account or mutating SQLCipher and
+    // process-local routes.
+    if let Some(history) = history {
+        let total = history
+            .seen_conversation_ids
+            .len()
+            .checked_add(validated_conversation_ids.len())
+            .ok_or("conversation directory entry count overflow")?;
+        if total > DIRECT_DIRECTORY_MAX_CONVERSATIONS {
+            return Err("conversation directory exceeds the conversation limit".to_string());
+        }
+    }
 
     let mut direct_conversations = Vec::new();
     let mut skipped_non_direct = 0usize;
@@ -1271,6 +1287,86 @@ mod tests {
         assert!(client.db().unwrap().get_conversations().unwrap().is_empty());
         drop(client);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn tracked_sync_caps_ten_thousand_entries_before_any_mutation() {
+        fn populated_history(entries: usize) -> DirectDirectorySyncHistory {
+            let mut history = DirectDirectorySyncHistory::default();
+            for value in 1..=entries {
+                history
+                    .seen_conversation_ids
+                    .insert(uuid::Uuid::from_u128(value as u128).to_string());
+            }
+            history
+        }
+
+        let (mut accepted_client, accepted_path) = initialized_client();
+        let accepted_peer = veil_crypto::IdentityKeyPair::generate();
+        let accepted_response = page(
+            vec![direct_conversation(
+                accepted_client.identity_key().unwrap(),
+                accepted_client.signing_key().unwrap(),
+                accepted_peer.x25519_public_bytes(),
+                accepted_peer.ed25519_public_bytes(),
+            )],
+            None,
+        );
+        let mut accepted_history = populated_history(DIRECT_DIRECTORY_MAX_CONVERSATIONS - 1);
+        let accepted = install_authenticated_direct_directory_page_tracked(
+            &mut accepted_client,
+            ORIGIN,
+            SELF_USER,
+            None,
+            &mut accepted_history,
+            &accepted_response,
+        )
+        .unwrap();
+        assert_eq!(accepted.conversations.len(), 1);
+        assert_eq!(
+            accepted_history.seen_conversation_ids.len(),
+            DIRECT_DIRECTORY_MAX_CONVERSATIONS
+        );
+        drop(accepted_client);
+        let _ = std::fs::remove_file(accepted_path);
+
+        let (mut rejected_client, rejected_path) = initialized_client();
+        let rejected_peer = veil_crypto::IdentityKeyPair::generate();
+        let rejected_identity = rejected_peer.x25519_public_bytes();
+        let rejected_response = page(
+            vec![direct_conversation(
+                rejected_client.identity_key().unwrap(),
+                rejected_client.signing_key().unwrap(),
+                rejected_identity,
+                rejected_peer.ed25519_public_bytes(),
+            )],
+            None,
+        );
+        let mut rejected_history = populated_history(DIRECT_DIRECTORY_MAX_CONVERSATIONS);
+        let error = install_authenticated_direct_directory_page_tracked(
+            &mut rejected_client,
+            ORIGIN,
+            SELF_USER,
+            None,
+            &mut rejected_history,
+            &rejected_response,
+        )
+        .unwrap_err();
+        assert!(error.contains("conversation limit"));
+        assert!(rejected_client
+            .db()
+            .unwrap()
+            .get_conversations()
+            .unwrap()
+            .is_empty());
+        assert_eq!(rejected_client.known_user_identity(PEER_USER), None);
+        assert!(!rejected_client.has_session(&rejected_identity));
+        assert_eq!(
+            rejected_history.seen_conversation_ids.len(),
+            DIRECT_DIRECTORY_MAX_CONVERSATIONS
+        );
+        drop(rejected_client);
+        let _ = std::fs::remove_file(rejected_path);
     }
 
     #[test]
