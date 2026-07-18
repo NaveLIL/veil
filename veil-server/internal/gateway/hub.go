@@ -389,15 +389,6 @@ func (h *Hub) indexClientLocked(client *Client) {
 	h.deviceClients[client.deviceID][client] = true
 }
 
-// indexClient adds an already-authenticated test/service client to both
-// indexes. The WebSocket authentication path uses publishAuthenticatedClient
-// so its successful AuthResult is gated on the same publication boundary.
-func (h *Hub) indexClient(client *Client) {
-	h.mu.Lock()
-	h.indexClientLocked(client)
-	h.mu.Unlock()
-}
-
 // publishAuthenticatedClient is the sole successful authentication cutover.
 // The success batch is already queued but writePump is blocked on gate. While
 // holding the write lock we publish identity state and both fan-out indexes,
