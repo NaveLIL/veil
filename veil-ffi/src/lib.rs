@@ -331,6 +331,161 @@ pub struct MobileDirectLiveBufferProgress {
     pub history_synchronized: bool,
 }
 
+/// Opaque UI availability for one caller-supplied Direct conversation.
+///
+/// The unavailable state deliberately does not distinguish a quarantined
+/// conversation, a revoked native runtime, an unknown route, or a stale
+/// lifecycle epoch. That distinction stays in Rust and cannot be used by a
+/// renderer to enumerate blocked conversation identifiers.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileDirectMessageProjectionAvailability {
+    Available,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileDirectMessageDirection {
+    Incoming,
+    Outgoing,
+}
+
+/// Delivery state intentionally collapses delivered/read into `Sent` for the
+/// first Direct preview. `Unknown` must never be presented as safe to retry.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileDirectMessageDelivery {
+    Sending,
+    Sent,
+    Failed,
+    Unknown,
+}
+
+/// Minimal decrypted Direct-text row allowed to cross the native UI boundary.
+/// Sender keys, ciphertext, protocol headers, author key snapshots, reply
+/// metadata, attachment keys, and raw database handles are intentionally
+/// absent.
+#[derive(uniffi::Object)]
+pub struct MobileDirectMessageData {
+    message_id: Zeroizing<String>,
+    text: Zeroizing<String>,
+    /// Authenticated server time when known. A local pending row deliberately
+    /// keeps this absent instead of inventing a trusted timestamp.
+    timestamp_ms: Option<i64>,
+    direction: MobileDirectMessageDirection,
+    delivery: MobileDirectMessageDelivery,
+}
+
+#[uniffi::export]
+impl MobileDirectMessageData {
+    pub fn message_id(&self) -> String {
+        self.message_id.to_string()
+    }
+
+    pub fn text(&self) -> String {
+        self.text.to_string()
+    }
+
+    pub fn timestamp_ms(&self) -> Option<i64> {
+        self.timestamp_ms
+    }
+
+    pub fn direction(&self) -> MobileDirectMessageDirection {
+        self.direction
+    }
+
+    pub fn delivery(&self) -> MobileDirectMessageDelivery {
+        self.delivery
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct MobileDirectMessageProjection {
+    pub availability: MobileDirectMessageProjectionAvailability,
+    pub messages: Vec<Arc<MobileDirectMessageData>>,
+}
+
+const MOBILE_DIRECT_MESSAGE_PROJECTION_LIMIT: u32 = 100;
+const MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES: usize = 32 * 1024;
+const MOBILE_DIRECT_MESSAGE_PROJECTION_MAX_PLAINTEXT_BYTES: usize = 1024 * 1024;
+
+fn unavailable_mobile_direct_message_projection() -> MobileDirectMessageProjection {
+    MobileDirectMessageProjection {
+        availability: MobileDirectMessageProjectionAvailability::Unavailable,
+        messages: Vec::new(),
+    }
+}
+
+fn mobile_direct_projection_availability(
+    availability: veil_client::api::DirectConversationAvailabilityV1,
+) -> MobileDirectMessageProjectionAvailability {
+    match availability {
+        veil_client::api::DirectConversationAvailabilityV1::Available => {
+            MobileDirectMessageProjectionAvailability::Available
+        }
+        veil_client::api::DirectConversationAvailabilityV1::Quarantined
+        | veil_client::api::DirectConversationAvailabilityV1::RuntimeRevoked
+        | veil_client::api::DirectConversationAvailabilityV1::NotDirect => {
+            MobileDirectMessageProjectionAvailability::Unavailable
+        }
+    }
+}
+
+fn mobile_direct_message_delivery(status: u8) -> Option<MobileDirectMessageDelivery> {
+    match status {
+        0 => Some(MobileDirectMessageDelivery::Sending),
+        1..=3 => Some(MobileDirectMessageDelivery::Sent),
+        4 => Some(MobileDirectMessageDelivery::Failed),
+        5 => Some(MobileDirectMessageDelivery::Unknown),
+        _ => None,
+    }
+}
+
+fn mobile_direct_projection_scope(
+    client: &veil_client::api::VeilClient,
+    state: &MobileDirectSyncState,
+    conversation_id: &str,
+) -> Option<([u8; 32], [u8; 32])> {
+    let peer = state.peers.get(conversation_id)?;
+    let Ok(authenticated_user_id) = client.authenticated_user_id() else {
+        return None;
+    };
+    if authenticated_user_id != state.epoch.binding.user_id {
+        return None;
+    }
+    let db = client.db()?;
+    let Ok(scope) = db.resolve_authenticated_direct_history_scope_v1(
+        &state.epoch.binding.canonical_server_origin,
+        &authenticated_user_id,
+        conversation_id,
+    ) else {
+        return None;
+    };
+    let Ok(self_identity_key) = client.identity_key() else {
+        return None;
+    };
+    let Ok(self_signing_key) = client.signing_key() else {
+        return None;
+    };
+    let matches = scope.conversation_id == conversation_id
+        && scope.self_account.locator.canonical_server_origin
+            == state.epoch.binding.canonical_server_origin
+        && scope.self_account.locator.user_id == authenticated_user_id
+        && scope.self_account.locator.identity_key == self_identity_key
+        && scope.self_account.signing_key == self_signing_key
+        && scope.self_account.source.as_u8() == 2
+        && scope.peer_account.locator.canonical_server_origin
+            == state.epoch.binding.canonical_server_origin
+        && scope.peer_account.locator.user_id == peer.user_id
+        && scope.peer_account.locator.identity_key == peer.identity_key
+        && scope.peer_account.signing_key == peer.signing_key
+        && scope.peer_account.source.as_u8() == 2
+        && client.known_user_identity(&peer.user_id) == Some(peer.identity_key)
+        && client.peer_signing_key_is_pinned(&peer.identity_key, &peer.signing_key)
+        && client
+            .ensure_dm_conversation_binding_compatible(conversation_id, peer.identity_key)
+            .is_ok();
+    matches.then_some((self_identity_key, peer.identity_key))
+}
+
 #[derive(uniffi::Record)]
 pub struct RestSignatureData {
     pub user_id: String,
@@ -1683,6 +1838,128 @@ impl VeilMobileSession {
         })
     }
 
+    /// Return a bounded UI projection for exactly one authenticated Direct.
+    ///
+    /// The caller supplies the conversation id it is about to render. Native
+    /// code checks the current directory lease, the exact live-replay
+    /// availability, and the guarded client projection while retaining the
+    /// documented `direct_sync -> binding -> client` lock order. Every denied
+    /// state is collapsed to the same opaque result with no identifiers.
+    pub fn project_direct_messages(
+        &self,
+        conversation_id: String,
+    ) -> Result<MobileDirectMessageProjection, VeilError> {
+        let conversation_id =
+            require_canonical_user_id("Direct conversation ID", &conversation_id)?;
+        let sync = self
+            .direct_sync
+            .lock()
+            .map_err(|error| VeilError::Session {
+                msg: format!("lock mobile Direct sync: {error}"),
+            })?;
+        let Some(state) = sync.as_ref() else {
+            return Ok(unavailable_mobile_direct_message_projection());
+        };
+        if state.phase != MobileDirectSyncPhase::Ready {
+            return Ok(unavailable_mobile_direct_message_projection());
+        }
+
+        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile binding: {error}"),
+        })?;
+        if binding.as_ref() != Some(&state.epoch) {
+            return Ok(unavailable_mobile_direct_message_projection());
+        }
+
+        let client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let availability = mobile_direct_projection_availability(
+            client.direct_conversation_availability_v1(&conversation_id),
+        );
+        if availability != MobileDirectMessageProjectionAvailability::Available
+            || state.blocked_conversations.contains_key(&conversation_id)
+        {
+            return Ok(unavailable_mobile_direct_message_projection());
+        }
+        let Some((self_identity_key, peer_identity_key)) =
+            mobile_direct_projection_scope(&client, state, &conversation_id)
+        else {
+            return Ok(unavailable_mobile_direct_message_projection());
+        };
+
+        let messages = match client
+            .direct_messages_projection_v1(&conversation_id, MOBILE_DIRECT_MESSAGE_PROJECTION_LIMIT)
+        {
+            Ok(messages) => messages,
+            Err(_) => return Ok(unavailable_mobile_direct_message_projection()),
+        };
+        if messages.len() > MOBILE_DIRECT_MESSAGE_PROJECTION_LIMIT as usize {
+            return Ok(unavailable_mobile_direct_message_projection());
+        }
+        let mut total_plaintext_bytes = 0usize;
+        for message in &messages {
+            const MAX_TIMESTAMP_MS: i64 = 253_402_300_799_999;
+            let canonical_message_id = uuid::Uuid::parse_str(&message.id).is_ok_and(|parsed| {
+                !parsed.is_nil() && parsed.hyphenated().to_string() == message.id
+            });
+            let timestamp_is_valid = message
+                .server_timestamp
+                .is_none_or(|timestamp_ms| (0..=MAX_TIMESTAMP_MS).contains(&timestamp_ms));
+            if mobile_direct_message_delivery(message.status as u8).is_none() {
+                return Ok(unavailable_mobile_direct_message_projection());
+            }
+            let expected_sender = if message.is_outgoing {
+                &self_identity_key
+            } else {
+                &peer_identity_key
+            };
+            let plaintext_bytes = message.plaintext.len();
+            let Some(next_total_plaintext_bytes) =
+                total_plaintext_bytes.checked_add(plaintext_bytes)
+            else {
+                return Ok(unavailable_mobile_direct_message_projection());
+            };
+            // Stage 5 publishes only immutable, non-expiring Direct text.
+            // Future protocol shapes need an explicit projection contract.
+            if message.conversation_id != conversation_id
+                || message.sender_key.as_slice() != expected_sender.as_slice()
+                || message.plaintext.is_empty()
+                || plaintext_bytes > MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES
+                || next_total_plaintext_bytes > MOBILE_DIRECT_MESSAGE_PROJECTION_MAX_PLAINTEXT_BYTES
+                || message.msg_type != 0
+                || message.reply_to_id.is_some()
+                || message.expires_at.is_some()
+                || !message.attachments.is_empty()
+                || !canonical_message_id
+                || !timestamp_is_valid
+            {
+                return Ok(unavailable_mobile_direct_message_projection());
+            }
+            total_plaintext_bytes = next_total_plaintext_bytes;
+        }
+
+        let mut projected = Vec::with_capacity(messages.len());
+        for message in messages {
+            projected.push(Arc::new(MobileDirectMessageData {
+                message_id: Zeroizing::new(message.id),
+                text: Zeroizing::new(message.plaintext),
+                timestamp_ms: message.server_timestamp,
+                direction: if message.is_outgoing {
+                    MobileDirectMessageDirection::Outgoing
+                } else {
+                    MobileDirectMessageDirection::Incoming
+                },
+                delivery: mobile_direct_message_delivery(message.status as u8)
+                    .expect("delivery state preflighted"),
+            }));
+        }
+        Ok(MobileDirectMessageProjection {
+            availability: MobileDirectMessageProjectionAvailability::Available,
+            messages: projected,
+        })
+    }
+
     /// Install a peer bundle by the conversation route learned under this
     /// lease. Kotlin cannot substitute peer account keys.
     pub fn prepare_direct_prekey_request(
@@ -2911,6 +3188,64 @@ mod tests {
         (response, peer)
     }
 
+    fn mobile_test_install_ready_direct(session: &VeilMobileSession, lease_token: &str) -> String {
+        let (response, _) = mobile_test_directory_response(session);
+        let request = session
+            .prepare_direct_directory_request(lease_token.to_string())
+            .unwrap();
+        let page = session
+            .install_direct_directory_page(lease_token.to_string(), request.request_token, response)
+            .unwrap();
+        assert_eq!(page.conversations.len(), 1);
+        let conversation_id = page.conversations[0].conversation_id.clone();
+        session.direct_sync.lock().unwrap().as_mut().unwrap().phase = MobileDirectSyncPhase::Ready;
+        conversation_id
+    }
+
+    fn mobile_test_direct_identities(
+        session: &VeilMobileSession,
+        conversation_id: &str,
+    ) -> ([u8; 32], [u8; 32]) {
+        let self_identity_key = session.client.lock().unwrap().identity_key().unwrap();
+        let peer_identity_key = session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .peers
+            .get(conversation_id)
+            .unwrap()
+            .identity_key;
+        (self_identity_key, peer_identity_key)
+    }
+
+    fn mobile_test_insert_direct_message(
+        session: &VeilMobileSession,
+        conversation_id: &str,
+        id_tail: u64,
+        sender_key: &[u8; 32],
+        plaintext: &str,
+        is_outgoing: bool,
+    ) {
+        session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .insert_message(
+                &format!("30000000-0000-4000-8000-{id_tail:012}"),
+                conversation_id,
+                sender_key,
+                plaintext,
+                is_outgoing,
+                Some(1_700_000_000_000 + id_tail as i64),
+                None,
+            )
+            .unwrap();
+    }
+
     #[test]
     fn test_generate_and_validate_mnemonic() {
         let m = generate_mnemonic();
@@ -3710,6 +4045,14 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("unavailable in this phase"));
+        let projection = session
+            .project_direct_messages("20000000-0000-4000-8000-000000000001".to_string())
+            .unwrap();
+        assert_eq!(
+            projection.availability,
+            MobileDirectMessageProjectionAvailability::Unavailable
+        );
+        assert!(projection.messages.is_empty());
 
         drop(session);
         let _ = std::fs::remove_file(path);
@@ -3864,6 +4207,387 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("blocked by authenticated history"));
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_projection_maps_all_native_denials_to_one_opaque_state() {
+        use veil_client::api::DirectConversationAvailabilityV1;
+
+        assert_eq!(
+            mobile_direct_projection_availability(DirectConversationAvailabilityV1::Available),
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        for denied in [
+            DirectConversationAvailabilityV1::Quarantined,
+            DirectConversationAvailabilityV1::RuntimeRevoked,
+            DirectConversationAvailabilityV1::NotDirect,
+        ] {
+            assert_eq!(
+                mobile_direct_projection_availability(denied),
+                MobileDirectMessageProjectionAvailability::Unavailable
+            );
+            let projection = unavailable_mobile_direct_message_projection();
+            let MobileDirectMessageProjection {
+                availability,
+                messages,
+            } = projection;
+            assert_eq!(
+                availability,
+                MobileDirectMessageProjectionAvailability::Unavailable
+            );
+            assert!(messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn mobile_direct_projection_returns_only_minimal_text_dto_for_healthy_exact_route() {
+        let (session, path, token) = mobile_test_session_with_sync(16);
+        let conversation_id = mobile_test_install_ready_direct(&session, &token);
+        let peer_identity_key = session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .peers
+            .get(&conversation_id)
+            .unwrap()
+            .identity_key;
+        let message_id = "30000000-0000-4000-8000-000000000001";
+        session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .insert_message(
+                message_id,
+                &conversation_id,
+                &peer_identity_key,
+                "authenticated preview text",
+                false,
+                Some(1_700_000_000_123),
+                None,
+            )
+            .unwrap();
+
+        let projection = session
+            .project_direct_messages(conversation_id.clone())
+            .unwrap();
+        assert_eq!(
+            projection.availability,
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        assert_eq!(projection.messages.len(), 1);
+        let message = projection.messages.into_iter().next().unwrap();
+        assert_eq!(message.message_id(), message_id);
+        assert_eq!(message.text(), "authenticated preview text");
+        assert_eq!(message.timestamp_ms(), Some(1_700_000_000_123));
+        assert_eq!(message.direction(), MobileDirectMessageDirection::Incoming);
+        assert_eq!(message.delivery(), MobileDirectMessageDelivery::Sent);
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_projection_denies_cross_peer_and_signing_pin_drift() {
+        let (session, path, token) = mobile_test_session_with_sync(18);
+        let conversation_id = mobile_test_install_ready_direct(&session, &token);
+        let durable_peer = session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .peers
+            .get(&conversation_id)
+            .unwrap()
+            .clone();
+        session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .insert_message(
+                "30000000-0000-4000-8000-000000000003",
+                &conversation_id,
+                &durable_peer.identity_key,
+                "durable peer B plaintext",
+                false,
+                Some(1_700_000_000_789),
+                None,
+            )
+            .unwrap();
+
+        let substituted_peer = IdentityKeyPair::generate();
+        session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .peers
+            .insert(
+                conversation_id.clone(),
+                MobileDirectPeer {
+                    user_id: "550e8400-e29b-41d4-a716-446655440099".to_string(),
+                    identity_key: substituted_peer.x25519_public_bytes(),
+                    signing_key: substituted_peer.ed25519_public_bytes(),
+                },
+            );
+        let cross_peer = session
+            .project_direct_messages(conversation_id.clone())
+            .unwrap();
+        let MobileDirectMessageProjection {
+            availability,
+            messages,
+        } = cross_peer;
+        assert_eq!(
+            availability,
+            MobileDirectMessageProjectionAvailability::Unavailable
+        );
+        assert!(messages.is_empty());
+
+        let unpinned_signing = IdentityKeyPair::generate().ed25519_public_bytes();
+        let mut signing_drift = durable_peer.clone();
+        signing_drift.signing_key = unpinned_signing;
+        session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .peers
+            .insert(conversation_id.clone(), signing_drift);
+        let signing_mismatch = session
+            .project_direct_messages(conversation_id.clone())
+            .unwrap();
+        assert_eq!(
+            signing_mismatch.availability,
+            MobileDirectMessageProjectionAvailability::Unavailable
+        );
+        assert!(signing_mismatch.messages.is_empty());
+
+        session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .peers
+            .insert(conversation_id.clone(), durable_peer);
+        let healthy = session.project_direct_messages(conversation_id).unwrap();
+        assert_eq!(
+            healthy.availability,
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        assert_eq!(healthy.messages.len(), 1);
+        assert_eq!(healthy.messages[0].text(), "durable peer B plaintext");
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_projection_denies_sender_direction_drift_without_a_prefix() {
+        for (generation, is_outgoing) in [(19, false), (20, true)] {
+            let (session, path, token) = mobile_test_session_with_sync(generation);
+            let conversation_id = mobile_test_install_ready_direct(&session, &token);
+            let (self_identity_key, peer_identity_key) =
+                mobile_test_direct_identities(&session, &conversation_id);
+            let wrong_sender = if is_outgoing {
+                peer_identity_key
+            } else {
+                self_identity_key
+            };
+            mobile_test_insert_direct_message(
+                &session,
+                &conversation_id,
+                100 + generation,
+                &wrong_sender,
+                "sender tuple must not render",
+                is_outgoing,
+            );
+
+            let projection = session.project_direct_messages(conversation_id).unwrap();
+            assert_eq!(
+                projection.availability,
+                MobileDirectMessageProjectionAvailability::Unavailable
+            );
+            assert!(projection.messages.is_empty());
+
+            drop(session);
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn mobile_direct_projection_enforces_utf8_row_and_total_plaintext_budgets() {
+        let (row_session, row_path, row_token) = mobile_test_session_with_sync(21);
+        let row_conversation = mobile_test_install_ready_direct(&row_session, &row_token);
+        let (_, row_peer) = mobile_test_direct_identities(&row_session, &row_conversation);
+        let exact_row = "a".repeat(MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES);
+        mobile_test_insert_direct_message(
+            &row_session,
+            &row_conversation,
+            200,
+            &row_peer,
+            &exact_row,
+            false,
+        );
+        assert_eq!(
+            row_session
+                .project_direct_messages(row_conversation.clone())
+                .unwrap()
+                .availability,
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        let oversized_row = "b".repeat(MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES + 1);
+        mobile_test_insert_direct_message(
+            &row_session,
+            &row_conversation,
+            201,
+            &row_peer,
+            &oversized_row,
+            false,
+        );
+        let row_denied = row_session
+            .project_direct_messages(row_conversation)
+            .unwrap();
+        assert_eq!(
+            row_denied.availability,
+            MobileDirectMessageProjectionAvailability::Unavailable
+        );
+        assert!(row_denied.messages.is_empty());
+        drop(row_session);
+        let _ = std::fs::remove_file(row_path);
+
+        let (total_session, total_path, total_token) = mobile_test_session_with_sync(22);
+        let total_conversation = mobile_test_install_ready_direct(&total_session, &total_token);
+        let (_, total_peer) = mobile_test_direct_identities(&total_session, &total_conversation);
+        for index in 0..32 {
+            mobile_test_insert_direct_message(
+                &total_session,
+                &total_conversation,
+                300 + index,
+                &total_peer,
+                &exact_row,
+                false,
+            );
+        }
+        let exact_total = total_session
+            .project_direct_messages(total_conversation.clone())
+            .unwrap();
+        assert_eq!(
+            exact_total.availability,
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        assert_eq!(exact_total.messages.len(), 32);
+        mobile_test_insert_direct_message(
+            &total_session,
+            &total_conversation,
+            332,
+            &total_peer,
+            "x",
+            false,
+        );
+        let total_denied = total_session
+            .project_direct_messages(total_conversation)
+            .unwrap();
+        assert_eq!(
+            total_denied.availability,
+            MobileDirectMessageProjectionAvailability::Unavailable
+        );
+        assert!(total_denied.messages.is_empty());
+        drop(total_session);
+        let _ = std::fs::remove_file(total_path);
+
+        let (utf8_session, utf8_path, utf8_token) = mobile_test_session_with_sync(23);
+        let utf8_conversation = mobile_test_install_ready_direct(&utf8_session, &utf8_token);
+        let (_, utf8_peer) = mobile_test_direct_identities(&utf8_session, &utf8_conversation);
+        let exact_utf8 = "🦀".repeat(MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES / 4);
+        assert_eq!(exact_utf8.len(), MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES);
+        mobile_test_insert_direct_message(
+            &utf8_session,
+            &utf8_conversation,
+            400,
+            &utf8_peer,
+            &exact_utf8,
+            false,
+        );
+        assert_eq!(
+            utf8_session
+                .project_direct_messages(utf8_conversation.clone())
+                .unwrap()
+                .availability,
+            MobileDirectMessageProjectionAvailability::Available
+        );
+        let oversized_utf8 = "🦀".repeat(MOBILE_DIRECT_MESSAGE_MAX_PLAINTEXT_BYTES / 4 + 1);
+        mobile_test_insert_direct_message(
+            &utf8_session,
+            &utf8_conversation,
+            401,
+            &utf8_peer,
+            &oversized_utf8,
+            false,
+        );
+        let utf8_denied = utf8_session
+            .project_direct_messages(utf8_conversation)
+            .unwrap();
+        assert_eq!(
+            utf8_denied.availability,
+            MobileDirectMessageProjectionAvailability::Unavailable
+        );
+        assert!(utf8_denied.messages.is_empty());
+        drop(utf8_session);
+        let _ = std::fs::remove_file(utf8_path);
+    }
+
+    #[test]
+    fn mobile_direct_projection_hides_history_blocked_exact_route_without_identifiers() {
+        let (session, path, token) = mobile_test_session_with_sync(17);
+        let conversation_id = mobile_test_install_ready_direct(&session, &token);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .insert_message(
+                "30000000-0000-4000-8000-000000000002",
+                &conversation_id,
+                &[9; 32],
+                "must stay native",
+                false,
+                Some(1_700_000_000_456),
+                None,
+            )
+            .unwrap();
+        session
+            .direct_sync
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .blocked_conversations
+            .insert(
+                conversation_id.clone(),
+                MobileDirectHistoryOutcome::ConversationRejected,
+            );
+
+        let projection = session
+            .project_direct_messages(conversation_id.clone())
+            .unwrap();
+        assert_eq!(
+            projection.availability,
+            MobileDirectMessageProjectionAvailability::Unavailable
+        );
+        assert!(projection.messages.is_empty());
 
         drop(session);
         let _ = std::fs::remove_file(path);

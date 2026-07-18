@@ -17,6 +17,11 @@ import uniffi.veil_ffi.MobileDirectHistoryNext
 import uniffi.veil_ffi.MobileDirectHistoryOutcome
 import uniffi.veil_ffi.MobileDirectHistoryProgress
 import uniffi.veil_ffi.MobileDirectLiveBufferProgress
+import uniffi.veil_ffi.MobileDirectMessageData
+import uniffi.veil_ffi.MobileDirectMessageDelivery
+import uniffi.veil_ffi.MobileDirectMessageDirection
+import uniffi.veil_ffi.MobileDirectMessageProjection
+import uniffi.veil_ffi.MobileDirectMessageProjectionAvailability
 import uniffi.veil_ffi.MobileDirectOwnPreKeyProgress
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
@@ -161,6 +166,131 @@ internal data class NativeDirectLiveBufferProgress(
   val historySynchronized: Boolean,
 )
 
+internal enum class NativeDirectMessageProjectionAvailability {
+  AVAILABLE,
+  UNAVAILABLE,
+}
+
+internal enum class NativeDirectMessageDirection {
+  INCOMING,
+  OUTGOING,
+}
+
+internal enum class NativeDirectMessageDelivery {
+  SENDING,
+  SENT,
+  FAILED,
+  UNKNOWN,
+}
+
+/**
+ * Exact Direct preview row allowed to reach React Native. Cryptographic and
+ * database fields are absent by construction.
+ */
+internal data class NativeDirectMessageView(
+  val messageId: String,
+  val text: String,
+  val timestampMs: Long?,
+  val direction: NativeDirectMessageDirection,
+  val delivery: NativeDirectMessageDelivery,
+) {
+  override fun toString(): String =
+    "NativeDirectMessageView(messageId=[REDACTED], text=[REDACTED], " +
+      "timestampMs=$timestampMs, direction=$direction, delivery=$delivery)"
+}
+
+/** Opaque denial never echoes or enumerates a blocked conversation id. */
+internal data class NativeDirectMessageProjection(
+  val availability: NativeDirectMessageProjectionAvailability,
+  val messages: List<NativeDirectMessageView>,
+) {
+  override fun toString(): String =
+    "NativeDirectMessageProjection(availability=$availability, messages=${messages.size})"
+}
+
+private fun unavailableDirectMessageProjection() = NativeDirectMessageProjection(
+  availability = NativeDirectMessageProjectionAvailability.UNAVAILABLE,
+  messages = emptyList(),
+)
+
+private const val MAX_DIRECT_MESSAGE_TEXT_BYTES = 32 * 1024
+private const val MAX_DIRECT_PROJECTION_TEXT_BYTES = 1024 * 1024
+
+private fun String.boundedUtf8Length(maxBytes: Int): Int? {
+  if (isEmpty()) return null
+  var bytes = 0
+  var index = 0
+  while (index < length) {
+    val character = this[index]
+    val additional = when {
+      character.code <= 0x7f -> 1
+      character.code <= 0x7ff -> 2
+      Character.isHighSurrogate(character) -> {
+        if (index + 1 >= length || !Character.isLowSurrogate(this[index + 1])) return null
+        index += 1
+        4
+      }
+      Character.isLowSurrogate(character) -> return null
+      else -> 3
+    }
+    if (bytes > maxBytes - additional) return null
+    bytes += additional
+    index += 1
+  }
+  return bytes
+}
+
+internal fun NativeDirectMessageProjection.isStructurallySafe(): Boolean {
+  if (availability == NativeDirectMessageProjectionAvailability.UNAVAILABLE) {
+    return messages.isEmpty()
+  }
+  if (messages.size > 100) return false
+  val ids = HashSet<String>(messages.size)
+  var totalTextBytes = 0
+  return messages.all { message ->
+    val parsedId = try {
+      UUID.fromString(message.messageId)
+    } catch (_: IllegalArgumentException) {
+      null
+    }
+    val canonicalId = parsedId
+      ?.takeUnless { it.mostSignificantBits == 0L && it.leastSignificantBits == 0L }
+      ?.toString()
+    val textBytes = message.text.boundedUtf8Length(MAX_DIRECT_MESSAGE_TEXT_BYTES)
+      ?: return@all false
+    if (totalTextBytes > MAX_DIRECT_PROJECTION_TEXT_BYTES - textBytes) return@all false
+    totalTextBytes += textBytes
+    canonicalId == message.messageId &&
+      ids.add(message.messageId) &&
+      message.timestampMs?.let { it in 0L..253_402_300_799_999L } != false
+  }
+}
+
+internal fun <Handle : AutoCloseable, Output> mapAndCloseAllNativeHandles(
+  handles: List<Handle>,
+  mapper: (Handle) -> Output,
+): List<Output> = try {
+  handles.map(mapper)
+} finally {
+  handles.forEach { handle ->
+    try {
+      handle.close()
+    } catch (_: Throwable) {
+      // Every handle is attempted; UniFFI's cleaner remains a last resort.
+    }
+  }
+}
+
+private fun closeAllDirectMessageHandles(handles: List<MobileDirectMessageData>) {
+  handles.forEach { handle ->
+    try {
+      handle.close()
+    } catch (_: Throwable) {
+      // Continue closing the remaining native plaintext owners.
+    }
+  }
+}
+
 internal enum class NativeDirectPreKeyInstallStatus {
   ESTABLISHED,
   ALREADY_ESTABLISHED,
@@ -256,6 +386,8 @@ internal interface NativeMobileSession : AutoCloseable {
 
   fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress
 
+  fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection
+
   fun prepareDirectPreKeyRequest(
     leaseToken: String,
     conversationId: String,
@@ -335,6 +467,13 @@ internal class VeilMobileRuntime internal constructor(
   private data class ConnectStart(
     val attempt: ActiveConnect,
     val detachedDirectSync: DetachedDirectSync?,
+  )
+
+  private class DirectProjectionTarget(
+    val session: NativeMobileSession,
+    val lifecycleEpoch: Long,
+    val binding: PublicAuthenticatedBinding,
+    val directSync: ActiveDirectSync,
   )
 
   private data class BackgroundLockRequest(
@@ -425,6 +564,95 @@ internal class VeilMobileRuntime internal constructor(
 
   fun snapshot(): VeilMobileRuntimeSnapshot = synchronized(stateLock) {
     snapshotLocked()
+  }
+
+  /**
+   * Publish exactly one Direct through the native guarded projection.
+   *
+   * The SQLCipher read and native-to-Kotlin conversion run without
+   * [stateLock]. The final exact-generation check and the narrow bridge
+   * publisher run under one lock acquisition, so lifecycle revocation is
+   * linearized strictly before an opaque denial or after Promise publication.
+   * The callback must only serialize and resolve this one projection; it must
+   * not retain the DTO or call back into the runtime.
+   */
+  fun publishDirectMessages(
+    rawConversationId: String,
+    publisher: (NativeDirectMessageProjection) -> Unit,
+  ) {
+    val conversationId = try {
+      UUID.fromString(rawConversationId).toString()
+    } catch (_: IllegalArgumentException) {
+      publishUnavailableDirectMessages(publisher)
+      return
+    }
+    if (conversationId != rawConversationId) {
+      publishUnavailableDirectMessages(publisher)
+      return
+    }
+
+    val target = synchronized(stateLock) {
+      val active = session
+      val currentBinding = binding
+      val sync = activeDirectSync
+      if (
+        !foreground ||
+        active == null ||
+        currentBinding == null ||
+        sync == null ||
+        !isCurrentDirectSyncLocked(sync) ||
+        sync.session !== active ||
+        sessionState != NativeSessionState.OPEN ||
+        connectionState != NativeConnectionState.CONNECTED ||
+        !directoryReady ||
+        !sync.conversations.containsKey(conversationId) ||
+        directConversations.none { it.conversationId == conversationId }
+      ) {
+        null
+      } else {
+        DirectProjectionTarget(active, lifecycleEpoch, currentBinding, sync)
+      }
+    }
+    if (target == null) {
+      publishUnavailableDirectMessages(publisher)
+      return
+    }
+
+    val projection = try {
+      target.session.projectDirectMessages(conversationId)
+    } catch (_: Throwable) {
+      unavailableDirectMessageProjection()
+    }
+    val structurallySafe = projection.isStructurallySafe()
+    synchronized(stateLock) {
+      val selected = if (
+        structurallySafe &&
+        foreground &&
+        session === target.session &&
+        lifecycleEpoch == target.lifecycleEpoch &&
+        binding == target.binding &&
+        activeDirectSync === target.directSync &&
+        isCurrentDirectSyncLocked(target.directSync) &&
+        sessionState == NativeSessionState.OPEN &&
+        connectionState == NativeConnectionState.CONNECTED &&
+        directoryReady &&
+        target.directSync.conversations.containsKey(conversationId) &&
+        directConversations.any { it.conversationId == conversationId }
+      ) {
+        projection
+      } else {
+        unavailableDirectMessageProjection()
+      }
+      publisher(selected)
+    }
+  }
+
+  private fun publishUnavailableDirectMessages(
+    publisher: (NativeDirectMessageProjection) -> Unit,
+  ) {
+    synchronized(stateLock) {
+      publisher(unavailableDirectMessageProjection())
+    }
   }
 
   fun openSession(): VeilMobileRuntimeSnapshot {
@@ -1686,6 +1914,9 @@ private class UniFfiMobileSession(
   override fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress =
     delegate.bufferDirectLiveEventsDuringSync(leaseToken).toNativeDirectLiveBufferProgress()
 
+  override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection =
+    delegate.projectDirectMessages(conversationId).toNativeDirectMessageProjection()
+
   override fun prepareDirectPreKeyRequest(
     leaseToken: String,
     conversationId: String,
@@ -1800,6 +2031,41 @@ internal fun MobileDirectLiveBufferProgress.toNativeDirectLiveBufferProgress(): 
   NativeDirectLiveBufferProgress(
     bufferedEvents = bufferedEvents.toLong(),
     historySynchronized = historySynchronized,
+  )
+
+internal fun MobileDirectMessageProjection.toNativeDirectMessageProjection(): NativeDirectMessageProjection {
+  if (availability == MobileDirectMessageProjectionAvailability.UNAVAILABLE) {
+    closeAllDirectMessageHandles(messages)
+    return unavailableDirectMessageProjection()
+  }
+  return try {
+    NativeDirectMessageProjection(
+      availability = NativeDirectMessageProjectionAvailability.AVAILABLE,
+      messages = mapAndCloseAllNativeHandles(
+        messages,
+        MobileDirectMessageData::toNativeDirectMessageView,
+      ),
+    )
+  } catch (_: Throwable) {
+    unavailableDirectMessageProjection()
+  }
+}
+
+private fun MobileDirectMessageData.toNativeDirectMessageView(): NativeDirectMessageView =
+  NativeDirectMessageView(
+    messageId = messageId(),
+    text = text(),
+    timestampMs = timestampMs(),
+    direction = when (direction()) {
+      MobileDirectMessageDirection.INCOMING -> NativeDirectMessageDirection.INCOMING
+      MobileDirectMessageDirection.OUTGOING -> NativeDirectMessageDirection.OUTGOING
+    },
+    delivery = when (delivery()) {
+      MobileDirectMessageDelivery.SENDING -> NativeDirectMessageDelivery.SENDING
+      MobileDirectMessageDelivery.SENT -> NativeDirectMessageDelivery.SENT
+      MobileDirectMessageDelivery.FAILED -> NativeDirectMessageDelivery.FAILED
+      MobileDirectMessageDelivery.UNKNOWN -> NativeDirectMessageDelivery.UNKNOWN
+    },
   )
 
 internal fun MobileDirectPreKeyResult.toNativeDirectPreKeyInstall(): NativeDirectPreKeyInstall =

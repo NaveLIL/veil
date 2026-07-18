@@ -70,6 +70,13 @@ internal class VeilMobileRuntimeModule(
     runtime.cancelPendingAccessPass(flowId)
   }
 
+  @ReactMethod
+  fun projectDirectMessages(conversationId: String, promise: Promise) = onRuntimePublication(promise) {
+    runtime.publishDirectMessages(conversationId) { projection ->
+      promise.resolve(projection.toWritableMap())
+    }
+  }
+
   /** Required by React Native's NativeEventEmitter contract. */
   @ReactMethod
   fun addListener(eventName: String) {
@@ -87,6 +94,18 @@ internal class VeilMobileRuntimeModule(
     runtime.execute {
       try {
         promise.resolve(operation())
+      } catch (error: VeilMobileRuntimeException) {
+        promise.reject(error.code, error.message ?: "Native mobile runtime operation failed")
+      } catch (_: Throwable) {
+        promise.reject("E_VEIL_RUNTIME", "Native mobile runtime operation failed")
+      }
+    }
+  }
+
+  private fun onRuntimePublication(promise: Promise, operation: () -> Unit) {
+    runtime.execute {
+      try {
+        operation()
       } catch (error: VeilMobileRuntimeException) {
         promise.reject(error.code, error.message ?: "Native mobile runtime operation failed")
       } catch (_: Throwable) {
@@ -120,4 +139,19 @@ private fun PendingNodeAccessPassView.toWritableMap(): WritableMap = Arguments.c
   putString("canonicalOrigin", canonicalOrigin)
   putString("tokenRef", tokenRef)
   putDouble("expiresInSeconds", expiresInSeconds.toDouble())
+}
+
+private fun NativeDirectMessageProjection.toWritableMap(): WritableMap = Arguments.createMap().apply {
+  putString("availability", availability.name.lowercase())
+  putArray("messages", Arguments.createArray().also { output ->
+    messages.forEach { message -> output.pushMap(message.toWritableMap()) }
+  })
+}
+
+private fun NativeDirectMessageView.toWritableMap(): WritableMap = Arguments.createMap().apply {
+  putString("messageId", messageId)
+  putString("text", text)
+  timestampMs?.let { putDouble("timestampMs", it.toDouble()) } ?: putNull("timestampMs")
+  putString("direction", direction.name.lowercase())
+  putString("delivery", delivery.name.lowercase())
 }

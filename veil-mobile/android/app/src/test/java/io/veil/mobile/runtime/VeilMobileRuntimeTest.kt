@@ -25,6 +25,9 @@ import uniffi.veil_ffi.MobileDirectHistoryNext
 import uniffi.veil_ffi.MobileDirectHistoryOutcome
 import uniffi.veil_ffi.MobileDirectHistoryProgress
 import uniffi.veil_ffi.MobileDirectLiveBufferProgress
+import uniffi.veil_ffi.MobileDirectMessageData
+import uniffi.veil_ffi.MobileDirectMessageProjection
+import uniffi.veil_ffi.MobileDirectMessageProjectionAvailability
 import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSyncLease
@@ -51,6 +54,195 @@ class VeilMobileRuntimeTest {
       runtime.markForeground()
       assertEquals(NativeSessionState.OPEN, runtime.openSession().sessionState)
     } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun directProjectionNeverTouchesNativePlaintextBeforeTheReadyLifecycleGate() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession)
+    try {
+      runtime.openSession()
+      val projection = publishDirectMessagesForTest(
+        runtime,
+        "20000000-0000-4000-8000-000000000001",
+      )
+      assertEquals(
+        NativeDirectMessageProjectionAvailability.UNAVAILABLE,
+        projection.availability,
+      )
+      assertTrue(projection.messages.isEmpty())
+      assertEquals(0, fakeSession.directProjectionCount)
+
+      var invalidPublications = 0
+      runtime.publishDirectMessages("not-a-canonical-uuid") { denied ->
+        invalidPublications += 1
+        assertEquals(NativeDirectMessageProjectionAvailability.UNAVAILABLE, denied.availability)
+        assertTrue(denied.messages.isEmpty())
+      }
+      assertEquals(1, invalidPublications)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun directProjectionRejectsAnOldSameSessionReconnectGenerationAfterNativeReturns() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+    val projectionEntered = CountDownLatch(1)
+    val releaseProjection = CountDownLatch(1)
+    val oldPlaintext = "plaintext owned by the revoked Direct generation"
+    val projected = AtomicReference<NativeDirectMessageProjection>()
+    fakeSession.directoryInstalls.clear()
+    fakeSession.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+    )
+    try {
+      runtime.openSession()
+      val firstBinding = runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success("directory-a".toByteArray()))
+      awaitRuntimeIdle(runtime)
+      forceDirectoryReadyForProjectionTest(runtime)
+
+      fakeSession.directProjection = NativeDirectMessageProjection(
+        NativeDirectMessageProjectionAvailability.AVAILABLE,
+        listOf(
+          NativeDirectMessageView(
+            messageId = "30000000-0000-4000-8000-000000000001",
+            text = oldPlaintext,
+            timestampMs = 1_700_000_000_123,
+            direction = NativeDirectMessageDirection.INCOMING,
+            delivery = NativeDirectMessageDelivery.SENT,
+          ),
+        ),
+      )
+      fakeSession.directProjectionEntered = projectionEntered
+      fakeSession.directProjectionRelease = releaseProjection
+      val reader = thread(name = "old-direct-projection") {
+        runtime.publishDirectMessages(conversation.conversationId) { projection ->
+          projected.set(projection)
+        }
+      }
+      assertTrue("old projection did not enter native code", projectionEntered.await(5, TimeUnit.SECONDS))
+
+      // Reconnect the same NativeMobileSession to the same public binding. A
+      // value-only lifecycle check would accept the old plaintext after this
+      // second Direct generation reaches Ready.
+      fakeSession.directoryInstalls.add(
+        NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+      )
+      val secondBinding = runtime.connect("https://access.example")
+      assertEquals(firstBinding, secondBinding)
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success("directory-b".toByteArray()))
+      awaitRuntimeIdle(runtime)
+      forceDirectoryReadyForProjectionTest(runtime)
+
+      releaseProjection.countDown()
+      reader.join(TimeUnit.SECONDS.toMillis(5))
+      assertFalse("old projection reader did not finish", reader.isAlive)
+      val denied = checkNotNull(projected.get())
+      assertEquals(NativeDirectMessageProjectionAvailability.UNAVAILABLE, denied.availability)
+      assertTrue(denied.messages.isEmpty())
+      assertFalse(denied.toString().contains(oldPlaintext))
+    } finally {
+      releaseProjection.countDown()
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun directProjectionBridgePublicationLinearizesBeforeBackgroundRevocation() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+    val publisherEntered = CountDownLatch(1)
+    val releasePublisher = CountDownLatch(1)
+    val backgroundAttempted = CountDownLatch(1)
+    val backgroundFinished = CountDownLatch(1)
+    val plaintext = "plaintext published before the background transition"
+    val published = AtomicReference<NativeDirectMessageProjection>()
+    fakeSession.directoryInstalls.clear()
+    fakeSession.directoryInstalls.add(
+      NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+    )
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success("directory-ready".toByteArray()))
+      awaitRuntimeIdle(runtime)
+      forceDirectoryReadyForProjectionTest(runtime)
+
+      fakeSession.directProjectionFailure = IllegalStateException("synthetic native projection failure")
+      var failurePublications = 0
+      runtime.publishDirectMessages(conversation.conversationId) { denied ->
+        failurePublications += 1
+        assertEquals(NativeDirectMessageProjectionAvailability.UNAVAILABLE, denied.availability)
+        assertTrue(denied.messages.isEmpty())
+      }
+      assertEquals(1, failurePublications)
+      fakeSession.directProjectionFailure = null
+
+      fakeSession.directProjection = NativeDirectMessageProjection(
+        NativeDirectMessageProjectionAvailability.AVAILABLE,
+        listOf(
+          NativeDirectMessageView(
+            messageId = "30000000-0000-4000-8000-000000000001",
+            text = plaintext,
+            timestampMs = 1_700_000_000_123,
+            direction = NativeDirectMessageDirection.INCOMING,
+            delivery = NativeDirectMessageDelivery.SENT,
+          ),
+        ),
+      )
+      val reader = thread(name = "direct-bridge-publisher") {
+        runtime.publishDirectMessages(conversation.conversationId) { projection ->
+          publisherEntered.countDown()
+          check(releasePublisher.await(5, TimeUnit.SECONDS)) {
+            "synthetic bridge publication timed out"
+          }
+          published.set(projection)
+        }
+      }
+      assertTrue("bridge publisher did not enter", publisherEntered.await(5, TimeUnit.SECONDS))
+
+      val background = thread(name = "background-during-direct-publication") {
+        backgroundAttempted.countDown()
+        runtime.lockForBackground()
+        backgroundFinished.countDown()
+      }
+      assertTrue("background transition did not start", backgroundAttempted.await(5, TimeUnit.SECONDS))
+      assertFalse(
+        "background transition crossed an in-flight bridge publication",
+        backgroundFinished.await(150, TimeUnit.MILLISECONDS),
+      )
+
+      releasePublisher.countDown()
+      reader.join(TimeUnit.SECONDS.toMillis(5))
+      background.join(TimeUnit.SECONDS.toMillis(5))
+      assertFalse("bridge publisher did not finish", reader.isAlive)
+      assertFalse("background transition did not finish", background.isAlive)
+      assertTrue(backgroundFinished.await(0, TimeUnit.MILLISECONDS))
+      val available = checkNotNull(published.get())
+      assertEquals(NativeDirectMessageProjectionAvailability.AVAILABLE, available.availability)
+      assertEquals(plaintext, available.messages.single().text)
+      awaitRuntimeIdle(runtime)
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+    } finally {
+      releasePublisher.countDown()
       runtime.lockSession()
       executor.shutdownNow()
     }
@@ -1161,6 +1353,102 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun generatedDirectMessageProjectionMapsOnlyTheMinimalUiContract() {
+    val nativeView = NativeDirectMessageView(
+      messageId = "30000000-0000-4000-8000-000000000001",
+      text = "authenticated preview",
+      timestampMs = 1_700_000_000_123,
+      direction = NativeDirectMessageDirection.INCOMING,
+      delivery = NativeDirectMessageDelivery.SENT,
+    )
+    val nativeProjection = NativeDirectMessageProjection(
+      NativeDirectMessageProjectionAvailability.AVAILABLE,
+      listOf(nativeView),
+    )
+    assertFalse(nativeView.toString().contains("authenticated preview"))
+    assertFalse(nativeProjection.toString().contains("authenticated preview"))
+    assertEquals(
+      setOf("messageId", "text", "timestampMs", "direction", "delivery"),
+      NativeDirectMessageView::class.java.declaredFields.map { it.name }.toSet(),
+    )
+    val generatedFields = MobileDirectMessageData::class.java.declaredFields.map { it.name }.toSet()
+    assertFalse(generatedFields.contains("messageId"))
+    assertFalse(generatedFields.contains("text"))
+
+    val denied = MobileDirectMessageProjection(
+      availability = MobileDirectMessageProjectionAvailability.UNAVAILABLE,
+      messages = emptyList(),
+    ).toNativeDirectMessageProjection()
+    assertEquals(NativeDirectMessageProjectionAvailability.UNAVAILABLE, denied.availability)
+    assertTrue(denied.messages.isEmpty())
+
+    class TestHandle(
+      val value: String,
+      val fail: Boolean = false,
+    ) : AutoCloseable {
+      var closed = false
+      override fun close() {
+        closed = true
+      }
+    }
+
+    val successfulHandles = listOf(TestHandle("one"), TestHandle("two"))
+    assertEquals(
+      listOf("one", "two"),
+      mapAndCloseAllNativeHandles(successfulHandles) { it.value },
+    )
+    assertTrue(successfulHandles.all { it.closed })
+
+    val failingHandles = listOf(TestHandle("one"), TestHandle("two", fail = true), TestHandle("three"))
+    assertThrows(IllegalStateException::class.java) {
+      mapAndCloseAllNativeHandles(failingHandles) { handle ->
+        check(!handle.fail) { "synthetic getter failure" }
+        handle.value
+      }
+    }
+    assertTrue(failingHandles.all { it.closed })
+  }
+
+  @Test
+  fun directProjectionStructuralGuardEnforcesUtf8RowAndAggregateBudgets() {
+    fun message(index: Int, text: String) = NativeDirectMessageView(
+      messageId = "30000000-0000-4000-8000-${index.toString(16).padStart(12, '0')}",
+      text = text,
+      timestampMs = 1_700_000_000_000L + index,
+      direction = NativeDirectMessageDirection.INCOMING,
+      delivery = NativeDirectMessageDelivery.SENT,
+    )
+
+    fun projection(messages: List<NativeDirectMessageView>) = NativeDirectMessageProjection(
+      NativeDirectMessageProjectionAvailability.AVAILABLE,
+      messages,
+    )
+
+    val exactRow = "a".repeat(32 * 1024)
+    assertTrue(projection(listOf(message(1, exactRow))).isStructurallySafe())
+    assertFalse(projection(listOf(message(1, "$exactRow+"))).isStructurallySafe())
+
+    val exactTotal = (1..32).map { index -> message(index, exactRow) }
+    assertTrue(projection(exactTotal).isStructurallySafe())
+    assertFalse(projection(exactTotal + message(33, "x")).isStructurallySafe())
+
+    val fourByteScalar = "\uD83E\uDD80"
+    val exactMultibyteRow = fourByteScalar.repeat((32 * 1024) / 4)
+    assertTrue(projection(listOf(message(1, exactMultibyteRow))).isStructurallySafe())
+    assertFalse(
+      projection(listOf(message(1, exactMultibyteRow + fourByteScalar))).isStructurallySafe(),
+    )
+    assertFalse(projection(listOf(message(1, ""))).isStructurallySafe())
+    assertFalse(projection(listOf(message(1, "\uD800"))).isStructurallySafe())
+    assertFalse(
+      NativeDirectMessageProjection(
+        NativeDirectMessageProjectionAvailability.UNAVAILABLE,
+        listOf(message(1, "must remain opaque")),
+      ).isStructurallySafe(),
+    )
+  }
+
+  @Test
   fun directoryInstallMappingCopiesOnlyPublicRowsAndDropsPeerKeyMaterial() {
     val peerIdentityKey = "identity-key-hex-must-remain-native"
     val peerSigningKey = "signing-key-hex-must-remain-native"
@@ -1258,6 +1546,27 @@ class VeilMobileRuntimeTest {
     assertTrue("runtime executor did not drain", drained.await(5, TimeUnit.SECONDS))
   }
 
+  private fun publishDirectMessagesForTest(
+    runtime: VeilMobileRuntime,
+    conversationId: String,
+  ): NativeDirectMessageProjection {
+    val published = AtomicReference<NativeDirectMessageProjection>()
+    var publicationCount = 0
+    runtime.publishDirectMessages(conversationId) { projection ->
+      publicationCount += 1
+      published.set(projection)
+    }
+    assertEquals(1, publicationCount)
+    return checkNotNull(published.get())
+  }
+
+  private fun forceDirectoryReadyForProjectionTest(runtime: VeilMobileRuntime) {
+    val field = VeilMobileRuntime::class.java.getDeclaredField("directoryReady")
+    field.isAccessible = true
+    field.setBoolean(runtime, true)
+    assertTrue(runtime.snapshot().directoryReady)
+  }
+
   /** Complete the mandatory count -> exact publication ACK barrier. */
   private fun completeOwnPreKeyBootstrap(
     runtime: VeilMobileRuntime,
@@ -1338,6 +1647,14 @@ class VeilMobileRuntimeTest {
     var directoryRequestCount = 0
     var historyRequestCount = 0
     var liveBufferPumpCount = 0
+    var directProjectionCount = 0
+    @Volatile var directProjection = NativeDirectMessageProjection(
+      NativeDirectMessageProjectionAvailability.UNAVAILABLE,
+      emptyList(),
+    )
+    @Volatile var directProjectionEntered: CountDownLatch? = null
+    @Volatile var directProjectionRelease: CountDownLatch? = null
+    @Volatile var directProjectionFailure: Throwable? = null
     var failLiveBufferPump = false
     var historySynchronized = false
     var ownPreKeyRequestCount = 0
@@ -1497,6 +1814,16 @@ class VeilMobileRuntimeTest {
         bufferedEvents = 0,
         historySynchronized = historySynchronized,
       )
+    }
+
+    override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection {
+      directProjectionCount += 1
+      directProjectionEntered?.countDown()
+      directProjectionRelease?.let { release ->
+        check(release.await(5, TimeUnit.SECONDS)) { "synthetic Direct projection timed out" }
+      }
+      directProjectionFailure?.let { throw it }
+      return directProjection
     }
 
     override fun prepareDirectPreKeyRequest(
