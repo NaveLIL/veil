@@ -5532,6 +5532,15 @@ fn connect_to_server(
                             header,
                             server_timestamp,
                             reply_to_id,
+                            // The shared transport preserves optional wire-policy
+                            // presence for mobile's fail-closed replay boundary.
+                            // Desktop already reconciles type/expiry through its
+                            // attachment and revision-history paths; acknowledge
+                            // the fields explicitly so future event additions still
+                            // break this exhaustive consumer at compile time.
+                            msg_type: _,
+                            ttl_seconds: _,
+                            sealed: _,
                             attachments,
                             security_context,
                         } => {
