@@ -1,6 +1,6 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-07-18. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-07-19. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
@@ -40,9 +40,9 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 5. Phase 3B и 4P сохраняются отдельными незакрытыми product scopes: имеющийся
    desktop/transport foundation не заменяет physical attachment и native mobile
    push device matrices.
-6. Продолжить Android Direct Preview: foundation/runtime 5A и receive/read часть
-   5B уже подключены; ближайший незакрытый gate — one-shot peer-prekey, затем
-   idempotent send/outbox и reconnect. Точный pause checkpoint приведён в Phase 5.
+6. Продолжить Android Direct Preview: foundation/runtime 5A, receive/read и
+   one-shot peer-prekey уже опубликованы; ближайший незакрытый gate — shared
+   idempotent send/outbox и reconnect. Точный checkpoint приведён в Phase 5.
 7. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
@@ -59,7 +59,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
 | 5A | Android foundation | core runtime подключён: Keystore/SQLCipher, Node Access Pass, authenticated origin-bound sync; signed standalone APK и physical matrix открыты |
-| 5B | Android messaging | receive/read foundation реализован; peer-prekey в незакоммиченном checkpoint, send/outbox/reconnect не реализованы |
+| 5B | Android messaging | receive/read и one-shot peer-prekey опубликованы; send/outbox/reconnect не реализованы |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -1192,16 +1192,18 @@ history-to-live handoff и read-only message projection принадлежат n
 boundary. Это всё ещё закрытый Direct Preview: безопасная отправка, polished
 reconnect и подписанный standalone tester APK пока не готовы.
 
-### Pause checkpoint 2026-07-18
+### Peer-prekey checkpoint 2026-07-19
 
-Работа остановлена на проверяемой границе по просьбе владельца проекта. Статусы
-ниже намеренно разделяют опубликованный код, незакоммиченный worktree и ещё не
-реализованный scope.
+Pause checkpoint 2026-07-18 завершён двумя отдельными проверенными коммитами.
+Статусы ниже разделяют опубликованный код и ещё не реализованный scope; dirty
+worktree после публикации отсутствует.
 
 **Опубликовано и проверено в `codex/mobile-direct-preview`:**
 
-- authoritative published head — `c9f2d06` (`feat(mobile): gate Direct send
-  readiness`); `master` этим checkpoint не изменялся;
+- authoritative published head — `f21c9c0` (`feat(android): add explicit peer
+  prekey transport`), его обязательный Rust predecessor — `029d1e3`
+  (`feat(mobile): guard peer prekey capability in Rust`); `master` этими
+  checkpoint не изменялся;
 - mobile-only registration по Node Access Pass, Keystore-wrapped identity,
   native SQLCipher/session runtime и exact origin/account binding;
 - own-prekey bootstrap, authenticated Direct directory, immutable history,
@@ -1209,29 +1211,37 @@ reconnect и подписанный standalone tester APK пока не гото
   projection только явно выбранного Direct;
 - native advisory send readiness повторно проверяет live ratchet, lease/epoch,
   durable scope, identity pin, quarantine/history, storage и connection state;
+- Rust one-shot peer-prekey capability допускает максимум одну released
+  signature, повторяет authoritative guards до/после signing и при install,
+  сохраняет exact lease/request binding, response limits и zeroization;
+- Android `establishDirectSession` привязан к exact lifecycle epoch и Direct
+  generation: prepare → одна signature → один bounded GET → install. Background,
+  reconnect и late callback отзывают lease и очищают body; OkHttp network guard
+  блокирует status-driven 503/421 follow-up до второго signed wire exchange;
 - exact `c9f2d06` прошёл Go, Coverage, Rust и Mobile CI. Security workflow красный
   только на прежнем Cargo Audit baseline (те же 7 advisories и 19 разрешённых
   warnings, без новой регрессии). CI debug APK является build evidence, а не
   подписанным tester release и не physical-device evidence.
 
-**Сохранено локально, но не закоммичено и не опубликовано:**
+**Локальная completion evidence для `029d1e3` + `f21c9c0`:**
 
-- `veil-client/src/api.rs` и `veil-ffi/src/lib.rs`: one-shot peer-prekey
-  capability, единственная released signature, authoritative prepare/sign/
-  install guards, response limits/zeroization и late-Ready semantics. Успешны
-  11 adversarial prekey tests, 3 live tests, scoped fmt/diff-check и FFI clippy;
-  полный 63-test FFI run был остановлен до итогового summary и остаётся gate;
-- Android runtime/module и их JVM tests: явное exact-generation действие
-  `establishDirectSession`, `PEER_PREKEY` transport без redirect/retry,
-  lifecycle-bound pending request, callback-once и late-body wipe. Последний
-  полный прогон **до** audit-правок: 135/135 JVM tests. Текущий audit-fix worktree
-  после исправления install/background race ещё не компилировался и не
-  перезапускался;
-- известный блокирующий P1 текущего Android worktree: после успешного native
-  prepare ошибка Kotlin validation/sign при одновременно наступившем `Ready`
-  может оставить unsigned outstanding capability. До коммита нужно разделить
-  ошибки до/после prepare; любая ошибка после успешного prepare отзывает всю
-  Direct lease. Обязателен deterministic retained-outstanding + Ready test.
+- `cargo fmt --all -- --check`, workspace clippy с `-D warnings`, полный
+  `cargo test --workspace --all-targets` и отдельный `veil-ffi` summary 65/65;
+- retained-outstanding/Ready, post-sign lease replacement, install/background,
+  reconnect/late-body, exactly-one signature/GET и prepare/sign/create-call
+  cleanup покрыты deterministic adversarial tests;
+- Android native libraries воспроизводимо пересобраны для `arm64-v8a` и
+  `x86_64`; `verifyVeilRustLibraries`, JVM 142/142, `lintDebug` с 0 errors и
+  `assembleDebug` для обеих ABI прошли без исключения `.so` preflight;
+- UniFFI regeneration byte-for-byte стабильна; contract version 29 и 68/68
+  checksums совпали для host DLL, обеих source `.so`, merged и stripped
+  intermediates;
+- ESLint, TypeScript и Jest 68/68 прошли после frozen pnpm install. Windows
+  virtual-store path policy не меняет dependency lock и Jest больше не зависит
+  от полного имени служебного `.pnpm` каталога;
+- два независимых exact-diff review после исправления OkHttp follow-up вернули
+  `P0/P1/P2: none`. Debug APK остаётся build evidence с debug key, а не tester
+  release и не physical-device evidence.
 
 **Не реализовано и не считается готовым:**
 
@@ -1247,14 +1257,16 @@ reconnect и подписанный standalone tester APK пока не гото
 - release signing, standalone tester APK, чистая установка и physical-device
   matrix. Ни текущий CI APK, ни старый debug APK не являются tester release.
 
-**Порядок возобновления:**
+**Следующий порядок:**
 
-1. Закрыть Android post-prepare P1 и запустить новые race/capability tests.
-2. Повторить полный Rust FFI/workspace и Android JVM/lint gates.
-3. Независимо проверить diff; закоммитить и опубликовать Rust и Android
-   checkpoints раздельно.
-4. Добавить shared idempotent send contract и атомарный native outbox до
-   включения composer; затем polished reconnect и только после этого signed APK.
+1. Добавить shared `client_message_id`/digest idempotency contract на wire и
+   серверную exact-replay семантику без второго insert/fan-out.
+2. Сохранить advanced ratchet, local row и exact serialized ciphertext outbox в
+   одной SQLCipher-транзакции; ACK reconciliation также сделать атомарным.
+3. Reconnect повторяет только те же bytes/ID после нового exact Ready lease;
+   composer включается без optimistic JS row только после native projection.
+4. Пройти airplane-mode/process-death/physical matrix и только после этого
+   собрать подписанный standalone tester APK.
 
 Ранее обязательные исправления проекта — текущий статус:
 
@@ -1310,11 +1322,11 @@ native failure разделены. Это закрывает первый пун
 
 ### Phase 5B — Android messaging
 
-**Receive/read checkpoint 2026-07-18: частично готов.** Настоящие Direct list,
-authenticated history, bounded live receive и native read-only projection уже
-заменили demo chat data. X3DH peer-prekey transport находится в локальном
-незакоммиченном checkpoint выше. ACK/outbox/send, reconnect/process-death matrix,
-private groups и остальные пункты 5B не готовы.
+**Receive/read + peer-prekey checkpoint 2026-07-19: частично готов.** Настоящие
+Direct list, authenticated history, bounded live receive и native read-only
+projection уже заменили demo chat data. X3DH one-shot peer-prekey transport
+опубликован в `029d1e3` + `f21c9c0`. ACK/outbox/send, reconnect/process-death
+matrix, private groups и остальные пункты 5B не готовы.
 
 1. Сначала один честный Desktop ↔ Android DM: X3DH/Double Ratchet, history sync,
    ack/outbox, reconnect, airplane mode и process death.
