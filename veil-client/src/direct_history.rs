@@ -16,6 +16,7 @@ use serde::{
 use veil_store::models::{
     AuthenticatedDirectHistoryScopeV1, MessageAuthorContext, RemoteMessageStateKind, RemoteReaction,
 };
+use zeroize::Zeroize;
 
 use crate::api::{
     DirectHistoryMutationError, ReceiveMessageResult, RemoteMessageMetadata, RemoteReconcileAction,
@@ -287,6 +288,21 @@ pub fn direct_history_request_target(state: &DirectHistorySyncState) -> Result<S
 /// an exact replay therefore sees already-committed prefix rows as duplicates
 /// and never advances their ratchets twice.
 pub fn install_authenticated_direct_history_page(
+    client: &mut VeilClient,
+    state: &mut DirectHistorySyncState,
+    response: &[u8],
+) -> Result<DirectHistoryPageResult, DirectHistoryInstallError> {
+    let result = install_authenticated_direct_history_page_inner(client, state, response);
+    if matches!(&result, Err(DirectHistoryInstallError::StorageUncertain)) {
+        // A page can touch ratchets, message rows, author snapshots, and
+        // metadata through several helpers. One top-level boundary ensures no
+        // storage-uncertain branch merely becomes a retryable sync failure.
+        client.revoke_storage_uncertain_epoch_v1();
+    }
+    result
+}
+
+fn install_authenticated_direct_history_page_inner(
     client: &mut VeilClient,
     state: &mut DirectHistorySyncState,
     response: &[u8],
@@ -714,27 +730,27 @@ fn process_message(
             .map_err(|_| DirectHistoryInstallError::StorageUncertain)?
     {
         client
-            .reconcile_remote_message_metadata(
+            .reconcile_remote_message_metadata_classified(
                 &message.id,
                 &scope.conversation_id,
                 &message.sender_identity_key,
                 &metadata,
                 RemoteMessageStateKind::Unavailable,
             )
-            .map_err(|_| DirectHistoryInstallError::StorageUncertain)?;
+            .map_err(classify_history_mutation_error)?;
         result.unavailable += 1;
         return Ok(());
     }
 
     let action = client
-        .reconcile_remote_message_metadata(
+        .reconcile_remote_message_metadata_classified(
             &message.id,
             &scope.conversation_id,
             &message.sender_identity_key,
             &metadata,
             message.remote_state,
         )
-        .map_err(|_| DirectHistoryInstallError::StorageUncertain)?;
+        .map_err(classify_history_mutation_error)?;
 
     match action {
         RemoteReconcileAction::Deleted => {
@@ -778,7 +794,10 @@ fn process_message(
                 )
                 .map_err(classify_history_mutation_error)?
             {
-                ReceiveMessageResult::Stored { .. } => result.stored += 1,
+                ReceiveMessageResult::Stored { mut plaintext } => {
+                    plaintext.zeroize();
+                    result.stored += 1;
+                }
                 ReceiveMessageResult::Duplicate => result.duplicates += 1,
             }
         }
@@ -1873,7 +1892,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlcipher_write_failure_is_storage_uncertain_and_rolls_back_ratchet() {
+    fn sqlcipher_write_failure_revokes_the_complete_native_epoch() {
         let mut fixture = HistoryFixture::new();
         fixture.establish_sender_session();
         let (ciphertext, header) = fixture
@@ -1913,34 +1932,17 @@ mod tests {
             DirectHistoryInstallError::StorageUncertain
         );
         assert_eq!(state.pages(), 0);
-        assert!(!fixture
-            .receiver
-            .db()
-            .unwrap()
-            .message_exists(&message_id(1))
-            .unwrap());
-        assert!(fixture
-            .receiver
-            .db()
-            .unwrap()
-            .load_ratchet_session(&fixture.peer_identity)
-            .unwrap()
-            .is_none());
-
-        fixture
-            .receiver
-            .db()
-            .unwrap()
-            .conn()
-            .execute_batch("DROP TRIGGER reject_direct_history_message")
-            .unwrap();
-        let installed = install_authenticated_direct_history_page(
-            &mut fixture.receiver,
-            &mut state,
-            &page(vec![valid], None),
-        )
-        .unwrap();
-        assert_eq!(installed.stored, 1);
+        assert_eq!(
+            fixture
+                .receiver
+                .direct_conversation_availability_v1(CONVERSATION),
+            crate::api::DirectConversationAvailabilityV1::RuntimeRevoked
+        );
+        assert!(fixture.receiver.db().is_none());
+        assert!(fixture.receiver.identity_key().is_err());
+        assert!(fixture.receiver.authenticated_user_id().is_err());
+        assert!(!fixture.receiver.has_session(&fixture.peer_identity));
+        assert!(fixture.receiver.generate_prekeys().is_err());
         fixture.close();
     }
 }

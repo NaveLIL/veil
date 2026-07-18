@@ -16,7 +16,8 @@ use veil_store::db::{
     PendingSenderKeyDeviceEnvelopeV1, VeilDb,
 };
 use veil_store::models::{
-    AccountSnapshot, ConversationType, MessageAuthorContext, RemoteMessageStateKind, RemoteReaction,
+    AccountSnapshot, ConversationType, Message, MessageAuthorContext, RemoteMessageStateKind,
+    RemoteReaction,
 };
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, Zeroizing};
@@ -140,6 +141,35 @@ fn random_device_id() -> [u8; 16] {
     }
 }
 
+fn canonical_server_origin_from_websocket_url_v1(server_url: &str) -> Result<String, String> {
+    let parsed = url::Url::parse(server_url)
+        .map_err(|_| "invalid authenticated WebSocket server URL".to_string())?;
+    if !parsed.username().is_empty() || parsed.password().is_some() || parsed.fragment().is_some() {
+        return Err("authenticated WebSocket URL has an invalid authority".to_string());
+    }
+    let origin_scheme = match parsed.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return Err("authenticated WebSocket URL has an unsupported scheme".to_string()),
+    };
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "authenticated WebSocket URL has no host".to_string())?
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "authenticated WebSocket URL has no effective port".to_string())?;
+    let authority = if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    };
+    let canonical = format!("{origin_scheme}://{authority}:{port}");
+    crate::direct::validate_canonical_origin(&canonical)?;
+    Ok(canonical)
+}
+
 /// Result of decrypting an incoming message.
 #[derive(Debug)]
 pub enum DecryptedPayload {
@@ -181,6 +211,86 @@ impl DirectHistoryMutationError {
             Self::ConversationRejected(detail) | Self::StorageUncertain(detail) => detail,
         }
     }
+}
+
+/// One native Direct live-replay turn never consumes more than this many
+/// authenticated socket events. The caller must schedule another turn when
+/// `quiescent` is false, giving lifecycle/terminal checks a bounded cadence.
+pub const DIRECT_LIVE_REPLAY_MAX_BATCH_V1: usize = 64;
+
+/// Deliberately coarse output from one Direct live-replay turn.
+///
+/// No account locator, conversation id, ciphertext, plaintext, or key material
+/// crosses this boundary. Renderer-facing projections are read separately
+/// from SQLCipher after replay has committed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DirectLiveReplayReportV1 {
+    pub consumed: usize,
+    pub stored: usize,
+    pub duplicates: usize,
+    pub ignored: usize,
+    pub newly_blocked: usize,
+    pub visible_mutations: usize,
+    /// True only when this turn explicitly observed `poll_event() == None`
+    /// before reaching the hard batch bound.
+    pub quiescent: bool,
+}
+
+/// Fail-closed reason which stopped Direct live replay globally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectLiveReplayStopV1 {
+    /// The authenticated transport epoch ended or its bounded FIFO failed.
+    TransportTerminal,
+    /// A native mutation could not establish whether durable state committed.
+    StorageUncertain,
+}
+
+/// Typed global stop with the aggregate work completed before the stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DirectLiveReplayErrorV1 {
+    pub stop: DirectLiveReplayStopV1,
+    pub report: DirectLiveReplayReportV1,
+}
+
+impl std::fmt::Display for DirectLiveReplayErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.stop {
+            DirectLiveReplayStopV1::TransportTerminal => {
+                formatter.write_str("authenticated Direct live transport ended")
+            }
+            DirectLiveReplayStopV1::StorageUncertain => {
+                formatter.write_str("Direct live SQLCipher state is uncertain")
+            }
+        }
+    }
+}
+
+impl std::error::Error for DirectLiveReplayErrorV1 {}
+
+/// Native-safe availability for one caller-supplied conversation id.
+///
+/// The result never enumerates or returns conversation identifiers. A future
+/// FFI projection must ask about the exact id it is about to expose.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectConversationAvailabilityV1 {
+    /// Policy/crypto availability only; transport connectivity is separate.
+    Available = 0,
+    Quarantined = 1,
+    RuntimeRevoked = 2,
+    NotDirect = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectLiveEventOutcomeV1 {
+    Stored,
+    Duplicate,
+    Ignored,
+}
+
+enum ClassifiedReceiveResultV1 {
+    Stored { plaintext: Zeroizing<String> },
+    Duplicate,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -608,6 +718,10 @@ pub struct VeilClient {
     deferred_connection_events: DeferredConnectionEventQueueV1,
     /// Server-assigned UUID from the authenticated WebSocket session.
     authenticated_user_id: Option<String>,
+    /// Canonical HTTPS/loopback-HTTP origin derived from the exact WebSocket
+    /// URL which authenticated `authenticated_user_id`. Cleared with the
+    /// transport epoch so non-global server UUIDs can never select old routes.
+    authenticated_server_origin: Option<String>,
     device_id: [u8; 16],
     /// Active ratchet sessions keyed by peer identity key (X25519 public).
     ratchet_sessions: HashMap<[u8; 32], RatchetSession>,
@@ -668,6 +782,14 @@ pub struct VeilClient {
     pending_sender_key_receipt_set: HashSet<PendingSenderKeyReceiptV1>,
     pending_sender_key_receipt_sequences: HashMap<u64, PendingSenderKeyReceiptV1>,
     failed_sender_key_distributions: HashSet<String>,
+    /// Process-lifetime quarantine for Direct conversations whose live stream
+    /// violated immutable routing/policy/cryptographic invariants. A later
+    /// event for another Direct remains independently processable.
+    direct_live_blocked_conversations: HashSet<String>,
+    /// Sticky global stop after an uncertain SQLCipher outcome. Continuing a
+    /// ratchet in this process could diverge from durable state, so only a
+    /// successful native reinitialization may clear it.
+    direct_live_storage_uncertain: bool,
     /// Optional local-only full-text index. Index calls are best-effort and never fatal.
     indexer: Option<Arc<Indexer>>,
 }
@@ -713,6 +835,7 @@ impl VeilClient {
             connection: None,
             deferred_connection_events: DeferredConnectionEventQueueV1::default(),
             authenticated_user_id: None,
+            authenticated_server_origin: None,
             device_id,
             ratchet_sessions: HashMap::new(),
             spk_secrets: HashMap::new(),
@@ -740,6 +863,8 @@ impl VeilClient {
             pending_sender_key_receipt_set: HashSet::new(),
             pending_sender_key_receipt_sequences: HashMap::new(),
             failed_sender_key_distributions: HashSet::new(),
+            direct_live_blocked_conversations: HashSet::new(),
+            direct_live_storage_uncertain: false,
             indexer: None,
         }
     }
@@ -754,6 +879,7 @@ impl VeilClient {
             connection: None,
             deferred_connection_events: DeferredConnectionEventQueueV1::default(),
             authenticated_user_id: None,
+            authenticated_server_origin: None,
             device_id,
             ratchet_sessions: HashMap::new(),
             spk_secrets: HashMap::new(),
@@ -781,6 +907,8 @@ impl VeilClient {
             pending_sender_key_receipt_set: HashSet::new(),
             pending_sender_key_receipt_sequences: HashMap::new(),
             failed_sender_key_distributions: HashSet::new(),
+            direct_live_blocked_conversations: HashSet::new(),
+            direct_live_storage_uncertain: false,
             indexer: None,
         }
     }
@@ -788,6 +916,9 @@ impl VeilClient {
     /// Attach a local search index. Subsequent message inserts/edits/deletes
     /// will be mirrored into it on a best-effort basis.
     pub fn set_indexer(&mut self, indexer: Arc<Indexer>) {
+        if self.direct_live_storage_uncertain {
+            return;
+        }
         self.indexer = Some(indexer);
     }
 
@@ -810,6 +941,42 @@ impl VeilClient {
     /// Initialize the client with a mnemonic.
     /// Derives identity keys and opens the encrypted local database.
     pub fn init_with_mnemonic(&mut self, mnemonic: &str, db_path: &Path) -> Result<(), String> {
+        if !self.direct_live_storage_uncertain
+            && (self.db.is_some()
+                || self.identity.is_some()
+                || self.device_identity.is_some()
+                || self.connection.is_some()
+                || self.authenticated_user_id.is_some()
+                || self.authenticated_server_origin.is_some())
+        {
+            // Replacing only identity/DB material would leave the authenticated
+            // transport, origin, and queued ciphertext attached to the wrong
+            // account epoch. Recovery is intentionally allowed only after the
+            // complete runtime has entered the sticky revoked state.
+            return Err(
+                "client is already initialized; revoke the active runtime before recovery"
+                    .to_string(),
+            );
+        }
+        let previous_device_id = self.device_id;
+        let result = self.init_with_mnemonic_inner_v1(mnemonic, db_path);
+        if result.is_err() {
+            // Initialization may fail after loading some SQLCipher-backed
+            // secrets and runtime routes. Never expose that partial epoch, and
+            // never keep an older authenticated transport alive after a
+            // failed identity/database switch. A later complete retry is the
+            // only operation allowed to clear this sticky revoke.
+            self.revoke_after_storage_uncertain_v1();
+            self.device_id = previous_device_id;
+        }
+        result
+    }
+
+    fn init_with_mnemonic_inner_v1(
+        &mut self,
+        mnemonic: &str,
+        db_path: &Path,
+    ) -> Result<(), String> {
         let identity = IdentityKeyPair::from_mnemonic(mnemonic)?;
 
         let db_key = Zeroizing::new(kdf::derive_db_key(mnemonic)?);
@@ -900,6 +1067,8 @@ impl VeilClient {
         self.device_identity = Some(device_identity);
         self.identity = Some(identity);
         self.db = Some(db);
+        self.direct_live_blocked_conversations.clear();
+        self.direct_live_storage_uncertain = false;
         Ok(())
     }
 
@@ -959,6 +1128,7 @@ impl VeilClient {
                 &signing_key,
             )?;
         self.authenticated_user_id = Some(user_id.to_string());
+        self.authenticated_server_origin = Some(canonical_server_origin.to_string());
         Ok(())
     }
 
@@ -1230,6 +1400,7 @@ impl VeilClient {
         &mut self,
         candidate: DeviceRosterCandidateV1,
     ) -> Result<bool, String> {
+        self.require_direct_conversation_available_v1(&candidate.conversation_id)?;
         let conversation_id = candidate.conversation_id.clone();
         let previous = self
             .device_rosters
@@ -1303,6 +1474,13 @@ impl VeilClient {
     }
 
     pub fn invalidate_device_roster_v1(&mut self, conversation_id: &str) {
+        if self.direct_live_storage_uncertain
+            || self
+                .direct_live_blocked_conversations
+                .contains(conversation_id)
+        {
+            return;
+        }
         if let Some(roster) = self.device_rosters.remove(conversation_id) {
             self.last_invalidated_device_rosters.insert(
                 conversation_id.to_string(),
@@ -1327,6 +1505,7 @@ impl VeilClient {
         &self,
         conversation_id: &str,
     ) -> Result<Vec<DeviceTargetV1>, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         self.device_rosters
             .get(conversation_id)
             .map(|roster| roster.targets.clone())
@@ -1340,6 +1519,7 @@ impl VeilClient {
         user_id: &str,
         identity_key: [u8; 32],
     ) -> Result<(), String> {
+        self.require_crypto_runtime_active_v1()?;
         self.ensure_user_identity_binding_compatible(user_id, identity_key)?;
         self.known_user_keys
             .entry(user_id.to_string())
@@ -1397,6 +1577,7 @@ impl VeilClient {
         identity_key: [u8; 32],
         signing_key: [u8; 32],
     ) -> Result<(), String> {
+        self.require_crypto_runtime_active_v1()?;
         self.ensure_peer_signing_key_compatible(identity_key, signing_key)?;
         if let Some(existing) = self.trusted_signing_keys.get(&identity_key) {
             debug_assert_eq!(existing, &signing_key);
@@ -1446,6 +1627,7 @@ impl VeilClient {
         conversation_id: &str,
         peer_identity_key: [u8; 32],
     ) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         self.ensure_dm_conversation_binding_compatible(conversation_id, peer_identity_key)?;
         self.dm_conversations
             .insert(conversation_id.to_string(), peer_identity_key);
@@ -1506,6 +1688,7 @@ impl VeilClient {
     /// Sign an arbitrary message with our Ed25519 identity key. Used for
     /// authenticating REST requests via the X-Veil-Signature header scheme.
     pub fn sign_message(&self, message: &[u8]) -> Result<[u8; 64], String> {
+        self.require_crypto_runtime_active_v1()?;
         let id = self.identity.as_ref().ok_or("not initialized")?;
         Ok(veil_crypto::signature::sign(id, message))
     }
@@ -1592,6 +1775,12 @@ impl VeilClient {
         client_id: &str,
         node_access_invite: Option<&[u8]>,
     ) -> Result<String, String> {
+        // An uncertain SQLCipher outcome invalidates the whole native epoch.
+        // Reconnect cannot repair that ambiguity; only a successful unlock
+        // reconstructs runtime state from durable storage.
+        self.require_crypto_runtime_active_v1()?;
+        let authenticated_server_origin =
+            canonical_server_origin_from_websocket_url_v1(server_url)?;
         if node_access_invite.is_some_and(|invite| invite.len() != 32) {
             return Err("node access pass must contain exactly 32 bytes".to_string());
         }
@@ -1643,11 +1832,12 @@ impl VeilClient {
         // Sequence numbers restart for every WebSocket. Resolve all old
         // pending entries before installing the new connection so a new ACK
         // can never confirm an unrelated pre-reconnect message or mutation.
-        self.mark_all_pending_sequences_unknown()?;
+        self.reconcile_previous_transport_before_install_v1()?;
         // REST backlog is authoritative for anything not processed from the
         // previous socket. Never replay its deferred events in the new epoch.
         self.deferred_connection_events.reset_for_new_epoch();
         self.authenticated_user_id = Some(user_id.clone());
+        self.authenticated_server_origin = Some(authenticated_server_origin);
         self.connection = Some(conn);
         Ok(user_id)
     }
@@ -1660,6 +1850,7 @@ impl VeilClient {
             connection.disconnect();
         }
         self.authenticated_user_id = None;
+        self.authenticated_server_origin = None;
         self.deferred_connection_events.reset_for_new_epoch();
     }
 
@@ -1669,6 +1860,7 @@ impl VeilClient {
     pub fn process_retained_sender_keys_before_sync(
         &mut self,
     ) -> Result<RetainedSenderKeyProcessReportV1, String> {
+        self.require_crypto_runtime_active_v1()?;
         let mut retained = Vec::new();
         let mut live = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
@@ -1831,6 +2023,9 @@ impl VeilClient {
     pub fn buffer_connection_events_during_sync(
         &mut self,
     ) -> Result<usize, ConnectionEventBufferErrorV1> {
+        if self.direct_live_storage_uncertain {
+            return Err(ConnectionEventBufferErrorV1::TransportEpochEnded);
+        }
         let mut incoming = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
             while let Ok(event) = connection.events.try_recv_budgeted() {
@@ -1855,10 +2050,13 @@ impl VeilClient {
             connection.disconnect();
         }
         self.authenticated_user_id = None;
-        // A fail-closed buffer terminal is transport loss. Keep any durable
-        // persistence failure for the next connect/startup retry; never clear
-        // the in-memory pending maps as if delivery had been rejected.
-        let _ = self.mark_all_pending_sequences_unknown();
+        self.authenticated_server_origin = None;
+        // A fail-closed buffer terminal is transport loss. If recording the
+        // delivery-unknown state itself is uncertain, revoke the complete
+        // native epoch instead of hiding a SQLCipher failure behind transport.
+        if self.mark_all_pending_sequences_unknown().is_err() {
+            self.revoke_after_storage_uncertain_v1();
+        }
     }
 
     fn resolve_budgeted_connection_event_v1(
@@ -1880,6 +2078,7 @@ impl VeilClient {
     /// Poll for the next incoming event from the server.
     /// Returns None if no event is available (non-blocking).
     pub async fn poll_event(&mut self) -> Result<Option<ConnectionEvent>, String> {
+        self.require_crypto_runtime_active_v1()?;
         if let Some(error) = self.deferred_connection_events.failure() {
             return Err(error.to_string());
         }
@@ -1927,71 +2126,734 @@ impl VeilClient {
             self.terminate_connection_after_deferred_failure_v1();
             return Err(error.to_string());
         }
-        match event.as_mut() {
-            Some(ConnectionEvent::MessageAcked {
-                message_id,
-                server_timestamp,
-                ref_seq,
-                local_message_id,
-                mutation,
-                sender_key,
-            }) => {
-                *local_message_id =
-                    self.finalize_outgoing_message(*ref_seq, message_id, *server_timestamp)?;
-                *mutation = self.confirm_pending_mutation(*ref_seq, *server_timestamp)?;
-                self.confirm_initial_message(*ref_seq)?;
-                self.confirm_sender_key_distribution(*ref_seq, sender_key.as_ref())?;
-            }
-            Some(ConnectionEvent::Error {
-                code,
-                ref_seq: Some(ref_seq),
-                local_message_id,
-                conversation_id,
-                stale_roster_context,
-                ..
-            }) => {
-                let pending_conversation = self
-                    .pending_sender_key_sequences
-                    .get(ref_seq)
-                    .map(|pending| pending.conversation_id.clone())
-                    .or_else(|| {
-                        self.pending_outgoing_messages
-                            .get(ref_seq)
-                            .map(|pending| pending.conversation_id.clone())
-                    });
-                if *code == 409 {
-                    if let Some(pending_conversation) = pending_conversation.as_ref() {
-                        if self.channel_conversations.contains(pending_conversation) {
-                            self.invalidate_device_roster_v1(pending_conversation);
-                            *conversation_id = Some(pending_conversation.clone());
-                            *stale_roster_context = true;
+        let reconciliation = (|| -> Result<(), String> {
+            match event.as_mut() {
+                Some(ConnectionEvent::MessageAcked {
+                    message_id,
+                    server_timestamp,
+                    ref_seq,
+                    local_message_id,
+                    mutation,
+                    sender_key,
+                }) => {
+                    *local_message_id =
+                        self.finalize_outgoing_message(*ref_seq, message_id, *server_timestamp)?;
+                    self.confirm_initial_message(*ref_seq)?;
+                    self.confirm_sender_key_distribution(*ref_seq, sender_key.as_ref())?;
+                    // Move a confirmed edit (and its plaintext) into the
+                    // caller-visible event only after every fallible ACK
+                    // reconciliation step has completed. Otherwise a later
+                    // Sender-Key/initial-session failure would drop the
+                    // event-local plaintext outside the explicit revoke
+                    // zeroization path.
+                    *mutation = self.confirm_pending_mutation(*ref_seq, *server_timestamp)?;
+                }
+                Some(ConnectionEvent::Error {
+                    code,
+                    ref_seq: Some(ref_seq),
+                    local_message_id,
+                    conversation_id,
+                    stale_roster_context,
+                    ..
+                }) => {
+                    let pending_conversation = self
+                        .pending_sender_key_sequences
+                        .get(ref_seq)
+                        .map(|pending| pending.conversation_id.clone())
+                        .or_else(|| {
+                            self.pending_outgoing_messages
+                                .get(ref_seq)
+                                .map(|pending| pending.conversation_id.clone())
+                        });
+                    if *code == 409 {
+                        if let Some(pending_conversation) = pending_conversation.as_ref() {
+                            if self.channel_conversations.contains(pending_conversation) {
+                                self.invalidate_device_roster_v1(pending_conversation);
+                                *conversation_id = Some(pending_conversation.clone());
+                                *stale_roster_context = true;
+                            }
                         }
                     }
+                    *local_message_id = self.reject_pending_sequence(*ref_seq)?;
                 }
-                *local_message_id = self.reject_pending_sequence(*ref_seq)?;
-            }
-            Some(ConnectionEvent::Disconnected { reason }) => {
-                // There can be no trustworthy delivery conclusion once the
-                // socket epoch ends: a frame may have reached the gateway and
-                // only its ACK may have been lost. Preserve every local row as
-                // DeliveryUnknown instead of deleting it or inviting a blind
-                // retry that could duplicate the message.
-                self.connection = None;
-                self.authenticated_user_id = None;
-                self.deferred_connection_events.close_epoch();
-                if let Err(error) = self.mark_all_pending_sequences_unknown() {
-                    // The transport terminal event must still reach the UI so
-                    // it stops claiming that the socket is connected. Keep
-                    // the pending maps for a fail-closed retry before the next
-                    // connect; startup recovery is the final fallback.
-                    reason.push_str(&format!(
-                        "; local delivery-state persistence failed: {error}"
-                    ));
+                Some(ConnectionEvent::Disconnected { .. }) => {
+                    // There can be no trustworthy delivery conclusion once the
+                    // socket epoch ends: a frame may have reached the gateway and
+                    // only its ACK may have been lost. Preserve every local row as
+                    // DeliveryUnknown instead of deleting it or inviting a blind
+                    // retry that could duplicate the message.
+                    self.connection = None;
+                    self.authenticated_user_id = None;
+                    self.authenticated_server_origin = None;
+                    self.deferred_connection_events.close_epoch();
+                    self.mark_all_pending_sequences_unknown()
+                        .map_err(|error| format!("persist disconnected delivery state: {error}"))?;
                 }
+                _ => {}
             }
-            _ => {}
+            Ok(())
+        })();
+        if let Err(error) = reconciliation {
+            self.revoke_after_storage_uncertain_v1();
+            return Err(error);
         }
         Ok(event)
+    }
+
+    fn direct_live_replay_error_v1(
+        stop: DirectLiveReplayStopV1,
+        report: DirectLiveReplayReportV1,
+    ) -> DirectLiveReplayErrorV1 {
+        DirectLiveReplayErrorV1 { stop, report }
+    }
+
+    pub fn direct_conversation_availability_v1(
+        &self,
+        conversation_id: &str,
+    ) -> DirectConversationAvailabilityV1 {
+        if self.direct_live_storage_uncertain {
+            DirectConversationAvailabilityV1::RuntimeRevoked
+        } else if self
+            .direct_live_blocked_conversations
+            .contains(conversation_id)
+        {
+            DirectConversationAvailabilityV1::Quarantined
+        } else if !self.dm_conversations.contains_key(conversation_id) {
+            DirectConversationAvailabilityV1::NotDirect
+        } else {
+            DirectConversationAvailabilityV1::Available
+        }
+    }
+
+    /// Exact native projection boundary for Stage-5 Direct history. Callers
+    /// receive no quarantine identifiers and cannot use a route that was
+    /// rejected by live replay; known non-Direct projections keep their
+    /// existing channel/group path.
+    pub fn direct_messages_projection_v1(
+        &self,
+        conversation_id: &str,
+        limit: u32,
+    ) -> Result<Vec<Message>, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
+        if !self.dm_conversations.contains_key(conversation_id) {
+            return Err("conversation is not an available Direct route".to_string());
+        }
+        if limit == 0 || limit > 500 {
+            return Err("Direct message projection limit is invalid".to_string());
+        }
+        self.db
+            .as_ref()
+            .ok_or("database not initialized")?
+            .get_messages(conversation_id, limit)
+    }
+
+    fn require_crypto_runtime_active_v1(&self) -> Result<(), String> {
+        if self.direct_live_storage_uncertain {
+            Err("native cryptographic runtime is revoked after uncertain storage state".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_direct_conversation_available_v1(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), String> {
+        self.require_crypto_runtime_active_v1()?;
+        if self
+            .direct_live_blocked_conversations
+            .contains(conversation_id)
+        {
+            Err("Direct conversation is quarantined in the native runtime".to_string())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn require_message_conversation_available_v1(&self, message_id: &str) -> Result<(), String> {
+        self.require_crypto_runtime_active_v1()?;
+        let Some(db) = self.db.as_ref() else {
+            return Err("database not initialized".to_string());
+        };
+        let (conversation_id, _, _, _) = db
+            .get_message_binding(message_id)?
+            .ok_or("message conversation binding is unavailable")?;
+        self.require_direct_conversation_available_v1(&conversation_id)?;
+        Ok(())
+    }
+
+    fn require_classified_receive_available_v1(
+        &self,
+        conversation_id: &str,
+    ) -> Result<(), DirectHistoryMutationError> {
+        if self.direct_live_storage_uncertain {
+            return Err(DirectHistoryMutationError::storage(
+                "native cryptographic runtime is revoked after uncertain storage state",
+            ));
+        }
+        if self
+            .direct_live_blocked_conversations
+            .contains(conversation_id)
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct conversation is quarantined in the native runtime",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_inbound_author_snapshot_classified_v1(
+        &self,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
+    ) -> Result<(), DirectHistoryMutationError> {
+        let Some(author_snapshot) = author_snapshot else {
+            return Ok(());
+        };
+        if author_snapshot.locator.identity_key != *sender_identity_key
+            || author_snapshot.profile_origin != author_snapshot.locator.canonical_server_origin
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "inbound author snapshot conflicts with the authenticated sender scope",
+            ));
+        }
+        let durable = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
+            .resolve_account_by_conversation_sender(conversation_id, sender_identity_key)
+            .map_err(DirectHistoryMutationError::storage)?
+            .ok_or_else(|| {
+                DirectHistoryMutationError::rejected(
+                    "inbound author is absent from the authenticated conversation origin",
+                )
+            })?;
+        if durable.locator != author_snapshot.locator
+            || durable.signing_key != author_snapshot.signing_key
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "inbound author snapshot changed its immutable account binding",
+            ));
+        }
+        Ok(())
+    }
+
+    fn zeroize_pending_mutation_v1(mutation: &mut ConfirmedMutation) {
+        match mutation {
+            ConfirmedMutation::Edit {
+                message_id,
+                conversation_id,
+                new_text,
+            } => {
+                message_id.zeroize();
+                conversation_id.zeroize();
+                new_text.zeroize();
+            }
+            ConfirmedMutation::Delete {
+                message_id,
+                conversation_id,
+            } => {
+                message_id.zeroize();
+                conversation_id.zeroize();
+            }
+            ConfirmedMutation::Reaction {
+                message_id,
+                conversation_id,
+                emoji,
+                user_id,
+                ..
+            } => {
+                message_id.zeroize();
+                conversation_id.zeroize();
+                emoji.zeroize();
+                user_id.zeroize();
+            }
+        }
+    }
+
+    /// Revoke the complete process-local epoch after an uncertain SQLCipher
+    /// outcome. This path deliberately performs no further database writes.
+    fn revoke_after_storage_uncertain_v1(&mut self) {
+        self.direct_live_storage_uncertain = true;
+        if let Some(connection) = self.connection.take() {
+            connection.disconnect();
+        }
+        if let Some(mut authenticated_user_id) = self.authenticated_user_id.take() {
+            authenticated_user_id.zeroize();
+        }
+        if let Some(mut authenticated_server_origin) = self.authenticated_server_origin.take() {
+            authenticated_server_origin.zeroize();
+        }
+        self.deferred_connection_events.reset_for_new_epoch();
+
+        for pending in self.pending_outgoing_messages.values_mut() {
+            pending.local_message_id.zeroize();
+            pending.conversation_id.zeroize();
+            pending.plaintext.zeroize();
+        }
+        self.pending_outgoing_messages.clear();
+        for mutation in self.pending_mutations.values_mut() {
+            Self::zeroize_pending_mutation_v1(mutation);
+        }
+        self.pending_mutations.clear();
+        self.pending_initial_sequences.clear();
+        self.pending_initial_headers.clear();
+        self.pending_sender_key_sequences.clear();
+        for wire in self.pending_sender_key_envelopes.values_mut() {
+            wire.zeroize();
+        }
+        self.pending_sender_key_envelopes.clear();
+        self.pending_sender_key_receipts.clear();
+        self.pending_sender_key_receipt_set.clear();
+        self.pending_sender_key_receipt_sequences.clear();
+        self.failed_sender_key_distributions.clear();
+
+        // Make the sticky bit defense-in-depth instead of the only barrier:
+        // legacy `db()`/identity accessors and any future missed call-site
+        // cannot touch an ambiguous SQLCipher or ratchet epoch. A successful
+        // `init_with_mnemonic` reconstructs all of this from durable state.
+        self.db = None;
+        self.indexer = None;
+        self.identity = None;
+        self.device_identity = None;
+        self.ratchet_sessions.clear();
+        self.zeroize_prekey_secrets();
+        self.spk_next_id = 1;
+        self.otk_next_id = 1;
+        self.sender_keys = SenderKeyStore::new();
+        self.dm_conversations.clear();
+        self.known_user_keys.clear();
+        self.trusted_signing_keys.clear();
+        self.channel_conversations.clear();
+        self.authorized_conversation_senders.clear();
+        self.device_rosters.clear();
+        self.last_invalidated_device_rosters.clear();
+        self.device_roster_rotation_pending.clear();
+        self.sender_key_distribution_pending.clear();
+        self.prepared_sender_key_generations.clear();
+        self.direct_live_blocked_conversations.clear();
+    }
+
+    pub(crate) fn revoke_storage_uncertain_epoch_v1(&mut self) {
+        self.revoke_after_storage_uncertain_v1();
+    }
+
+    fn resolve_public_classified_mutation_v1<T>(
+        &mut self,
+        result: Result<T, DirectHistoryMutationError>,
+    ) -> Result<T, String> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(DirectHistoryMutationError::ConversationRejected(detail)) => Err(detail),
+            Err(DirectHistoryMutationError::StorageUncertain(detail)) => {
+                self.revoke_after_storage_uncertain_v1();
+                Err(detail)
+            }
+        }
+    }
+
+    /// Check sticky global state before every individual FIFO receive. This is
+    /// intentionally repeated inside the bounded loop so a terminal published
+    /// between two events preempts the next ratchet step.
+    fn direct_live_terminal_precheck_v1(
+        &self,
+        report: DirectLiveReplayReportV1,
+    ) -> Result<(), DirectLiveReplayErrorV1> {
+        if self.direct_live_storage_uncertain {
+            return Err(Self::direct_live_replay_error_v1(
+                DirectLiveReplayStopV1::StorageUncertain,
+                report,
+            ));
+        }
+        if self.deferred_connection_events.failure().is_some()
+            || (self.deferred_connection_events.is_terminal()
+                && self.deferred_connection_events.events.is_empty())
+            || self.authenticated_user_id.is_none()
+            || self.authenticated_server_origin.is_none()
+        {
+            return Err(Self::direct_live_replay_error_v1(
+                DirectLiveReplayStopV1::TransportTerminal,
+                report,
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_canonical_live_uuid_v1(value: &str) -> bool {
+        uuid::Uuid::parse_str(value)
+            .is_ok_and(|parsed| !parsed.is_nil() && parsed.hyphenated().to_string() == value)
+    }
+
+    fn quarantine_known_direct_live_conversation_v1(&mut self, conversation_id: &str) -> bool {
+        self.dm_conversations.contains_key(conversation_id)
+            && self
+                .direct_live_blocked_conversations
+                .insert(conversation_id.to_string())
+    }
+
+    fn process_direct_live_message_v1(
+        &mut self,
+        event: ConnectionEvent,
+    ) -> Result<DirectLiveEventOutcomeV1, DirectHistoryMutationError> {
+        let ConnectionEvent::MessageReceived {
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            sender_username: _,
+            ciphertext,
+            header,
+            server_timestamp,
+            reply_to_id,
+            msg_type,
+            ttl_seconds,
+            sealed,
+            attachments,
+            security_context,
+        } = event
+        else {
+            return Ok(DirectLiveEventOutcomeV1::Ignored);
+        };
+
+        let Some(expected_peer) = self.dm_conversations.get(&conversation_id).copied() else {
+            if self.channel_conversations.contains(&conversation_id) {
+                // Stage 5 is Direct-only. A known channel/group event remains
+                // encrypted, unapplied, and discarded by this Direct-only
+                // replay; it cannot select a Direct ratchet.
+                return Ok(DirectLiveEventOutcomeV1::Ignored);
+            }
+            // Silently dropping an event for an unknown route and later
+            // claiming quiescence could skip a ratchet step. The caller turns
+            // this unscoped rejection into a protocol-terminal epoch.
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct live event references an unknown conversation route",
+            ));
+        };
+        if self
+            .direct_live_blocked_conversations
+            .contains(&conversation_id)
+        {
+            return Ok(DirectLiveEventOutcomeV1::Ignored);
+        }
+
+        if !Self::is_canonical_live_uuid_v1(&message_id)
+            || !Self::is_canonical_live_uuid_v1(&conversation_id)
+            || reply_to_id
+                .as_deref()
+                .is_some_and(|reply| !Self::is_canonical_live_uuid_v1(reply))
+            || reply_to_id.as_deref() == Some(message_id.as_str())
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct live event contains a non-canonical UUID",
+            ));
+        }
+        let sender_identity_key: [u8; 32] = sender_identity_key.try_into().map_err(|_| {
+            DirectHistoryMutationError::rejected("Direct live sender identity has the wrong length")
+        })?;
+        if sender_identity_key != expected_peer
+            || self.channel_conversations.contains(&conversation_id)
+            || !self.is_currently_authorized_sender(&conversation_id, &sender_identity_key)
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct live sender conflicts with the immutable current route",
+            ));
+        }
+        let authenticated_user_id = self.authenticated_user_id.clone().ok_or_else(|| {
+            DirectHistoryMutationError::rejected("Direct live replay is not authenticated")
+        })?;
+        if !Self::is_canonical_live_uuid_v1(&authenticated_user_id) {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct live authenticated user id is not canonical",
+            ));
+        }
+        let authenticated_server_origin =
+            self.authenticated_server_origin.clone().ok_or_else(|| {
+                DirectHistoryMutationError::rejected(
+                    "Direct live replay has no authenticated server origin",
+                )
+            })?;
+        if msg_type != Some(proto::MessageType::Text as i32)
+            || ttl_seconds.is_some()
+            || sealed != Some(false)
+            || !attachments.is_empty()
+            || security_context.is_some()
+            || header.is_empty()
+            || ciphertext.is_empty()
+            || header.first() == Some(&HEADER_SENDER_KEY)
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct live preview received an unsupported message policy",
+            ));
+        }
+        // Gateway live fanout is UnixNano while retained REST history and the
+        // SQLCipher binding are UnixMilli. Normalize before duplicate
+        // classification so reconnect history is exactly idempotent.
+        let server_timestamp_ms = server_timestamp / 1_000_000;
+        if server_timestamp == 0 || server_timestamp_ms == 0 {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct live timestamp is not a positive UnixNano value",
+            ));
+        }
+        let server_timestamp = i64::try_from(server_timestamp_ms).map_err(|_| {
+            DirectHistoryMutationError::rejected("Direct live timestamp exceeds SQLCipher range")
+        })?;
+
+        let scope = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
+            .resolve_authenticated_direct_history_scope_v1(
+                &authenticated_server_origin,
+                &authenticated_user_id,
+                &conversation_id,
+            )
+            .map_err(DirectHistoryMutationError::storage)?;
+        let local_identity_key = self
+            .identity_key()
+            .map_err(DirectHistoryMutationError::storage)?;
+        let local_signing_key = self
+            .signing_key()
+            .map_err(DirectHistoryMutationError::storage)?;
+        if scope.self_account.locator.identity_key != local_identity_key
+            || scope.self_account.signing_key != local_signing_key
+            || scope.self_account.locator.user_id != authenticated_user_id
+            || scope.peer_account.locator.identity_key != expected_peer
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct live scope conflicts with the authenticated account route",
+            ));
+        }
+        let author = scope.peer_account;
+        if author.source
+            != veil_store::models::AccountSnapshotSource::AuthenticatedConversationDirectory
+            || author.locator.identity_key != sender_identity_key
+            || author.locator.user_id == authenticated_user_id
+            || !self.peer_signing_key_is_pinned(&sender_identity_key, &author.signing_key)
+        {
+            return Err(DirectHistoryMutationError::rejected(
+                "Direct live author tuple conflicts with authenticated directory pins",
+            ));
+        }
+
+        match self.receive_and_persist_direct_history_message(
+            &message_id,
+            &conversation_id,
+            &sender_identity_key,
+            &author,
+            MessageAuthorContext::DirectoryMemberAtObservation,
+            &header,
+            &ciphertext,
+            Some(server_timestamp),
+            reply_to_id.as_deref(),
+            None,
+        )? {
+            ReceiveMessageResult::Stored { mut plaintext } => {
+                plaintext.zeroize();
+                Ok(DirectLiveEventOutcomeV1::Stored)
+            }
+            ReceiveMessageResult::Duplicate => Ok(DirectLiveEventOutcomeV1::Duplicate),
+        }
+    }
+
+    fn apply_direct_live_event_v1(
+        &mut self,
+        event: ConnectionEvent,
+        report: &mut DirectLiveReplayReportV1,
+    ) -> Result<(), DirectHistoryMutationError> {
+        match event {
+            event @ ConnectionEvent::MessageReceived { .. } => {
+                let conversation_id = match &event {
+                    ConnectionEvent::MessageReceived {
+                        conversation_id, ..
+                    } => conversation_id.clone(),
+                    _ => unreachable!(),
+                };
+                match self.process_direct_live_message_v1(event) {
+                    Ok(DirectLiveEventOutcomeV1::Stored) => {
+                        report.stored += 1;
+                        report.visible_mutations += 1;
+                    }
+                    Ok(DirectLiveEventOutcomeV1::Duplicate) => {
+                        report.duplicates += 1;
+                        // Duplicate reconciliation may repair absent legacy
+                        // author metadata. Conservatively signal a projection
+                        // refresh without exposing a message identifier.
+                        report.visible_mutations += 1;
+                    }
+                    Ok(DirectLiveEventOutcomeV1::Ignored) => report.ignored += 1,
+                    Err(DirectHistoryMutationError::ConversationRejected(_)) => {
+                        if self.quarantine_known_direct_live_conversation_v1(&conversation_id) {
+                            report.newly_blocked += 1;
+                            report.ignored += 1;
+                        } else {
+                            return Err(DirectHistoryMutationError::rejected(
+                                "Direct live event could not be scoped to a known conversation",
+                            ));
+                        }
+                    }
+                    Err(error @ DirectHistoryMutationError::StorageUncertain(_)) => {
+                        return Err(error)
+                    }
+                }
+            }
+            ConnectionEvent::MessageEdited {
+                conversation_id, ..
+            }
+            | ConnectionEvent::MessageDeleted {
+                conversation_id, ..
+            }
+            | ConnectionEvent::ReactionEvent {
+                conversation_id, ..
+            } => {
+                if self.dm_conversations.contains_key(&conversation_id) {
+                    if self.quarantine_known_direct_live_conversation_v1(&conversation_id) {
+                        report.newly_blocked += 1;
+                    }
+                } else if !self.channel_conversations.contains(&conversation_id) {
+                    return Err(DirectHistoryMutationError::rejected(
+                        "Direct live mutation references an unknown conversation route",
+                    ));
+                }
+                report.ignored += 1;
+            }
+            ConnectionEvent::SenderKeyDist { route, .. } => {
+                if self.dm_conversations.contains_key(&route.conversation_id) {
+                    if self.quarantine_known_direct_live_conversation_v1(&route.conversation_id) {
+                        report.newly_blocked += 1;
+                    }
+                } else if !self.channel_conversations.contains(&route.conversation_id) {
+                    return Err(DirectHistoryMutationError::rejected(
+                        "Sender-Key distribution references an unknown conversation route",
+                    ));
+                }
+                report.ignored += 1;
+            }
+            ConnectionEvent::MessageAcked {
+                local_message_id,
+                mut mutation,
+                ..
+            } => {
+                if local_message_id.is_some() || mutation.is_some() {
+                    report.visible_mutations += 1;
+                }
+                if let Some(ConfirmedMutation::Edit { new_text, .. }) = mutation.as_mut() {
+                    new_text.zeroize();
+                }
+                report.ignored += 1;
+            }
+            ConnectionEvent::Error {
+                local_message_id, ..
+            } => {
+                if local_message_id.is_some() {
+                    report.visible_mutations += 1;
+                }
+                report.ignored += 1;
+            }
+            ConnectionEvent::Authenticated { .. }
+            | ConnectionEvent::AuthFailed { .. }
+            | ConnectionEvent::Disconnected { .. } => {
+                return Err(DirectHistoryMutationError::rejected(
+                    "transport control reached Direct live event application",
+                ));
+            }
+            ConnectionEvent::TypingEvent { .. }
+            | ConnectionEvent::PresenceUpdate { .. }
+            | ConnectionEvent::FriendRequestReceived { .. }
+            | ConnectionEvent::FriendAccepted { .. }
+            | ConnectionEvent::FriendRemoved { .. }
+            | ConnectionEvent::FriendListReceived { .. }
+            | ConnectionEvent::ProfileUpdated { .. }
+            | ConnectionEvent::ServerEvent { .. }
+            | ConnectionEvent::ChannelEvent { .. } => report.ignored += 1,
+        }
+        Ok(())
+    }
+
+    /// Consume a bounded, gap-free slice of authenticated live events for the
+    /// Stage-5 Direct text preview. `poll_event` remains the sole FIFO/ACK
+    /// reconciler and is called exactly once per loop iteration.
+    pub async fn replay_direct_live_events_v1(
+        &mut self,
+    ) -> Result<DirectLiveReplayReportV1, DirectLiveReplayErrorV1> {
+        self.replay_direct_live_events_inner_v1(|_, _| {}).await
+    }
+
+    async fn replay_direct_live_events_inner_v1<F>(
+        &mut self,
+        mut after_event: F,
+    ) -> Result<DirectLiveReplayReportV1, DirectLiveReplayErrorV1>
+    where
+        F: FnMut(&mut Self, usize),
+    {
+        let mut report = DirectLiveReplayReportV1::default();
+        while report.consumed < DIRECT_LIVE_REPLAY_MAX_BATCH_V1 {
+            self.direct_live_terminal_precheck_v1(report)?;
+            let event = match self.poll_event().await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    report.quiescent = true;
+                    return Ok(report);
+                }
+                Err(_) if self.direct_live_storage_uncertain => {
+                    return Err(Self::direct_live_replay_error_v1(
+                        DirectLiveReplayStopV1::StorageUncertain,
+                        report,
+                    ));
+                }
+                Err(_) if self.deferred_connection_events.failure().is_some() => {
+                    return Err(Self::direct_live_replay_error_v1(
+                        DirectLiveReplayStopV1::TransportTerminal,
+                        report,
+                    ));
+                }
+                Err(_) => {
+                    self.revoke_after_storage_uncertain_v1();
+                    return Err(Self::direct_live_replay_error_v1(
+                        DirectLiveReplayStopV1::StorageUncertain,
+                        report,
+                    ));
+                }
+            };
+            report.consumed += 1;
+
+            if matches!(event, ConnectionEvent::Disconnected { .. }) {
+                return Err(Self::direct_live_replay_error_v1(
+                    DirectLiveReplayStopV1::TransportTerminal,
+                    report,
+                ));
+            }
+            if let Err(error) = self.apply_direct_live_event_v1(event, &mut report) {
+                match error {
+                    DirectHistoryMutationError::StorageUncertain(_) => {
+                        self.revoke_after_storage_uncertain_v1();
+                        return Err(Self::direct_live_replay_error_v1(
+                            DirectLiveReplayStopV1::StorageUncertain,
+                            report,
+                        ));
+                    }
+                    DirectHistoryMutationError::ConversationRejected(_) => {
+                        // A rejection with no known Direct quarantine target is
+                        // an authenticated protocol anomaly. Poison the whole
+                        // epoch so a later call cannot claim quiescence after
+                        // silently losing this event.
+                        self.deferred_connection_events.fail(
+                            ConnectionEventBufferErrorV1::ProtocolViolation {
+                                envelope: "Direct live route",
+                            },
+                        );
+                        self.terminate_connection_after_deferred_failure_v1();
+                        let stop = if self.direct_live_storage_uncertain {
+                            DirectLiveReplayStopV1::StorageUncertain
+                        } else {
+                            DirectLiveReplayStopV1::TransportTerminal
+                        };
+                        return Err(Self::direct_live_replay_error_v1(stop, report));
+                    }
+                }
+            }
+            after_event(self, report.consumed);
+        }
+        Ok(report)
     }
 
     fn mark_all_pending_sequences_unknown(&mut self) -> Result<(), String> {
@@ -2030,6 +2892,19 @@ impl VeilClient {
                     .insert(pending.conversation_id);
             }
             self.pending_outgoing_messages.remove(&sequence);
+        }
+        Ok(())
+    }
+
+    fn reconcile_previous_transport_before_install_v1(&mut self) -> Result<(), String> {
+        if let Err(error) = self.mark_all_pending_sequences_unknown() {
+            // A transaction commit error leaves delivery-state durability
+            // genuinely ambiguous. Neither the old nor the newly authenticated
+            // socket may remain usable until a successful native re-unlock.
+            self.revoke_after_storage_uncertain_v1();
+            return Err(format!(
+                "reconcile previous transport delivery state: {error}"
+            ));
         }
         Ok(())
     }
@@ -2199,7 +3074,7 @@ impl VeilClient {
         sequence: u64,
         _server_timestamp: u64,
     ) -> Result<Option<ConfirmedMutation>, String> {
-        let Some(mutation) = self.pending_mutations.get(&sequence).cloned() else {
+        let Some(mutation) = self.pending_mutations.get(&sequence) else {
             return Ok(None);
         };
 
@@ -2243,12 +3118,7 @@ impl VeilClient {
             }
         }
 
-        if let Some(ConfirmedMutation::Edit { new_text, .. }) =
-            self.pending_mutations.remove(&sequence).as_mut()
-        {
-            new_text.zeroize();
-        }
-        Ok(Some(mutation))
+        Ok(self.pending_mutations.remove(&sequence))
     }
 
     fn reject_pending_sequence(&mut self, sequence: u64) -> Result<Option<String>, String> {
@@ -2302,6 +3172,7 @@ impl VeilClient {
     }
 
     pub fn discard_failed_outgoing_message(&self, local_message_id: &str) -> Result<(), String> {
+        self.require_message_conversation_available_v1(local_message_id)?;
         let db = self.db.as_ref().ok_or("database not initialized")?;
         if !db.is_discardable_outgoing_message(local_message_id)? {
             return Err("failed or unknown outgoing message not found".to_string());
@@ -2336,6 +3207,7 @@ impl VeilClient {
         reply_to_id: Option<&str>,
         attachments: Vec<crate::attachments::OutgoingAttachmentV1>,
     ) -> Result<u64, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         if plaintext.is_empty() && attachments.is_empty() {
             return Err("message plaintext must not be empty".to_string());
         }
@@ -2526,6 +3398,7 @@ impl VeilClient {
 
     /// Exact owner-only count endpoint for the currently initialized account.
     pub fn own_prekey_count_target(&self) -> Result<String, String> {
+        self.require_crypto_runtime_active_v1()?;
         Ok(format!(
             "/v1/prekeys/{}/count",
             hex::encode(self.identity_key()?)
@@ -2654,6 +3527,7 @@ impl VeilClient {
     /// Protocol ids are durably reserved first; runtime secret maps are exposed
     /// only after the immutable key rows commit successfully.
     pub fn generate_prekeys(&mut self) -> Result<PreKeySet, String> {
+        self.require_crypto_runtime_active_v1()?;
         let batch = self.build_prekey_batch()?;
         if let Some(db) = self.db.as_ref() {
             db.save_local_prekeys(&batch.local_prekeys)?;
@@ -2663,6 +3537,7 @@ impl VeilClient {
     }
 
     fn require_own_prekey_scope(&self, authenticated_user_id: &str) -> Result<(), String> {
+        self.require_crypto_runtime_active_v1()?;
         if self.identity.is_none() || self.db.is_none() {
             return Err("own prekey publication requires an unlocked database".to_string());
         }
@@ -2786,6 +3661,7 @@ impl VeilClient {
         peer_identity_key: &[u8; 32],
         bundle: &x3dh::PreKeyBundle,
     ) -> Result<(), String> {
+        self.require_crypto_runtime_active_v1()?;
         let identity = self.identity.as_ref().ok_or("not initialized")?;
         let result = x3dh::initiate(identity, bundle)?;
 
@@ -2822,6 +3698,7 @@ impl VeilClient {
         spk_id: u32,
         opk_id: Option<u32>,
     ) -> Result<(), String> {
+        self.require_crypto_runtime_active_v1()?;
         let session =
             self.build_responder_session(sender_identity_key, ephemeral_key, spk_id, opk_id)?;
 
@@ -2896,7 +3773,7 @@ impl VeilClient {
 
     /// Check if a ratchet session exists with a peer.
     pub fn has_session(&self, peer_identity_key: &[u8; 32]) -> bool {
-        self.ratchet_sessions.contains_key(peer_identity_key)
+        !self.direct_live_storage_uncertain && self.ratchet_sessions.contains_key(peer_identity_key)
     }
 
     /// Encrypt outgoing plaintext. Returns (ciphertext, wire_header).
@@ -2908,6 +3785,7 @@ impl VeilClient {
         conversation_id: &str,
         plaintext: &str,
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         if self.channel_conversations.contains(conversation_id) {
             if self
                 .sender_key_distribution_pending
@@ -2989,6 +3867,7 @@ impl VeilClient {
         conversation_id: &str,
         plaintext: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         let our_identity_key = self.identity_key()?;
         let pending = self.pending_initial_headers.get(peer_identity_key).copied();
         let mut wire_prefix = Vec::with_capacity(1 + 32 + 4 + 4);
@@ -3064,6 +3943,7 @@ impl VeilClient {
         ciphertext: &[u8],
         security_context: &MessageSecurityContextV1,
     ) -> Result<ValidatedSenderKeyRouteForMessageV1, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         let MessageSecurityContextV1::SenderKeyV5(context) = security_context;
         let local = self
             .device_identity
@@ -3272,6 +4152,7 @@ impl VeilClient {
         ciphertext: &[u8],
         security_context: Option<&MessageSecurityContextV1>,
     ) -> Result<DecryptedPayload, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         if header.is_empty() {
             // Network messages without an authenticated E2E header are a
             // downgrade attempt (or unsupported legacy data), not plaintext.
@@ -3655,6 +4536,13 @@ impl VeilClient {
     /// Mark a conversation as a channel — outgoing messages will be encrypted
     /// with a sender key, and incoming messages will look up the sender key store.
     pub fn mark_channel_conversation(&mut self, conversation_id: &str) {
+        if self.direct_live_storage_uncertain
+            || self
+                .direct_live_blocked_conversations
+                .contains(conversation_id)
+        {
+            return;
+        }
         self.channel_conversations
             .insert(conversation_id.to_string());
         if !self.sender_keys.has_outgoing(conversation_id) {
@@ -3664,7 +4552,11 @@ impl VeilClient {
     }
 
     pub fn is_channel_conversation(&self, conversation_id: &str) -> bool {
-        self.channel_conversations.contains(conversation_id)
+        !self.direct_live_storage_uncertain
+            && !self
+                .direct_live_blocked_conversations
+                .contains(conversation_id)
+            && self.channel_conversations.contains(conversation_id)
     }
 
     pub fn replace_authorized_conversation_senders(
@@ -3672,6 +4564,7 @@ impl VeilClient {
         conversation_id: &str,
         senders: impl IntoIterator<Item = [u8; 32]>,
     ) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         if conversation_id.is_empty() {
             return Err("authorized conversation id must not be empty".to_string());
         }
@@ -3736,6 +4629,7 @@ impl VeilClient {
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
     ) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         if self.is_currently_authorized_sender(conversation_id, sender_identity_key) {
             Ok(())
         } else {
@@ -3787,6 +4681,7 @@ impl VeilClient {
 
     /// Force-rotate our outgoing sender key for a channel (e.g. after a member leaves).
     pub fn rotate_sender_key(&mut self, conversation_id: &str) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         let owner_key = self
             .device_identity
             .as_ref()
@@ -3826,6 +4721,7 @@ impl VeilClient {
     /// rotating per retry would keep the group permanently pending.
     /// Returns false when the current generation is already fully distributed.
     pub fn begin_sender_key_distribution(&mut self, conversation_id: &str) -> Result<bool, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         self.channel_conversations
             .insert(conversation_id.to_string());
         if self
@@ -3869,6 +4765,7 @@ impl VeilClient {
         conversation_id: &str,
         refresh: OfflineSenderKeyRefresh,
     ) -> Result<bool, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         let already_prepared = self
             .prepared_sender_key_generations
             .contains(conversation_id);
@@ -3890,6 +4787,7 @@ impl VeilClient {
     /// Mark distribution complete only after every current non-self member has
     /// received the fresh generation successfully.
     pub fn mark_sender_key_distributed(&mut self, conversation_id: &str) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         if !self.sender_keys.has_outgoing(conversation_id) {
             return Err("cannot complete distribution without an outgoing sender key".to_string());
         }
@@ -3907,6 +4805,13 @@ impl VeilClient {
     }
 
     pub fn mark_sender_key_distribution_failed(&mut self, conversation_id: &str) {
+        if self.direct_live_storage_uncertain
+            || self
+                .direct_live_blocked_conversations
+                .contains(conversation_id)
+        {
+            return;
+        }
         self.failed_sender_key_distributions
             .insert(conversation_id.to_string());
         self.sender_key_distribution_pending
@@ -3914,7 +4819,14 @@ impl VeilClient {
     }
 
     pub fn sender_key_distribution_status(&self, conversation_id: &str) -> &'static str {
-        if self
+        if self.direct_live_storage_uncertain {
+            "revoked"
+        } else if self
+            .direct_live_blocked_conversations
+            .contains(conversation_id)
+        {
+            "quarantined"
+        } else if self
             .failed_sender_key_distributions
             .contains(conversation_id)
         {
@@ -3974,6 +4886,7 @@ impl VeilClient {
         &mut self,
         target: &DeviceTargetV1,
     ) -> Result<(PendingSenderKeyEnvelopeKey, Vec<u8>), String> {
+        self.require_direct_conversation_available_v1(&target.conversation_id)?;
         let conversation_id = target.conversation_id.as_str();
         let roster = self
             .device_rosters
@@ -4118,6 +5031,7 @@ impl VeilClient {
         &mut self,
         target: &DeviceTargetV1,
     ) -> Result<u64, String> {
+        self.require_direct_conversation_available_v1(&target.conversation_id)?;
         let (pending, sealed) = self.prepare_sender_key_device_envelope(target)?;
         let local = self
             .device_identity
@@ -4262,6 +5176,7 @@ impl VeilClient {
         route: &SenderKeyRouteV1,
         mode: SenderKeyDistributionModeV1,
     ) -> Result<PendingSenderKeyReceiptV1, String> {
+        self.require_direct_conversation_available_v1(&route.conversation_id)?;
         if self.dm_conversations.contains_key(&route.conversation_id) {
             return Err("sender keys are forbidden for DM conversations".to_string());
         }
@@ -4414,8 +5329,17 @@ impl VeilClient {
     /// A transport failure leaves the FIFO intact; retained replay is also
     /// idempotent because the receipt set is keyed by the immutable route.
     pub async fn flush_sender_key_receipts_v1(&mut self) -> Result<usize, String> {
+        self.require_crypto_runtime_active_v1()?;
         let mut sent = 0usize;
         while let Some(receipt) = self.pending_sender_key_receipts.front().cloned() {
+            if self
+                .direct_live_blocked_conversations
+                .contains(&receipt.conversation_id)
+            {
+                self.pending_sender_key_receipts.pop_front();
+                self.pending_sender_key_receipt_set.remove(&receipt);
+                continue;
+            }
             let conn = self.connection.as_ref().ok_or("not connected")?;
             let seq = conn.next_seq().await;
             conn.send_envelope(&proto::Envelope {
@@ -4443,6 +5367,9 @@ impl VeilClient {
 
     /// Drop a peer's incoming sender key (e.g. after a kick/leave WS event).
     pub fn drop_incoming_sender_key(&mut self, conversation_id: &str, sender_ik: &[u8; 32]) {
+        if self.direct_live_storage_uncertain {
+            return;
+        }
         self.sender_keys.remove_incoming(conversation_id, sender_ik);
         // Note: per-row delete is not exposed by VeilDb today; on next save it
         // will be overwritten if the peer re-distributes.
@@ -4613,6 +5540,7 @@ impl VeilClient {
         &mut self,
         conversation_id: &str,
     ) -> Result<OfflineSenderKeyRefresh, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         self.channel_conversations
             .insert(conversation_id.to_string());
         let account_key = self.identity_key()?;
@@ -4868,7 +5796,7 @@ impl VeilClient {
         attachments: &[crate::attachments::WireAttachmentV1],
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
     ) -> Result<ReceiveMessageResult, String> {
-        self.receive_and_persist_message_with_attachments_classified(
+        let result = self.receive_and_persist_message_with_attachments_classified(
             message_id,
             conversation_id,
             sender_identity_key,
@@ -4884,8 +5812,8 @@ impl VeilClient {
             attachments,
             remote_metadata,
             AtomicReceiveDecryptMode::General,
-        )
-        .map_err(DirectHistoryMutationError::into_detail)
+        );
+        self.resolve_public_classified_mutation_v1(result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4940,6 +5868,7 @@ impl VeilClient {
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
         decrypt_mode: AtomicReceiveDecryptMode,
     ) -> Result<ReceiveMessageResult, DirectHistoryMutationError> {
+        self.require_classified_receive_available_v1(conversation_id)?;
         if message_id.is_empty() || conversation_id.is_empty() {
             return Err(DirectHistoryMutationError::rejected(
                 "inbound message and conversation ids must not be empty",
@@ -4955,6 +5884,11 @@ impl VeilClient {
                 "inbound author snapshot and observation context must be paired",
             ));
         }
+        self.validate_inbound_author_snapshot_classified_v1(
+            conversation_id,
+            sender_identity_key,
+            author_snapshot,
+        )?;
         if !sender_key_mode && !self.trusted_signing_keys.contains_key(sender_identity_key) {
             return Err(DirectHistoryMutationError::rejected(
                 "inbound sender identity is not pinned to a signing key",
@@ -4981,7 +5915,7 @@ impl VeilClient {
             .map_err(DirectHistoryMutationError::rejected)?;
         }
 
-        let result = self.with_classified_receive_savepoint("receive", |client| {
+        let classified_result = self.with_classified_receive_savepoint("receive", |client| {
             if let Some((
                 bound_conversation_id,
                 bound_sender_key,
@@ -5023,7 +5957,7 @@ impl VeilClient {
                         )
                         .map_err(DirectHistoryMutationError::storage)?;
                 }
-                return Ok(ReceiveMessageResult::Duplicate);
+                return Ok(ClassifiedReceiveResultV1::Duplicate);
             }
             client
                 .db
@@ -5037,7 +5971,7 @@ impl VeilClient {
                 )
                 .map_err(DirectHistoryMutationError::storage)?;
 
-            let decrypted = match decrypt_mode {
+            let mut decrypted = Zeroizing::new(match decrypt_mode {
                 AtomicReceiveDecryptMode::General => {
                     match client
                         .decrypt_from_with_security_context(
@@ -5064,14 +5998,14 @@ impl VeilClient {
                         header,
                         ciphertext,
                     )?,
-            };
+            });
             let (plaintext, private_attachments) = if attachments.is_empty() {
                 if crate::attachments::is_attachment_payload_v1(&decrypted) {
                     return Err(DirectHistoryMutationError::rejected(
                         "attachment payload has no authenticated public descriptors",
                     ));
                 }
-                let plaintext = match String::from_utf8(decrypted) {
+                let plaintext = match String::from_utf8(std::mem::take(&mut *decrypted)) {
                     Ok(plaintext) => plaintext,
                     Err(error) => {
                         let mut plaintext = error.into_bytes();
@@ -5091,6 +6025,7 @@ impl VeilClient {
                 .map_err(DirectHistoryMutationError::rejected)?;
                 (opened.text, opened.attachments)
             };
+            let plaintext = Zeroizing::new(plaintext);
             if !sender_key_mode {
                 // Successful authenticated ratchet decryption is the first
                 // evidence that the peer possesses this session. Clearing the
@@ -5146,8 +6081,19 @@ impl VeilClient {
                         .map_err(DirectHistoryMutationError::storage)?;
                 }
             }
-            Ok(ReceiveMessageResult::Stored { plaintext })
+            Ok(ClassifiedReceiveResultV1::Stored { plaintext })
         })?;
+
+        // The savepoint has committed successfully. Only now may plaintext
+        // leave its zeroizing guard in the established public result shape.
+        // A commit/rollback error above drops ClassifiedReceiveResultV1 and
+        // wipes the String before returning StorageUncertain.
+        let result = match classified_result {
+            ClassifiedReceiveResultV1::Stored { mut plaintext } => ReceiveMessageResult::Stored {
+                plaintext: std::mem::take(&mut *plaintext),
+            },
+            ClassifiedReceiveResultV1::Duplicate => ReceiveMessageResult::Duplicate,
+        };
 
         if let ReceiveMessageResult::Stored { ref plaintext } = result {
             if let Some(ref idx) = self.indexer {
@@ -5169,7 +6115,7 @@ impl VeilClient {
         Ok(result)
     }
 
-    fn commit_remote_metadata_only(
+    fn commit_remote_metadata_only_classified(
         &self,
         message_id: &str,
         conversation_id: &str,
@@ -5177,12 +6123,17 @@ impl VeilClient {
         metadata: &RemoteMessageMetadata<'_>,
         state: RemoteMessageStateKind,
         delete_local: bool,
-    ) -> Result<(), String> {
-        let db = self.db.as_ref().ok_or("database not initialized")?;
-        db.begin_receive_savepoint()?;
-        let operation = (|| {
+    ) -> Result<(), DirectHistoryMutationError> {
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?;
+        db.begin_receive_savepoint()
+            .map_err(DirectHistoryMutationError::storage)?;
+        let operation = (|| -> Result<(), DirectHistoryMutationError> {
             if delete_local {
-                db.delete_message_scoped(message_id, conversation_id)?;
+                db.delete_message_scoped(message_id, conversation_id)
+                    .map_err(DirectHistoryMutationError::storage)?;
             }
             db.record_remote_message_state(
                 message_id,
@@ -5190,29 +6141,42 @@ impl VeilClient {
                 sender_identity_key,
                 metadata.revision_ms,
                 state,
-            )?;
-            if state == RemoteMessageStateKind::Active && db.message_exists(message_id)? {
+            )
+            .map_err(DirectHistoryMutationError::storage)?;
+            if state == RemoteMessageStateKind::Active
+                && db
+                    .message_exists(message_id)
+                    .map_err(DirectHistoryMutationError::storage)?
+            {
                 if let Some(reactions) = metadata.reactions {
-                    db.replace_message_reactions(message_id, reactions)?;
+                    db.replace_message_reactions(message_id, reactions)
+                        .map_err(DirectHistoryMutationError::storage)?;
                 }
             } else {
                 // Tombstones and ciphertext that is intentionally unavailable
                 // must not leave reaction metadata for a message body we no
                 // longer retain. The reactions table predates foreign keys, so
                 // clear it explicitly rather than relying on message deletion.
-                db.replace_message_reactions(message_id, &[])?;
+                db.replace_message_reactions(message_id, &[])
+                    .map_err(DirectHistoryMutationError::storage)?;
             }
             Ok(())
         })();
         match operation {
-            Ok(()) => db.commit_receive_savepoint(),
+            Ok(()) => db
+                .commit_receive_savepoint()
+                .map_err(DirectHistoryMutationError::storage),
             Err(error) => {
                 let rollback = db.rollback_receive_savepoint();
-                Err(match rollback {
-                    Ok(()) => error,
-                    Err(rollback_error) => {
-                        format!("{error}; remote metadata rollback failed: {rollback_error}")
+                Err(match (error, rollback) {
+                    (DirectHistoryMutationError::StorageUncertain(detail), Ok(())) => {
+                        DirectHistoryMutationError::storage(detail)
                     }
+                    (error, Ok(())) => error,
+                    (error, Err(rollback_error)) => DirectHistoryMutationError::storage(format!(
+                        "{}; remote metadata rollback failed: {rollback_error}",
+                        error.into_detail()
+                    )),
                 })
             }
         }
@@ -5222,40 +6186,74 @@ impl VeilClient {
     /// which atomic ciphertext path the caller must take next. Reaction rows
     /// are authoritative and replaced even when the content revision is equal.
     pub fn reconcile_remote_message_metadata(
-        &self,
+        &mut self,
         message_id: &str,
         conversation_id: &str,
         sender_identity_key: &[u8; 32],
         metadata: &RemoteMessageMetadata<'_>,
         state: RemoteMessageStateKind,
     ) -> Result<RemoteReconcileAction, String> {
+        let result = self.reconcile_remote_message_metadata_classified(
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            metadata,
+            state,
+        );
+        self.resolve_public_classified_mutation_v1(result)
+    }
+
+    pub(crate) fn reconcile_remote_message_metadata_classified(
+        &self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        metadata: &RemoteMessageMetadata<'_>,
+        state: RemoteMessageStateKind,
+    ) -> Result<RemoteReconcileAction, DirectHistoryMutationError> {
+        self.require_classified_receive_available_v1(conversation_id)?;
         if metadata.revision_ms < 0 {
-            return Err("remote message revision must not be negative".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "remote message revision must not be negative",
+            ));
         }
-        let db = self.db.as_ref().ok_or("database not initialized")?;
-        let binding = db.get_message_binding(message_id)?;
+        let db = self
+            .db
+            .as_ref()
+            .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?;
+        let binding = db
+            .get_message_binding(message_id)
+            .map_err(DirectHistoryMutationError::storage)?;
         if let Some((bound_conversation, bound_sender, _, _)) = binding.as_ref() {
             if bound_conversation != conversation_id
                 || bound_sender.as_slice() != sender_identity_key
             {
-                return Err("remote message conflicts with its local binding".to_string());
+                return Err(DirectHistoryMutationError::rejected(
+                    "remote message conflicts with its local binding",
+                ));
             }
         }
-        let remote = db.get_remote_message_state(message_id)?;
+        let remote = db
+            .get_remote_message_state(message_id)
+            .map_err(DirectHistoryMutationError::storage)?;
         if let Some(remote) = remote.as_ref() {
             if remote.conversation_id != conversation_id
                 || remote.sender_key.as_slice() != sender_identity_key
             {
-                return Err("remote message UUID changed scope or sender".to_string());
+                return Err(DirectHistoryMutationError::rejected(
+                    "remote message UUID changed scope or sender",
+                ));
             }
             if metadata.revision_ms < remote.revision_ms {
-                return Err("remote message revision moved backwards".to_string());
+                return Err(DirectHistoryMutationError::rejected(
+                    "remote message revision moved backwards",
+                ));
             }
         }
 
         match state {
             RemoteMessageStateKind::Deleted | RemoteMessageStateKind::Expired => {
-                self.commit_remote_metadata_only(
+                self.commit_remote_metadata_only_classified(
                     message_id,
                     conversation_id,
                     sender_identity_key,
@@ -5269,7 +6267,7 @@ impl VeilClient {
                 Ok(RemoteReconcileAction::Deleted)
             }
             RemoteMessageStateKind::Unavailable => {
-                self.commit_remote_metadata_only(
+                self.commit_remote_metadata_only_classified(
                     message_id,
                     conversation_id,
                     sender_identity_key,
@@ -5282,7 +6280,7 @@ impl VeilClient {
             RemoteMessageStateKind::Active => {
                 if let Some((_, _, is_outgoing, _)) = binding.as_ref() {
                     if *is_outgoing {
-                        self.commit_remote_metadata_only(
+                        self.commit_remote_metadata_only_classified(
                             message_id,
                             conversation_id,
                             sender_identity_key,
@@ -5299,11 +6297,11 @@ impl VeilClient {
                 match remote {
                     Some(remote) if metadata.revision_ms == remote.revision_ms => {
                         if remote.state != RemoteMessageStateKind::Active {
-                            return Err(
-                                "remote message attempted same-revision resurrection".to_string()
-                            );
+                            return Err(DirectHistoryMutationError::rejected(
+                                "remote message attempted same-revision resurrection",
+                            ));
                         }
-                        self.commit_remote_metadata_only(
+                        self.commit_remote_metadata_only_classified(
                             message_id,
                             conversation_id,
                             sender_identity_key,
@@ -5319,7 +6317,7 @@ impl VeilClient {
                         if created_ms.is_some_and(|created| metadata.revision_ms > created) {
                             Ok(RemoteReconcileAction::NeedsEncryptedEdit)
                         } else {
-                            self.commit_remote_metadata_only(
+                            self.commit_remote_metadata_only_classified(
                                 message_id,
                                 conversation_id,
                                 sender_identity_key,
@@ -5378,64 +6376,116 @@ impl VeilClient {
         ciphertext: &[u8],
         remote_metadata: Option<&RemoteMessageMetadata<'_>>,
     ) -> Result<String, String> {
+        let result = self.receive_and_persist_edit_classified(
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            author_snapshot,
+            author_context,
+            sender_key_mode,
+            header,
+            ciphertext,
+            remote_metadata,
+        );
+        let mut plaintext = self.resolve_public_classified_mutation_v1(result)?;
+        let plaintext = std::mem::take(&mut *plaintext);
+        if let Some(indexer) = self.indexer.as_ref() {
+            let _ = indexer.update_message_body(message_id, &plaintext);
+        }
+        Ok(plaintext)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn receive_and_persist_edit_classified(
+        &mut self,
+        message_id: &str,
+        conversation_id: &str,
+        sender_identity_key: &[u8; 32],
+        author_snapshot: Option<&AccountSnapshot>,
+        author_context: Option<MessageAuthorContext>,
+        sender_key_mode: bool,
+        header: &[u8],
+        ciphertext: &[u8],
+        remote_metadata: Option<&RemoteMessageMetadata<'_>>,
+    ) -> Result<Zeroizing<String>, DirectHistoryMutationError> {
+        self.require_classified_receive_available_v1(conversation_id)?;
         if sender_key_mode || self.channel_conversations.contains(conversation_id) {
-            return Err(
+            return Err(DirectHistoryMutationError::rejected(
                 "encrypted group/channel edits are disabled until an exact device edit protocol exists"
-                    .to_string(),
-            );
+            ));
         }
         if author_snapshot.is_some() != author_context.is_some() {
-            return Err("edit author snapshot and observation context must be paired".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "edit author snapshot and observation context must be paired",
+            ));
         }
+        self.validate_inbound_author_snapshot_classified_v1(
+            conversation_id,
+            sender_identity_key,
+            author_snapshot,
+        )?;
         if !self.trusted_signing_keys.contains_key(sender_identity_key) {
-            return Err("edit sender identity is not pinned to a signing key".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "edit sender identity is not pinned to a signing key",
+            ));
         }
         if header.is_empty()
             || ciphertext.is_empty()
             || (header.first() == Some(&HEADER_SENDER_KEY)) != sender_key_mode
         {
-            return Err("edit E2E header conflicts with the conversation type".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "edit E2E header conflicts with the conversation type",
+            ));
         }
-        let crypto_snapshot = self.receive_crypto_snapshot();
-        self.db
-            .as_ref()
-            .ok_or("database not initialized")?
-            .begin_receive_savepoint()?;
-        let operation = (|| {
-            self.db
+
+        self.with_classified_receive_savepoint("edit", |client| {
+            client
+                .db
                 .as_ref()
-                .ok_or("database not initialized")?
+                .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
                 .ensure_receive_conversation(
                     conversation_id,
                     sender_key_mode,
                     sender_identity_key,
                     None,
-                )?;
-            let plaintext = match self.decrypt_from(
+                )
+                .map_err(DirectHistoryMutationError::storage)?;
+            let plaintext = client.decrypt_direct_history_text_classified(
                 sender_identity_key,
                 conversation_id,
                 header,
                 ciphertext,
-            )? {
-                DecryptedPayload::Text(plaintext) => String::from_utf8(plaintext)
-                    .map_err(|_| "edited plaintext is not valid UTF-8".to_string())?,
-                DecryptedPayload::Control => {
-                    return Err("control frame is not valid as a message edit".to_string());
+            )?;
+            let plaintext = match String::from_utf8(plaintext) {
+                Ok(plaintext) => Zeroizing::new(plaintext),
+                Err(error) => {
+                    let mut plaintext = error.into_bytes();
+                    plaintext.zeroize();
+                    return Err(DirectHistoryMutationError::rejected(
+                        "edited plaintext is not valid UTF-8",
+                    ));
                 }
             };
             if !sender_key_mode {
-                self.confirm_peer_session_possession(sender_identity_key)?;
+                client
+                    .confirm_peer_session_possession(sender_identity_key)
+                    .map_err(DirectHistoryMutationError::storage)?;
             }
-            let db = self.db.as_ref().ok_or("database not initialized")?;
+            let db = client
+                .db
+                .as_ref()
+                .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?;
             db.update_incoming_message_text_scoped(
                 message_id,
                 conversation_id,
                 sender_identity_key,
                 &plaintext,
-            )?;
+            )
+            .map_err(DirectHistoryMutationError::storage)?;
             if let (Some(author_snapshot), Some(author_context)) = (author_snapshot, author_context)
             {
-                db.attach_message_author_with_context(message_id, author_snapshot, author_context)?;
+                db.attach_message_author_with_context(message_id, author_snapshot, author_context)
+                    .map_err(DirectHistoryMutationError::storage)?;
             }
             if let Some(metadata) = remote_metadata {
                 db.record_remote_message_state(
@@ -5444,48 +6494,15 @@ impl VeilClient {
                     sender_identity_key,
                     metadata.revision_ms,
                     RemoteMessageStateKind::Active,
-                )?;
+                )
+                .map_err(DirectHistoryMutationError::storage)?;
                 if let Some(reactions) = metadata.reactions {
-                    db.replace_message_reactions(message_id, reactions)?;
+                    db.replace_message_reactions(message_id, reactions)
+                        .map_err(DirectHistoryMutationError::storage)?;
                 }
             }
             Ok(plaintext)
-        })();
-
-        let plaintext = match operation {
-            Ok(plaintext) => {
-                if let Err(commit_error) = self
-                    .db
-                    .as_ref()
-                    .ok_or("database not initialized")?
-                    .commit_receive_savepoint()
-                {
-                    let rollback = self
-                        .db
-                        .as_ref()
-                        .and_then(|db| db.rollback_receive_savepoint().err());
-                    self.restore_receive_crypto(crypto_snapshot);
-                    return Err(rollback.map_or(commit_error.clone(), |rollback| {
-                        format!("{commit_error}; edit rollback also failed: {rollback}")
-                    }));
-                }
-                plaintext
-            }
-            Err(error) => {
-                let rollback = self
-                    .db
-                    .as_ref()
-                    .and_then(|db| db.rollback_receive_savepoint().err());
-                self.restore_receive_crypto(crypto_snapshot);
-                return Err(rollback.map_or(error.clone(), |rollback| {
-                    format!("{error}; edit rollback also failed: {rollback}")
-                }));
-            }
-        };
-        if let Some(indexer) = self.indexer.as_ref() {
-            let _ = indexer.update_message_body(message_id, &plaintext);
-        }
-        Ok(plaintext)
+        })
     }
 
     /// Persist a received message to the local DB.
@@ -5498,6 +6515,7 @@ impl VeilClient {
         server_timestamp: Option<i64>,
         reply_to_id: Option<&str>,
     ) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         let db = self.db.as_ref().ok_or("database not initialized")?;
         db.insert_message(
             message_id,
@@ -5533,6 +6551,7 @@ impl VeilClient {
         conversation_id: &str,
         new_text: &str,
     ) -> Result<u64, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         if self.channel_conversations.contains(conversation_id) {
             return Err(
                 "group/channel edits are disabled until an exact device edit protocol exists"
@@ -5591,6 +6610,7 @@ impl VeilClient {
         message_id: &str,
         conversation_id: &str,
     ) -> Result<u64, String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let seq = conn.next_seq().await;
 
@@ -5623,6 +6643,7 @@ impl VeilClient {
         conversation_id: &str,
         started: bool,
     ) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let identity_key = self
             .identity
@@ -5651,6 +6672,7 @@ impl VeilClient {
         emoji: &str,
         add: bool,
     ) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         let user_id = self.authenticated_user_id()?.to_string();
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let seq = conn.next_seq().await;
@@ -5688,6 +6710,7 @@ impl VeilClient {
         emoji: &str,
         username: &str,
     ) -> Result<(), String> {
+        self.require_message_conversation_available_v1(message_id)?;
         self.db
             .as_ref()
             .ok_or("database not initialized")?
@@ -5701,6 +6724,7 @@ impl VeilClient {
         user_id: &str,
         emoji: &str,
     ) -> Result<(), String> {
+        self.require_message_conversation_available_v1(message_id)?;
         self.db
             .as_ref()
             .ok_or("database not initialized")?
@@ -5712,6 +6736,7 @@ impl VeilClient {
         &self,
         message_id: &str,
     ) -> Result<Vec<(String, String, String)>, String> {
+        self.require_message_conversation_available_v1(message_id)?;
         self.db
             .as_ref()
             .ok_or("database not initialized")?
@@ -5720,6 +6745,7 @@ impl VeilClient {
 
     /// Update a message in local DB (for incoming edits).
     pub fn update_local_message(&self, message_id: &str, new_text: &str) -> Result<(), String> {
+        self.require_message_conversation_available_v1(message_id)?;
         self.db
             .as_ref()
             .ok_or("database not initialized")?
@@ -5739,6 +6765,7 @@ impl VeilClient {
         message_id: &str,
         conversation_id: &str,
     ) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(conversation_id)?;
         self.db
             .as_ref()
             .ok_or("database not initialized")?
@@ -5757,6 +6784,7 @@ impl VeilClient {
         name: Option<&str>,
         peer_key: Option<&[u8]>,
     ) -> Result<(), String> {
+        self.require_direct_conversation_available_v1(id)?;
         if conv_type == 0 {
             if let Some(peer) = peer_key.and_then(|key| <[u8; 32]>::try_from(key).ok()) {
                 self.dm_conversations.insert(id.to_string(), peer);
@@ -8417,6 +9445,1898 @@ mod tests {
             .contains("retained-size limit"));
     }
 
+    const DIRECT_LIVE_TEST_ORIGIN: &str = "https://live-replay.example.test:443";
+
+    struct DirectLivePeerFixture {
+        sender: VeilClient,
+        sender_identity_key: [u8; 32],
+        receiver_identity_key: [u8; 32],
+        conversation_id: String,
+        username: String,
+        next_message: u128,
+    }
+
+    impl DirectLivePeerFixture {
+        fn next_event(&mut self, text: &str) -> ConnectionEvent {
+            let (ciphertext, header) = self
+                .sender
+                .encrypt_outgoing(&self.conversation_id, text)
+                .unwrap();
+            if header.first() == Some(&HEADER_INITIAL) {
+                self.sender
+                    .test_only_confirm_peer_session_possession(&self.receiver_identity_key)
+                    .unwrap();
+            }
+            self.next_message += 1;
+            ConnectionEvent::MessageReceived {
+                message_id: uuid::Uuid::from_u128(self.next_message).to_string(),
+                conversation_id: self.conversation_id.clone(),
+                sender_identity_key: self.sender_identity_key.to_vec(),
+                sender_username: self.username.clone(),
+                ciphertext,
+                header,
+                server_timestamp: 1_700_000_000_000_000_000
+                    + (self.next_message as u64 & 0x0000_ffff_ffff_ffff),
+                reply_to_id: None,
+                msg_type: Some(proto::MessageType::Text as i32),
+                ttl_seconds: None,
+                sealed: Some(false),
+                attachments: Vec::new(),
+                security_context: None,
+            }
+        }
+    }
+
+    struct DirectLiveReplayFixture {
+        receiver: VeilClient,
+        receiver_identity_key: [u8; 32],
+        receiver_signing_key: [u8; 32],
+        peers: Vec<DirectLivePeerFixture>,
+    }
+
+    impl DirectLiveReplayFixture {
+        fn new() -> Self {
+            Self::new_with_db(VeilDb::open_memory(&[0x91; 32]).unwrap())
+        }
+
+        fn new_with_db(db: VeilDb) -> Self {
+            let receiver_identity = IdentityKeyPair::generate();
+            let receiver_identity_key = receiver_identity.x25519_public_bytes();
+            let receiver_signing_key = receiver_identity.ed25519_public_bytes();
+            let receiver_user_id =
+                uuid::Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0001).to_string();
+            let mut receiver = VeilClient::from_identity(receiver_identity);
+            db.bind_authenticated_self(
+                DIRECT_LIVE_TEST_ORIGIN,
+                &receiver_user_id,
+                &receiver_identity_key,
+                &receiver_signing_key,
+            )
+            .unwrap();
+            let self_account = AccountSnapshot {
+                locator: veil_store::models::ProfileLocator {
+                    canonical_server_origin: DIRECT_LIVE_TEST_ORIGIN.to_string(),
+                    user_id: receiver_user_id.clone(),
+                    identity_key: receiver_identity_key,
+                },
+                signing_key: receiver_signing_key,
+                username: Some("Receiver".to_string()),
+                display_name: Some("Replay Receiver".to_string()),
+                profile_version: Some(1),
+                profile_origin: DIRECT_LIVE_TEST_ORIGIN.to_string(),
+                source:
+                    veil_store::models::AccountSnapshotSource::AuthenticatedConversationDirectory,
+                observed_at: "2026-07-18T00:00:00Z".to_string(),
+            };
+            db.upsert_identity_directory(std::slice::from_ref(&self_account))
+                .unwrap();
+            receiver.db = Some(db);
+            receiver.authenticated_user_id = Some(receiver_user_id.clone());
+            receiver.authenticated_server_origin = Some(DIRECT_LIVE_TEST_ORIGIN.to_string());
+            receiver
+                .remember_user_identity(&receiver_user_id, receiver_identity_key)
+                .unwrap();
+            receiver
+                .pin_peer_signing_key(receiver_identity_key, receiver_signing_key)
+                .unwrap();
+            Self {
+                receiver,
+                receiver_identity_key,
+                receiver_signing_key,
+                peers: Vec::new(),
+            }
+        }
+
+        fn add_peer(&mut self) -> usize {
+            let index = self.peers.len() as u128 + 1;
+            let sender_identity = IdentityKeyPair::generate();
+            let sender_identity_key = sender_identity.x25519_public_bytes();
+            let sender_signing_key = sender_identity.ed25519_public_bytes();
+            let sender_user_id =
+                uuid::Uuid::from_u128(0x2000_0000_0000_0000_0000_0000_0000_0000 + index)
+                    .to_string();
+            let conversation_id =
+                uuid::Uuid::from_u128(0x3000_0000_0000_0000_0000_0000_0000_0000 + index)
+                    .to_string();
+            let username = format!("Sender{index}");
+            let author = AccountSnapshot {
+                locator: veil_store::models::ProfileLocator {
+                    canonical_server_origin: DIRECT_LIVE_TEST_ORIGIN.to_string(),
+                    user_id: sender_user_id.clone(),
+                    identity_key: sender_identity_key,
+                },
+                signing_key: sender_signing_key,
+                username: Some(username.clone()),
+                display_name: Some(format!("Replay Sender {index}")),
+                profile_version: Some(1),
+                profile_origin: DIRECT_LIVE_TEST_ORIGIN.to_string(),
+                source:
+                    veil_store::models::AccountSnapshotSource::AuthenticatedConversationDirectory,
+                observed_at: "2026-07-18T00:00:00Z".to_string(),
+            };
+            let db = self.receiver.db().unwrap();
+            db.upsert_identity_directory(std::slice::from_ref(&author))
+                .unwrap();
+            db.upsert_directory_conversation(
+                &conversation_id,
+                0,
+                DIRECT_LIVE_TEST_ORIGIN,
+                Some(&username),
+                Some(&sender_user_id),
+                Some(&sender_identity_key),
+                None,
+                "2026-07-18T00:00:00Z",
+            )
+            .unwrap();
+            self.receiver
+                .remember_user_identity(&sender_user_id, sender_identity_key)
+                .unwrap();
+            self.receiver
+                .pin_peer_signing_key(sender_identity_key, sender_signing_key)
+                .unwrap();
+            self.receiver
+                .replace_authorized_conversation_senders(
+                    &conversation_id,
+                    [self.receiver_identity_key, sender_identity_key],
+                )
+                .unwrap();
+            self.receiver
+                .bind_dm_conversation(&conversation_id, sender_identity_key)
+                .unwrap();
+
+            let prekeys = self.receiver.generate_prekeys().unwrap();
+            let (one_time_prekey, one_time_prekey_id) = prekeys.otk_publics[0];
+            let mut sender = VeilClient::from_identity(sender_identity);
+            sender
+                .establish_session(
+                    &self.receiver_identity_key,
+                    &x3dh::PreKeyBundle {
+                        identity_key: self.receiver_identity_key,
+                        signing_key: self.receiver_signing_key,
+                        signed_prekey: prekeys.spk_public,
+                        signed_prekey_signature: prekeys.spk_signature,
+                        signed_prekey_id: prekeys.spk_id,
+                        one_time_prekey: Some(one_time_prekey),
+                        one_time_prekey_id: Some(one_time_prekey_id),
+                    },
+                )
+                .unwrap();
+            sender
+                .bind_dm_conversation(&conversation_id, self.receiver_identity_key)
+                .unwrap();
+            self.peers.push(DirectLivePeerFixture {
+                sender,
+                sender_identity_key,
+                receiver_identity_key: self.receiver_identity_key,
+                conversation_id,
+                username,
+                next_message: 0x4000_0000_0000_0000_0000_0000_0000_0000 + (index << 32),
+            });
+            self.peers.len() - 1
+        }
+
+        fn enqueue(&mut self, events: Vec<ConnectionEvent>) {
+            let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+                LIVE_EVENT_QUEUE_CAPACITY,
+                LIVE_EVENT_RETAINED_BYTES,
+            );
+            let events = events
+                .into_iter()
+                .map(|event| budget.try_wrap(event).unwrap())
+                .collect();
+            self.receiver
+                .deferred_connection_events
+                .try_extend(events)
+                .unwrap();
+        }
+    }
+
+    fn runtime_ratchet_fingerprint_v1(
+        client: &VeilClient,
+        peer_identity_key: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        client
+            .ratchet_sessions
+            .get(peer_identity_key)
+            .map(|ratchet| {
+                let serialized = Zeroizing::new(serde_json::to_vec(ratchet).unwrap());
+                Sha256::digest(serialized.as_slice()).into()
+            })
+    }
+
+    fn durable_ratchet_fingerprint_v1(
+        db: &VeilDb,
+        peer_identity_key: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        db.load_ratchet_session(peer_identity_key)
+            .unwrap()
+            .map(|serialized| {
+                let serialized = Zeroizing::new(serialized);
+                Sha256::digest(serialized.as_slice()).into()
+            })
+    }
+
+    fn runtime_otk_fingerprint_v1(client: &VeilClient) -> [u8; 32] {
+        let mut ids: Vec<_> = client.otk_secrets.keys().copied().collect();
+        ids.sort_unstable();
+        let mut digest = Sha256::new();
+        for id in ids {
+            digest.update(id.to_be_bytes());
+            digest.update(client.otk_secrets[&id]);
+        }
+        digest.finalize().into()
+    }
+
+    type DurablePreKeyPublicFingerprintV1 = (u8, u32, [u8; 32], Option<[u8; 64]>);
+
+    fn durable_prekey_public_fingerprint_v1(db: &VeilDb) -> Vec<DurablePreKeyPublicFingerprintV1> {
+        db.load_local_prekeys()
+            .unwrap()
+            .into_iter()
+            .map(|prekey| {
+                (
+                    prekey.key_type,
+                    prekey.protocol_key_id,
+                    prekey.public_key,
+                    prekey.signature,
+                )
+            })
+            .collect()
+    }
+
+    fn direct_message_projection_fingerprint_v1(db: &VeilDb, conversation_id: &str) -> [u8; 32] {
+        let serialized = Zeroizing::new(
+            serde_json::to_vec(&db.get_messages(conversation_id, 100).unwrap()).unwrap(),
+        );
+        Sha256::digest(serialized.as_slice()).into()
+    }
+
+    #[test]
+    fn websocket_url_maps_to_exact_canonical_authenticated_origin() {
+        for (websocket, expected) in [
+            (
+                "wss://Chat.Example.Test/ws?transport=websocket",
+                "https://chat.example.test:443",
+            ),
+            ("wss://example.test:8443/ws", "https://example.test:8443"),
+            ("ws://127.0.0.1:8080/ws", "http://127.0.0.1:8080"),
+            ("ws://[::1]:9090/ws", "http://[::1]:9090"),
+            (
+                "wss://bücher.example/ws",
+                "https://xn--bcher-kva.example:443",
+            ),
+        ] {
+            assert_eq!(
+                canonical_server_origin_from_websocket_url_v1(websocket).unwrap(),
+                expected
+            );
+        }
+
+        for rejected in [
+            "ws://example.test/ws",
+            "wss://user@example.test/ws",
+            "wss://example.test/ws#fragment",
+            "https://example.test/ws",
+            "wss:///",
+        ] {
+            assert!(
+                canonical_server_origin_from_websocket_url_v1(rejected).is_err(),
+                "unexpectedly accepted {rejected}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_live_replay_is_exactly_duplicate_safe_and_reports_quiescence() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let event = fixture.peers[peer].next_event("store exactly once");
+        fixture.enqueue(vec![event.clone()]);
+
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap(),
+            DirectLiveReplayReportV1 {
+                consumed: 1,
+                stored: 1,
+                visible_mutations: 1,
+                quiescent: true,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+
+        let ConnectionEvent::MessageReceived {
+            message_id,
+            conversation_id,
+            sender_identity_key,
+            ciphertext,
+            header,
+            server_timestamp,
+            reply_to_id,
+            ..
+        } = &event
+        else {
+            unreachable!()
+        };
+        let sender_identity_key: [u8; 32] = sender_identity_key.as_slice().try_into().unwrap();
+        let author = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .resolve_account_by_conversation_sender(conversation_id, &sender_identity_key)
+            .unwrap()
+            .unwrap();
+        let rest_timestamp_ms = i64::try_from(*server_timestamp / 1_000_000).unwrap();
+        assert_eq!(
+            fixture
+                .receiver
+                .receive_and_persist_direct_history_message(
+                    message_id,
+                    conversation_id,
+                    &sender_identity_key,
+                    &author,
+                    MessageAuthorContext::DirectoryMemberAtObservation,
+                    header,
+                    ciphertext,
+                    Some(rest_timestamp_ms),
+                    reply_to_id.as_deref(),
+                    None,
+                )
+                .unwrap(),
+            ReceiveMessageResult::Duplicate
+        );
+        assert_eq!(
+            fixture
+                .receiver
+                .db()
+                .unwrap()
+                .get_messages(conversation_id, 10)
+                .unwrap()[0]
+                .server_timestamp,
+            Some(rest_timestamp_ms)
+        );
+
+        fixture.enqueue(vec![event]);
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap(),
+            DirectLiveReplayReportV1 {
+                consumed: 1,
+                duplicates: 1,
+                visible_mutations: 1,
+                quiescent: true,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+        assert_eq!(
+            fixture
+                .receiver
+                .db()
+                .unwrap()
+                .get_messages(&fixture.peers[peer].conversation_id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_live_duplicate_repairs_legacy_author_and_signals_projection_refresh() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let event = fixture.peers[peer].next_event("legacy author repair");
+        let (message_id, conversation_id) = match &event {
+            ConnectionEvent::MessageReceived {
+                message_id,
+                conversation_id,
+                ..
+            } => (message_id.clone(), conversation_id.clone()),
+            _ => unreachable!(),
+        };
+        fixture.enqueue(vec![event.clone()]);
+        fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        fixture
+            .receiver
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "DELETE FROM message_author_snapshots_v1 WHERE message_id = ?1",
+                rusqlite::params![message_id],
+            )
+            .unwrap();
+        assert!(fixture
+            .receiver
+            .db()
+            .unwrap()
+            .get_messages(&conversation_id, 10)
+            .unwrap()[0]
+            .author
+            .is_none());
+        let ratchet_before =
+            duplicate_ratchet_state(&fixture.receiver, &fixture.peers[peer].sender_identity_key);
+
+        fixture.enqueue(vec![event]);
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap(),
+            DirectLiveReplayReportV1 {
+                consumed: 1,
+                duplicates: 1,
+                visible_mutations: 1,
+                quiescent: true,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+        assert_eq!(
+            duplicate_ratchet_state(&fixture.receiver, &fixture.peers[peer].sender_identity_key),
+            ratchet_before
+        );
+        assert!(fixture
+            .receiver
+            .db()
+            .unwrap()
+            .get_messages(&conversation_id, 10)
+            .unwrap()[0]
+            .author
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn direct_live_ack_and_error_reconcile_sqlcipher_without_leaking_identifiers() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let conversation_id = fixture.peers[peer].conversation_id.clone();
+        let ack_local_id = uuid::Uuid::new_v4().to_string();
+        let failed_local_id = uuid::Uuid::new_v4().to_string();
+        let server_message_id = uuid::Uuid::new_v4().to_string();
+        let ack_sequence = 0xA1;
+        let failed_sequence = 0xA2;
+        let ack_timestamp_ns = 1_700_000_123_456_000_000u64;
+        for (sequence, local_id, plaintext) in [
+            (ack_sequence, ack_local_id.as_str(), "acknowledged"),
+            (failed_sequence, failed_local_id.as_str(), "failed"),
+        ] {
+            fixture
+                .receiver
+                .db()
+                .unwrap()
+                .insert_outgoing_pending_message(
+                    local_id,
+                    &conversation_id,
+                    &fixture.receiver_identity_key,
+                    plaintext,
+                    None,
+                )
+                .unwrap();
+            fixture.receiver.pending_outgoing_messages.insert(
+                sequence,
+                PendingOutgoingMessage {
+                    local_message_id: local_id.to_string(),
+                    conversation_id: conversation_id.clone(),
+                    sender_identity_key: fixture.receiver_identity_key,
+                    plaintext: plaintext.to_string(),
+                },
+            );
+        }
+        fixture.enqueue(vec![
+            ConnectionEvent::MessageAcked {
+                message_id: server_message_id.clone(),
+                server_timestamp: ack_timestamp_ns,
+                ref_seq: ack_sequence,
+                local_message_id: None,
+                mutation: None,
+                sender_key: None,
+            },
+            ConnectionEvent::Error {
+                code: 500,
+                message: "rejected".to_string(),
+                ref_seq: Some(failed_sequence),
+                local_message_id: None,
+                conversation_id: None,
+                stale_roster_context: false,
+            },
+        ]);
+
+        let report = fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            DirectLiveReplayReportV1 {
+                consumed: 2,
+                ignored: 2,
+                visible_mutations: 2,
+                quiescent: true,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+        let aggregate_debug = format!("{report:?}");
+        assert!(!aggregate_debug.contains(&ack_local_id));
+        assert!(!aggregate_debug.contains(&failed_local_id));
+        assert!(!aggregate_debug.contains(&server_message_id));
+        assert!(fixture.receiver.pending_outgoing_messages.is_empty());
+
+        let messages = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .get_messages(&conversation_id, 10)
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.id != ack_local_id));
+        let acknowledged = messages
+            .iter()
+            .find(|message| message.id == server_message_id)
+            .unwrap();
+        assert_eq!(acknowledged.status, veil_store::models::MessageStatus::Sent);
+        assert_eq!(
+            acknowledged.server_timestamp,
+            Some(i64::try_from(ack_timestamp_ns / 1_000_000).unwrap())
+        );
+        let failed = messages
+            .iter()
+            .find(|message| message.id == failed_local_id)
+            .unwrap();
+        assert_eq!(failed.status, veil_store::models::MessageStatus::Failed);
+        assert_eq!(failed.server_timestamp, None);
+    }
+
+    #[tokio::test]
+    async fn generic_poll_storage_reconciliation_revokes_the_native_epoch() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let baseline = fixture.peers[peer].next_event("message to edit");
+        let message_id = match &baseline {
+            ConnectionEvent::MessageReceived { message_id, .. } => message_id.clone(),
+            _ => unreachable!(),
+        };
+        fixture.enqueue(vec![baseline]);
+        fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        fixture.receiver.pending_mutations.insert(
+            0xB1,
+            ConfirmedMutation::Edit {
+                message_id: message_id.clone(),
+                conversation_id: fixture.peers[peer].conversation_id.clone(),
+                new_text: "sensitive pending edit".to_string(),
+            },
+        );
+        fixture
+            .receiver
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_poll_edit
+                 BEFORE UPDATE OF plaintext ON messages
+                 BEGIN SELECT RAISE(FAIL, 'forced poll reconciliation failure'); END;",
+            )
+            .unwrap();
+        fixture.enqueue(vec![ConnectionEvent::MessageAcked {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            server_timestamp: 1_700_000_000_000_000_000,
+            ref_seq: 0xB1,
+            local_message_id: None,
+            mutation: None,
+            sender_key: None,
+        }]);
+
+        let error = fixture.receiver.poll_event().await.unwrap_err();
+        assert!(error.contains("forced poll reconciliation failure"));
+        assert!(fixture.receiver.direct_live_storage_uncertain);
+        assert!(fixture.receiver.connection.is_none());
+        assert!(fixture.receiver.authenticated_user_id.is_none());
+        assert!(fixture.receiver.authenticated_server_origin.is_none());
+        assert!(fixture.receiver.pending_mutations.is_empty());
+        assert!(fixture.receiver.db().is_none());
+        assert!(fixture.receiver.identity.is_none());
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap_err()
+                .stop,
+            DirectLiveReplayStopV1::StorageUncertain
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_initial_session_failure_never_moves_or_persists_pending_edit_plaintext() {
+        let path =
+            std::env::temp_dir().join(format!("veil-ack-late-failure-{}.db", uuid::Uuid::new_v4()));
+        remove_test_database(&path);
+        let db_key = [0x94; 32];
+        let mut fixture =
+            DirectLiveReplayFixture::new_with_db(VeilDb::open(&path, &db_key).unwrap());
+        let peer = fixture.add_peer();
+        let conversation_id = fixture.peers[peer].conversation_id.clone();
+        let peer_identity_key = fixture.peers[peer].sender_identity_key;
+        let baseline = fixture.peers[peer].next_event("original durable text");
+        let message_id = match &baseline {
+            ConnectionEvent::MessageReceived { message_id, .. } => message_id.clone(),
+            _ => unreachable!(),
+        };
+        fixture.enqueue(vec![baseline]);
+        fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+
+        // One sequence deliberately overlaps a plaintext-bearing edit and an
+        // initial-session acknowledgement. Persisting the ratchet fails after
+        // the earlier ACK step; the edit must still be owned by the pending
+        // map so revoke can explicitly zeroize it.
+        let sequence = 0xB2;
+        fixture.receiver.pending_mutations.insert(
+            sequence,
+            ConfirmedMutation::Edit {
+                message_id: message_id.clone(),
+                conversation_id: conversation_id.clone(),
+                new_text: "sensitive edit that must never escape".to_string(),
+            },
+        );
+        fixture
+            .receiver
+            .pending_initial_sequences
+            .insert(sequence, peer_identity_key);
+        fixture
+            .receiver
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_ack_ratchet
+                 BEFORE INSERT ON ratchet_sessions
+                 BEGIN SELECT RAISE(FAIL, 'forced acknowledged ratchet failure'); END;",
+            )
+            .unwrap();
+        fixture.enqueue(vec![ConnectionEvent::MessageAcked {
+            message_id: uuid::Uuid::new_v4().to_string(),
+            server_timestamp: 1_700_000_000_000_000_000,
+            ref_seq: sequence,
+            local_message_id: None,
+            mutation: None,
+            sender_key: None,
+        }]);
+
+        let error = fixture.receiver.poll_event().await.unwrap_err();
+        assert!(error.contains("forced acknowledged ratchet failure"));
+        assert!(fixture.receiver.direct_live_storage_uncertain);
+        assert!(fixture.receiver.pending_mutations.is_empty());
+        assert!(fixture.receiver.db().is_none());
+
+        let reopened = VeilDb::open(&path, &db_key).unwrap();
+        let messages = reopened.get_messages(&conversation_id, 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, message_id);
+        assert_eq!(messages[0].plaintext, "original durable text");
+        drop(reopened);
+        remove_test_database(&path);
+    }
+
+    fn assert_failed_initialization_epoch_is_scrubbed_v1(
+        client: &VeilClient,
+        peer_identity_key: &[u8; 32],
+    ) {
+        assert!(client.direct_live_storage_uncertain);
+        assert!(client.connection.is_none());
+        assert!(client.authenticated_user_id.is_none());
+        assert!(client.authenticated_server_origin.is_none());
+        assert!(client.deferred_connection_events.events.is_empty());
+        assert!(client.db().is_none());
+        assert!(client.indexer().is_none());
+        assert!(client.identity.is_none());
+        assert!(client.device_identity.is_none());
+        assert!(client.ratchet_sessions.is_empty());
+        assert!(!client.has_session(peer_identity_key));
+        assert!(client.spk_secrets.is_empty());
+        assert!(client.otk_secrets.is_empty());
+        assert_eq!(client.spk_next_id, 1);
+        assert_eq!(client.otk_next_id, 1);
+        assert!(client.pending_initial_headers.is_empty());
+        assert!(client.pending_initial_sequences.is_empty());
+        assert!(client.pending_outgoing_messages.is_empty());
+        assert!(client.pending_mutations.is_empty());
+        assert!(client.dm_conversations.is_empty());
+        assert!(client.known_user_keys.is_empty());
+        assert!(client.trusted_signing_keys.is_empty());
+        assert!(client.channel_conversations.is_empty());
+        assert!(client.authorized_conversation_senders.is_empty());
+        assert!(client.device_rosters.is_empty());
+        assert!(client.last_invalidated_device_rosters.is_empty());
+        assert!(client.device_roster_rotation_pending.is_empty());
+        assert!(client.sender_key_distribution_pending.is_empty());
+        assert!(client.prepared_sender_key_generations.is_empty());
+        assert!(client.pending_sender_key_sequences.is_empty());
+        assert!(client.pending_sender_key_envelopes.is_empty());
+        assert!(client.pending_sender_key_receipts.is_empty());
+        assert!(client.pending_sender_key_receipt_set.is_empty());
+        assert!(client.pending_sender_key_receipt_sequences.is_empty());
+        assert!(client.failed_sender_key_distributions.is_empty());
+        assert!(client.direct_live_blocked_conversations.is_empty());
+        assert!(!client.sender_keys.has_outgoing("scrubbed-sender-key-probe"));
+        assert!(!client
+            .sender_keys
+            .has_incoming("scrubbed-sender-key-probe", peer_identity_key));
+    }
+
+    #[test]
+    fn failed_initialization_scrubs_partial_fresh_and_revoked_epochs() {
+        let mnemonic = generate_mnemonic().to_string();
+        let corrupt_path = std::env::temp_dir().join(format!(
+            "veil-init-partial-corrupt-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let recovered_path = std::env::temp_dir().join(format!(
+            "veil-init-partial-recovered-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&corrupt_path);
+        remove_test_database(&recovered_path);
+
+        let peer_identity = IdentityKeyPair::generate();
+        let peer_identity_key = peer_identity.x25519_public_bytes();
+        let peer_signing_key = peer_identity.ed25519_public_bytes();
+        let mut peer = VeilClient::from_identity(peer_identity);
+        let peer_prekeys = peer.generate_prekeys().unwrap();
+        let (one_time_prekey, one_time_prekey_id) = peer_prekeys.otk_publics[0];
+        let bundle = x3dh::PreKeyBundle {
+            identity_key: peer_identity_key,
+            signing_key: peer_signing_key,
+            signed_prekey: peer_prekeys.spk_public,
+            signed_prekey_signature: peer_prekeys.spk_signature,
+            signed_prekey_id: peer_prekeys.spk_id,
+            one_time_prekey: Some(one_time_prekey),
+            one_time_prekey_id: Some(one_time_prekey_id),
+        };
+
+        let mut seeded = VeilClient::new();
+        seeded.init_with_mnemonic(&mnemonic, &corrupt_path).unwrap();
+        seeded.generate_prekeys().unwrap();
+        seeded
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        seeded
+            .db()
+            .unwrap()
+            .upsert_directory_conversation(
+                "late-corrupt-init",
+                ConversationType::DM as u8,
+                "https://init-corrupt.test:443",
+                Some("Peer"),
+                Some("00000000-0000-0000-0000-000000000047"),
+                Some(peer_identity_key.as_slice()),
+                None,
+                "2026-07-18T00:00:00Z",
+            )
+            .unwrap();
+        let changed = seeded
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE pending_initial_headers SET header_data = ?1
+                 WHERE peer_identity_key = ?2",
+                rusqlite::params![b"{".as_slice(), peer_identity_key.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        assert!(!seeded
+            .db()
+            .unwrap()
+            .load_local_prekeys()
+            .unwrap()
+            .is_empty());
+        assert!(seeded
+            .db()
+            .unwrap()
+            .load_ratchet_session(&peer_identity_key)
+            .unwrap()
+            .is_some());
+        drop(seeded);
+
+        let mut recovering = VeilClient::new();
+        let original_device_id = recovering.device_id();
+        let first_error = recovering
+            .init_with_mnemonic(&mnemonic, &corrupt_path)
+            .unwrap_err();
+        assert!(first_error.contains("decode pending X3DH header"));
+        assert_eq!(recovering.device_id(), original_device_id);
+        assert_failed_initialization_epoch_is_scrubbed_v1(&recovering, &peer_identity_key);
+
+        // The same corrupt late load is also safe when entered as an explicit
+        // sticky-revoke recovery attempt.
+        let second_error = recovering
+            .init_with_mnemonic(&mnemonic, &corrupt_path)
+            .unwrap_err();
+        assert!(second_error.contains("decode pending X3DH header"));
+        assert_eq!(recovering.device_id(), original_device_id);
+        assert_failed_initialization_epoch_is_scrubbed_v1(&recovering, &peer_identity_key);
+
+        recovering
+            .init_with_mnemonic(&mnemonic, &recovered_path)
+            .unwrap();
+        assert!(!recovering.direct_live_storage_uncertain);
+        assert!(recovering.db().is_some());
+        assert!(recovering.identity.is_some());
+        assert!(recovering.device_identity.is_some());
+
+        drop(recovering);
+        remove_test_database(&corrupt_path);
+        remove_test_database(&recovered_path);
+    }
+
+    #[tokio::test]
+    async fn active_reinitialization_is_rejected_without_epoch_mutation() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let conversation_id = fixture.peers[peer].conversation_id.clone();
+        let peer_identity_key = fixture.peers[peer].sender_identity_key;
+        let baseline = fixture.peers[peer].next_event("baseline");
+        fixture.enqueue(vec![baseline]);
+        fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        let queued = fixture.peers[peer].next_event("queued after reject");
+        fixture.enqueue(vec![queued]);
+
+        let identity_before = fixture.receiver.identity_key().unwrap();
+        let signing_before = fixture.receiver.signing_key().unwrap();
+        let device_id_before = fixture.receiver.device_id();
+        let auth_before = fixture.receiver.authenticated_user_id.clone();
+        let origin_before = fixture.receiver.authenticated_server_origin.clone();
+        let ratchet_before =
+            runtime_ratchet_fingerprint_v1(&fixture.receiver, &peer_identity_key).unwrap();
+        let db_changes_before = fixture.receiver.db().unwrap().conn().changes();
+        let queued_before = fixture.receiver.deferred_connection_events.events.len();
+        let transport_before = fixture.receiver.connection.is_some();
+        let replacement_path = std::env::temp_dir().join(format!(
+            "veil-active-reinit-rejected-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&replacement_path);
+        let replacement_mnemonic = generate_mnemonic().to_string();
+
+        let error = fixture
+            .receiver
+            .init_with_mnemonic(&replacement_mnemonic, &replacement_path)
+            .unwrap_err();
+        assert!(error.contains("already initialized"));
+        assert!(!fixture.receiver.direct_live_storage_uncertain);
+        assert_eq!(fixture.receiver.identity_key().unwrap(), identity_before);
+        assert_eq!(fixture.receiver.signing_key().unwrap(), signing_before);
+        assert_eq!(fixture.receiver.device_id(), device_id_before);
+        assert_eq!(fixture.receiver.authenticated_user_id, auth_before);
+        assert_eq!(fixture.receiver.authenticated_server_origin, origin_before);
+        assert_eq!(
+            runtime_ratchet_fingerprint_v1(&fixture.receiver, &peer_identity_key),
+            Some(ratchet_before)
+        );
+        assert_eq!(
+            fixture.receiver.db().unwrap().conn().changes(),
+            db_changes_before
+        );
+        assert_eq!(
+            fixture.receiver.deferred_connection_events.events.len(),
+            queued_before
+        );
+        assert_eq!(fixture.receiver.connection.is_some(), transport_before);
+        assert!(!replacement_path.exists());
+
+        let report = fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        assert_eq!(report.stored, 1);
+        let messages = fixture
+            .receiver
+            .direct_messages_projection_v1(&conversation_id, 10)
+            .unwrap();
+        assert_eq!(messages.len(), 2);
+        remove_test_database(&replacement_path);
+    }
+
+    #[test]
+    fn connect_preinstall_reconciliation_failure_revokes_the_old_epoch() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let conversation_id = fixture.peers[peer].conversation_id.clone();
+        let local_message_id = uuid::Uuid::new_v4().to_string();
+        fixture
+            .receiver
+            .db()
+            .unwrap()
+            .insert_outgoing_pending_message(
+                &local_message_id,
+                &conversation_id,
+                &fixture.receiver_identity_key,
+                "ambiguous reconnect draft",
+                None,
+            )
+            .unwrap();
+        fixture.receiver.pending_outgoing_messages.insert(
+            0xB2,
+            PendingOutgoingMessage {
+                local_message_id,
+                conversation_id,
+                sender_identity_key: fixture.receiver_identity_key,
+                plaintext: "ambiguous reconnect draft".to_string(),
+            },
+        );
+        fixture
+            .receiver
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_reconnect_delivery_state
+                 BEFORE UPDATE OF status ON messages
+                 BEGIN SELECT RAISE(FAIL, 'forced reconnect reconciliation failure'); END;",
+            )
+            .unwrap();
+
+        let error = fixture
+            .receiver
+            .reconcile_previous_transport_before_install_v1()
+            .unwrap_err();
+        assert!(error.contains("forced reconnect reconciliation failure"));
+        assert!(fixture.receiver.direct_live_storage_uncertain);
+        assert!(fixture.receiver.connection.is_none());
+        assert!(fixture.receiver.authenticated_user_id.is_none());
+        assert!(fixture.receiver.authenticated_server_origin.is_none());
+        assert!(fixture.receiver.pending_outgoing_messages.is_empty());
+        assert!(fixture.receiver.db().is_none());
+        assert!(fixture.receiver.identity.is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_live_terminal_between_events_preempts_the_next_poll() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let first = fixture.peers[peer].next_event("first");
+        let second = fixture.peers[peer].next_event("must be preempted");
+        fixture.enqueue(vec![first, second]);
+
+        let error = fixture
+            .receiver
+            .replay_direct_live_events_inner_v1(|client, consumed| {
+                if consumed == 1 {
+                    client
+                        .deferred_connection_events
+                        .fail(ConnectionEventBufferErrorV1::TransportEpochEnded);
+                }
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.stop, DirectLiveReplayStopV1::TransportTerminal);
+        assert_eq!(
+            error.report,
+            DirectLiveReplayReportV1 {
+                consumed: 1,
+                stored: 1,
+                visible_mutations: 1,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+        assert_eq!(
+            fixture
+                .receiver
+                .db()
+                .unwrap()
+                .get_messages(&fixture.peers[peer].conversation_id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_live_replay_stops_at_sixty_four_without_claiming_quiescence() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let events = (0..(DIRECT_LIVE_REPLAY_MAX_BATCH_V1 + 1))
+            .map(|index| fixture.peers[peer].next_event(&format!("message {index}")))
+            .collect();
+        fixture.enqueue(events);
+
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap(),
+            DirectLiveReplayReportV1 {
+                consumed: DIRECT_LIVE_REPLAY_MAX_BATCH_V1,
+                stored: DIRECT_LIVE_REPLAY_MAX_BATCH_V1,
+                visible_mutations: DIRECT_LIVE_REPLAY_MAX_BATCH_V1,
+                quiescent: false,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap(),
+            DirectLiveReplayReportV1 {
+                consumed: 1,
+                stored: 1,
+                visible_mutations: 1,
+                quiescent: true,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_live_poison_blocks_only_its_conversation() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let poisoned_peer = fixture.add_peer();
+        let healthy_peer = fixture.add_peer();
+        let mut poison = fixture.peers[poisoned_peer].next_event("poisoned");
+        if let ConnectionEvent::MessageReceived { ciphertext, .. } = &mut poison {
+            let last = ciphertext.last_mut().unwrap();
+            *last ^= 0x80;
+        }
+        let healthy = fixture.peers[healthy_peer].next_event("healthy");
+        fixture.enqueue(vec![poison, healthy]);
+
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap(),
+            DirectLiveReplayReportV1 {
+                consumed: 2,
+                stored: 1,
+                ignored: 1,
+                newly_blocked: 1,
+                visible_mutations: 1,
+                quiescent: true,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+        assert!(fixture
+            .receiver
+            .direct_live_blocked_conversations
+            .contains(&fixture.peers[poisoned_peer].conversation_id));
+        assert!(!fixture
+            .receiver
+            .direct_live_blocked_conversations
+            .contains(&fixture.peers[healthy_peer].conversation_id));
+        assert_eq!(
+            fixture
+                .receiver
+                .direct_conversation_availability_v1(&fixture.peers[poisoned_peer].conversation_id),
+            DirectConversationAvailabilityV1::Quarantined
+        );
+        assert_eq!(
+            fixture
+                .receiver
+                .direct_conversation_availability_v1(&fixture.peers[healthy_peer].conversation_id),
+            DirectConversationAvailabilityV1::Available
+        );
+        assert!(fixture
+            .receiver
+            .direct_messages_projection_v1(&fixture.peers[poisoned_peer].conversation_id, 10)
+            .unwrap_err()
+            .contains("quarantined"));
+        assert_eq!(
+            fixture
+                .receiver
+                .direct_messages_projection_v1(&fixture.peers[healthy_peer].conversation_id, 10)
+                .unwrap()
+                .len(),
+            1
+        );
+        let blocked_send = fixture
+            .receiver
+            .test_only_encrypt_outgoing(
+                &fixture.peers[poisoned_peer].conversation_id,
+                "must not encrypt",
+            )
+            .unwrap_err();
+        assert!(blocked_send.contains("quarantined"));
+
+        let quarantined = fixture.peers[poisoned_peer].next_event("still blocked");
+        let ConnectionEvent::MessageReceived {
+            conversation_id,
+            sender_identity_key,
+            header,
+            ciphertext,
+            ..
+        } = &quarantined
+        else {
+            unreachable!()
+        };
+        let blocked_sender: [u8; 32] = sender_identity_key.as_slice().try_into().unwrap();
+        let blocked_receive = fixture
+            .receiver
+            .decrypt_from(&blocked_sender, conversation_id, header, ciphertext)
+            .unwrap_err();
+        assert!(blocked_receive.contains("quarantined"));
+        let blocked_projection = fixture
+            .receiver
+            .persist_incoming_message(
+                &uuid::Uuid::new_v4().to_string(),
+                conversation_id,
+                &blocked_sender,
+                "must not project",
+                Some(1),
+                None,
+            )
+            .unwrap_err();
+        assert!(blocked_projection.contains("quarantined"));
+        let still_healthy = fixture.peers[healthy_peer].next_event("still healthy");
+        fixture.enqueue(vec![quarantined, still_healthy]);
+        let report = fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        assert_eq!(report.stored, 1);
+        assert_eq!(report.ignored, 1);
+        assert_eq!(report.newly_blocked, 0);
+        assert!(report.quiescent);
+
+        let blocked_id = fixture.peers[poisoned_peer].conversation_id.clone();
+        fixture.receiver.clear_server_scoped_conversation_routing();
+        assert_eq!(
+            fixture
+                .receiver
+                .direct_conversation_availability_v1(&blocked_id),
+            DirectConversationAvailabilityV1::Quarantined
+        );
+        fixture.receiver.mark_channel_conversation(&blocked_id);
+        assert!(!fixture.receiver.is_channel_conversation(&blocked_id));
+        assert!(fixture
+            .receiver
+            .begin_sender_key_distribution(&blocked_id)
+            .unwrap_err()
+            .contains("quarantined"));
+        assert_eq!(
+            fixture.receiver.sender_key_distribution_status(&blocked_id),
+            "quarantined"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_unsupported_direct_mutations_stay_conversation_scoped() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let blocked_peer = fixture.add_peer();
+        let healthy_peer = fixture.add_peer();
+        let blocked_conversation = fixture.peers[blocked_peer].conversation_id.clone();
+        let blocked_identity = fixture.peers[blocked_peer].sender_identity_key.to_vec();
+        let edit = |message_suffix: u128| ConnectionEvent::MessageEdited {
+            message_id: uuid::Uuid::from_u128(
+                0x7000_0000_0000_0000_0000_0000_0000_0000 + message_suffix,
+            )
+            .to_string(),
+            conversation_id: blocked_conversation.clone(),
+            sender_identity_key: blocked_identity.clone(),
+            ciphertext: vec![1],
+            header: vec![HEADER_RATCHET],
+            edit_timestamp: 1_700_000_000_000_000_000 + message_suffix as u64,
+        };
+        let healthy = fixture.peers[healthy_peer].next_event("healthy after blocked mutations");
+        fixture.enqueue(vec![edit(1), edit(2), healthy]);
+
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap(),
+            DirectLiveReplayReportV1 {
+                consumed: 3,
+                stored: 1,
+                ignored: 2,
+                newly_blocked: 1,
+                visible_mutations: 1,
+                quiescent: true,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_live_storage_uncertainty_is_a_sticky_global_stop() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-direct-live-storage-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&path);
+        let db_key = [0x91; 32];
+        let mut fixture =
+            DirectLiveReplayFixture::new_with_db(VeilDb::open(&path, &db_key).unwrap());
+        let peer = fixture.add_peer();
+        let conversation_id = fixture.peers[peer].conversation_id.clone();
+        let sender_identity_key = fixture.peers[peer].sender_identity_key;
+        let durable_prekeys_before = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .load_local_prekeys()
+            .unwrap()
+            .len();
+        let durable_ratchet_before =
+            durable_ratchet_fingerprint_v1(fixture.receiver.db().unwrap(), &sender_identity_key);
+        fixture.receiver.pending_outgoing_messages.insert(
+            700,
+            PendingOutgoingMessage {
+                local_message_id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conversation_id.clone(),
+                sender_identity_key: fixture.receiver_identity_key,
+                plaintext: "pending plaintext must be erased".to_string(),
+            },
+        );
+        fixture.receiver.pending_mutations.insert(
+            701,
+            ConfirmedMutation::Edit {
+                message_id: uuid::Uuid::new_v4().to_string(),
+                conversation_id: conversation_id.clone(),
+                new_text: "pending edit must be erased".to_string(),
+            },
+        );
+        fixture
+            .receiver
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_direct_live_message
+                 BEFORE INSERT ON messages
+                 BEGIN SELECT RAISE(FAIL, 'forced Direct live write failure'); END;",
+            )
+            .unwrap();
+        let event = fixture.peers[peer].next_event("must roll back");
+        let receive_probe = event.clone();
+        fixture.enqueue(vec![event]);
+
+        let error = fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap_err();
+        assert_eq!(error.stop, DirectLiveReplayStopV1::StorageUncertain);
+        assert_eq!(error.report.consumed, 1);
+        assert_eq!(error.report.stored, 0);
+        assert!(fixture.receiver.direct_live_storage_uncertain);
+        assert!(fixture.receiver.connection.is_none());
+        assert!(fixture.receiver.authenticated_user_id.is_none());
+        assert!(fixture.receiver.authenticated_server_origin.is_none());
+        assert!(fixture
+            .receiver
+            .deferred_connection_events
+            .events
+            .is_empty());
+        assert!(fixture.receiver.pending_outgoing_messages.is_empty());
+        assert!(fixture.receiver.pending_mutations.is_empty());
+        assert!(fixture.receiver.pending_initial_headers.is_empty());
+        assert!(fixture.receiver.pending_sender_key_envelopes.is_empty());
+        assert!(fixture.receiver.ratchet_sessions.is_empty());
+        assert!(fixture.receiver.spk_secrets.is_empty());
+        assert!(fixture.receiver.otk_secrets.is_empty());
+        assert!(fixture.receiver.db().is_none());
+        assert!(fixture.receiver.identity.is_none());
+        assert!(fixture.receiver.device_identity.is_none());
+        assert_eq!(
+            fixture
+                .receiver
+                .direct_conversation_availability_v1(&conversation_id),
+            DirectConversationAvailabilityV1::RuntimeRevoked
+        );
+
+        let send_error = fixture
+            .receiver
+            .send_message(&conversation_id, "denied", None)
+            .await
+            .unwrap_err();
+        assert!(send_error.contains("revoked"));
+        let ConnectionEvent::MessageReceived {
+            sender_identity_key,
+            header,
+            ciphertext,
+            ..
+        } = receive_probe
+        else {
+            unreachable!()
+        };
+        let sender_identity_key: [u8; 32] = sender_identity_key.try_into().unwrap();
+        let receive_error = fixture
+            .receiver
+            .decrypt_from(&sender_identity_key, &conversation_id, &header, &ciphertext)
+            .unwrap_err();
+        assert!(receive_error.contains("revoked"));
+        assert!(fixture
+            .receiver
+            .poll_event()
+            .await
+            .unwrap_err()
+            .contains("revoked"));
+
+        // The failed handle was dropped by revoke. Remove the external fault
+        // with a separately opened SQLCipher handle; the old runtime must stay
+        // revoked even after the original storage cause no longer exists.
+        let inspection_db = VeilDb::open(&path, &db_key).unwrap();
+        inspection_db
+            .conn()
+            .execute_batch("DROP TRIGGER reject_direct_live_message")
+            .unwrap();
+        assert!(inspection_db
+            .get_messages(&conversation_id, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            inspection_db.load_local_prekeys().unwrap().len(),
+            durable_prekeys_before
+        );
+        assert_eq!(
+            durable_ratchet_fingerprint_v1(&inspection_db, &sender_identity_key),
+            durable_ratchet_before
+        );
+
+        let sticky = fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap_err();
+        assert_eq!(sticky.stop, DirectLiveReplayStopV1::StorageUncertain);
+        assert_eq!(sticky.report, DirectLiveReplayReportV1::default());
+
+        let failed_reinit_path = std::env::temp_dir().join(format!(
+            "veil-direct-live-failed-reinit-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        assert!(fixture
+            .receiver
+            .init_with_mnemonic("not a valid mnemonic", &failed_reinit_path)
+            .is_err());
+        assert!(fixture.receiver.direct_live_storage_uncertain);
+
+        let recovered_path = std::env::temp_dir().join(format!(
+            "veil-direct-live-reinit-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let mnemonic = fixture.receiver.generate_mnemonic();
+        fixture
+            .receiver
+            .init_with_mnemonic(&mnemonic, &recovered_path)
+            .unwrap();
+        assert!(!fixture.receiver.direct_live_storage_uncertain);
+        assert!(fixture.receiver.db().is_some());
+        assert_eq!(
+            fixture
+                .receiver
+                .direct_conversation_availability_v1(&conversation_id),
+            DirectConversationAvailabilityV1::NotDirect
+        );
+
+        drop(inspection_db);
+        drop(fixture);
+        remove_test_database(&path);
+        remove_test_database(&failed_reinit_path);
+        remove_test_database(&recovered_path);
+    }
+
+    #[tokio::test]
+    async fn direct_live_durable_scope_mismatch_matrix_revokes_before_decrypt() {
+        for variant in 0..6 {
+            let path = std::env::temp_dir().join(format!(
+                "veil-direct-live-scope-{variant}-{}.db",
+                uuid::Uuid::new_v4()
+            ));
+            remove_test_database(&path);
+            let db_key = [0x92; 32];
+            let mut fixture =
+                DirectLiveReplayFixture::new_with_db(VeilDb::open(&path, &db_key).unwrap());
+            let peer = fixture.add_peer();
+            let conversation_id = fixture.peers[peer].conversation_id.clone();
+            let sender_identity_key = fixture.peers[peer].sender_identity_key;
+            let event = fixture.peers[peer].next_event("must fail durable scope");
+
+            match variant {
+                0 => {
+                    fixture.receiver.authenticated_server_origin =
+                        Some("https://other.example.test:443".to_string());
+                }
+                1 => {
+                    fixture.receiver.authenticated_user_id = Some(uuid::Uuid::new_v4().to_string());
+                }
+                2 => {
+                    let replacement = IdentityKeyPair::generate().x25519_public_bytes();
+                    fixture
+                        .receiver
+                        .db()
+                        .unwrap()
+                        .conn()
+                        .execute(
+                            "UPDATE authenticated_self_bindings_v1
+                             SET identity_key = ?1
+                             WHERE canonical_server_origin = ?2",
+                            rusqlite::params![replacement.as_slice(), DIRECT_LIVE_TEST_ORIGIN],
+                        )
+                        .unwrap();
+                }
+                3 => {
+                    let replacement = IdentityKeyPair::generate().ed25519_public_bytes();
+                    fixture
+                        .receiver
+                        .db()
+                        .unwrap()
+                        .conn()
+                        .execute(
+                            "UPDATE authenticated_self_bindings_v1
+                             SET signing_key = ?1
+                             WHERE canonical_server_origin = ?2",
+                            rusqlite::params![replacement.as_slice(), DIRECT_LIVE_TEST_ORIGIN],
+                        )
+                        .unwrap();
+                }
+                4 => {
+                    fixture
+                        .receiver
+                        .db()
+                        .unwrap()
+                        .conn()
+                        .execute(
+                            "UPDATE conversations SET peer_user_id = ?1 WHERE id = ?2",
+                            rusqlite::params![uuid::Uuid::new_v4().to_string(), conversation_id],
+                        )
+                        .unwrap();
+                }
+                5 => {
+                    let replacement = IdentityKeyPair::generate().x25519_public_bytes();
+                    fixture
+                        .receiver
+                        .db()
+                        .unwrap()
+                        .conn()
+                        .execute(
+                            "UPDATE conversations SET peer_identity_key = ?1 WHERE id = ?2",
+                            rusqlite::params![replacement.as_slice(), conversation_id],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let runtime_ratchet_before =
+                runtime_ratchet_fingerprint_v1(&fixture.receiver, &sender_identity_key);
+            let runtime_otk_before = runtime_otk_fingerprint_v1(&fixture.receiver);
+            let durable_ratchet_before = durable_ratchet_fingerprint_v1(
+                fixture.receiver.db().unwrap(),
+                &sender_identity_key,
+            );
+            let durable_prekeys_before =
+                durable_prekey_public_fingerprint_v1(fixture.receiver.db().unwrap());
+            fixture.enqueue(vec![event]);
+
+            let error = fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.stop,
+                DirectLiveReplayStopV1::StorageUncertain,
+                "scope mismatch variant {variant}"
+            );
+            assert_eq!(error.report.consumed, 1, "scope mismatch variant {variant}");
+            assert!(!error.report.quiescent, "scope mismatch variant {variant}");
+            assert!(fixture.receiver.direct_live_storage_uncertain);
+            assert!(fixture.receiver.db().is_none());
+            assert!(fixture.receiver.identity.is_none());
+            assert!(fixture.receiver.ratchet_sessions.is_empty());
+            assert!(fixture.receiver.otk_secrets.is_empty());
+            assert_eq!(runtime_ratchet_before, None);
+            assert_ne!(runtime_otk_before, [0u8; 32]);
+
+            let inspection_db = VeilDb::open(&path, &db_key).unwrap();
+            assert!(inspection_db
+                .get_messages(&conversation_id, 10)
+                .unwrap()
+                .is_empty());
+            assert_eq!(
+                durable_ratchet_fingerprint_v1(&inspection_db, &sender_identity_key),
+                durable_ratchet_before
+            );
+            assert_eq!(
+                durable_prekey_public_fingerprint_v1(&inspection_db),
+                durable_prekeys_before
+            );
+            drop(inspection_db);
+            drop(fixture);
+            remove_test_database(&path);
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_live_authorization_mismatch_matrix_quarantines_before_decrypt() {
+        for variant in 0..3 {
+            let mut fixture = DirectLiveReplayFixture::new();
+            let blocked_peer = fixture.add_peer();
+            let healthy_peer = fixture.add_peer();
+            let conversation_id = fixture.peers[blocked_peer].conversation_id.clone();
+            let sender_identity_key = fixture.peers[blocked_peer].sender_identity_key;
+            let event = fixture.peers[blocked_peer].next_event("must be quarantined");
+
+            match variant {
+                0 => {
+                    let replacement = IdentityKeyPair::generate().ed25519_public_bytes();
+                    fixture
+                        .receiver
+                        .db()
+                        .unwrap()
+                        .conn()
+                        .execute(
+                            "UPDATE identity_directory_v1
+                             SET signing_key = ?1
+                             WHERE canonical_server_origin = ?2 AND identity_key = ?3",
+                            rusqlite::params![
+                                replacement.as_slice(),
+                                DIRECT_LIVE_TEST_ORIGIN,
+                                sender_identity_key.as_slice()
+                            ],
+                        )
+                        .unwrap();
+                }
+                1 => {
+                    fixture
+                        .receiver
+                        .db()
+                        .unwrap()
+                        .conn()
+                        .execute(
+                            "UPDATE identity_directory_v1
+                             SET source = 1
+                             WHERE canonical_server_origin = ?1 AND identity_key = ?2",
+                            rusqlite::params![
+                                DIRECT_LIVE_TEST_ORIGIN,
+                                sender_identity_key.as_slice()
+                            ],
+                        )
+                        .unwrap();
+                }
+                2 => fixture
+                    .receiver
+                    .clear_authorized_conversation_senders(&conversation_id),
+                _ => unreachable!(),
+            }
+
+            let runtime_ratchet_before =
+                runtime_ratchet_fingerprint_v1(&fixture.receiver, &sender_identity_key);
+            let runtime_otk_before = runtime_otk_fingerprint_v1(&fixture.receiver);
+            let durable_ratchet_before = durable_ratchet_fingerprint_v1(
+                fixture.receiver.db().unwrap(),
+                &sender_identity_key,
+            );
+            let durable_prekeys_before =
+                durable_prekey_public_fingerprint_v1(fixture.receiver.db().unwrap());
+            let sql_changes_before: i64 = fixture
+                .receiver
+                .db()
+                .unwrap()
+                .conn()
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            fixture.enqueue(vec![event]);
+
+            assert_eq!(
+                fixture
+                    .receiver
+                    .replay_direct_live_events_v1()
+                    .await
+                    .unwrap(),
+                DirectLiveReplayReportV1 {
+                    consumed: 1,
+                    ignored: 1,
+                    newly_blocked: 1,
+                    quiescent: true,
+                    ..DirectLiveReplayReportV1::default()
+                },
+                "authorization mismatch variant {variant}"
+            );
+            assert_eq!(
+                fixture
+                    .receiver
+                    .direct_conversation_availability_v1(&conversation_id),
+                DirectConversationAvailabilityV1::Quarantined
+            );
+            assert_eq!(
+                runtime_ratchet_fingerprint_v1(&fixture.receiver, &sender_identity_key),
+                runtime_ratchet_before
+            );
+            assert_eq!(
+                runtime_otk_fingerprint_v1(&fixture.receiver),
+                runtime_otk_before
+            );
+            assert_eq!(
+                durable_ratchet_fingerprint_v1(
+                    fixture.receiver.db().unwrap(),
+                    &sender_identity_key
+                ),
+                durable_ratchet_before
+            );
+            assert_eq!(
+                durable_prekey_public_fingerprint_v1(fixture.receiver.db().unwrap()),
+                durable_prekeys_before
+            );
+            assert_eq!(
+                fixture
+                    .receiver
+                    .db()
+                    .unwrap()
+                    .conn()
+                    .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                sql_changes_before
+            );
+            assert!(fixture
+                .receiver
+                .db()
+                .unwrap()
+                .get_messages(&conversation_id, 10)
+                .unwrap()
+                .is_empty());
+
+            let healthy_event = fixture.peers[healthy_peer].next_event("healthy continuation");
+            let healthy_conversation = fixture.peers[healthy_peer].conversation_id.clone();
+            fixture.enqueue(vec![healthy_event]);
+            let healthy_report = fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap();
+            assert_eq!(healthy_report.stored, 1);
+            assert_eq!(
+                fixture
+                    .receiver
+                    .direct_conversation_availability_v1(&healthy_conversation),
+                DirectConversationAvailabilityV1::Available
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_live_future_policy_is_quarantined_before_decrypt() {
+        for mutation in 0..7 {
+            let mut fixture = DirectLiveReplayFixture::new();
+            let peer = fixture.add_peer();
+            let mut event = fixture.peers[peer].next_event("unsupported");
+            let ConnectionEvent::MessageReceived {
+                msg_type,
+                ttl_seconds,
+                sealed,
+                attachments,
+                header,
+                message_id,
+                reply_to_id,
+                ..
+            } = &mut event
+            else {
+                unreachable!()
+            };
+            match mutation {
+                0 => *msg_type = Some(i32::MAX),
+                1 => *ttl_seconds = Some(30),
+                2 => *sealed = Some(true),
+                3 => attachments.push(crate::attachments::WireAttachmentV1 {
+                    media_id: uuid::Uuid::from_u128(0x5000).to_string(),
+                    encrypted_key: vec![1; 32],
+                    nonce: vec![2; 24],
+                    size: 1,
+                    content_type: "application/octet-stream".to_string(),
+                }),
+                4 => header[0] = HEADER_SENDER_KEY,
+                5 => *msg_type = None,
+                6 => *reply_to_id = Some(message_id.clone()),
+                _ => unreachable!(),
+            }
+            fixture.enqueue(vec![event]);
+            let report = fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap();
+            assert_eq!(report.stored, 0);
+            assert_eq!(report.ignored, 1);
+            assert_eq!(report.newly_blocked, 1);
+            assert!(report.quiescent);
+            assert!(fixture
+                .receiver
+                .db()
+                .unwrap()
+                .get_messages(&fixture.peers[peer].conversation_id, 10)
+                .unwrap()
+                .is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_live_unknown_route_poison_cannot_be_reported_quiescent() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let mut unknown = fixture.peers[peer].next_event("unknown route");
+        if let ConnectionEvent::MessageReceived {
+            conversation_id, ..
+        } = &mut unknown
+        {
+            *conversation_id =
+                uuid::Uuid::from_u128(0x6000_0000_0000_0000_0000_0000_0000_0001).to_string();
+        }
+        let otherwise_valid = fixture.peers[peer].next_event("must be preempted");
+        fixture.enqueue(vec![unknown, otherwise_valid]);
+
+        let error = fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap_err();
+        assert_eq!(error.stop, DirectLiveReplayStopV1::TransportTerminal);
+        assert_eq!(error.report.consumed, 1);
+        assert!(!error.report.quiescent);
+        assert_eq!(error.report.stored, 0);
+        assert_eq!(
+            fixture.receiver.deferred_connection_events.failure(),
+            Some(ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "Direct live route"
+            })
+        );
+        let sticky = fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap_err();
+        assert_eq!(sticky.stop, DirectLiveReplayStopV1::TransportTerminal);
+        assert_eq!(sticky.report, DirectLiveReplayReportV1::default());
+    }
+
+    #[tokio::test]
+    async fn direct_live_known_non_direct_does_not_advance_ratchet_or_sqlcipher() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let direct_conversation_id = fixture.peers[peer].conversation_id.clone();
+        let baseline = fixture.peers[peer].next_event("establish Direct receive state");
+        fixture.enqueue(vec![baseline]);
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap()
+                .stored,
+            1
+        );
+        let channel_id =
+            uuid::Uuid::from_u128(0x6000_0000_0000_0000_0000_0000_0000_0002).to_string();
+        fixture.receiver.mark_channel_conversation(&channel_id);
+        let mut channel_event = fixture.peers[peer].next_event("known channel");
+        if let ConnectionEvent::MessageReceived {
+            conversation_id, ..
+        } = &mut channel_event
+        {
+            *conversation_id = channel_id.clone();
+        }
+        let sender_identity_key = fixture.peers[peer].sender_identity_key;
+        let ratchet_before =
+            runtime_ratchet_fingerprint_v1(&fixture.receiver, &sender_identity_key);
+        let otk_before = runtime_otk_fingerprint_v1(&fixture.receiver);
+        let durable_ratchet_before =
+            durable_ratchet_fingerprint_v1(fixture.receiver.db().unwrap(), &sender_identity_key);
+        let durable_prekeys_before =
+            durable_prekey_public_fingerprint_v1(fixture.receiver.db().unwrap());
+        let sql_changes_before: i64 = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .conn()
+            .query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap();
+        let direct_messages_before = direct_message_projection_fingerprint_v1(
+            fixture.receiver.db().unwrap(),
+            &direct_conversation_id,
+        );
+        fixture.enqueue(vec![channel_event]);
+
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap(),
+            DirectLiveReplayReportV1 {
+                consumed: 1,
+                ignored: 1,
+                quiescent: true,
+                ..DirectLiveReplayReportV1::default()
+            }
+        );
+        assert_eq!(
+            runtime_ratchet_fingerprint_v1(&fixture.receiver, &sender_identity_key),
+            ratchet_before
+        );
+        assert_eq!(runtime_otk_fingerprint_v1(&fixture.receiver), otk_before);
+        assert_eq!(
+            durable_ratchet_fingerprint_v1(fixture.receiver.db().unwrap(), &sender_identity_key),
+            durable_ratchet_before
+        );
+        assert_eq!(
+            durable_prekey_public_fingerprint_v1(fixture.receiver.db().unwrap()),
+            durable_prekeys_before
+        );
+        assert_eq!(
+            fixture
+                .receiver
+                .db()
+                .unwrap()
+                .conn()
+                .query_row("SELECT total_changes()", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            sql_changes_before
+        );
+        assert!(fixture
+            .receiver
+            .db()
+            .unwrap()
+            .get_messages(&channel_id, 10)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            direct_message_projection_fingerprint_v1(
+                fixture.receiver.db().unwrap(),
+                &direct_conversation_id
+            ),
+            direct_messages_before
+        );
+    }
+
     #[test]
     fn dm_encryption_fails_closed_without_binding_or_session() {
         let peer = IdentityKeyPair::generate().x25519_public_bytes();
@@ -8643,7 +11563,13 @@ mod tests {
 
         let mut alice = VeilClient::from_identity(alice_identity);
         let mut bob = VeilClient::from_identity(bob_identity);
-        bob.db = Some(VeilDb::open_memory(&[73u8; 32]).unwrap());
+        let bob_path = std::env::temp_dir().join(format!(
+            "veil-public-receive-revoke-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&bob_path);
+        let bob_db_key = [73u8; 32];
+        bob.db = Some(VeilDb::open(&bob_path, &bob_db_key).unwrap());
         let author = AccountSnapshot {
             locator: veil_store::models::ProfileLocator {
                 canonical_server_origin: "https://atomic.test:443".to_string(),
@@ -8719,6 +11645,9 @@ mod tests {
                 None,
             )
             .is_err());
+        assert!(!bob.direct_live_storage_uncertain);
+        assert!(bob.db().is_some());
+        assert!(bob.identity.is_some());
         assert!(!bob.has_session(&alice_key));
         assert!(bob.otk_secrets.contains_key(&opk_id));
         bob.replace_authorized_conversation_senders("dm-atomic", [bob_key, alice_key])
@@ -8744,6 +11673,9 @@ mod tests {
                 None,
             )
             .is_err());
+        assert!(!bob.direct_live_storage_uncertain);
+        assert!(bob.db().is_some());
+        assert!(bob.identity.is_some());
         assert!(!bob.has_session(&alice_key));
         assert!(bob.otk_secrets.contains_key(&opk_id));
         assert!(!bob.db().unwrap().message_exists("server-message").unwrap());
@@ -8774,128 +11706,43 @@ mod tests {
                 None,
             )
             .is_err());
+        assert!(bob.direct_live_storage_uncertain);
+        assert!(bob.connection.is_none());
+        assert!(bob.authenticated_user_id.is_none());
+        assert!(bob.authenticated_server_origin.is_none());
+        assert!(bob.db().is_none());
+        assert!(bob.identity.is_none());
+        assert!(bob.device_identity.is_none());
+        assert!(bob.ratchet_sessions.is_empty());
+        assert!(bob.spk_secrets.is_empty());
+        assert!(bob.otk_secrets.is_empty());
         assert!(!bob.has_session(&alice_key));
-        assert!(bob.otk_secrets.contains_key(&opk_id));
-        assert!(bob
-            .db()
-            .unwrap()
-            .load_ratchet_session(&alice_key)
-            .unwrap()
-            .is_none());
-        assert!(!bob.db().unwrap().message_exists("server-message").unwrap());
+        assert_eq!(
+            bob.direct_conversation_availability_v1("dm-atomic"),
+            DirectConversationAvailabilityV1::RuntimeRevoked
+        );
 
-        bob.db()
-            .unwrap()
+        let inspection_db = VeilDb::open(&bob_path, &bob_db_key).unwrap();
+        inspection_db
             .conn()
             .execute_batch("DROP TRIGGER reject_synced_message")
             .unwrap();
-        assert_eq!(
-            bob.receive_and_persist_message(
-                "server-message",
-                "dm-atomic",
-                &alice_key,
-                Some(&author),
-                Some(MessageAuthorContext::DirectoryMemberAtObservation),
-                false,
-                None,
-                Some("Alice"),
-                &header,
-                &ciphertext,
-                Some(1000),
-                None,
-                None,
-            )
-            .unwrap(),
-            ReceiveMessageResult::Stored {
-                plaintext: "transactional".to_string()
-            }
-        );
-        assert!(bob.has_session(&alice_key));
-        assert!(!bob.otk_secrets.contains_key(&opk_id));
-        assert!(bob.db().unwrap().message_exists("server-message").unwrap());
-        assert_eq!(
-            bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0]
-                .author
-                .as_ref(),
-            Some(&author)
-        );
-
-        // Simulate a row created before author snapshots existed. The edit
-        // transaction must either restore attribution together with plaintext
-        // or leave both unchanged on rollback.
-        bob.db()
+        assert!(!inspection_db.message_exists("server-message").unwrap());
+        assert!(inspection_db
+            .load_ratchet_session(&alice_key)
             .unwrap()
-            .conn()
-            .execute(
-                "DELETE FROM message_author_snapshots_v1 WHERE message_id = ?1",
-                rusqlite::params!["server-message"],
-            )
-            .unwrap();
-        assert!(bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0]
-            .author
             .is_none());
-
-        let (edit_ciphertext, edit_header) = alice
-            .encrypt_outgoing("dm-atomic", "edited transactionally")
-            .unwrap();
-        bob.db()
+        assert!(inspection_db
+            .load_local_prekeys()
             .unwrap()
-            .conn()
-            .execute_batch(
-                "CREATE TRIGGER reject_synced_edit
-                 BEFORE UPDATE OF plaintext ON messages
-                 BEGIN SELECT RAISE(ABORT, 'simulated edit write failure'); END;",
-            )
-            .unwrap();
-        assert!(bob
-            .receive_and_persist_edit(
-                "server-message",
-                "dm-atomic",
-                &alice_key,
-                Some(&author),
-                Some(MessageAuthorContext::DirectoryMemberAtObservation),
-                false,
-                &edit_header,
-                &edit_ciphertext,
-                None,
-            )
-            .is_err());
-        assert_eq!(
-            bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0].plaintext,
-            "transactional"
-        );
-        assert!(bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0]
-            .author
-            .is_none());
-        bob.db()
-            .unwrap()
-            .conn()
-            .execute_batch("DROP TRIGGER reject_synced_edit")
-            .unwrap();
-        assert_eq!(
-            bob.receive_and_persist_edit(
-                "server-message",
-                "dm-atomic",
-                &alice_key,
-                Some(&author),
-                Some(MessageAuthorContext::DirectoryMemberAtObservation),
-                false,
-                &edit_header,
-                &edit_ciphertext,
-                None,
-            )
-            .unwrap(),
-            "edited transactionally"
-        );
-        assert_eq!(
-            bob.db().unwrap().get_messages("dm-atomic", 10).unwrap()[0]
-                .author
-                .as_ref(),
-            Some(&author)
-        );
+            .iter()
+            .any(|prekey| prekey.protocol_key_id == opk_id));
+        drop(inspection_db);
+        remove_test_database(&bob_path);
     }
 
     struct DuplicateReceiveFixture {
+        alice: VeilClient,
         bob: VeilClient,
         alice_key: [u8; 32],
         bob_key: [u8; 32],
@@ -8906,6 +11753,10 @@ mod tests {
     }
 
     fn duplicate_receive_fixture() -> DuplicateReceiveFixture {
+        duplicate_receive_fixture_with_db(VeilDb::open_memory(&[0xD7; 32]).unwrap())
+    }
+
+    fn duplicate_receive_fixture_with_db(db: VeilDb) -> DuplicateReceiveFixture {
         let alice_identity = IdentityKeyPair::generate();
         let alice_key = alice_identity.x25519_public_bytes();
         let alice_signing = alice_identity.ed25519_public_bytes();
@@ -8914,7 +11765,7 @@ mod tests {
         let bob_signing = bob_identity.ed25519_public_bytes();
         let mut alice = VeilClient::from_identity(alice_identity);
         let mut bob = VeilClient::from_identity(bob_identity);
-        bob.db = Some(VeilDb::open_memory(&[0xD7; 32]).unwrap());
+        bob.db = Some(db);
 
         let author = AccountSnapshot {
             locator: veil_store::models::ProfileLocator {
@@ -8992,6 +11843,7 @@ mod tests {
         );
 
         DuplicateReceiveFixture {
+            alice,
             bob,
             alice_key,
             bob_key,
@@ -9017,6 +11869,234 @@ mod tests {
             .unwrap()
             .expect("stored fixture message persisted its ratchet");
         (runtime, persisted)
+    }
+
+    #[test]
+    fn encrypted_edit_success_and_ciphertext_rejection_preserve_epoch_semantics() {
+        let mut fixture = duplicate_receive_fixture();
+        fixture
+            .bob
+            .bind_dm_conversation("dm-duplicate", fixture.alice_key)
+            .unwrap();
+        let ratchet_before = runtime_ratchet_fingerprint_v1(&fixture.bob, &fixture.alice_key);
+
+        let rejected = fixture
+            .bob
+            .receive_and_persist_edit(
+                "duplicate-message",
+                "dm-duplicate",
+                &fixture.alice_key,
+                Some(&fixture.author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
+                false,
+                &[HEADER_RATCHET],
+                &[0xFF],
+                None,
+            )
+            .unwrap_err();
+        assert!(rejected.contains("invalid Direct history ratchet header length"));
+        assert!(!fixture.bob.direct_live_storage_uncertain);
+        assert!(fixture.bob.db().is_some());
+        assert!(fixture.bob.identity.is_some());
+        assert!(fixture.bob.has_session(&fixture.alice_key));
+        assert_eq!(
+            runtime_ratchet_fingerprint_v1(&fixture.bob, &fixture.alice_key),
+            ratchet_before
+        );
+
+        let (ciphertext, header) = fixture
+            .alice
+            .encrypt_outgoing("dm-duplicate", "edited successfully")
+            .unwrap();
+        assert_eq!(
+            fixture
+                .bob
+                .receive_and_persist_edit(
+                    "duplicate-message",
+                    "dm-duplicate",
+                    &fixture.alice_key,
+                    Some(&fixture.author),
+                    Some(MessageAuthorContext::DirectoryMemberAtObservation),
+                    false,
+                    &header,
+                    &ciphertext,
+                    None,
+                )
+                .unwrap(),
+            "edited successfully"
+        );
+        let messages = fixture
+            .bob
+            .db()
+            .unwrap()
+            .get_messages("dm-duplicate", 10)
+            .unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].plaintext, "edited successfully");
+    }
+
+    #[test]
+    fn encrypted_edit_storage_failure_revokes_and_preserves_durable_state() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-edit-storage-revoke-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&path);
+        let db_key = [0xD8; 32];
+        let mut fixture = duplicate_receive_fixture_with_db(VeilDb::open(&path, &db_key).unwrap());
+        fixture
+            .bob
+            .bind_dm_conversation("dm-duplicate", fixture.alice_key)
+            .unwrap();
+        let durable_ratchet_before =
+            durable_ratchet_fingerprint_v1(fixture.bob.db().unwrap(), &fixture.alice_key);
+        let (ciphertext, header) = fixture
+            .alice
+            .encrypt_outgoing("dm-duplicate", "must not commit")
+            .unwrap();
+        fixture
+            .bob
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_public_edit
+                 BEFORE UPDATE OF plaintext ON messages
+                 BEGIN SELECT RAISE(ABORT, 'forced public edit failure'); END;",
+            )
+            .unwrap();
+
+        let error = fixture
+            .bob
+            .receive_and_persist_edit(
+                "duplicate-message",
+                "dm-duplicate",
+                &fixture.alice_key,
+                Some(&fixture.author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
+                false,
+                &header,
+                &ciphertext,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("forced public edit failure"));
+        assert_failed_initialization_epoch_is_scrubbed_v1(&fixture.bob, &fixture.alice_key);
+
+        let inspection_db = VeilDb::open(&path, &db_key).unwrap();
+        inspection_db
+            .conn()
+            .execute_batch("DROP TRIGGER reject_public_edit")
+            .unwrap();
+        let messages = inspection_db.get_messages("dm-duplicate", 10).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].plaintext, "duplicate fixture");
+        assert_eq!(
+            durable_ratchet_fingerprint_v1(&inspection_db, &fixture.alice_key),
+            durable_ratchet_before
+        );
+        drop(inspection_db);
+        drop(fixture);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn remote_metadata_storage_failures_revoke_but_peer_rejections_do_not() {
+        for variant in 0..2 {
+            let mut fixture = duplicate_receive_fixture();
+            fixture
+                .bob
+                .bind_dm_conversation("dm-duplicate", fixture.alice_key)
+                .unwrap();
+            let metadata = RemoteMessageMetadata {
+                revision_ms: 1700,
+                reactions: None,
+            };
+            let state = if variant == 0 {
+                fixture
+                    .bob
+                    .db()
+                    .unwrap()
+                    .conn()
+                    .execute_batch(
+                        "CREATE TRIGGER reject_metadata_delete
+                         BEFORE DELETE ON messages
+                         BEGIN SELECT RAISE(ABORT, 'forced metadata delete failure'); END;",
+                    )
+                    .unwrap();
+                RemoteMessageStateKind::Deleted
+            } else {
+                assert_eq!(
+                    fixture
+                        .bob
+                        .reconcile_remote_message_metadata(
+                            "duplicate-message",
+                            "dm-duplicate",
+                            &fixture.alice_key,
+                            &metadata,
+                            RemoteMessageStateKind::Active,
+                        )
+                        .unwrap(),
+                    RemoteReconcileAction::Unchanged
+                );
+                fixture
+                    .bob
+                    .db()
+                    .unwrap()
+                    .conn()
+                    .execute_batch(
+                        "CREATE TRIGGER reject_metadata_unchanged
+                         BEFORE INSERT ON remote_message_state
+                         BEGIN SELECT RAISE(ABORT, 'forced unchanged metadata failure'); END;",
+                    )
+                    .unwrap();
+                RemoteMessageStateKind::Active
+            };
+
+            assert!(fixture
+                .bob
+                .reconcile_remote_message_metadata(
+                    "duplicate-message",
+                    "dm-duplicate",
+                    &fixture.alice_key,
+                    &metadata,
+                    state,
+                )
+                .is_err());
+            assert_failed_initialization_epoch_is_scrubbed_v1(&fixture.bob, &fixture.alice_key);
+        }
+
+        let mut rejected = duplicate_receive_fixture();
+        rejected
+            .bob
+            .bind_dm_conversation("dm-duplicate", rejected.alice_key)
+            .unwrap();
+        let wrong_sender = [0xE1; 32];
+        let metadata = RemoteMessageMetadata {
+            revision_ms: 1700,
+            reactions: None,
+        };
+        let error = rejected
+            .bob
+            .reconcile_remote_message_metadata(
+                "duplicate-message",
+                "dm-duplicate",
+                &wrong_sender,
+                &metadata,
+                RemoteMessageStateKind::Active,
+            )
+            .unwrap_err();
+        assert!(error.contains("conflicts with its local binding"));
+        assert!(!rejected.bob.direct_live_storage_uncertain);
+        assert!(rejected.bob.db().is_some());
+        assert!(rejected.bob.identity.is_some());
+        assert!(rejected.bob.has_session(&rejected.alice_key));
+        assert_eq!(
+            rejected
+                .bob
+                .direct_conversation_availability_v1("dm-duplicate"),
+            DirectConversationAvailabilityV1::Available
+        );
     }
 
     fn assert_duplicate_rejected_without_mutation(
