@@ -137,10 +137,42 @@ sudo certbot certonly --webroot -w /var/www/letsencrypt \
 Replace the bootstrap vhost with the final loopback TLS vhost:
 
 ```sh
+python3 scripts/tests/check_nginx_rest_authority.py
 sudo install -m 0644 deploy/nginx/veil.erez.pro.conf /etc/nginx/sites-available/veil.erez.pro
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+The final vhost has a temporary, strict `veil-rest-v1` authority bridge.
+Previously released desktop builds sign and send `veil.erez.pro`; Android and
+current canonical clients sign and send `veil.erez.pro:443`. Nginx accepts
+those two reviewed authority forms and maps either to the corresponding
+lowercase literal before preserving it as upstream `Host` and
+`X-Forwarded-Host`. DNS hostname matching is case-insensitive, so case variants
+of the same hostname normalize to the same literal. Any other hostname, port,
+leading-zero port alias, trailing dot, or missing authority is rejected with
+HTTP 421. Deploy and verify this bridge before publishing a client that always
+includes the effective port, and retain it while a supported released desktop
+can still send the bare authority. Do not replace the allowlist with direct
+`$host` or `$http_host` forwarding. The permanent fix is the coordinated
+configured public-origin + REST v2 + WS v3 migration, not broader ingress
+trust.
+
+Before replacement, save the active expanded configuration and vhost so the
+change has a deterministic rollback path:
+
+```sh
+sudo sh -c 'nginx -T > /root/nginx-before-veil-authority.txt'
+sudo cp -a /etc/nginx/sites-available/veil.erez.pro \
+  /root/veil.erez.pro.before-authority
+sudo sha256sum /root/nginx-before-veil-authority.txt \
+  /root/veil.erez.pro.before-authority
+```
+
+After reload, verify HTTP/1.1 and HTTP/2 preserve both allowed authorities to
+the gateway, reject an unexpected port, and keep the packaged desktop and
+Android signed REST probes green. If either client receives a new 401, restore
+the saved vhost, run `sudo nginx -t`, and reload immediately.
 
 Before publishing the managed-service privacy notice, verify that the host's
 existing Nginx logrotate policy covers `/var/log/nginx/veil.erez.pro.*.log`
