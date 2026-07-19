@@ -866,6 +866,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -950,6 +952,8 @@ fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_history_res
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_response(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_mobile_reconnect_target(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request(
 ): Short
@@ -1145,6 +1149,8 @@ fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_history_response(
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_prekey_bundle(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_mobile_reconnect_target(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_directory_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
@@ -1463,6 +1469,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_response() != 26861.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_mobile_reconnect_target() != 50260.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request() != 63870.toShort()) {
@@ -2981,6 +2990,13 @@ public interface VeilMobileSessionInterface {
      */
     fun `installOwnPrekeyResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectOwnPreKeyProgress
 
+    /**
+     * Load the exact mobile reconnect target selected by successful mobile
+     * authentication. No Node Access Pass or bearer credential is
+     * persisted or returned through this interface.
+     */
+    fun `mobileReconnectTarget`(): MobileReconnectTarget?
+
     fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest
 
     /**
@@ -3379,6 +3395,24 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(
         it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Load the exact mobile reconnect target selected by successful mobile
+     * authentication. No Node Access Pass or bearer credential is
+     * persisted or returned through this interface.
+     */
+    @Throws(VeilException::class)override fun `mobileReconnectTarget`(): MobileReconnectTarget? {
+            return FfiConverterOptionalTypeMobileReconnectTarget.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_mobile_reconnect_target(
+        it, _status)
 }
     }
     )
@@ -5002,6 +5036,43 @@ public object FfiConverterTypeMobileDirectSyncLease: FfiConverterRustBuffer<Mobi
 
 
 
+/**
+ * Credential-free process-death reconnect selection loaded from SQLCipher.
+ * Android must still authenticate with a plain reconnect and require the
+ * returned account UUID to equal `expected_user_id` before publishing Ready.
+ */
+data class MobileReconnectTarget (
+    var `canonicalServerOrigin`: kotlin.String,
+    var `expectedUserId`: kotlin.String
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileReconnectTarget: FfiConverterRustBuffer<MobileReconnectTarget> {
+    override fun read(buf: ByteBuffer): MobileReconnectTarget {
+        return MobileReconnectTarget(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileReconnectTarget) = (
+            FfiConverterString.allocationSize(value.`canonicalServerOrigin`) +
+            FfiConverterString.allocationSize(value.`expectedUserId`)
+    )
+
+    override fun write(value: MobileReconnectTarget, buf: ByteBuffer) {
+            FfiConverterString.write(value.`canonicalServerOrigin`, buf)
+            FfiConverterString.write(value.`expectedUserId`, buf)
+    }
+}
+
+
+
 data class PreKeyBundleData (
     var `identityKey`: kotlin.ByteArray,
     var `signingKey`: kotlin.ByteArray,
@@ -5731,6 +5802,38 @@ public object FfiConverterOptionalTypeMobileDirectRestRequest: FfiConverterRustB
         } else {
             buf.put(1)
             FfiConverterTypeMobileDirectRestRequest.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeMobileReconnectTarget: FfiConverterRustBuffer<MobileReconnectTarget?> {
+    override fun read(buf: ByteBuffer): MobileReconnectTarget? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeMobileReconnectTarget.read(buf)
+    }
+
+    override fun allocationSize(value: MobileReconnectTarget?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeMobileReconnectTarget.allocationSize(value)
+        }
+    }
+
+    override fun write(value: MobileReconnectTarget?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeMobileReconnectTarget.write(value, buf)
         }
     }
 }

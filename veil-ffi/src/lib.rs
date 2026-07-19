@@ -99,6 +99,15 @@ pub struct MobileAuthenticatedBinding {
     pub user_id: String,
 }
 
+/// Credential-free process-death reconnect selection loaded from SQLCipher.
+/// Android must still authenticate with a plain reconnect and require the
+/// returned account UUID to equal `expected_user_id` before publishing Ready.
+#[derive(Clone, Eq, PartialEq, uniffi::Record)]
+pub struct MobileReconnectTarget {
+    pub canonical_server_origin: String,
+    pub expected_user_id: String,
+}
+
 #[derive(Clone, Eq, PartialEq)]
 struct MobileAuthenticatedEpoch {
     binding: MobileAuthenticatedBinding,
@@ -1282,6 +1291,46 @@ impl VeilMobileSession {
 
     pub fn authenticated_binding(&self) -> Result<MobileAuthenticatedBinding, VeilError> {
         Ok(self.authenticated_epoch()?.binding)
+    }
+
+    /// Load the exact mobile reconnect target selected by successful mobile
+    /// authentication. No Node Access Pass or bearer credential is
+    /// persisted or returned through this interface.
+    pub fn mobile_reconnect_target(&self) -> Result<Option<MobileReconnectTarget>, VeilError> {
+        let client = self.client.lock().map_err(|error| VeilError::Session {
+            msg: format!("lock mobile client: {error}"),
+        })?;
+        let identity_key = client
+            .identity_key()
+            .map_err(|msg| VeilError::Session { msg })?;
+        let signing_key = client
+            .signing_key()
+            .map_err(|msg| VeilError::Session { msg })?;
+        let target = client
+            .db()
+            .ok_or_else(|| VeilError::Session {
+                msg: "mobile SQLCipher database is unavailable".to_string(),
+            })?
+            .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+            .map_err(|msg| VeilError::Session { msg })?;
+        target
+            .map(|target| {
+                let invalid_target = || VeilError::Session {
+                    msg: "persisted mobile reconnect target is invalid".to_string(),
+                };
+                Ok(MobileReconnectTarget {
+                    canonical_server_origin: require_canonical_server_origin(
+                        &target.canonical_server_origin,
+                    )
+                    .map_err(|_| invalid_target())?,
+                    expected_user_id: require_canonical_user_id(
+                        "stored mobile reconnect target user ID",
+                        &target.expected_user_id,
+                    )
+                    .map_err(|_| invalid_target())?,
+                })
+            })
+            .transpose()
     }
 
     /// Start an object-bound Direct directory sync for the exact current
@@ -2967,20 +3016,18 @@ impl VeilMobileSession {
             "veil-android",
             mobile_node_access_pass_bytes(&node_access_pass),
         );
-        let user_id = match self
+        let connect_outcome = self
             .runtime
-            .block_on(await_mobile_connect(connection, cancellation))
-        {
-            MobileConnectOutcome::Completed(result) => {
-                if cancellation.is_some_and(MobileConnectCancellation::is_cancelled) {
-                    return Err(fail_closed_mobile_connect_cancellation(
-                        &mut client,
-                        &self.binding,
-                    ));
-                }
-                result.map_err(|error| safe_mobile_connect_error(error, has_node_access_pass))?
+            .block_on(await_mobile_connect(connection, cancellation));
+        let user_id = match classify_mobile_connect_outcome(
+            connect_outcome,
+            cancellation.is_some_and(MobileConnectCancellation::is_cancelled),
+        ) {
+            MobileConnectDecision::Authenticated(user_id) => user_id,
+            MobileConnectDecision::Failed(error) => {
+                return Err(safe_mobile_connect_error(error, has_node_access_pass));
             }
-            MobileConnectOutcome::Cancelled => {
+            MobileConnectDecision::Cancelled => {
                 return Err(fail_closed_mobile_connect_cancellation(
                     &mut client,
                     &self.binding,
@@ -3000,7 +3047,7 @@ impl VeilMobileSession {
                 .ok_or_else(|| VeilError::Session {
                     msg: "mobile SQLCipher database is unavailable".to_string(),
                 })?
-                .bind_authenticated_self(
+                .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
                     &canonical_server_origin,
                     &user_id,
                     &identity_key,
@@ -3023,9 +3070,10 @@ impl VeilMobileSession {
 
         match post_auth_result {
             Ok(binding) => {
-                // This load is the cancellation linearization point after all
-                // synchronous post-auth work. If connect wins this race, the
-                // Kotlin lifecycle epoch still guards publication to JS.
+                // An observed authenticated success has already been durably
+                // pinned because a one-use Access Pass may be consumed. This
+                // load is the linearization point only for live publication;
+                // Kotlin's lifecycle epoch remains the outer publication guard.
                 if cancellation.is_some_and(MobileConnectCancellation::is_cancelled) {
                     Err(fail_closed_mobile_connect_cancellation(
                         &mut client,
@@ -3580,6 +3628,32 @@ fn mobile_direct_directory_target(cursor: Option<&str>) -> Result<String, VeilEr
 enum MobileConnectOutcome<T> {
     Completed(T),
     Cancelled,
+}
+
+enum MobileConnectDecision {
+    Authenticated(String),
+    Failed(veil_client::api::MobileConnectErrorV1),
+    Cancelled,
+}
+
+fn classify_mobile_connect_outcome(
+    outcome: MobileConnectOutcome<Result<String, veil_client::api::MobileConnectErrorV1>>,
+    cancellation_observed: bool,
+) -> MobileConnectDecision {
+    match outcome {
+        // Once the authenticated success has been observed, post-auth must run
+        // even if lifecycle cancellation raced immediately afterwards. This
+        // durably selects the credential-free reconnect target before the final
+        // cancellation check clears the live binding and transport.
+        MobileConnectOutcome::Completed(Ok(user_id)) => {
+            MobileConnectDecision::Authenticated(user_id)
+        }
+        MobileConnectOutcome::Completed(Err(_)) if cancellation_observed => {
+            MobileConnectDecision::Cancelled
+        }
+        MobileConnectOutcome::Completed(Err(error)) => MobileConnectDecision::Failed(error),
+        MobileConnectOutcome::Cancelled => MobileConnectDecision::Cancelled,
+    }
 }
 
 async fn await_mobile_connect<F, T>(
@@ -4481,6 +4555,137 @@ mod tests {
     }
 
     #[test]
+    fn mobile_reconnect_target_loads_without_publishing_a_live_binding_across_restarts() {
+        let mnemonic = generate_mnemonic();
+        let path = std::env::temp_dir().join(format!(
+            "veil-ffi-mobile-reconnect-target-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let database_path = path.to_string_lossy().into_owned();
+        let session =
+            VeilMobileSession::from_mnemonic(mnemonic.clone(), database_path.clone()).unwrap();
+        assert!(session.mobile_reconnect_target().unwrap().is_none());
+        {
+            let client = session.client.lock().unwrap();
+            let identity_key = client.identity_key().unwrap();
+            let signing_key = client.signing_key().unwrap();
+            client
+                .db()
+                .unwrap()
+                .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                    "https://node.example.test:443",
+                    "550e8400-e29b-41d4-a716-446655440001",
+                    &identity_key,
+                    &signing_key,
+                )
+                .unwrap();
+        }
+        drop(session);
+
+        let reopened =
+            VeilMobileSession::from_mnemonic(mnemonic.clone(), database_path.clone()).unwrap();
+        assert!(reopened.authenticated_binding().is_err());
+        let target = reopened.mobile_reconnect_target().unwrap().unwrap();
+        assert_eq!(
+            target.canonical_server_origin,
+            "https://node.example.test:443"
+        );
+        assert_eq!(
+            target.expected_user_id,
+            "550e8400-e29b-41d4-a716-446655440001"
+        );
+        assert!(reopened.begin_direct_sync().is_err());
+        drop(reopened);
+
+        let reopened = VeilMobileSession::from_mnemonic(mnemonic, database_path).unwrap();
+        let target = reopened.mobile_reconnect_target().unwrap().unwrap();
+        assert_eq!(
+            target.canonical_server_origin,
+            "https://node.example.test:443"
+        );
+        assert_eq!(
+            target.expected_user_id,
+            "550e8400-e29b-41d4-a716-446655440001"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_reconnect_target_revalidates_mobile_origin_and_account_keys_fail_closed() {
+        let mnemonic = generate_mnemonic();
+        let insecure_path = std::env::temp_dir().join(format!(
+            "veil-ffi-mobile-reconnect-insecure-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let insecure = VeilMobileSession::from_mnemonic(
+            mnemonic.clone(),
+            insecure_path.to_string_lossy().into_owned(),
+        )
+        .unwrap();
+        {
+            let client = insecure.client.lock().unwrap();
+            let identity_key = client.identity_key().unwrap();
+            let signing_key = client.signing_key().unwrap();
+            client
+                .db()
+                .unwrap()
+                .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                    "http://remote.example.test:80",
+                    "550e8400-e29b-41d4-a716-446655440001",
+                    &identity_key,
+                    &signing_key,
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            insecure.mobile_reconnect_target(),
+            Err(VeilError::Session { .. })
+        ));
+        drop(insecure);
+        let _ = std::fs::remove_file(insecure_path);
+
+        let corrupt_path = std::env::temp_dir().join(format!(
+            "veil-ffi-mobile-reconnect-corrupt-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let corrupt =
+            VeilMobileSession::from_mnemonic(mnemonic, corrupt_path.to_string_lossy().into_owned())
+                .unwrap();
+        {
+            let client = corrupt.client.lock().unwrap();
+            let identity_key = client.identity_key().unwrap();
+            let signing_key = client.signing_key().unwrap();
+            let db = client.db().unwrap();
+            db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                "https://node.example.test:443",
+                "550e8400-e29b-41d4-a716-446655440001",
+                &identity_key,
+                &signing_key,
+            )
+            .unwrap();
+            let corrupt_identity_key = [0x7c_u8; 32];
+            db.conn()
+                .execute(
+                    "UPDATE authenticated_self_bindings_v1
+                     SET identity_key = ?1
+                     WHERE canonical_server_origin = ?2",
+                    (
+                        corrupt_identity_key.as_slice(),
+                        "https://node.example.test:443",
+                    ),
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            corrupt.mobile_reconnect_target(),
+            Err(VeilError::Session { .. })
+        ));
+        drop(corrupt);
+        let _ = std::fs::remove_file(corrupt_path);
+    }
+
+    #[test]
     fn test_aead_roundtrip() {
         let key = vec![42u8; 32];
         let plain = b"hello veil".to_vec();
@@ -4712,6 +4917,23 @@ mod tests {
     }
 
     #[test]
+    fn pre_observation_cancellation_precedes_an_immediately_ready_connect() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let cancellation = MobileConnectCancellation::new();
+        cancellation.cancel();
+
+        let outcome = runtime.block_on(await_mobile_connect(
+            async { "authenticated-user" },
+            Some(cancellation.as_ref()),
+        ));
+
+        assert!(matches!(outcome, MobileConnectOutcome::Cancelled));
+    }
+
+    #[test]
     fn mobile_connect_cancellation_wakes_a_pending_waiter() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -4749,6 +4971,61 @@ mod tests {
             MobileConnectOutcome::Completed(value) => assert_eq!(value, 42),
             MobileConnectOutcome::Cancelled => panic!("legacy mobile connect was cancelled"),
         }
+    }
+
+    #[test]
+    fn observed_mobile_authentication_success_precedes_racing_cancellation() {
+        let decision = classify_mobile_connect_outcome(
+            MobileConnectOutcome::Completed(Ok("authenticated-user".to_string())),
+            true,
+        );
+
+        assert!(matches!(
+            decision,
+            MobileConnectDecision::Authenticated(user_id) if user_id == "authenticated-user"
+        ));
+    }
+
+    #[test]
+    fn mobile_connect_failure_is_cancelled_only_when_late_cancellation_was_requested() {
+        let failed = classify_mobile_connect_outcome(
+            MobileConnectOutcome::Completed(Err(veil_client::api::MobileConnectErrorV1 {
+                stop: veil_client::api::MobileConnectStopV1::RetryableTransport,
+                detail: "transport".to_string(),
+            })),
+            false,
+        );
+        assert!(matches!(
+            failed,
+            MobileConnectDecision::Failed(error)
+                if error.stop == veil_client::api::MobileConnectStopV1::RetryableTransport
+        ));
+
+        let cancelled = classify_mobile_connect_outcome(
+            MobileConnectOutcome::Completed(Err(veil_client::api::MobileConnectErrorV1 {
+                stop: veil_client::api::MobileConnectStopV1::RetryableTransport,
+                detail: "transport".to_string(),
+            })),
+            true,
+        );
+        assert!(matches!(cancelled, MobileConnectDecision::Cancelled));
+    }
+
+    #[test]
+    fn pre_observation_mobile_connect_cancellation_remains_terminal() {
+        let without_late_cancellation =
+            classify_mobile_connect_outcome(MobileConnectOutcome::Cancelled, false);
+        let with_late_cancellation =
+            classify_mobile_connect_outcome(MobileConnectOutcome::Cancelled, true);
+
+        assert!(matches!(
+            without_late_cancellation,
+            MobileConnectDecision::Cancelled
+        ));
+        assert!(matches!(
+            with_late_cancellation,
+            MobileConnectDecision::Cancelled
+        ));
     }
 
     #[test]

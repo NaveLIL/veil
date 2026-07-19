@@ -379,6 +379,18 @@ pub struct VeilDb {
     conn: Connection,
 }
 
+/// Durable mobile reconnect selection resolved through the immutable
+/// authenticated-self binding for the selected canonical origin.
+///
+/// No credential, bearer token, WebSocket URL, or caller-controlled endpoint
+/// is persisted here. The expected user ID is returned from the pinned
+/// authenticated-self row after its account keys have been revalidated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileReconnectTargetV1 {
+    pub canonical_server_origin: String,
+    pub expected_user_id: String,
+}
+
 pub type PendingInitialHeaderRow = ([u8; 32], Vec<u8>);
 pub type MessageBinding = (String, Vec<u8>, bool, Option<i64>);
 pub type TrustedSigningKeyBinding = ([u8; 32], [u8; 32]);
@@ -887,6 +899,76 @@ fn validated_self_binding_for_origin(
         ensure_self_binding_directory_compatible(conn, canonical_server_origin, binding)?;
     }
     Ok(binding)
+}
+
+fn validate_authenticated_self_coordinates(
+    canonical_server_origin: &str,
+    user_id: &str,
+    identity_key: &[u8; 32],
+    signing_key: &[u8; 32],
+) -> Result<(), String> {
+    validate_canonical_server_origin(canonical_server_origin)?;
+    validate_canonical_uuid("authenticated self user id", user_id)?;
+    if identity_key == &[0u8; 32] || !veil_crypto::public_key::valid_ed25519_public_key(signing_key)
+    {
+        return Err("authenticated self keys are not valid account public keys".to_string());
+    }
+    if identity_key == signing_key {
+        return Err("authenticated self identity and signing keys must be distinct".to_string());
+    }
+    Ok(())
+}
+
+fn bind_authenticated_self_in_transaction(
+    tx: &Transaction<'_>,
+    canonical_server_origin: &str,
+    user_id: &str,
+    identity_key: &[u8; 32],
+    signing_key: &[u8; 32],
+) -> Result<(), String> {
+    let existing = load_authenticated_self_binding(tx, canonical_server_origin)?;
+
+    match existing {
+        Some(stored) => {
+            if stored.user_id != user_id
+                || stored.identity_key != *identity_key
+                || stored.signing_key != *signing_key
+            {
+                return Err(
+                    "authenticated server attempted to remap the durable self account".to_string(),
+                );
+            }
+            ensure_self_binding_directory_compatible(tx, canonical_server_origin, &stored)?;
+            tx.execute(
+                "UPDATE authenticated_self_bindings_v1
+                 SET last_authenticated_at = datetime('now')
+                 WHERE canonical_server_origin = ?1",
+                rusqlite::params![canonical_server_origin],
+            )
+            .map_err(|error| format!("refresh authenticated self binding: {error}"))?;
+        }
+        None => {
+            let pending = AuthenticatedSelfBinding {
+                user_id: user_id.to_string(),
+                identity_key: *identity_key,
+                signing_key: *signing_key,
+            };
+            ensure_self_binding_directory_compatible(tx, canonical_server_origin, &pending)?;
+            tx.execute(
+                "INSERT INTO authenticated_self_bindings_v1
+                    (canonical_server_origin, user_id, identity_key, signing_key)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    canonical_server_origin,
+                    user_id,
+                    identity_key.as_slice(),
+                    signing_key.as_slice(),
+                ],
+            )
+            .map_err(|error| format!("insert authenticated self binding: {error}"))?;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -2021,6 +2103,19 @@ impl VeilDb {
                 CHECK(identity_key <> signing_key)
             );
 
+            -- The one canonical origin selected by a successful mobile
+            -- authentication. Account coordinates remain owned by the
+            -- immutable authenticated-self binding above; this table stores
+            -- no Node Access Pass, token, WebSocket URL, or key material.
+            CREATE TABLE IF NOT EXISTS mobile_reconnect_target_v1 (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                canonical_server_origin TEXT NOT NULL UNIQUE
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512)
+                    REFERENCES authenticated_self_bindings_v1(canonical_server_origin)
+                    ON UPDATE RESTRICT ON DELETE RESTRICT,
+                selected_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             -- Immutable author attribution captured when plaintext is
             -- committed. It follows an outgoing local UUID when the server
             -- ACK replaces that UUID and is removed with the message.
@@ -2988,68 +3083,141 @@ impl VeilDb {
         identity_key: &[u8; 32],
         signing_key: &[u8; 32],
     ) -> Result<(), String> {
-        validate_canonical_server_origin(canonical_server_origin)?;
-        validate_canonical_uuid("authenticated self user id", user_id)?;
-        if identity_key == &[0u8; 32]
-            || !veil_crypto::public_key::valid_ed25519_public_key(signing_key)
-        {
-            return Err("authenticated self keys are not valid account public keys".to_string());
-        }
-        if identity_key == signing_key {
-            return Err(
-                "authenticated self identity and signing keys must be distinct".to_string(),
-            );
-        }
+        validate_authenticated_self_coordinates(
+            canonical_server_origin,
+            user_id,
+            identity_key,
+            signing_key,
+        )?;
 
         let tx = self
             .conn
             .unchecked_transaction()
             .map_err(|error| format!("begin authenticated self binding: {error}"))?;
-        let existing = load_authenticated_self_binding(&tx, canonical_server_origin)?;
-
-        match existing {
-            Some(stored) => {
-                if stored.user_id != user_id
-                    || stored.identity_key != *identity_key
-                    || stored.signing_key != *signing_key
-                {
-                    return Err(
-                        "authenticated server attempted to remap the durable self account"
-                            .to_string(),
-                    );
-                }
-                ensure_self_binding_directory_compatible(&tx, canonical_server_origin, &stored)?;
-                tx.execute(
-                    "UPDATE authenticated_self_bindings_v1
-                     SET last_authenticated_at = datetime('now')
-                     WHERE canonical_server_origin = ?1",
-                    rusqlite::params![canonical_server_origin],
-                )
-                .map_err(|error| format!("refresh authenticated self binding: {error}"))?;
-            }
-            None => {
-                let pending = AuthenticatedSelfBinding {
-                    user_id: user_id.to_string(),
-                    identity_key: *identity_key,
-                    signing_key: *signing_key,
-                };
-                ensure_self_binding_directory_compatible(&tx, canonical_server_origin, &pending)?;
-                tx.execute(
-                    "INSERT INTO authenticated_self_bindings_v1
-                        (canonical_server_origin, user_id, identity_key, signing_key)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![
-                        canonical_server_origin,
-                        user_id,
-                        identity_key.as_slice(),
-                        signing_key.as_slice(),
-                    ],
-                )
-                .map_err(|error| format!("insert authenticated self binding: {error}"))?;
-            }
-        }
+        bind_authenticated_self_in_transaction(
+            &tx,
+            canonical_server_origin,
+            user_id,
+            identity_key,
+            signing_key,
+        )?;
         tx.commit()
             .map_err(|error| format!("commit authenticated self binding: {error}"))
+    }
+
+    /// Atomically pin an authenticated mobile account and select its exact
+    /// canonical origin for credential-free process-death reconnect.
+    pub fn bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        identity_key: &[u8; 32],
+        signing_key: &[u8; 32],
+    ) -> Result<(), String> {
+        validate_authenticated_self_coordinates(
+            canonical_server_origin,
+            user_id,
+            identity_key,
+            signing_key,
+        )?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin mobile reconnect target selection: {error}"))?;
+        bind_authenticated_self_in_transaction(
+            &tx,
+            canonical_server_origin,
+            user_id,
+            identity_key,
+            signing_key,
+        )?;
+        tx.execute(
+            "INSERT INTO mobile_reconnect_target_v1
+                (singleton, canonical_server_origin, selected_at)
+             VALUES (1, ?1, datetime('now'))
+             ON CONFLICT(singleton) DO UPDATE SET
+                canonical_server_origin = excluded.canonical_server_origin,
+                selected_at = excluded.selected_at",
+            rusqlite::params![canonical_server_origin],
+        )
+        .map_err(|error| format!("select mobile reconnect target: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit mobile reconnect target selection: {error}"))
+    }
+
+    /// Resolve the selected mobile origin against the immutable self binding
+    /// and the account keys derived by the currently opened SQLCipher session.
+    pub fn load_mobile_reconnect_target_v1(
+        &self,
+        current_identity_key: &[u8; 32],
+        current_signing_key: &[u8; 32],
+    ) -> Result<Option<MobileReconnectTargetV1>, String> {
+        let canonical_server_origin = {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT singleton, canonical_server_origin
+                     FROM mobile_reconnect_target_v1
+                     ORDER BY singleton
+                     LIMIT 2",
+                )
+                .map_err(|error| format!("prepare mobile reconnect target load: {error}"))?;
+            let mut rows = statement
+                .query([])
+                .map_err(|error| format!("query mobile reconnect target: {error}"))?;
+            let Some(row) = rows
+                .next()
+                .map_err(|error| format!("read mobile reconnect target: {error}"))?
+            else {
+                return Ok(None);
+            };
+            let singleton = row
+                .get::<_, i64>(0)
+                .map_err(|error| format!("decode mobile reconnect target singleton: {error}"))?;
+            let canonical_server_origin = row
+                .get::<_, String>(1)
+                .map_err(|error| format!("decode mobile reconnect target origin: {error}"))?;
+            if singleton != 1 {
+                return Err(
+                    "persisted mobile reconnect target has an invalid singleton".to_string()
+                );
+            }
+            if rows
+                .next()
+                .map_err(|error| format!("read duplicate mobile reconnect target: {error}"))?
+                .is_some()
+            {
+                return Err("persisted mobile reconnect target is not unique".to_string());
+            }
+            Some(canonical_server_origin)
+        };
+        let Some(canonical_server_origin) = canonical_server_origin else {
+            return Ok(None);
+        };
+        validate_canonical_server_origin(&canonical_server_origin)
+            .map_err(|error| format!("persisted mobile reconnect target is invalid: {error}"))?;
+        let binding = validated_self_binding_for_origin(&self.conn, &canonical_server_origin)?
+            .ok_or_else(|| {
+                "persisted mobile reconnect target has no authenticated self binding".to_string()
+            })?;
+        validate_authenticated_self_coordinates(
+            &canonical_server_origin,
+            &binding.user_id,
+            current_identity_key,
+            current_signing_key,
+        )?;
+        if binding.identity_key != *current_identity_key
+            || binding.signing_key != *current_signing_key
+        {
+            return Err(
+                "persisted mobile reconnect target does not match the current account keys"
+                    .to_string(),
+            );
+        }
+        Ok(Some(MobileReconnectTargetV1 {
+            canonical_server_origin,
+            expected_user_id: binding.user_id,
+        }))
     }
 
     /// Merge a complete authenticated account-directory batch atomically.
@@ -10967,6 +11135,309 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn mobile_reconnect_target_requires_explicit_atomic_mobile_selection() {
+        let db = VeilDb::open_memory(&[0xA6; 32]).unwrap();
+        let identity_key = [0x23; 32];
+        let signing_key = test_signing_key(0x24);
+
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        assert_eq!(
+            db.load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            None
+        );
+
+        db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+            ORIGIN_A,
+            USER_A,
+            &identity_key,
+            &signing_key,
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            Some(MobileReconnectTargetV1 {
+                canonical_server_origin: ORIGIN_A.to_string(),
+                expected_user_id: USER_A.to_string(),
+            })
+        );
+        assert!(db
+            .load_mobile_reconnect_target_v1(&[0x25; 32], &signing_key)
+            .is_err());
+
+        db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+            ORIGIN_B,
+            USER_B,
+            &identity_key,
+            &signing_key,
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            Some(MobileReconnectTargetV1 {
+                canonical_server_origin: ORIGIN_B.to_string(),
+                expected_user_id: USER_B.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn mobile_reconnect_target_migration_never_guesses_from_legacy_self_bindings() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-mobile-reconnect-legacy-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xAC; 32];
+        let identity_key = [0x2E; 32];
+        let signing_key = test_signing_key(0x2F);
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+                .unwrap();
+            db.conn
+                .execute_batch("DROP TABLE mobile_reconnect_target_v1;")
+                .unwrap();
+        }
+        {
+            let migrated = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                migrated
+                    .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                    .unwrap(),
+                None
+            );
+            let retained_bindings: i64 = migrated
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM authenticated_self_bindings_v1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained_bindings, 1);
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn mobile_reconnect_target_selection_rolls_back_on_account_remap() {
+        let db = VeilDb::open_memory(&[0xA7; 32]).unwrap();
+        let identity_key = [0x26; 32];
+        let signing_key = test_signing_key(0x27);
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+            ORIGIN_B,
+            USER_B,
+            &identity_key,
+            &signing_key,
+        )
+        .unwrap();
+
+        assert!(db
+            .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_A,
+                USER_B,
+                &identity_key,
+                &signing_key,
+            )
+            .is_err());
+        assert_eq!(
+            db.load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            Some(MobileReconnectTargetV1 {
+                canonical_server_origin: ORIGIN_B.to_string(),
+                expected_user_id: USER_B.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn mobile_reconnect_target_write_failures_roll_back_self_binding_and_selection() {
+        let identity_key = [0x2C; 32];
+        let signing_key = test_signing_key(0x2D);
+        let insert_failure = VeilDb::open_memory(&[0xAA; 32]).unwrap();
+        insert_failure
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_mobile_target_insert
+                 BEFORE INSERT ON mobile_reconnect_target_v1
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected target insert failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(insert_failure
+            .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_A,
+                USER_A,
+                &identity_key,
+                &signing_key,
+            )
+            .is_err());
+        let inserted_bindings: i64 = insert_failure
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM authenticated_self_bindings_v1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inserted_bindings, 0);
+
+        let update_failure = VeilDb::open_memory(&[0xAB; 32]).unwrap();
+        update_failure
+            .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_A,
+                USER_A,
+                &identity_key,
+                &signing_key,
+            )
+            .unwrap();
+        update_failure
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_mobile_target_update
+                 BEFORE UPDATE ON mobile_reconnect_target_v1
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected target update failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(update_failure
+            .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_B,
+                USER_B,
+                &identity_key,
+                &signing_key,
+            )
+            .is_err());
+        assert!(
+            load_authenticated_self_binding(&update_failure.conn, ORIGIN_B)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            update_failure
+                .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            Some(MobileReconnectTargetV1 {
+                canonical_server_origin: ORIGIN_A.to_string(),
+                expected_user_id: USER_A.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn mobile_reconnect_target_survives_repeated_file_restarts() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-mobile-reconnect-target-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xA8; 32];
+        let identity_key = [0x28; 32];
+        let signing_key = test_signing_key(0x29);
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_A,
+                USER_A,
+                &identity_key,
+                &signing_key,
+            )
+            .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened
+                    .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                    .unwrap(),
+                Some(MobileReconnectTargetV1 {
+                    canonical_server_origin: ORIGIN_A.to_string(),
+                    expected_user_id: USER_A.to_string(),
+                })
+            );
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened
+                    .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                    .unwrap(),
+                Some(MobileReconnectTargetV1 {
+                    canonical_server_origin: ORIGIN_A.to_string(),
+                    expected_user_id: USER_A.to_string(),
+                })
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn mobile_reconnect_target_fails_closed_when_its_self_binding_is_missing() {
+        let db = VeilDb::open_memory(&[0xA9; 32]).unwrap();
+        let identity_key = [0x2A; 32];
+        let signing_key = test_signing_key(0x2B);
+        db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+            ORIGIN_A,
+            USER_A,
+            &identity_key,
+            &signing_key,
+        )
+        .unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM authenticated_self_bindings_v1
+                 WHERE canonical_server_origin = ?1",
+                rusqlite::params![ORIGIN_A],
+            )
+            .unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        assert!(db
+            .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+            .is_err());
+    }
+
+    #[test]
+    fn mobile_reconnect_target_fails_closed_on_an_invalid_singleton_row() {
+        let db = VeilDb::open_memory(&[0xAD; 32]).unwrap();
+        let identity_key = [0x30; 32];
+        let signing_key = test_signing_key(0x31);
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mobile_reconnect_target_v1
+                    (singleton, canonical_server_origin)
+                 VALUES (2, ?1)",
+                rusqlite::params![ORIGIN_A],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+
+        assert!(db
+            .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+            .is_err());
     }
 
     #[test]
