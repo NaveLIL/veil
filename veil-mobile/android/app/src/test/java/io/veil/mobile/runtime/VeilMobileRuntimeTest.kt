@@ -2,11 +2,15 @@ package io.veil.mobile.runtime
 
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import java.util.Base64
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -33,7 +37,9 @@ import uniffi.veil_ffi.MobileDirectPreKeyResult
 import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
+import uniffi.veil_ffi.MobileRetryableReason
 import uniffi.veil_ffi.RestSignatureData
+import uniffi.veil_ffi.VeilException
 
 class VeilMobileRuntimeTest {
   @Test
@@ -777,6 +783,45 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun contradictoryContinuousReadyReplayWithPendingOutboxRevokesTheGeneration() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("46", "Continuous", "47", "continuous", false)
+    try {
+      completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      fakeSession.liveReplayProgresses.add(
+        NativeDirectLiveReplayProgress(
+          consumed = 0,
+          projectionChanged = false,
+          needsImmediatePump = false,
+          outboxReplayRequired = true,
+          ready = true,
+        ),
+      )
+
+      executor.runCapturedDelayedTask()
+
+      val failed = runtime.snapshot()
+      assertEquals(2, fakeSession.liveReplayPumpCount)
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
+      assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
+      assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertNull(failed.directGeneration)
+      assertNull(failed.directContentRevision)
+      assertNull(failed.binding)
+      assertFalse(failed.directoryReady)
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertNull(runtime.reconnectPlanForTesting())
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun backgroundRevocationMakesAnAlreadyScheduledContinuousReplayANoOp() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession()
@@ -1015,6 +1060,49 @@ class VeilMobileRuntimeTest {
       val failed = runtime.snapshot()
       assertEquals(1, fakeSession.liveReplayPumpCount)
       assertEquals(1, fakeSession.outboxReplayPumpCount)
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
+      assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
+      assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertNull(failed.directGeneration)
+      assertNull(failed.directContentRevision)
+      assertNull(failed.binding)
+      assertFalse(failed.directoryReady)
+      assertEquals(1, fakeSession.directLeaseCancellations)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun contradictoryReadyLiveReplayWithPendingOutboxFailsClosed() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    fakeSession.liveReplayProgresses.add(
+      NativeDirectLiveReplayProgress(
+        consumed = 0,
+        projectionChanged = false,
+        needsImmediatePump = false,
+        outboxReplayRequired = true,
+        ready = true,
+      ),
+    )
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      completeOwnPreKeyBootstrap(runtime, transport)
+
+      transport.completeNext(
+        NativeDirectHttpResult.Success("directory-before-contradictory-ready".toByteArray()),
+      )
+      awaitRuntimeIdle(runtime)
+
+      val failed = runtime.snapshot()
+      assertEquals(1, fakeSession.liveReplayPumpCount)
+      assertEquals(0, fakeSession.outboxReplayPumpCount)
       assertEquals(NativeConnectionState.ERROR, failed.connectionState)
       assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
       assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
@@ -1831,7 +1919,7 @@ class VeilMobileRuntimeTest {
 
   @Test
   fun acceptedForReplayCompletesOnceButRevokesTheLostTransportGeneration() {
-    val executor = daemonExecutor()
+    val executor = CapturingScheduledExecutor()
     val fakeSession = FakeSession().apply {
       directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
     }
@@ -1842,6 +1930,7 @@ class VeilMobileRuntimeTest {
     try {
       val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
       val requestCount = transport.requests.size
+      val delayedSchedulesBeforeSend = executor.delayedScheduleCount()
       val result = DirectTextSendCapture()
       runtime.addListener(publishedAfterSend::add)
 
@@ -1856,18 +1945,28 @@ class VeilMobileRuntimeTest {
       assertEquals(1, result.completionCount.get())
       assertEquals(1, fakeSession.directTextSendCount)
       assertEquals(requestCount, transport.requests.size)
+      assertEquals(delayedSchedulesBeforeSend + 1, executor.delayedScheduleCount())
       assertTrue(fakeSession.directTextPlaintextReferences.single().all { it == 0.toByte() })
       val revoked = runtime.snapshot()
-      assertEquals(NativeConnectionState.ERROR, revoked.connectionState)
+      assertEquals(NativeConnectionState.CONNECTING, revoked.connectionState)
       assertNull(revoked.directGeneration)
       assertNull(revoked.directContentRevision)
       assertNull(revoked.binding)
       assertFalse(revoked.directoryReady)
       assertEquals(1, fakeSession.directLeaseCancellations)
+      assertEquals(
+        NativeReconnectPlanDebug(
+          reason = NativeMobileRetryableReason.TRANSPORT,
+          failureOrdinal = 0,
+          delayMillis = 1_000L,
+          stage = NativeReconnectStage.WAITING,
+        ),
+        runtime.reconnectPlanForTesting(),
+      )
       assertTrue(
         "React listeners must observe the native generation revoke",
         publishedAfterSend.any { published ->
-          published.connectionState == NativeConnectionState.ERROR &&
+          published.connectionState == NativeConnectionState.CONNECTING &&
             published.directGeneration == null &&
             published.directContentRevision == null &&
             published.binding == null &&
@@ -1915,6 +2014,7 @@ class VeilMobileRuntimeTest {
       assertNull(revoked.binding)
       assertFalse(revoked.directoryReady)
       assertEquals(1, fakeSession.directLeaseCancellations)
+      assertNull(runtime.reconnectPlanForTesting())
       assertTrue(
         "React listeners must observe the non-retryable session revoke",
         publishedAfterSend.any { published ->
@@ -1925,6 +2025,669 @@ class VeilMobileRuntimeTest {
             !published.directoryReady
         },
       )
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun mobileRetryableReasonMappingIsClosedOverTheExactNativeAllowlist() {
+    assertEquals(
+      NativeMobileRetryableReason.TRANSPORT,
+      MobileRetryableReason.TRANSPORT.toNativeMobileRetryableReason(),
+    )
+    assertEquals(
+      NativeMobileRetryableReason.ACK_DEADLINE,
+      MobileRetryableReason.ACK_DEADLINE.toNativeMobileRetryableReason(),
+    )
+    val translated = assertThrows(NativeMobileRetryableException::class.java) {
+      translateMobileRetryable<Unit> {
+        throw VeilException.MobileRetryable(MobileRetryableReason.ACK_DEADLINE)
+      }
+    }
+    assertEquals(NativeMobileRetryableReason.ACK_DEADLINE, translated.reason)
+
+    val terminal = VeilException.Session("transport ACK_DEADLINE retryable")
+    val preserved = assertThrows(VeilException.Session::class.java) {
+      translateMobileRetryable<Unit> { throw terminal }
+    }
+    assertTrue(preserved === terminal)
+  }
+
+  @Test
+  fun typedTransportAndAckDeadlineReplayFailuresRemainDistinctReconnectReasons() {
+    val cases = listOf(
+      NativeMobileRetryableReason.TRANSPORT,
+      NativeMobileRetryableReason.ACK_DEADLINE,
+    )
+    cases.forEachIndexed { index, reason ->
+      val executor = CapturingScheduledExecutor()
+      val fakeSession = FakeSession()
+      val transport = ControllableDirectTransport()
+      val runtime = runtime(executor, fakeSession, directTransport = transport)
+      val conversation = directConversation("2$index", "Typed $index", "3$index", "typed$index", false)
+      try {
+        completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+        fakeSession.nextLiveReplayFailure.set(NativeMobileRetryableException(reason))
+
+        executor.runCapturedDelayedTask()
+
+        assertEquals(
+          NativeReconnectPlanDebug(
+            reason = reason,
+            failureOrdinal = 0,
+            delayMillis = 1_000L,
+            stage = NativeReconnectStage.WAITING,
+          ),
+          runtime.reconnectPlanForTesting(),
+        )
+        val reconnecting = runtime.snapshot()
+        assertEquals(NativeConnectionState.CONNECTING, reconnecting.connectionState)
+        assertNull(reconnecting.binding)
+        assertNull(reconnecting.directGeneration)
+      } finally {
+        runtime.lockSession()
+        executor.shutdownNow()
+      }
+    }
+  }
+
+  @Test
+  fun sessionFailureWithRetryWordsRemainsTerminalAndNeverCreatesAPlan() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("24", "Terminal", "25", "terminal", false)
+    try {
+      completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      fakeSession.nextLiveReplayFailure.set(
+        VeilException.Session("transport retry ACK_DEADLINE mobile retryable"),
+      )
+
+      executor.runCapturedDelayedTask()
+
+      val failed = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertNull(failed.binding)
+      assertNull(failed.directGeneration)
+      assertNull(runtime.reconnectPlanForTesting())
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun reconnectConnectRetriesOnlyTheTypedAllowlistAndKeepsTheExactReason() {
+    data class ReconnectConnectCase(
+      val conversationSuffix: String,
+      val peerSuffix: String,
+      val failure: Throwable,
+      val expectedReason: NativeMobileRetryableReason?,
+    )
+
+    val cases = listOf(
+      ReconnectConnectCase(
+        conversationSuffix = "40",
+        peerSuffix = "41",
+        failure = NativeMobileRetryableException(NativeMobileRetryableReason.ACK_DEADLINE),
+        expectedReason = NativeMobileRetryableReason.ACK_DEADLINE,
+      ),
+      ReconnectConnectCase(
+        conversationSuffix = "42",
+        peerSuffix = "43",
+        failure = VeilException.Session("transport retry ACK_DEADLINE mobile retryable"),
+        expectedReason = null,
+      ),
+    )
+
+    cases.forEachIndexed { index, case ->
+      val executor = CapturingScheduledExecutor()
+      val fakeSession = FakeSession()
+      val transport = ControllableDirectTransport()
+      val runtime = runtime(executor, fakeSession, directTransport = transport)
+      val conversation = directConversation(
+        case.conversationSuffix,
+        "Reconnect connect $index",
+        case.peerSuffix,
+        "reconnect-connect-$index",
+        false,
+      )
+      try {
+        establishWaitingReconnect(runtime, fakeSession, transport, conversation)
+        val schedulesBeforeConnect = executor.delayedScheduleCount()
+        fakeSession.queuedConnectFailures.add(case.failure)
+
+        executor.runCapturedDelayedTask()
+
+        if (case.expectedReason != null) {
+          assertEquals(
+            NativeReconnectPlanDebug(
+              reason = case.expectedReason,
+              failureOrdinal = 1,
+              delayMillis = 2_000L,
+              stage = NativeReconnectStage.WAITING,
+            ),
+            runtime.reconnectPlanForTesting(),
+          )
+          assertEquals(schedulesBeforeConnect + 1, executor.delayedScheduleCount())
+          assertEquals(NativeConnectionState.CONNECTING, runtime.snapshot().connectionState)
+        } else {
+          assertNull(runtime.reconnectPlanForTesting())
+          assertEquals(schedulesBeforeConnect, executor.delayedScheduleCount())
+          assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+        }
+        assertEquals(2, fakeSession.plainConnectCount)
+        assertNull(runtime.snapshot().binding)
+        assertNull(runtime.snapshot().directGeneration)
+      } finally {
+        runtime.lockSession()
+        executor.shutdownNow()
+      }
+    }
+  }
+
+  @Test
+  fun reconnectTaskMayRunBeforeFutureAssignmentWithoutDuplicatingItsOwner() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("44", "Inline", "45", "inline", false)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val schedulesBeforeSend = executor.delayedScheduleCount()
+      executor.runNextDelayedTaskInline()
+      val result = DirectTextSendCapture()
+
+      runtime.sendDirectText(conversation.conversationId, generation, "inline-reconnect", result)
+
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+      assertEquals(schedulesBeforeSend + 1, executor.delayedScheduleCount())
+      assertEquals(2, fakeSession.plainConnectCount)
+      assertEquals(2, fakeSession.directSyncBeginCount)
+      assertEquals(NativeReconnectStage.BOOTSTRAPPING, runtime.reconnectPlanForTesting()?.stage)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+      assertEquals(1, transport.pendingCount())
+
+      val requestsAfterInlineRun = transport.requests.size
+      executor.runCapturedDelayedTask()
+      assertEquals(2, fakeSession.plainConnectCount)
+      assertEquals(2, fakeSession.directSyncBeginCount)
+      assertEquals(requestsAfterInlineRun, transport.requests.size)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun reconnectAfterAccessPassAuthenticationUsesOnlyThePlainBoundAccountPath() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, deterministicPassStore(), directTransport = transport)
+    val conversation = directConversation("26", "Pass", "27", "pass", false)
+    val tokenBytes = ByteArray(32) { 0x5c.toByte() }
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+    try {
+      fakeSession.directoryInstalls.clear()
+      fakeSession.directoryInstalls.add(
+        NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+      )
+      runtime.openSession()
+      assertTrue(runtime.consumeEnrollmentUri("https://access.example/enroll#invite=$token"))
+      val pending = checkNotNull(runtime.snapshot().pendingAccessPass)
+      runtime.connectPendingAccessPass(pending.flowId)
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success("access-pass-directory".toByteArray()))
+      awaitRuntimeIdle(runtime)
+      val generation = checkNotNull(runtime.snapshot().directGeneration)
+      assertEquals(1, fakeSession.accessPassConnectCount)
+      assertEquals(0, fakeSession.plainConnectCount)
+      assertNull(runtime.snapshot().pendingAccessPass)
+
+      val result = DirectTextSendCapture()
+      runtime.sendDirectText(conversation.conversationId, generation, "durable-pass-send", result)
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+      executor.runCapturedDelayedTask()
+
+      assertEquals(1, fakeSession.accessPassConnectCount)
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertArrayEquals(tokenBytes, fakeSession.lastAccessPass)
+      assertEquals(NativeReconnectStage.BOOTSTRAPPING, runtime.reconnectPlanForTesting()?.stage)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+    } finally {
+      tokenBytes.fill(0)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun reconnectRejectsAValidButDifferentAuthenticatedAccount() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("28", "Scope", "29", "scope", false)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      fakeSession.authenticatedUserId = "550e8400-e29b-41d4-a716-446655440099"
+
+      val result = DirectTextSendCapture()
+      runtime.sendDirectText(conversation.conversationId, generation, "wrong-account", result)
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+      executor.runCapturedDelayedTask()
+
+      val failed = runtime.snapshot()
+      assertEquals(2, fakeSession.plainConnectCount)
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertNull(failed.binding)
+      assertNull(failed.directGeneration)
+      assertNull(runtime.reconnectPlanForTesting())
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun reconnectBackoffSurvivesAuthenticationAndResetsOnlyAtTheReadyOutboxBarrier() {
+    val executor = CapturingScheduledExecutor()
+    val sampledCaps = CopyOnWriteArrayList<Long>()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(
+      executor,
+      fakeSession,
+      directTransport = transport,
+      reconnectJitterMillis = { capMillis ->
+        sampledCaps.add(capMillis)
+        capMillis
+      },
+    )
+    val conversation = directConversation("2a", "Backoff", "2b", "backoff", false)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val first = DirectTextSendCapture()
+      runtime.sendDirectText(conversation.conversationId, generation, "first-retry", first)
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, first.await())
+      assertEquals(listOf(1_000L), sampledCaps.toList())
+
+      fakeSession.directoryInstalls.add(
+        NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+      )
+      fakeSession.nextOutboxReplayFailure.set(
+        NativeMobileRetryableException(NativeMobileRetryableReason.ACK_DEADLINE),
+      )
+      executor.runCapturedDelayedTask()
+      assertEquals(NativeReconnectStage.BOOTSTRAPPING, runtime.reconnectPlanForTesting()?.stage)
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success("first-reconnect-directory".toByteArray()))
+      awaitRuntimeIdle(runtime)
+
+      assertEquals(listOf(1_000L, 2_000L), sampledCaps.toList())
+      assertEquals(
+        NativeReconnectPlanDebug(
+          reason = NativeMobileRetryableReason.ACK_DEADLINE,
+          failureOrdinal = 1,
+          delayMillis = 2_000L,
+          stage = NativeReconnectStage.WAITING,
+        ),
+        runtime.reconnectPlanForTesting(),
+      )
+
+      fakeSession.directoryInstalls.add(
+        NativeDirectDirectoryInstall(listOf(conversation), directoryComplete = true),
+      )
+      executor.runCapturedDelayedTask()
+      completeOwnPreKeyBootstrap(runtime, transport)
+      transport.completeNext(NativeDirectHttpResult.Success("second-reconnect-directory".toByteArray()))
+      awaitRuntimeIdle(runtime)
+
+      val ready = runtime.snapshot()
+      assertTrue(ready.directoryReady)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(3, fakeSession.plainConnectCount)
+
+      fakeSession.directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+      val afterReady = DirectTextSendCapture()
+      runtime.sendDirectText(
+        conversation.conversationId,
+        checkNotNull(ready.directGeneration),
+        "retry-after-ready",
+        afterReady,
+      )
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, afterReady.await())
+      assertEquals(listOf(1_000L, 2_000L, 1_000L), sampledCaps.toList())
+      assertEquals(0, runtime.reconnectPlanForTesting()?.failureOrdinal)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun reconnectFullJitterCapsExponentiallyAndSaturatesAtSixtySeconds() {
+    val executor = CapturingScheduledExecutor()
+    val sampledCaps = CopyOnWriteArrayList<Long>()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(
+      executor,
+      fakeSession,
+      directTransport = transport,
+      reconnectJitterMillis = { capMillis ->
+        sampledCaps.add(capMillis)
+        capMillis
+      },
+    )
+    val conversation = directConversation("2c", "Jitter", "2d", "jitter", false)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      repeat(7) {
+        fakeSession.queuedConnectFailures.add(
+          NativeMobileRetryableException(NativeMobileRetryableReason.TRANSPORT),
+        )
+      }
+      val result = DirectTextSendCapture()
+      runtime.sendDirectText(conversation.conversationId, generation, "bounded-jitter", result)
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+
+      repeat(7) { executor.runCapturedDelayedTask() }
+
+      assertEquals(
+        listOf(1_000L, 2_000L, 4_000L, 8_000L, 16_000L, 32_000L, 60_000L, 60_000L),
+        sampledCaps.toList(),
+      )
+      assertEquals(7, runtime.reconnectPlanForTesting()?.failureOrdinal)
+      assertEquals(NativeReconnectStage.WAITING, runtime.reconnectPlanForTesting()?.stage)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundCancelsWaitingReconnectAndItsCapturedLateTaskCannotConnect() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("2e", "Background", "2f", "background", false)
+    try {
+      establishWaitingReconnect(runtime, fakeSession, transport, conversation)
+      val connectCount = fakeSession.plainConnectCount
+
+      runtime.lockForBackground()
+      executor.runCapturedDelayedTask()
+      awaitRuntimeIdle(runtime)
+
+      assertEquals(connectCount, fakeSession.plainConnectCount)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundCancelsConnectingReconnectEvenWhenNativeReturnsSuccessAfterCancellation() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("3a", "Connecting", "3b", "connecting", false)
+    var reconnectTask: Thread? = null
+    try {
+      establishWaitingReconnect(runtime, fakeSession, transport, conversation)
+      fakeSession.blockPlainConnectOnCount = 2
+      fakeSession.succeedBlockedPlainConnectAfterCancellation = true
+      reconnectTask = thread(start = true, name = "cancelled-connecting-reconnect") {
+        executor.runCapturedDelayedTask()
+      }
+      assertTrue(
+        "reconnect did not enter its native connect call",
+        fakeSession.blockedPlainConnectEntered.await(5, TimeUnit.SECONDS),
+      )
+
+      runtime.lockForBackground()
+      reconnectTask.join(5_000L)
+      assertFalse("cancelled reconnect task did not finish", reconnectTask.isAlive)
+      awaitRuntimeIdle(runtime)
+
+      val locked = runtime.snapshot()
+      assertEquals(2, fakeSession.plainConnectCount)
+      assertFalse(fakeSession.closedDuringConnect.get())
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(NativeSessionState.LOCKED, locked.sessionState)
+      assertEquals(NativeConnectionState.DISCONNECTED, locked.connectionState)
+      assertNull(locked.binding)
+    } finally {
+      reconnectTask?.join(5_000L)
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun explicitLockCancelsWaitingReconnectAndItsCapturedLateTaskCannotConnect() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("30", "Lock", "31", "lock", false)
+    try {
+      establishWaitingReconnect(runtime, fakeSession, transport, conversation)
+      val connectCount = fakeSession.plainConnectCount
+
+      val locked = runtime.lockSession()
+      executor.runCapturedDelayedTask()
+
+      assertEquals(connectCount, fakeSession.plainConnectCount)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(NativeSessionState.LOCKED, locked.sessionState)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun manualDisconnectCancelsWaitingReconnectAndItsCapturedLateTaskCannotConnect() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("32", "Disconnect", "33", "disconnect", false)
+    try {
+      establishWaitingReconnect(runtime, fakeSession, transport, conversation)
+      val connectCount = fakeSession.plainConnectCount
+
+      val disconnected = runtime.disconnect()
+      executor.runCapturedDelayedTask()
+
+      assertEquals(connectCount, fakeSession.plainConnectCount)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(NativeConnectionState.DISCONNECTED, disconnected.connectionState)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun manualConnectSupersedesOneWaitingReconnectAndTheOldLateTaskCannotDisconnectIt() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("34", "Manual", "35", "manual", false)
+    try {
+      establishWaitingReconnect(runtime, fakeSession, transport, conversation)
+
+      val authenticated = runtime.connect("https://access.example")
+      assertEquals(USER_ID, authenticated.userId)
+      assertEquals(2, fakeSession.plainConnectCount)
+      assertNull(runtime.reconnectPlanForTesting())
+      executor.runCapturedDelayedTask()
+
+      assertEquals(2, fakeSession.plainConnectCount)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+      assertEquals(USER_ID, runtime.snapshot().binding?.userId)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun sameAccountManualConnectSupersedesAnAuthenticatedReconnectBeforeLeaseBegin() {
+    val executor = CapturingScheduledExecutor()
+    val bootstrapTurn = AtomicInteger(0)
+    val staleReconnectAccepted = CountDownLatch(1)
+    val releaseStaleReconnect = CountDownLatch(1)
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(
+      executor,
+      fakeSession,
+      directTransport = transport,
+      directBootstrapOwnerBoundary = {
+        if (bootstrapTurn.incrementAndGet() == 2) {
+          staleReconnectAccepted.countDown()
+          check(releaseStaleReconnect.await(5, TimeUnit.SECONDS)) {
+            "stale authenticated reconnect was not released"
+          }
+        }
+      },
+    )
+    val conversation = directConversation("38", "Owner", "39", "owner", false)
+    var staleTask: Thread? = null
+    try {
+      establishWaitingReconnect(runtime, fakeSession, transport, conversation)
+      staleTask = thread(start = true, name = "stale-authenticated-reconnect") {
+        executor.runCapturedDelayedTask()
+      }
+      assertTrue(
+        "reconnect did not reach its authenticated bootstrap boundary",
+        staleReconnectAccepted.await(5, TimeUnit.SECONDS),
+      )
+
+      val replacement = runtime.connect("https://access.example")
+      assertEquals(USER_ID, replacement.userId)
+      assertEquals(2, fakeSession.directSyncBeginCount)
+      assertEquals(3, fakeSession.plainConnectCount)
+      assertNull(runtime.reconnectPlanForTesting())
+
+      releaseStaleReconnect.countDown()
+      staleTask.join(5_000L)
+      assertFalse("stale reconnect task did not finish", staleTask.isAlive)
+      assertEquals(2, fakeSession.directSyncBeginCount)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+      assertEquals(USER_ID, runtime.snapshot().binding?.userId)
+      assertTrue(runtime.snapshot().directGeneration != null)
+    } finally {
+      releaseStaleReconnect.countDown()
+      staleTask?.join(5_000L)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun typedFailureInTheFirstBootstrapReturnsAuthenticatedWhileReconnectOwnsRecovery() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession().apply {
+      nextLiveBufferFailure.set(
+        NativeMobileRetryableException(NativeMobileRetryableReason.ACK_DEADLINE),
+      )
+    }
+    val runtime = runtime(executor, fakeSession)
+    try {
+      runtime.openSession()
+
+      val authenticated = runtime.connect("https://access.example")
+
+      assertEquals(USER_ID, authenticated.userId)
+      assertEquals(NativeConnectionState.CONNECTING, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertEquals(
+        NativeReconnectPlanDebug(
+          reason = NativeMobileRetryableReason.ACK_DEADLINE,
+          failureOrdinal = 0,
+          delayMillis = 1_000L,
+          stage = NativeReconnectStage.WAITING,
+        ),
+        runtime.reconnectPlanForTesting(),
+      )
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun firstBootstrapRetryFailureDoesNotReturnSuccessAfterSchedulerRejection() {
+    val executor = CapturingScheduledExecutor().apply { rejectDelayedTasks = true }
+    val fakeSession = FakeSession().apply {
+      nextLiveBufferFailure.set(
+        NativeMobileRetryableException(NativeMobileRetryableReason.TRANSPORT),
+      )
+    }
+    val runtime = runtime(executor, fakeSession)
+    try {
+      runtime.openSession()
+
+      val error = assertThrows(VeilMobileRuntimeException::class.java) {
+        runtime.connect("https://access.example")
+      }
+
+      assertEquals("E_VEIL_SYNC", error.code)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertNull(runtime.reconnectPlanForTesting())
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun reconnectSchedulerRejectionIsTerminalAndCannotLeaveAConnectingOwner() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("36", "Rejected", "37", "rejected", false)
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      executor.rejectDelayedTasks = true
+      val result = DirectTextSendCapture()
+
+      runtime.sendDirectText(conversation.conversationId, generation, "scheduler-rejected", result)
+
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+      val failed = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertNull(failed.binding)
+      assertNull(failed.directGeneration)
+      assertNull(runtime.reconnectPlanForTesting())
+      executor.runCapturedDelayedTask()
+      assertEquals(1, fakeSession.plainConnectCount)
     } finally {
       runtime.lockSession()
       executor.shutdownNow()
@@ -2936,6 +3699,8 @@ class VeilMobileRuntimeTest {
       NativeConnectCancellationFactory { FakeCancellation() },
     directTransport: NativeDirectHttpExecutor = PassiveDirectTransport(),
     directLivePollIntervalMillis: Long = 60_000L,
+    reconnectJitterMillis: (Long) -> Long = { capMillis -> capMillis },
+    directBootstrapOwnerBoundary: () -> Unit = {},
     peerPreKeyInstallBoundary: () -> Unit = {},
   ): VeilMobileRuntime = VeilMobileRuntime(
       vault = vault,
@@ -2950,6 +3715,8 @@ class VeilMobileRuntimeTest {
       executor = executor,
       databasePathProvider = { "/private/veil/account-v1.db" },
       directLivePollIntervalMillis = directLivePollIntervalMillis,
+      reconnectJitterMillis = reconnectJitterMillis,
+      directBootstrapOwnerBoundary = directBootstrapOwnerBoundary,
       peerPreKeyInstallBoundary = peerPreKeyInstallBoundary,
     ).also { runtime ->
       if (markForeground) runtime.markForeground()
@@ -2963,6 +3730,35 @@ class VeilMobileRuntimeTest {
   private fun daemonExecutor(): ScheduledExecutorService =
     Executors.newSingleThreadScheduledExecutor { operation ->
     Thread(operation, "veil-runtime-test").apply { isDaemon = true }
+  }
+
+  private class CapturingScheduledExecutor : ScheduledThreadPoolExecutor(
+    1,
+    { operation -> Thread(operation, "veil-runtime-capturing-test").apply { isDaemon = true } },
+  ) {
+    private val delayedTask = AtomicReference<Runnable?>()
+    private val delayedSchedules = AtomicInteger(0)
+    private val executeNextDelayedTaskInline = AtomicBoolean(false)
+    @Volatile var rejectDelayedTasks = false
+
+    override fun schedule(command: Runnable, delay: Long, unit: TimeUnit): ScheduledFuture<*> {
+      if (delay <= 0L) return super.schedule(command, delay, unit)
+      if (rejectDelayedTasks) throw RejectedExecutionException("synthetic delayed scheduler rejection")
+      delayedSchedules.incrementAndGet()
+      delayedTask.set(command)
+      if (executeNextDelayedTaskInline.getAndSet(false)) command.run()
+      return super.schedule({}, 1L, TimeUnit.DAYS)
+    }
+
+    fun runCapturedDelayedTask() {
+      checkNotNull(delayedTask.get()).run()
+    }
+
+    fun runNextDelayedTaskInline() {
+      check(executeNextDelayedTaskInline.compareAndSet(false, true))
+    }
+
+    fun delayedScheduleCount(): Int = delayedSchedules.get()
   }
 
   private fun awaitRuntimeIdle(runtime: VeilMobileRuntime) {
@@ -3038,6 +3834,20 @@ class VeilMobileRuntimeTest {
     assertTrue(ready.directoryReady)
     assertEquals(NativeDirectHistoryState.SYNCHRONIZED, ready.directHistoryState)
     return checkNotNull(ready.directGeneration)
+  }
+
+  private fun establishWaitingReconnect(
+    runtime: VeilMobileRuntime,
+    session: FakeSession,
+    transport: ControllableDirectTransport,
+    conversation: NativeDirectConversationInstall,
+  ) {
+    val generation = completeDirectReadyBootstrap(runtime, session, transport, conversation)
+    session.directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY)
+    val result = DirectTextSendCapture()
+    runtime.sendDirectText(conversation.conversationId, generation, "durable-before-cancel", result)
+    assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+    assertEquals(NativeReconnectStage.WAITING, runtime.reconnectPlanForTesting()?.stage)
   }
 
   private class DirectSessionActionCapture : NativeDirectSessionActionCallback {
@@ -3145,8 +3955,16 @@ class VeilMobileRuntimeTest {
     var websocketUrl: String? = null
     var canonicalOrigin: String? = null
     var lastAccessPass: ByteArray? = null
+    @Volatile var authenticatedUserId = USER_ID
+    @Volatile var plainConnectCount = 0
+    @Volatile var accessPassConnectCount = 0
+    val queuedConnectFailures = ConcurrentLinkedQueue<Throwable>()
+    @Volatile var blockPlainConnectOnCount: Int? = null
+    @Volatile var succeedBlockedPlainConnectAfterCancellation = false
+    val blockedPlainConnectEntered = CountDownLatch(1)
     var closed = false
     var directLeaseCancellations = 0
+    @Volatile var directSyncBeginCount = 0
     var directLeaseUserOverride: String? = null
     var directoryRequestCount = 0
     var historyRequestCount = 0
@@ -3154,8 +3972,11 @@ class VeilMobileRuntimeTest {
     @Volatile var liveReplayPumpCount = 0
     @Volatile var projectionChangeOnOrAfterReplayPump: Int? = null
     @Volatile var failLiveReplayOnOrAfterPump: Int? = null
+    val nextLiveBufferFailure = AtomicReference<Throwable?>()
+    val nextLiveReplayFailure = AtomicReference<Throwable?>()
     @Volatile var outboxReplayPumpCount = 0
     @Volatile var failOutboxReplayPump = false
+    val nextOutboxReplayFailure = AtomicReference<Throwable?>()
     @Volatile var outboxReplayComplete = false
     @Volatile var blockOutboxReplayOnPump: Int? = null
     @Volatile var outboxReplayEntered: CountDownLatch? = null
@@ -3214,11 +4035,14 @@ class VeilMobileRuntimeTest {
       canonicalOrigin: String,
       cancellation: NativeConnectCancellation,
     ): PublicAuthenticatedBinding {
+      plainConnectCount += 1
+      awaitDynamicPlainConnectCancellation(cancellation)
       awaitCancellationIfRequested(cancellation)
+      queuedConnectFailures.poll()?.let { throw it }
       connectFailure?.let { throw it }
       this.websocketUrl = websocketUrl
       this.canonicalOrigin = canonicalOrigin
-      return PublicAuthenticatedBinding(canonicalOrigin, USER_ID)
+      return PublicAuthenticatedBinding(canonicalOrigin, authenticatedUserId)
     }
 
     override fun connectWithNodeAccessPass(
@@ -3227,15 +4051,18 @@ class VeilMobileRuntimeTest {
       nodeAccessPass: ByteArray,
       cancellation: NativeConnectCancellation,
     ): PublicAuthenticatedBinding {
+      accessPassConnectCount += 1
       awaitCancellationIfRequested(cancellation)
+      queuedConnectFailures.poll()?.let { throw it }
       connectFailure?.let { throw it }
       this.websocketUrl = websocketUrl
       this.canonicalOrigin = canonicalOrigin
       lastAccessPass = nodeAccessPass.copyOf()
-      return PublicAuthenticatedBinding(canonicalOrigin, USER_ID)
+      return PublicAuthenticatedBinding(canonicalOrigin, authenticatedUserId)
     }
 
     override fun beginDirectSync(): NativeDirectSyncLease {
+      directSyncBeginCount += 1
       historySynchronized = false
       outboxReplayComplete = false
       return NativeDirectSyncLease(
@@ -3344,6 +4171,7 @@ class VeilMobileRuntimeTest {
 
     override fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress {
       liveBufferPumpCount += 1
+      nextLiveBufferFailure.getAndSet(null)?.let { throw it }
       if (failLiveBufferPump) throw IllegalStateException("synthetic terminal live buffer")
       return NativeDirectLiveBufferProgress(
         bufferedEvents = 0,
@@ -3357,6 +4185,7 @@ class VeilMobileRuntimeTest {
       directReplayRelease?.let { release ->
         check(release.await(5, TimeUnit.SECONDS)) { "synthetic Direct live replay timed out" }
       }
+      nextLiveReplayFailure.getAndSet(null)?.let { throw it }
       if (
         failLiveReplayPump ||
         failLiveReplayOnOrAfterPump?.let { liveReplayPumpCount >= it } == true
@@ -3396,6 +4225,7 @@ class VeilMobileRuntimeTest {
           check(release.await(5, TimeUnit.SECONDS)) { "synthetic outbox replay timed out" }
         }
       }
+      nextOutboxReplayFailure.getAndSet(null)?.let { throw it }
       if (failOutboxReplayPump) throw IllegalStateException("synthetic terminal outbox replay")
       val progress = if (outboxReplayProgresses.isEmpty()) {
         NativeDirectOutboxReplayProgress(
@@ -3539,6 +4369,28 @@ class VeilMobileRuntimeTest {
       inConnect.set(false)
       if (!succeedAfterCancellation) {
         throw IllegalStateException("mobile connection attempt cancelled")
+      }
+    }
+
+    private fun awaitDynamicPlainConnectCancellation(cancellation: NativeConnectCancellation) {
+      val shouldBlock = synchronized(this) {
+        if (blockPlainConnectOnCount == plainConnectCount) {
+          blockPlainConnectOnCount = null
+          true
+        } else {
+          false
+        }
+      }
+      if (!shouldBlock) return
+      val fake = cancellation as FakeCancellation
+      inConnect.set(true)
+      blockedPlainConnectEntered.countDown()
+      check(fake.cancelled.await(5, TimeUnit.SECONDS)) {
+        "dynamic reconnect cancellation timed out"
+      }
+      inConnect.set(false)
+      if (!succeedBlockedPlainConnectAfterCancellation) {
+        throw NativeMobileRetryableException(NativeMobileRetryableReason.TRANSPORT)
       }
     }
 

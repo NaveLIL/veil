@@ -14,6 +14,8 @@ import java.util.UUID
 import java.util.concurrent.CopyOnWriteArraySet
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
+import java.util.concurrent.ScheduledFuture
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 import uniffi.veil_ffi.MobileAuthenticatedBinding
 import uniffi.veil_ffi.MobileConnectCancellation
@@ -36,7 +38,9 @@ import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
 import uniffi.veil_ffi.MobileDirectTextSendOutcome
+import uniffi.veil_ffi.MobileRetryableReason
 import uniffi.veil_ffi.RestSignatureData
+import uniffi.veil_ffi.VeilException
 import uniffi.veil_ffi.VeilMobileSession
 
 internal enum class NativeSessionState {
@@ -53,6 +57,45 @@ internal enum class NativeConnectionState {
   CONNECTED,
   ERROR,
 }
+
+/** Exact positive allow-list copied from the UniFFI boundary without text parsing. */
+internal enum class NativeMobileRetryableReason {
+  TRANSPORT,
+  ACK_DEADLINE,
+}
+
+internal class NativeMobileRetryableException(
+  val reason: NativeMobileRetryableReason,
+) : RuntimeException("typed mobile transport retry permitted")
+
+internal fun MobileRetryableReason.toNativeMobileRetryableReason(): NativeMobileRetryableReason =
+  when (this) {
+    MobileRetryableReason.TRANSPORT -> NativeMobileRetryableReason.TRANSPORT
+    MobileRetryableReason.ACK_DEADLINE -> NativeMobileRetryableReason.ACK_DEADLINE
+  }
+
+@VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+internal inline fun <T> translateMobileRetryable(operation: () -> T): T =
+  try {
+    operation()
+  } catch (error: VeilException.MobileRetryable) {
+    throw NativeMobileRetryableException(error.reason.toNativeMobileRetryableReason())
+  }
+
+internal enum class NativeReconnectStage {
+  WAITING,
+  CONNECTING,
+  BOOTSTRAPPING,
+  TERMINATING,
+}
+
+@VisibleForTesting
+internal data class NativeReconnectPlanDebug(
+  val reason: NativeMobileRetryableReason,
+  val failureOrdinal: Int,
+  val delayMillis: Long,
+  val stage: NativeReconnectStage,
+)
 
 internal enum class NativeDirectDirectoryState {
   IDLE,
@@ -551,6 +594,11 @@ internal class VeilMobileRuntime internal constructor(
   private val executor: ScheduledExecutorService,
   private val databasePathProvider: () -> String,
   private val directLivePollIntervalMillis: Long = DIRECT_LIVE_IDLE_POLL_MILLIS,
+  private val reconnectJitterMillis: (Long) -> Long = { capMillis ->
+    ThreadLocalRandom.current().nextLong(capMillis + 1L)
+  },
+  @get:VisibleForTesting
+  private val directBootstrapOwnerBoundary: () -> Unit = {},
   @get:VisibleForTesting
   private val peerPreKeyInstallBoundary: () -> Unit = {},
 ) {
@@ -572,6 +620,7 @@ internal class VeilMobileRuntime internal constructor(
 
   private val listeners = CopyOnWriteArraySet<(VeilMobileRuntimeSnapshot) -> Unit>()
   private val stateLock = Any()
+  private val transportOperationLock = Any()
   private val publicationLock = Any()
   private var publicationInProgress = false
   private var publicationPending = false
@@ -594,6 +643,9 @@ internal class VeilMobileRuntime internal constructor(
   private var publicSnapshotRevision = 0L
   private var directGenerationCounter = 0L
   private var activeConnect: ActiveConnect? = null
+  private var activeReconnect: ActiveReconnect? = null
+  private var reconnectBackoffScope: ReconnectBackoffScope? = null
+  private var activeDirectBootstrap: ActiveDirectBootstrap? = null
   private var activeDirectSync: ActiveDirectSync? = null
 
   private data class ActiveConnect(
@@ -606,6 +658,54 @@ internal class VeilMobileRuntime internal constructor(
     val attempt: ActiveConnect,
     val detachedDirectSync: DetachedDirectSync?,
   )
+
+  /** Exact identity owner between authenticated socket acceptance and lease install. */
+  private class ActiveDirectBootstrap(
+    val session: NativeMobileSession,
+    val epoch: Long,
+    val origin: CanonicalServerOrigin,
+    val authenticated: PublicAuthenticatedBinding,
+    val connectAttempt: ActiveConnect? = null,
+    val reconnectPlan: ActiveReconnect? = null,
+  ) {
+    init {
+      check((connectAttempt == null) != (reconnectPlan == null)) {
+        "Direct bootstrap must have exactly one connection owner"
+      }
+    }
+
+    override fun toString(): String =
+      "ActiveDirectBootstrap(epoch=$epoch, origin=${origin.value}, userId=[REDACTED], " +
+        "reconnect=${reconnectPlan != null})"
+  }
+
+  private class ReconnectBackoffScope(
+    val session: NativeMobileSession,
+    val epoch: Long,
+    val origin: CanonicalServerOrigin,
+    val expectedUserId: String,
+  ) {
+    var failureCount = 0
+  }
+
+  private class ActiveReconnect(
+    val backoffScope: ReconnectBackoffScope,
+    val session: NativeMobileSession,
+    val epoch: Long,
+    val origin: CanonicalServerOrigin,
+    val expectedUserId: String,
+    val reason: NativeMobileRetryableReason,
+    val failureOrdinal: Int,
+    val delayMillis: Long,
+  ) {
+    var stage = NativeReconnectStage.WAITING
+    var scheduledFuture: ScheduledFuture<*>? = null
+    var cancellation: NativeConnectCancellation? = null
+
+    override fun toString(): String =
+      "ActiveReconnect(epoch=$epoch, origin=${origin.value}, expectedUserId=[REDACTED], " +
+        "reason=$reason, failureOrdinal=$failureOrdinal, delayMillis=$delayMillis, stage=$stage)"
+  }
 
   private class DirectProjectionTarget(
     val session: NativeMobileSession,
@@ -624,9 +724,10 @@ internal class VeilMobileRuntime internal constructor(
     val epoch: Long,
     val generation: Long,
     val leaseToken: String,
-    val canonicalServerOrigin: String,
+    val origin: CanonicalServerOrigin,
     val userId: String,
   ) {
+    val canonicalServerOrigin: String = origin.value
     val conversations = LinkedHashMap<String, NativeDirectConversationInstall>()
     var pendingRequest: PendingDirectRequest? = null
     /** Exact user action reservation; never created by directory or replay. */
@@ -766,6 +867,12 @@ internal class VeilMobileRuntime internal constructor(
     val detached: DetachedDirectSync? = null,
     val publishProjection: Boolean = false,
     val fatal: Boolean = false,
+    val reconnectPlan: ActiveReconnect? = null,
+  )
+
+  private data class PreparedReconnect(
+    val plan: ActiveReconnect,
+    val detachedDirectSync: DetachedDirectSync?,
   )
 
   private enum class DirectRequestStage {
@@ -824,6 +931,18 @@ internal class VeilMobileRuntime internal constructor(
 
   fun snapshot(): VeilMobileRuntimeSnapshot = synchronized(stateLock) {
     snapshotLocked()
+  }
+
+  @VisibleForTesting
+  internal fun reconnectPlanForTesting(): NativeReconnectPlanDebug? = synchronized(stateLock) {
+    activeReconnect?.let { plan ->
+      NativeReconnectPlanDebug(
+        reason = plan.reason,
+        failureOrdinal = plan.failureOrdinal,
+        delayMillis = plan.delayMillis,
+        stage = plan.stage,
+      )
+    }
   }
 
   /**
@@ -1014,11 +1133,12 @@ internal class VeilMobileRuntime internal constructor(
     return when (outcome) {
       NativeDirectTextSendOutcome.ACCEPTED -> {
         sync.directSessionAction = null
-        if (sync.contentRevision >= MAX_PUBLIC_SNAPSHOT_REVISION) {
-          val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
-          connectionState = NativeConnectionState.ERROR
-          binding = null
-          DirectSendTransition(
+          if (sync.contentRevision >= MAX_PUBLIC_SNAPSHOT_REVISION) {
+            val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+            connectionState = NativeConnectionState.ERROR
+            binding = null
+            reconnectBackoffScope = null
+            DirectSendTransition(
             result = NativeDirectTextSendResult.ACCEPTED,
             detached = detached,
           )
@@ -1035,12 +1155,13 @@ internal class VeilMobileRuntime internal constructor(
         // the action before detaching so cancellation cannot turn acceptance
         // into an unavailable result and invite a duplicate user intent.
         sync.directSessionAction = null
-        val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
-        connectionState = NativeConnectionState.ERROR
-        binding = null
+        val reconnect = checkNotNull(
+          prepareDirectReconnectLocked(sync, NativeMobileRetryableReason.TRANSPORT),
+        ) { "accepted replay lost its exact authenticated reconnect scope" }
         DirectSendTransition(
           result = NativeDirectTextSendResult.ACCEPTED,
-          detached = detached,
+          detached = reconnect.detachedDirectSync,
+          reconnectPlan = reconnect.plan,
         )
       }
       NativeDirectTextSendOutcome.ACCEPTED_SESSION_INVALID -> {
@@ -1051,6 +1172,7 @@ internal class VeilMobileRuntime internal constructor(
         val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
         connectionState = NativeConnectionState.ERROR
         binding = null
+        reconnectBackoffScope = null
         DirectSendTransition(
           result = NativeDirectTextSendResult.ACCEPTED,
           detached = detached,
@@ -1086,13 +1208,29 @@ internal class VeilMobileRuntime internal constructor(
       return
     }
     transition.result?.let(action::complete)
-    transition.detached.cancelHttpQuietly()
-    transition.detached.cancelLeaseQuietly()
-    // AcceptedForReplay and the revision-exhaustion edge revoke the public
-    // generation inside the send linearization point. Publish that fail-closed
-    // state even though no projection is available, otherwise React could
-    // keep rendering a stale Ready generation after native authority is gone.
-    if (transition.detached != null || transition.publishProjection) publishSnapshot()
+    val reconnectPlan = transition.reconnectPlan
+    if (reconnectPlan != null) {
+      finalizePreparedReconnect(PreparedReconnect(reconnectPlan, transition.detached))
+    } else {
+      transition.detached.cancelHttpQuietly()
+      transition.detached.cancelLeaseQuietly()
+      if (transition.detached != null) {
+        disconnectTransportQuietlyIf(sync.session) {
+          foreground &&
+            lifecycleEpoch == sync.epoch &&
+            session === sync.session &&
+            activeConnect == null &&
+            activeReconnect == null &&
+            connectionState == NativeConnectionState.ERROR &&
+            binding == null
+        }
+      }
+      // Terminal acceptance and the revision-exhaustion edge revoke the public
+      // generation inside the send linearization point. Publish that fail-closed
+      // state even though no projection is available, otherwise React could
+      // keep rendering a stale Ready generation after native authority is gone.
+      if (transition.detached != null || transition.publishProjection) publishSnapshot()
+    }
     if (transition.requestPreKey) requestPeerPreKey(sync, action)
   }
 
@@ -1155,8 +1293,8 @@ internal class VeilMobileRuntime internal constructor(
 
     val readiness = try {
       sync.session.directSendReadiness(sync.leaseToken, conversationId)
-    } catch (_: Throwable) {
-      failDirectSync(sync)
+    } catch (error: Throwable) {
+      handleDirectSyncFailure(sync, error)
       return
     }
     when (readiness) {
@@ -1415,6 +1553,11 @@ internal class VeilMobileRuntime internal constructor(
         sessionState = NativeSessionState.OPEN
         return snapshotLocked()
       }
+      // A newly opened SQLCipher session must never inherit a reconnect
+      // capability or backoff identity from a previously closed native handle.
+      cancelActiveReconnectLocked()
+      reconnectBackoffScope = null
+      activeDirectBootstrap = null
       lifecycleEpoch += 1
       sessionState = NativeSessionState.OPENING
       connectionState = NativeConnectionState.DISCONNECTED
@@ -1527,6 +1670,15 @@ internal class VeilMobileRuntime internal constructor(
       if (activeConnect != null) {
         throw VeilMobileRuntimeException("E_VEIL_CONNECTING", "A connection attempt is already running")
       }
+      if (activeReconnect?.stage == NativeReconnectStage.TERMINATING) {
+        throw VeilMobileRuntimeException("E_VEIL_CONNECTING", "The previous connection is still closing")
+      }
+      // An explicit user connect supersedes a retry plan, but never reuses its
+      // account scope or delay history. In particular, no access-pass bytes are
+      // copied into the reconnect owner.
+      cancelActiveReconnectLocked()
+      reconnectBackoffScope = null
+      activeDirectBootstrap = null
       val pending = ActiveConnect(
         session = active,
         cancellation = cancellationFactory.create(),
@@ -1544,36 +1696,39 @@ internal class VeilMobileRuntime internal constructor(
     start.detachedDirectSync.cancelLeaseQuietly()
     publishSnapshot()
 
-    try {
-      active.disconnect()
-    } catch (_: Throwable) {
-      // A stale transport must not prevent a fresh, serialized connection.
-    }
-
     return try {
-      val mayConnect = synchronized(stateLock) {
-        foreground &&
-          lifecycleEpoch == attempt.epoch &&
-          session === active &&
-          activeConnect === attempt
-      }
-      if (!mayConnect) {
-        throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
-      }
-
-      val authenticated = if (accessAttempt == null) {
-        active.connect(origin.websocketUrl, origin.value, attempt.cancellation)
-      } else {
-        active.connectWithNodeAccessPass(
-          origin.websocketUrl,
-          origin.value,
-          accessAttempt.token,
-          attempt.cancellation,
-        )
+      val authenticated = synchronized(transportOperationLock) {
+        fun ownsAttempt(): Boolean = synchronized(stateLock) {
+          foreground &&
+            lifecycleEpoch == attempt.epoch &&
+            session === active &&
+            activeConnect === attempt
+        }
+        if (!ownsAttempt()) {
+          throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
+        }
+        try {
+          active.disconnect()
+        } catch (_: Throwable) {
+          // A stale transport must not prevent a fresh, serialized connection.
+        }
+        if (!ownsAttempt()) {
+          throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
+        }
+        if (accessAttempt == null) {
+          active.connect(origin.websocketUrl, origin.value, attempt.cancellation)
+        } else {
+          active.connectWithNodeAccessPass(
+            origin.websocketUrl,
+            origin.value,
+            accessAttempt.token,
+            attempt.cancellation,
+          )
+        }
       }
       requireAuthenticatedBinding(authenticated, origin)
 
-      val accepted = synchronized(stateLock) {
+      val bootstrapOwner = synchronized(stateLock) {
         val current = foreground &&
           lifecycleEpoch == attempt.epoch &&
           session === active &&
@@ -1582,28 +1737,38 @@ internal class VeilMobileRuntime internal constructor(
         if (current) {
           binding = authenticated
           connectionState = NativeConnectionState.CONNECTED
+          ActiveDirectBootstrap(
+            session = active,
+            epoch = attempt.epoch,
+            origin = origin,
+            authenticated = authenticated,
+            connectAttempt = attempt,
+          ).also { owner -> activeDirectBootstrap = owner }
+        } else {
+          null
         }
-        current
       }
-      if (!accepted) {
+      if (bootstrapOwner == null) {
         throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
       }
       if (accessAttempt != null) passStore.clearAfterSuccess(accessAttempt.flowId)
-      startDirectSyncBootstrap(active, attempt.epoch, authenticated)
+      directBootstrapOwnerBoundary()
+      startDirectSyncBootstrap(bootstrapOwner)
       publishSnapshot()
       authenticated
     } catch (error: Throwable) {
       val failedSync = synchronized(stateLock) {
         val connecting = activeConnect === attempt
         if (connecting) activeConnect = null
-        val authenticated = binding
+        val ownsBootstrap = activeDirectBootstrap?.connectAttempt === attempt
         val current = foreground &&
           lifecycleEpoch == attempt.epoch &&
           session === active &&
-          (connecting || authenticated != null)
+          (connecting || ownsBootstrap)
         if (
           current
         ) {
+          if (ownsBootstrap) activeDirectBootstrap = null
           val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
           connectionState = NativeConnectionState.ERROR
           binding = null
@@ -1614,10 +1779,15 @@ internal class VeilMobileRuntime internal constructor(
       }
       failedSync.cancelHttpQuietly()
       failedSync.cancelLeaseQuietly()
-      try {
-        active.disconnect()
-      } catch (_: Throwable) {
-        // Preserve the original, sanitized connection failure.
+      disconnectTransportQuietlyIf(active) {
+        foreground &&
+          lifecycleEpoch == attempt.epoch &&
+          session === active &&
+          activeConnect == null &&
+          activeReconnect == null &&
+          activeDirectBootstrap == null &&
+          connectionState == NativeConnectionState.ERROR &&
+          binding == null
       }
       publishSnapshot()
       if (error is VeilMobileRuntimeException) throw error
@@ -1652,17 +1822,45 @@ internal class VeilMobileRuntime internal constructor(
     }
   }
 
-  private fun startDirectSyncBootstrap(
-    active: NativeMobileSession,
-    epoch: Long,
-    authenticated: PublicAuthenticatedBinding,
-  ) {
+  /** Caller holds [stateLock]. */
+  private fun isCurrentDirectBootstrapLocked(owner: ActiveDirectBootstrap): Boolean {
+    val reconnectOwner = owner.reconnectPlan
+    val exactConnectionOwner = if (reconnectOwner == null) {
+      activeReconnect == null
+    } else {
+      activeReconnect === reconnectOwner &&
+        reconnectOwner.stage == NativeReconnectStage.BOOTSTRAPPING
+    }
+    return activeDirectBootstrap === owner &&
+      exactConnectionOwner &&
+      foreground &&
+      lifecycleEpoch == owner.epoch &&
+      session === owner.session &&
+      sessionState == NativeSessionState.OPEN &&
+      connectionState == NativeConnectionState.CONNECTED &&
+      binding == owner.authenticated &&
+      activeConnect == null &&
+      activeDirectSync == null
+  }
+
+  private fun startDirectSyncBootstrap(owner: ActiveDirectBootstrap) {
+    val active = owner.session
+    val epoch = owner.epoch
+    val origin = owner.origin
+    val authenticated = owner.authenticated
     val lease = try {
-      active.beginDirectSync()
+      synchronized(transportOperationLock) {
+        val mayBegin = synchronized(stateLock) { isCurrentDirectBootstrapLocked(owner) }
+        if (!mayBegin) {
+          throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
+        }
+        active.beginDirectSync()
+      }
     } catch (_: Throwable) {
       throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
     }
     if (
+      origin.value != authenticated.canonicalServerOrigin ||
       lease.canonicalServerOrigin != authenticated.canonicalServerOrigin ||
       lease.userId != authenticated.userId
     ) {
@@ -1682,19 +1880,12 @@ internal class VeilMobileRuntime internal constructor(
       epoch = epoch,
       generation = generation,
       leaseToken = lease.leaseToken,
-      canonicalServerOrigin = lease.canonicalServerOrigin,
+      origin = origin,
       userId = lease.userId,
     )
     val installed = synchronized(stateLock) {
-      if (
-        foreground &&
-        lifecycleEpoch == epoch &&
-        session === active &&
-        sessionState == NativeSessionState.OPEN &&
-        connectionState == NativeConnectionState.CONNECTED &&
-        binding == authenticated &&
-        activeDirectSync == null
-      ) {
+      if (isCurrentDirectBootstrapLocked(owner)) {
+        activeDirectBootstrap = null
         activeDirectSync = sync
         ownPreKeyState = NativeOwnPreKeyState.CHECKING
         directDirectoryState = NativeDirectDirectoryState.IDLE
@@ -1713,8 +1904,9 @@ internal class VeilMobileRuntime internal constructor(
 
     try {
       requestNextOwnPreKeyStep(sync)
-    } catch (_: Throwable) {
-      failDirectSync(sync)
+    } catch (error: Throwable) {
+      val reconnectScheduled = handleDirectSyncFailure(sync, error)
+      if (reconnectScheduled) return
       throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
     }
   }
@@ -1857,8 +2049,8 @@ internal class VeilMobileRuntime internal constructor(
         requestNextOwnPreKeyStep(sync)
       }
       publishSnapshot()
-    } catch (_: Throwable) {
-      failDirectSync(sync)
+    } catch (error: Throwable) {
+      handleDirectSyncFailure(sync, error)
     } finally {
       result.wipeSensitiveBody()
     }
@@ -2075,9 +2267,9 @@ internal class VeilMobileRuntime internal constructor(
         pumpDirectLiveEvents(sync)
         requestNextDirectDirectoryPage(sync)
       }
-    } catch (_: Throwable) {
+    } catch (error: Throwable) {
       result.wipeSensitiveBody()
-      failDirectSync(sync)
+      handleDirectSyncFailure(sync, error)
     } finally {
       result.wipeSensitiveBody()
     }
@@ -2215,8 +2407,8 @@ internal class VeilMobileRuntime internal constructor(
         pumpDirectLiveEvents(sync)
         requestNextDirectHistoryPage(sync)
       }
-    } catch (_: Throwable) {
-      failDirectSync(sync)
+    } catch (error: Throwable) {
+      handleDirectSyncFailure(sync, error)
     } finally {
       result.wipeSensitiveBody()
     }
@@ -2283,6 +2475,9 @@ internal class VeilMobileRuntime internal constructor(
       check(!progress.needsImmediatePump) {
         "initial native Direct live replay reached Ready before quiescence"
       }
+      check(!progress.outboxReplayRequired) {
+        "initial native Direct live replay reached Ready before the outbox barrier"
+      }
 
       val accepted = synchronized(stateLock) {
         if (
@@ -2292,14 +2487,14 @@ internal class VeilMobileRuntime internal constructor(
         ) {
           false
         } else {
-          directoryReady = true
+          markDirectReadyLocked(sync)
           true
         }
       }
       if (accepted) publishSnapshot()
       if (accepted) scheduleContinuousDirectLiveReplay(sync)
-    } catch (_: Throwable) {
-      failDirectSync(sync)
+    } catch (error: Throwable) {
+      handleDirectSyncFailure(sync, error)
     }
   }
 
@@ -2347,14 +2542,14 @@ internal class VeilMobileRuntime internal constructor(
         ) {
           false
         } else {
-          directoryReady = true
+          markDirectReadyLocked(sync)
           true
         }
       }
       if (accepted) publishSnapshot()
       if (accepted) scheduleContinuousDirectLiveReplay(sync)
-    } catch (_: Throwable) {
-      failDirectSync(sync)
+    } catch (error: Throwable) {
+      handleDirectSyncFailure(sync, error)
     }
   }
 
@@ -2420,6 +2615,9 @@ internal class VeilMobileRuntime internal constructor(
       check(progress.ready) {
         "continuous native Direct replay revoked the Ready checkpoint"
       }
+      check(!progress.outboxReplayRequired) {
+        "continuous native Direct replay reopened the outbox barrier"
+      }
       if (progress.needsImmediatePump) {
         check(progress.consumed == MAX_DIRECT_LIVE_REPLAY_EVENTS_PER_TURN) {
           "continuous native Direct replay requested an invalid immediate turn"
@@ -2445,14 +2643,397 @@ internal class VeilMobileRuntime internal constructor(
         sync,
         if (progress.needsImmediatePump) 0L else directLivePollIntervalMillis,
       )
+    } catch (error: Throwable) {
+      handleDirectSyncFailure(sync, error)
+    }
+  }
+
+  /** Caller holds [stateLock]. */
+  private fun prepareDirectReconnectLocked(
+    sync: ActiveDirectSync,
+    reason: NativeMobileRetryableReason,
+  ): PreparedReconnect? {
+    if (!isCurrentDirectSyncLocked(sync)) return null
+    val scope = reconnectBackoffScopeForLocked(
+      session = sync.session,
+      epoch = sync.epoch,
+      origin = sync.origin,
+      expectedUserId = sync.userId,
+    )
+    cancelActiveReconnectLocked()
+    val detached = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
+    connectionState = NativeConnectionState.CONNECTING
+    binding = null
+    val plan = createReconnectPlanLocked(scope, reason)
+    activeReconnect = plan
+    return PreparedReconnect(plan, detached)
+  }
+
+  /** Caller holds [stateLock]. */
+  private fun reconnectBackoffScopeForLocked(
+    session: NativeMobileSession,
+    epoch: Long,
+    origin: CanonicalServerOrigin,
+    expectedUserId: String,
+  ): ReconnectBackoffScope {
+    val current = reconnectBackoffScope
+    if (
+      current != null &&
+      current.session === session &&
+      current.epoch == epoch &&
+      current.origin == origin &&
+      current.expectedUserId == expectedUserId
+    ) {
+      return current
+    }
+    return ReconnectBackoffScope(session, epoch, origin, expectedUserId).also { replacement ->
+      reconnectBackoffScope = replacement
+    }
+  }
+
+  /** Caller holds [stateLock]. */
+  private fun createReconnectPlanLocked(
+    scope: ReconnectBackoffScope,
+    reason: NativeMobileRetryableReason,
+  ): ActiveReconnect {
+    val failureOrdinal = scope.failureCount.coerceAtMost(MAX_RECONNECT_FAILURE_ORDINAL)
+    val capMillis = reconnectDelayCapMillis(failureOrdinal)
+    val sampledMillis = try {
+      reconnectJitterMillis(capMillis)
     } catch (_: Throwable) {
-      failDirectSync(sync)
+      capMillis
+    }.coerceIn(0L, capMillis)
+    if (scope.failureCount < MAX_RECONNECT_FAILURE_ORDINAL) scope.failureCount += 1
+    return ActiveReconnect(
+      backoffScope = scope,
+      session = scope.session,
+      epoch = scope.epoch,
+      origin = scope.origin,
+      expectedUserId = scope.expectedUserId,
+      reason = reason,
+      failureOrdinal = failureOrdinal,
+      delayMillis = sampledMillis,
+    )
+  }
+
+  private fun reconnectDelayCapMillis(failureOrdinal: Int): Long {
+    var capMillis = RECONNECT_BASE_DELAY_MILLIS
+    repeat(failureOrdinal.coerceIn(0, MAX_RECONNECT_BACKOFF_EXPONENT)) {
+      capMillis = minOf(RECONNECT_MAX_DELAY_MILLIS, capMillis * 2L)
+    }
+    return capMillis
+  }
+
+  /** Caller holds [stateLock]. Backoff scope deliberately survives cancellation. */
+  private fun cancelActiveReconnectLocked() {
+    val selected = activeReconnect ?: return
+    activeReconnect = null
+    selected.scheduledFuture?.cancel(false)
+    selected.scheduledFuture = null
+    selected.cancellation?.cancelQuietly()
+    selected.cancellation = null
+  }
+
+  /** Returns true only when the exact typed failure installed a live retry owner. */
+  private fun handleDirectSyncFailure(sync: ActiveDirectSync, error: Throwable): Boolean {
+    if (error is NativeMobileRetryableException) {
+      val prepared = synchronized(stateLock) {
+        prepareDirectReconnectLocked(sync, error.reason)
+      }
+      if (prepared != null) {
+        return finalizePreparedReconnect(prepared)
+      }
+    }
+    failDirectSync(sync)
+    return false
+  }
+
+  private fun finalizePreparedReconnect(prepared: PreparedReconnect): Boolean {
+    prepared.detachedDirectSync.cancelHttpQuietly()
+    prepared.detachedDirectSync.cancelLeaseQuietly()
+    disconnectTransportQuietlyIf(prepared.plan.session) {
+      activeReconnect === prepared.plan &&
+        prepared.plan.stage == NativeReconnectStage.WAITING &&
+        foreground &&
+        lifecycleEpoch == prepared.plan.epoch &&
+        session === prepared.plan.session &&
+        sessionState == NativeSessionState.OPEN
+    }
+    publishSnapshot()
+    scheduleReconnectPlan(prepared.plan)
+    return synchronized(stateLock) {
+      val current = activeReconnect
+      current != null &&
+        current.backoffScope === prepared.plan.backoffScope &&
+        foreground &&
+        lifecycleEpoch == current.epoch &&
+        session === current.session &&
+        sessionState == NativeSessionState.OPEN &&
+        current.stage != NativeReconnectStage.TERMINATING
+    }
+  }
+
+  private fun scheduleReconnectPlan(plan: ActiveReconnect) {
+    val future = try {
+      executor.schedule(
+        { runReconnectPlan(plan) },
+        plan.delayMillis,
+        TimeUnit.MILLISECONDS,
+      )
+    } catch (_: RuntimeException) {
+      failReconnectPlanTerminal(plan)
+      return
+    }
+    val retained = synchronized(stateLock) {
+      if (
+        activeReconnect === plan &&
+        plan.stage == NativeReconnectStage.WAITING &&
+        plan.scheduledFuture == null
+      ) {
+        plan.scheduledFuture = future
+        true
+      } else {
+        false
+      }
+    }
+    if (!retained) future.cancel(false)
+  }
+
+  private fun runReconnectPlan(plan: ActiveReconnect) {
+    val cancellation = try {
+      cancellationFactory.create()
+    } catch (_: Throwable) {
+      failReconnectPlanTerminal(plan)
+      return
+    }
+    val started = synchronized(stateLock) {
+      if (
+        activeReconnect !== plan ||
+        plan.stage != NativeReconnectStage.WAITING ||
+        !foreground ||
+        lifecycleEpoch != plan.epoch ||
+        session !== plan.session ||
+        sessionState != NativeSessionState.OPEN ||
+        activeConnect != null ||
+        binding != null ||
+        activeDirectBootstrap != null ||
+        activeDirectSync != null
+      ) {
+        false
+      } else {
+        plan.stage = NativeReconnectStage.CONNECTING
+        plan.scheduledFuture = null
+        plan.cancellation = cancellation
+        connectionState = NativeConnectionState.CONNECTING
+        true
+      }
+    }
+    if (!started) {
+      closeConnectCancellationQuietly(cancellation)
+      return
+    }
+    publishSnapshot()
+
+    try {
+      val authenticated = synchronized(transportOperationLock) {
+        val mayConnect = synchronized(stateLock) {
+          activeReconnect === plan &&
+            plan.stage == NativeReconnectStage.CONNECTING &&
+            foreground &&
+            lifecycleEpoch == plan.epoch &&
+            session === plan.session &&
+            sessionState == NativeSessionState.OPEN
+        }
+        if (!mayConnect) {
+          throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
+        }
+        plan.session.connect(plan.origin.websocketUrl, plan.origin.value, cancellation)
+      }
+      requireAuthenticatedBinding(authenticated, plan.origin)
+      if (authenticated.userId != plan.expectedUserId) {
+        throw VeilMobileRuntimeException("E_VEIL_CONNECT", "Unable to authenticate with the Veil Node")
+      }
+
+      val bootstrapOwner = synchronized(stateLock) {
+        if (
+          activeReconnect !== plan ||
+          plan.stage != NativeReconnectStage.CONNECTING ||
+          !foreground ||
+          lifecycleEpoch != plan.epoch ||
+          session !== plan.session ||
+          sessionState != NativeSessionState.OPEN ||
+          binding != null ||
+          activeDirectBootstrap != null ||
+          activeDirectSync != null
+        ) {
+          null
+        } else {
+          plan.cancellation = null
+          plan.stage = NativeReconnectStage.BOOTSTRAPPING
+          binding = authenticated
+          connectionState = NativeConnectionState.CONNECTED
+          ActiveDirectBootstrap(
+            session = plan.session,
+            epoch = plan.epoch,
+            origin = plan.origin,
+            authenticated = authenticated,
+            reconnectPlan = plan,
+          ).also { owner -> activeDirectBootstrap = owner }
+        }
+      }
+      if (bootstrapOwner == null) {
+        failReconnectPlanTerminal(plan)
+        return
+      }
+      directBootstrapOwnerBoundary()
+      startDirectSyncBootstrap(bootstrapOwner)
+      publishSnapshot()
+    } catch (error: NativeMobileRetryableException) {
+      retryReconnectPlan(plan, error.reason)
+    } catch (_: Throwable) {
+      failReconnectPlanTerminal(plan)
+    } finally {
+      closeConnectCancellationQuietly(cancellation)
+    }
+  }
+
+  private fun retryReconnectPlan(
+    failed: ActiveReconnect,
+    reason: NativeMobileRetryableReason,
+  ) {
+    var terminalizeUnexpectedOwner = false
+    val replacement = synchronized(stateLock) {
+      if (
+        activeReconnect !== failed ||
+        !foreground ||
+        lifecycleEpoch != failed.epoch ||
+        session !== failed.session ||
+        sessionState != NativeSessionState.OPEN
+      ) {
+        null
+      } else if (
+        failed.stage != NativeReconnectStage.CONNECTING ||
+        activeConnect != null ||
+        binding != null ||
+        activeDirectBootstrap != null ||
+        activeDirectSync != null
+      ) {
+        terminalizeUnexpectedOwner = true
+        null
+      } else {
+        failed.scheduledFuture?.cancel(false)
+        failed.scheduledFuture = null
+        failed.cancellation = null
+        val next = createReconnectPlanLocked(failed.backoffScope, reason)
+        activeReconnect = next
+        connectionState = NativeConnectionState.CONNECTING
+        binding = null
+        next
+      }
+    }
+    if (replacement == null) {
+      if (terminalizeUnexpectedOwner) failReconnectPlanTerminal(failed)
+      return
+    }
+    disconnectTransportQuietlyIf(failed.session) {
+      activeReconnect === replacement &&
+        replacement.stage == NativeReconnectStage.WAITING &&
+        foreground &&
+        lifecycleEpoch == replacement.epoch &&
+        session === replacement.session &&
+        sessionState == NativeSessionState.OPEN
+    }
+    publishSnapshot()
+    scheduleReconnectPlan(replacement)
+  }
+
+  private fun failReconnectPlanTerminal(plan: ActiveReconnect) {
+    val detached = synchronized(stateLock) {
+      if (activeReconnect !== plan) return
+      plan.stage = NativeReconnectStage.TERMINATING
+      plan.scheduledFuture?.cancel(false)
+      plan.scheduledFuture = null
+      plan.cancellation?.cancelQuietly()
+      plan.cancellation = null
+      connectionState = NativeConnectionState.ERROR
+      binding = null
+      if (activeDirectBootstrap?.reconnectPlan === plan) activeDirectBootstrap = null
+      if (reconnectBackoffScope === plan.backoffScope) reconnectBackoffScope = null
+      detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+    }
+    detached.cancelHttpQuietly()
+    detached.cancelLeaseQuietly()
+    disconnectTransportQuietly(plan.session)
+    synchronized(stateLock) {
+      if (activeReconnect === plan) activeReconnect = null
+    }
+    publishSnapshot()
+  }
+
+  /** Caller holds [stateLock] at the exact Ready + durable outbox barrier. */
+  private fun markDirectReadyLocked(sync: ActiveDirectSync) {
+    check(isCurrentDirectSyncLocked(sync)) { "stale Direct generation reached Ready" }
+    val plan = activeReconnect
+    if (plan != null) {
+      check(
+        plan.stage == NativeReconnectStage.BOOTSTRAPPING &&
+          plan.session === sync.session &&
+          plan.epoch == sync.epoch &&
+          plan.origin == sync.origin &&
+          plan.expectedUserId == sync.userId,
+      ) { "Direct Ready did not match its reconnect scope" }
+      activeReconnect = null
+    }
+    reconnectBackoffScope = null
+    directoryReady = true
+  }
+
+  private fun disconnectTransportQuietly(active: NativeMobileSession) {
+    synchronized(transportOperationLock) {
+      try {
+        active.disconnect()
+      } catch (_: Throwable) {
+        // The stateLock-owned generation already revoked this transport.
+      }
+    }
+  }
+
+  /**
+   * Disconnect only while the state transition that requested teardown still
+   * owns the native session. The predicate executes under [stateLock] after the
+   * transport lock is acquired, so a newer manual connect can safely supersede
+   * an older failure without the older task disconnecting the new socket.
+   */
+  private fun disconnectTransportQuietlyIf(
+    active: NativeMobileSession,
+    stillOwnedLocked: () -> Boolean,
+  ): Boolean = synchronized(transportOperationLock) {
+    val stillOwned = synchronized(stateLock) { stillOwnedLocked() }
+    if (!stillOwned) {
+      false
+    } else {
+      try {
+        active.disconnect()
+      } catch (_: Throwable) {
+        // The public state already revoked the failed transport authority.
+      }
+      true
+    }
+  }
+
+  private fun closeConnectCancellationQuietly(cancellation: NativeConnectCancellation) {
+    try {
+      cancellation.close()
+    } catch (_: Throwable) {
+      // Native cancellation is one-shot; its cleaner remains a fallback.
     }
   }
 
   private fun failDirectSync(sync: ActiveDirectSync) {
     val detached = synchronized(stateLock) {
       if (activeDirectSync !== sync) return
+      cancelActiveReconnectLocked()
+      reconnectBackoffScope = null
       val selected = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
       ownPreKeyState = NativeOwnPreKeyState.ERROR
       if (
@@ -2467,10 +3048,14 @@ internal class VeilMobileRuntime internal constructor(
     }
     detached.cancelHttpQuietly()
     detached.cancelLeaseQuietly()
-    try {
-      sync.session.disconnect()
-    } catch (_: Throwable) {
-      // The public state is already fail-closed; transport teardown is best effort.
+    disconnectTransportQuietlyIf(sync.session) {
+      foreground &&
+        lifecycleEpoch == sync.epoch &&
+        session === sync.session &&
+        activeConnect == null &&
+        activeReconnect == null &&
+        connectionState == NativeConnectionState.ERROR &&
+        binding == null
     }
     publishSnapshot()
   }
@@ -2556,6 +3141,16 @@ internal class VeilMobileRuntime internal constructor(
 
   fun disconnect(): VeilMobileRuntimeSnapshot {
     val target = synchronized(stateLock) {
+      lifecycleEpoch += 1
+      activeConnect?.cancellation?.cancelQuietly()
+      activeConnect = null
+      if (activeReconnect?.stage != NativeReconnectStage.TERMINATING) {
+        cancelActiveReconnectLocked()
+      }
+      reconnectBackoffScope = null
+      activeDirectBootstrap = null
+      connectionState = NativeConnectionState.DISCONNECTED
+      binding = null
       Triple(
         session,
         lifecycleEpoch,
@@ -2565,14 +3160,38 @@ internal class VeilMobileRuntime internal constructor(
     val active = target.first
     target.third.cancelHttpQuietly()
     target.third.cancelLeaseQuietly()
-    try {
-      active?.disconnect()
-    } catch (_: Throwable) {
+    val disconnectError = active?.let { selected ->
+      synchronized(transportOperationLock) {
+        val stillOwned = synchronized(stateLock) {
+          lifecycleEpoch == target.second &&
+            session === selected &&
+            activeConnect == null &&
+            activeReconnect == null &&
+            connectionState == NativeConnectionState.DISCONNECTED &&
+            binding == null
+        }
+        if (!stillOwned) {
+          null
+        } else {
+          try {
+            selected.disconnect()
+            null
+          } catch (error: Throwable) {
+            error
+          }
+        }
+      }
+    }
+    if (disconnectError != null) {
       synchronized(stateLock) {
         if (
           foreground &&
           lifecycleEpoch == target.second &&
-          session === active
+          session === active &&
+          activeConnect == null &&
+          activeReconnect == null &&
+          connectionState == NativeConnectionState.DISCONNECTED &&
+          binding == null
         ) {
           connectionState = NativeConnectionState.ERROR
           binding = null
@@ -2581,12 +3200,6 @@ internal class VeilMobileRuntime internal constructor(
       }
       publishSnapshot()
       throw VeilMobileRuntimeException("E_VEIL_DISCONNECT", "Unable to close the Veil Node connection cleanly")
-    }
-    synchronized(stateLock) {
-      if (lifecycleEpoch == target.second && session === active) {
-        connectionState = NativeConnectionState.DISCONNECTED
-        binding = null
-      }
     }
     return publishSnapshot()
   }
@@ -2600,6 +3213,9 @@ internal class VeilMobileRuntime internal constructor(
       // atomic/non-blocking and never calls back into this runtime.
       activeConnect?.cancellation?.cancelQuietly()
       activeConnect = null
+      cancelActiveReconnectLocked()
+      reconnectBackoffScope = null
+      activeDirectBootstrap = null
       sessionState = NativeSessionState.CLOSING
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
@@ -2611,7 +3227,7 @@ internal class VeilMobileRuntime internal constructor(
     publishSnapshot()
     try {
       target.second.cancelLeaseQuietly()
-      active?.disconnect()
+      if (active != null) disconnectTransportQuietly(active)
     } catch (_: Throwable) {
       // Lock remains fail-closed even if transport teardown reports an error.
     } finally {
@@ -2639,6 +3255,9 @@ internal class VeilMobileRuntime internal constructor(
       // See lockSession(): selecting and cancelling the capability must be one
       // linearized state transition so onStop cannot race a UniFFI close.
       activeConnect?.cancellation?.cancelQuietly()
+      cancelActiveReconnectLocked()
+      reconnectBackoffScope = null
+      activeDirectBootstrap = null
       sessionState = NativeSessionState.CLOSING
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
@@ -2663,7 +3282,7 @@ internal class VeilMobileRuntime internal constructor(
       session.also { session = null }
     }
     try {
-      active?.disconnect()
+      if (active != null) disconnectTransportQuietly(active)
     } catch (_: Throwable) {
       // Background teardown remains fail-closed even after transport errors.
     } finally {
@@ -2814,6 +3433,10 @@ internal class VeilMobileRuntime internal constructor(
     private const val MAX_PUBLIC_SNAPSHOT_REVISION = 9_007_199_254_740_991L
 
     private const val DIRECT_LIVE_IDLE_POLL_MILLIS = 250L
+    private const val RECONNECT_BASE_DELAY_MILLIS = 1_000L
+    private const val RECONNECT_MAX_DELAY_MILLIS = 60_000L
+    private const val MAX_RECONNECT_BACKOFF_EXPONENT = 6
+    private const val MAX_RECONNECT_FAILURE_ORDINAL = 30
 
     private fun newRuntimeExecutor(): ScheduledExecutorService =
       Executors.newSingleThreadScheduledExecutor { operation ->
@@ -2862,25 +3485,27 @@ private class UniFfiMobileSession(
     websocketUrl: String,
     canonicalOrigin: String,
     cancellation: NativeConnectCancellation,
-  ): PublicAuthenticatedBinding =
+  ): PublicAuthenticatedBinding = translateMobileRetryable {
     delegate.connectCancellable(
       websocketUrl,
       canonicalOrigin,
       cancellation.requireUniFfiDelegate(),
     ).toPublicBinding()
+  }
 
   override fun connectWithNodeAccessPass(
     websocketUrl: String,
     canonicalOrigin: String,
     nodeAccessPass: ByteArray,
     cancellation: NativeConnectCancellation,
-  ): PublicAuthenticatedBinding =
+  ): PublicAuthenticatedBinding = translateMobileRetryable {
     delegate.connectWithNodeAccessPassCancellable(
       websocketUrl,
       canonicalOrigin,
       nodeAccessPass,
       cancellation.requireUniFfiDelegate(),
     ).toPublicBinding()
+  }
 
   override fun beginDirectSync(): NativeDirectSyncLease =
     delegate.beginDirectSync().toNativeDirectSyncLease()
@@ -2918,13 +3543,19 @@ private class UniFfiMobileSession(
       .toNativeDirectHistoryProgress()
 
   override fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress =
-    delegate.bufferDirectLiveEventsDuringSync(leaseToken).toNativeDirectLiveBufferProgress()
+    translateMobileRetryable {
+      delegate.bufferDirectLiveEventsDuringSync(leaseToken).toNativeDirectLiveBufferProgress()
+    }
 
   override fun replayDirectLiveEvents(leaseToken: String): NativeDirectLiveReplayProgress =
-    delegate.replayDirectLiveEvents(leaseToken).toNativeDirectLiveReplayProgress()
+    translateMobileRetryable {
+      delegate.replayDirectLiveEvents(leaseToken).toNativeDirectLiveReplayProgress()
+    }
 
   override fun replayDirectOutbox(leaseToken: String): NativeDirectOutboxReplayProgress =
-    delegate.replayDirectOutbox(leaseToken).toNativeDirectOutboxReplayProgress()
+    translateMobileRetryable {
+      delegate.replayDirectOutbox(leaseToken).toNativeDirectOutboxReplayProgress()
+    }
 
   override fun projectDirectMessages(conversationId: String): NativeDirectMessageProjection =
     delegate.projectDirectMessages(conversationId).toNativeDirectMessageProjection()
