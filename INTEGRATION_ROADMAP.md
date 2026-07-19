@@ -1299,7 +1299,7 @@ Shared protocol/server/client core и Android send slice опубликован�
 Debug APK остаётся только build evidence с debug key. Он не является
 подписанным tester release и не заменяет physical-device evidence.
 
-**Не реализовано и не считается готовым:**
+**На момент этого checkpoint не было реализовано и не считалось готовым:**
 
 - monotonic ACK deadline для live transport correlation;
 - typed разделение ordinary transport loss, retryable connect failure,
@@ -1314,7 +1314,7 @@ Debug APK остаётся только build evidence с debug key. Он не �
 - release signing, standalone tester APK, чистая установка и physical-device
   matrix. Ни текущий CI APK, ни локальный debug APK не являются tester release.
 
-**Следующий порядок:**
+**Следующий порядок на момент этого checkpoint:**
 
 1. Ввести typed connect/live/outbox stop taxonomy и native monotonic ACK
    deadline, не retry-я protocol/storage/security failures.
@@ -1322,6 +1322,67 @@ Debug APK остаётся только build evidence с debug key. Он не �
    session/origin/account guards и отменой при background/lock/manual connect.
 3. Сохранять выбранный canonical origin native-side для безопасного
    process-death recovery без Node Access Pass replay.
+4. Пройти airplane-mode/process-death/physical matrix и только после этого
+   собрать подписанный standalone tester APK.
+
+### Typed Direct terminal/ACK checkpoint 2026-07-19
+
+Typed live/connect/outbox taxonomy и monotonic ACK deadline опубликованы двумя
+раздельными checkpoint в `codex/mobile-direct-preview`; `master` не изменялся.
+
+**Опубликовано и проверено:**
+
+- `cbecd94` (`feat(client): harden Direct terminal reconciliation`) вводит
+  source-typed connect/WebSocket/send terminal causes и положительный retry
+  allowlist. Protocol/auth/security anomaly и storage uncertainty никогда не
+  становятся retryable по тексту ошибки; storage остаётся sticky fail-closed;
+- каждый durable Direct sequence получает отдельный monotonic ACK deadline и
+  конечный FIFO snapshot. Более поздние события не расширяют grace window,
+  staggered deadlines не делят один watermark, а ACK, уже попавший в очередь к
+  первому наблюдению expiry, получает ограниченный post-poll turn;
+- ACK/Error correlation сначала строит взаимоисключающий typed reconciliation
+  plan. Repeated durable receipt не может по старому `ref_seq` подтвердить
+  mutation, sender-key или новый command; mutation ACK обязан совпасть с exact
+  target message ID;
+- read-only SQLCipher receipt validation различает unknown/conflicting/opposite
+  protocol result и реальную storage uncertainty. UUID из другого
+  origin/user/device scope не alias-ится с текущим durable receipt;
+- ACK timestamp обязан давать положительный millisecond value, correlated Error
+  принимает только HTTP-like `400..=599`, а retry допускает только exact `429`,
+  exact unauthenticated `401` и `500..=599`;
+- `ad0713e` (`feat(android): classify accepted invalid Direct sessions`) добавляет
+  `AcceptedSessionInvalid` во FFI/UniFFI/Android contract. Intent уже принадлежит
+  SQLCipher и завершается как accepted ровно один раз, но Kotlin отзывает lease,
+  binding и public generation и не выдаёт automatic reconnect permission.
+
+**Completion evidence:**
+
+- `cargo test --workspace --all-targets` завершён без ошибок; отдельно
+  `veil-client` 165 passed / 11 ignored, `veil-ffi` 75/75 и `veil-store` 79/79;
+  workspace clippy с `-D warnings`, `cargo fmt --check` и `git diff --check`
+  зелёные;
+- UniFFI и Android native libraries дважды воспроизводимо пересобраны для
+  `arm64-v8a` и `x86_64`. SHA-256 generated Kotlin:
+  `2C18588C73F907E9AB7525BE9ABB8D8C6EFA990AD804DC520D115904B016F995`;
+- `verifyVeilRustLibraries`, полный JVM suite 152/152, `lintDebug` и
+  `assembleDebug` прошли без исключения `.so` preflight; собранный debug APK
+  содержит обе ABI;
+- TypeScript, ESLint и Jest 80/80 зелёные. Независимые ACK snapshot и
+  FFI/Android exact-diff аудиты после исправлений не нашли P0/P1/P2.
+
+Локальный debug APK остаётся только build evidence с debug key. Он не является
+подписанным tester release и не заменяет physical-device evidence.
+
+**Следующий порядок:**
+
+1. Добавить Kotlin-owned ровно один reconnect plan с full-jitter exponential
+   backoff, exact lifecycle/session/origin/account guards и отменой при
+   background, lock, manual connect и manual disconnect.
+2. Сбрасывать backoff только после полного Ready + durable outbox barrier;
+   планировать reconnect только для typed `Transport`/`AckDeadline`, никогда для
+   `AcceptedSessionInvalid`, protocol/storage/security failure.
+3. Сохранить выбранный canonical origin native-side для process-death recovery
+   без хранения или повторного использования Node Access Pass.
 4. Пройти airplane-mode/process-death/physical matrix и только после этого
    собрать подписанный standalone tester APK.
 
