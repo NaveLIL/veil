@@ -30,6 +30,8 @@ import java.nio.CharBuffer
 import java.nio.charset.CodingErrorAction
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.ConcurrentHashMap
+import android.os.Build
+import androidx.annotation.RequiresApi
 import java.util.concurrent.atomic.AtomicBoolean
 
 // This is a helper for safely working with byte buffers returned from the Rust code.
@@ -774,6 +776,98 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is
 // rather `InterfaceTooLargeException`, caused by too many methods
@@ -811,6 +905,18 @@ fun uniffi_veil_ffi_checksum_func_validate_mnemonic(
 ): Short
 fun uniffi_veil_ffi_checksum_func_x3dh_initiate(
 ): Short
+fun uniffi_veil_ffi_checksum_method_mobileconnectcancellation_cancel(
+): Short
+fun uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_delivery(
+): Short
+fun uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_direction(
+): Short
+fun uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_message_id(
+): Short
+fun uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_text(
+): Short
+fun uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_timestamp_ms(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilidentity_identity_key(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilidentity_sign(
@@ -821,11 +927,51 @@ fun uniffi_veil_ffi_checksum_method_veilidentity_to_key_bundle(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_authenticated_binding(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_begin_direct_sync(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_buffer_direct_live_events_during_sync(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync(
+): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_cancellable(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass_cancellable(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_direct_send_readiness(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect(
 ): Short
-fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_rest_request(
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_page(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_history_response(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_response(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_mobile_reconnect_target(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_next_direct_history_request(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_own_prekey_request(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_project_direct_messages(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_live_events(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_outbox(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_send_direct_text(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilratchet_decrypt(
 ): Short
@@ -833,17 +979,51 @@ fun uniffi_veil_ffi_checksum_method_veilratchet_encrypt(
 ): Short
 fun uniffi_veil_ffi_checksum_method_veilratchet_serialize(
 ): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_cancel(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_choice_count(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_choice_word_index(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_count(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_position(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_confirm_challenge(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_consume_commit_authorization(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_is_commit_authorized(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_set_import_word_index(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_validate_import(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_count(
+): Short
+fun uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_index(
+): Short
+fun uniffi_veil_ffi_checksum_constructor_mobileconnectcancellation_new(
+): Short
 fun uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic(
+): Short
+fun uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic_bytes(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilidentity_generate(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic(
+): Short
+fun uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic_bytes(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilratchet_deserialize(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilratchet_init_initiator(
 ): Short
 fun uniffi_veil_ffi_checksum_constructor_veilratchet_init_responder(
+): Short
+fun uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_create(
+): Short
+fun uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_restore(
 ): Short
 fun ffi_veil_ffi_uniffi_contract_version(
 ): Int
@@ -894,11 +1074,35 @@ internal interface UniffiLib : Library {
     }
 
     // FFI functions
-    fun uniffi_veil_ffi_fn_clone_veilidentity(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+    fun uniffi_veil_ffi_fn_clone_mobileconnectcancellation(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_free_mobileconnectcancellation(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_constructor_mobileconnectcancellation_new(uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_method_mobileconnectcancellation_cancel(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_clone_mobiledirectmessagedata(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_free_mobiledirectmessagedata(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_mobiledirectmessagedata_delivery(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_mobiledirectmessagedata_direction(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_mobiledirectmessagedata_message_id(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_mobiledirectmessagedata_text(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_mobiledirectmessagedata_timestamp_ms(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_clone_veilidentity(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
 fun uniffi_veil_ffi_fn_free_veilidentity(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
 fun uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic(`mnemonic`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic_bytes(`mnemonicUtf8`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
 fun uniffi_veil_ffi_fn_constructor_veilidentity_generate(uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
@@ -916,13 +1120,55 @@ fun uniffi_veil_ffi_fn_free_veilmobilesession(`ptr`: Pointer,uniffi_out_err: Uni
 ): Unit
 fun uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic(`mnemonic`: RustBuffer.ByValue,`databasePath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
+fun uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic_bytes(`mnemonicUtf8`: RustBuffer.ByValue,`databasePath`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
 fun uniffi_veil_ffi_fn_method_veilmobilesession_authenticated_binding(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_begin_direct_sync(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_buffer_direct_live_events_during_sync(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_cancel_direct_sync(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): Unit
 fun uniffi_veil_ffi_fn_method_veilmobilesession_connect(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_cancellable(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`cancellation`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`nodeAccessPass`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass_cancellable(`ptr`: Pointer,`websocketUrl`: RustBuffer.ByValue,`canonicalServerOrigin`: RustBuffer.ByValue,`nodeAccessPass`: RustBuffer.ByValue,`cancellation`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_direct_send_readiness(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilmobilesession_disconnect(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Unit
-fun uniffi_veil_ffi_fn_method_veilmobilesession_sign_rest_request(`ptr`: Pointer,`canonicalServerOrigin`: RustBuffer.ByValue,`method`: RustBuffer.ByValue,`requestTarget`: RustBuffer.ByValue,`body`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_directory_page(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_history_response(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_prekey_bundle(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,`response`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_mobile_reconnect_target(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_directory_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_prekey_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_next_direct_history_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_prepare_own_prekey_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_project_direct_messages(`ptr`: Pointer,`conversationId`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_live_events(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_outbox(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_send_direct_text(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`conversationId`: RustBuffer.ByValue,`plaintextUtf8`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
+): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_method_veilmobilesession_sign_direct_rest_request(`ptr`: Pointer,`leaseToken`: RustBuffer.ByValue,`requestToken`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_clone_veilratchet(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): Pointer
@@ -940,6 +1186,38 @@ fun uniffi_veil_ffi_fn_method_veilratchet_encrypt(`ptr`: Pointer,`plaintext`: Ru
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_method_veilratchet_serialize(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
+fun uniffi_veil_ffi_fn_clone_veilrecoverydraft(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_free_veilrecoverydraft(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_constructor_veilrecoverydraft_new_create(uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_constructor_veilrecoverydraft_new_restore(uniffi_out_err: UniffiRustCallStatus,
+): Pointer
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_cancel(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_choice_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_choice_word_index(`ptr`: Pointer,`slot`: Byte,`choice`: Byte,uniffi_out_err: UniffiRustCallStatus,
+): Short
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_position(`ptr`: Pointer,`slot`: Byte,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_confirm_challenge(`ptr`: Pointer,`slot`: Byte,`chosen`: Short,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_consume_commit_authorization(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_is_commit_authorized(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_set_import_word_index(`ptr`: Pointer,`position`: Byte,`index`: Short,uniffi_out_err: UniffiRustCallStatus,
+): Unit
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_validate_import(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_word_count(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus,
+): Byte
+fun uniffi_veil_ffi_fn_method_veilrecoverydraft_word_index(`ptr`: Pointer,`position`: Byte,uniffi_out_err: UniffiRustCallStatus,
+): Short
 fun uniffi_veil_ffi_fn_func_aead_decrypt(`key`: RustBuffer.ByValue,`ciphertext`: RustBuffer.ByValue,`nonce`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
 ): RustBuffer.ByValue
 fun uniffi_veil_ffi_fn_func_aead_encrypt(`key`: RustBuffer.ByValue,`plaintext`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus,
@@ -1121,6 +1399,24 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_func_x3dh_initiate() != 23751.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_mobileconnectcancellation_cancel() != 39557.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_delivery() != 64497.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_direction() != 17344.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_message_id() != 19542.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_text() != 10276.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_mobiledirectmessagedata_timestamp_ms() != 10321.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilidentity_identity_key() != 64826.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1136,13 +1432,73 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_authenticated_binding() != 44182.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_begin_direct_sync() != 53699.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_buffer_direct_live_events_during_sync() != 50158.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_cancel_direct_sync() != 53148.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect() != 62689.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect_cancellable() != 29561.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass() != 52518.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_connect_with_node_access_pass_cancellable() != 57674.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_direct_send_readiness() != 43278.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_disconnect() != 63203.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_rest_request() != 64338.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_directory_page() != 42994.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_history_response() != 7731.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_direct_prekey_bundle() != 30329.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_install_own_prekey_response() != 26861.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_mobile_reconnect_target() != 50260.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_directory_request() != 63870.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_direct_prekey_request() != 25222.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_next_direct_history_request() != 13299.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_prepare_own_prekey_request() != 30230.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_project_direct_messages() != 54664.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_live_events() != 1036.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_replay_direct_outbox() != 35205.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_send_direct_text() != 47245.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilmobilesession_sign_direct_rest_request() != 2886.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_method_veilratchet_decrypt() != 38547.toShort()) {
@@ -1154,13 +1510,58 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_veil_ffi_checksum_method_veilratchet_serialize() != 60336.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic() != 62701.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_cancel() != 49968.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_choice_count() != 11952.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_choice_word_index() != 64768.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_count() != 53824.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_challenge_position() != 35173.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_confirm_challenge() != 4264.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_consume_commit_authorization() != 8218.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_is_commit_authorized() != 29992.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_set_import_word_index() != 23815.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_validate_import() != 65163.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_count() != 62750.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_method_veilrecoverydraft_word_index() != 29093.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_mobileconnectcancellation_new() != 64803.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic() != 47191.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_from_mnemonic_bytes() != 61700.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilidentity_generate() != 34969.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic() != 57352.toShort()) {
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic() != 36500.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilmobilesession_from_mnemonic_bytes() != 10254.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilratchet_deserialize() != 1736.toShort()) {
@@ -1170,6 +1571,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_veil_ffi_checksum_constructor_veilratchet_init_responder() != 46456.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_create() != 16323.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_veil_ffi_checksum_constructor_veilrecoverydraft_new_restore() != 1104.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -1289,30 +1696,76 @@ private class UniffiJnaCleanable(
 // using Android or not.
 // There are further runtime checks to chose the correct implementation
 // of the cleaner.
+
+
 private fun UniffiCleaner.Companion.create(): UniffiCleaner =
-    try {
-        // For safety's sake: if the library hasn't been run in android_cleaner = true
-        // mode, but is being run on Android, then we still need to think about
-        // Android API versions.
-        // So we check if java.lang.ref.Cleaner is there, and use that…
-        java.lang.Class.forName("java.lang.ref.Cleaner")
-        JavaLangRefCleaner()
-    } catch (e: ClassNotFoundException) {
-        // … otherwise, fallback to the JNA cleaner.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        AndroidSystemCleaner()
+    } else {
         UniffiJnaCleaner()
     }
 
-private class JavaLangRefCleaner : UniffiCleaner {
-    val cleaner = java.lang.ref.Cleaner.create()
+// The SystemCleaner, available from API Level 33.
+// Some API Level 33 OSes do not support using it, so we require API Level 34.
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+private class AndroidSystemCleaner : UniffiCleaner {
+    val cleaner = android.system.SystemCleaner.cleaner()
 
     override fun register(value: Any, cleanUpTask: Runnable): UniffiCleaner.Cleanable =
-        JavaLangRefCleanable(cleaner.register(value, cleanUpTask))
+        AndroidSystemCleanable(cleaner.register(value, cleanUpTask))
 }
 
-private class JavaLangRefCleanable(
-    val cleanable: java.lang.ref.Cleaner.Cleanable
+@RequiresApi(Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
+private class AndroidSystemCleanable(
+    private val cleanable: java.lang.ref.Cleaner.Cleanable,
 ) : UniffiCleaner.Cleanable {
     override fun clean() = cleanable.clean()
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUByte: FfiConverter<UByte, Byte> {
+    override fun lift(value: Byte): UByte {
+        return value.toUByte()
+    }
+
+    override fun read(buf: ByteBuffer): UByte {
+        return lift(buf.get())
+    }
+
+    override fun lower(value: UByte): Byte {
+        return value.toByte()
+    }
+
+    override fun allocationSize(value: UByte) = 1UL
+
+    override fun write(value: UByte, buf: ByteBuffer) {
+        buf.put(value.toByte())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterUShort: FfiConverter<UShort, Short> {
+    override fun lift(value: Short): UShort {
+        return value.toUShort()
+    }
+
+    override fun read(buf: ByteBuffer): UShort {
+        return lift(buf.getShort())
+    }
+
+    override fun lower(value: UShort): Short {
+        return value.toShort()
+    }
+
+    override fun allocationSize(value: UShort) = 2UL
+
+    override fun write(value: UShort, buf: ByteBuffer) {
+        buf.putShort(value.toShort())
+    }
 }
 
 /**
@@ -1335,6 +1788,29 @@ public object FfiConverterUInt: FfiConverter<UInt, Int> {
 
     override fun write(value: UInt, buf: ByteBuffer) {
         buf.putInt(value.toInt())
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterLong: FfiConverter<Long, Long> {
+    override fun lift(value: Long): Long {
+        return value
+    }
+
+    override fun read(buf: ByteBuffer): Long {
+        return buf.getLong()
+    }
+
+    override fun lower(value: Long): Long {
+        return value
+    }
+
+    override fun allocationSize(value: Long) = 8UL
+
+    override fun write(value: Long, buf: ByteBuffer) {
+        buf.putLong(value)
     }
 }
 
@@ -1434,6 +1910,574 @@ public object FfiConverterByteArray: FfiConverterRustBuffer<ByteArray> {
     override fun write(value: ByteArray, buf: ByteBuffer) {
         buf.putInt(value.size)
         buf.put(value)
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
+// to the live Rust struct on the other side of the FFI.
+//
+// Each instance implements core operations for working with the Rust `Arc<T>` and the
+// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque pointer to the underlying Rust struct.
+//     Method calls need to read this pointer from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its pointer should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the pointer, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
+//      before it can pass the pointer over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * One-shot cancellation capability for a single mobile connection attempt.
+ *
+ * `cancel` is the only mobile-session-adjacent operation designed to run from
+ * an Android lifecycle thread while `connect_*_cancellable` is blocked on the
+ * serialized native runtime thread. It never locks or closes `VeilClient`.
+ */
+public interface MobileConnectCancellationInterface {
+
+    /**
+     * Request cancellation without waiting for the mobile client mutex.
+     * Repeated calls are harmless and cancellation remains sticky.
+     */
+    fun `cancel`()
+
+    companion object
+}
+
+/**
+ * One-shot cancellation capability for a single mobile connection attempt.
+ *
+ * `cancel` is the only mobile-session-adjacent operation designed to run from
+ * an Android lifecycle thread while `connect_*_cancellable` is blocked on the
+ * serialized native runtime thread. It never locks or closes `VeilClient`.
+ */
+open class MobileConnectCancellation: Disposable, AutoCloseable, MobileConnectCancellationInterface
+{
+
+    constructor(pointer: Pointer) {
+        this.pointer = pointer
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    /**
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noPointer: NoPointer) {
+        this.pointer = null
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+    constructor() :
+        this(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_mobileconnectcancellation_new(
+        _status)
+}
+    )
+
+    protected val pointer: Pointer?
+    protected val cleanable: UniffiCleaner.Cleanable
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the pointer being freed concurrently.
+        try {
+            return block(this.uniffiClonePointer())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+        override fun run() {
+            pointer?.let { ptr ->
+                uniffiRustCall { status ->
+                    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_free_mobileconnectcancellation(ptr, status)
+                }
+            }
+        }
+    }
+
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.uniffi_veil_ffi_fn_clone_mobileconnectcancellation(pointer!!, status)
+        }
+    }
+
+
+    /**
+     * Request cancellation without waiting for the mobile client mutex.
+     * Repeated calls are harmless and cancellation remains sticky.
+     */override fun `cancel`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobileconnectcancellation_cancel(
+        it, _status)
+}
+    }
+
+
+
+
+
+
+
+    companion object
+
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileConnectCancellation: FfiConverter<MobileConnectCancellation, Pointer> {
+
+    override fun lower(value: MobileConnectCancellation): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): MobileConnectCancellation {
+        return MobileConnectCancellation(value)
+    }
+
+    override fun read(buf: ByteBuffer): MobileConnectCancellation {
+        // The Rust code always writes pointers as 8 bytes, and will
+        // fail to compile if they don't fit.
+        return lift(Pointer(buf.getLong()))
+    }
+
+    override fun allocationSize(value: MobileConnectCancellation) = 8UL
+
+    override fun write(value: MobileConnectCancellation, buf: ByteBuffer) {
+        // The Rust code always expects pointers written as 8 bytes,
+        // and will fail to compile if they don't fit.
+        buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
+// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
+// to the live Rust struct on the other side of the FFI.
+//
+// Each instance implements core operations for working with the Rust `Arc<T>` and the
+// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque pointer to the underlying Rust struct.
+//     Method calls need to read this pointer from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its pointer should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the pointer, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
+//      before it can pass the pointer over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Minimal decrypted Direct-text row allowed to cross the native UI boundary.
+ * Sender keys, ciphertext, protocol headers, author key snapshots, reply
+ * metadata, attachment keys, and raw database handles are intentionally
+ * absent.
+ */
+public interface MobileDirectMessageDataInterface {
+
+    fun `delivery`(): MobileDirectMessageDelivery
+
+    fun `direction`(): MobileDirectMessageDirection
+
+    fun `messageId`(): kotlin.String
+
+    fun `text`(): kotlin.String
+
+    fun `timestampMs`(): kotlin.Long?
+
+    companion object
+}
+
+/**
+ * Minimal decrypted Direct-text row allowed to cross the native UI boundary.
+ * Sender keys, ciphertext, protocol headers, author key snapshots, reply
+ * metadata, attachment keys, and raw database handles are intentionally
+ * absent.
+ */
+open class MobileDirectMessageData: Disposable, AutoCloseable, MobileDirectMessageDataInterface
+{
+
+    constructor(pointer: Pointer) {
+        this.pointer = pointer
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    /**
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noPointer: NoPointer) {
+        this.pointer = null
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    protected val pointer: Pointer?
+    protected val cleanable: UniffiCleaner.Cleanable
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the pointer being freed concurrently.
+        try {
+            return block(this.uniffiClonePointer())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+        override fun run() {
+            pointer?.let { ptr ->
+                uniffiRustCall { status ->
+                    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_free_mobiledirectmessagedata(ptr, status)
+                }
+            }
+        }
+    }
+
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.uniffi_veil_ffi_fn_clone_mobiledirectmessagedata(pointer!!, status)
+        }
+    }
+
+    override fun `delivery`(): MobileDirectMessageDelivery {
+            return FfiConverterTypeMobileDirectMessageDelivery.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobiledirectmessagedata_delivery(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+    override fun `direction`(): MobileDirectMessageDirection {
+            return FfiConverterTypeMobileDirectMessageDirection.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobiledirectmessagedata_direction(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+    override fun `messageId`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobiledirectmessagedata_message_id(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+    override fun `text`(): kotlin.String {
+            return FfiConverterString.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobiledirectmessagedata_text(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+    override fun `timestampMs`(): kotlin.Long? {
+            return FfiConverterOptionalLong.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_mobiledirectmessagedata_timestamp_ms(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+
+
+
+    companion object
+
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectMessageData: FfiConverter<MobileDirectMessageData, Pointer> {
+
+    override fun lower(value: MobileDirectMessageData): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): MobileDirectMessageData {
+        return MobileDirectMessageData(value)
+    }
+
+    override fun read(buf: ByteBuffer): MobileDirectMessageData {
+        // The Rust code always writes pointers as 8 bytes, and will
+        // fail to compile if they don't fit.
+        return lift(Pointer(buf.getLong()))
+    }
+
+    override fun allocationSize(value: MobileDirectMessageData) = 8UL
+
+    override fun write(value: MobileDirectMessageData, buf: ByteBuffer) {
+        // The Rust code always expects pointers written as 8 bytes,
+        // and will fail to compile if they don't fit.
+        buf.putLong(Pointer.nativeValue(lower(value)))
     }
 }
 
@@ -1684,11 +2728,27 @@ open class VeilIdentity: Disposable, AutoCloseable, VeilIdentityInterface
 
     companion object {
 
+    /**
+     * Compatibility constructor for non-mobile callers. Android must use
+     * `from_mnemonic_bytes` so its decrypted mnemonic never becomes a JVM
+     * `String`.
+     */
     @Throws(VeilException::class) fun `fromMnemonic`(`mnemonic`: kotlin.String): VeilIdentity {
             return FfiConverterTypeVeilIdentity.lift(
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic(
         FfiConverterString.lower(`mnemonic`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(VeilException::class) fun `fromMnemonicBytes`(`mnemonicUtf8`: kotlin.ByteArray): VeilIdentity {
+            return FfiConverterTypeVeilIdentity.lift(
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilidentity_from_mnemonic_bytes(
+        FfiConverterByteArray.lower(`mnemonicUtf8`),_status)
 }
     )
     }
@@ -1840,16 +2900,178 @@ public object FfiConverterTypeVeilIdentity: FfiConverter<VeilIdentity, Pointer> 
  * Native mobile session backed by the same SQLCipher/per-device engine as
  * desktop. Account authentication and request signatures never cross into
  * JavaScript; Kotlin receives only bounded public binding metadata.
+ *
+ * Any operation needing more than one guard must acquire them in this order:
+ * `direct_sync` -> `binding` -> `client`. Lifecycle invalidation never waits
+ * for `direct_sync` while retaining `client`, preventing a reconnect/history
+ * callback inversion from deadlocking the serialized Android runtime. Initial
+ * authentication is the deliberate exception: it holds `client` while
+ * publishing a previously invalidated `binding`; no current Direct lease can
+ * exist until that publication has completed.
  */
 public interface VeilMobileSessionInterface {
 
     fun `authenticatedBinding`(): MobileAuthenticatedBinding
 
+    /**
+     * Start an object-bound Direct directory sync for the exact current
+     * WebSocket generation. The random token never crosses into JavaScript;
+     * Kotlin must return it with every raw REST response.
+     */
+    fun `beginDirectSync`(): MobileDirectSyncLease
+
+    /**
+     * Pump authenticated WebSocket events into the shared bounded deferred
+     * FIFO while REST bootstrap/history is still in progress. This method
+     * never drains or publishes the FIFO; the separate bounded replay method
+     * owns the only history-to-live transition to Ready.
+     */
+    fun `bufferDirectLiveEventsDuringSync`(`leaseToken`: kotlin.String): MobileDirectLiveBufferProgress
+
+    fun `cancelDirectSync`(`leaseToken`: kotlin.String)
+
     fun `connect`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String): MobileAuthenticatedBinding
+
+    /**
+     * Connect with lifecycle-safe cooperative cancellation.
+     *
+     * Cancelling never closes this UniFFI object from another thread. Instead,
+     * it wakes the in-flight future so the serialized native thread can tear
+     * down the partially-open transport and clear its authenticated binding.
+     */
+    fun `connectCancellable`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `cancellation`: MobileConnectCancellation): MobileAuthenticatedBinding
+
+    /**
+     * Connect a newly enrolled account with a single-use Node Access Pass.
+     * The pass remains in native memory, is never returned in diagnostics,
+     * and is zeroized after this connection attempt (including early errors).
+     */
+    fun `connectWithNodeAccessPass`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray): MobileAuthenticatedBinding
+
+    /**
+     * Connect a newly enrolled account with cooperative lifecycle
+     * cancellation. The access pass remains zeroized on every exit path.
+     */
+    fun `connectWithNodeAccessPassCancellable`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray, `cancellation`: MobileConnectCancellation): MobileAuthenticatedBinding
+
+    /**
+     * Return coarse, advisory send readiness for one exact Direct route under
+     * the current Ready lease.
+     *
+     * Every malformed, stale, denied, poisoned, disconnected, or revoked
+     * state collapses to `Unavailable`. The result exposes neither denial
+     * detail nor key material and must never be treated as a send capability:
+     * a future send operation must repeat all guards atomically.
+     */
+    fun `directSendReadiness`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectSendReadiness
 
     fun `disconnect`()
 
-    fun `signRestRequest`(`canonicalServerOrigin`: kotlin.String, `method`: kotlin.String, `requestTarget`: kotlin.String, `body`: kotlin.ByteArray): RestSignatureData
+    /**
+     * Validate and install one raw directory response under the exact lease
+     * that issued its request. Binding and client guards stay held across the
+     * mutation, making reconnect/disconnect linearize before or after it.
+     */
+    fun `installDirectDirectoryPage`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectDirectoryPageData
+
+    /**
+     * Install one bounded history page and return only a coarse typed
+     * scheduler outcome. Conversation rejection is isolated; uncertain local
+     * storage is a sticky global abort for this authenticated generation.
+     */
+    fun `installDirectHistoryResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectHistoryProgress
+
+    fun `installDirectPrekeyBundle`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `conversationId`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectPreKeyResult
+
+    /**
+     * Install one own-prekey count or upload response under the exact native
+     * lease/request capability. A count never opens the directory; a valid
+     * upload acknowledgement is the sole transition to `publication_complete`.
+     */
+    fun `installOwnPrekeyResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectOwnPreKeyProgress
+
+    /**
+     * Load the exact mobile reconnect target selected by successful mobile
+     * authentication. No Node Access Pass or bearer credential is
+     * persisted or returned through this interface.
+     */
+    fun `mobileReconnectTarget`(): MobileReconnectTarget?
+
+    fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest
+
+    /**
+     * Prepare one peer-prekey fetch only while the exact live route still
+     * authoritatively needs a session. The advisory readiness result is never
+     * accepted as a capability: every guard is repeated here while retaining
+     * `direct_sync -> binding -> client`.
+     */
+    fun `prepareDirectPrekeyRequest`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectRestRequest
+
+    /**
+     * Prepare exactly one immutable Direct-history GET. The scheduler owns
+     * conversation order and cursors; Android can only transport the returned
+     * capability. Repeating this operation before installation returns the
+     * same immutable request token and bytes.
+     */
+    fun `prepareNextDirectHistoryRequest`(`leaseToken`: kotlin.String): MobileDirectHistoryNext
+
+    /**
+     * Prepare the next origin-scoped own-prekey bootstrap request. A durable
+     * pending publication is retried immediately; otherwise native first
+     * obtains the exact local-device count and then prepares a persisted POST.
+     * Kotlin receives public wire bytes but never chooses the target, method,
+     * key ids, or whether a fresh batch may be generated.
+     */
+    fun `prepareOwnPrekeyRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest
+
+    /**
+     * Return a bounded UI projection for exactly one authenticated Direct.
+     *
+     * The caller supplies the conversation id it is about to render. Native
+     * code checks the current directory lease, the exact live-replay
+     * availability, and the guarded client projection while retaining the
+     * documented `direct_sync -> binding -> client` lock order. Every denied
+     * state is collapsed to the same opaque result with no identifiers.
+     */
+    fun `projectDirectMessages`(`conversationId`: kotlin.String): MobileDirectMessageProjection
+
+    /**
+     * Drain one bounded, authenticated Direct live-replay turn.
+     *
+     * The history-to-live handoff reaches `Ready` only after the shared FIFO
+     * explicitly reports quiescence. A full batch must be scheduled again;
+     * terminal transport or uncertain SQLCipher state poisons this lease and
+     * never opens the renderer projection boundary.
+     */
+    fun `replayDirectLiveEvents`(`leaseToken`: kotlin.String): MobileDirectLiveReplayProgress
+
+    /**
+     * Replay one native-owned FIFO page of the exact durable Direct outbox.
+     *
+     * This barrier is available only after authenticated history/live replay
+     * reached the exact lease's Ready phase. The cursor never crosses FFI and
+     * is reset to `None` by construction for every new lease. Renderer and
+     * send projection guards remain closed until a bounded turn reports the
+     * end of the queue.
+     */
+    fun `replayDirectOutbox`(`leaseToken`: kotlin.String): MobileDirectOutboxReplayProgress
+
+    /**
+     * Atomically accept one explicit Direct text intent under the exact Ready
+     * lease. Every authority guard is repeated while retaining the documented
+     * `direct_sync -> binding -> client` lock order. No message ID, sequence,
+     * ciphertext or error detail crosses FFI.
+     */
+    fun `sendDirectText`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String, `plaintextUtf8`: kotlin.ByteArray): MobileDirectTextSendOutcome
+
+    /**
+     * Sign only the exact native-owned Direct request identified by the
+     * current lease and request capability. The transport never supplies
+     * method, target, or body to the signing boundary. Peer-prekey GETs repeat
+     * the complete live route guard before and after signing and release at
+     * most one signature because each server fetch consumes an OPK.
+     */
+    fun `signDirectRestRequest`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String): RestSignatureData
 
     companion object
 }
@@ -1858,6 +3080,14 @@ public interface VeilMobileSessionInterface {
  * Native mobile session backed by the same SQLCipher/per-device engine as
  * desktop. Account authentication and request signatures never cross into
  * JavaScript; Kotlin receives only bounded public binding metadata.
+ *
+ * Any operation needing more than one guard must acquire them in this order:
+ * `direct_sync` -> `binding` -> `client`. Lifecycle invalidation never waits
+ * for `direct_sync` while retaining `client`, preventing a reconnect/history
+ * callback inversion from deadlocking the serialized Android runtime. Initial
+ * authentication is the deliberate exception: it holds `client` while
+ * publishing a previously invalidated `binding`; no current Direct lease can
+ * exist until that publication has completed.
  */
 open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterface
 {
@@ -1955,12 +3185,137 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
+    /**
+     * Start an object-bound Direct directory sync for the exact current
+     * WebSocket generation. The random token never crosses into JavaScript;
+     * Kotlin must return it with every raw REST response.
+     */
+    @Throws(VeilException::class)override fun `beginDirectSync`(): MobileDirectSyncLease {
+            return FfiConverterTypeMobileDirectSyncLease.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_begin_direct_sync(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Pump authenticated WebSocket events into the shared bounded deferred
+     * FIFO while REST bootstrap/history is still in progress. This method
+     * never drains or publishes the FIFO; the separate bounded replay method
+     * owns the only history-to-live transition to Ready.
+     */
+    @Throws(VeilException::class)override fun `bufferDirectLiveEventsDuringSync`(`leaseToken`: kotlin.String): MobileDirectLiveBufferProgress {
+            return FfiConverterTypeMobileDirectLiveBufferProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_buffer_direct_live_events_during_sync(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `cancelDirectSync`(`leaseToken`: kotlin.String)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_cancel_direct_sync(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+
+
+
+
     @Throws(VeilException::class)override fun `connect`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String): MobileAuthenticatedBinding {
             return FfiConverterTypeMobileAuthenticatedBinding.lift(
     callWithPointer {
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_connect(
         it, FfiConverterString.lower(`websocketUrl`),FfiConverterString.lower(`canonicalServerOrigin`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Connect with lifecycle-safe cooperative cancellation.
+     *
+     * Cancelling never closes this UniFFI object from another thread. Instead,
+     * it wakes the in-flight future so the serialized native thread can tear
+     * down the partially-open transport and clear its authenticated binding.
+     */
+    @Throws(VeilException::class)override fun `connectCancellable`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `cancellation`: MobileConnectCancellation): MobileAuthenticatedBinding {
+            return FfiConverterTypeMobileAuthenticatedBinding.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_connect_cancellable(
+        it, FfiConverterString.lower(`websocketUrl`),FfiConverterString.lower(`canonicalServerOrigin`),FfiConverterTypeMobileConnectCancellation.lower(`cancellation`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Connect a newly enrolled account with a single-use Node Access Pass.
+     * The pass remains in native memory, is never returned in diagnostics,
+     * and is zeroized after this connection attempt (including early errors).
+     */
+    @Throws(VeilException::class)override fun `connectWithNodeAccessPass`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray): MobileAuthenticatedBinding {
+            return FfiConverterTypeMobileAuthenticatedBinding.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass(
+        it, FfiConverterString.lower(`websocketUrl`),FfiConverterString.lower(`canonicalServerOrigin`),FfiConverterByteArray.lower(`nodeAccessPass`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Connect a newly enrolled account with cooperative lifecycle
+     * cancellation. The access pass remains zeroized on every exit path.
+     */
+    @Throws(VeilException::class)override fun `connectWithNodeAccessPassCancellable`(`websocketUrl`: kotlin.String, `canonicalServerOrigin`: kotlin.String, `nodeAccessPass`: kotlin.ByteArray, `cancellation`: MobileConnectCancellation): MobileAuthenticatedBinding {
+            return FfiConverterTypeMobileAuthenticatedBinding.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_connect_with_node_access_pass_cancellable(
+        it, FfiConverterString.lower(`websocketUrl`),FfiConverterString.lower(`canonicalServerOrigin`),FfiConverterByteArray.lower(`nodeAccessPass`),FfiConverterTypeMobileConnectCancellation.lower(`cancellation`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Return coarse, advisory send readiness for one exact Direct route under
+     * the current Ready lease.
+     *
+     * Every malformed, stale, denied, poisoned, disconnected, or revoked
+     * state collapses to `Unavailable`. The result exposes neither denial
+     * detail nor key material and must never be treated as a send capability:
+     * a future send operation must repeat all guards atomically.
+     */override fun `directSendReadiness`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectSendReadiness {
+            return FfiConverterTypeMobileDirectSendReadiness.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_direct_send_readiness(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`conversationId`),_status)
 }
     }
     )
@@ -1980,12 +3335,259 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
 
 
-    @Throws(VeilException::class)override fun `signRestRequest`(`canonicalServerOrigin`: kotlin.String, `method`: kotlin.String, `requestTarget`: kotlin.String, `body`: kotlin.ByteArray): RestSignatureData {
+    /**
+     * Validate and install one raw directory response under the exact lease
+     * that issued its request. Binding and client guards stay held across the
+     * mutation, making reconnect/disconnect linearize before or after it.
+     */
+    @Throws(VeilException::class)override fun `installDirectDirectoryPage`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectDirectoryPageData {
+            return FfiConverterTypeMobileDirectDirectoryPageData.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_directory_page(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Install one bounded history page and return only a coarse typed
+     * scheduler outcome. Conversation rejection is isolated; uncertain local
+     * storage is a sticky global abort for this authenticated generation.
+     */
+    @Throws(VeilException::class)override fun `installDirectHistoryResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectHistoryProgress {
+            return FfiConverterTypeMobileDirectHistoryProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_history_response(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `installDirectPrekeyBundle`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `conversationId`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectPreKeyResult {
+            return FfiConverterTypeMobileDirectPreKeyResult.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_direct_prekey_bundle(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterString.lower(`conversationId`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Install one own-prekey count or upload response under the exact native
+     * lease/request capability. A count never opens the directory; a valid
+     * upload acknowledgement is the sole transition to `publication_complete`.
+     */
+    @Throws(VeilException::class)override fun `installOwnPrekeyResponse`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String, `response`: kotlin.ByteArray): MobileDirectOwnPreKeyProgress {
+            return FfiConverterTypeMobileDirectOwnPreKeyProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_install_own_prekey_response(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),FfiConverterByteArray.lower(`response`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Load the exact mobile reconnect target selected by successful mobile
+     * authentication. No Node Access Pass or bearer credential is
+     * persisted or returned through this interface.
+     */
+    @Throws(VeilException::class)override fun `mobileReconnectTarget`(): MobileReconnectTarget? {
+            return FfiConverterOptionalTypeMobileReconnectTarget.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_mobile_reconnect_target(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `prepareDirectDirectoryRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest {
+            return FfiConverterTypeMobileDirectRestRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_directory_request(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Prepare one peer-prekey fetch only while the exact live route still
+     * authoritatively needs a session. The advisory readiness result is never
+     * accepted as a capability: every guard is repeated here while retaining
+     * `direct_sync -> binding -> client`.
+     */
+    @Throws(VeilException::class)override fun `prepareDirectPrekeyRequest`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String): MobileDirectRestRequest {
+            return FfiConverterTypeMobileDirectRestRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_direct_prekey_request(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`conversationId`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Prepare exactly one immutable Direct-history GET. The scheduler owns
+     * conversation order and cursors; Android can only transport the returned
+     * capability. Repeating this operation before installation returns the
+     * same immutable request token and bytes.
+     */
+    @Throws(VeilException::class)override fun `prepareNextDirectHistoryRequest`(`leaseToken`: kotlin.String): MobileDirectHistoryNext {
+            return FfiConverterTypeMobileDirectHistoryNext.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_next_direct_history_request(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Prepare the next origin-scoped own-prekey bootstrap request. A durable
+     * pending publication is retried immediately; otherwise native first
+     * obtains the exact local-device count and then prepares a persisted POST.
+     * Kotlin receives public wire bytes but never chooses the target, method,
+     * key ids, or whether a fresh batch may be generated.
+     */
+    @Throws(VeilException::class)override fun `prepareOwnPrekeyRequest`(`leaseToken`: kotlin.String): MobileDirectRestRequest {
+            return FfiConverterTypeMobileDirectRestRequest.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_prepare_own_prekey_request(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Return a bounded UI projection for exactly one authenticated Direct.
+     *
+     * The caller supplies the conversation id it is about to render. Native
+     * code checks the current directory lease, the exact live-replay
+     * availability, and the guarded client projection while retaining the
+     * documented `direct_sync -> binding -> client` lock order. Every denied
+     * state is collapsed to the same opaque result with no identifiers.
+     */
+    @Throws(VeilException::class)override fun `projectDirectMessages`(`conversationId`: kotlin.String): MobileDirectMessageProjection {
+            return FfiConverterTypeMobileDirectMessageProjection.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_project_direct_messages(
+        it, FfiConverterString.lower(`conversationId`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Drain one bounded, authenticated Direct live-replay turn.
+     *
+     * The history-to-live handoff reaches `Ready` only after the shared FIFO
+     * explicitly reports quiescence. A full batch must be scheduled again;
+     * terminal transport or uncertain SQLCipher state poisons this lease and
+     * never opens the renderer projection boundary.
+     */
+    @Throws(VeilException::class)override fun `replayDirectLiveEvents`(`leaseToken`: kotlin.String): MobileDirectLiveReplayProgress {
+            return FfiConverterTypeMobileDirectLiveReplayProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_live_events(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Replay one native-owned FIFO page of the exact durable Direct outbox.
+     *
+     * This barrier is available only after authenticated history/live replay
+     * reached the exact lease's Ready phase. The cursor never crosses FFI and
+     * is reset to `None` by construction for every new lease. Renderer and
+     * send projection guards remain closed until a bounded turn reports the
+     * end of the queue.
+     */
+    @Throws(VeilException::class)override fun `replayDirectOutbox`(`leaseToken`: kotlin.String): MobileDirectOutboxReplayProgress {
+            return FfiConverterTypeMobileDirectOutboxReplayProgress.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_replay_direct_outbox(
+        it, FfiConverterString.lower(`leaseToken`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Atomically accept one explicit Direct text intent under the exact Ready
+     * lease. Every authority guard is repeated while retaining the documented
+     * `direct_sync -> binding -> client` lock order. No message ID, sequence,
+     * ciphertext or error detail crosses FFI.
+     */
+    @Throws(VeilException::class)override fun `sendDirectText`(`leaseToken`: kotlin.String, `conversationId`: kotlin.String, `plaintextUtf8`: kotlin.ByteArray): MobileDirectTextSendOutcome {
+            return FfiConverterTypeMobileDirectTextSendOutcome.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_send_direct_text(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`conversationId`),FfiConverterByteArray.lower(`plaintextUtf8`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Sign only the exact native-owned Direct request identified by the
+     * current lease and request capability. The transport never supplies
+     * method, target, or body to the signing boundary. Peer-prekey GETs repeat
+     * the complete live route guard before and after signing and release at
+     * most one signature because each server fetch consumes an OPK.
+     */
+    @Throws(VeilException::class)override fun `signDirectRestRequest`(`leaseToken`: kotlin.String, `requestToken`: kotlin.String): RestSignatureData {
             return FfiConverterTypeRestSignatureData.lift(
     callWithPointer {
     uniffiRustCallWithError(VeilException) { _status ->
-    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_sign_rest_request(
-        it, FfiConverterString.lower(`canonicalServerOrigin`),FfiConverterString.lower(`method`),FfiConverterString.lower(`requestTarget`),FfiConverterByteArray.lower(`body`),_status)
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilmobilesession_sign_direct_rest_request(
+        it, FfiConverterString.lower(`leaseToken`),FfiConverterString.lower(`requestToken`),_status)
 }
     }
     )
@@ -1997,11 +3599,27 @@ open class VeilMobileSession: Disposable, AutoCloseable, VeilMobileSessionInterf
 
     companion object {
 
+    /**
+     * Compatibility constructor for non-mobile callers. Android must pass
+     * decrypted mnemonic bytes to `from_mnemonic_bytes` and clear its own
+     * `ByteArray` immediately after this call.
+     */
     @Throws(VeilException::class) fun `fromMnemonic`(`mnemonic`: kotlin.String, `databasePath`: kotlin.String): VeilMobileSession {
             return FfiConverterTypeVeilMobileSession.lift(
     uniffiRustCallWithError(VeilException) { _status ->
     UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic(
         FfiConverterString.lower(`mnemonic`),FfiConverterString.lower(`databasePath`),_status)
+}
+    )
+    }
+
+
+
+    @Throws(VeilException::class) fun `fromMnemonicBytes`(`mnemonicUtf8`: kotlin.ByteArray, `databasePath`: kotlin.String): VeilMobileSession {
+            return FfiConverterTypeVeilMobileSession.lift(
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilmobilesession_from_mnemonic_bytes(
+        FfiConverterByteArray.lower(`mnemonicUtf8`),FfiConverterString.lower(`databasePath`),_status)
 }
     )
     }
@@ -2342,6 +3960,487 @@ public object FfiConverterTypeVeilRatchet: FfiConverter<VeilRatchet, Pointer> {
 }
 
 
+// This template implements a class for working with a Rust struct via a Pointer/Arc<T>
+// to the live Rust struct on the other side of the FFI.
+//
+// Each instance implements core operations for working with the Rust `Arc<T>` and the
+// Kotlin Pointer to work with the live Rust struct on the other side of the FFI.
+//
+// There's some subtlety here, because we have to be careful not to operate on a Rust
+// struct after it has been dropped, and because we must expose a public API for freeing
+// theq Kotlin wrapper object in lieu of reliable finalizers. The core requirements are:
+//
+//   * Each instance holds an opaque pointer to the underlying Rust struct.
+//     Method calls need to read this pointer from the object's state and pass it in to
+//     the Rust FFI.
+//
+//   * When an instance is no longer needed, its pointer should be passed to a
+//     special destructor function provided by the Rust FFI, which will drop the
+//     underlying Rust struct.
+//
+//   * Given an instance, calling code is expected to call the special
+//     `destroy` method in order to free it after use, either by calling it explicitly
+//     or by using a higher-level helper like the `use` method. Failing to do so risks
+//     leaking the underlying Rust struct.
+//
+//   * We can't assume that calling code will do the right thing, and must be prepared
+//     to handle Kotlin method calls executing concurrently with or even after a call to
+//     `destroy`, and to handle multiple (possibly concurrent!) calls to `destroy`.
+//
+//   * We must never allow Rust code to operate on the underlying Rust struct after
+//     the destructor has been called, and must never call the destructor more than once.
+//     Doing so may trigger memory unsafety.
+//
+//   * To mitigate many of the risks of leaking memory and use-after-free unsafety, a `Cleaner`
+//     is implemented to call the destructor when the Kotlin object becomes unreachable.
+//     This is done in a background thread. This is not a panacea, and client code should be aware that
+//      1. the thread may starve if some there are objects that have poorly performing
+//     `drop` methods or do significant work in their `drop` methods.
+//      2. the thread is shared across the whole library. This can be tuned by using `android_cleaner = true`,
+//         or `android = true` in the [`kotlin` section of the `uniffi.toml` file](https://mozilla.github.io/uniffi-rs/kotlin/configuration.html).
+//
+// If we try to implement this with mutual exclusion on access to the pointer, there is the
+// possibility of a race between a method call and a concurrent call to `destroy`:
+//
+//    * Thread A starts a method call, reads the value of the pointer, but is interrupted
+//      before it can pass the pointer over the FFI to Rust.
+//    * Thread B calls `destroy` and frees the underlying Rust struct.
+//    * Thread A resumes, passing the already-read pointer value to Rust and triggering
+//      a use-after-free.
+//
+// One possible solution would be to use a `ReadWriteLock`, with each method call taking
+// a read lock (and thus allowed to run concurrently) and the special `destroy` method
+// taking a write lock (and thus blocking on live method calls). However, we aim not to
+// generate methods with any hidden blocking semantics, and a `destroy` method that might
+// block if called incorrectly seems to meet that bar.
+//
+// So, we achieve our goals by giving each instance an associated `AtomicLong` counter to track
+// the number of in-flight method calls, and an `AtomicBoolean` flag to indicate whether `destroy`
+// has been called. These are updated according to the following rules:
+//
+//    * The initial value of the counter is 1, indicating a live object with no in-flight calls.
+//      The initial value for the flag is false.
+//
+//    * At the start of each method call, we atomically check the counter.
+//      If it is 0 then the underlying Rust struct has already been destroyed and the call is aborted.
+//      If it is nonzero them we atomically increment it by 1 and proceed with the method call.
+//
+//    * At the end of each method call, we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+//    * When `destroy` is called, we atomically flip the flag from false to true.
+//      If the flag was already true we silently fail.
+//      Otherwise we atomically decrement and check the counter.
+//      If it has reached zero then we destroy the underlying Rust struct.
+//
+// Astute readers may observe that this all sounds very similar to the way that Rust's `Arc<T>` works,
+// and indeed it is, with the addition of a flag to guard against multiple calls to `destroy`.
+//
+// The overall effect is that the underlying Rust struct is destroyed only when `destroy` has been
+// called *and* all in-flight method calls have completed, avoiding violating any of the expectations
+// of the underlying Rust code.
+//
+// This makes a cleaner a better alternative to _not_ calling `destroy()` as
+// and when the object is finished with, but the abstraction is not perfect: if the Rust object's `drop`
+// method is slow, and/or there are many objects to cleanup, and it's on a low end Android device, then the cleaner
+// thread may be starved, and the app will leak memory.
+//
+// In this case, `destroy`ing manually may be a better solution.
+//
+// The cleaner can live side by side with the manual calling of `destroy`. In the order of responsiveness, uniffi objects
+// with Rust peers are reclaimed:
+//
+// 1. By calling the `destroy` method of the object, which calls `rustObject.free()`. If that doesn't happen:
+// 2. When the object becomes unreachable, AND the Cleaner thread gets to call `rustObject.free()`. If the thread is starved then:
+// 3. The memory is reclaimed when the process terminates.
+//
+// [1] https://stackoverflow.com/questions/24376768/can-java-finalize-an-object-when-it-is-still-in-scope/24380219
+//
+
+
+/**
+ * Opaque, serialized recovery setup state for Android.
+ *
+ * The object deliberately exposes only scalar word indices and positions.
+ * A complete recovery phrase is never represented by a UniFFI `String` or
+ * collection. Android maps indices through its pinned public BIP39 English
+ * dictionary and assembles one short-lived mutable ASCII buffer only after
+ * this draft authorizes commit.
+ */
+public interface VeilRecoveryDraftInterface {
+
+    /**
+     * Terminal, idempotent cancellation. Poison recovery is used only to
+     * erase state; no secret operation is permitted afterwards.
+     */
+    fun `cancel`()
+
+    fun `challengeChoiceCount`(): kotlin.UByte
+
+    fun `challengeChoiceWordIndex`(`slot`: kotlin.UByte, `choice`: kotlin.UByte): kotlin.UShort
+
+    fun `challengeCount`(): kotlin.UByte
+
+    fun `challengePosition`(`slot`: kotlin.UByte): kotlin.UByte
+
+    /**
+     * Confirm one randomized create-flow challenge. A wrong answer revokes
+     * that slot and therefore revokes commit authorization.
+     */
+    fun `confirmChallenge`(`slot`: kotlin.UByte, `chosen`: kotlin.UShort): kotlin.Boolean
+
+    /**
+     * Atomically consume the authorization immediately before provisioning.
+     * The first authorized caller wins; the draft is then zeroized and
+     * terminal. Provisioning failures must restart recovery setup.
+     */
+    fun `consumeCommitAuthorization`(): kotlin.Boolean
+
+    fun `isCommitAuthorized`(): kotlin.Boolean
+
+    /**
+     * Set one word index for the restore flow. Every edit revokes a previous
+     * checksum authorization until `validate_import` succeeds again.
+     */
+    fun `setImportWordIndex`(`position`: kotlin.UByte, `index`: kotlin.UShort)
+
+    /**
+     * Validate all imported indices and the BIP39 checksum. Invalid or
+     * incomplete input returns `false` without diagnostics derived from it.
+     */
+    fun `validateImport`(): kotlin.Boolean
+
+    fun `wordCount`(): kotlin.UByte
+
+    /**
+     * Return one generated word index for the create flow.
+     */
+    fun `wordIndex`(`position`: kotlin.UByte): kotlin.UShort
+
+    companion object
+}
+
+/**
+ * Opaque, serialized recovery setup state for Android.
+ *
+ * The object deliberately exposes only scalar word indices and positions.
+ * A complete recovery phrase is never represented by a UniFFI `String` or
+ * collection. Android maps indices through its pinned public BIP39 English
+ * dictionary and assembles one short-lived mutable ASCII buffer only after
+ * this draft authorizes commit.
+ */
+open class VeilRecoveryDraft: Disposable, AutoCloseable, VeilRecoveryDraftInterface
+{
+
+    constructor(pointer: Pointer) {
+        this.pointer = pointer
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    /**
+     * This constructor can be used to instantiate a fake object. Only used for tests. Any
+     * attempt to actually use an object constructed this way will fail as there is no
+     * connected Rust object.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    constructor(noPointer: NoPointer) {
+        this.pointer = null
+        this.cleanable = UniffiLib.CLEANER.register(this, UniffiCleanAction(pointer))
+    }
+
+    protected val pointer: Pointer?
+    protected val cleanable: UniffiCleaner.Cleanable
+
+    private val wasDestroyed = AtomicBoolean(false)
+    private val callCounter = AtomicLong(1)
+
+    override fun destroy() {
+        // Only allow a single call to this method.
+        // TODO: maybe we should log a warning if called more than once?
+        if (this.wasDestroyed.compareAndSet(false, true)) {
+            // This decrement always matches the initial count of 1 given at creation time.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    @Synchronized
+    override fun close() {
+        this.destroy()
+    }
+
+    internal inline fun <R> callWithPointer(block: (ptr: Pointer) -> R): R {
+        // Check and increment the call counter, to keep the object alive.
+        // This needs a compare-and-set retry loop in case of concurrent updates.
+        do {
+            val c = this.callCounter.get()
+            if (c == 0L) {
+                throw IllegalStateException("${this.javaClass.simpleName} object has already been destroyed")
+            }
+            if (c == Long.MAX_VALUE) {
+                throw IllegalStateException("${this.javaClass.simpleName} call counter would overflow")
+            }
+        } while (! this.callCounter.compareAndSet(c, c + 1L))
+        // Now we can safely do the method call without the pointer being freed concurrently.
+        try {
+            return block(this.uniffiClonePointer())
+        } finally {
+            // This decrement always matches the increment we performed above.
+            if (this.callCounter.decrementAndGet() == 0L) {
+                cleanable.clean()
+            }
+        }
+    }
+
+    // Use a static inner class instead of a closure so as not to accidentally
+    // capture `this` as part of the cleanable's action.
+    private class UniffiCleanAction(private val pointer: Pointer?) : Runnable {
+        override fun run() {
+            pointer?.let { ptr ->
+                uniffiRustCall { status ->
+                    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_free_veilrecoverydraft(ptr, status)
+                }
+            }
+        }
+    }
+
+    fun uniffiClonePointer(): Pointer {
+        return uniffiRustCall() { status ->
+            UniffiLib.INSTANCE.uniffi_veil_ffi_fn_clone_veilrecoverydraft(pointer!!, status)
+        }
+    }
+
+
+    /**
+     * Terminal, idempotent cancellation. Poison recovery is used only to
+     * erase state; no secret operation is permitted afterwards.
+     */override fun `cancel`()
+        =
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_cancel(
+        it, _status)
+}
+    }
+
+
+
+    override fun `challengeChoiceCount`(): kotlin.UByte {
+            return FfiConverterUByte.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_choice_count(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `challengeChoiceWordIndex`(`slot`: kotlin.UByte, `choice`: kotlin.UByte): kotlin.UShort {
+            return FfiConverterUShort.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_choice_word_index(
+        it, FfiConverterUByte.lower(`slot`),FfiConverterUByte.lower(`choice`),_status)
+}
+    }
+    )
+    }
+
+
+    override fun `challengeCount`(): kotlin.UByte {
+            return FfiConverterUByte.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_count(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    @Throws(VeilException::class)override fun `challengePosition`(`slot`: kotlin.UByte): kotlin.UByte {
+            return FfiConverterUByte.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_challenge_position(
+        it, FfiConverterUByte.lower(`slot`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Confirm one randomized create-flow challenge. A wrong answer revokes
+     * that slot and therefore revokes commit authorization.
+     */
+    @Throws(VeilException::class)override fun `confirmChallenge`(`slot`: kotlin.UByte, `chosen`: kotlin.UShort): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_confirm_challenge(
+        it, FfiConverterUByte.lower(`slot`),FfiConverterUShort.lower(`chosen`),_status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Atomically consume the authorization immediately before provisioning.
+     * The first authorized caller wins; the draft is then zeroized and
+     * terminal. Provisioning failures must restart recovery setup.
+     */override fun `consumeCommitAuthorization`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_consume_commit_authorization(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+    override fun `isCommitAuthorized`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_is_commit_authorized(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Set one word index for the restore flow. Every edit revokes a previous
+     * checksum authorization until `validate_import` succeeds again.
+     */
+    @Throws(VeilException::class)override fun `setImportWordIndex`(`position`: kotlin.UByte, `index`: kotlin.UShort)
+        =
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_set_import_word_index(
+        it, FfiConverterUByte.lower(`position`),FfiConverterUShort.lower(`index`),_status)
+}
+    }
+
+
+
+
+    /**
+     * Validate all imported indices and the BIP39 checksum. Invalid or
+     * incomplete input returns `false` without diagnostics derived from it.
+     */
+    @Throws(VeilException::class)override fun `validateImport`(): kotlin.Boolean {
+            return FfiConverterBoolean.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_validate_import(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+    override fun `wordCount`(): kotlin.UByte {
+            return FfiConverterUByte.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_word_count(
+        it, _status)
+}
+    }
+    )
+    }
+
+
+
+    /**
+     * Return one generated word index for the create flow.
+     */
+    @Throws(VeilException::class)override fun `wordIndex`(`position`: kotlin.UByte): kotlin.UShort {
+            return FfiConverterUShort.lift(
+    callWithPointer {
+    uniffiRustCallWithError(VeilException) { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_method_veilrecoverydraft_word_index(
+        it, FfiConverterUByte.lower(`position`),_status)
+}
+    }
+    )
+    }
+
+
+
+
+
+    companion object {
+         fun `newCreate`(): VeilRecoveryDraft {
+            return FfiConverterTypeVeilRecoveryDraft.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilrecoverydraft_new_create(
+        _status)
+}
+    )
+    }
+
+
+         fun `newRestore`(): VeilRecoveryDraft {
+            return FfiConverterTypeVeilRecoveryDraft.lift(
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_veil_ffi_fn_constructor_veilrecoverydraft_new_restore(
+        _status)
+}
+    )
+    }
+
+
+
+    }
+
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeVeilRecoveryDraft: FfiConverter<VeilRecoveryDraft, Pointer> {
+
+    override fun lower(value: VeilRecoveryDraft): Pointer {
+        return value.uniffiClonePointer()
+    }
+
+    override fun lift(value: Pointer): VeilRecoveryDraft {
+        return VeilRecoveryDraft(value)
+    }
+
+    override fun read(buf: ByteBuffer): VeilRecoveryDraft {
+        // The Rust code always writes pointers as 8 bytes, and will
+        // fail to compile if they don't fit.
+        return lift(Pointer(buf.getLong()))
+    }
+
+    override fun allocationSize(value: VeilRecoveryDraft) = 8UL
+
+    override fun write(value: VeilRecoveryDraft, buf: ByteBuffer) {
+        // The Rust code always expects pointers written as 8 bytes,
+        // and will fail to compile if they don't fit.
+        buf.putLong(Pointer.nativeValue(lower(value)))
+    }
+}
+
+
 
 data class AeadResult (
     var `ciphertext`: kotlin.ByteArray,
@@ -2466,6 +4565,509 @@ public object FfiConverterTypeMobileAuthenticatedBinding: FfiConverterRustBuffer
     override fun write(value: MobileAuthenticatedBinding, buf: ByteBuffer) {
             FfiConverterString.write(value.`canonicalServerOrigin`, buf)
             FfiConverterString.write(value.`userId`, buf)
+    }
+}
+
+
+
+data class MobileDirectConversationData (
+    var `conversationId`: kotlin.String,
+    var `name`: kotlin.String,
+    var `peerUserId`: kotlin.String,
+    var `peerUsername`: kotlin.String,
+    var `peerIdentityKeyHex`: kotlin.String,
+    var `peerSigningKeyHex`: kotlin.String,
+    var `needsPrekey`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectConversationData: FfiConverterRustBuffer<MobileDirectConversationData> {
+    override fun read(buf: ByteBuffer): MobileDirectConversationData {
+        return MobileDirectConversationData(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectConversationData) = (
+            FfiConverterString.allocationSize(value.`conversationId`) +
+            FfiConverterString.allocationSize(value.`name`) +
+            FfiConverterString.allocationSize(value.`peerUserId`) +
+            FfiConverterString.allocationSize(value.`peerUsername`) +
+            FfiConverterString.allocationSize(value.`peerIdentityKeyHex`) +
+            FfiConverterString.allocationSize(value.`peerSigningKeyHex`) +
+            FfiConverterBoolean.allocationSize(value.`needsPrekey`)
+    )
+
+    override fun write(value: MobileDirectConversationData, buf: ByteBuffer) {
+            FfiConverterString.write(value.`conversationId`, buf)
+            FfiConverterString.write(value.`name`, buf)
+            FfiConverterString.write(value.`peerUserId`, buf)
+            FfiConverterString.write(value.`peerUsername`, buf)
+            FfiConverterString.write(value.`peerIdentityKeyHex`, buf)
+            FfiConverterString.write(value.`peerSigningKeyHex`, buf)
+            FfiConverterBoolean.write(value.`needsPrekey`, buf)
+    }
+}
+
+
+
+data class MobileDirectDirectoryPageData (
+    var `conversations`: List<MobileDirectConversationData>,
+    var `nextCursor`: kotlin.String?,
+    var `skippedNonDirect`: kotlin.UInt,
+    var `directoryComplete`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectDirectoryPageData: FfiConverterRustBuffer<MobileDirectDirectoryPageData> {
+    override fun read(buf: ByteBuffer): MobileDirectDirectoryPageData {
+        return MobileDirectDirectoryPageData(
+            FfiConverterSequenceTypeMobileDirectConversationData.read(buf),
+            FfiConverterOptionalString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectDirectoryPageData) = (
+            FfiConverterSequenceTypeMobileDirectConversationData.allocationSize(value.`conversations`) +
+            FfiConverterOptionalString.allocationSize(value.`nextCursor`) +
+            FfiConverterUInt.allocationSize(value.`skippedNonDirect`) +
+            FfiConverterBoolean.allocationSize(value.`directoryComplete`)
+    )
+
+    override fun write(value: MobileDirectDirectoryPageData, buf: ByteBuffer) {
+            FfiConverterSequenceTypeMobileDirectConversationData.write(value.`conversations`, buf)
+            FfiConverterOptionalString.write(value.`nextCursor`, buf)
+            FfiConverterUInt.write(value.`skippedNonDirect`, buf)
+            FfiConverterBoolean.write(value.`directoryComplete`, buf)
+    }
+}
+
+
+
+data class MobileDirectHistoryNext (
+    var `request`: MobileDirectRestRequest?,
+    var `historiesTerminal`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectHistoryNext: FfiConverterRustBuffer<MobileDirectHistoryNext> {
+    override fun read(buf: ByteBuffer): MobileDirectHistoryNext {
+        return MobileDirectHistoryNext(
+            FfiConverterOptionalTypeMobileDirectRestRequest.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectHistoryNext) = (
+            FfiConverterOptionalTypeMobileDirectRestRequest.allocationSize(value.`request`) +
+            FfiConverterBoolean.allocationSize(value.`historiesTerminal`)
+    )
+
+    override fun write(value: MobileDirectHistoryNext, buf: ByteBuffer) {
+            FfiConverterOptionalTypeMobileDirectRestRequest.write(value.`request`, buf)
+            FfiConverterBoolean.write(value.`historiesTerminal`, buf)
+    }
+}
+
+
+
+data class MobileDirectHistoryProgress (
+    var `outcome`: MobileDirectHistoryOutcome,
+    var `historiesTerminal`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectHistoryProgress: FfiConverterRustBuffer<MobileDirectHistoryProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectHistoryProgress {
+        return MobileDirectHistoryProgress(
+            FfiConverterTypeMobileDirectHistoryOutcome.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectHistoryProgress) = (
+            FfiConverterTypeMobileDirectHistoryOutcome.allocationSize(value.`outcome`) +
+            FfiConverterBoolean.allocationSize(value.`historiesTerminal`)
+    )
+
+    override fun write(value: MobileDirectHistoryProgress, buf: ByteBuffer) {
+            FfiConverterTypeMobileDirectHistoryOutcome.write(value.`outcome`, buf)
+            FfiConverterBoolean.write(value.`historiesTerminal`, buf)
+    }
+}
+
+
+
+data class MobileDirectLiveBufferProgress (
+    var `bufferedEvents`: kotlin.UInt,
+    var `historySynchronized`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectLiveBufferProgress: FfiConverterRustBuffer<MobileDirectLiveBufferProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectLiveBufferProgress {
+        return MobileDirectLiveBufferProgress(
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectLiveBufferProgress) = (
+            FfiConverterUInt.allocationSize(value.`bufferedEvents`) +
+            FfiConverterBoolean.allocationSize(value.`historySynchronized`)
+    )
+
+    override fun write(value: MobileDirectLiveBufferProgress, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`bufferedEvents`, buf)
+            FfiConverterBoolean.write(value.`historySynchronized`, buf)
+    }
+}
+
+
+
+/**
+ * Aggregate-only result of one bounded authenticated Direct live-replay turn.
+ *
+ * No message, conversation, account, ciphertext, plaintext, or key identifier
+ * crosses this boundary. Android schedules another turn when requested and
+ * may expose Direct projections only after `ready` becomes true.
+ */
+data class MobileDirectLiveReplayProgress (
+    var `consumed`: kotlin.UInt,
+    var `projectionChanged`: kotlin.Boolean,
+    var `needsImmediatePump`: kotlin.Boolean,
+    /**
+     * Live history is quiescent, but the exact durable outbox still owns the
+     * renderer-opening barrier for this lease.
+     */
+    var `outboxReplayRequired`: kotlin.Boolean,
+    var `ready`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectLiveReplayProgress: FfiConverterRustBuffer<MobileDirectLiveReplayProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectLiveReplayProgress {
+        return MobileDirectLiveReplayProgress(
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectLiveReplayProgress) = (
+            FfiConverterUInt.allocationSize(value.`consumed`) +
+            FfiConverterBoolean.allocationSize(value.`projectionChanged`) +
+            FfiConverterBoolean.allocationSize(value.`needsImmediatePump`) +
+            FfiConverterBoolean.allocationSize(value.`outboxReplayRequired`) +
+            FfiConverterBoolean.allocationSize(value.`ready`)
+    )
+
+    override fun write(value: MobileDirectLiveReplayProgress, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`consumed`, buf)
+            FfiConverterBoolean.write(value.`projectionChanged`, buf)
+            FfiConverterBoolean.write(value.`needsImmediatePump`, buf)
+            FfiConverterBoolean.write(value.`outboxReplayRequired`, buf)
+            FfiConverterBoolean.write(value.`ready`, buf)
+    }
+}
+
+
+
+data class MobileDirectMessageProjection (
+    var `availability`: MobileDirectMessageProjectionAvailability,
+    var `messages`: List<MobileDirectMessageData>
+) : Disposable {
+
+    @Suppress("UNNECESSARY_SAFE_CALL") // codegen is much simpler if we unconditionally emit safe calls here
+    override fun destroy() {
+
+    Disposable.destroy(
+        this.`availability`,
+        this.`messages`
+    )
+    }
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectMessageProjection: FfiConverterRustBuffer<MobileDirectMessageProjection> {
+    override fun read(buf: ByteBuffer): MobileDirectMessageProjection {
+        return MobileDirectMessageProjection(
+            FfiConverterTypeMobileDirectMessageProjectionAvailability.read(buf),
+            FfiConverterSequenceTypeMobileDirectMessageData.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectMessageProjection) = (
+            FfiConverterTypeMobileDirectMessageProjectionAvailability.allocationSize(value.`availability`) +
+            FfiConverterSequenceTypeMobileDirectMessageData.allocationSize(value.`messages`)
+    )
+
+    override fun write(value: MobileDirectMessageProjection, buf: ByteBuffer) {
+            FfiConverterTypeMobileDirectMessageProjectionAvailability.write(value.`availability`, buf)
+            FfiConverterSequenceTypeMobileDirectMessageData.write(value.`messages`, buf)
+    }
+}
+
+
+
+/**
+ * Aggregate-only result of one bounded exact-byte Direct outbox replay turn.
+ *
+ * Queue order, message IDs, conversation IDs, ciphertext and plaintext stay
+ * native. Android may only schedule another turn or revoke the connection.
+ */
+data class MobileDirectOutboxReplayProgress (
+    var `visited`: kotlin.UInt,
+    var `enqueued`: kotlin.UInt,
+    var `needsImmediatePump`: kotlin.Boolean,
+    var `replayComplete`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectOutboxReplayProgress: FfiConverterRustBuffer<MobileDirectOutboxReplayProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectOutboxReplayProgress {
+        return MobileDirectOutboxReplayProgress(
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectOutboxReplayProgress) = (
+            FfiConverterUInt.allocationSize(value.`visited`) +
+            FfiConverterUInt.allocationSize(value.`enqueued`) +
+            FfiConverterBoolean.allocationSize(value.`needsImmediatePump`) +
+            FfiConverterBoolean.allocationSize(value.`replayComplete`)
+    )
+
+    override fun write(value: MobileDirectOutboxReplayProgress, buf: ByteBuffer) {
+            FfiConverterUInt.write(value.`visited`, buf)
+            FfiConverterUInt.write(value.`enqueued`, buf)
+            FfiConverterBoolean.write(value.`needsImmediatePump`, buf)
+            FfiConverterBoolean.write(value.`replayComplete`, buf)
+    }
+}
+
+
+
+data class MobileDirectOwnPreKeyProgress (
+    var `publicationComplete`: kotlin.Boolean
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectOwnPreKeyProgress: FfiConverterRustBuffer<MobileDirectOwnPreKeyProgress> {
+    override fun read(buf: ByteBuffer): MobileDirectOwnPreKeyProgress {
+        return MobileDirectOwnPreKeyProgress(
+            FfiConverterBoolean.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectOwnPreKeyProgress) = (
+            FfiConverterBoolean.allocationSize(value.`publicationComplete`)
+    )
+
+    override fun write(value: MobileDirectOwnPreKeyProgress, buf: ByteBuffer) {
+            FfiConverterBoolean.write(value.`publicationComplete`, buf)
+    }
+}
+
+
+
+data class MobileDirectPreKeyResult (
+    var `status`: kotlin.String
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectPreKeyResult: FfiConverterRustBuffer<MobileDirectPreKeyResult> {
+    override fun read(buf: ByteBuffer): MobileDirectPreKeyResult {
+        return MobileDirectPreKeyResult(
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectPreKeyResult) = (
+            FfiConverterString.allocationSize(value.`status`)
+    )
+
+    override fun write(value: MobileDirectPreKeyResult, buf: ByteBuffer) {
+            FfiConverterString.write(value.`status`, buf)
+    }
+}
+
+
+
+data class MobileDirectRestRequest (
+    var `requestToken`: kotlin.String,
+    var `method`: kotlin.String,
+    var `requestTarget`: kotlin.String,
+    var `body`: kotlin.ByteArray,
+    var `responseLimitBytes`: kotlin.UInt
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectRestRequest: FfiConverterRustBuffer<MobileDirectRestRequest> {
+    override fun read(buf: ByteBuffer): MobileDirectRestRequest {
+        return MobileDirectRestRequest(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterByteArray.read(buf),
+            FfiConverterUInt.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectRestRequest) = (
+            FfiConverterString.allocationSize(value.`requestToken`) +
+            FfiConverterString.allocationSize(value.`method`) +
+            FfiConverterString.allocationSize(value.`requestTarget`) +
+            FfiConverterByteArray.allocationSize(value.`body`) +
+            FfiConverterUInt.allocationSize(value.`responseLimitBytes`)
+    )
+
+    override fun write(value: MobileDirectRestRequest, buf: ByteBuffer) {
+            FfiConverterString.write(value.`requestToken`, buf)
+            FfiConverterString.write(value.`method`, buf)
+            FfiConverterString.write(value.`requestTarget`, buf)
+            FfiConverterByteArray.write(value.`body`, buf)
+            FfiConverterUInt.write(value.`responseLimitBytes`, buf)
+    }
+}
+
+
+
+data class MobileDirectSyncLease (
+    var `token`: kotlin.String,
+    var `canonicalServerOrigin`: kotlin.String,
+    var `userId`: kotlin.String
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectSyncLease: FfiConverterRustBuffer<MobileDirectSyncLease> {
+    override fun read(buf: ByteBuffer): MobileDirectSyncLease {
+        return MobileDirectSyncLease(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileDirectSyncLease) = (
+            FfiConverterString.allocationSize(value.`token`) +
+            FfiConverterString.allocationSize(value.`canonicalServerOrigin`) +
+            FfiConverterString.allocationSize(value.`userId`)
+    )
+
+    override fun write(value: MobileDirectSyncLease, buf: ByteBuffer) {
+            FfiConverterString.write(value.`token`, buf)
+            FfiConverterString.write(value.`canonicalServerOrigin`, buf)
+            FfiConverterString.write(value.`userId`, buf)
+    }
+}
+
+
+
+/**
+ * Credential-free process-death reconnect selection loaded from SQLCipher.
+ * Android must still authenticate with a plain reconnect and require the
+ * returned account UUID to equal `expected_user_id` before publishing Ready.
+ */
+data class MobileReconnectTarget (
+    var `canonicalServerOrigin`: kotlin.String,
+    var `expectedUserId`: kotlin.String
+) {
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileReconnectTarget: FfiConverterRustBuffer<MobileReconnectTarget> {
+    override fun read(buf: ByteBuffer): MobileReconnectTarget {
+        return MobileReconnectTarget(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+    }
+
+    override fun allocationSize(value: MobileReconnectTarget) = (
+            FfiConverterString.allocationSize(value.`canonicalServerOrigin`) +
+            FfiConverterString.allocationSize(value.`expectedUserId`)
+    )
+
+    override fun write(value: MobileReconnectTarget, buf: ByteBuffer) {
+            FfiConverterString.write(value.`canonicalServerOrigin`, buf)
+            FfiConverterString.write(value.`expectedUserId`, buf)
     }
 }
 
@@ -2668,6 +5270,263 @@ public object FfiConverterTypeX3dhResultData: FfiConverterRustBuffer<X3dhResultD
 
 
 
+enum class MobileDirectHistoryOutcome {
+
+    IN_PROGRESS,
+    COMPLETE,
+    INCOMPLETE_SELF_HISTORY,
+    CONVERSATION_REJECTED,
+    STORAGE_UNCERTAIN;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectHistoryOutcome: FfiConverterRustBuffer<MobileDirectHistoryOutcome> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectHistoryOutcome.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectHistoryOutcome) = 4UL
+
+    override fun write(value: MobileDirectHistoryOutcome, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Delivery state intentionally collapses delivered/read into `Sent` for the
+ * first Direct preview. `Unknown` must never be presented as safe to retry.
+ */
+
+enum class MobileDirectMessageDelivery {
+
+    SENDING,
+    SENT,
+    FAILED,
+    UNKNOWN;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectMessageDelivery: FfiConverterRustBuffer<MobileDirectMessageDelivery> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectMessageDelivery.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectMessageDelivery) = 4UL
+
+    override fun write(value: MobileDirectMessageDelivery, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
+enum class MobileDirectMessageDirection {
+
+    INCOMING,
+    OUTGOING;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectMessageDirection: FfiConverterRustBuffer<MobileDirectMessageDirection> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectMessageDirection.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectMessageDirection) = 4UL
+
+    override fun write(value: MobileDirectMessageDirection, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Opaque UI availability for one caller-supplied Direct conversation.
+ *
+ * The unavailable state deliberately does not distinguish a quarantined
+ * conversation, a revoked native runtime, an unknown route, or a stale
+ * lifecycle epoch. That distinction stays in Rust and cannot be used by a
+ * renderer to enumerate blocked conversation identifiers.
+ */
+
+enum class MobileDirectMessageProjectionAvailability {
+
+    AVAILABLE,
+    UNAVAILABLE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectMessageProjectionAvailability: FfiConverterRustBuffer<MobileDirectMessageProjectionAvailability> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectMessageProjectionAvailability.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectMessageProjectionAvailability) = 4UL
+
+    override fun write(value: MobileDirectMessageProjectionAvailability, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Coarse, advisory send readiness for exactly one Direct conversation under
+ * the caller's current authenticated lease.
+ *
+ * `Unavailable` deliberately collapses malformed or stale leases, lifecycle
+ * changes, blocked or unknown routes, storage revocation, and transport loss.
+ * No denial detail or key identifier crosses the FFI boundary. A future send
+ * operation must repeat every authority, storage, transport, and session
+ * guard atomically; this value is never a send capability.
+ */
+
+enum class MobileDirectSendReadiness {
+
+    READY,
+    NEEDS_PRE_KEY,
+    UNAVAILABLE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectSendReadiness: FfiConverterRustBuffer<MobileDirectSendReadiness> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectSendReadiness.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectSendReadiness) = 4UL
+
+    override fun write(value: MobileDirectSendReadiness, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Opaque terminal outcome for one explicit Direct text user intent.
+ *
+ * `AcceptedForReplay` still means SQLCipher owns the intent. Android must not
+ * create a second intent; it closes the current lease and reconnects so the
+ * exact persisted bytes/ID can be replayed after the next Ready checkpoint.
+ * `AcceptedSessionInvalid` also owns the intent, but the socket failed a
+ * protocol/security invariant and therefore must not trigger automatic
+ * reconnect.
+ */
+
+enum class MobileDirectTextSendOutcome {
+
+    ACCEPTED,
+    ACCEPTED_FOR_REPLAY,
+    ACCEPTED_SESSION_INVALID,
+    NEEDS_PRE_KEY,
+    REJECTED,
+    UNAVAILABLE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileDirectTextSendOutcome: FfiConverterRustBuffer<MobileDirectTextSendOutcome> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileDirectTextSendOutcome.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileDirectTextSendOutcome) = 4UL
+
+    override fun write(value: MobileDirectTextSendOutcome, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Positive allow-list of mobile failures for which a native controller may
+ * create one guarded reconnect plan. Every error not represented here is
+ * terminal by default and must never become retryable through message text.
+ */
+
+enum class MobileRetryableReason {
+
+    TRANSPORT,
+    ACK_DEADLINE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileRetryableReason: FfiConverterRustBuffer<MobileRetryableReason> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileRetryableReason.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileRetryableReason) = 4UL
+
+    override fun write(value: MobileRetryableReason, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+
 
 sealed class VeilException: kotlin.Exception() {
 
@@ -2695,6 +5554,14 @@ sealed class VeilException: kotlin.Exception() {
             get() = "msg=${ `msg` }"
     }
 
+    class MobileRetryable(
+
+        val `reason`: MobileRetryableReason
+        ) : VeilException() {
+        override val message
+            get() = "reason=${ `reason` }"
+    }
+
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<VeilException> {
         override fun lift(error_buf: RustBuffer.ByValue): VeilException = FfiConverterTypeVeilError.lift(error_buf)
@@ -2720,6 +5587,9 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
             3 -> VeilException.Session(
                 FfiConverterString.read(buf),
                 )
+            4 -> VeilException.MobileRetryable(
+                FfiConverterTypeMobileRetryableReason.read(buf),
+                )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -2741,6 +5611,11 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
                 4UL
                 + FfiConverterString.allocationSize(value.`msg`)
             )
+            is VeilException.MobileRetryable -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterTypeMobileRetryableReason.allocationSize(value.`reason`)
+            )
         }
     }
 
@@ -2759,6 +5634,11 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
             is VeilException.Session -> {
                 buf.putInt(3)
                 FfiConverterString.write(value.`msg`, buf)
+                Unit
+            }
+            is VeilException.MobileRetryable -> {
+                buf.putInt(4)
+                FfiConverterTypeMobileRetryableReason.write(value.`reason`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }
@@ -2794,6 +5674,38 @@ public object FfiConverterOptionalUInt: FfiConverterRustBuffer<kotlin.UInt?> {
         } else {
             buf.put(1)
             FfiConverterUInt.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalLong: FfiConverterRustBuffer<kotlin.Long?> {
+    override fun read(buf: ByteBuffer): kotlin.Long? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterLong.read(buf)
+    }
+
+    override fun allocationSize(value: kotlin.Long?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterLong.allocationSize(value)
+        }
+    }
+
+    override fun write(value: kotlin.Long?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterLong.write(value, buf)
         }
     }
 }
@@ -2858,6 +5770,126 @@ public object FfiConverterOptionalByteArray: FfiConverterRustBuffer<kotlin.ByteA
         } else {
             buf.put(1)
             FfiConverterByteArray.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeMobileDirectRestRequest: FfiConverterRustBuffer<MobileDirectRestRequest?> {
+    override fun read(buf: ByteBuffer): MobileDirectRestRequest? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeMobileDirectRestRequest.read(buf)
+    }
+
+    override fun allocationSize(value: MobileDirectRestRequest?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeMobileDirectRestRequest.allocationSize(value)
+        }
+    }
+
+    override fun write(value: MobileDirectRestRequest?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeMobileDirectRestRequest.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeMobileReconnectTarget: FfiConverterRustBuffer<MobileReconnectTarget?> {
+    override fun read(buf: ByteBuffer): MobileReconnectTarget? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeMobileReconnectTarget.read(buf)
+    }
+
+    override fun allocationSize(value: MobileReconnectTarget?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeMobileReconnectTarget.allocationSize(value)
+        }
+    }
+
+    override fun write(value: MobileReconnectTarget?, buf: ByteBuffer) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeMobileReconnectTarget.write(value, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeMobileDirectMessageData: FfiConverterRustBuffer<List<MobileDirectMessageData>> {
+    override fun read(buf: ByteBuffer): List<MobileDirectMessageData> {
+        val len = buf.getInt()
+        return List<MobileDirectMessageData>(len) {
+            FfiConverterTypeMobileDirectMessageData.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<MobileDirectMessageData>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMobileDirectMessageData.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<MobileDirectMessageData>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMobileDirectMessageData.write(it, buf)
+        }
+    }
+}
+
+
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeMobileDirectConversationData: FfiConverterRustBuffer<List<MobileDirectConversationData>> {
+    override fun read(buf: ByteBuffer): List<MobileDirectConversationData> {
+        val len = buf.getInt()
+        return List<MobileDirectConversationData>(len) {
+            FfiConverterTypeMobileDirectConversationData.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<MobileDirectConversationData>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeMobileDirectConversationData.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(value: List<MobileDirectConversationData>, buf: ByteBuffer) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeMobileDirectConversationData.write(it, buf)
         }
     }
 }

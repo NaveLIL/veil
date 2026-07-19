@@ -31,6 +31,11 @@ message SendMessage {
   // ciphertext only for the exact current ready device roster.
   uint64 roster_version = 9;
   bytes roster_commitment = 10; // SHA-256, 32 bytes
+
+  // Native-generated idempotency key. It is mandatory for every send and
+  // must be a canonical lowercase, non-nil UUID. Exact retries reuse the same
+  // value and the exact same deterministic SendMessage bytes.
+  string client_message_id = 11;
 }
 
 message EncryptedAttachment {
@@ -51,6 +56,9 @@ message MessageAck {
   optional uint32 sender_key_generation = 6;
   optional uint64 roster_version = 7;
   optional bytes envelope_commitment = 8; // SHA-256 of the retained SKDM
+
+  // Required for chat-message ACKs and empty for generic command ACKs.
+  string client_message_id = 9;
 }
 
 // Сервер → клиент: сообщение доставлено получателю

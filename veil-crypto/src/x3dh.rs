@@ -1,6 +1,9 @@
 use ed25519_dalek::Signer;
 use rand::rngs::OsRng;
-use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
+use x25519_dalek::{
+    PublicKey as X25519PublicKey, SharedSecret as X25519SharedSecret,
+    StaticSecret as X25519StaticSecret,
+};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::kdf;
@@ -8,6 +11,26 @@ use crate::keys::IdentityKeyPair;
 
 /// Domain separator for Ed25519 signatures over X3DH signed prekeys.
 pub const SIGNED_PREKEY_SIGNATURE_DOMAIN: &[u8] = b"veil-x3dh-spk-v1\0";
+
+/// Reject X25519 inputs that collapse a DH term to the identity element.
+///
+/// RFC 7748 requires protocols to check the all-zero shared-secret result.
+/// X25519 accepts several equivalent/low-order public encodings, so checking
+/// the received bytes for `[0; 32]` is insufficient. Keeping the check here,
+/// immediately after every DH operation, protects all callers before X3DH can
+/// derive a root key or publish a Double Ratchet session.
+fn require_contributory(
+    shared_secret: &X25519SharedSecret,
+    peer_key_kind: &str,
+) -> Result<(), String> {
+    if shared_secret.was_contributory() {
+        Ok(())
+    } else {
+        Err(format!(
+            "non-contributory X25519 {peer_key_kind} was rejected"
+        ))
+    }
+}
 
 /// Build the canonical message covered by an X3DH signed-prekey signature.
 ///
@@ -146,6 +169,17 @@ pub fn initiate(
     let ik_public = X25519PublicKey::from(peer_bundle.identity_key);
     let dh2 = ek_secret.diffie_hellman(&ik_public);
     let dh3 = ek_secret.diffie_hellman(&spk_public);
+    let dh4 = peer_bundle.one_time_prekey.map(|opk_bytes| {
+        let opk_public = X25519PublicKey::from(opk_bytes);
+        ek_secret.diffie_hellman(&opk_public)
+    });
+
+    require_contributory(&dh1, "signed prekey")?;
+    require_contributory(&dh2, "identity key")?;
+    require_contributory(&dh3, "signed prekey")?;
+    if let Some(shared) = dh4.as_ref() {
+        require_contributory(shared, "one-time prekey")?;
+    }
 
     // Concatenate DH outputs
     let mut dh_concat = Vec::with_capacity(128);
@@ -153,10 +187,8 @@ pub fn initiate(
     dh_concat.extend_from_slice(dh2.as_bytes());
     dh_concat.extend_from_slice(dh3.as_bytes());
 
-    if let Some(opk_bytes) = peer_bundle.one_time_prekey {
-        let opk_public = X25519PublicKey::from(opk_bytes);
-        let dh4 = ek_secret.diffie_hellman(&opk_public);
-        dh_concat.extend_from_slice(dh4.as_bytes());
+    if let Some(shared) = dh4.as_ref() {
+        dh_concat.extend_from_slice(shared.as_bytes());
     }
 
     // Derive shared secret: HKDF-SHA256
@@ -204,15 +236,22 @@ pub fn respond(
     let dh1 = spk.secret.diffie_hellman(&ik_public);
     let dh2 = identity.x25519_secret().diffie_hellman(&ek_public);
     let dh3 = spk.secret.diffie_hellman(&ek_public);
+    let dh4 = opk.map(|one_time_prekey| one_time_prekey.secret.diffie_hellman(&ek_public));
+
+    require_contributory(&dh1, "identity key")?;
+    require_contributory(&dh2, "ephemeral key")?;
+    require_contributory(&dh3, "ephemeral key")?;
+    if let Some(shared) = dh4.as_ref() {
+        require_contributory(shared, "ephemeral key")?;
+    }
 
     let mut dh_concat = Vec::with_capacity(128);
     dh_concat.extend_from_slice(dh1.as_bytes());
     dh_concat.extend_from_slice(dh2.as_bytes());
     dh_concat.extend_from_slice(dh3.as_bytes());
 
-    if let Some(opk) = opk {
-        let dh4 = opk.secret.diffie_hellman(&ek_public);
-        dh_concat.extend_from_slice(dh4.as_bytes());
+    if let Some(shared) = dh4.as_ref() {
+        dh_concat.extend_from_slice(shared.as_bytes());
     }
 
     // Derive shared secret (same HKDF as initiator)
@@ -240,6 +279,12 @@ pub fn respond(
 mod tests {
     use super::*;
     use crate::keys::IdentityKeyPair;
+
+    fn non_zero_low_order_public_key() -> [u8; 32] {
+        let mut key = [0u8; 32];
+        key[0] = 1;
+        key
+    }
 
     #[test]
     fn test_x3dh_with_opk() {
@@ -349,6 +394,80 @@ mod tests {
             result1.shared_secret, result2.shared_secret,
             "Different OPKs must produce different shared secrets"
         );
+    }
+
+    #[test]
+    fn initiator_rejects_non_contributory_identity_spk_and_opk() {
+        let alice = IdentityKeyPair::generate();
+        let bob = IdentityKeyPair::generate();
+        let bob_spk = SignedPreKey::generate(&bob, 1);
+        let bob_opk = OneTimePreKey::generate(1);
+        let bundle = PreKeyBundle {
+            identity_key: bob.x25519_public_bytes(),
+            signing_key: bob.ed25519_public_bytes(),
+            signed_prekey: *bob_spk.public.as_bytes(),
+            signed_prekey_signature: bob_spk.signature,
+            signed_prekey_id: bob_spk.id,
+            one_time_prekey: Some(*bob_opk.public.as_bytes()),
+            one_time_prekey_id: Some(bob_opk.id),
+        };
+        let low_order = non_zero_low_order_public_key();
+
+        let mut low_identity = bundle.clone();
+        low_identity.identity_key = low_order;
+        assert!(initiate(&alice, &low_identity)
+            .err()
+            .expect("low-order identity key must fail")
+            .contains("non-contributory X25519 identity key"));
+
+        let mut low_spk = bundle.clone();
+        low_spk.signed_prekey = low_order;
+        low_spk.signed_prekey_signature = bob
+            .ed25519_signing_key()
+            .sign(&signed_prekey_signature_message(&low_order))
+            .to_bytes();
+        assert!(initiate(&alice, &low_spk)
+            .err()
+            .expect("low-order signed prekey must fail")
+            .contains("non-contributory X25519 signed prekey"));
+
+        let mut low_opk = bundle;
+        low_opk.one_time_prekey = Some(low_order);
+        assert!(initiate(&alice, &low_opk)
+            .err()
+            .expect("low-order one-time prekey must fail")
+            .contains("non-contributory X25519 one-time prekey"));
+    }
+
+    #[test]
+    fn responder_rejects_non_contributory_identity_and_ephemeral_keys() {
+        let alice = IdentityKeyPair::generate();
+        let bob = IdentityKeyPair::generate();
+        let bob_spk = SignedPreKey::generate(&bob, 1);
+        let bob_opk = OneTimePreKey::generate(1);
+        let low_order = non_zero_low_order_public_key();
+
+        assert!(respond(
+            &bob,
+            &bob_spk,
+            Some(&bob_opk),
+            &low_order,
+            &alice.x25519_public_bytes(),
+        )
+        .err()
+        .expect("low-order identity key must fail")
+        .contains("non-contributory X25519 identity key"));
+
+        assert!(respond(
+            &bob,
+            &bob_spk,
+            Some(&bob_opk),
+            &alice.x25519_public_bytes(),
+            &low_order,
+        )
+        .err()
+        .expect("low-order ephemeral key must fail")
+        .contains("non-contributory X25519 ephemeral key"));
     }
 
     #[test]

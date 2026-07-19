@@ -144,8 +144,12 @@ type SendMessage struct {
 	// ciphertext only for the exact current ready device roster.
 	RosterVersion    uint64 `protobuf:"varint,9,opt,name=roster_version,json=rosterVersion,proto3" json:"roster_version,omitempty"`
 	RosterCommitment []byte `protobuf:"bytes,10,opt,name=roster_commitment,json=rosterCommitment,proto3" json:"roster_commitment,omitempty"` // SHA-256, 32 bytes
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Native-generated idempotency key. It is mandatory for every send and
+	// must be a canonical lowercase, non-nil UUID. Exact retries reuse the same
+	// value and the exact same deterministic SendMessage bytes.
+	ClientMessageId string `protobuf:"bytes,11,opt,name=client_message_id,json=clientMessageId,proto3" json:"client_message_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *SendMessage) Reset() {
@@ -248,6 +252,13 @@ func (x *SendMessage) GetRosterCommitment() []byte {
 	return nil
 }
 
+func (x *SendMessage) GetClientMessageId() string {
+	if x != nil {
+		return x.ClientMessageId
+	}
+	return ""
+}
+
 type EncryptedAttachment struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	MediaId       string                 `protobuf:"bytes,1,opt,name=media_id,json=mediaId,proto3" json:"media_id,omitempty"`                // ID загруженного файла
@@ -335,8 +346,10 @@ type MessageAck struct {
 	SenderKeyGeneration *uint32                `protobuf:"varint,6,opt,name=sender_key_generation,json=senderKeyGeneration,proto3,oneof" json:"sender_key_generation,omitempty"`
 	RosterVersion       *uint64                `protobuf:"varint,7,opt,name=roster_version,json=rosterVersion,proto3,oneof" json:"roster_version,omitempty"`
 	EnvelopeCommitment  []byte                 `protobuf:"bytes,8,opt,name=envelope_commitment,json=envelopeCommitment,proto3,oneof" json:"envelope_commitment,omitempty"` // SHA-256 of the retained SKDM
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// Required for chat-message ACKs and empty for generic command ACKs.
+	ClientMessageId string `protobuf:"bytes,9,opt,name=client_message_id,json=clientMessageId,proto3" json:"client_message_id,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *MessageAck) Reset() {
@@ -423,6 +436,13 @@ func (x *MessageAck) GetEnvelopeCommitment() []byte {
 		return x.EnvelopeCommitment
 	}
 	return nil
+}
+
+func (x *MessageAck) GetClientMessageId() string {
+	if x != nil {
+		return x.ClientMessageId
+	}
+	return ""
 }
 
 // Сервер → клиент: сообщение доставлено получателю
@@ -1447,7 +1467,7 @@ var File_veil_v1_chat_proto protoreflect.FileDescriptor
 
 const file_veil_v1_chat_proto_rawDesc = "" +
 	"\n" +
-	"\x12veil/v1/chat.proto\x12\aveil.v1\"\xb6\x03\n" +
+	"\x12veil/v1/chat.proto\x12\aveil.v1\"\xe2\x03\n" +
 	"\vSendMessage\x12'\n" +
 	"\x0fconversation_id\x18\x01 \x01(\tR\x0econversationId\x12\x1e\n" +
 	"\n" +
@@ -1462,7 +1482,8 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x06sealed\x18\b \x01(\bR\x06sealed\x12%\n" +
 	"\x0eroster_version\x18\t \x01(\x04R\rrosterVersion\x12+\n" +
 	"\x11roster_commitment\x18\n" +
-	" \x01(\fR\x10rosterCommitmentB\x0e\n" +
+	" \x01(\fR\x10rosterCommitment\x12*\n" +
+	"\x11client_message_id\x18\v \x01(\tR\x0fclientMessageIdB\x0e\n" +
 	"\f_reply_to_idB\x0e\n" +
 	"\f_ttl_seconds\"\xa2\x01\n" +
 	"\x13EncryptedAttachment\x12\x19\n" +
@@ -1470,7 +1491,7 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\rencrypted_key\x18\x02 \x01(\fR\fencryptedKey\x12\x14\n" +
 	"\x05nonce\x18\x03 \x01(\fR\x05nonce\x12\x12\n" +
 	"\x04size\x18\x04 \x01(\x04R\x04size\x12!\n" +
-	"\fcontent_type\x18\x05 \x01(\tR\vcontentType\"\xbb\x03\n" +
+	"\fcontent_type\x18\x05 \x01(\tR\vcontentType\"\xe7\x03\n" +
 	"\n" +
 	"MessageAck\x12\x1d\n" +
 	"\n" +
@@ -1481,7 +1502,8 @@ const file_veil_v1_chat_proto_rawDesc = "" +
 	"\x0fconversation_id\x18\x05 \x01(\tH\x00R\x0econversationId\x88\x01\x01\x127\n" +
 	"\x15sender_key_generation\x18\x06 \x01(\rH\x01R\x13senderKeyGeneration\x88\x01\x01\x12*\n" +
 	"\x0eroster_version\x18\a \x01(\x04H\x02R\rrosterVersion\x88\x01\x01\x124\n" +
-	"\x13envelope_commitment\x18\b \x01(\fH\x03R\x12envelopeCommitment\x88\x01\x01B\x12\n" +
+	"\x13envelope_commitment\x18\b \x01(\fH\x03R\x12envelopeCommitment\x88\x01\x01\x12*\n" +
+	"\x11client_message_id\x18\t \x01(\tR\x0fclientMessageIdB\x12\n" +
 	"\x10_conversation_idB\x18\n" +
 	"\x16_sender_key_generationB\x11\n" +
 	"\x0f_roster_versionB\x16\n" +

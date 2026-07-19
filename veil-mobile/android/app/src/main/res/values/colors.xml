@@ -3,4 +3,18 @@
   <color name="colorPrimary">#023c69</color>
   <color name="colorPrimaryDark">#ffffff</color>
   <color name="activityBackground">#111117</color>
+  <!-- Native recovery mirrors the shared desktop/mobile island palette. -->
+  <color name="recoveryBackground">#111117</color>
+  <color name="recoverySurfaceLow">#191A1F</color>
+  <color name="recoverySurface">#1E1F22</color>
+  <color name="recoverySurfaceRaised">#2B2D31</color>
+  <color name="recoverySurfaceFocused">#51486F</color>
+  <color name="recoveryBorder">#14FFFFFF</color>
+  <color name="recoveryPrimary">#6955E0</color>
+  <color name="recoveryPrimaryPressed">#5843C4</color>
+  <color name="recoveryPrimaryText">#FFFFFF</color>
+  <color name="recoveryAccent">#9B8AFB</color>
+  <color name="recoveryText">#EDEDF0</color>
+  <color name="recoveryTextMuted">#9999AA</color>
+  <color name="recoveryDanger">#FF6673</color>
 </resources>

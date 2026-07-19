@@ -1,8 +1,11 @@
 use crate::models::{
-    AccountSnapshot, AccountSnapshotSource, HistoricalAccountContinuity, LocalIdentityVerification,
+    AccountSnapshot, AccountSnapshotSource, AuthenticatedDirectDirectoryEntry,
+    AuthenticatedDirectHistoryScopeV1, HistoricalAccountContinuity, LocalIdentityVerification,
     Message, MessageAuthorContext, NetworkProfile, ProfileLocator,
 };
-use rusqlite::{Connection, OptionalExtension, Row};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior};
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
 use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
@@ -15,6 +18,342 @@ pub struct LocalPreKey {
     pub secret_key: [u8; 32],
     pub public_key: [u8; 32],
     pub signature: Option<[u8; 64]>,
+}
+
+/// Durable, origin-scoped exact-byte outbox for one X3DH publication.
+///
+/// The body contains public material only, but it remains inside SQLCipher so
+/// request capabilities and unpublished device metadata cannot leak through a
+/// renderer cache. `acknowledged` is set only after a strictly validated HTTP
+/// 200 response for the exact body digest and signed-prekey id.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct LocalPreKeyPublicationV1 {
+    pub canonical_server_origin: String,
+    pub user_id: String,
+    pub device_id: [u8; 16],
+    pub signed_prekey_id: u32,
+    pub one_time_prekey_count: u32,
+    pub request_body: Vec<u8>,
+    pub body_sha256: [u8; 32],
+    pub acknowledged: bool,
+}
+
+/// Exact authenticated account/device scope of the durable Direct outbox.
+///
+/// The server origin is part of the account locator: UUIDs issued by different
+/// self-hosted nodes are deliberately never treated as interchangeable.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct DirectMessageOutboxScopeV1 {
+    pub canonical_server_origin: String,
+    pub user_id: String,
+    pub device_id: [u8; 16],
+}
+
+/// All state required to publish one new Direct ciphertext without exposing a
+/// ratchet/message split-brain window.
+///
+/// `exact_send_message_payload` is the serialized `SendMessage` payload, not a
+/// surrounding transport envelope. `veil-store` intentionally treats it as an
+/// opaque bounded byte string and authenticates only its domain-separated
+/// digest; protobuf interpretation remains owned by the protocol crate.
+#[derive(Clone)]
+pub struct DirectMessageOutboxEnqueueV1 {
+    pub scope: DirectMessageOutboxScopeV1,
+    pub conversation_id: String,
+    pub client_message_id: String,
+    pub local_message_id: String,
+    pub request_digest: [u8; 32],
+    pub exact_send_message_payload: Vec<u8>,
+    pub expected_ratchet_revision: u64,
+    pub advanced_ratchet_session: Vec<u8>,
+    pub plaintext: String,
+    pub reply_to_id: Option<String>,
+    pub attachments: Vec<crate::models::MessageAttachment>,
+    pub author_snapshot: Option<AccountSnapshot>,
+}
+
+impl Zeroize for DirectMessageOutboxEnqueueV1 {
+    fn zeroize(&mut self) {
+        self.scope.zeroize();
+        self.conversation_id.zeroize();
+        self.client_message_id.zeroize();
+        self.local_message_id.zeroize();
+        self.request_digest.zeroize();
+        self.exact_send_message_payload.zeroize();
+        self.expected_ratchet_revision.zeroize();
+        self.advanced_ratchet_session.zeroize();
+        self.plaintext.zeroize();
+        self.reply_to_id.zeroize();
+        for attachment in &mut self.attachments {
+            attachment.ordinal.zeroize();
+            attachment.media_id.zeroize();
+            attachment.file_name.zeroize();
+            attachment.detected_mime.zeroize();
+            attachment.format_version.zeroize();
+            attachment.nonce_prefix.zeroize();
+            attachment.chunk_count.zeroize();
+            attachment.plaintext_size.zeroize();
+            attachment.ciphertext_size.zeroize();
+            attachment.content_key.zeroize();
+        }
+        self.attachments.clear();
+        if let Some(snapshot) = self.author_snapshot.as_mut() {
+            snapshot.locator.canonical_server_origin.zeroize();
+            snapshot.locator.user_id.zeroize();
+            snapshot.locator.identity_key.zeroize();
+            snapshot.signing_key.zeroize();
+            snapshot.username.zeroize();
+            snapshot.display_name.zeroize();
+            snapshot.profile_version.zeroize();
+            snapshot.profile_origin.zeroize();
+            snapshot.observed_at.zeroize();
+        }
+        self.author_snapshot = None;
+    }
+}
+
+impl Drop for DirectMessageOutboxEnqueueV1 {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+/// Durable FIFO row returned to a reconnecting native runtime.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct PendingDirectMessageOutboxV1 {
+    pub queue_order: u64,
+    pub scope: DirectMessageOutboxScopeV1,
+    pub conversation_id: String,
+    pub peer_user_id: String,
+    pub peer_identity_key: [u8; 32],
+    pub peer_signing_key: [u8; 32],
+    pub client_message_id: String,
+    pub local_message_id: String,
+    pub request_digest: [u8; 32],
+    pub exact_send_message_payload: Vec<u8>,
+    pub ratchet_revision: u64,
+    /// SQLCipher projection used only to repair the local search document
+    /// when an ACK renames the provisional UUID after process restart.
+    pub plaintext: String,
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct DirectMessageOutboxEnqueueResultV1 {
+    pub queue_order: u64,
+    pub client_message_id: String,
+    pub local_message_id: String,
+    pub ratchet_revision: u64,
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct DirectMessageOutboxAckResultV1 {
+    pub client_message_id: String,
+    pub local_message_id: String,
+    pub server_message_id: String,
+    pub server_timestamp_ms: i64,
+    pub already_acknowledged: bool,
+}
+
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct DirectMessageOutboxRejectResultV1 {
+    pub client_message_id: String,
+    pub local_message_id: String,
+    pub rejection_reason: String,
+    pub already_rejected: bool,
+}
+
+/// Read-only durable state used by the authenticated client to distinguish a
+/// harmless repeated receipt from an unknown or conflicting wire result
+/// before any ACK/Error reconciliation mutates SQLCipher or process memory.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub enum DirectMessageOutboxReceiptV1 {
+    Pending {
+        local_message_id: String,
+    },
+    Acknowledged {
+        local_message_id: String,
+        server_message_id: String,
+        server_timestamp_ms: i64,
+    },
+    Rejected {
+        local_message_id: String,
+        rejection_reason: String,
+    },
+}
+
+/// Serialized ratchet state and the CAS revision that protects its next write.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub struct RatchetSessionWithRevisionV1 {
+    pub session_data: Vec<u8>,
+    pub revision: u64,
+}
+
+/// One immutable reservation from the SQLCipher-backed prekey allocator.
+///
+/// Reservations are committed before key generation. Consequently a crash or
+/// persistence failure may leave gaps, but two clients opening the same local
+/// database can never assign one protocol id to different private material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LocalPreKeyIdReservationV1 {
+    pub signed_prekey_id: u32,
+    pub one_time_prekey_start_id: u32,
+    pub next_signed_prekey_id: u32,
+    pub next_one_time_prekey_id: u32,
+}
+
+const LOCAL_PREKEY_PUBLICATION_BODY_LIMIT: usize = 64 * 1024;
+const LOCAL_PREKEY_PUBLICATION_BATCH_SIZE: usize = 20;
+pub const DIRECT_MESSAGE_OUTBOX_MAX_PAYLOAD_BYTES_V1: usize = 256 * 1024;
+pub const DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1: usize = 256;
+pub const DIRECT_MESSAGE_OUTBOX_MAX_LOAD_V1: usize = 256;
+const DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1: usize = 1024 * 1024;
+const DIRECT_MESSAGE_PLAINTEXT_MAX_BYTES_V1: usize = 32 * 1024;
+const DIRECT_MESSAGE_REJECTION_REASON_MAX_BYTES_V1: usize = 128;
+const DIRECT_MESSAGE_DIGEST_DOMAIN_V1: &[u8] = b"veil.message.send.v1\x00";
+
+pub fn direct_message_request_digest_v1(payload: &[u8]) -> [u8; 32] {
+    let mut digest = Sha256::new();
+    digest.update(DIRECT_MESSAGE_DIGEST_DOMAIN_V1);
+    digest.update(payload);
+    digest.finalize().into()
+}
+
+fn begin_immediate<'conn>(
+    conn: &'conn Connection,
+    operation: &str,
+) -> Result<Transaction<'conn>, String> {
+    Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .map_err(|error| format!("begin {operation}: {error}"))
+}
+
+fn max_local_prekey_id_on(conn: &Connection, key_type: u8) -> Result<u32, String> {
+    let value: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(protocol_key_id), 0) FROM local_prekeys WHERE key_type = ?1",
+            rusqlite::params![key_type],
+            |row| row.get(0),
+        )
+        .map_err(|error| format!("load local prekey counter: {error}"))?;
+    u32::try_from(value).map_err(|_| "local prekey id exceeds u32".to_string())
+}
+
+fn next_after_max_local_prekey_id(conn: &Connection, key_type: u8) -> Result<u32, String> {
+    max_local_prekey_id_on(conn, key_type)?
+        .checked_add(1)
+        .ok_or_else(|| "local prekey id allocator is exhausted".to_string())
+}
+
+fn synchronize_local_prekey_allocator_on(conn: &Connection) -> Result<(u32, u32), String> {
+    let persisted = conn
+        .query_row(
+            "SELECT next_signed_prekey_id, next_one_time_prekey_id
+             FROM local_prekey_allocator_v1 WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(|error| format!("load local prekey allocator: {error}"))?;
+    let (persisted_signed, persisted_one_time) = match persisted {
+        Some((signed, one_time)) => (
+            u32::try_from(signed)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "persisted signed prekey allocator is invalid".to_string())?,
+            u32::try_from(one_time)
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| "persisted one-time prekey allocator is invalid".to_string())?,
+        ),
+        None => (1, 1),
+    };
+    let next_signed = persisted_signed.max(next_after_max_local_prekey_id(conn, 0)?);
+    let next_one_time = persisted_one_time.max(next_after_max_local_prekey_id(conn, 1)?);
+    conn.execute(
+        "INSERT INTO local_prekey_allocator_v1
+           (singleton, next_signed_prekey_id, next_one_time_prekey_id, updated_at)
+         VALUES (1, ?1, ?2, datetime('now'))
+         ON CONFLICT(singleton) DO UPDATE SET
+           next_signed_prekey_id = excluded.next_signed_prekey_id,
+           next_one_time_prekey_id = excluded.next_one_time_prekey_id,
+           updated_at = datetime('now')",
+        rusqlite::params![i64::from(next_signed), i64::from(next_one_time)],
+    )
+    .map_err(|error| format!("synchronize local prekey allocator: {error}"))?;
+    Ok((next_signed, next_one_time))
+}
+
+fn validate_local_prekey_publication_record(
+    publication: &LocalPreKeyPublicationV1,
+) -> Result<(), String> {
+    validate_canonical_server_origin(&publication.canonical_server_origin)?;
+    validate_canonical_uuid("local prekey publication user id", &publication.user_id)?;
+    if publication.device_id == [0u8; 16] {
+        return Err("local prekey publication device is invalid".to_string());
+    }
+    if publication.signed_prekey_id == 0 {
+        return Err("local prekey publication SPK id is invalid".to_string());
+    }
+    if publication.one_time_prekey_count as usize != LOCAL_PREKEY_PUBLICATION_BATCH_SIZE {
+        return Err("local prekey publication OPK count is invalid".to_string());
+    }
+    if publication.request_body.is_empty()
+        || publication.request_body.len() > LOCAL_PREKEY_PUBLICATION_BODY_LIMIT
+    {
+        return Err("local prekey publication body is empty or oversized".to_string());
+    }
+    let calculated: [u8; 32] = Sha256::digest(&publication.request_body).into();
+    if calculated != publication.body_sha256 {
+        return Err("local prekey publication body digest is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_local_prekey_publication_input(
+    keys: &[LocalPreKey],
+    publication: &LocalPreKeyPublicationV1,
+) -> Result<(), String> {
+    validate_local_prekey_publication_record(publication)?;
+    if publication.acknowledged {
+        return Err("a newly generated prekey publication cannot be acknowledged".to_string());
+    }
+    if keys.len() != LOCAL_PREKEY_PUBLICATION_BATCH_SIZE + 1 {
+        return Err("local prekey publication must contain one SPK and 20 OPKs".to_string());
+    }
+
+    let mut seen = HashSet::with_capacity(keys.len());
+    let mut signed_count = 0usize;
+    let mut one_time_count = 0usize;
+    for key in keys {
+        if key.protocol_key_id == 0 || !seen.insert((key.key_type, key.protocol_key_id)) {
+            return Err("local prekey publication contains an invalid or duplicate id".to_string());
+        }
+        if key.secret_key == [0u8; 32] || key.public_key == [0u8; 32] {
+            return Err("local prekey publication contains invalid key material".to_string());
+        }
+        match key.key_type {
+            0 => {
+                signed_count += 1;
+                if key.protocol_key_id != publication.signed_prekey_id
+                    || key.signature.is_none_or(|signature| signature == [0u8; 64])
+                {
+                    return Err(
+                        "local prekey publication SPK does not match its outbox".to_string()
+                    );
+                }
+            }
+            1 => {
+                one_time_count += 1;
+                if key.signature.is_some() {
+                    return Err("local one-time prekeys must not contain signatures".to_string());
+                }
+            }
+            _ => return Err("local prekey publication contains an invalid key type".to_string()),
+        }
+    }
+    if signed_count != 1 || one_time_count != LOCAL_PREKEY_PUBLICATION_BATCH_SIZE {
+        return Err("local prekey publication batch shape is invalid".to_string());
+    }
+    Ok(())
 }
 
 /// Private per-install device identity stored only inside SQLCipher. Public
@@ -38,6 +377,18 @@ pub struct LocalDeviceIdentityV1 {
 /// Encrypted SQLite database using SQLCipher.
 pub struct VeilDb {
     conn: Connection,
+}
+
+/// Durable mobile reconnect selection resolved through the immutable
+/// authenticated-self binding for the selected canonical origin.
+///
+/// No credential, bearer token, WebSocket URL, or caller-controlled endpoint
+/// is persisted here. The expected user ID is returned from the pinned
+/// authenticated-self row after its account keys have been revalidated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileReconnectTargetV1 {
+    pub canonical_server_origin: String,
+    pub expected_user_id: String,
 }
 
 pub type PendingInitialHeaderRow = ([u8; 32], Vec<u8>);
@@ -548,6 +899,483 @@ fn validated_self_binding_for_origin(
         ensure_self_binding_directory_compatible(conn, canonical_server_origin, binding)?;
     }
     Ok(binding)
+}
+
+fn validate_authenticated_self_coordinates(
+    canonical_server_origin: &str,
+    user_id: &str,
+    identity_key: &[u8; 32],
+    signing_key: &[u8; 32],
+) -> Result<(), String> {
+    validate_canonical_server_origin(canonical_server_origin)?;
+    validate_canonical_uuid("authenticated self user id", user_id)?;
+    if identity_key == &[0u8; 32] || !veil_crypto::public_key::valid_ed25519_public_key(signing_key)
+    {
+        return Err("authenticated self keys are not valid account public keys".to_string());
+    }
+    if identity_key == signing_key {
+        return Err("authenticated self identity and signing keys must be distinct".to_string());
+    }
+    Ok(())
+}
+
+fn bind_authenticated_self_in_transaction(
+    tx: &Transaction<'_>,
+    canonical_server_origin: &str,
+    user_id: &str,
+    identity_key: &[u8; 32],
+    signing_key: &[u8; 32],
+) -> Result<(), String> {
+    let existing = load_authenticated_self_binding(tx, canonical_server_origin)?;
+
+    match existing {
+        Some(stored) => {
+            if stored.user_id != user_id
+                || stored.identity_key != *identity_key
+                || stored.signing_key != *signing_key
+            {
+                return Err(
+                    "authenticated server attempted to remap the durable self account".to_string(),
+                );
+            }
+            ensure_self_binding_directory_compatible(tx, canonical_server_origin, &stored)?;
+            tx.execute(
+                "UPDATE authenticated_self_bindings_v1
+                 SET last_authenticated_at = datetime('now')
+                 WHERE canonical_server_origin = ?1",
+                rusqlite::params![canonical_server_origin],
+            )
+            .map_err(|error| format!("refresh authenticated self binding: {error}"))?;
+        }
+        None => {
+            let pending = AuthenticatedSelfBinding {
+                user_id: user_id.to_string(),
+                identity_key: *identity_key,
+                signing_key: *signing_key,
+            };
+            ensure_self_binding_directory_compatible(tx, canonical_server_origin, &pending)?;
+            tx.execute(
+                "INSERT INTO authenticated_self_bindings_v1
+                    (canonical_server_origin, user_id, identity_key, signing_key)
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    canonical_server_origin,
+                    user_id,
+                    identity_key.as_slice(),
+                    signing_key.as_slice(),
+                ],
+            )
+            .map_err(|error| format!("insert authenticated self binding: {error}"))?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+struct DurableDirectOutboxRouteV1 {
+    self_binding: AuthenticatedSelfBinding,
+    peer_user_id: String,
+    peer_identity_key: [u8; 32],
+    peer_signing_key: [u8; 32],
+}
+
+#[derive(Zeroize, ZeroizeOnDrop)]
+struct StoredDirectMessageOutboxRowV1 {
+    queue_order: i64,
+    canonical_server_origin: String,
+    user_id: String,
+    device_id: Vec<u8>,
+    conversation_id: String,
+    peer_user_id: String,
+    peer_identity_key: Vec<u8>,
+    peer_signing_key: Vec<u8>,
+    client_message_id: String,
+    local_message_id: String,
+    request_digest: Vec<u8>,
+    exact_send_message_payload: Option<Vec<u8>>,
+    ratchet_revision: i64,
+    state: i64,
+    server_message_id: Option<String>,
+    server_timestamp_ms: Option<i64>,
+    rejection_reason: Option<String>,
+}
+
+fn stored_direct_message_outbox_row_v1(
+    row: &Row<'_>,
+) -> rusqlite::Result<StoredDirectMessageOutboxRowV1> {
+    Ok(StoredDirectMessageOutboxRowV1 {
+        queue_order: row.get(0)?,
+        canonical_server_origin: row.get(1)?,
+        user_id: row.get(2)?,
+        device_id: row.get(3)?,
+        conversation_id: row.get(4)?,
+        peer_user_id: row.get(5)?,
+        peer_identity_key: row.get(6)?,
+        peer_signing_key: row.get(7)?,
+        client_message_id: row.get(8)?,
+        local_message_id: row.get(9)?,
+        request_digest: row.get(10)?,
+        exact_send_message_payload: row.get(11)?,
+        ratchet_revision: row.get(12)?,
+        state: row.get(13)?,
+        server_message_id: row.get(14)?,
+        server_timestamp_ms: row.get(15)?,
+        rejection_reason: row.get(16)?,
+    })
+}
+
+const DIRECT_MESSAGE_OUTBOX_SELECT_V1: &str =
+    "queue_order, canonical_server_origin, user_id, device_id,
+     conversation_id, peer_user_id, peer_identity_key, peer_signing_key,
+     client_message_id, local_message_id, request_digest,
+     exact_send_message_payload, ratchet_revision, state,
+     server_message_id, server_timestamp_ms, rejection_reason";
+
+fn validate_direct_message_outbox_scope_v1(
+    scope: &DirectMessageOutboxScopeV1,
+) -> Result<(), String> {
+    validate_canonical_server_origin(&scope.canonical_server_origin)?;
+    validate_canonical_uuid("Direct outbox authenticated user id", &scope.user_id)?;
+    if scope.device_id == [0u8; 16] {
+        return Err("Direct outbox device id is invalid".to_string());
+    }
+    Ok(())
+}
+
+fn validate_direct_message_rejection_reason_v1(reason: &str) -> Result<(), String> {
+    if reason.is_empty()
+        || reason.len() > DIRECT_MESSAGE_REJECTION_REASON_MAX_BYTES_V1
+        || !reason.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'.' | b'_' | b':' | b'-')
+        })
+    {
+        return Err("Direct outbox rejection reason is not a stable bounded token".to_string());
+    }
+    Ok(())
+}
+
+fn validate_direct_message_outbox_enqueue_v1(
+    input: &DirectMessageOutboxEnqueueV1,
+) -> Result<(), String> {
+    validate_direct_message_outbox_scope_v1(&input.scope)?;
+    validate_canonical_uuid("Direct outbox conversation id", &input.conversation_id)?;
+    validate_canonical_uuid("Direct outbox client message id", &input.client_message_id)?;
+    validate_canonical_uuid("Direct outbox local message id", &input.local_message_id)?;
+    if input.client_message_id != input.local_message_id {
+        return Err(
+            "Direct outbox client message id must equal its initial local message id".to_string(),
+        );
+    }
+    if let Some(reply_to_id) = input.reply_to_id.as_deref() {
+        validate_canonical_uuid("Direct outbox reply target id", reply_to_id)?;
+    }
+    if input.exact_send_message_payload.is_empty()
+        || input.exact_send_message_payload.len() > DIRECT_MESSAGE_OUTBOX_MAX_PAYLOAD_BYTES_V1
+    {
+        return Err("Direct outbox payload is empty or oversized".to_string());
+    }
+    if direct_message_request_digest_v1(&input.exact_send_message_payload) != input.request_digest {
+        return Err("Direct outbox request digest does not match its exact payload".to_string());
+    }
+    if input.advanced_ratchet_session.is_empty()
+        || input.advanced_ratchet_session.len() > DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1
+    {
+        return Err("Direct outbox ratchet session is empty or oversized".to_string());
+    }
+    if input.plaintext.len() > DIRECT_MESSAGE_PLAINTEXT_MAX_BYTES_V1
+        || (input.plaintext.is_empty() && input.attachments.is_empty())
+    {
+        return Err("Direct outbox plaintext is empty or oversized".to_string());
+    }
+    if input.attachments.len() > 16 {
+        return Err("Direct outbox contains too many attachments".to_string());
+    }
+    i64::try_from(input.expected_ratchet_revision).map_err(|_| {
+        "Direct outbox expected ratchet revision exceeds SQLite integer".to_string()
+    })?;
+    input
+        .expected_ratchet_revision
+        .checked_add(1)
+        .and_then(|value| i64::try_from(value).ok())
+        .ok_or_else(|| "Direct outbox ratchet revision is exhausted".to_string())?;
+    if let Some(snapshot) = input.author_snapshot.as_ref() {
+        validate_account_snapshot(snapshot)?;
+    }
+    Ok(())
+}
+
+/// Validate the exact durable account and local device binding from one SQLite
+/// transaction. No caller-provided public key participates in this decision.
+fn require_current_direct_outbox_self_v1(
+    conn: &Connection,
+    scope: &DirectMessageOutboxScopeV1,
+) -> Result<AuthenticatedSelfBinding, String> {
+    validate_direct_message_outbox_scope_v1(scope)?;
+    let self_binding = validated_self_binding_for_origin(conn, &scope.canonical_server_origin)?
+        .ok_or("Direct outbox origin has no authenticated self binding")?;
+    if self_binding.user_id != scope.user_id {
+        return Err("Direct outbox caller differs from authenticated self".to_string());
+    }
+    // A newly registered account can legitimately have an empty conversation
+    // directory, so its presentation row is only a corroborating cache. The
+    // immutable authenticated-self binding remains the authority, and
+    // `validated_self_binding_for_origin` has already rejected every directory
+    // row that aliases or conflicts with that exact origin/user/key tuple.
+    if let Some(self_account) =
+        load_account_by_origin_user(conn, &scope.canonical_server_origin, &scope.user_id)?
+    {
+        if self_account.locator.identity_key != self_binding.identity_key
+            || self_account.signing_key != self_binding.signing_key
+        {
+            return Err("Direct outbox authenticated directory tuple changed".to_string());
+        }
+    }
+
+    type DeviceScopeRow = (
+        Vec<u8>,
+        i64,
+        Vec<u8>,
+        Vec<u8>,
+        Option<Vec<u8>>,
+        Option<Vec<u8>>,
+    );
+    let device: DeviceScopeRow = conn
+        .query_row(
+            "SELECT d.device_id, d.status, d.account_identity_key, d.account_signing_key,
+                    (SELECT value FROM client_state WHERE key = 'device_binding_v1_created'),
+                    (SELECT value FROM client_state WHERE key = 'device_id')
+             FROM device_identity_v1 AS d WHERE d.singleton = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("load Direct outbox device scope: {error}"))?
+        .ok_or("Direct outbox local device identity is absent")?;
+    let device_id = fixed_bytes::<16>("Direct outbox device id", device.0)?;
+    let status = u8::try_from(device.1)
+        .map_err(|_| "Direct outbox local device status is invalid".to_string())?;
+    let account_identity_key =
+        fixed_bytes::<32>("Direct outbox device account identity key", device.2)?;
+    let account_signing_key =
+        fixed_bytes::<32>("Direct outbox device account signing key", device.3)?;
+    let marker = fixed_bytes::<16>(
+        "Direct outbox device binding marker",
+        device
+            .4
+            .ok_or("Direct outbox device binding marker is absent")?,
+    )?;
+    let installation_id = fixed_bytes::<16>(
+        "Direct outbox installation device id",
+        device
+            .5
+            .ok_or("Direct outbox installation device id is absent")?,
+    )?;
+    if status != 1
+        || device_id != scope.device_id
+        || marker != device_id
+        || installation_id != device_id
+        || account_identity_key != self_binding.identity_key
+        || account_signing_key != self_binding.signing_key
+    {
+        return Err("Direct outbox local device scope changed or is not active".to_string());
+    }
+    Ok(self_binding)
+}
+
+fn resolve_current_direct_outbox_route_v1(
+    conn: &Connection,
+    scope: &DirectMessageOutboxScopeV1,
+    self_binding: &AuthenticatedSelfBinding,
+    conversation_id: &str,
+) -> Result<DurableDirectOutboxRouteV1, String> {
+    validate_canonical_uuid("Direct outbox conversation id", conversation_id)?;
+    let route = conn
+        .query_row(
+            "SELECT conv_type, server_origin, peer_user_id, peer_identity_key
+             FROM conversations WHERE id = ?1",
+            rusqlite::params![conversation_id],
+            |row| {
+                Ok((
+                    row.get::<_, u8>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<Vec<u8>>>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|error| format!("load Direct outbox conversation route: {error}"))?
+        .ok_or("Direct outbox conversation is absent from SQLCipher")?;
+    if route.0 != 0 || route.1.as_deref() != Some(scope.canonical_server_origin.as_str()) {
+        return Err("Direct outbox conversation has the wrong type or origin".to_string());
+    }
+    let peer_user_id = route
+        .2
+        .ok_or("Direct outbox conversation has no peer user")?;
+    validate_canonical_uuid("Direct outbox peer user id", &peer_user_id)?;
+    if peer_user_id == self_binding.user_id {
+        return Err("Direct outbox conversation points to authenticated self".to_string());
+    }
+    let peer_identity_key = fixed_bytes::<32>(
+        "Direct outbox peer identity key",
+        route
+            .3
+            .ok_or("Direct outbox conversation has no peer identity")?,
+    )?;
+    if peer_identity_key == [0u8; 32] {
+        return Err("Direct outbox peer identity key is invalid".to_string());
+    }
+    let peer_account =
+        load_account_by_origin_user(conn, &scope.canonical_server_origin, &peer_user_id)?
+            .ok_or("Direct outbox peer account is absent from the directory")?;
+    if peer_account.locator.identity_key != peer_identity_key {
+        return Err("Direct outbox peer route differs from its directory tuple".to_string());
+    }
+    Ok(DurableDirectOutboxRouteV1 {
+        self_binding: self_binding.clone(),
+        peer_user_id,
+        peer_identity_key,
+        peer_signing_key: peer_account.signing_key,
+    })
+}
+
+struct ValidatedDirectOutboxRowV1 {
+    queue_order: u64,
+    peer_identity_key: [u8; 32],
+    peer_signing_key: [u8; 32],
+    request_digest: [u8; 32],
+    ratchet_revision: u64,
+}
+
+fn validate_stored_direct_outbox_row_v1(
+    row: &StoredDirectMessageOutboxRowV1,
+    expected_scope: &DirectMessageOutboxScopeV1,
+    route: Option<&DurableDirectOutboxRouteV1>,
+) -> Result<ValidatedDirectOutboxRowV1, String> {
+    let queue_order = u64::try_from(row.queue_order)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "persisted Direct outbox queue order is invalid".to_string())?;
+    validate_canonical_server_origin(&row.canonical_server_origin)?;
+    validate_canonical_uuid("persisted Direct outbox user id", &row.user_id)?;
+    validate_canonical_uuid(
+        "persisted Direct outbox conversation id",
+        &row.conversation_id,
+    )?;
+    validate_canonical_uuid("persisted Direct outbox peer user id", &row.peer_user_id)?;
+    validate_canonical_uuid(
+        "persisted Direct outbox client message id",
+        &row.client_message_id,
+    )?;
+    validate_canonical_uuid(
+        "persisted Direct outbox local message id",
+        &row.local_message_id,
+    )?;
+    if row.client_message_id != row.local_message_id {
+        return Err("persisted Direct outbox client/local correlation changed".to_string());
+    }
+    if let Some(server_message_id) = row.server_message_id.as_deref() {
+        validate_canonical_uuid(
+            "persisted Direct outbox server message id",
+            server_message_id,
+        )?;
+    }
+    let device_id = fixed_bytes::<16>("persisted Direct outbox device id", row.device_id.clone())?;
+    let peer_identity_key = fixed_bytes::<32>(
+        "persisted Direct outbox peer identity key",
+        row.peer_identity_key.clone(),
+    )?;
+    let peer_signing_key = fixed_bytes::<32>(
+        "persisted Direct outbox peer signing key",
+        row.peer_signing_key.clone(),
+    )?;
+    let request_digest = fixed_bytes::<32>(
+        "persisted Direct outbox request digest",
+        row.request_digest.clone(),
+    )?;
+    let ratchet_revision = u64::try_from(row.ratchet_revision)
+        .ok()
+        .filter(|value| *value > 0)
+        .ok_or_else(|| "persisted Direct outbox ratchet revision is invalid".to_string())?;
+    if row.canonical_server_origin != expected_scope.canonical_server_origin
+        || row.user_id != expected_scope.user_id
+        || device_id != expected_scope.device_id
+        || row.peer_user_id == expected_scope.user_id
+        || peer_identity_key == [0u8; 32]
+        || peer_signing_key == [0u8; 32]
+    {
+        return Err("persisted Direct outbox scope or peer binding is invalid".to_string());
+    }
+    if route.is_some_and(|route| {
+        row.peer_user_id != route.peer_user_id
+            || peer_identity_key != route.peer_identity_key
+            || peer_signing_key != route.peer_signing_key
+    }) {
+        return Err("persisted Direct outbox peer route changed".to_string());
+    }
+    match row.state {
+        0 => {
+            let payload = row
+                .exact_send_message_payload
+                .as_deref()
+                .ok_or("pending Direct outbox row has no exact payload")?;
+            if payload.is_empty() || payload.len() > DIRECT_MESSAGE_OUTBOX_MAX_PAYLOAD_BYTES_V1 {
+                return Err("pending Direct outbox payload is empty or oversized".to_string());
+            }
+            if direct_message_request_digest_v1(payload) != request_digest {
+                return Err("pending Direct outbox payload digest is invalid".to_string());
+            }
+            if row.server_message_id.is_some() || row.server_timestamp_ms.is_some() {
+                return Err("pending Direct outbox row contains an ACK result".to_string());
+            }
+            if row.rejection_reason.is_some() {
+                return Err("pending Direct outbox row contains a rejection result".to_string());
+            }
+        }
+        1 => {
+            if row.exact_send_message_payload.is_some()
+                || row.server_message_id.is_none()
+                || row
+                    .server_timestamp_ms
+                    .is_none_or(|timestamp| timestamp <= 0)
+                || row.rejection_reason.is_some()
+            {
+                return Err("acknowledged Direct outbox receipt has an invalid shape".to_string());
+            }
+        }
+        2 => {
+            if row.exact_send_message_payload.is_some()
+                || row.server_message_id.is_some()
+                || row.server_timestamp_ms.is_some()
+            {
+                return Err("rejected Direct outbox receipt has an invalid shape".to_string());
+            }
+            validate_direct_message_rejection_reason_v1(
+                row.rejection_reason
+                    .as_deref()
+                    .ok_or("rejected Direct outbox receipt has no reason")?,
+            )?;
+        }
+        _ => return Err("persisted Direct outbox state is invalid".to_string()),
+    }
+    Ok(ValidatedDirectOutboxRowV1 {
+        queue_order,
+        peer_identity_key,
+        peer_signing_key,
+        request_digest,
+        ratchet_revision,
+    })
 }
 
 fn ensure_account_snapshot_compatible_with_self(
@@ -1281,6 +2109,19 @@ impl VeilDb {
                 CHECK(identity_key <> signing_key)
             );
 
+            -- The one canonical origin selected by a successful mobile
+            -- authentication. Account coordinates remain owned by the
+            -- immutable authenticated-self binding above; this table stores
+            -- no Node Access Pass, token, WebSocket URL, or key material.
+            CREATE TABLE IF NOT EXISTS mobile_reconnect_target_v1 (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                canonical_server_origin TEXT NOT NULL UNIQUE
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512)
+                    REFERENCES authenticated_self_bindings_v1(canonical_server_origin)
+                    ON UPDATE RESTRICT ON DELETE RESTRICT,
+                selected_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
             -- Immutable author attribution captured when plaintext is
             -- committed. It follows an outgoing local UUID when the server
             -- ACK replaces that UUID and is removed with the message.
@@ -1316,6 +2157,7 @@ impl VeilDb {
             CREATE TABLE IF NOT EXISTS ratchet_sessions (
                 peer_identity_key BLOB PRIMARY KEY,
                 session_data BLOB NOT NULL,  -- Serialized RatchetSession (encrypted by SQLCipher)
+                revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
@@ -1324,6 +2166,66 @@ impl VeilDb {
                 header_data BLOB NOT NULL,
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
+
+            -- Durable exact-byte FIFO for Direct sends. Acknowledged rows keep
+            -- the compact identity/digest/result receipt forever, while the
+            -- bounded serialized payload is erased in the ACK transaction.
+            CREATE TABLE IF NOT EXISTS direct_message_outbox_v1 (
+                queue_order INTEGER PRIMARY KEY AUTOINCREMENT,
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL
+                    CHECK(length(user_id) = 36 AND user_id = lower(user_id)),
+                device_id BLOB NOT NULL CHECK(length(device_id) = 16),
+                conversation_id TEXT NOT NULL
+                    CHECK(length(conversation_id) = 36 AND conversation_id = lower(conversation_id)),
+                peer_user_id TEXT NOT NULL
+                    CHECK(length(peer_user_id) = 36 AND peer_user_id = lower(peer_user_id)),
+                peer_identity_key BLOB NOT NULL CHECK(length(peer_identity_key) = 32),
+                peer_signing_key BLOB NOT NULL CHECK(length(peer_signing_key) = 32),
+                client_message_id TEXT NOT NULL UNIQUE
+                    CHECK(length(client_message_id) = 36 AND client_message_id = lower(client_message_id)),
+                local_message_id TEXT NOT NULL UNIQUE
+                    CHECK(length(local_message_id) = 36 AND local_message_id = lower(local_message_id)),
+                request_digest BLOB NOT NULL CHECK(length(request_digest) = 32),
+                exact_send_message_payload BLOB,
+                ratchet_revision INTEGER NOT NULL CHECK(ratchet_revision > 0),
+                state INTEGER NOT NULL DEFAULT 0 CHECK(state IN (0, 1, 2)),
+                server_message_id TEXT UNIQUE
+                    CHECK(server_message_id IS NULL OR
+                          (length(server_message_id) = 36 AND server_message_id = lower(server_message_id))),
+                server_timestamp_ms INTEGER,
+                rejection_reason TEXT
+                    CHECK(rejection_reason IS NULL OR
+                          length(CAST(rejection_reason AS BLOB)) BETWEEN 1 AND 128),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                CHECK(client_message_id = local_message_id),
+                CHECK(
+                    (state = 0 AND
+                     exact_send_message_payload IS NOT NULL AND
+                     length(exact_send_message_payload) BETWEEN 1 AND 262144 AND
+                     server_message_id IS NULL AND server_timestamp_ms IS NULL AND
+                     rejection_reason IS NULL)
+                    OR
+                    (state = 1 AND exact_send_message_payload IS NULL AND
+                     server_message_id IS NOT NULL AND server_timestamp_ms > 0 AND
+                     rejection_reason IS NULL)
+                    OR
+                    (state = 2 AND exact_send_message_payload IS NULL AND
+                     server_message_id IS NULL AND server_timestamp_ms IS NULL AND
+                     rejection_reason IS NOT NULL)
+                )
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_direct_message_outbox_v1_pending_scope
+                ON direct_message_outbox_v1
+                    (canonical_server_origin, user_id, device_id, state, queue_order);
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_direct_message_outbox_v1_ratchet_revision
+                ON direct_message_outbox_v1
+                    (canonical_server_origin, user_id, device_id,
+                     peer_identity_key, ratchet_revision);
 
             CREATE TABLE IF NOT EXISTS client_state (
                 key TEXT PRIMARY KEY,
@@ -1383,6 +2285,41 @@ impl VeilDb {
                 PRIMARY KEY (key_type, protocol_key_id),
                 CHECK((consumed = 0 AND length(secret_key) = 32) OR
                       (consumed = 1 AND secret_key IS NULL))
+            );
+
+            -- Persisted protocol-id allocator. Values are the next ids which
+            -- have not yet been reserved. Reservation commits independently
+            -- before generation, so failures create safe gaps instead of id
+            -- reuse. Existing key rows remain the authoritative lower bound.
+            CREATE TABLE IF NOT EXISTS local_prekey_allocator_v1 (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                next_signed_prekey_id INTEGER NOT NULL
+                    CHECK(next_signed_prekey_id BETWEEN 1 AND 4294967295),
+                next_one_time_prekey_id INTEGER NOT NULL
+                    CHECK(next_one_time_prekey_id BETWEEN 1 AND 4294967295),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+
+            -- Exact-byte X3DH publication outbox. A batch belongs to one
+            -- authenticated node/account/device scope: reusing an OPK batch
+            -- across independent nodes would violate its one-time property.
+            CREATE TABLE IF NOT EXISTS local_prekey_publications_v1 (
+                canonical_server_origin TEXT NOT NULL
+                    CHECK(length(canonical_server_origin) BETWEEN 1 AND 512),
+                user_id TEXT NOT NULL CHECK(length(user_id) = 36),
+                device_id BLOB NOT NULL CHECK(length(device_id) = 16),
+                signed_prekey_id INTEGER NOT NULL CHECK(signed_prekey_id > 0),
+                one_time_prekey_count INTEGER NOT NULL
+                    CHECK(one_time_prekey_count = 20),
+                request_body BLOB NOT NULL
+                    CHECK(length(request_body) BETWEEN 1 AND 65536),
+                body_sha256 BLOB NOT NULL CHECK(length(body_sha256) = 32),
+                acknowledged INTEGER NOT NULL DEFAULT 0
+                    CHECK(acknowledged IN (0, 1)),
+                created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                acknowledged_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (canonical_server_origin, user_id, device_id)
             );
 
             CREATE TABLE IF NOT EXISTS trusted_identity_keys (
@@ -1598,6 +2535,7 @@ impl VeilDb {
             )
             .map_err(|e| format!("migrations: {e}"))?;
 
+        self.ensure_ratchet_session_revision_schema()?;
         self.ensure_conversation_identity_schema()?;
         self.ensure_network_profile_avatar_schema()?;
         self.ensure_message_author_context_schema()?;
@@ -1622,6 +2560,42 @@ impl VeilDb {
             .map_err(|e| format!("normalize incoming message status: {e}"))?;
 
         Ok(())
+    }
+
+    /// Older SQLCipher files predate ratchet CAS. Add the revision inside one
+    /// IMMEDIATE schema transaction and preserve every existing session at
+    /// revision zero; callers must explicitly advance it with the outbox write.
+    fn ensure_ratchet_session_revision_schema(&self) -> Result<(), String> {
+        let tx = begin_immediate(&self.conn, "ratchet session revision schema upgrade")?;
+        let has_revision: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM pragma_table_info('ratchet_sessions')
+                    WHERE name = 'revision'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect ratchet session revision schema: {error}"))?;
+        if !has_revision {
+            tx.execute_batch(
+                "ALTER TABLE ratchet_sessions
+                 ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0);",
+            )
+            .map_err(|error| format!("add ratchet session revision: {error}"))?;
+        }
+        let invalid: bool = tx
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM ratchet_sessions WHERE revision < 0)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("validate ratchet session revisions: {error}"))?;
+        if invalid {
+            return Err("persisted ratchet session revision is invalid".to_string());
+        }
+        tx.commit()
+            .map_err(|error| format!("commit ratchet session revision schema upgrade: {error}"))
     }
 
     /// Add the nullable origin/account coordinates used by authenticated
@@ -2115,68 +3089,141 @@ impl VeilDb {
         identity_key: &[u8; 32],
         signing_key: &[u8; 32],
     ) -> Result<(), String> {
-        validate_canonical_server_origin(canonical_server_origin)?;
-        validate_canonical_uuid("authenticated self user id", user_id)?;
-        if identity_key == &[0u8; 32]
-            || !veil_crypto::public_key::valid_ed25519_public_key(signing_key)
-        {
-            return Err("authenticated self keys are not valid account public keys".to_string());
-        }
-        if identity_key == signing_key {
-            return Err(
-                "authenticated self identity and signing keys must be distinct".to_string(),
-            );
-        }
+        validate_authenticated_self_coordinates(
+            canonical_server_origin,
+            user_id,
+            identity_key,
+            signing_key,
+        )?;
 
         let tx = self
             .conn
             .unchecked_transaction()
             .map_err(|error| format!("begin authenticated self binding: {error}"))?;
-        let existing = load_authenticated_self_binding(&tx, canonical_server_origin)?;
-
-        match existing {
-            Some(stored) => {
-                if stored.user_id != user_id
-                    || stored.identity_key != *identity_key
-                    || stored.signing_key != *signing_key
-                {
-                    return Err(
-                        "authenticated server attempted to remap the durable self account"
-                            .to_string(),
-                    );
-                }
-                ensure_self_binding_directory_compatible(&tx, canonical_server_origin, &stored)?;
-                tx.execute(
-                    "UPDATE authenticated_self_bindings_v1
-                     SET last_authenticated_at = datetime('now')
-                     WHERE canonical_server_origin = ?1",
-                    rusqlite::params![canonical_server_origin],
-                )
-                .map_err(|error| format!("refresh authenticated self binding: {error}"))?;
-            }
-            None => {
-                let pending = AuthenticatedSelfBinding {
-                    user_id: user_id.to_string(),
-                    identity_key: *identity_key,
-                    signing_key: *signing_key,
-                };
-                ensure_self_binding_directory_compatible(&tx, canonical_server_origin, &pending)?;
-                tx.execute(
-                    "INSERT INTO authenticated_self_bindings_v1
-                        (canonical_server_origin, user_id, identity_key, signing_key)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    rusqlite::params![
-                        canonical_server_origin,
-                        user_id,
-                        identity_key.as_slice(),
-                        signing_key.as_slice(),
-                    ],
-                )
-                .map_err(|error| format!("insert authenticated self binding: {error}"))?;
-            }
-        }
+        bind_authenticated_self_in_transaction(
+            &tx,
+            canonical_server_origin,
+            user_id,
+            identity_key,
+            signing_key,
+        )?;
         tx.commit()
             .map_err(|error| format!("commit authenticated self binding: {error}"))
+    }
+
+    /// Atomically pin an authenticated mobile account and select its exact
+    /// canonical origin for credential-free process-death reconnect.
+    pub fn bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        identity_key: &[u8; 32],
+        signing_key: &[u8; 32],
+    ) -> Result<(), String> {
+        validate_authenticated_self_coordinates(
+            canonical_server_origin,
+            user_id,
+            identity_key,
+            signing_key,
+        )?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin mobile reconnect target selection: {error}"))?;
+        bind_authenticated_self_in_transaction(
+            &tx,
+            canonical_server_origin,
+            user_id,
+            identity_key,
+            signing_key,
+        )?;
+        tx.execute(
+            "INSERT INTO mobile_reconnect_target_v1
+                (singleton, canonical_server_origin, selected_at)
+             VALUES (1, ?1, datetime('now'))
+             ON CONFLICT(singleton) DO UPDATE SET
+                canonical_server_origin = excluded.canonical_server_origin,
+                selected_at = excluded.selected_at",
+            rusqlite::params![canonical_server_origin],
+        )
+        .map_err(|error| format!("select mobile reconnect target: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit mobile reconnect target selection: {error}"))
+    }
+
+    /// Resolve the selected mobile origin against the immutable self binding
+    /// and the account keys derived by the currently opened SQLCipher session.
+    pub fn load_mobile_reconnect_target_v1(
+        &self,
+        current_identity_key: &[u8; 32],
+        current_signing_key: &[u8; 32],
+    ) -> Result<Option<MobileReconnectTargetV1>, String> {
+        let canonical_server_origin = {
+            let mut statement = self
+                .conn
+                .prepare(
+                    "SELECT singleton, canonical_server_origin
+                     FROM mobile_reconnect_target_v1
+                     ORDER BY singleton
+                     LIMIT 2",
+                )
+                .map_err(|error| format!("prepare mobile reconnect target load: {error}"))?;
+            let mut rows = statement
+                .query([])
+                .map_err(|error| format!("query mobile reconnect target: {error}"))?;
+            let Some(row) = rows
+                .next()
+                .map_err(|error| format!("read mobile reconnect target: {error}"))?
+            else {
+                return Ok(None);
+            };
+            let singleton = row
+                .get::<_, i64>(0)
+                .map_err(|error| format!("decode mobile reconnect target singleton: {error}"))?;
+            let canonical_server_origin = row
+                .get::<_, String>(1)
+                .map_err(|error| format!("decode mobile reconnect target origin: {error}"))?;
+            if singleton != 1 {
+                return Err(
+                    "persisted mobile reconnect target has an invalid singleton".to_string()
+                );
+            }
+            if rows
+                .next()
+                .map_err(|error| format!("read duplicate mobile reconnect target: {error}"))?
+                .is_some()
+            {
+                return Err("persisted mobile reconnect target is not unique".to_string());
+            }
+            Some(canonical_server_origin)
+        };
+        let Some(canonical_server_origin) = canonical_server_origin else {
+            return Ok(None);
+        };
+        validate_canonical_server_origin(&canonical_server_origin)
+            .map_err(|error| format!("persisted mobile reconnect target is invalid: {error}"))?;
+        let binding = validated_self_binding_for_origin(&self.conn, &canonical_server_origin)?
+            .ok_or_else(|| {
+                "persisted mobile reconnect target has no authenticated self binding".to_string()
+            })?;
+        validate_authenticated_self_coordinates(
+            &canonical_server_origin,
+            &binding.user_id,
+            current_identity_key,
+            current_signing_key,
+        )?;
+        if binding.identity_key != *current_identity_key
+            || binding.signing_key != *current_signing_key
+        {
+            return Err(
+                "persisted mobile reconnect target does not match the current account keys"
+                    .to_string(),
+            );
+        }
+        Ok(Some(MobileReconnectTargetV1 {
+            canonical_server_origin,
+            expected_user_id: binding.user_id,
+        }))
     }
 
     /// Merge a complete authenticated account-directory batch atomically.
@@ -3061,6 +4108,161 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Atomically persist every Direct conversation from one authenticated
+    /// directory page. Duplicate conversation/peer bindings are rejected
+    /// before the transaction so a corrupted page cannot select a winner by
+    /// row order.
+    pub fn upsert_directory_directs(
+        &self,
+        canonical_server_origin: &str,
+        conversations: &[AuthenticatedDirectDirectoryEntry],
+    ) -> Result<(), String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        let mut conversation_ids = std::collections::HashSet::with_capacity(conversations.len());
+        let mut peer_user_ids = std::collections::HashSet::with_capacity(conversations.len());
+        let mut peer_identity_keys = std::collections::HashSet::with_capacity(conversations.len());
+        for conversation in conversations {
+            if !conversation_ids.insert(conversation.conversation_id.as_str()) {
+                return Err("Direct directory batch repeats a conversation id".to_string());
+            }
+            if !peer_user_ids.insert(conversation.peer_user_id.as_str())
+                || !peer_identity_keys.insert(conversation.peer_identity_key)
+            {
+                return Err("Direct directory batch repeats a peer account".to_string());
+            }
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin Direct directory transaction: {error}"))?;
+        for conversation in conversations {
+            let duplicate = self
+                .conn
+                .query_row(
+                    "SELECT id
+                     FROM conversations
+                     WHERE conv_type = 0 AND id <> ?1
+                       AND (
+                         peer_identity_key = ?2
+                         OR (server_origin = ?3 AND peer_user_id = ?4)
+                       )
+                     LIMIT 1",
+                    rusqlite::params![
+                        conversation.conversation_id,
+                        conversation.peer_identity_key.as_slice(),
+                        canonical_server_origin,
+                        conversation.peer_user_id,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(|error| format!("check duplicate Direct directory route: {error}"))?;
+            if let Some(existing_id) = duplicate {
+                return Err(format!(
+                    "Direct peer is already bound to conversation {existing_id}"
+                ));
+            }
+            self.upsert_directory_conversation(
+                &conversation.conversation_id,
+                0,
+                canonical_server_origin,
+                Some(&conversation.name),
+                Some(&conversation.peer_user_id),
+                Some(&conversation.peer_identity_key),
+                None,
+                &conversation.created_at,
+            )?;
+        }
+        tx.commit()
+            .map_err(|error| format!("commit Direct directory transaction: {error}"))
+    }
+
+    /// Resolve one Direct history trust scope from a single SQLCipher read
+    /// transaction. The authenticated self binding, conversation origin/type,
+    /// immutable peer route and both directory account tuples must all agree.
+    ///
+    /// This helper deliberately accepts no candidate keys from the network.
+    /// A caller may compare its process-local pins with the returned tuples,
+    /// but it cannot use this function to establish new trust.
+    pub fn resolve_authenticated_direct_history_scope_v1(
+        &self,
+        canonical_server_origin: &str,
+        authenticated_user_id: &str,
+        conversation_id: &str,
+    ) -> Result<AuthenticatedDirectHistoryScopeV1, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid(
+            "Direct history authenticated user id",
+            authenticated_user_id,
+        )?;
+        validate_canonical_uuid("Direct history conversation id", conversation_id)?;
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin Direct history scope read: {error}"))?;
+        let self_binding = load_authenticated_self_binding(&tx, canonical_server_origin)?
+            .ok_or("Direct history origin has no authenticated self binding")?;
+        if self_binding.user_id != authenticated_user_id {
+            return Err("Direct history user differs from authenticated self".to_string());
+        }
+
+        let route = tx
+            .query_row(
+                "SELECT conv_type, server_origin, peer_user_id, peer_identity_key
+                 FROM conversations WHERE id = ?1",
+                rusqlite::params![conversation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u8>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<Vec<u8>>>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load Direct history conversation route: {error}"))?
+            .ok_or("Direct history conversation is absent from SQLCipher")?;
+        let (conversation_type, stored_origin, peer_user_id, peer_identity_key) = route;
+        if conversation_type != 0 || stored_origin.as_deref() != Some(canonical_server_origin) {
+            return Err("Direct history conversation has the wrong type or origin".to_string());
+        }
+        let peer_user_id = peer_user_id.ok_or("Direct history conversation has no peer user")?;
+        validate_canonical_uuid("Direct history peer user id", &peer_user_id)?;
+        if peer_user_id == authenticated_user_id {
+            return Err("Direct history conversation points to authenticated self".to_string());
+        }
+        let peer_identity_key: [u8; 32] = peer_identity_key
+            .ok_or("Direct history conversation has no peer identity")?
+            .try_into()
+            .map_err(|_| "Direct history peer identity has the wrong length".to_string())?;
+
+        let self_account =
+            load_account_by_origin_user(&tx, canonical_server_origin, authenticated_user_id)?
+                .ok_or("Direct history authenticated account is absent from the directory")?;
+        let peer_account =
+            load_account_by_origin_user(&tx, canonical_server_origin, &peer_user_id)?
+                .ok_or("Direct history peer account is absent from the directory")?;
+        if self_account.locator.identity_key != self_binding.identity_key
+            || self_account.signing_key != self_binding.signing_key
+        {
+            return Err("Direct history authenticated directory tuple changed".to_string());
+        }
+        if peer_account.locator.identity_key != peer_identity_key {
+            return Err("Direct history peer route differs from its directory tuple".to_string());
+        }
+
+        tx.commit()
+            .map_err(|error| format!("commit Direct history scope read: {error}"))?;
+        Ok(AuthenticatedDirectHistoryScopeV1 {
+            conversation_id: conversation_id.to_string(),
+            self_account,
+            peer_account,
+        })
+    }
+
     /// Atomically persist the text-channel conversations from one authenticated
     /// server directory page. A conflicting existing scope rolls back every
     /// row from the page so renderer state can never observe a partial trust
@@ -3682,6 +4884,790 @@ impl VeilDb {
         Ok(())
     }
 
+    /// Commit one advanced Direct ratchet step, optimistic local message, exact
+    /// retry payload and private attachment/author state as one IMMEDIATE
+    /// transaction. The ratchet CAS is intentionally performed before the
+    /// other inserts: every later failure rolls it back with the whole unit.
+    pub fn enqueue_direct_message_outbox_v1(
+        &self,
+        input: &DirectMessageOutboxEnqueueV1,
+    ) -> Result<DirectMessageOutboxEnqueueResultV1, String> {
+        validate_direct_message_outbox_enqueue_v1(input)?;
+        let expected_revision = i64::try_from(input.expected_ratchet_revision)
+            .map_err(|_| "Direct outbox expected ratchet revision exceeds SQLite integer")?;
+        let next_revision = input
+            .expected_ratchet_revision
+            .checked_add(1)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or("Direct outbox ratchet revision is exhausted")?;
+
+        let tx = begin_immediate(&self.conn, "Direct message outbox transaction")?;
+        let self_binding = require_current_direct_outbox_self_v1(&tx, &input.scope)?;
+        let route = resolve_current_direct_outbox_route_v1(
+            &tx,
+            &input.scope,
+            &self_binding,
+            &input.conversation_id,
+        )?;
+        if let Some(snapshot) = input.author_snapshot.as_ref() {
+            if snapshot.locator.canonical_server_origin != input.scope.canonical_server_origin
+                || snapshot.locator.user_id != input.scope.user_id
+                || snapshot.locator.identity_key != route.self_binding.identity_key
+                || snapshot.signing_key != route.self_binding.signing_key
+            {
+                return Err(
+                    "Direct outbox author snapshot differs from authenticated self".to_string(),
+                );
+            }
+        }
+        if let Some(reply_to_id) = input.reply_to_id.as_deref() {
+            let valid_reply: bool = tx
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM messages
+                        WHERE id = ?1 AND conversation_id = ?2
+                     )",
+                    rusqlite::params![reply_to_id, &input.conversation_id],
+                    |row| row.get(0),
+                )
+                .map_err(|error| format!("validate Direct outbox reply target: {error}"))?;
+            if !valid_reply {
+                return Err(
+                    "Direct outbox reply target is absent from its conversation".to_string()
+                );
+            }
+        }
+
+        let pending_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2
+                   AND device_id = ?3 AND state = 0",
+                rusqlite::params![
+                    &input.scope.canonical_server_origin,
+                    &input.scope.user_id,
+                    input.scope.device_id.as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("count Direct outbox capacity: {error}"))?;
+        if pending_count < 0 || pending_count as usize >= DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1 {
+            return Err("Direct outbox pending-row limit reached".to_string());
+        }
+
+        let changed = tx
+            .execute(
+                "UPDATE ratchet_sessions
+                 SET session_data = ?1, revision = ?2, updated_at = datetime('now')
+                 WHERE peer_identity_key = ?3 AND revision = ?4",
+                rusqlite::params![
+                    &input.advanced_ratchet_session,
+                    next_revision,
+                    route.peer_identity_key.as_slice(),
+                    expected_revision,
+                ],
+            )
+            .map_err(|error| format!("advance Direct outbox ratchet session: {error}"))?;
+        if changed != 1 {
+            return Err("Direct outbox ratchet revision changed or session is absent".to_string());
+        }
+
+        tx.execute(
+            "INSERT INTO messages
+               (id, conversation_id, sender_key, plaintext, is_outgoing,
+                status, reply_to_id, msg_type)
+             VALUES (?1, ?2, ?3, ?4, 1, 0, ?5, ?6)",
+            rusqlite::params![
+                &input.local_message_id,
+                &input.conversation_id,
+                route.self_binding.identity_key.as_slice(),
+                &input.plaintext,
+                input.reply_to_id.as_deref(),
+                if input.attachments.is_empty() {
+                    0u8
+                } else {
+                    2u8
+                },
+            ],
+        )
+        .map_err(|error| format!("insert Direct outbox local message: {error}"))?;
+        self.insert_message_attachments(&input.local_message_id, &input.attachments)?;
+        if let Some(snapshot) = input.author_snapshot.as_ref() {
+            self.attach_message_author(&input.local_message_id, snapshot)?;
+        }
+
+        tx.execute(
+            "INSERT INTO direct_message_outbox_v1
+               (canonical_server_origin, user_id, device_id, conversation_id,
+                peer_user_id, peer_identity_key, peer_signing_key,
+                client_message_id, local_message_id, request_digest,
+                exact_send_message_payload, ratchet_revision, state)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 0)",
+            rusqlite::params![
+                &input.scope.canonical_server_origin,
+                &input.scope.user_id,
+                input.scope.device_id.as_slice(),
+                &input.conversation_id,
+                &route.peer_user_id,
+                route.peer_identity_key.as_slice(),
+                route.peer_signing_key.as_slice(),
+                &input.client_message_id,
+                &input.local_message_id,
+                input.request_digest.as_slice(),
+                &input.exact_send_message_payload,
+                next_revision,
+            ],
+        )
+        .map_err(|error| format!("insert Direct exact outbox row: {error}"))?;
+        let queue_order = u64::try_from(tx.last_insert_rowid())
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or("Direct outbox queue order is invalid")?;
+        tx.execute(
+            "UPDATE conversations SET last_message_at = datetime('now') WHERE id = ?1",
+            rusqlite::params![&input.conversation_id],
+        )
+        .map_err(|error| format!("update Direct outbox conversation timestamp: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("commit Direct message outbox transaction: {error}"))?;
+
+        Ok(DirectMessageOutboxEnqueueResultV1 {
+            queue_order,
+            client_message_id: input.client_message_id.clone(),
+            local_message_id: input.local_message_id.clone(),
+            ratchet_revision: u64::try_from(next_revision)
+                .map_err(|_| "committed Direct outbox ratchet revision is invalid")?,
+        })
+    }
+
+    /// Load pending exact payloads in durable FIFO order for one authenticated
+    /// origin/account/device. Every row is revalidated against current SQLCipher
+    /// self, device, conversation, peer directory and ratchet state.
+    pub fn load_pending_direct_message_outbox_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        limit: usize,
+    ) -> Result<Vec<PendingDirectMessageOutboxV1>, String> {
+        self.load_pending_direct_message_outbox_after_v1(scope, None, limit)
+    }
+
+    /// Continue a strict FIFO scan after the last committed queue order from
+    /// the previous page. The cursor is a local SQLCipher row order, not a
+    /// server-provided value.
+    pub fn load_pending_direct_message_outbox_after_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        after_queue_order: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<PendingDirectMessageOutboxV1>, String> {
+        validate_direct_message_outbox_scope_v1(scope)?;
+        if limit == 0 || limit > DIRECT_MESSAGE_OUTBOX_MAX_LOAD_V1 {
+            return Err("Direct outbox load limit is invalid".to_string());
+        }
+        let after_queue_order_sql = after_queue_order
+            .map(|value| {
+                if value == 0 {
+                    return Err("Direct outbox FIFO cursor is invalid".to_string());
+                }
+                i64::try_from(value)
+                    .map_err(|_| "Direct outbox FIFO cursor exceeds SQLite integer".to_string())
+            })
+            .transpose()?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin Direct outbox read transaction: {error}"))?;
+        let self_binding = require_current_direct_outbox_self_v1(&tx, scope)?;
+        let total: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2
+                   AND device_id = ?3 AND state = 0",
+                rusqlite::params![
+                    &scope.canonical_server_origin,
+                    &scope.user_id,
+                    scope.device_id.as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("count pending Direct outbox rows: {error}"))?;
+        if total < 0 || total as usize > DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1 {
+            return Err("persisted Direct outbox exceeds its pending-row bound".to_string());
+        }
+
+        let sql = format!(
+            "SELECT {DIRECT_MESSAGE_OUTBOX_SELECT_V1}
+             FROM direct_message_outbox_v1
+             WHERE canonical_server_origin = ?1 AND user_id = ?2
+               AND device_id = ?3 AND state = 0
+               AND queue_order > COALESCE(?4, 0)
+             ORDER BY queue_order ASC LIMIT ?5"
+        );
+        let mut statement = tx
+            .prepare(&sql)
+            .map_err(|error| format!("prepare pending Direct outbox load: {error}"))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    &scope.canonical_server_origin,
+                    &scope.user_id,
+                    scope.device_id.as_slice(),
+                    after_queue_order_sql,
+                    i64::try_from(limit).map_err(|_| "Direct outbox load limit overflow")?,
+                ],
+                stored_direct_message_outbox_row_v1,
+            )
+            .map_err(|error| format!("query pending Direct outbox rows: {error}"))?;
+        let mut pending = Vec::new();
+        let mut previous_queue_order = after_queue_order.unwrap_or(0);
+        for row in rows {
+            let row = row.map_err(|error| format!("read pending Direct outbox row: {error}"))?;
+            let route = resolve_current_direct_outbox_route_v1(
+                &tx,
+                scope,
+                &self_binding,
+                &row.conversation_id,
+            )?;
+            let validated = validate_stored_direct_outbox_row_v1(&row, scope, Some(&route))?;
+            if validated.queue_order <= previous_queue_order {
+                return Err("persisted Direct outbox FIFO order is invalid".to_string());
+            }
+            previous_queue_order = validated.queue_order;
+            let current_ratchet_revision: i64 = tx
+                .query_row(
+                    "SELECT revision FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                    rusqlite::params![validated.peer_identity_key.as_slice()],
+                    |ratchet_row| ratchet_row.get(0),
+                )
+                .optional()
+                .map_err(|error| format!("load pending Direct ratchet revision: {error}"))?
+                .ok_or("pending Direct outbox ratchet session is absent")?;
+            let current_ratchet_revision = u64::try_from(current_ratchet_revision)
+                .map_err(|_| "pending Direct ratchet revision is invalid")?;
+            if validated.ratchet_revision > current_ratchet_revision {
+                return Err("pending Direct outbox is ahead of its ratchet session".to_string());
+            }
+            let local_binding = tx
+                .query_row(
+                    "SELECT conversation_id, sender_key, is_outgoing, status, plaintext
+                     FROM messages WHERE id = ?1",
+                    rusqlite::params![&row.local_message_id],
+                    |message_row| {
+                        Ok((
+                            message_row.get::<_, String>(0)?,
+                            message_row.get::<_, Vec<u8>>(1)?,
+                            message_row.get::<_, bool>(2)?,
+                            message_row.get::<_, i64>(3)?,
+                            message_row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| format!("load pending Direct local message: {error}"))?
+                .ok_or("pending Direct outbox local message is absent")?;
+            if local_binding.0 != row.conversation_id
+                || local_binding.1.as_slice() != route.self_binding.identity_key.as_slice()
+                || !local_binding.2
+                || local_binding.3 != 0
+                || local_binding.4.len() > DIRECT_MESSAGE_PLAINTEXT_MAX_BYTES_V1
+            {
+                return Err("pending Direct outbox local message binding is invalid".to_string());
+            }
+            pending.push(PendingDirectMessageOutboxV1 {
+                queue_order: validated.queue_order,
+                scope: scope.clone(),
+                conversation_id: row.conversation_id.clone(),
+                peer_user_id: row.peer_user_id.clone(),
+                peer_identity_key: validated.peer_identity_key,
+                peer_signing_key: validated.peer_signing_key,
+                client_message_id: row.client_message_id.clone(),
+                local_message_id: row.local_message_id.clone(),
+                request_digest: validated.request_digest,
+                exact_send_message_payload: row
+                    .exact_send_message_payload
+                    .clone()
+                    .ok_or("pending Direct outbox payload disappeared")?,
+                ratchet_revision: validated.ratchet_revision,
+                plaintext: local_binding.4,
+            });
+        }
+        drop(statement);
+        tx.commit()
+            .map_err(|error| format!("commit Direct outbox read transaction: {error}"))?;
+        Ok(pending)
+    }
+
+    pub fn count_pending_direct_message_outbox_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+    ) -> Result<usize, String> {
+        validate_direct_message_outbox_scope_v1(scope)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin Direct outbox count transaction: {error}"))?;
+        require_current_direct_outbox_self_v1(&tx, scope)?;
+        let count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2
+                   AND device_id = ?3 AND state = 0",
+                rusqlite::params![
+                    &scope.canonical_server_origin,
+                    &scope.user_id,
+                    scope.device_id.as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("count pending Direct outbox rows: {error}"))?;
+        let count = usize::try_from(count)
+            .ok()
+            .filter(|value| *value <= DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1)
+            .ok_or("persisted Direct outbox exceeds its pending-row bound")?;
+        tx.commit()
+            .map_err(|error| format!("commit Direct outbox count transaction: {error}"))?;
+        Ok(count)
+    }
+
+    /// Load and fully validate one durable receipt without changing it.
+    /// `Ok(None)` is an authoritative absence, while `Err` means the
+    /// SQLCipher read or its persisted invariants could not be trusted.
+    pub fn load_direct_message_outbox_receipt_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        client_message_id: &str,
+    ) -> Result<Option<DirectMessageOutboxReceiptV1>, String> {
+        validate_direct_message_outbox_scope_v1(scope)?;
+        validate_canonical_uuid("Direct outbox receipt client message id", client_message_id)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin Direct outbox receipt read: {error}"))?;
+        let self_binding = require_current_direct_outbox_self_v1(&tx, scope)?;
+        let sql = format!(
+            "SELECT {DIRECT_MESSAGE_OUTBOX_SELECT_V1}
+             FROM direct_message_outbox_v1
+             WHERE client_message_id = ?1
+               AND canonical_server_origin = ?2
+               AND user_id = ?3 AND device_id = ?4"
+        );
+        let Some(row) = tx
+            .query_row(
+                &sql,
+                rusqlite::params![
+                    client_message_id,
+                    &scope.canonical_server_origin,
+                    &scope.user_id,
+                    scope.device_id.as_slice(),
+                ],
+                stored_direct_message_outbox_row_v1,
+            )
+            .optional()
+            .map_err(|error| format!("load Direct outbox receipt row: {error}"))?
+        else {
+            tx.commit()
+                .map_err(|error| format!("commit empty Direct outbox receipt read: {error}"))?;
+            return Ok(None);
+        };
+        let route = if row.state == 0 {
+            Some(resolve_current_direct_outbox_route_v1(
+                &tx,
+                scope,
+                &self_binding,
+                &row.conversation_id,
+            )?)
+        } else {
+            None
+        };
+        validate_stored_direct_outbox_row_v1(&row, scope, route.as_ref())?;
+        let receipt = match row.state {
+            0 => DirectMessageOutboxReceiptV1::Pending {
+                local_message_id: row.local_message_id.clone(),
+            },
+            1 => DirectMessageOutboxReceiptV1::Acknowledged {
+                local_message_id: row.local_message_id.clone(),
+                server_message_id: row
+                    .server_message_id
+                    .clone()
+                    .expect("validated acknowledged receipt has a server message id"),
+                server_timestamp_ms: row
+                    .server_timestamp_ms
+                    .expect("validated acknowledged receipt has a server timestamp"),
+            },
+            2 => DirectMessageOutboxReceiptV1::Rejected {
+                local_message_id: row.local_message_id.clone(),
+                rejection_reason: row
+                    .rejection_reason
+                    .clone()
+                    .expect("validated rejected receipt has a stable reason"),
+            },
+            _ => unreachable!("validated Direct outbox receipt state"),
+        };
+        tx.commit()
+            .map_err(|error| format!("commit Direct outbox receipt read: {error}"))?;
+        Ok(Some(receipt))
+    }
+
+    /// Commit the authoritative ACK result and erase retry bytes atomically.
+    /// An acknowledged compact receipt remains immutable, making an identical
+    /// repeated ACK harmless and every different result fail closed.
+    pub fn acknowledge_direct_message_outbox_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        client_message_id: &str,
+        server_message_id: &str,
+        server_timestamp_ms: i64,
+    ) -> Result<DirectMessageOutboxAckResultV1, String> {
+        self.acknowledge_direct_message_outbox_inner_v1(
+            scope,
+            client_message_id,
+            server_message_id,
+            server_timestamp_ms,
+            true,
+        )
+    }
+
+    /// Validate an identical ACK only against an already-committed compact
+    /// receipt. This can never transition a pending row and is therefore safe
+    /// when the process has no current socket-sequence correlation.
+    pub fn validate_repeated_direct_message_outbox_ack_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        client_message_id: &str,
+        server_message_id: &str,
+        server_timestamp_ms: i64,
+    ) -> Result<DirectMessageOutboxAckResultV1, String> {
+        self.acknowledge_direct_message_outbox_inner_v1(
+            scope,
+            client_message_id,
+            server_message_id,
+            server_timestamp_ms,
+            false,
+        )
+    }
+
+    fn acknowledge_direct_message_outbox_inner_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        client_message_id: &str,
+        server_message_id: &str,
+        server_timestamp_ms: i64,
+        allow_pending_transition: bool,
+    ) -> Result<DirectMessageOutboxAckResultV1, String> {
+        validate_direct_message_outbox_scope_v1(scope)?;
+        validate_canonical_uuid("Direct outbox ACK client message id", client_message_id)?;
+        validate_canonical_uuid("Direct outbox ACK server message id", server_message_id)?;
+        if server_timestamp_ms <= 0 {
+            return Err("Direct outbox ACK timestamp is invalid".to_string());
+        }
+        let tx = begin_immediate(&self.conn, "Direct outbox ACK transaction")?;
+        let self_binding = require_current_direct_outbox_self_v1(&tx, scope)?;
+        let sql = format!(
+            "SELECT {DIRECT_MESSAGE_OUTBOX_SELECT_V1}
+             FROM direct_message_outbox_v1 WHERE client_message_id = ?1"
+        );
+        let row = tx
+            .query_row(
+                &sql,
+                rusqlite::params![client_message_id],
+                stored_direct_message_outbox_row_v1,
+            )
+            .optional()
+            .map_err(|error| format!("load Direct outbox ACK row: {error}"))?
+            .ok_or("Direct outbox ACK client message id is unknown")?;
+        if row.state == 2 {
+            validate_stored_direct_outbox_row_v1(&row, scope, None)?;
+            return Err("rejected Direct outbox receipt cannot be acknowledged".to_string());
+        }
+
+        if row.state == 1 {
+            validate_stored_direct_outbox_row_v1(&row, scope, None)?;
+            if row.server_message_id.as_deref() != Some(server_message_id)
+                || row.server_timestamp_ms != Some(server_timestamp_ms)
+            {
+                return Err(
+                    "repeated Direct outbox ACK conflicts with its durable receipt".to_string(),
+                );
+            }
+            tx.commit()
+                .map_err(|error| format!("commit repeated Direct outbox ACK read: {error}"))?;
+            return Ok(DirectMessageOutboxAckResultV1 {
+                client_message_id: row.client_message_id.clone(),
+                local_message_id: row.local_message_id.clone(),
+                server_message_id: server_message_id.to_string(),
+                server_timestamp_ms,
+                already_acknowledged: true,
+            });
+        }
+
+        let route = resolve_current_direct_outbox_route_v1(
+            &tx,
+            scope,
+            &self_binding,
+            &row.conversation_id,
+        )?;
+        let validated = validate_stored_direct_outbox_row_v1(&row, scope, Some(&route))?;
+
+        if !allow_pending_transition {
+            return Err(
+                "pending Direct outbox ACK requires a current transport sequence correlation"
+                    .to_string(),
+            );
+        }
+
+        let current_ratchet_revision: i64 = tx
+            .query_row(
+                "SELECT revision FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                rusqlite::params![validated.peer_identity_key.as_slice()],
+                |ratchet_row| ratchet_row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("load Direct ACK ratchet revision: {error}"))?
+            .ok_or("Direct ACK ratchet session is absent")?;
+        if u64::try_from(current_ratchet_revision)
+            .map_err(|_| "Direct ACK ratchet revision is invalid")?
+            < validated.ratchet_revision
+        {
+            return Err("Direct ACK outbox is ahead of its ratchet session".to_string());
+        }
+        let local_message = tx
+            .query_row(
+                "SELECT conversation_id, sender_key, is_outgoing, status
+                 FROM messages WHERE id = ?1",
+                rusqlite::params![&row.local_message_id],
+                |message_row| {
+                    Ok((
+                        message_row.get::<_, String>(0)?,
+                        message_row.get::<_, Vec<u8>>(1)?,
+                        message_row.get::<_, bool>(2)?,
+                        message_row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("load Direct ACK local message: {error}"))?
+            .ok_or("Direct ACK local message is absent")?;
+        if local_message.0 != row.conversation_id
+            || local_message.1.as_slice() != route.self_binding.identity_key.as_slice()
+            || !local_message.2
+            || local_message.3 != 0
+        {
+            return Err("Direct ACK local message binding is invalid".to_string());
+        }
+        let collision: bool = tx
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM messages WHERE id = ?1 AND id <> ?2
+                 )",
+                rusqlite::params![server_message_id, &row.local_message_id],
+                |message_row| message_row.get(0),
+            )
+            .map_err(|error| format!("check Direct ACK server id collision: {error}"))?;
+        if collision {
+            return Err("Direct ACK server message id already exists locally".to_string());
+        }
+        let changed = tx
+            .execute(
+                "UPDATE messages
+                 SET id = ?1, server_timestamp = ?2, status = 1
+                 WHERE id = ?3 AND conversation_id = ?4
+                   AND is_outgoing = 1 AND status = 0",
+                rusqlite::params![
+                    server_message_id,
+                    server_timestamp_ms,
+                    &row.local_message_id,
+                    &row.conversation_id,
+                ],
+            )
+            .map_err(|error| format!("acknowledge Direct outbox message: {error}"))?;
+        if changed != 1 {
+            return Err("Direct ACK pending message changed during reconciliation".to_string());
+        }
+        if row.local_message_id != server_message_id {
+            tx.execute(
+                "UPDATE messages SET reply_to_id = ?1 WHERE reply_to_id = ?2",
+                rusqlite::params![server_message_id, &row.local_message_id],
+            )
+            .map_err(|error| format!("migrate Direct ACK reply references: {error}"))?;
+            tx.execute(
+                "UPDATE reactions SET message_id = ?1 WHERE message_id = ?2",
+                rusqlite::params![server_message_id, &row.local_message_id],
+            )
+            .map_err(|error| format!("migrate Direct ACK reaction references: {error}"))?;
+        }
+        let receipt_changed = tx
+            .execute(
+                "UPDATE direct_message_outbox_v1
+                 SET state = 1, exact_send_message_payload = NULL,
+                     server_message_id = ?1, server_timestamp_ms = ?2,
+                     updated_at = datetime('now')
+                 WHERE queue_order = ?3 AND state = 0",
+                rusqlite::params![server_message_id, server_timestamp_ms, row.queue_order],
+            )
+            .map_err(|error| format!("commit Direct outbox ACK receipt: {error}"))?;
+        if receipt_changed != 1 {
+            return Err("Direct outbox ACK receipt changed during reconciliation".to_string());
+        }
+        tx.commit()
+            .map_err(|error| format!("commit Direct outbox ACK transaction: {error}"))?;
+        Ok(DirectMessageOutboxAckResultV1 {
+            client_message_id: row.client_message_id.clone(),
+            local_message_id: row.local_message_id.clone(),
+            server_message_id: server_message_id.to_string(),
+            server_timestamp_ms,
+            already_acknowledged: false,
+        })
+    }
+
+    /// Commit a correlated permanent server rejection. Callers must not use
+    /// this for retryable transport loss, rate limiting or server failure.
+    /// The exact payload is erased, while the UUID/digest/reason receipt stays
+    /// immutable so the same ciphertext can never be assigned a new meaning.
+    pub fn reject_direct_message_outbox_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        client_message_id: &str,
+        rejection_reason: &str,
+    ) -> Result<DirectMessageOutboxRejectResultV1, String> {
+        self.reject_direct_message_outbox_inner_v1(scope, client_message_id, rejection_reason, true)
+    }
+
+    /// Validate an identical permanent Error only against an existing
+    /// rejected receipt. It cannot turn a pending intent into Failed without
+    /// a current exact sequence map.
+    pub fn validate_repeated_direct_message_outbox_rejection_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        client_message_id: &str,
+        rejection_reason: &str,
+    ) -> Result<DirectMessageOutboxRejectResultV1, String> {
+        self.reject_direct_message_outbox_inner_v1(
+            scope,
+            client_message_id,
+            rejection_reason,
+            false,
+        )
+    }
+
+    fn reject_direct_message_outbox_inner_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        client_message_id: &str,
+        rejection_reason: &str,
+        allow_pending_transition: bool,
+    ) -> Result<DirectMessageOutboxRejectResultV1, String> {
+        validate_direct_message_outbox_scope_v1(scope)?;
+        validate_canonical_uuid(
+            "Direct outbox rejection client message id",
+            client_message_id,
+        )?;
+        validate_direct_message_rejection_reason_v1(rejection_reason)?;
+
+        let tx = begin_immediate(&self.conn, "Direct outbox rejection transaction")?;
+        let self_binding = require_current_direct_outbox_self_v1(&tx, scope)?;
+        let sql = format!(
+            "SELECT {DIRECT_MESSAGE_OUTBOX_SELECT_V1}
+             FROM direct_message_outbox_v1 WHERE client_message_id = ?1"
+        );
+        let row = tx
+            .query_row(
+                &sql,
+                rusqlite::params![client_message_id],
+                stored_direct_message_outbox_row_v1,
+            )
+            .optional()
+            .map_err(|error| format!("load Direct outbox rejection row: {error}"))?
+            .ok_or("Direct outbox rejection client message id is unknown")?;
+        match row.state {
+            1 => {
+                validate_stored_direct_outbox_row_v1(&row, scope, None)?;
+                return Err("acknowledged Direct outbox receipt cannot be rejected".to_string());
+            }
+            2 => {
+                validate_stored_direct_outbox_row_v1(&row, scope, None)?;
+                if row.rejection_reason.as_deref() != Some(rejection_reason) {
+                    return Err(
+                        "repeated Direct outbox rejection conflicts with its durable receipt"
+                            .to_string(),
+                    );
+                }
+                tx.commit().map_err(|error| {
+                    format!("commit repeated Direct outbox rejection read: {error}")
+                })?;
+                return Ok(DirectMessageOutboxRejectResultV1 {
+                    client_message_id: row.client_message_id.clone(),
+                    local_message_id: row.local_message_id.clone(),
+                    rejection_reason: rejection_reason.to_string(),
+                    already_rejected: true,
+                });
+            }
+            0 => {}
+            _ => return Err("persisted Direct outbox state is invalid".to_string()),
+        }
+
+        let route = resolve_current_direct_outbox_route_v1(
+            &tx,
+            scope,
+            &self_binding,
+            &row.conversation_id,
+        )?;
+        let validated = validate_stored_direct_outbox_row_v1(&row, scope, Some(&route))?;
+
+        if !allow_pending_transition {
+            return Err(
+                "pending Direct outbox rejection requires a current transport sequence correlation"
+                    .to_string(),
+            );
+        }
+
+        let current_ratchet_revision: i64 = tx
+            .query_row(
+                "SELECT revision FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                rusqlite::params![validated.peer_identity_key.as_slice()],
+                |ratchet_row| ratchet_row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("load Direct rejection ratchet revision: {error}"))?
+            .ok_or("Direct rejection ratchet session is absent")?;
+        if u64::try_from(current_ratchet_revision)
+            .map_err(|_| "Direct rejection ratchet revision is invalid")?
+            < validated.ratchet_revision
+        {
+            return Err("Direct rejection outbox is ahead of its ratchet session".to_string());
+        }
+        let failed = tx
+            .execute(
+                "UPDATE messages SET status = 4
+                 WHERE id = ?1 AND conversation_id = ?2 AND sender_key = ?3
+                   AND is_outgoing = 1 AND status = 0",
+                rusqlite::params![
+                    &row.local_message_id,
+                    &row.conversation_id,
+                    route.self_binding.identity_key.as_slice(),
+                ],
+            )
+            .map_err(|error| format!("mark rejected Direct message Failed: {error}"))?;
+        if failed != 1 {
+            return Err("Direct rejection pending message binding changed".to_string());
+        }
+        let receipt_changed = tx
+            .execute(
+                "UPDATE direct_message_outbox_v1
+                 SET state = 2, exact_send_message_payload = NULL,
+                     rejection_reason = ?1, updated_at = datetime('now')
+                 WHERE queue_order = ?2 AND state = 0",
+                rusqlite::params![rejection_reason, row.queue_order],
+            )
+            .map_err(|error| format!("commit Direct outbox rejection receipt: {error}"))?;
+        if receipt_changed != 1 {
+            return Err(
+                "Direct outbox rejection receipt changed during reconciliation".to_string(),
+            );
+        }
+        tx.commit()
+            .map_err(|error| format!("commit Direct outbox rejection transaction: {error}"))?;
+        Ok(DirectMessageOutboxRejectResultV1 {
+            client_message_id: row.client_message_id.clone(),
+            local_message_id: row.local_message_id.clone(),
+            rejection_reason: rejection_reason.to_string(),
+            already_rejected: false,
+        })
+    }
+
     pub fn insert_outgoing_pending_message(
         &self,
         id: &str,
@@ -3834,13 +5820,108 @@ impl VeilDb {
             .map_err(|e| format!("commit outgoing delivery states: {e}"))
     }
 
-    /// Process state contains the sequence-to-local-id correlation. After a
-    /// crash/restart that map is gone, so every surviving status=0 row must be
-    /// made explicitly ambiguous instead of pretending it is still sending.
+    /// Reconcile sequence-correlated sends after a clean transport loss.
+    ///
+    /// Legacy `Sending` rows have no durable retry correlation and therefore
+    /// become `Unknown`. A `Sending` row backed by an exact pending Direct
+    /// outbox remains retryable and is left untouched. Every supplied id must
+    /// name exactly one of those two shapes; one invalid id rolls back all
+    /// legacy transitions in the batch.
+    pub fn reconcile_outgoing_transport_loss_v1(
+        &self,
+        local_message_ids: &[String],
+    ) -> Result<usize, String> {
+        if local_message_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut unique = HashSet::with_capacity(local_message_ids.len());
+        for local_message_id in local_message_ids {
+            validate_canonical_uuid("outgoing transport-loss local message id", local_message_id)?;
+            if !unique.insert(local_message_id.as_str()) {
+                return Err("outgoing transport-loss batch contains a duplicate id".to_string());
+            }
+        }
+
+        let tx = begin_immediate(&self.conn, "outgoing transport-loss reconciliation")?;
+        let mut transitioned = 0usize;
+        for local_message_id in local_message_ids {
+            let shape = tx
+                .query_row(
+                    "SELECT message.is_outgoing, message.status,
+                            EXISTS(
+                                SELECT 1 FROM direct_message_outbox_v1 AS pending
+                                WHERE pending.local_message_id = message.id
+                                  AND pending.state = 0
+                            ),
+                            EXISTS(
+                                SELECT 1 FROM direct_message_outbox_v1 AS outbox
+                                WHERE outbox.local_message_id = message.id
+                            )
+                     FROM messages AS message WHERE message.id = ?1",
+                    rusqlite::params![local_message_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, bool>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, bool>(2)?,
+                            row.get::<_, bool>(3)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| format!("load outgoing transport-loss message shape: {error}"))?
+                .ok_or_else(|| {
+                    format!("outgoing transport-loss message {local_message_id} is absent")
+                })?;
+            if !shape.0 || shape.1 != 0 {
+                return Err(format!(
+                    "outgoing transport-loss message {local_message_id} is not Sending"
+                ));
+            }
+            if shape.2 {
+                continue;
+            }
+            if shape.3 {
+                return Err(format!(
+                    "outgoing transport-loss message {local_message_id} has no pending retry row"
+                ));
+            }
+            let changed = tx
+                .execute(
+                    "UPDATE messages SET status = 5
+                     WHERE id = ?1 AND is_outgoing = 1 AND status = 0
+                       AND NOT EXISTS (
+                           SELECT 1 FROM direct_message_outbox_v1 AS outbox
+                           WHERE outbox.local_message_id = messages.id
+                       )",
+                    rusqlite::params![local_message_id],
+                )
+                .map_err(|error| format!("mark legacy outgoing transport loss Unknown: {error}"))?;
+            if changed != 1 {
+                return Err(format!(
+                    "outgoing transport-loss message {local_message_id} changed during reconciliation"
+                ));
+            }
+            transitioned += 1;
+        }
+        tx.commit()
+            .map_err(|error| format!("commit outgoing transport-loss reconciliation: {error}"))?;
+        Ok(transitioned)
+    }
+
+    /// Legacy process state contains the sequence-to-local-id correlation. An
+    /// exact pending outbox row retains that correlation and its retry bytes,
+    /// so only legacy status=0 rows become explicitly ambiguous after restart.
     pub fn recover_unacknowledged_outgoing_messages(&self) -> Result<usize, String> {
         self.conn
             .execute(
-                "UPDATE messages SET status = 5 WHERE is_outgoing = 1 AND status = 0",
+                "UPDATE messages AS message SET status = 5
+                 WHERE message.is_outgoing = 1 AND message.status = 0
+                   AND NOT EXISTS (
+                       SELECT 1 FROM direct_message_outbox_v1 AS outbox
+                       WHERE outbox.state = 0
+                         AND outbox.local_message_id = message.id
+                   )",
                 [],
             )
             .map_err(|e| format!("recover unacknowledged outgoing messages: {e}"))
@@ -4344,11 +6425,24 @@ impl VeilDb {
     ) -> Result<(), String> {
         self.conn
             .execute(
-                "INSERT OR REPLACE INTO ratchet_sessions (peer_identity_key, session_data, updated_at)
-                 VALUES (?1, ?2, datetime('now'))",
+                "INSERT INTO ratchet_sessions
+                    (peer_identity_key, session_data, revision, updated_at)
+                 VALUES (?1, ?2, 0, datetime('now'))
+                 ON CONFLICT(peer_identity_key) DO UPDATE SET
+                    session_data = excluded.session_data,
+                    revision = ratchet_sessions.revision + 1,
+                    updated_at = datetime('now')
+                 WHERE ratchet_sessions.revision < 9223372036854775807",
                 rusqlite::params![peer_identity_key, session_data],
             )
-            .map_err(|e| format!("save ratchet session: {e}"))?;
+            .map_err(|e| format!("save ratchet session: {e}"))
+            .and_then(|changed| {
+                if changed == 1 {
+                    Ok(())
+                } else {
+                    Err("ratchet session revision is exhausted".to_string())
+                }
+            })?;
         Ok(())
     }
 
@@ -4365,12 +6459,24 @@ impl VeilDb {
             .unchecked_transaction()
             .map_err(|e| format!("begin initiator session transaction: {e}"))?;
         tx.execute(
-            "INSERT OR REPLACE INTO ratchet_sessions
-               (peer_identity_key, session_data, updated_at)
-             VALUES (?1, ?2, datetime('now'))",
+            "INSERT INTO ratchet_sessions
+               (peer_identity_key, session_data, revision, updated_at)
+             VALUES (?1, ?2, 0, datetime('now'))
+             ON CONFLICT(peer_identity_key) DO UPDATE SET
+                session_data = excluded.session_data,
+                revision = ratchet_sessions.revision + 1,
+                updated_at = datetime('now')
+             WHERE ratchet_sessions.revision < 9223372036854775807",
             rusqlite::params![peer_identity_key.as_slice(), session_data],
         )
-        .map_err(|e| format!("save initiator ratchet session: {e}"))?;
+        .map_err(|e| format!("save initiator ratchet session: {e}"))
+        .and_then(|changed| {
+            if changed == 1 {
+                Ok(())
+            } else {
+                Err("initiator ratchet session revision is exhausted".to_string())
+            }
+        })?;
         tx.execute(
             "INSERT OR REPLACE INTO pending_initial_headers
                (peer_identity_key, header_data, updated_at)
@@ -4426,6 +6532,36 @@ impl VeilDb {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("load ratchet session: {e}")),
         }
+    }
+
+    /// Load the exact serialized ratchet state together with the revision that
+    /// a future atomic Direct enqueue must present to its CAS update.
+    pub fn load_ratchet_session_with_revision_v1(
+        &self,
+        peer_identity_key: &[u8; 32],
+    ) -> Result<Option<RatchetSessionWithRevisionV1>, String> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT session_data, revision
+                 FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                rusqlite::params![peer_identity_key.as_slice()],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(|error| format!("load ratchet session revision: {error}"))?;
+        let Some((session_data, revision)) = row else {
+            return Ok(None);
+        };
+        if session_data.is_empty() || session_data.len() > DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1 {
+            return Err("persisted ratchet session is empty or oversized".to_string());
+        }
+        let revision = u64::try_from(revision)
+            .map_err(|_| "persisted ratchet session revision is invalid".to_string())?;
+        Ok(Some(RatchetSessionWithRevisionV1 {
+            session_data,
+            revision,
+        }))
     }
 
     /// Return the stable per-install device ID stored inside SQLCipher, or
@@ -4891,23 +7027,17 @@ impl VeilDb {
     }
 
     /// Store freshly generated X3DH prekeys as one transaction. Private bytes
-    /// are protected by SQLCipher and zeroized by `LocalPreKey` on drop.
+    /// are protected by SQLCipher and zeroized by `LocalPreKey` on drop. A
+    /// protocol id is immutable for the lifetime of the installation: a stale
+    /// client must fail instead of replacing or resurrecting key material.
     pub fn save_local_prekeys(&self, keys: &[LocalPreKey]) -> Result<(), String> {
-        let tx = self
-            .conn
-            .unchecked_transaction()
-            .map_err(|e| format!("begin local prekey transaction: {e}"))?;
+        let tx = begin_immediate(&self.conn, "local prekey transaction")?;
         for key in keys {
             let signature = key.signature.as_ref().map(|value| value.as_slice());
             tx.execute(
                 "INSERT INTO local_prekeys
                    (key_type, protocol_key_id, secret_key, public_key, signature, consumed)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 0)
-                 ON CONFLICT(key_type, protocol_key_id) DO UPDATE SET
-                   secret_key=excluded.secret_key,
-                   public_key=excluded.public_key,
-                   signature=excluded.signature,
-                   consumed=0",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
                 rusqlite::params![
                     key.key_type,
                     i64::from(key.protocol_key_id),
@@ -4920,6 +7050,278 @@ impl VeilDb {
         }
         tx.commit()
             .map_err(|e| format!("commit local prekeys: {e}"))
+    }
+
+    /// Initialize or advance the persisted allocator to at least one greater
+    /// than every existing protocol id. The immediate transaction also makes
+    /// opening an older database safe before its first reservation.
+    pub fn synchronize_local_prekey_allocator(&self) -> Result<(u32, u32), String> {
+        let tx = begin_immediate(&self.conn, "local prekey allocator synchronization")?;
+        let next = synchronize_local_prekey_allocator_on(&tx)?;
+        tx.commit()
+            .map_err(|error| format!("commit local prekey allocator synchronization: {error}"))?;
+        Ok(next)
+    }
+
+    /// Atomically reserve one SPK id and twenty contiguous OPK ids.
+    ///
+    /// The reservation is intentionally committed before generation and key
+    /// persistence. Gaps after crashes or failed writes are safe; reuse is not.
+    pub fn reserve_local_prekey_batch_ids(&self) -> Result<LocalPreKeyIdReservationV1, String> {
+        let tx = begin_immediate(&self.conn, "local prekey id reservation")?;
+        let (signed_prekey_id, one_time_prekey_start_id) =
+            synchronize_local_prekey_allocator_on(&tx)?;
+        let next_signed_prekey_id = signed_prekey_id
+            .checked_add(1)
+            .ok_or_else(|| "signed prekey id exhausted".to_string())?;
+        let next_one_time_prekey_id = one_time_prekey_start_id
+            .checked_add(LOCAL_PREKEY_PUBLICATION_BATCH_SIZE as u32)
+            .ok_or_else(|| "one-time prekey id exhausted".to_string())?;
+        let changed = tx
+            .execute(
+                "UPDATE local_prekey_allocator_v1
+                 SET next_signed_prekey_id = ?1,
+                     next_one_time_prekey_id = ?2,
+                     updated_at = datetime('now')
+                 WHERE singleton = 1
+                   AND next_signed_prekey_id = ?3
+                   AND next_one_time_prekey_id = ?4",
+                rusqlite::params![
+                    i64::from(next_signed_prekey_id),
+                    i64::from(next_one_time_prekey_id),
+                    i64::from(signed_prekey_id),
+                    i64::from(one_time_prekey_start_id),
+                ],
+            )
+            .map_err(|error| format!("reserve local prekey ids: {error}"))?;
+        if changed != 1 {
+            return Err("local prekey allocator changed during reservation".to_string());
+        }
+        tx.commit()
+            .map_err(|error| format!("commit local prekey id reservation: {error}"))?;
+        Ok(LocalPreKeyIdReservationV1 {
+            signed_prekey_id,
+            one_time_prekey_start_id,
+            next_signed_prekey_id,
+            next_one_time_prekey_id,
+        })
+    }
+
+    /// Atomically persist a newly generated SPK/OPK batch and its exact-byte
+    /// origin-scoped publication outbox. Existing protocol ids are never
+    /// overwritten: one id must identify one key for the lifetime of an
+    /// installation, including after a failed or ambiguous network attempt.
+    pub fn save_local_prekeys_with_publication(
+        &self,
+        keys: &[LocalPreKey],
+        publication: &LocalPreKeyPublicationV1,
+    ) -> Result<(), String> {
+        validate_local_prekey_publication_input(keys, publication)?;
+
+        let tx = begin_immediate(&self.conn, "local prekey publication transaction")?;
+        let authenticated =
+            load_authenticated_self_binding(&tx, &publication.canonical_server_origin)?
+                .ok_or("authenticated self binding is unavailable for prekey publication")?;
+        if authenticated.user_id != publication.user_id {
+            return Err("prekey publication user differs from authenticated self".to_string());
+        }
+
+        let persisted_device: Vec<u8> = tx
+            .query_row(
+                "SELECT device_id FROM device_identity_v1 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("load local device for prekey publication: {e}"))?;
+        if persisted_device.as_slice() != publication.device_id.as_slice() {
+            return Err(
+                "prekey publication device differs from the local installation".to_string(),
+            );
+        }
+
+        let existing_pending: Option<u8> = tx
+            .query_row(
+                "SELECT acknowledged FROM local_prekey_publications_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2 AND device_id = ?3",
+                rusqlite::params![
+                    publication.canonical_server_origin,
+                    publication.user_id,
+                    publication.device_id.as_slice(),
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|e| format!("load existing local prekey publication: {e}"))?;
+        if existing_pending == Some(0) {
+            return Err(
+                "an unacknowledged prekey publication already exists for this node".to_string(),
+            );
+        }
+
+        for key in keys {
+            let signature = key.signature.as_ref().map(|value| value.as_slice());
+            tx.execute(
+                "INSERT INTO local_prekeys
+                   (key_type, protocol_key_id, secret_key, public_key, signature, consumed)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                rusqlite::params![
+                    key.key_type,
+                    i64::from(key.protocol_key_id),
+                    key.secret_key.as_slice(),
+                    key.public_key.as_slice(),
+                    signature,
+                ],
+            )
+            .map_err(|e| {
+                format!(
+                    "save immutable local publication prekey {}: {e}",
+                    key.protocol_key_id
+                )
+            })?;
+        }
+
+        tx.execute(
+            "INSERT INTO local_prekey_publications_v1
+               (canonical_server_origin, user_id, device_id, signed_prekey_id,
+                one_time_prekey_count, request_body, body_sha256, acknowledged,
+                created_at, acknowledged_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, datetime('now'), NULL, datetime('now'))
+             ON CONFLICT(canonical_server_origin, user_id, device_id) DO UPDATE SET
+                signed_prekey_id=excluded.signed_prekey_id,
+                one_time_prekey_count=excluded.one_time_prekey_count,
+                request_body=excluded.request_body,
+                body_sha256=excluded.body_sha256,
+                acknowledged=0,
+                created_at=datetime('now'),
+                acknowledged_at=NULL,
+                updated_at=datetime('now')",
+            rusqlite::params![
+                publication.canonical_server_origin,
+                publication.user_id,
+                publication.device_id.as_slice(),
+                i64::from(publication.signed_prekey_id),
+                i64::from(publication.one_time_prekey_count),
+                publication.request_body.as_slice(),
+                publication.body_sha256.as_slice(),
+            ],
+        )
+        .map_err(|e| format!("save local prekey publication outbox: {e}"))?;
+
+        tx.commit()
+            .map_err(|e| format!("commit local prekey publication: {e}"))
+    }
+
+    pub fn load_local_prekey_publication(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        device_id: &[u8; 16],
+    ) -> Result<Option<LocalPreKeyPublicationV1>, String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("local prekey publication user id", user_id)?;
+        if *device_id == [0u8; 16] {
+            return Err("local prekey publication device is invalid".to_string());
+        }
+
+        let raw = self
+            .conn
+            .query_row(
+                "SELECT signed_prekey_id, one_time_prekey_count, request_body,
+                        body_sha256, acknowledged
+                 FROM local_prekey_publications_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2 AND device_id = ?3",
+                rusqlite::params![canonical_server_origin, user_id, device_id.as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, u8>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|e| format!("load local prekey publication: {e}"))?;
+
+        raw.map(
+            |(signed_prekey_id, one_time_prekey_count, request_body, digest, acknowledged)| {
+                let signed_prekey_id = u32::try_from(signed_prekey_id)
+                    .map_err(|_| "persisted publication SPK id is invalid".to_string())?;
+                let one_time_prekey_count = u32::try_from(one_time_prekey_count)
+                    .map_err(|_| "persisted publication OPK count is invalid".to_string())?;
+                let body_sha256 = fixed_bytes::<32>("local prekey publication digest", digest)?;
+                let publication = LocalPreKeyPublicationV1 {
+                    canonical_server_origin: canonical_server_origin.to_string(),
+                    user_id: user_id.to_string(),
+                    device_id: *device_id,
+                    signed_prekey_id,
+                    one_time_prekey_count,
+                    request_body,
+                    body_sha256,
+                    acknowledged: match acknowledged {
+                        0 => false,
+                        1 => true,
+                        _ => {
+                            return Err(
+                                "persisted publication acknowledgement is invalid".to_string()
+                            )
+                        }
+                    },
+                };
+                validate_local_prekey_publication_record(&publication)?;
+                Ok(publication)
+            },
+        )
+        .transpose()
+    }
+
+    /// Mark only the exact current outbox row acknowledged. Wrong scope,
+    /// digest, or SPK id leaves it pending and returns an error.
+    pub fn acknowledge_local_prekey_publication(
+        &self,
+        canonical_server_origin: &str,
+        user_id: &str,
+        device_id: &[u8; 16],
+        signed_prekey_id: u32,
+        body_sha256: &[u8; 32],
+    ) -> Result<(), String> {
+        validate_canonical_server_origin(canonical_server_origin)?;
+        validate_canonical_uuid("local prekey publication user id", user_id)?;
+        if *device_id == [0u8; 16] || signed_prekey_id == 0 || *body_sha256 == [0u8; 32] {
+            return Err("local prekey publication acknowledgement is invalid".to_string());
+        }
+        let tx = begin_immediate(&self.conn, "local prekey publication acknowledgement")?;
+        // Match and acknowledge in one write-serialized statement. Updating an
+        // already acknowledged exact row is deliberately idempotent, while a
+        // rotation to another SPK/body can never pass this predicate.
+        let changed = tx
+            .execute(
+                "UPDATE local_prekey_publications_v1
+                 SET acknowledged = 1,
+                     acknowledged_at = COALESCE(acknowledged_at, datetime('now')),
+                     updated_at = CASE
+                         WHEN acknowledged = 0 THEN datetime('now')
+                         ELSE updated_at
+                     END
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2 AND device_id = ?3
+                   AND signed_prekey_id = ?4 AND body_sha256 = ?5",
+                rusqlite::params![
+                    canonical_server_origin,
+                    user_id,
+                    device_id.as_slice(),
+                    i64::from(signed_prekey_id),
+                    body_sha256.as_slice(),
+                ],
+            )
+            .map_err(|e| format!("acknowledge local prekey publication: {e}"))?;
+        if changed != 1 {
+            return Err(
+                "local prekey publication acknowledgement does not match the outbox".to_string(),
+            );
+        }
+        tx.commit()
+            .map_err(|error| format!("commit local prekey publication acknowledgement: {error}"))
     }
 
     /// Load only live prekeys. Consumed OTK rows retain their public IDs for
@@ -4983,15 +7385,7 @@ impl VeilDb {
     }
 
     pub fn max_local_prekey_id(&self, key_type: u8) -> Result<u32, String> {
-        let value: i64 = self
-            .conn
-            .query_row(
-                "SELECT COALESCE(MAX(protocol_key_id), 0) FROM local_prekeys WHERE key_type = ?1",
-                rusqlite::params![key_type],
-                |row| row.get(0),
-            )
-            .map_err(|e| format!("load local prekey counter: {e}"))?;
-        u32::try_from(value).map_err(|_| "local prekey id exceeds u32".to_string())
+        max_local_prekey_id_on(&self.conn, key_type)
     }
 
     /// Atomically persist the authenticated first ratchet state and destroy the
@@ -5010,12 +7404,24 @@ impl VeilDb {
         let operation = (|| {
             self.conn
                 .execute(
-                    "INSERT OR REPLACE INTO ratchet_sessions
-                       (peer_identity_key, session_data, updated_at)
-                     VALUES (?1, ?2, datetime('now'))",
+                    "INSERT INTO ratchet_sessions
+                       (peer_identity_key, session_data, revision, updated_at)
+                     VALUES (?1, ?2, 0, datetime('now'))
+                     ON CONFLICT(peer_identity_key) DO UPDATE SET
+                        session_data = excluded.session_data,
+                        revision = ratchet_sessions.revision + 1,
+                        updated_at = datetime('now')
+                     WHERE ratchet_sessions.revision < 9223372036854775807",
                     rusqlite::params![peer_identity_key.as_slice(), session_data],
                 )
-                .map_err(|e| format!("save initial ratchet session: {e}"))?;
+                .map_err(|e| format!("save initial ratchet session: {e}"))
+                .and_then(|changed| {
+                    if changed == 1 {
+                        Ok(())
+                    } else {
+                        Err("initial ratchet session revision is exhausted".to_string())
+                    }
+                })?;
             if let Some(id) = one_time_prekey_id {
                 let changed = self
                     .conn
@@ -6695,6 +9101,48 @@ mod tests {
         }
     }
 
+    fn sample_prekey_batch(spk_id: u32, first_opk_id: u32) -> Vec<LocalPreKey> {
+        let mut keys = Vec::with_capacity(LOCAL_PREKEY_PUBLICATION_BATCH_SIZE + 1);
+        keys.push(LocalPreKey {
+            key_type: 0,
+            protocol_key_id: spk_id,
+            secret_key: [0x31; 32],
+            public_key: [0x32; 32],
+            signature: Some([0x33; 64]),
+        });
+        for offset in 0..LOCAL_PREKEY_PUBLICATION_BATCH_SIZE as u32 {
+            let id = first_opk_id + offset;
+            let marker = u8::try_from((id % 250) + 1).unwrap();
+            keys.push(LocalPreKey {
+                key_type: 1,
+                protocol_key_id: id,
+                secret_key: [marker; 32],
+                public_key: [marker.wrapping_add(1); 32],
+                signature: None,
+            });
+        }
+        keys
+    }
+
+    fn sample_prekey_publication(
+        origin: &str,
+        user_id: &str,
+        device_id: [u8; 16],
+        spk_id: u32,
+        body: &[u8],
+    ) -> LocalPreKeyPublicationV1 {
+        LocalPreKeyPublicationV1 {
+            canonical_server_origin: origin.to_string(),
+            user_id: user_id.to_string(),
+            device_id,
+            signed_prekey_id: spk_id,
+            one_time_prekey_count: LOCAL_PREKEY_PUBLICATION_BATCH_SIZE as u32,
+            request_body: body.to_vec(),
+            body_sha256: Sha256::digest(body).into(),
+            acknowledged: false,
+        }
+    }
+
     fn sample_binding_pin(seed: u8, version: u64, status: u8) -> DeviceBindingPinV1 {
         DeviceBindingPinV1 {
             device_id: [seed; 16],
@@ -6733,6 +9181,168 @@ mod tests {
                 target_device_identity_key: Some(target_device_identity_key),
             }),
         }
+    }
+
+    const DIRECT_CONVERSATION_ID: &str = "10000000-0000-4000-8000-000000000001";
+    const DIRECT_CLIENT_ID_1: &str = "20000000-0000-4000-8000-000000000001";
+    const DIRECT_CLIENT_ID_2: &str = "20000000-0000-4000-8000-000000000002";
+    const DIRECT_CLIENT_ID_3: &str = "20000000-0000-4000-8000-000000000003";
+    const DIRECT_SERVER_ID_1: &str = "30000000-0000-4000-8000-000000000001";
+    const DIRECT_SERVER_ID_2: &str = "30000000-0000-4000-8000-000000000002";
+    const DIRECT_LEGACY_ID_1: &str = "40000000-0000-4000-8000-000000000001";
+    const DIRECT_LEGACY_ID_2: &str = "40000000-0000-4000-8000-000000000002";
+    const DIRECT_LEGACY_ID_3: &str = "40000000-0000-4000-8000-000000000003";
+
+    #[derive(Clone)]
+    struct DirectOutboxFixture {
+        scope: DirectMessageOutboxScopeV1,
+        self_account: AccountSnapshot,
+        peer_account: AccountSnapshot,
+    }
+
+    fn install_direct_outbox_fixture(db: &VeilDb) -> DirectOutboxFixture {
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x71,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(1),
+        );
+        let peer_account = sample_account(
+            ORIGIN_A,
+            USER_B,
+            0x73,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            Some(1),
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &self_account.locator.identity_key,
+            &self_account.signing_key,
+        )
+        .unwrap();
+        db.upsert_identity_directory(&[self_account.clone(), peer_account.clone()])
+            .unwrap();
+
+        let device_id = [0x75; 16];
+        let mut device = sample_device_identity(device_id);
+        device.account_identity_key = self_account.locator.identity_key;
+        device.account_signing_key = self_account.signing_key;
+        db.create_device_identity_v1(&device).unwrap();
+        db.upsert_directory_directs(
+            ORIGIN_A,
+            &[AuthenticatedDirectDirectoryEntry {
+                conversation_id: DIRECT_CONVERSATION_ID.to_string(),
+                name: "Durable Direct".to_string(),
+                peer_user_id: USER_B.to_string(),
+                peer_identity_key: peer_account.locator.identity_key,
+                created_at: "2026-07-19T00:00:00Z".to_string(),
+            }],
+        )
+        .unwrap();
+        db.save_initiator_session(
+            &peer_account.locator.identity_key,
+            b"ratchet-session-v0",
+            b"initial-header-v1",
+        )
+        .unwrap();
+
+        DirectOutboxFixture {
+            scope: DirectMessageOutboxScopeV1 {
+                canonical_server_origin: ORIGIN_A.to_string(),
+                user_id: USER_A.to_string(),
+                device_id,
+            },
+            self_account,
+            peer_account,
+        }
+    }
+
+    fn install_direct_outbox_self_without_directory(db: &VeilDb) -> DirectMessageOutboxScopeV1 {
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x77,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &self_account.locator.identity_key,
+            &self_account.signing_key,
+        )
+        .unwrap();
+
+        let device_id = [0x78; 16];
+        let mut device = sample_device_identity(device_id);
+        device.account_identity_key = self_account.locator.identity_key;
+        device.account_signing_key = self_account.signing_key;
+        db.create_device_identity_v1(&device).unwrap();
+
+        DirectMessageOutboxScopeV1 {
+            canonical_server_origin: ORIGIN_A.to_string(),
+            user_id: USER_A.to_string(),
+            device_id,
+        }
+    }
+
+    fn sample_direct_attachment() -> crate::models::MessageAttachment {
+        crate::models::MessageAttachment {
+            ordinal: 0,
+            media_id: "ab".repeat(16),
+            file_name: "ciphertext.bin".to_string(),
+            detected_mime: "application/octet-stream".to_string(),
+            format_version: 1,
+            nonce_prefix: [0x81; 16],
+            chunk_count: 1,
+            plaintext_size: 5,
+            ciphertext_size: 21,
+            content_key: [0x82; 32],
+        }
+    }
+
+    fn direct_outbox_input(
+        fixture: &DirectOutboxFixture,
+        client_message_id: &str,
+        payload: &[u8],
+        expected_ratchet_revision: u64,
+    ) -> DirectMessageOutboxEnqueueV1 {
+        DirectMessageOutboxEnqueueV1 {
+            scope: fixture.scope.clone(),
+            conversation_id: DIRECT_CONVERSATION_ID.to_string(),
+            client_message_id: client_message_id.to_string(),
+            local_message_id: client_message_id.to_string(),
+            request_digest: direct_message_request_digest_v1(payload),
+            exact_send_message_payload: payload.to_vec(),
+            expected_ratchet_revision,
+            advanced_ratchet_session: format!("ratchet-session-v{}", expected_ratchet_revision + 1)
+                .into_bytes(),
+            plaintext: format!("plaintext for {client_message_id}"),
+            reply_to_id: None,
+            attachments: vec![sample_direct_attachment()],
+            author_snapshot: Some(fixture.self_account.clone()),
+        }
+    }
+
+    fn message_status(db: &VeilDb, message_id: &str) -> Option<i64> {
+        db.conn
+            .query_row(
+                "SELECT status FROM messages WHERE id = ?1",
+                rusqlite::params![message_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap()
+    }
+
+    fn table_count(db: &VeilDb, table: &str) -> i64 {
+        db.conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap()
     }
     use rusqlite::params;
 
@@ -8563,6 +11173,309 @@ mod tests {
     }
 
     #[test]
+    fn mobile_reconnect_target_requires_explicit_atomic_mobile_selection() {
+        let db = VeilDb::open_memory(&[0xA6; 32]).unwrap();
+        let identity_key = [0x23; 32];
+        let signing_key = test_signing_key(0x24);
+
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        assert_eq!(
+            db.load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            None
+        );
+
+        db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+            ORIGIN_A,
+            USER_A,
+            &identity_key,
+            &signing_key,
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            Some(MobileReconnectTargetV1 {
+                canonical_server_origin: ORIGIN_A.to_string(),
+                expected_user_id: USER_A.to_string(),
+            })
+        );
+        assert!(db
+            .load_mobile_reconnect_target_v1(&[0x25; 32], &signing_key)
+            .is_err());
+
+        db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+            ORIGIN_B,
+            USER_B,
+            &identity_key,
+            &signing_key,
+        )
+        .unwrap();
+        assert_eq!(
+            db.load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            Some(MobileReconnectTargetV1 {
+                canonical_server_origin: ORIGIN_B.to_string(),
+                expected_user_id: USER_B.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn mobile_reconnect_target_migration_never_guesses_from_legacy_self_bindings() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-mobile-reconnect-legacy-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xAC; 32];
+        let identity_key = [0x2E; 32];
+        let signing_key = test_signing_key(0x2F);
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+                .unwrap();
+            db.conn
+                .execute_batch("DROP TABLE mobile_reconnect_target_v1;")
+                .unwrap();
+        }
+        {
+            let migrated = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                migrated
+                    .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                    .unwrap(),
+                None
+            );
+            let retained_bindings: i64 = migrated
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM authenticated_self_bindings_v1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(retained_bindings, 1);
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn mobile_reconnect_target_selection_rolls_back_on_account_remap() {
+        let db = VeilDb::open_memory(&[0xA7; 32]).unwrap();
+        let identity_key = [0x26; 32];
+        let signing_key = test_signing_key(0x27);
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+            ORIGIN_B,
+            USER_B,
+            &identity_key,
+            &signing_key,
+        )
+        .unwrap();
+
+        assert!(db
+            .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_A,
+                USER_B,
+                &identity_key,
+                &signing_key,
+            )
+            .is_err());
+        assert_eq!(
+            db.load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            Some(MobileReconnectTargetV1 {
+                canonical_server_origin: ORIGIN_B.to_string(),
+                expected_user_id: USER_B.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn mobile_reconnect_target_write_failures_roll_back_self_binding_and_selection() {
+        let identity_key = [0x2C; 32];
+        let signing_key = test_signing_key(0x2D);
+        let insert_failure = VeilDb::open_memory(&[0xAA; 32]).unwrap();
+        insert_failure
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_mobile_target_insert
+                 BEFORE INSERT ON mobile_reconnect_target_v1
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected target insert failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(insert_failure
+            .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_A,
+                USER_A,
+                &identity_key,
+                &signing_key,
+            )
+            .is_err());
+        let inserted_bindings: i64 = insert_failure
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM authenticated_self_bindings_v1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(inserted_bindings, 0);
+
+        let update_failure = VeilDb::open_memory(&[0xAB; 32]).unwrap();
+        update_failure
+            .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_A,
+                USER_A,
+                &identity_key,
+                &signing_key,
+            )
+            .unwrap();
+        update_failure
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_mobile_target_update
+                 BEFORE UPDATE ON mobile_reconnect_target_v1
+                 BEGIN
+                    SELECT RAISE(ABORT, 'injected target update failure');
+                 END;",
+            )
+            .unwrap();
+        assert!(update_failure
+            .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_B,
+                USER_B,
+                &identity_key,
+                &signing_key,
+            )
+            .is_err());
+        assert!(
+            load_authenticated_self_binding(&update_failure.conn, ORIGIN_B)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            update_failure
+                .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                .unwrap(),
+            Some(MobileReconnectTargetV1 {
+                canonical_server_origin: ORIGIN_A.to_string(),
+                expected_user_id: USER_A.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn mobile_reconnect_target_survives_repeated_file_restarts() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-mobile-reconnect-target-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let db_key = [0xA8; 32];
+        let identity_key = [0x28; 32];
+        let signing_key = test_signing_key(0x29);
+        {
+            let db = VeilDb::open(&path, &db_key).unwrap();
+            db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                ORIGIN_A,
+                USER_A,
+                &identity_key,
+                &signing_key,
+            )
+            .unwrap();
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened
+                    .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                    .unwrap(),
+                Some(MobileReconnectTargetV1 {
+                    canonical_server_origin: ORIGIN_A.to_string(),
+                    expected_user_id: USER_A.to_string(),
+                })
+            );
+        }
+        {
+            let reopened = VeilDb::open(&path, &db_key).unwrap();
+            assert_eq!(
+                reopened
+                    .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+                    .unwrap(),
+                Some(MobileReconnectTargetV1 {
+                    canonical_server_origin: ORIGIN_A.to_string(),
+                    expected_user_id: USER_A.to_string(),
+                })
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn mobile_reconnect_target_fails_closed_when_its_self_binding_is_missing() {
+        let db = VeilDb::open_memory(&[0xA9; 32]).unwrap();
+        let identity_key = [0x2A; 32];
+        let signing_key = test_signing_key(0x2B);
+        db.bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+            ORIGIN_A,
+            USER_A,
+            &identity_key,
+            &signing_key,
+        )
+        .unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        db.conn
+            .execute(
+                "DELETE FROM authenticated_self_bindings_v1
+                 WHERE canonical_server_origin = ?1",
+                rusqlite::params![ORIGIN_A],
+            )
+            .unwrap();
+        db.conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+
+        assert!(db
+            .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+            .is_err());
+    }
+
+    #[test]
+    fn mobile_reconnect_target_fails_closed_on_an_invalid_singleton_row() {
+        let db = VeilDb::open_memory(&[0xAD; 32]).unwrap();
+        let identity_key = [0x30; 32];
+        let signing_key = test_signing_key(0x31);
+        db.bind_authenticated_self(ORIGIN_A, USER_A, &identity_key, &signing_key)
+            .unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO mobile_reconnect_target_v1
+                    (singleton, canonical_server_origin)
+                 VALUES (2, ?1)",
+                rusqlite::params![ORIGIN_A],
+            )
+            .unwrap();
+        db.conn
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+
+        assert!(db
+            .load_mobile_reconnect_target_v1(&identity_key, &signing_key)
+            .is_err());
+    }
+
+    #[test]
     fn authenticated_self_binding_rejects_upgrade_poisoning_before_insert() {
         let db = VeilDb::open_memory(&[0xA3; 32]).unwrap();
         let persisted_self = sample_account(
@@ -10324,6 +13237,324 @@ mod tests {
     }
 
     #[test]
+    fn prekey_publication_outbox_survives_restart_and_is_origin_scoped() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-prekey-publication-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let key = [0x91u8; 32];
+        let device_id = [0x41u8; 16];
+        let body_a = br#"{"device_id":"41414141414141414141414141414141","batch":"alpha"}"#;
+        let body_b = br#"{"device_id":"41414141414141414141414141414141","batch":"beta"}"#;
+
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            let mut device = sample_device_identity(device_id);
+            device.account_signing_key = test_signing_key(0x68);
+            db.create_device_identity_v1(&device).unwrap();
+            db.bind_authenticated_self(
+                ORIGIN_A,
+                USER_A,
+                &device.account_identity_key,
+                &device.account_signing_key,
+            )
+            .unwrap();
+            db.bind_authenticated_self(
+                ORIGIN_B,
+                USER_B,
+                &device.account_identity_key,
+                &device.account_signing_key,
+            )
+            .unwrap();
+
+            let publication_a = sample_prekey_publication(ORIGIN_A, USER_A, device_id, 1, body_a);
+            db.save_local_prekeys_with_publication(&sample_prekey_batch(1, 1), &publication_a)
+                .unwrap();
+            assert!(db
+                .load_local_prekey_publication(ORIGIN_B, USER_B, &device_id)
+                .unwrap()
+                .is_none());
+        }
+
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            let loaded = db
+                .load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.request_body, body_a);
+            let expected_body_sha256: [u8; 32] = Sha256::digest(body_a).into();
+            assert_eq!(loaded.body_sha256, expected_body_sha256);
+            assert!(!loaded.acknowledged);
+            let mut wrong_digest = loaded.body_sha256;
+            wrong_digest[0] ^= 1;
+            assert!(db
+                .acknowledge_local_prekey_publication(
+                    ORIGIN_A,
+                    USER_A,
+                    &device_id,
+                    loaded.signed_prekey_id,
+                    &wrong_digest,
+                )
+                .is_err());
+            db.acknowledge_local_prekey_publication(
+                ORIGIN_A,
+                USER_A,
+                &device_id,
+                loaded.signed_prekey_id,
+                &loaded.body_sha256,
+            )
+            .unwrap();
+            assert!(
+                db.load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                    .unwrap()
+                    .unwrap()
+                    .acknowledged
+            );
+
+            let publication_b = sample_prekey_publication(ORIGIN_B, USER_B, device_id, 2, body_b);
+            db.save_local_prekeys_with_publication(&sample_prekey_batch(2, 21), &publication_b)
+                .unwrap();
+            assert_eq!(
+                db.load_local_prekey_publication(ORIGIN_B, USER_B, &device_id)
+                    .unwrap()
+                    .unwrap()
+                    .request_body,
+                body_b,
+            );
+            assert_eq!(
+                db.load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                    .unwrap()
+                    .unwrap()
+                    .request_body,
+                body_a,
+            );
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn prekey_publication_key_conflict_rolls_back_the_entire_outbox_transaction() {
+        let db = VeilDb::open_memory(&[0x92u8; 32]).unwrap();
+        let device_id = [0x42u8; 16];
+        let mut device = sample_device_identity(device_id);
+        device.account_signing_key = test_signing_key(0x69);
+        db.create_device_identity_v1(&device).unwrap();
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &device.account_identity_key,
+            &device.account_signing_key,
+        )
+        .unwrap();
+        db.save_local_prekeys(&[LocalPreKey {
+            key_type: 1,
+            protocol_key_id: 7,
+            secret_key: [0x51; 32],
+            public_key: [0x52; 32],
+            signature: None,
+        }])
+        .unwrap();
+
+        let publication = sample_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            device_id,
+            1,
+            br#"{"device_id":"42424242424242424242424242424242","batch":"conflict"}"#,
+        );
+        assert!(db
+            .save_local_prekeys_with_publication(&sample_prekey_batch(1, 1), &publication)
+            .is_err());
+        assert!(db
+            .load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+            .unwrap()
+            .is_none());
+        assert_eq!(db.load_local_prekeys().unwrap().len(), 1);
+        assert_eq!(db.max_local_prekey_id(0).unwrap(), 0);
+        assert_eq!(db.max_local_prekey_id(1).unwrap(), 7);
+    }
+
+    #[test]
+    fn persisted_prekey_allocator_serializes_preopened_database_handles() {
+        let path =
+            std::env::temp_dir().join(format!("veil-prekey-allocator-{}.db", uuid::Uuid::new_v4()));
+        let key = [0x93u8; 32];
+        let first = VeilDb::open(&path, &key).unwrap();
+        let second = VeilDb::open(&path, &key).unwrap();
+
+        // Simulate an older database whose key rows predate the allocator.
+        first
+            .save_local_prekeys(&[
+                LocalPreKey {
+                    key_type: 0,
+                    protocol_key_id: 7,
+                    secret_key: [0x11; 32],
+                    public_key: [0x12; 32],
+                    signature: Some([0x13; 64]),
+                },
+                LocalPreKey {
+                    key_type: 1,
+                    protocol_key_id: 41,
+                    secret_key: [0x21; 32],
+                    public_key: [0x22; 32],
+                    signature: None,
+                },
+            ])
+            .unwrap();
+
+        let from_second = second.reserve_local_prekey_batch_ids().unwrap();
+        assert_eq!(from_second.signed_prekey_id, 8);
+        assert_eq!(from_second.one_time_prekey_start_id, 42);
+        assert_eq!(from_second.next_signed_prekey_id, 9);
+        assert_eq!(from_second.next_one_time_prekey_id, 62);
+
+        let from_first = first.reserve_local_prekey_batch_ids().unwrap();
+        assert_eq!(from_first.signed_prekey_id, 9);
+        assert_eq!(from_first.one_time_prekey_start_id, 62);
+        assert_eq!(from_first.next_signed_prekey_id, 10);
+        assert_eq!(from_first.next_one_time_prekey_id, 82);
+
+        drop(second);
+        drop(first);
+        let reopened = VeilDb::open(&path, &key).unwrap();
+        assert_eq!(
+            reopened.synchronize_local_prekey_allocator().unwrap(),
+            (10, 82)
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn immutable_prekey_insert_cannot_resurrect_a_consumed_opk() {
+        let db = VeilDb::open_memory(&[0x94u8; 32]).unwrap();
+        let original_public = [0x32u8; 32];
+        db.save_local_prekeys(&[LocalPreKey {
+            key_type: 1,
+            protocol_key_id: 7,
+            secret_key: [0x31; 32],
+            public_key: original_public,
+            signature: None,
+        }])
+        .unwrap();
+        db.commit_initial_ratchet_session(&[0x33; 32], b"session", Some(7))
+            .unwrap();
+
+        assert!(db
+            .save_local_prekeys(&[LocalPreKey {
+                key_type: 1,
+                protocol_key_id: 7,
+                secret_key: [0x41; 32],
+                public_key: [0x42; 32],
+                signature: None,
+            }])
+            .is_err());
+        let (secret, public, consumed): (Option<Vec<u8>>, Vec<u8>, u8) = db
+            .conn
+            .query_row(
+                "SELECT secret_key, public_key, consumed FROM local_prekeys
+                 WHERE key_type = 1 AND protocol_key_id = 7",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(secret.is_none());
+        assert_eq!(public, original_public);
+        assert_eq!(consumed, 1);
+    }
+
+    #[test]
+    fn prekey_publication_ack_is_exact_idempotent_and_cannot_cross_rotation() {
+        let db = VeilDb::open_memory(&[0x95u8; 32]).unwrap();
+        let device_id = [0x43u8; 16];
+        let mut device = sample_device_identity(device_id);
+        device.account_signing_key = test_signing_key(0x6A);
+        db.create_device_identity_v1(&device).unwrap();
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &device.account_identity_key,
+            &device.account_signing_key,
+        )
+        .unwrap();
+
+        let first = sample_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            device_id,
+            1,
+            br#"{"device_id":"43434343434343434343434343434343","batch":"first"}"#,
+        );
+        db.save_local_prekeys_with_publication(&sample_prekey_batch(1, 1), &first)
+            .unwrap();
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            first.signed_prekey_id,
+            &first.body_sha256,
+        )
+        .unwrap();
+        // Reinstalling the exact ACK is harmless and does not require a
+        // read-before-write race window.
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            first.signed_prekey_id,
+            &first.body_sha256,
+        )
+        .unwrap();
+
+        let second = sample_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            device_id,
+            2,
+            br#"{"device_id":"43434343434343434343434343434343","batch":"second"}"#,
+        );
+        db.save_local_prekeys_with_publication(&sample_prekey_batch(2, 21), &second)
+            .unwrap();
+        assert!(db
+            .acknowledge_local_prekey_publication(
+                ORIGIN_A,
+                USER_A,
+                &device_id,
+                first.signed_prekey_id,
+                &first.body_sha256,
+            )
+            .is_err());
+        assert!(
+            !db.load_local_prekey_publication(ORIGIN_A, USER_A, &device_id)
+                .unwrap()
+                .unwrap()
+                .acknowledged
+        );
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            second.signed_prekey_id,
+            &second.body_sha256,
+        )
+        .unwrap();
+        db.acknowledge_local_prekey_publication(
+            ORIGIN_A,
+            USER_A,
+            &device_id,
+            second.signed_prekey_id,
+            &second.body_sha256,
+        )
+        .unwrap();
+    }
+
+    #[test]
     fn initial_ratchet_commit_atomically_consumes_otk_secret() {
         let db = VeilDb::open_memory(&[8u8; 32]).unwrap();
         db.save_local_prekeys(&[
@@ -10376,6 +13607,775 @@ mod tests {
         assert_eq!(
             db.load_ratchet_session(&peer).unwrap().unwrap(),
             b"ratchet-one"
+        );
+    }
+
+    #[test]
+    fn direct_outbox_schema_and_ratchet_revision_upgrade_are_idempotent() {
+        let db = VeilDb::open_memory(&[0xD0; 32]).unwrap();
+        db.run_migrations().unwrap();
+        db.run_migrations().unwrap();
+
+        let revision_columns: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('ratchet_sessions')
+                 WHERE name = 'revision' AND \"notnull\" = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(revision_columns, 1);
+        let schema = db.normalized_table_sql("direct_message_outbox_v1").unwrap();
+        assert!(schema.contains("queue_order integer primary key autoincrement"));
+        assert!(schema.contains("client_message_id text not null unique"));
+        assert!(schema.contains("check(client_message_id = local_message_id)"));
+        assert!(schema.contains("state in (0, 1, 2)"));
+        let outbox_foreign_keys: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('direct_message_outbox_v1')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outbox_foreign_keys, 0);
+
+        let payload = b"opaque-protobuf-payload";
+        let mut expected = Sha256::new();
+        expected.update(b"veil.message.send.v1\x00");
+        expected.update(payload);
+        assert_eq!(
+            direct_message_request_digest_v1(payload),
+            <[u8; 32]>::from(expected.finalize())
+        );
+        assert_ne!(
+            direct_message_request_digest_v1(payload),
+            <[u8; 32]>::from(Sha256::digest(payload))
+        );
+
+        let legacy = Connection::open_in_memory().unwrap();
+        legacy
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                    peer_identity_key BLOB PRIMARY KEY,
+                    session_data BLOB NOT NULL,
+                    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO ratchet_sessions (peer_identity_key, session_data)
+                 VALUES (x'0101010101010101010101010101010101010101010101010101010101010101',
+                         x'0203');",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: legacy };
+        legacy.ensure_ratchet_session_revision_schema().unwrap();
+        legacy.ensure_ratchet_session_revision_schema().unwrap();
+        let preserved: (Vec<u8>, i64) = legacy
+            .conn
+            .query_row(
+                "SELECT session_data, revision FROM ratchet_sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved, (vec![2, 3], 0));
+    }
+
+    #[test]
+    fn direct_outbox_empty_account_does_not_require_a_self_presentation_row() {
+        let db = VeilDb::open_memory(&[0xCF; 32]).unwrap();
+        let scope = install_direct_outbox_self_without_directory(&db);
+
+        assert_eq!(table_count(&db, "identity_directory_v1"), 0);
+        assert_eq!(table_count(&db, "direct_message_outbox_v1"), 0);
+        assert_eq!(
+            db.count_pending_direct_message_outbox_v1(&scope).unwrap(),
+            0
+        );
+        assert!(db
+            .load_pending_direct_message_outbox_v1(&scope, 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(table_count(&db, "identity_directory_v1"), 0);
+    }
+
+    #[test]
+    fn direct_outbox_empty_account_still_rejects_a_conflicting_directory_row() {
+        let db = VeilDb::open_memory(&[0xCE; 32]).unwrap();
+        let scope = install_direct_outbox_self_without_directory(&db);
+        let conflicting_identity_key = [0x79u8; 32];
+        let conflicting_signing_key = test_signing_key(0x7A);
+
+        db.conn
+            .execute(
+                "INSERT INTO identity_directory_v1
+                    (canonical_server_origin, user_id, identity_key, signing_key,
+                     username, display_name, profile_version, profile_origin,
+                     source, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, 'conflict', NULL, NULL, ?1, 2,
+                         '2026-07-19T00:00:00Z')",
+                rusqlite::params![
+                    ORIGIN_A,
+                    USER_A,
+                    conflicting_identity_key.as_slice(),
+                    conflicting_signing_key.as_slice(),
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .count_pending_direct_message_outbox_v1(&scope)
+            .unwrap_err();
+        assert!(error.contains("conflicts with the authenticated self binding"));
+        assert_eq!(table_count(&db, "direct_message_outbox_v1"), 0);
+    }
+
+    #[test]
+    fn direct_outbox_self_presentation_is_an_optional_corroborating_cache() {
+        let db = VeilDb::open_memory(&[0xCD; 32]).unwrap();
+        let scope = install_direct_outbox_self_without_directory(&db);
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x77,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+
+        db.upsert_identity_directory(std::slice::from_ref(&self_account))
+            .unwrap();
+        assert_eq!(table_count(&db, "identity_directory_v1"), 1);
+        assert_eq!(
+            db.count_pending_direct_message_outbox_v1(&scope).unwrap(),
+            0
+        );
+
+        db.conn
+            .execute(
+                "DELETE FROM identity_directory_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2",
+                rusqlite::params![ORIGIN_A, USER_A],
+            )
+            .unwrap();
+
+        assert_eq!(table_count(&db, "identity_directory_v1"), 0);
+        assert_eq!(
+            db.count_pending_direct_message_outbox_v1(&scope).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn direct_outbox_empty_account_keeps_exact_origin_user_and_device_guards() {
+        let db = VeilDb::open_memory(&[0xCC; 32]).unwrap();
+        let scope = install_direct_outbox_self_without_directory(&db);
+
+        let mut wrong_origin = scope.clone();
+        wrong_origin.canonical_server_origin = ORIGIN_B.to_string();
+        assert!(db
+            .count_pending_direct_message_outbox_v1(&wrong_origin)
+            .is_err());
+
+        let mut wrong_user = scope.clone();
+        wrong_user.user_id = USER_B.to_string();
+        assert!(db
+            .count_pending_direct_message_outbox_v1(&wrong_user)
+            .is_err());
+
+        let mut wrong_device = scope.clone();
+        wrong_device.device_id = [0x7B; 16];
+        assert!(db
+            .count_pending_direct_message_outbox_v1(&wrong_device)
+            .is_err());
+
+        db.conn
+            .execute(
+                "UPDATE device_identity_v1 SET status = 2 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        assert!(db.count_pending_direct_message_outbox_v1(&scope).is_err());
+        assert_eq!(table_count(&db, "direct_message_outbox_v1"), 0);
+    }
+
+    #[test]
+    fn direct_outbox_enqueue_faults_roll_back_ratchet_and_every_private_row() {
+        for (table, operation) in [
+            ("ratchet_sessions", "UPDATE"),
+            ("messages", "INSERT"),
+            ("direct_message_outbox_v1", "INSERT"),
+            ("message_author_snapshots_v1", "INSERT"),
+        ] {
+            let db = VeilDb::open_memory(&[0xD1; 32]).unwrap();
+            let fixture = install_direct_outbox_fixture(&db);
+            db.conn
+                .execute_batch(&format!(
+                    "CREATE TRIGGER fail_direct_enqueue
+                     BEFORE {operation} ON {table}
+                     BEGIN SELECT RAISE(ABORT, 'injected direct enqueue failure'); END;"
+                ))
+                .unwrap();
+
+            let input =
+                direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, b"exact-send-payload-fault", 0);
+            assert!(db.enqueue_direct_message_outbox_v1(&input).is_err());
+            let ratchet = db
+                .load_ratchet_session_with_revision_v1(&fixture.peer_account.locator.identity_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(ratchet.session_data, b"ratchet-session-v0");
+            assert_eq!(ratchet.revision, 0, "fault target: {table}");
+            assert_eq!(table_count(&db, "messages"), 0, "fault target: {table}");
+            assert_eq!(
+                table_count(&db, "message_attachments_v1"),
+                0,
+                "fault target: {table}"
+            );
+            assert_eq!(
+                table_count(&db, "message_author_snapshots_v1"),
+                0,
+                "fault target: {table}"
+            );
+            assert_eq!(
+                table_count(&db, "direct_message_outbox_v1"),
+                0,
+                "fault target: {table}"
+            );
+            let last_message_at: Option<String> = db
+                .conn
+                .query_row(
+                    "SELECT last_message_at FROM conversations WHERE id = ?1",
+                    rusqlite::params![DIRECT_CONVERSATION_ID],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(last_message_at.is_none(), "fault target: {table}");
+        }
+    }
+
+    #[test]
+    fn direct_outbox_reopens_exact_bytes_pages_fifo_and_cas_blocks_second_handle() {
+        let path =
+            std::env::temp_dir().join(format!("veil-direct-outbox-{}.db", uuid::Uuid::new_v4()));
+        let key = [0xD2; 32];
+        let first_payload = b"first exact serialized SendMessage".to_vec();
+        let second_payload = b"second exact serialized SendMessage".to_vec();
+        let fixture;
+        {
+            let first = VeilDb::open(&path, &key).unwrap();
+            fixture = install_direct_outbox_fixture(&first);
+            let second_handle = VeilDb::open(&path, &key).unwrap();
+            let first_input = direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, &first_payload, 0);
+            let committed = first
+                .enqueue_direct_message_outbox_v1(&first_input)
+                .unwrap();
+            assert_eq!(committed.ratchet_revision, 1);
+
+            let stale = direct_outbox_input(
+                &fixture,
+                DIRECT_CLIENT_ID_2,
+                b"stale competing ciphertext",
+                0,
+            );
+            assert!(second_handle
+                .enqueue_direct_message_outbox_v1(&stale)
+                .is_err());
+            assert_eq!(message_status(&second_handle, DIRECT_CLIENT_ID_2), None);
+            assert_eq!(
+                second_handle
+                    .load_ratchet_session_with_revision_v1(
+                        &fixture.peer_account.locator.identity_key,
+                    )
+                    .unwrap()
+                    .unwrap()
+                    .revision,
+                1
+            );
+        }
+        {
+            let reopened = VeilDb::open(&path, &key).unwrap();
+            let first_page = reopened
+                .load_pending_direct_message_outbox_v1(&fixture.scope, 1)
+                .unwrap();
+            assert_eq!(first_page.len(), 1);
+            let first_row = &first_page[0];
+            assert_eq!(first_row.client_message_id, DIRECT_CLIENT_ID_1);
+            assert_eq!(first_row.local_message_id, DIRECT_CLIENT_ID_1);
+            assert_eq!(first_row.exact_send_message_payload, first_payload);
+            assert_eq!(
+                first_row.request_digest,
+                direct_message_request_digest_v1(&first_payload)
+            );
+            assert_eq!(first_row.peer_user_id, USER_B);
+            assert_eq!(
+                first_row.peer_identity_key,
+                fixture.peer_account.locator.identity_key
+            );
+            assert_eq!(first_row.peer_signing_key, fixture.peer_account.signing_key);
+            assert_eq!(first_row.ratchet_revision, 1);
+
+            let second_input =
+                direct_outbox_input(&fixture, DIRECT_CLIENT_ID_2, &second_payload, 1);
+            let second_result = reopened
+                .enqueue_direct_message_outbox_v1(&second_input)
+                .unwrap();
+            assert!(second_result.queue_order > first_row.queue_order);
+            assert_eq!(
+                reopened
+                    .count_pending_direct_message_outbox_v1(&fixture.scope)
+                    .unwrap(),
+                2
+            );
+            let second_page = reopened
+                .load_pending_direct_message_outbox_after_v1(
+                    &fixture.scope,
+                    Some(first_row.queue_order),
+                    1,
+                )
+                .unwrap();
+            assert_eq!(second_page.len(), 1);
+            assert_eq!(second_page[0].client_message_id, DIRECT_CLIENT_ID_2);
+            assert_eq!(second_page[0].exact_send_message_payload, second_payload);
+            assert!(reopened
+                .load_pending_direct_message_outbox_after_v1(
+                    &fixture.scope,
+                    Some(second_page[0].queue_order),
+                    1,
+                )
+                .unwrap()
+                .is_empty());
+            assert!(reopened
+                .load_pending_direct_message_outbox_after_v1(&fixture.scope, Some(0), 1)
+                .is_err());
+            assert!(reopened
+                .load_pending_direct_message_outbox_v1(&fixture.scope, 0)
+                .is_err());
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn direct_outbox_receipt_loader_never_aliases_a_foreign_scope_uuid() {
+        let db = VeilDb::open_memory(&[0xD8; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        let input = direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, b"scope-isolated receipt", 0);
+        db.enqueue_direct_message_outbox_v1(&input).unwrap();
+        assert!(matches!(
+            db.load_direct_message_outbox_receipt_v1(&fixture.scope, DIRECT_CLIENT_ID_1)
+                .unwrap(),
+            Some(DirectMessageOutboxReceiptV1::Pending {
+                ref local_message_id,
+            })
+                if local_message_id == DIRECT_CLIENT_ID_1
+        ));
+
+        db.conn
+            .execute(
+                "UPDATE direct_message_outbox_v1 SET device_id = ?1
+                 WHERE client_message_id = ?2",
+                rusqlite::params![[0x76_u8; 16].as_slice(), DIRECT_CLIENT_ID_1],
+            )
+            .unwrap();
+        assert!(db
+            .load_direct_message_outbox_receipt_v1(&fixture.scope, DIRECT_CLIENT_ID_1)
+            .unwrap()
+            .is_none());
+
+        db.conn
+            .execute(
+                "UPDATE direct_message_outbox_v1
+                 SET device_id = ?1, canonical_server_origin = ?2
+                 WHERE client_message_id = ?3",
+                rusqlite::params![
+                    fixture.scope.device_id.as_slice(),
+                    ORIGIN_B,
+                    DIRECT_CLIENT_ID_1
+                ],
+            )
+            .unwrap();
+        assert!(db
+            .load_direct_message_outbox_receipt_v1(&fixture.scope, DIRECT_CLIENT_ID_1)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn direct_outbox_scope_drift_and_uuid_reuse_after_ack_fail_closed() {
+        let db = VeilDb::open_memory(&[0xD3; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        let input = direct_outbox_input(
+            &fixture,
+            DIRECT_CLIENT_ID_1,
+            b"scope-bound exact payload",
+            0,
+        );
+        db.enqueue_direct_message_outbox_v1(&input).unwrap();
+
+        let mut wrong_origin = fixture.scope.clone();
+        wrong_origin.canonical_server_origin = ORIGIN_B.to_string();
+        let mut wrong_user = fixture.scope.clone();
+        wrong_user.user_id = USER_B.to_string();
+        let mut wrong_device = fixture.scope.clone();
+        wrong_device.device_id = [0x76; 16];
+        for wrong_scope in [wrong_origin, wrong_user, wrong_device] {
+            assert!(db
+                .load_pending_direct_message_outbox_v1(&wrong_scope, 1)
+                .is_err());
+        }
+
+        let ack = db
+            .acknowledge_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                DIRECT_SERVER_ID_1,
+                1_700_000_000_001,
+            )
+            .unwrap();
+        assert!(!ack.already_acknowledged);
+        let repeated = db
+            .acknowledge_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                DIRECT_SERVER_ID_1,
+                1_700_000_000_001,
+            )
+            .unwrap();
+        assert!(repeated.already_acknowledged);
+        assert!(db
+            .acknowledge_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                DIRECT_SERVER_ID_1,
+                1_700_000_000_002,
+            )
+            .is_err());
+        assert!(db
+            .acknowledge_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                DIRECT_SERVER_ID_2,
+                1_700_000_000_001,
+            )
+            .is_err());
+
+        let receipt: (i64, Option<Vec<u8>>, Vec<u8>) = db
+            .conn
+            .query_row(
+                "SELECT state, exact_send_message_payload, request_digest
+                 FROM direct_message_outbox_v1 WHERE client_message_id = ?1",
+                rusqlite::params![DIRECT_CLIENT_ID_1],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(receipt.0, 1);
+        assert!(receipt.1.is_none());
+        assert_eq!(
+            receipt.2,
+            direct_message_request_digest_v1(b"scope-bound exact payload")
+        );
+
+        let reuse = direct_outbox_input(
+            &fixture,
+            DIRECT_CLIENT_ID_1,
+            b"different ciphertext under reused UUID",
+            1,
+        );
+        assert!(db.enqueue_direct_message_outbox_v1(&reuse).is_err());
+        assert_eq!(
+            db.load_ratchet_session_with_revision_v1(&fixture.peer_account.locator.identity_key)
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
+        );
+
+        db.delete_message(DIRECT_SERVER_ID_1).unwrap();
+        let second = direct_outbox_input(
+            &fixture,
+            DIRECT_CLIENT_ID_2,
+            b"route drift pending payload",
+            1,
+        );
+        db.enqueue_direct_message_outbox_v1(&second).unwrap();
+        assert!(db
+            .acknowledge_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_2,
+                DIRECT_SERVER_ID_1,
+                1_700_000_000_001,
+            )
+            .is_err());
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_2), Some(0));
+        db.conn
+            .execute(
+                "UPDATE conversations SET peer_identity_key = ?2 WHERE id = ?1",
+                rusqlite::params![DIRECT_CONVERSATION_ID, [0x99u8; 32].as_slice()],
+            )
+            .unwrap();
+        assert!(db
+            .load_pending_direct_message_outbox_v1(&fixture.scope, 1)
+            .is_err());
+
+        let mut split_id =
+            direct_outbox_input(&fixture, DIRECT_CLIENT_ID_3, b"split local correlation", 2);
+        split_id.local_message_id = DIRECT_LEGACY_ID_1.to_string();
+        assert!(db.enqueue_direct_message_outbox_v1(&split_id).is_err());
+    }
+
+    #[test]
+    fn direct_outbox_ack_collision_and_fault_roll_back_then_migrate_references() {
+        const REPLY_ID: &str = "50000000-0000-4000-8000-000000000001";
+        let db = VeilDb::open_memory(&[0xD4; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        let input =
+            direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, b"ack atomic exact payload", 0);
+        db.enqueue_direct_message_outbox_v1(&input).unwrap();
+
+        db.insert_message(
+            DIRECT_SERVER_ID_1,
+            DIRECT_CONVERSATION_ID,
+            &fixture.peer_account.locator.identity_key,
+            "collision",
+            false,
+            Some(10),
+            None,
+        )
+        .unwrap();
+        assert!(db
+            .acknowledge_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                DIRECT_SERVER_ID_1,
+                1_700_000_000_010,
+            )
+            .is_err());
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_1), Some(0));
+        db.delete_message(DIRECT_SERVER_ID_1).unwrap();
+
+        db.conn
+            .execute_batch(
+                "CREATE TRIGGER fail_direct_ack_receipt
+                 BEFORE UPDATE OF state ON direct_message_outbox_v1
+                 WHEN NEW.state = 1
+                 BEGIN SELECT RAISE(ABORT, 'injected direct ACK failure'); END;",
+            )
+            .unwrap();
+        assert!(db
+            .acknowledge_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                DIRECT_SERVER_ID_1,
+                1_700_000_000_010,
+            )
+            .is_err());
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_1), Some(0));
+        assert_eq!(message_status(&db, DIRECT_SERVER_ID_1), None);
+        let pending_shape: (i64, bool) = db
+            .conn
+            .query_row(
+                "SELECT state, exact_send_message_payload IS NOT NULL
+                 FROM direct_message_outbox_v1 WHERE client_message_id = ?1",
+                rusqlite::params![DIRECT_CLIENT_ID_1],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(pending_shape, (0, true));
+        db.conn
+            .execute_batch("DROP TRIGGER fail_direct_ack_receipt")
+            .unwrap();
+
+        db.insert_message(
+            REPLY_ID,
+            DIRECT_CONVERSATION_ID,
+            &fixture.peer_account.locator.identity_key,
+            "reply",
+            false,
+            Some(11),
+            Some(DIRECT_CLIENT_ID_1),
+        )
+        .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO reactions (message_id, user_id, emoji, username)
+                 VALUES (?1, ?2, 'ok', 'peer')",
+                rusqlite::params![DIRECT_CLIENT_ID_1, USER_B],
+            )
+            .unwrap();
+        db.acknowledge_direct_message_outbox_v1(
+            &fixture.scope,
+            DIRECT_CLIENT_ID_1,
+            DIRECT_SERVER_ID_1,
+            1_700_000_000_010,
+        )
+        .unwrap();
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_1), None);
+        assert_eq!(message_status(&db, DIRECT_SERVER_ID_1), Some(1));
+        let timestamp: i64 = db
+            .conn
+            .query_row(
+                "SELECT server_timestamp FROM messages WHERE id = ?1",
+                rusqlite::params![DIRECT_SERVER_ID_1],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(timestamp, 1_700_000_000_010);
+        let reply_target: String = db
+            .conn
+            .query_row(
+                "SELECT reply_to_id FROM messages WHERE id = ?1",
+                rusqlite::params![REPLY_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reply_target, DIRECT_SERVER_ID_1);
+        for table in ["message_attachments_v1", "message_author_snapshots_v1"] {
+            let migrated: i64 = db
+                .conn
+                .query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE message_id = ?1"),
+                    rusqlite::params![DIRECT_SERVER_ID_1],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(migrated, 1, "table: {table}");
+        }
+        let reaction_target: String = db
+            .conn
+            .query_row("SELECT message_id FROM reactions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(reaction_target, DIRECT_SERVER_ID_1);
+    }
+
+    #[test]
+    fn direct_outbox_recovery_transport_loss_and_permanent_rejection_split_cleanly() {
+        const MISSING_ID: &str = "60000000-0000-4000-8000-000000000001";
+        let db = VeilDb::open_memory(&[0xD5; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        let input =
+            direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, b"retryable exact payload", 0);
+        db.enqueue_direct_message_outbox_v1(&input).unwrap();
+        db.insert_outgoing_pending_message(
+            DIRECT_LEGACY_ID_1,
+            DIRECT_CONVERSATION_ID,
+            &fixture.self_account.locator.identity_key,
+            "legacy sending one",
+            None,
+        )
+        .unwrap();
+        assert_eq!(db.recover_unacknowledged_outgoing_messages().unwrap(), 1);
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_1), Some(0));
+        assert_eq!(message_status(&db, DIRECT_LEGACY_ID_1), Some(5));
+
+        db.insert_outgoing_pending_message(
+            DIRECT_LEGACY_ID_2,
+            DIRECT_CONVERSATION_ID,
+            &fixture.self_account.locator.identity_key,
+            "legacy sending two",
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            db.reconcile_outgoing_transport_loss_v1(&[
+                DIRECT_CLIENT_ID_1.to_string(),
+                DIRECT_LEGACY_ID_2.to_string(),
+            ])
+            .unwrap(),
+            1
+        );
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_1), Some(0));
+        assert_eq!(message_status(&db, DIRECT_LEGACY_ID_2), Some(5));
+
+        db.insert_outgoing_pending_message(
+            DIRECT_LEGACY_ID_3,
+            DIRECT_CONVERSATION_ID,
+            &fixture.self_account.locator.identity_key,
+            "legacy sending three",
+            None,
+        )
+        .unwrap();
+        assert!(db
+            .reconcile_outgoing_transport_loss_v1(&[
+                DIRECT_LEGACY_ID_3.to_string(),
+                MISSING_ID.to_string(),
+            ])
+            .is_err());
+        assert_eq!(message_status(&db, DIRECT_LEGACY_ID_3), Some(0));
+
+        let rejected = db
+            .reject_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                "permission_denied",
+            )
+            .unwrap();
+        assert!(!rejected.already_rejected);
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_1), Some(4));
+        assert_eq!(
+            db.count_pending_direct_message_outbox_v1(&fixture.scope)
+                .unwrap(),
+            0
+        );
+        let rejected_shape: (i64, Option<Vec<u8>>, Option<String>, Vec<u8>) = db
+            .conn
+            .query_row(
+                "SELECT state, exact_send_message_payload, rejection_reason, request_digest
+                 FROM direct_message_outbox_v1 WHERE client_message_id = ?1",
+                rusqlite::params![DIRECT_CLIENT_ID_1],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(rejected_shape.0, 2);
+        assert!(rejected_shape.1.is_none());
+        assert_eq!(rejected_shape.2.as_deref(), Some("permission_denied"));
+        assert_eq!(
+            rejected_shape.3,
+            direct_message_request_digest_v1(b"retryable exact payload")
+        );
+        assert!(
+            db.reject_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                "different_reason",
+            )
+            .is_err()
+        );
+        assert!(db
+            .reject_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                "Permission Denied",
+            )
+            .is_err());
+
+        db.discard_failed_outgoing_message(DIRECT_CLIENT_ID_1)
+            .unwrap();
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_1), None);
+        assert!(
+            db.reject_direct_message_outbox_v1(
+                &fixture.scope,
+                DIRECT_CLIENT_ID_1,
+                "permission_denied",
+            )
+            .unwrap()
+            .already_rejected
+        );
+        let reuse = direct_outbox_input(
+            &fixture,
+            DIRECT_CLIENT_ID_1,
+            b"must not reuse rejected UUID",
+            1,
+        );
+        assert!(db.enqueue_direct_message_outbox_v1(&reuse).is_err());
+        assert_eq!(message_status(&db, DIRECT_CLIENT_ID_1), None);
+        assert_eq!(
+            db.load_ratchet_session_with_revision_v1(&fixture.peer_account.locator.identity_key)
+                .unwrap()
+                .unwrap()
+                .revision,
+            1
         );
     }
 }

@@ -1,15 +1,93 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"net/http"
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/NaveLIL/veil/veil-server/internal/chat"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
 )
+
+func TestAuthenticatedSenderSnapshotIsCompleteAndImmutable(t *testing.T) {
+	t.Parallel()
+
+	identityKey := bytes.Repeat([]byte{0x2a}, 32)
+	client := &Client{
+		authenticated: true,
+		userID:        "authenticated-user",
+		username:      "authenticated-name",
+		identityKey:   identityKey,
+	}
+	snapshot, ok := client.snapshotAuthenticatedSender()
+	if !ok {
+		t.Fatal("complete authenticated sender was rejected")
+	}
+	client.identityKey[0] ^= 0xff
+	client.username = "changed-after-snapshot"
+	if !bytes.Equal(snapshot.identityKey, bytes.Repeat([]byte{0x2a}, 32)) ||
+		snapshot.username != "authenticated-name" {
+		t.Fatalf("snapshot changed with client state: key=%x username=%q", snapshot.identityKey, snapshot.username)
+	}
+
+	for name, invalid := range map[string]*Client{
+		"unauthenticated": {
+			userID: "user", username: "name", identityKey: bytes.Repeat([]byte{1}, 32),
+		},
+		"missing user": {
+			authenticated: true, username: "name", identityKey: bytes.Repeat([]byte{1}, 32),
+		},
+		"missing username": {
+			authenticated: true, userID: "user", identityKey: bytes.Repeat([]byte{1}, 32),
+		},
+		"short identity": {
+			authenticated: true, userID: "user", username: "name", identityKey: bytes.Repeat([]byte{1}, 31),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if snapshot, ok := invalid.snapshotAuthenticatedSender(); ok {
+				t.Fatalf("invalid sender produced snapshot: %+v", snapshot)
+			}
+		})
+	}
+}
+
+func TestSealedMessageIsRejectedBeforeGatewayDependencies(t *testing.T) {
+	t.Parallel()
+
+	// A nil hub is an intentional poison dependency: reaching ACL, type, or
+	// roster preflight would panic. The unsupported shape must fail first.
+	client := &Client{
+		authenticated: true,
+		userID:        "authenticated-user",
+		username:      "authenticated-name",
+		identityKey:   bytes.Repeat([]byte{0x44}, 32),
+		send:          make(chan outboundBatch, 1),
+	}
+	client.handleSendMessage(context.Background(), 41, &pb.SendMessage{
+		ClientMessageId: "55555555-5555-4555-8555-555555555555",
+		ConversationId:  "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+		Ciphertext:      []byte("must-not-reach-dependencies"),
+		Sealed:          true,
+	})
+
+	envelope := decodePublicErrorEnvelope(t, <-client.send)
+	got := envelope.GetError()
+	if got == nil || got.GetCode() != http.StatusBadRequest ||
+		got.GetMessage() != "message rejected" || got.GetRefSeq() != 41 ||
+		got.GetClientMessageId() != "55555555-5555-4555-8555-555555555555" ||
+		got.GetReason() != sendMessageReasonSealedUnsupported ||
+		envelope.GetMessageAck() != nil {
+		t.Fatalf("sealed gateway response = %#v, want generic 400 without ACK", envelope)
+	}
+}
 
 func TestClassifySendMessageErrorRequiresRosterRefresh(t *testing.T) {
 	t.Parallel()
@@ -18,24 +96,37 @@ func TestClassifySendMessageErrorRequiresRosterRefresh(t *testing.T) {
 		err        error
 		wantStatus int
 		wantText   string
+		wantReason string
 	}{
 		{
+			name: "invalid client message id", err: chat.ErrInvalidClientMessageID,
+			wantStatus: 400, wantText: "invalid client message id", wantReason: sendMessageReasonInvalidClientMessageID,
+		},
+		{
+			name: "client message id conflict", err: chat.ErrClientMessageIDConflict,
+			wantStatus: 409, wantText: "client message id already used for a different request", wantReason: sendMessageReasonClientMessageIDConflict,
+		},
+		{
 			name: "roster changed", err: db.ErrMessageRosterChanged,
-			wantStatus: 409, wantText: errMessageRosterRefresh,
+			wantStatus: 409, wantText: errMessageRosterRefresh, wantReason: sendMessageReasonSecureRosterChanged,
 		},
 		{
 			name: "sender device changed", err: db.ErrMessageSecurityContext,
-			wantStatus: 409, wantText: errMessageDeviceRefresh,
+			wantStatus: 409, wantText: errMessageDeviceRefresh, wantReason: sendMessageReasonDeviceNotEligible,
 		},
 		{
-			name: "ordinary validation", err: errors.New("invalid message"),
-			wantStatus: 400, wantText: "message rejected",
+			name: "ordinary validation", err: chat.ErrInvalidSendMessage,
+			wantStatus: 400, wantText: "message rejected", wantReason: sendMessageReasonInvalidMessage,
+		},
+		{
+			name: "infrastructure failure", err: errors.New("database unavailable"),
+			wantStatus: 500, wantText: "internal error", wantReason: sendMessageReasonInternalError,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			status, text := classifySendMessageError(tc.err)
-			if status != tc.wantStatus || text != tc.wantText {
-				t.Fatalf("classification=(%d, %q), want (%d, %q)", status, text, tc.wantStatus, tc.wantText)
+			status, text, reason := classifySendMessageError(tc.err)
+			if status != tc.wantStatus || text != tc.wantText || reason != tc.wantReason {
+				t.Fatalf("classification=(%d, %q, %q), want (%d, %q, %q)", status, text, reason, tc.wantStatus, tc.wantText, tc.wantReason)
 			}
 		})
 	}
@@ -71,7 +162,7 @@ func TestConcurrentFanoutAndDisconnectIsSafe(t *testing.T) {
 	}
 
 	for range 2_000 {
-		client := &Client{send: make(chan []byte, 1)}
+		client := &Client{send: make(chan outboundBatch, 1)}
 		hub.mu.Lock()
 		hub.clients[client] = true
 		hub.userClients[userID] = map[*Client]bool{client: true}
@@ -94,8 +185,18 @@ func TestConcurrentFanoutAndDisconnectIsSafe(t *testing.T) {
 
 func TestFullQueuesDoNotSuppressPushFallback(t *testing.T) {
 	hub := NewHub(nil, nil)
-	client := &Client{send: make(chan []byte, 1)}
-	client.send <- []byte("already queued")
+	var closeMu sync.Mutex
+	closeCalls := 0
+	client := &Client{
+		send: make(chan outboundBatch, 1),
+		closeFn: func() error {
+			closeMu.Lock()
+			closeCalls++
+			closeMu.Unlock()
+			return nil
+		},
+	}
+	client.send <- singleOutbound([]byte("already queued"))
 	hub.userClients["online"] = map[*Client]bool{client: true}
 	hub.deviceClients["device-db-id"] = map[*Client]bool{client: true}
 	recorder := &recordingPushNotifier{}
@@ -103,6 +204,9 @@ func TestFullQueuesDoNotSuppressPushFallback(t *testing.T) {
 
 	if enqueued := hub.enqueueToUser("online", []byte("dropped")); enqueued {
 		t.Fatal("a full user queue falsely reported successful enqueue")
+	}
+	if !client.closing.Load() {
+		t.Fatal("a saturated session was not marked closing")
 	}
 	if enqueued := hub.enqueueToDevice("device-db-id", []byte("dropped")); enqueued {
 		t.Fatal("a full device queue falsely reported successful enqueue")
@@ -118,6 +222,110 @@ func TestFullQueuesDoNotSuppressPushFallback(t *testing.T) {
 	}}, envelope)
 	if recorder.calls != 2 {
 		t.Fatalf("push calls = %d, want one user and one device fallback", recorder.calls)
+	}
+	closeMu.Lock()
+	defer closeMu.Unlock()
+	if closeCalls != 1 {
+		t.Fatalf("transport close calls = %d, want exactly 1", closeCalls)
+	}
+}
+
+func TestAuthenticatedPublicationGatesFIFOUntilBothIndexesExist(t *testing.T) {
+	hub := NewHub(nil, nil)
+	client := &Client{
+		hub:      hub,
+		send:     make(chan outboundBatch, 4),
+		userID:   "published-user",
+		deviceID: "published-device",
+	}
+	hub.clients[client] = true
+
+	gate := newPublicationGate()
+	client.send <- outboundBatch{
+		frames:      [][]byte{[]byte("retained-control"), []byte("auth-result")},
+		publication: gate,
+	}
+
+	dequeued := make(chan struct{})
+	written := make(chan string, 3)
+	go func() {
+		first := <-client.send
+		close(dequeued)
+		if first.publication.wait() {
+			for _, frame := range first.frames {
+				written <- string(frame)
+			}
+		}
+		live := <-client.send
+		if live.publication.wait() {
+			for _, frame := range live.frames {
+				written <- string(frame)
+			}
+		}
+	}()
+
+	<-dequeued
+	select {
+	case frame := <-written:
+		t.Fatalf("publication frame became visible before indexing: %q", frame)
+	default:
+	}
+	if client.authenticated {
+		t.Fatal("client authenticated before publication")
+	}
+
+	if !hub.publishAuthenticatedClient(client, gate) {
+		t.Fatal("authenticated publication failed")
+	}
+	hub.mu.RLock()
+	indexedByUser := hub.userClients[client.userID][client]
+	indexedByDevice := hub.deviceClients[client.deviceID][client]
+	hub.mu.RUnlock()
+	if !client.authenticated || !indexedByUser || !indexedByDevice {
+		t.Fatalf("incomplete publication: authenticated=%v user=%v device=%v",
+			client.authenticated, indexedByUser, indexedByDevice)
+	}
+	if !hub.enqueueToUser(client.userID, []byte("live-event")) {
+		t.Fatal("published client did not accept live fan-out")
+	}
+
+	for index, want := range []string{"retained-control", "auth-result", "live-event"} {
+		select {
+		case got := <-written:
+			if got != want {
+				t.Fatalf("frame %d = %q, want %q", index, got, want)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("timed out waiting for frame %d (%q)", index, want)
+		}
+	}
+}
+
+func TestRejectedPublicationNeverExposesSuccessBatch(t *testing.T) {
+	hub := NewHub(nil, nil)
+	client := &Client{
+		send:     make(chan outboundBatch, 1),
+		userID:   "missing-user",
+		deviceID: "missing-device",
+	}
+	gate := newPublicationGate()
+	batch := outboundBatch{frames: [][]byte{[]byte("auth-result")}, publication: gate}
+	client.send <- batch
+
+	written := make(chan []byte, 1)
+	go func() {
+		queued := <-client.send
+		if queued.publication.wait() {
+			written <- queued.frames[0]
+		}
+	}()
+	if hub.publishAuthenticatedClient(client, gate) {
+		t.Fatal("unregistered client was published")
+	}
+	select {
+	case frame := <-written:
+		t.Fatalf("rejected success batch became visible: %q", frame)
+	case <-time.After(25 * time.Millisecond):
 	}
 }
 

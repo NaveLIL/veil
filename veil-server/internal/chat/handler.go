@@ -25,7 +25,66 @@ import (
 const (
 	defaultConversationPageLimit = 100
 	absolutePageLimit            = 500
+	// Keep this wire contract aligned with
+	// veil-client::direct_history::DIRECT_HISTORY_RESPONSE_LIMIT. The encoded
+	// body includes the same trailing newline as json.Encoder.
+	maxMessageHistoryResponseBytes = 4 * 1024 * 1024
+	// Bound database materialization and row encoding independently of the
+	// legacy desktop request limit. Native Direct history requests 25 rows, and
+	// larger legacy limits remain accepted but are served through keyset pages.
+	maxMessageHistoryCandidateRows = 25
 )
+
+var errMessageHistoryRowExceedsWireBudget = errors.New("message history row exceeds wire budget")
+
+type messageHistoryReactionJSON struct {
+	Emoji    string `json:"emoji"`
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+}
+
+type messageHistoryAttachmentJSON struct {
+	MediaID      string `json:"media_id"`
+	EncryptedKey string `json:"encrypted_key"`
+	Nonce        string `json:"nonce"`
+	Size         int64  `json:"size"`
+	ContentType  string `json:"content_type"`
+}
+
+type messageHistoryMessageJSON struct {
+	ID                   string                         `json:"id"`
+	ConversationID       string                         `json:"conversation_id"`
+	SenderID             string                         `json:"sender_id"`
+	SenderIdentityKey    string                         `json:"sender_identity_key"`
+	SenderSigningKey     string                         `json:"sender_signing_key"`
+	Ciphertext           string                         `json:"ciphertext"` // lowercase hex (legacy wire contract)
+	Header               string                         `json:"header"`     // lowercase hex (legacy wire contract)
+	MsgType              int16                          `json:"msg_type"`
+	ReplyToID            *string                        `json:"reply_to_id,omitempty"`
+	ExpiresAt            *string                        `json:"expires_at,omitempty"`
+	EditedAt             *string                        `json:"edited_at"`
+	IsDeleted            bool                           `json:"is_deleted"`
+	IsExpired            bool                           `json:"is_expired"`
+	Reactions            []messageHistoryReactionJSON   `json:"reactions"`
+	Attachments          []messageHistoryAttachmentJSON `json:"attachments"`
+	CreatedAt            string                         `json:"created_at"`
+	ServerTimestamp      int64                          `json:"server_timestamp"`
+	RevisionTimestamp    int64                          `json:"revision_timestamp"`
+	CryptoProfile        string                         `json:"crypto_profile"`
+	CryptoEra            string                         `json:"crypto_era,omitempty"`
+	RosterVersion        string                         `json:"roster_version,omitempty"`
+	RosterCommitment     string                         `json:"roster_commitment,omitempty"`
+	SenderDeviceID       string                         `json:"sender_device_id,omitempty"`
+	SenderBindingVersion string                         `json:"sender_binding_version,omitempty"`
+}
+
+// Field order is intentional: encodeMessageHistoryPageWithinBudget accounts
+// for this exact compact representation before the response is written.
+type messageHistoryPageJSON struct {
+	Count      int                         `json:"count"`
+	Messages   []messageHistoryMessageJSON `json:"messages"`
+	NextCursor *string                     `json:"next_cursor,omitempty"`
+}
 
 // Handler provides REST endpoints for the chat service.
 // Message sync, conversation management.
@@ -66,17 +125,26 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 		return f
 	}
 
-	mux.HandleFunc("GET /v1/messages/{conversationID}", signed(h.GetMessages))
-	mux.HandleFunc("GET /v1/conversations", signed(h.ListConversations))
+	// no-store remains outermost so authenticated chat state cannot be cached
+	// even when signature verification or rate limiting rejects the request.
+	mux.HandleFunc("GET /v1/messages/{conversationID}", chatNoStore(signed(h.GetMessages)))
+	mux.HandleFunc("GET /v1/conversations", chatNoStore(signed(h.ListConversations)))
 	mux.HandleFunc("POST /v1/conversations/dm", signed(h.CreateDM))
-	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", signed(h.GetMembers))
-	mux.HandleFunc("GET /v1/conversations/{conversationID}/device-directory", signed(h.GetDeviceDirectory))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/members", chatNoStore(signed(h.GetMembers)))
+	mux.HandleFunc("GET /v1/conversations/{conversationID}/device-directory", chatNoStore(signed(h.GetDeviceDirectory)))
 
 	// Group endpoints
 	mux.HandleFunc("POST /v1/groups", signed(h.CreateGroup))
 	mux.HandleFunc("POST /v1/groups/{groupID}/members", signed(h.AddGroupMember))
 	mux.HandleFunc("DELETE /v1/groups/{groupID}/members/{userID}", signed(h.RemoveGroupMember))
-	mux.HandleFunc("GET /v1/groups/{groupID}/members", signed(h.GetGroupMembers))
+	mux.HandleFunc("GET /v1/groups/{groupID}/members", chatNoStore(signed(h.GetGroupMembers)))
+}
+
+func chatNoStore(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next(w, r)
+	}
 }
 
 // --- Message Sync (store-and-forward) ---
@@ -98,13 +166,14 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxLimit := configuredPageLimit(h.svc.cfg.MessageBatchLimit)
-	limit, err := parsePageLimit(r.URL.Query().Get("limit"), maxLimit, maxLimit)
+	requestedLimit, err := parsePageLimit(r.URL.Query().Get("limit"), maxLimit, maxLimit)
 	if err != nil {
 		publicerr.Write(w, http.StatusBadRequest, publicerr.New(
 			http.StatusBadRequest, "invalid_page_limit", "invalid pagination limit", err,
 		))
 		return
 	}
+	candidateLimit := messageHistoryCandidateLimit(requestedLimit)
 
 	// `since` is retained for compatibility.  New clients should use the
 	// opaque keyset cursor because a timestamp alone cannot distinguish rows
@@ -135,7 +204,7 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	history, err := h.svc.db.GetConversationHistoryPage(
-		r.Context(), conversationID, userID, after, afterID, limit+1,
+		r.Context(), conversationID, userID, after, afterID, candidateLimit+1,
 	)
 	if err != nil {
 		if errors.Is(err, db.ErrConversationAccessDenied) {
@@ -148,51 +217,12 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 	}
 	msgs := history.Messages
 
-	type reactionJSON struct {
-		Emoji    string `json:"emoji"`
-		UserID   string `json:"user_id"`
-		Username string `json:"username"`
+	rowsRemainAfterCandidateSet := len(msgs) > candidateLimit
+	if rowsRemainAfterCandidateSet {
+		msgs = msgs[:candidateLimit]
 	}
-	type attachmentJSON struct {
-		MediaID      string `json:"media_id"`
-		EncryptedKey string `json:"encrypted_key"`
-		Nonce        string `json:"nonce"`
-		Size         int64  `json:"size"`
-		ContentType  string `json:"content_type"`
-	}
-	type msgJSON struct {
-		ID                   string           `json:"id"`
-		ConversationID       string           `json:"conversation_id"`
-		SenderID             string           `json:"sender_id"`
-		SenderIdentityKey    string           `json:"sender_identity_key"`
-		SenderSigningKey     string           `json:"sender_signing_key"`
-		Ciphertext           string           `json:"ciphertext"` // lowercase hex (legacy wire contract)
-		Header               string           `json:"header"`     // lowercase hex (legacy wire contract)
-		MsgType              int16            `json:"msg_type"`
-		ReplyToID            *string          `json:"reply_to_id,omitempty"`
-		ExpiresAt            *string          `json:"expires_at,omitempty"`
-		EditedAt             *string          `json:"edited_at"`
-		IsDeleted            bool             `json:"is_deleted"`
-		IsExpired            bool             `json:"is_expired"`
-		Reactions            []reactionJSON   `json:"reactions"`
-		Attachments          []attachmentJSON `json:"attachments"`
-		CreatedAt            string           `json:"created_at"`
-		ServerTimestamp      int64            `json:"server_timestamp"`
-		RevisionTimestamp    int64            `json:"revision_timestamp"`
-		CryptoProfile        string           `json:"crypto_profile"`
-		CryptoEra            string           `json:"crypto_era,omitempty"`
-		RosterVersion        string           `json:"roster_version,omitempty"`
-		RosterCommitment     string           `json:"roster_commitment,omitempty"`
-		SenderDeviceID       string           `json:"sender_device_id,omitempty"`
-		SenderBindingVersion string           `json:"sender_binding_version,omitempty"`
-	}
-
-	hasMore := len(msgs) > limit
-	if hasMore {
-		msgs = msgs[:limit]
-	}
-	reactionsByMessage := make(map[string][]reactionJSON, len(msgs))
-	attachmentsByMessage := make(map[string][]attachmentJSON, len(msgs))
+	reactionsByMessage := make(map[string][]messageHistoryReactionJSON, len(msgs))
+	attachmentsByMessage := make(map[string][]messageHistoryAttachmentJSON, len(msgs))
 	if len(msgs) != 0 {
 		for _, reaction := range history.Reactions {
 			if reaction.ConversationID != conversationID {
@@ -204,14 +234,14 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 				writeJSON(w, http.StatusInternalServerError, errorResp("invalid reaction state"))
 				return
 			}
-			reactionsByMessage[reaction.MessageID] = append(reactionsByMessage[reaction.MessageID], reactionJSON{
+			reactionsByMessage[reaction.MessageID] = append(reactionsByMessage[reaction.MessageID], messageHistoryReactionJSON{
 				Emoji: reaction.Emoji, UserID: reaction.UserID, Username: reaction.Username,
 			})
 		}
 		for _, attachment := range history.Attachments {
 			attachmentsByMessage[attachment.MessageID] = append(
 				attachmentsByMessage[attachment.MessageID],
-				attachmentJSON{
+				messageHistoryAttachmentJSON{
 					MediaID:      attachment.FileID,
 					EncryptedKey: base64.StdEncoding.EncodeToString(attachment.EncryptedKey),
 					Nonce:        base64.StdEncoding.EncodeToString(attachment.Nonce),
@@ -222,7 +252,7 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	result := make([]msgJSON, 0, len(msgs))
+	result := make([]messageHistoryMessageJSON, 0, len(msgs))
 	now := time.Now()
 	for _, m := range msgs {
 		if len(m.SenderIdentityKey) != 32 || len(m.SenderSigningKey) != ed25519.PublicKeySize {
@@ -239,20 +269,20 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		}
 		reactions := reactionsByMessage[m.ID]
 		if reactions == nil {
-			reactions = make([]reactionJSON, 0)
+			reactions = make([]messageHistoryReactionJSON, 0)
 		}
-		attachments := make([]attachmentJSON, 0)
+		attachments := make([]messageHistoryAttachmentJSON, 0)
 		if !m.IsDeleted && !isExpired {
 			attachments = attachmentsByMessage[m.ID]
 			if attachments == nil {
-				attachments = make([]attachmentJSON, 0)
+				attachments = make([]messageHistoryAttachmentJSON, 0)
 			}
 		}
 		revisionTimestamp := m.CreatedAt.UnixMilli()
 		if m.EditedAt != nil {
 			revisionTimestamp = m.EditedAt.UnixMilli()
 		}
-		mj := msgJSON{
+		mj := messageHistoryMessageJSON{
 			ID:                m.ID,
 			ConversationID:    m.ConversationID,
 			SenderID:          m.SenderID,
@@ -299,21 +329,18 @@ func (h *Handler) GetMessages(w http.ResponseWriter, r *http.Request) {
 		result = append(result, mj)
 	}
 
-	response := map[string]any{
-		"messages": result,
-		"count":    len(result),
+	encoded, _, encodeErr := encodeMessageHistoryPageWithinBudget(
+		result,
+		msgs,
+		rowsRemainAfterCandidateSet,
+		maxMessageHistoryResponseBytes,
+	)
+	if encodeErr != nil {
+		log.Printf("encode message page: class=%s", logsafe.ErrorClass(encodeErr))
+		writeJSON(w, http.StatusInternalServerError, errorResp("failed to paginate messages"))
+		return
 	}
-	if hasMore && len(msgs) != 0 {
-		last := msgs[len(msgs)-1]
-		nextCursor, encodeErr := encodePageCursor("messages", conversationID, last.CreatedAt, last.ID)
-		if encodeErr != nil {
-			log.Printf("encode message cursor: class=%s", logsafe.ErrorClass(encodeErr))
-			writeJSON(w, http.StatusInternalServerError, errorResp("failed to paginate messages"))
-			return
-		}
-		response["next_cursor"] = nextCursor
-	}
-	writeJSON(w, http.StatusOK, response)
+	writeEncodedJSON(w, http.StatusOK, encoded)
 }
 
 // --- Offline conversation discovery ---
@@ -584,6 +611,129 @@ func resolveDMPeer(authenticatedUserID string, req CreateDMRequest) (string, err
 
 // --- Helpers ---
 
+// encodeMessageHistoryPageWithinBudget returns the largest non-empty prefix
+// whose exact compact JSON representation fits budget. cursorRows is aligned
+// with messages and supplies the authenticated keyset boundary for each
+// possible prefix. rowsRemainAfterCandidateSet means the database returned the
+// requested row limit plus one.
+func encodeMessageHistoryPageWithinBudget(
+	messages []messageHistoryMessageJSON,
+	cursorRows []db.Message,
+	rowsRemainAfterCandidateSet bool,
+	budget int,
+) ([]byte, int, error) {
+	if budget <= 0 || len(messages) != len(cursorRows) || (len(messages) == 0 && rowsRemainAfterCandidateSet) {
+		return nil, 0, errors.New("invalid message history page encoding input")
+	}
+	if len(messages) == 0 {
+		empty := make([]messageHistoryMessageJSON, 0)
+		encoded, err := marshalMessageHistoryPage(messageHistoryPageJSON{
+			Count:    0,
+			Messages: empty,
+		})
+		if err != nil {
+			return nil, 0, err
+		}
+		if len(encoded) > budget {
+			return nil, 0, errors.New("message history wire budget cannot encode an empty page")
+		}
+		return encoded, 0, nil
+	}
+
+	rowWireBytes := 0
+	chosenCount := 0
+	chosenSize := 0
+	chosenHasCursor := false
+	chosenCursor := ""
+	for index, message := range messages {
+		encodedRow, err := json.Marshal(message)
+		if err != nil {
+			return nil, 0, fmt.Errorf("encode message history row: %w", err)
+		}
+		if index != 0 {
+			rowWireBytes++ // comma between array entries
+		}
+		rowWireBytes += len(encodedRow)
+
+		count := index + 1
+		hasMore := count < len(messages) || rowsRemainAfterCandidateSet
+		var nextCursor *string
+		if hasMore {
+			cursor, err := encodePageCursor(
+				"messages",
+				cursorRows[index].ConversationID,
+				cursorRows[index].CreatedAt,
+				cursorRows[index].ID,
+			)
+			if err != nil {
+				return nil, 0, fmt.Errorf("encode message cursor: %w", err)
+			}
+			nextCursor = &cursor
+		}
+		size, err := messageHistoryPageEncodedSize(count, rowWireBytes, nextCursor)
+		if err != nil {
+			return nil, 0, err
+		}
+		if size <= budget {
+			chosenCount = count
+			chosenSize = size
+			chosenHasCursor = hasMore
+			if hasMore {
+				chosenCursor = *nextCursor
+			} else {
+				chosenCursor = ""
+			}
+		}
+	}
+
+	if chosenCount == 0 {
+		return nil, 0, errMessageHistoryRowExceedsWireBudget
+	}
+	var nextCursor *string
+	if chosenHasCursor {
+		nextCursor = &chosenCursor
+	}
+	encoded, err := marshalMessageHistoryPage(messageHistoryPageJSON{
+		Count:      chosenCount,
+		Messages:   messages[:chosenCount],
+		NextCursor: nextCursor,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	if len(encoded) != chosenSize || len(encoded) > budget {
+		return nil, 0, errors.New("message history page size accounting mismatch")
+	}
+	return encoded, chosenCount, nil
+}
+
+func messageHistoryPageEncodedSize(count, rowWireBytes int, nextCursor *string) (int, error) {
+	size := len(`{"count":`) + len(strconv.Itoa(count)) +
+		len(`,"messages":[`) + rowWireBytes + len(`]`)
+	if nextCursor != nil {
+		encodedCursor, err := json.Marshal(*nextCursor)
+		if err != nil {
+			return 0, fmt.Errorf("encode message cursor string: %w", err)
+		}
+		size += len(`,"next_cursor":`) + len(encodedCursor)
+	}
+	return size + len("}\n"), nil
+}
+
+func marshalMessageHistoryPage(page messageHistoryPageJSON) ([]byte, error) {
+	encoded, err := json.Marshal(page)
+	if err != nil {
+		return nil, fmt.Errorf("encode message history page: %w", err)
+	}
+	return append(encoded, '\n'), nil
+}
+
+func writeEncodedJSON(w http.ResponseWriter, status int, encoded []byte) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_, _ = w.Write(encoded)
+}
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -610,6 +760,13 @@ func configuredPageLimit(configured int) int {
 		return absolutePageLimit
 	}
 	return configured
+}
+
+func messageHistoryCandidateLimit(requested int) int {
+	if requested > maxMessageHistoryCandidateRows {
+		return maxMessageHistoryCandidateRows
+	}
+	return requested
 }
 
 func parsePageLimit(raw string, fallback, maximum int) (int, error) {

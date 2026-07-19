@@ -38,12 +38,17 @@ Substantial Preview implementations exist for:
 - native Rust identity, X3DH, Double Ratchet, authenticated Sender Keys v5,
   encrypted attachment primitives, and recovery foundations;
 - origin-scoped SQLCipher storage and a process-memory-only local search index;
-- signed REST/WebSocket transport with Protobuf contracts;
+- signed REST/WebSocket transport with Protobuf contracts; the managed Preview
+  ingress has an exact transitional REST-v1 authority allowlist, while full
+  cryptographic origin/user binding remains a Phase 5S gate;
 - Direct, Circle, and structured Space/Room product surfaces and ACLs;
 - a Tauri v2 desktop client with a SolidJS interface;
 - a Go Veil Node gateway with PostgreSQL, uploads, push wake-ups, profiles,
   invitations, and release/download pages;
-- an Android/mobile foundation through React Native and UniFFI.
+- a closed Android Direct Preview through React Native, Kotlin, and UniFFI:
+  Node Access Pass registration, Keystore/SQLCipher runtime, receive/read,
+  one-shot peer-prekey, idempotent send/outbox, guarded reconnect, atomic vault,
+  native recovery, and whole-app lifecycle authority are implemented.
 
 Implemented code is not the same as release evidence. The authoritative phase
 status and remaining physical/device matrices are tracked in
@@ -53,8 +58,10 @@ status and remaining physical/device matrices are tracked in
 ## What is not complete
 
 - There is no stable, independently audited release.
-- Mobile production messaging, calls, and the MLS runtime are not enabled as
-  complete user features.
+- Android still lacks the full Desktop ↔ Android send/outbox/reconnect/airplane/
+  process-death device matrix, connected recovery/capture instrumentation,
+  public failure codes, and signed standalone tester distribution. Calls and
+  the MLS runtime are not enabled as complete user features.
 - Key transparency is not implemented; the current model is service-mediated
   TOFU with explicit local fingerprint verification.
 - Platform signing, multi-device, attachment, and distributor matrices still
@@ -70,10 +77,19 @@ inside the native Rust boundary. Sending fails closed when the required
 session, roster proof, or Sender Key is unavailable; there is no plaintext
 fallback.
 
+On Android, recovery material is displayed only inside a screenshot-protected
+native Activity and is excluded from React Native, clipboard, autofill,
+accessibility, content capture, and the system IME. An interrupted result remains
+unknown until a strict native durable-vault check; a recovery phrase is never
+discarded based on a failed or unsettled check.
+
 The Veil Node stores and routes ciphertext, but it still sees unavoidable
 routing metadata such as network addresses, timing, sizes, account and
 conversation membership, and delivery state. E2EE does not hide that metadata.
-The canonical HTTPS origin is part of account identity.
+The canonical HTTPS origin is part of the account model. The Preview validates
+URL/TLS and managed legacy REST authority strictly, but WS v2/REST v1 do not yet
+bind the full origin/user context end to end; WS v3/REST v2 remains a Phase 5S
+security gate.
 
 Files are encrypted before upload. Push payloads are restricted to generic
 wake-up signals without sender, message, conversation, or plaintext preview.
@@ -93,7 +109,7 @@ databases, or unsanitized logs in a public Issue.
 | **veil-search**, **veil-uploads** | In-memory search and encrypted transfer primitives |
 | **veil-ffi**, **veil-mls** | Mobile native boundary and experimental MLS foundation |
 | **veil-desktop** | Tauri/SolidJS desktop application |
-| **veil-mobile** | React Native/Expo mobile foundation |
+| **veil-mobile** | Closed Android Direct Preview using React Native, Kotlin, and Rust/UniFFI |
 | **veil-server** | Go Veil Node gateway and hosted web surfaces |
 | **veil-proto** | Protobuf wire contracts |
 | **veil-share-viewer** | Isolated one-time share viewer |

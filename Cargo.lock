@@ -6528,6 +6528,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tungstenite",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -7131,6 +7132,7 @@ name = "veil-client"
 version = "0.1.4"
 dependencies = [
  "base64 0.22.1",
+ "chrono",
  "ed25519-dalek",
  "futures-util",
  "hex",
@@ -7138,6 +7140,8 @@ dependencies = [
  "prost-build",
  "rand 0.8.6",
  "rusqlite",
+ "rustls",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "sha2",
@@ -7150,6 +7154,7 @@ dependencies = [
  "veil-crypto",
  "veil-search",
  "veil-store",
+ "webpki-roots 0.26.11",
  "x25519-dalek",
  "zeroize",
 ]
@@ -7218,7 +7223,9 @@ name = "veil-ffi"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "bip39",
  "hex",
+ "rand 0.8.6",
  "serde_json",
  "sha2",
  "thiserror 2.0.18",
@@ -7228,6 +7235,7 @@ dependencies = [
  "uuid",
  "veil-client",
  "veil-crypto",
+ "zeroize",
 ]
 
 [[package]]
@@ -7284,6 +7292,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
  "uuid",
  "veil-crypto",
  "zeroize",
@@ -7599,6 +7608,24 @@ dependencies = [
  "pkg-config",
  "soup3-sys",
  "system-deps",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
+dependencies = [
+ "webpki-roots 1.0.8",
+]
+
+[[package]]
+name = "webpki-roots"
+version = "1.0.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf85cb06032201fa7c6f829d7db5a7e5aa45bcc0655327713065f6f0576731bf"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

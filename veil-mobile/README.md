@@ -12,6 +12,8 @@ Prerequisites:
 - Android SDK 35 and NDK `27.1.12297006`;
 - Rust targets `aarch64-linux-android` and `x86_64-linux-android`;
 - `cargo-ndk`;
+- a complete Unix-compatible Perl and `make` (MSYS2 on Windows) for vendored
+  OpenSSL/SQLCipher;
 - an ASCII-only Cargo target directory on Windows.
 
 The full Windows Android build must run from an actual ASCII-only checkout or
@@ -55,10 +57,67 @@ any value is missing.
   and several recovery words must be confirmed before identity creation.
 - JavaScript receives the public identity key only. It does not receive the seed,
   private signing key, ratchet state, database key, or a raw signing/AEAD oracle.
-- UnifiedPush accepts only decrypted 2048-byte generic wake records. Endpoint
-  publication and sync remain dormant until the account/origin-bound native
-  authenticated runtime is implemented.
+- Node Access Pass registration, the authenticated WebSocket generation,
+  per-device prekey publication, the origin-bound Direct directory, and
+  immutable legacy Direct-text history are owned by Rust/Kotlin. Idempotent text
+  send/outbox mutation and its delivery state also stay behind that boundary.
+  JavaScript sees only bounded public projections and coarse sync progress.
+- History uses one native-owned HTTP capability at a time, a deterministic UUID
+  order, a 4 MiB response ceiling, and a single in-memory conversation state.
+  Unsupported or incomplete history blocks only that Direct conversation;
+  uncertain SQLCipher state aborts the complete authenticated generation.
+- Authenticated live events retain the same shared 4096-event/32 MiB permits as
+  they move from the socket queue to the deferred FIFO. The Android boundary
+  pumps at every HTTP/lifecycle boundary, including immediately before durable
+  install. A terminal epoch observed at that boundary aborts before install; a
+  concurrent terminal event linearizes before or after the boundary, and any
+  committed prefix remains duplicate-safe when reconnect restarts history.
+- After the gap-free history handoff reaches `Ready`, Android continuously asks
+  Rust for bounded 64-event replay turns. Full batches continue immediately;
+  an idle authenticated generation polls every 250 ms. Only a native aggregate
+  content revision can refresh the conversation the user explicitly selected;
+  ordinary snapshot reads never trigger another plaintext projection.
+- Only typed native `Transport` and `AckDeadline` failures may create one
+  account/origin/session-scoped reconnect plan. It uses full-jitter exponential
+  backoff capped at 60 seconds, never retains or replays a Node Access Pass, is
+  cancelled by background/lock/manual lifecycle actions, and resets only after
+  a new `Ready` plus durable outbox barrier. Protocol, authentication, storage,
+  and accepted-session-invalid failures remain terminal.
+- A successful mobile authentication atomically selects one credential-free
+  reconnect target in SQLCipher: only the canonical server origin and exact
+  authenticated user ID. On a fresh process the native loader revalidates that
+  target against the immutable self binding and current mnemonic-derived keys;
+  Android then starts one zero-delay plain reconnect through the same guarded
+  runtime. Access Pass bytes, WebSocket URLs, and key material are never stored
+  or replayed, and an older database without an explicit selection is never
+  guessed from timestamps or existing bindings.
+- Manual disconnect is intentionally process-local and non-destructive: it
+  closes the current transport but preserves the verified target, so a later
+  background reopen or process restart may recover it. A future explicit
+  “Forget Node / remain offline” action requires a separate destructive
+  contract; no hidden clear API exists in this preview.
+- Foreground authority is process-wide and restricted to exact `MainActivity`
+  and `RecoveryActivity` surfaces. Internal handoff/configuration recreation
+  cannot impersonate app background, dependency Activities cannot keep the
+  session open, and an enrollment Intent crosses the native foreground barrier
+  before its Pass is staged. Background Pass/session revocation is linearized
+  under the runtime lifecycle lock.
+- Android WSS uses an explicit per-connection `ring` provider with TLS 1.2/1.3
+  and public WebPKI roots. The managed legacy REST-v1 ingress accepts only the
+  exact bare/canonical-`:443` authority forms; this compatibility bridge does
+  not replace the Phase 5S WS v3/REST v2 origin-binding gate.
+- The write-once identity vault publishes through fsync/readback plus atomic
+  directory rename. Native recovery holds a coordinator barrier over strict
+  presence checks: READY/COMMITTING is always ambiguous, never false, so an
+  unsettled commit cannot cause the only recovery phrase to be destroyed.
+- UnifiedPush still accepts only decrypted 2048-byte generic wake records.
 
-This is a Phase 5A foundation, not a production-ready mobile messenger. SQLCipher,
-native session/network orchestration, lock/PIN/biometric policy and physical device
-tests are still required.
+This remains a closed Direct Preview, not a tester release or production-ready
+mobile messenger. Authenticated Direct directory/history, bounded live receive,
+native projection, per-conversation prekey establishment, guarded send/outbox,
+typed transient reconnect, and canonical-origin process-death recovery are
+present. Same-account force-stop recovery without a new Pass or device has been
+physically confirmed on a Samsung S23. Cross-client E2EE text/airplane/background
+evidence, connected recovery/vault/capture instrumentation, public failure
+codes, push publication, Circle/Space/attachments, correct multi-device, signed
+standalone APK distribution, and the broader physical-device matrix remain gated.

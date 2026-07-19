@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AccessibilityInfo,
   StyleSheet,
@@ -38,6 +38,12 @@ export default function ChatListScreen() {
   const channels = useChatStore((s) => s.channels);
   const dms = useChatStore((s) => s.dms);
 
+  useEffect(() => () => {
+    // Runtime gates unmount this screen for reconnect, errors and privacy.
+    // Do not leave an old binding's plaintext renderable in the JS heap.
+    useChatStore.getState().clearRenderableChat();
+  }, []);
+
   const isDmHome = selectedServerId === DM_HOME_ID;
   const chatTitle = useMemo(() => {
     if (isDmHome) {
@@ -62,7 +68,7 @@ export default function ChatListScreen() {
       case 0:
         return "Your spaces";
       case 1:
-        return isDmHome ? "Direct & groups" : "Channels";
+        return isDmHome ? "Conversations" : "Channels";
       case 2:
         return "Conversation";
       case 3:

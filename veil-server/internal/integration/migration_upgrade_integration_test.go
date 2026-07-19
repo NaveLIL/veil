@@ -5,14 +5,17 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"net/url"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	veildb "github.com/NaveLIL/veil/veil-server/internal/db"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -855,18 +858,457 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		requireMigrationError(t, err, "23514", "push_validation_state_consistent")
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 025", func(t *testing.T) {
+	t.Run("027 backfills monotonic prekey state and requires verifiable legacy receipt", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_027")
+		applyMigrationsBefore(t, pool, migrations, 27)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var userID, deviceID, missingDeviceID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users(identity_key, signing_key, username)
+			 VALUES ($1,$2,'prekey-state-upgrade') RETURNING id::text`,
+			bytes.Repeat([]byte{0x81}, 32), bytes.Repeat([]byte{0x82}, 32),
+		).Scan(&userID); err != nil {
+			t.Fatal(err)
+		}
+		for _, fixture := range []struct {
+			marker byte
+			name   string
+			result *string
+		}{
+			{marker: 0x83, name: "legacy-complete", result: &deviceID},
+			{marker: 0x84, name: "legacy-missing", result: &missingDeviceID},
+		} {
+			if err := pool.QueryRow(ctx,
+				`INSERT INTO devices(user_id,device_key,device_name)
+				 VALUES ($1::uuid,$2,$3) RETURNING id::text`,
+				userID, bytes.Repeat([]byte{fixture.marker}, 16), fixture.name,
+			).Scan(fixture.result); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		oldSPK := bytes.Repeat([]byte{0x91}, 32)
+		oldSignature := bytes.Repeat([]byte{0x92}, 64)
+		currentSPK := bytes.Repeat([]byte{0x93}, 32)
+		currentSignature := bytes.Repeat([]byte{0x94}, 64)
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO prekeys(device_id,key_type,protocol_key_id,public_key,signature,used)
+			 VALUES ($1::uuid,0,9,$2,$3,false),
+			        ($1::uuid,1,1,$4,NULL,true)`,
+			deviceID, oldSPK, oldSignature, bytes.Repeat([]byte{0x95}, 32),
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO prekeys(device_id,key_type,protocol_key_id,public_key,signature,used)
+			 SELECT $1::uuid,1,n,digest(n::text,'sha256'),NULL,false
+			 FROM generate_series(2,106) n`,
+			deviceID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		opk111 := bytes.Repeat([]byte{0x96}, 32)
+		opk112 := bytes.Repeat([]byte{0x97}, 32)
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO prekeys(device_id,key_type,protocol_key_id,public_key,signature,used)
+			 VALUES ($1::uuid,0,2,$2,$3,false),
+			        ($1::uuid,1,111,$4,NULL,true),
+			        ($1::uuid,1,112,$5,NULL,false)`,
+			deviceID, currentSPK, currentSignature, opk111, opk112,
+		); err != nil {
+			t.Fatal(err)
+		}
+		missingSPK := bytes.Repeat([]byte{0xa1}, 32)
+		missingSignature := bytes.Repeat([]byte{0xa2}, 64)
+		missingOPK := bytes.Repeat([]byte{0xa3}, 32)
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO prekeys(device_id,key_type,protocol_key_id,public_key,signature,used)
+			 VALUES ($1::uuid,0,5,$2,$3,false),
+			        ($1::uuid,1,50,$4,NULL,true)`,
+			missingDeviceID, missingSPK, missingSignature, missingOPK,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := execMigration(t, pool, migrations, 27); err != nil {
+			t.Fatalf("migration 027: %v", err)
+		}
+		var signedHigh, oneTimeHigh, signedRows, unusedRows, usedRows int
+		var latestDigest []byte
+		if err := pool.QueryRow(ctx,
+			`SELECT s.signed_prekey_high_watermark,
+			        s.one_time_prekey_high_watermark,
+			        s.latest_upload_digest,
+			        COUNT(*) FILTER (WHERE p.key_type=0),
+			        COUNT(*) FILTER (WHERE p.key_type=1 AND p.used=false),
+			        COUNT(*) FILTER (WHERE p.key_type=1 AND p.used=true)
+			 FROM prekey_publication_state s
+			 LEFT JOIN prekeys p ON p.device_id=s.device_id
+			 WHERE s.device_id=$1::uuid
+			 GROUP BY s.signed_prekey_high_watermark,
+			          s.one_time_prekey_high_watermark,
+			          s.latest_upload_digest`,
+			deviceID,
+		).Scan(&signedHigh, &oneTimeHigh, &latestDigest, &signedRows, &unusedRows, &usedRows); err != nil {
+			t.Fatal(err)
+		}
+		// The historical protocol allowed non-monotonic SPK ids. The newest
+		// database row is current even though the durable watermark must retain
+		// the larger retired id 9 to prevent resurrection.
+		if signedHigh != 9 || oneTimeHigh != 112 || latestDigest != nil ||
+			signedRows != 1 || unusedRows > 100 || usedRows != 2 {
+			t.Fatalf("027 backfill high=%d/%d digest=%x rows=%d/%d/%d",
+				signedHigh, oneTimeHigh, latestDigest, signedRows, unusedRows, usedRows)
+		}
+
+		database := &veildb.DB{Pool: pool}
+		claimed, err := database.ClaimOneTimePreKey(ctx, deviceID)
+		if err != nil || claimed == nil {
+			t.Fatalf("legacy claim=%#v err=%v", claimed, err)
+		}
+		var claimedRetained bool
+		if err := pool.QueryRow(ctx,
+			`SELECT EXISTS(SELECT 1 FROM prekeys WHERE id=$1 AND used=true)`,
+			claimed.ID,
+		).Scan(&claimedRetained); err != nil || !claimedRetained {
+			t.Fatalf("legacy claim retained=%v err=%v", claimedRetained, err)
+		}
+
+		if _, err := pool.Exec(ctx,
+			`DELETE FROM prekeys
+			 WHERE device_id=$1::uuid AND key_type=1 AND protocol_key_id=50`,
+			missingDeviceID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		missingBatch := []veildb.PreKey{
+			{KeyType: 0, ProtocolKeyID: 5, PublicKey: missingSPK, Signature: missingSignature},
+			{KeyType: 1, ProtocolKeyID: 50, PublicKey: missingOPK},
+		}
+		if _, err := database.StorePreKeysWithReceipt(
+			ctx, missingDeviceID, missingBatch, sha256.Sum256([]byte("missing-legacy-body")),
+		); !errors.Is(err, veildb.ErrPreKeyMaterialConflict) {
+			t.Fatalf("missing legacy material error=%v", err)
+		}
+
+		legacyBatch := []veildb.PreKey{
+			{KeyType: 0, ProtocolKeyID: 2, PublicKey: currentSPK, Signature: currentSignature},
+			{KeyType: 1, ProtocolKeyID: 111, PublicKey: opk111},
+			{KeyType: 1, ProtocolKeyID: 112, PublicKey: opk112},
+		}
+		legacyDigest := sha256.Sum256([]byte("exact-legacy-body"))
+		receipt, err := database.StorePreKeysWithReceipt(ctx, deviceID, legacyBatch, legacyDigest)
+		if err != nil || receipt.Stored != len(legacyBatch) {
+			t.Fatalf("verified legacy adoption receipt=%#v err=%v", receipt, err)
+		}
+		if err := pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM prekeys
+			 WHERE device_id=$1::uuid AND key_type=1 AND used=true`,
+			deviceID,
+		).Scan(&usedRows); err != nil || usedRows != 0 {
+			t.Fatalf("post-adoption legacy used rows=%d err=%v", usedRows, err)
+		}
+		receipt, err = database.StorePreKeysWithReceipt(ctx, deviceID, legacyBatch, legacyDigest)
+		if err != nil || !receipt.Replay || receipt.Stored != len(legacyBatch) {
+			t.Fatalf("legacy exact replay receipt=%#v err=%v", receipt, err)
+		}
+
+		retiredSigned := []veildb.PreKey{{
+			KeyType: 0, ProtocolKeyID: 9, PublicKey: oldSPK, Signature: oldSignature,
+		}}
+		if _, err := database.StorePreKeysWithReceipt(
+			ctx, deviceID, retiredSigned, sha256.Sum256([]byte("retired-signed-body")),
+		); !errors.Is(err, veildb.ErrPreKeyMaterialConflict) {
+			t.Fatalf("retired signed prekey error=%v, want material conflict", err)
+		}
+
+		nextSPK := []veildb.PreKey{{
+			KeyType:       0,
+			ProtocolKeyID: 10,
+			PublicKey:     bytes.Repeat([]byte{0x98}, 32),
+			Signature:     bytes.Repeat([]byte{0x99}, 64),
+		}}
+		if _, err := database.StorePreKeysWithReceipt(
+			ctx, deviceID, nextSPK, sha256.Sum256([]byte("next-monotonic-body")),
+		); err != nil {
+			t.Fatalf("next monotonic signed prekey: %v", err)
+		}
+		current, err := database.GetSignedPreKey(ctx, deviceID)
+		if err != nil || current.ProtocolKeyID != 10 {
+			t.Fatalf("current signed prekey=%#v err=%v, want protocol id 10", current, err)
+		}
+	})
+
+	t.Run("028 cleans legacy scope, prunes deterministically, and guards raw writers", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_028")
+		applyMigrationsBefore(t, pool, migrations, 28)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var userID, messageID, conversationID, otherConversationID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO users(identity_key, signing_key, username)
+			 VALUES ($1,$2,'reaction-bound-upgrade') RETURNING id::text`,
+			bytes.Repeat([]byte{0xb1}, 32), bytes.Repeat([]byte{0xb2}, 32),
+		).Scan(&userID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO conversations(conv_type,name)
+			 VALUES (0,'reaction-bound-primary') RETURNING id::text`,
+		).Scan(&conversationID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO conversations(conv_type,name)
+			 VALUES (0,'reaction-bound-other') RETURNING id::text`,
+		).Scan(&otherConversationID); err != nil {
+			t.Fatal(err)
+		}
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO messages(conversation_id,sender_id,ciphertext)
+			 VALUES ($1::uuid,$2::uuid,'\x01') RETURNING id::text`,
+			conversationID, userID,
+		).Scan(&messageID); err != nil {
+			t.Fatal(err)
+		}
+
+		// Simulate rows that predate migration 009's NOT VALID foreign keys.
+		if _, err := pool.Exec(ctx,
+			`ALTER TABLE reactions DROP CONSTRAINT reactions_message_conversation_fk;
+			 ALTER TABLE reactions DROP CONSTRAINT reactions_user_fk`,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji,created_at)
+			 SELECT $1::uuid,$2::uuid,$3::uuid,
+			        'legacy-' || lpad(value::text,3,'0'),
+			        TIMESTAMPTZ '2026-01-01 00:00:00+00' + value * INTERVAL '1 second'
+			 FROM generate_series(1,260) AS value`,
+			messageID, conversationID, userID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji,created_at)
+			 VALUES
+			   ($1::uuid,$2::uuid,$3::uuid,'legacy-invalid-scope',TIMESTAMPTZ '2025-01-01'),
+			   ($1::uuid,$4::uuid,gen_random_uuid(),'legacy-invalid-user',TIMESTAMPTZ '2025-01-02')`,
+			messageID, otherConversationID, userID, conversationID,
+		); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := execMigration(t, pool, migrations, 28); err != nil {
+			t.Fatalf("migration 028: %v", err)
+		}
+		var retained []string
+		if err := pool.QueryRow(ctx,
+			`SELECT array_agg(emoji ORDER BY created_at,user_id,emoji COLLATE "C")
+			 FROM reactions WHERE message_id=$1::uuid`,
+			messageID,
+		).Scan(&retained); err != nil {
+			t.Fatal(err)
+		}
+		if len(retained) != veildb.MaxReactionsPerMessage {
+			t.Fatalf("retained reaction count=%d, want %d", len(retained), veildb.MaxReactionsPerMessage)
+		}
+		for index, emoji := range retained {
+			want := "legacy-" + fmt.Sprintf("%03d", index+1)
+			if emoji != want {
+				t.Fatalf("retained reaction[%d]=%q, want %q", index, emoji, want)
+			}
+		}
+		var minSlot, maxSlot, distinctSlots int
+		if err := pool.QueryRow(ctx,
+			`SELECT min(history_slot),max(history_slot),count(DISTINCT history_slot)
+			 FROM reactions WHERE message_id=$1::uuid`,
+			messageID,
+		).Scan(&minSlot, &maxSlot, &distinctSlots); err != nil ||
+			minSlot != 0 || maxSlot != veildb.MaxReactionsPerMessage-1 ||
+			distinctSlots != veildb.MaxReactionsPerMessage {
+			t.Fatalf(
+				"reaction slots min=%d max=%d distinct=%d err=%v",
+				minSlot, maxSlot, distinctSlots, err,
+			)
+		}
+		var validatedCount int
+		if err := pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM pg_constraint
+			 WHERE conrelid='reactions'::regclass
+			   AND conname IN ('reactions_message_conversation_fk','reactions_user_fk')
+			   AND convalidated`,
+		).Scan(&validatedCount); err != nil || validatedCount != 2 {
+			t.Fatalf("validated reaction FK count=%d err=%v, want 2", validatedCount, err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji)
+			 VALUES ($1::uuid,$2::uuid,$3::uuid,'legacy-001')
+			 ON CONFLICT (message_id,user_id,emoji) DO NOTHING`,
+			messageID, conversationID, userID,
+		); err != nil {
+			t.Fatalf("raw exact retry at cap: %v", err)
+		}
+		_, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji)
+			 VALUES ($1::uuid,$2::uuid,$3::uuid,'raw-overflow')`,
+			messageID, conversationID, userID,
+		)
+		requireMigrationError(t, err, "23514", "message reaction limit reached")
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "reactions_per_message_limit" {
+			t.Fatalf("raw overflow constraint=%v, want reactions_per_message_limit", pgErr)
+		}
+
+		var sourceMessageID string
+		if err := pool.QueryRow(ctx,
+			`INSERT INTO messages(conversation_id,sender_id,ciphertext)
+			 VALUES ($1::uuid,$2::uuid,'\x02') RETURNING id::text`,
+			otherConversationID, userID,
+		).Scan(&sourceMessageID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO reactions(message_id,conversation_id,user_id,emoji)
+			 VALUES ($1::uuid,$2::uuid,$3::uuid,'move-source')`,
+			sourceMessageID, otherConversationID, userID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		_, err = pool.Exec(ctx,
+			`UPDATE reactions
+			 SET message_id=$1::uuid, conversation_id=$2::uuid, emoji='raw-update-overflow'
+			 WHERE message_id=$3::uuid AND user_id=$4::uuid AND emoji='move-source'`,
+			messageID, conversationID, sourceMessageID, userID,
+		)
+		requireMigrationError(t, err, "23514", "reaction identity is immutable")
+		pgErr = nil
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "reactions_identity_immutable" {
+			t.Fatalf("raw update constraint=%v, want reactions_identity_immutable", pgErr)
+		}
+		var targetCount int
+		if err := pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM reactions WHERE message_id=$1::uuid`, messageID,
+		).Scan(&targetCount); err != nil || targetCount != veildb.MaxReactionsPerMessage {
+			t.Fatalf("raw update target count=%d err=%v, want %d", targetCount, err, veildb.MaxReactionsPerMessage)
+		}
+	})
+
+	t.Run("029 adds durable account-scoped message send idempotency", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_029")
+		applyMigrationsBefore(t, pool, migrations, 29)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var senderID, otherSenderID string
+		for index, destination := range []*string{&senderID, &otherSenderID} {
+			if err := pool.QueryRow(ctx,
+				`INSERT INTO users(identity_key,signing_key,username)
+				 VALUES ($1,$2,$3) RETURNING id::text`,
+				bytes.Repeat([]byte{byte(0xc1 + index*2)}, 32),
+				bytes.Repeat([]byte{byte(0xc2 + index*2)}, 32),
+				fmt.Sprintf("send-ledger-%d", index),
+			).Scan(destination); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := execMigration(t, pool, migrations, 29); err != nil {
+			t.Fatalf("migration 029: %v", err)
+		}
+
+		var messageForeignKeys, senderForeignKeys int
+		if err := pool.QueryRow(ctx,
+			`SELECT
+			   count(*) FILTER (WHERE pg_get_constraintdef(oid) LIKE 'FOREIGN KEY (message_id)%'),
+			   count(*) FILTER (WHERE pg_get_constraintdef(oid) LIKE 'FOREIGN KEY (sender_id)%')
+			 FROM pg_constraint
+			 WHERE conrelid='message_send_idempotency'::regclass AND contype='f'`,
+		).Scan(&messageForeignKeys, &senderForeignKeys); err != nil {
+			t.Fatal(err)
+		}
+		if messageForeignKeys != 0 || senderForeignKeys != 1 {
+			t.Fatalf("ledger foreign keys message=%d sender=%d, want 0,1", messageForeignKeys, senderForeignKeys)
+		}
+
+		clientMessageID := "11111111-1111-4111-8111-111111111111"
+		messageID := "22222222-2222-4222-8222-222222222222"
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp)
+			 VALUES ($1::uuid,$2::uuid,$3,$4::uuid,now())`,
+			senderID, clientMessageID, bytes.Repeat([]byte{0xd1}, sha256.Size), messageID,
+		); err != nil {
+			t.Fatalf("insert tombstone-safe ledger row: %v", err)
+		}
+
+		_, err := pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp)
+			 VALUES ($1::uuid,gen_random_uuid(),$2,gen_random_uuid(),now())`,
+			senderID, bytes.Repeat([]byte{0xd2}, sha256.Size-1),
+		)
+		requireMigrationError(t, err, "23514", "message_send_idempotency_digest_length")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp,ack_roster_version)
+			 VALUES ($1::uuid,gen_random_uuid(),$2,gen_random_uuid(),now(),0)`,
+			senderID, bytes.Repeat([]byte{0xd3}, sha256.Size),
+		)
+		requireMigrationError(t, err, "23514", "message_send_idempotency_roster_version")
+
+		_, err = pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp)
+			 VALUES ($1::uuid,$2::uuid,$3,gen_random_uuid(),now())`,
+			senderID, clientMessageID, bytes.Repeat([]byte{0xd4}, sha256.Size),
+		)
+		requireMigrationError(t, err, "23505", "message_send_idempotency_pkey")
+
+		// The same client ID belongs to a different account scope, while a
+		// server message ID can never identify two send intents.
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp,ack_roster_version)
+			 VALUES ($1::uuid,$2::uuid,$3,gen_random_uuid(),now(),7)`,
+			otherSenderID, clientMessageID, bytes.Repeat([]byte{0xd5}, sha256.Size),
+		); err != nil {
+			t.Fatalf("account-scoped client ID insert: %v", err)
+		}
+		_, err = pool.Exec(ctx,
+			`INSERT INTO message_send_idempotency
+			   (sender_id,client_message_id,request_digest,message_id,server_timestamp)
+			 VALUES ($1::uuid,gen_random_uuid(),$2,$3::uuid,now())`,
+			otherSenderID, bytes.Repeat([]byte{0xd6}, sha256.Size), messageID,
+		)
+		requireMigrationError(t, err, "23505", "message_send_idempotency_message_id_unique")
+
+		if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id=$1::uuid`, senderID); err != nil {
+			t.Fatal(err)
+		}
+		var retained int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM message_send_idempotency WHERE sender_id=$1::uuid`, senderID,
+		).Scan(&retained); err != nil || retained != 0 {
+			t.Fatalf("sender cascade retained=%d err=%v, want 0", retained, err)
+		}
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 029", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 25; number++ {
+		for number := 1; number <= 29; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 26)
+		applyMigrationsBefore(t, pool, migrations, 30)
 	})
 }
 

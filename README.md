@@ -25,8 +25,9 @@ Preview-сборки, но ещё не достиг стабильного ре�
 
 > **Security boundary.** Операции с приватными ключами, E2EE state и
 > расшифрованное долговременное хранилище остаются в Rust. Recovery phrase
-> появляется в WebView только во время явного onboarding либо повторного
-> показа после PIN re-authentication и не возвращается generic IPC-командой.
+> на Android отображается только в отдельной screenshot-protected native
+> Activity: она не входит в React Native, clipboard, autofill, accessibility,
+> content capture или системный IME и не возвращается generic IPC-командой.
 > Если требуемая криптографическая сессия, roster proof или распределение
 > Sender Key недоступны, отправка блокируется fail closed — без plaintext или
 > «упрощённого» fallback.
@@ -75,8 +76,15 @@ native-клиента.
   остаётся открытым до физической upload/download/tamper/resume/media matrix.
 - Phase 4P transport core и desktop management существуют, но native mobile
   clients и distributor/device matrix ещё не закрыты.
-- Android имеет foundation/prototype, а production messaging остаётся Phase
-  5A/5B. MLS runtime и звонки пока не включены как пользовательские функции.
+- Android уже является закрытым Direct Preview: Node Access Pass registration,
+  Keystore/SQLCipher runtime, authenticated receive/read, one-shot peer-prekey,
+  idempotent native send/outbox, guarded reconnect и whole-app lifecycle/Pass
+  authority реализованы; отдельными checkpoint’ами опубликованы Android
+  public-WebPKI TLS, atomic write-once vault, native recovery и debug Ready
+  capture boundary. Cross-client E2EE/airplane matrix, connected recovery/
+  capture instrumentation, публичные коды ошибок и подписанный standalone APK
+  ещё входят в Phase 5A/5B; MLS runtime и звонки не включены как пользовательские
+  функции.
 
 Публичный Windows Preview собирается только в CI и всегда сопровождается
 `SHA256SUMS`. До появления доверенного Authenticode-сертификата он явно
@@ -92,11 +100,11 @@ native-клиента.
 | `veil-client` | Rust | WebSocket/Protobuf, offline queue и crypto orchestration |
 | `veil-search` | Rust | process-memory-only Tantivy index с hard coverage budget |
 | `veil-uploads` | Rust | resumable tus client и streaming chunked AEAD |
-| `veil-ffi` | Rust | UniFFI bindings; высокоуровневая mobile runtime boundary ещё развивается |
+| `veil-ffi` | Rust | UniFFI boundary для native account, Direct sync/send/outbox и reconnect |
 | `veil-proto` | Protobuf | wire contracts |
 | `veil-server` | Go | gateway, auth, messages, Spaces/ACL, push, uploads и invitation portal |
 | `veil-desktop` | Rust + SolidJS | Tauri v2 desktop client и Island UI |
-| `veil-mobile` | TypeScript + native Rust | React Native/Expo foundation; production runtime ещё не готов |
+| `veil-mobile` | TypeScript + Kotlin + Rust | закрытый Android Direct Preview; tester signing и physical exit matrix открыты |
 | `veil-mls` | Rust | экспериментальный OpenMLS foundation, выключенный в desktop runtime |
 | `veil-share-viewer` | Rust/WASM | изолированный viewer для one-time secure-share capability |
 

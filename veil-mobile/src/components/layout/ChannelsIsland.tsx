@@ -30,9 +30,17 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
     <View style={styles.wrap}>
       <Island padding={spacing.md} style={styles.island}>
         <Text style={styles.title}>{isDmHome ? "Direct messages" : server?.name ?? "Channels"}</Text>
-        <Text style={styles.sub}>{isDmHome ? "people · groups" : "channels"}</Text>
+        <Text style={styles.sub}>{isDmHome ? "authenticated native directory" : "channels"}</Text>
 
         <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.list}>
+          {isDmHome && dms.length === 0 ? (
+            <View testID="direct-directory-empty" style={styles.emptyDirectory}>
+              <Text style={styles.emptyTitle}>No Direct conversations yet</Text>
+              <Text style={styles.emptyText}>
+                Conversations appear here only after the authenticated native directory is ready.
+              </Text>
+            </View>
+          ) : null}
           {isDmHome
             ? dms.map((dm) => {
                 const active = dm.id === selectedDmId;
@@ -61,7 +69,6 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
                       <UserAvatar
                         canonicalServerOrigin={dm.avatarIdentity.canonicalServerOrigin}
                         userId={dm.avatarIdentity.userId}
-                        identityKey={dm.avatarIdentity.identityKey}
                         technicalUsername={dm.avatarIdentity.username}
                         size={44}
                       />
@@ -71,17 +78,12 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
                         <Text numberOfLines={1} style={styles.dmName}>
                           {dm.name}
                         </Text>
-                        <Text style={styles.dmTime}>{dm.lastAt}</Text>
+                        {dm.lastAt ? <Text style={styles.dmTime}>{dm.lastAt}</Text> : null}
                       </View>
                       <View style={styles.dmHead}>
                         <Text numberOfLines={1} style={styles.dmLast}>
-                          {dm.lastMessage}
+                          {dm.lastMessage ?? "Tap to open encrypted history"}
                         </Text>
-                        {dm.unread ? (
-                          <View style={styles.badge}>
-                            <Text style={styles.badgeText}>{dm.unread}</Text>
-                          </View>
-                        ) : null}
                       </View>
                     </View>
                   </Pressable>
@@ -135,6 +137,16 @@ const styles = StyleSheet.create({
   title: { color: colors.textHi, fontSize: 18, fontWeight: "700" },
   sub: { color: colors.textLo, fontSize: 11, marginTop: 2, marginBottom: spacing.md, textTransform: "uppercase", letterSpacing: 1.5 },
   list: { paddingBottom: spacing.lg, gap: 4 },
+  emptyDirectory: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.xl,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    borderRadius: radii.lg,
+    backgroundColor: "rgba(255,255,255,0.025)",
+  },
+  emptyTitle: { color: colors.textMd, fontSize: 14, fontWeight: "700" },
+  emptyText: { color: colors.textLo, fontSize: 12, lineHeight: 18, marginTop: 5 },
   rowActive: { backgroundColor: "rgba(124,107,245,0.10)" },
 
   // channel row

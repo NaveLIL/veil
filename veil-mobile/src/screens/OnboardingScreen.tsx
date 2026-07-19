@@ -1,696 +1,585 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Animated,
   Easing,
-  KeyboardAvoidingView,
-  Linking,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
-  TextInput,
-  useWindowDimensions,
   View,
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { SafeAreaView } from "react-native-safe-area-context";
+import Svg, { Path, Rect } from "react-native-svg";
 
-import { colors, motion, radii, spacing } from "../lib/theme";
-import { Island } from "../components/ui/Island";
-import { IslandButton } from "../components/ui/IslandButton";
-import { HebrewRain } from "../components/onboarding/HebrewRain";
-import { GlowBlobs } from "../components/onboarding/GlowBlobs";
-import { TaglineCarousel } from "../components/onboarding/TaglineCarousel";
-import VeilCrypto from "../native/crypto";
-import { useAuthStore } from "../stores/auth";
+import { colors, radii, spacing } from "../lib/theme";
+import {
+  beginNativeIdentitySetup,
+  type NativeIdentitySetupMode,
+} from "../native/identitySetup";
 
-type Step = "welcome" | "generate" | "confirm" | "restore";
+interface OnboardingScreenProps {
+  onVerifyIdentity: () => Promise<IdentityVerificationResult>;
+  reducedMotion: boolean;
+}
 
-const CONFIRM_WORD_INDICES = [2, 6, 10] as const;
+export type IdentityVerificationResult = "present" | "absent" | "unknown";
 
-export default function OnboardingScreen() {
-  const { height } = useWindowDimensions();
-  const [step, setStep] = useState<Step>("welcome");
-  const [mnemonic, setMnemonic] = useState("");
-  const [restoreInput, setRestoreInput] = useState("");
-  const [confirmWords, setConfirmWords] = useState(["", "", ""]);
-  const [showPhrase, setShowPhrase] = useState(true);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
+const PUBLIC_SETUP_ERROR =
+  "Secure setup could not be completed. Nothing changed. Please try again.";
+const PUBLIC_REFRESH_ERROR =
+  "Native setup reported completion, but Veil could not verify the encrypted local account. Keep the recovery phrase, close and reopen Veil, and do not start setup again yet.";
+const PUBLIC_CREATE_CANCELLED =
+  "Setup was cancelled. If a new recovery phrase was shown, it was not committed and must be destroyed before trying again.";
+const PUBLIC_CREATE_INTERRUPTION_ABSENT =
+  "Secure setup was interrupted and Veil verified that no local identity was committed. Any new recovery phrase from that attempt is invalid and must be destroyed before starting again.";
+const PUBLIC_RESTORE_INTERRUPTION_ABSENT =
+  "Secure restore was interrupted and Veil verified that no local identity was committed. Keep your existing recovery phrase and reopen Veil before trying again.";
+const PUBLIC_INTERRUPTION_UNKNOWN =
+  "Secure setup was interrupted, but Veil could not verify whether the local identity was committed. Keep any recovery phrase, close and reopen Veil, and do not start setup again until the local account check finishes.";
 
-  const setLocalIdentityReady = useAuthStore((state) => state.setLocalIdentityReady);
+export default function OnboardingScreen({
+  onVerifyIdentity,
+  reducedMotion,
+}: OnboardingScreenProps) {
+  const [activeMode, setActiveMode] = useState<NativeIdentitySetupMode | null>(null);
+  const [publicError, setPublicError] = useState<string | null>(null);
+  const [restartBlocked, setRestartBlocked] = useState(false);
+  const mounted = useRef(true);
+  const entrance = useRef(new Animated.Value(reducedMotion ? 1 : 0)).current;
 
-  // Step transition: opacity + translateY + scale.
-  const t = useRef(new Animated.Value(1)).current;
-
-  const animateStep = (next: Step) => {
-    setError("");
-    Animated.timing(t, {
-      toValue: 0,
-      duration: motion.leaveMs,
-      easing: Easing.in(Easing.cubic),
-      useNativeDriver: true,
-    }).start(() => {
-      setStep(next);
-      // Start from below for entry.
-      t.setValue(-1);
-      Animated.timing(t, {
-        toValue: 1,
-        duration: motion.enterMs,
-        easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
-      }).start();
-    });
-  };
-
-  const enterStyle = {
-    opacity: t.interpolate({
-      inputRange: [-1, 0, 1],
-      outputRange: [0, 0, 1],
-    }),
-    transform: [
-      {
-        translateY: t.interpolate({
-          inputRange: [-1, 0, 1],
-          outputRange: [-24, 24, 0],
-        }),
-      },
-      {
-        scale: t.interpolate({
-          inputRange: [-1, 0, 1],
-          outputRange: [0.97, 0.97, 1],
-        }),
-      },
-    ],
-  };
-
-  // Error toast slide-in from top.
-  const errorAnim = useRef(new Animated.Value(0)).current;
   useEffect(() => {
-    Animated.timing(errorAnim, {
-      toValue: error ? 1 : 0,
-      duration: 220,
+    mounted.current = true;
+    if (reducedMotion) {
+      entrance.setValue(1);
+      return () => {
+        mounted.current = false;
+      };
+    }
+
+    const animation = Animated.timing(entrance, {
+      toValue: 1,
+      duration: 320,
       easing: Easing.out(Easing.cubic),
       useNativeDriver: true,
-    }).start();
-  }, [error, errorAnim]);
-
-  useEffect(() => {
-    const sensitive = step === "generate" || step === "confirm" || step === "restore";
-    void VeilCrypto.setSensitiveScreen(sensitive).catch(() => {
-      if (sensitive) setError("Screen capture protection is unavailable on this device.");
     });
+    animation.start();
     return () => {
-      void VeilCrypto.setSensitiveScreen(false).catch(() => undefined);
+      mounted.current = false;
+      animation.stop();
     };
-  }, [step]);
+  }, [entrance, reducedMotion]);
 
-  const generateMnemonic = async () => {
+  const beginSetup = async (mode: NativeIdentitySetupMode): Promise<void> => {
+    if (activeMode || restartBlocked) return;
+    setPublicError(null);
+    setActiveMode(mode);
+
+    let result: Awaited<ReturnType<typeof beginNativeIdentitySetup>>;
     try {
-      setError("");
-      setLoading(true);
-      const m = await VeilCrypto.generateMnemonic();
-      setMnemonic(m);
-      animateStep("generate");
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const initIdentity = async (phrase: string) => {
-    try {
-      setLoading(true);
-      setError("");
-      const normalized = phrase.trim().replace(/\s+/g, " ");
-      if (!normalized) {
-        setError("Recovery phrase is empty.");
-        return;
-      }
-      const ok = await VeilCrypto.validateMnemonic(normalized);
-      if (!ok) {
-        setError("Invalid recovery phrase. Check spelling and order.");
-        return;
-      }
-      const key = await VeilCrypto.createIdentity(normalized);
-      // Clear sensitive state only after successful init.
-      setMnemonic("");
-      setRestoreInput("");
-      setLocalIdentityReady(key);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const confirmAndInitIdentity = async () => {
-    const words = mnemonic.split(" ").filter(Boolean);
-    const matches = CONFIRM_WORD_INDICES.every(
-      (wordIndex, inputIndex) => words[wordIndex] === confirmWords[inputIndex].trim().toLowerCase(),
-    );
-    if (!matches) {
-      setError("Those words do not match your recovery phrase. Check your offline copy and try again.");
+      result = await beginNativeIdentitySetup(mode);
+    } catch {
+      if (mounted.current) setPublicError(PUBLIC_SETUP_ERROR);
+      if (mounted.current) setActiveMode(null);
       return;
     }
-    await initIdentity(mnemonic);
+
+    if (!mounted.current) return;
+    if (result === "user_cancelled") {
+      if (mode === "create") setPublicError(PUBLIC_CREATE_CANCELLED);
+      setActiveMode(null);
+      return;
+    }
+
+    let verification: IdentityVerificationResult;
+    try {
+      verification = await onVerifyIdentity();
+    } catch {
+      verification = "unknown";
+    }
+    if (!mounted.current) return;
+
+    if (result === "interrupted") {
+      if (verification === "present") {
+        setActiveMode(null);
+        return;
+      }
+      setPublicError(
+        verification === "absent"
+          ? mode === "create"
+            ? PUBLIC_CREATE_INTERRUPTION_ABSENT
+            : PUBLIC_RESTORE_INTERRUPTION_ABSENT
+          : PUBLIC_INTERRUPTION_UNKNOWN,
+      );
+      setRestartBlocked(verification === "unknown");
+      setActiveMode(null);
+      return;
+    }
+
+    if (verification !== "present") {
+      setPublicError(PUBLIC_REFRESH_ERROR);
+      setRestartBlocked(true);
+    }
+    setActiveMode(null);
   };
 
-  const words = mnemonic.split(" ").filter(Boolean);
+  const busy = activeMode !== null;
+  const setupDisabled = busy || restartBlocked;
+  const animatedStyle = reducedMotion
+    ? undefined
+    : {
+        opacity: entrance,
+        transform: [
+          {
+            translateY: entrance.interpolate({
+              inputRange: [0, 1],
+              outputRange: [12, 0],
+            }),
+          },
+        ],
+      };
 
   return (
-    <View style={styles.root}>
-      <GlowBlobs />
-      <HebrewRain height={height} />
+    <View testID="native-identity-welcome" style={styles.root}>
+      <LinearGradient
+        pointerEvents="none"
+        colors={["rgba(124,107,245,0.20)", "rgba(17,17,23,0)"]}
+        start={{ x: 0.1, y: 0 }}
+        end={{ x: 0.72, y: 0.6 }}
+        style={styles.ambientTop}
+      />
+      <View pointerEvents="none" style={styles.ambientOrb} />
 
-      <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
-        <KeyboardAvoidingView
-          style={styles.flex}
-          behavior={Platform.OS === "ios" ? "padding" : undefined}
+      <SafeAreaView style={styles.safeArea} edges={["top", "bottom"]}>
+        <ScrollView
+          contentContainerStyle={styles.scrollContent}
+          showsVerticalScrollIndicator={false}
+          alwaysBounceVertical={false}
         >
-          {/* Error toast */}
           <Animated.View
-            pointerEvents={error ? "auto" : "none"}
-            style={[
-              styles.errorWrap,
-              {
-                opacity: errorAnim,
-                transform: [
-                  {
-                    translateY: errorAnim.interpolate({
-                      inputRange: [0, 1],
-                      outputRange: [-20, 0],
-                    }),
-                  },
-                ],
-              },
-            ]}
+            accessibilityState={{ busy }}
+            style={[styles.content, animatedStyle]}
           >
-            <View style={styles.errorBox}>
-              <Text style={styles.errorIcon}>⚠</Text>
-              <Text style={styles.errorText} numberOfLines={3}>
-                {error}
+            <View style={styles.brandBlock}>
+              <PhaseShiftMark />
+              <Text accessibilityRole="header" style={styles.brandName}>
+                VEIL
+              </Text>
+              <Text style={styles.eyebrow}>PRIVATE MOBILE PREVIEW</Text>
+            </View>
+
+            <View style={styles.heroCopy}>
+              <Text accessibilityRole="header" style={styles.title}>
+                Your identity stays native.
+              </Text>
+              <Text style={styles.subtitle}>
+                Create or restore inside a protected system screen. Recovery material never enters
+                the React Native interface.
               </Text>
             </View>
+
+            <View style={styles.assuranceRow} accessibilityRole="summary">
+              <AssuranceItem label="Native-only setup" />
+              <AssuranceItem label="Encrypted local vault" />
+              <AssuranceItem label="No cloud recovery" />
+            </View>
+
+            <View style={styles.actionPanel}>
+              <Text style={styles.panelTitle}>Set up this device</Text>
+              <Text style={styles.panelBody}>
+                Nothing is saved until you confirm in the protected native flow. You can cancel at
+                any time.
+              </Text>
+
+              {publicError ? (
+                <View
+                  testID="identity-setup-error"
+                  accessibilityRole="alert"
+                  accessibilityLiveRegion="assertive"
+                  style={styles.errorBox}
+                >
+                  <Text style={styles.errorText}>{publicError}</Text>
+                </View>
+              ) : null}
+
+              <View style={styles.actions}>
+                <SetupButton
+                  testID="identity-setup-create"
+                  title="Create identity"
+                  description="Start with a new device-local identity"
+                  marker="+"
+                  variant="primary"
+                  loading={activeMode === "create"}
+                  disabled={setupDisabled}
+                  onPress={() => void beginSetup("create")}
+                />
+                <SetupButton
+                  testID="identity-setup-restore"
+                  title="Restore identity"
+                  description="Recover an identity you already control"
+                  marker="↙"
+                  variant="secondary"
+                  loading={activeMode === "restore"}
+                  disabled={setupDisabled}
+                  onPress={() => void beginSetup("restore")}
+                />
+              </View>
+
+              {busy ? (
+                <Text
+                  testID="identity-setup-loading"
+                  accessibilityLiveRegion="polite"
+                  style={styles.loadingText}
+                >
+                  Protected setup is open…
+                </Text>
+              ) : null}
+            </View>
+
+            <Text style={styles.footer}>
+              Development preview · Some mobile features are not available yet.
+            </Text>
           </Animated.View>
-
-          <Animated.View style={[styles.stage, enterStyle]}>
-            {step === "welcome" ? (
-              <WelcomeStep
-                onCreate={generateMnemonic}
-                onRestore={() => animateStep("restore")}
-                loading={loading}
-              />
-            ) : null}
-
-            {step === "generate" ? (
-              <GenerateStep
-                words={words}
-                showPhrase={showPhrase}
-                onToggleVisibility={() => setShowPhrase((v) => !v)}
-                onContinue={() => animateStep("confirm")}
-                onBack={() => animateStep("welcome")}
-                loading={loading}
-              />
-            ) : null}
-
-            {step === "confirm" ? (
-              <ConfirmStep
-                values={confirmWords}
-                onChange={(index, value) =>
-                  setConfirmWords((current) => current.map((word, i) => (i === index ? value : word)))
-                }
-                onContinue={confirmAndInitIdentity}
-                onBack={() => animateStep("generate")}
-                loading={loading}
-              />
-            ) : null}
-
-            {step === "restore" ? (
-              <RestoreStep
-                value={restoreInput}
-                onChange={setRestoreInput}
-                onContinue={() => initIdentity(restoreInput)}
-                onBack={() => animateStep("welcome")}
-                loading={loading}
-              />
-            ) : null}
-          </Animated.View>
-        </KeyboardAvoidingView>
+        </ScrollView>
       </SafeAreaView>
     </View>
   );
 }
 
-/* ─── Welcome ───────────────────────────────────────── */
-
-const WelcomeStep: React.FC<{
-  onCreate: () => void;
-  onRestore: () => void;
-  loading: boolean;
-}> = ({ onCreate, onRestore, loading }) => (
-  <View style={styles.welcomeStack}>
-    <View style={styles.logoWrap}>
-      <View style={styles.logoBadge}>
-        <View style={styles.logoGlow} />
-        <Text style={styles.logoMark}>◇</Text>
-      </View>
-      <Text style={styles.brand}>VEIL</Text>
-      <Text style={styles.brandSub}>Encrypted messenger</Text>
+function PhaseShiftMark() {
+  return (
+    <View style={styles.markFrame}>
+      <Svg
+        testID="brand-phase-shift-mark"
+        accessibilityRole="image"
+        accessibilityLabel="Veil Phase Shift mark"
+        width={64}
+        height={64}
+        viewBox="0 0 24 24"
+      >
+        {/* Exact geometry and colors from assets/brand/phase-shift-mark.svg. */}
+        <Rect x="0.5" y="0.5" width="23" height="23" rx="5.5" fill="#0d0e14" stroke="#2e2e50" />
+        <Path
+          fill="#a78bfa"
+          d="M4 4H8V11.8L4 13ZM4 16L8 14.8V20H4ZM10 2H14V10.5L10 11.7ZM10 14.7L14 13.5V22H10ZM16 5H20V8.2L16 9.4ZM16 12.4L20 11.2V19H16Z"
+        />
+      </Svg>
     </View>
+  );
+}
 
-    <Island padding={spacing.xxl} style={styles.welcomeIsland}>
-      <TaglineCarousel />
+function AssuranceItem({ label }: { label: string }) {
+  return (
+    <View style={styles.assuranceItem}>
+      <View style={styles.assuranceDot} />
+      <Text style={styles.assuranceText}>{label}</Text>
+    </View>
+  );
+}
 
-      <View style={styles.divider} />
+interface SetupButtonProps {
+  testID: string;
+  title: string;
+  description: string;
+  marker: string;
+  variant: "primary" | "secondary";
+  loading: boolean;
+  disabled: boolean;
+  onPress: () => void;
+}
 
-      <View style={{ gap: spacing.md }}>
-        <IslandButton
-          label="Create New Key"
-          onPress={onCreate}
-          loading={loading}
-          icon={<Text style={styles.btnIconText}>✦</Text>}
-        />
-        <IslandButton
-          label="Restore from Phrase"
-          onPress={onRestore}
-          variant="secondary"
-          icon={<Text style={[styles.btnIconText, { color: colors.textMd }]}>↓</Text>}
-        />
-      </View>
-    </Island>
-
+function SetupButton({
+  testID,
+  title,
+  description,
+  marker,
+  variant,
+  loading,
+  disabled,
+  onPress,
+}: SetupButtonProps) {
+  const primary = variant === "primary";
+  return (
     <Pressable
-      accessibilityRole="link"
-      accessibilityLabel="Open Veil source code and license"
-      onPress={() => void Linking.openURL("https://github.com/NaveLIL/veil")}
-      style={styles.licenseLink}
+      testID={testID}
+      accessibilityRole="button"
+      accessibilityLabel={title}
+      accessibilityHint={description}
+      accessibilityState={{ disabled, busy: loading }}
+      disabled={disabled}
+      onPress={onPress}
+      style={({ pressed }) => [
+        styles.setupButton,
+        primary ? styles.setupButtonPrimary : styles.setupButtonSecondary,
+        pressed && !disabled ? styles.setupButtonPressed : null,
+        disabled && !loading ? styles.setupButtonDisabled : null,
+      ]}
     >
-      <Text style={styles.licenseText}>© 2026 NaveLIL · AGPL-3.0-or-later · no warranty · Source &amp; License</Text>
-    </Pressable>
-  </View>
-);
-
-/* ─── Confirm recovery ───────────────────────────────── */
-
-const ConfirmStep: React.FC<{
-  values: string[];
-  onChange: (index: number, value: string) => void;
-  onContinue: () => void;
-  onBack: () => void;
-  loading: boolean;
-}> = ({ values, onChange, onContinue, onBack, loading }) => (
-  <ScrollView
-    contentContainerStyle={styles.scrollPad}
-    showsVerticalScrollIndicator={false}
-    keyboardShouldPersistTaps="handled"
-  >
-    <Island padding={spacing.xxl}>
-      <Text style={styles.sectionTitle}>Confirm your offline copy</Text>
-      <Text style={styles.sectionSub}>
-        Enter the requested words from the recovery phrase you saved. Veil cannot recover it for you.
-      </Text>
-
-      <View style={styles.confirmStack}>
-        {CONFIRM_WORD_INDICES.map((wordIndex, inputIndex) => (
-          <View key={wordIndex} style={styles.confirmRow}>
-            <Text style={styles.confirmLabel}>Word {wordIndex + 1}</Text>
-            <TextInput
-              style={styles.confirmInput}
-              value={values[inputIndex]}
-              onChangeText={(value) => onChange(inputIndex, value)}
-              autoCapitalize="none"
-              autoCorrect={false}
-              spellCheck={false}
-              secureTextEntry
-              returnKeyType={inputIndex === values.length - 1 ? "done" : "next"}
-            />
-          </View>
-        ))}
+      <View style={[styles.buttonMarker, primary && styles.buttonMarkerPrimary]}>
+        {loading ? (
+          <ActivityIndicator size="small" color={primary ? "#ffffff" : colors.primaryHi} />
+        ) : (
+          <Text style={[styles.buttonMarkerText, primary && styles.buttonMarkerTextPrimary]}>
+            {marker}
+          </Text>
+        )}
       </View>
-
-      <IslandButton
-        label="Create encrypted identity"
-        onPress={onContinue}
-        loading={loading}
-        disabled={values.some((value) => !value.trim())}
-      />
-      <Pressable onPress={onBack} style={styles.backBtn}>
-        <Text style={styles.backText}>← Review phrase</Text>
-      </Pressable>
-    </Island>
-  </ScrollView>
-);
-
-/* ─── Generate ──────────────────────────────────────── */
-
-const GenerateStep: React.FC<{
-  words: string[];
-  showPhrase: boolean;
-  onToggleVisibility: () => void;
-  onContinue: () => void;
-  onBack: () => void;
-  loading: boolean;
-}> = ({ words, showPhrase, onToggleVisibility, onContinue, onBack, loading }) => (
-  <ScrollView
-    contentContainerStyle={styles.scrollPad}
-    showsVerticalScrollIndicator={false}
-  >
-    <Island padding={spacing.xxl}>
-      <Text style={styles.sectionTitle}>Recovery Phrase</Text>
-      <Text style={styles.sectionSub}>
-        Write down these 12 words in order. They are your only backup.
-      </Text>
-
-      <View style={styles.wordGrid}>
-        {words.map((w, i) => (
-          <View key={i} style={styles.wordCell}>
-            <Text style={styles.wordNum}>{String(i + 1).padStart(2, "0")}</Text>
-            <Text
-              style={[
-                styles.wordText,
-                !showPhrase && { color: "transparent", textShadowColor: colors.textMd, textShadowRadius: 8 },
-              ]}
-            >
-              {w}
-            </Text>
-          </View>
-        ))}
-      </View>
-
-      <View style={styles.warningBox}>
-        <Text style={styles.warningIcon}>⚠</Text>
-        <Text style={styles.warningText}>
-          Anyone with this phrase can read all your messages. Store it offline.
+      <View style={styles.buttonCopy}>
+        <Text style={[styles.buttonTitle, primary && styles.buttonTitlePrimary]}>{title}</Text>
+        <Text style={[styles.buttonDescription, primary && styles.buttonDescriptionPrimary]}>
+          {description}
         </Text>
       </View>
-
-      <View style={styles.row}>
-        <Pressable
-          style={styles.smallBtn}
-          onPress={onToggleVisibility}
-          android_ripple={{ color: "rgba(255,255,255,0.08)" }}
-        >
-          <Text style={styles.smallBtnText}>{showPhrase ? "Hide" : "Reveal"}</Text>
-        </Pressable>
-      </View>
-
-      <View style={{ height: spacing.lg }} />
-
-      <IslandButton
-        label="I've saved my phrase"
-        onPress={onContinue}
-        loading={loading}
-      />
-      <Pressable onPress={onBack} style={styles.backBtn}>
-        <Text style={styles.backText}>← Back</Text>
-      </Pressable>
-    </Island>
-  </ScrollView>
-);
-
-/* ─── Restore ───────────────────────────────────────── */
-
-const RestoreStep: React.FC<{
-  value: string;
-  onChange: (v: string) => void;
-  onContinue: () => void;
-  onBack: () => void;
-  loading: boolean;
-}> = ({ value, onChange, onContinue, onBack, loading }) => (
-  <ScrollView
-    contentContainerStyle={styles.scrollPad}
-    showsVerticalScrollIndicator={false}
-    keyboardShouldPersistTaps="handled"
-  >
-    <Island padding={spacing.xxl}>
-      <Text style={styles.sectionTitle}>Restore Identity</Text>
-      <Text style={styles.sectionSub}>
-        Enter your 12-word recovery phrase to restore your identity on this device.
+      <Text importantForAccessibility="no" style={[styles.chevron, primary && styles.chevronPrimary]}>
+        ›
       </Text>
-
-      <TextInput
-        style={styles.textarea}
-        value={value}
-        onChangeText={onChange}
-        placeholder="word1 word2 word3 …"
-        placeholderTextColor={colors.textXLo}
-        multiline
-        autoCapitalize="none"
-        autoCorrect={false}
-        spellCheck={false}
-        textAlignVertical="top"
-      />
-
-      <View style={{ height: spacing.lg }} />
-
-      <IslandButton
-        label="Restore Identity"
-        onPress={onContinue}
-        loading={loading}
-        disabled={!value.trim()}
-      />
-      <Pressable onPress={onBack} style={styles.backBtn}>
-        <Text style={styles.backText}>← Back</Text>
-      </Pressable>
-    </Island>
-  </ScrollView>
-);
-
-/* ─── Styles ────────────────────────────────────────── */
+    </Pressable>
+  );
+}
 
 const styles = StyleSheet.create({
   root: {
     flex: 1,
-    backgroundColor: "#111117",
+    backgroundColor: colors.background,
   },
-  safe: { flex: 1 },
-  flex: { flex: 1 },
-  stage: {
-    flex: 1,
-    paddingHorizontal: spacing.xl,
-    justifyContent: "flex-end",
-    paddingBottom: spacing.xl,
+  safeArea: { flex: 1 },
+  ambientTop: {
+    position: "absolute",
+    top: 0,
+    left: 0,
+    right: 0,
+    height: "54%",
   },
-  scrollPad: {
+  ambientOrb: {
+    position: "absolute",
+    width: 260,
+    height: 260,
+    borderRadius: 130,
+    right: -150,
+    bottom: 32,
+    backgroundColor: "rgba(83,72,180,0.10)",
+  },
+  scrollContent: {
     flexGrow: 1,
     justifyContent: "center",
-    paddingVertical: spacing.xl,
+    paddingHorizontal: spacing.xl,
+    paddingVertical: spacing.xxl,
   },
-
-  // Welcome
-  welcomeStack: { gap: spacing.xxl },
-  logoWrap: {
+  content: {
+    width: "100%",
+    maxWidth: 520,
+    alignSelf: "center",
+  },
+  brandBlock: {
     alignItems: "center",
-    gap: 6,
   },
-  logoBadge: {
-    width: 64,
-    height: 64,
-    borderRadius: radii.lg + 2,
+  markFrame: {
+    width: 76,
+    height: 76,
+    borderRadius: radii.xl,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: "rgba(124,107,245,0.18)",
+    backgroundColor: "rgba(13,14,20,0.78)",
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "rgba(124,107,245,0.35)",
-    overflow: "hidden",
+    borderColor: "rgba(167,139,250,0.24)",
+    shadowColor: colors.primary,
+    shadowOpacity: 0.28,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 8,
   },
-  logoGlow: {
-    position: "absolute",
-    inset: -16,
-    backgroundColor: "rgba(124,107,245,0.18)",
-    borderRadius: 32,
-  } as any,
-  logoMark: {
-    color: colors.primaryHi,
-    fontSize: 28,
-  },
-  brand: {
-    fontSize: 18,
-    fontWeight: "700",
+  brandName: {
     color: colors.textHi,
-    letterSpacing: 6,
-    marginTop: 6,
+    fontSize: 18,
+    fontWeight: "800",
+    letterSpacing: 7,
+    marginTop: spacing.lg,
+    marginLeft: 7,
   },
-  brandSub: {
+  eyebrow: {
+    color: colors.primaryHi,
     fontSize: 11,
-    color: colors.textLo,
-    letterSpacing: 1,
+    fontWeight: "700",
+    letterSpacing: 1.5,
+    marginTop: spacing.sm,
   },
-  welcomeIsland: { gap: spacing.xl },
-  licenseLink: {
-    alignSelf: "center",
+  heroCopy: {
+    alignItems: "center",
+    marginTop: spacing.xxl,
+  },
+  title: {
+    color: colors.textHi,
+    fontSize: 30,
+    lineHeight: 36,
+    fontWeight: "800",
+    textAlign: "center",
+    letterSpacing: -0.5,
+  },
+  subtitle: {
+    color: colors.textMd,
+    fontSize: 16,
+    lineHeight: 24,
+    textAlign: "center",
+    marginTop: spacing.md,
+    maxWidth: 450,
+  },
+  assuranceRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    justifyContent: "center",
+    gap: spacing.sm,
+    marginTop: spacing.xl,
+  },
+  assuranceItem: {
+    minHeight: 36,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    borderRadius: radii.pill,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceLow,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
   },
-  licenseText: {
-    color: colors.textLo,
-    fontSize: 10,
-    textAlign: "center",
+  assuranceDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+    backgroundColor: colors.success,
   },
-  divider: {
-    height: StyleSheet.hairlineWidth,
-    backgroundColor: colors.border,
-    marginVertical: spacing.sm,
-  },
-
-  // Buttons
-  btnIconText: {
-    color: "#fff",
-    fontSize: 16,
-    fontWeight: "700",
-  },
-
-  // Generate / restore
-  sectionTitle: {
-    fontSize: 19,
-    fontWeight: "700",
-    color: colors.textHi,
-    marginBottom: 6,
-  },
-  sectionSub: {
-    fontSize: 13,
-    color: colors.textLo,
-    lineHeight: 19,
-    marginBottom: spacing.lg,
-  },
-  wordGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: 8,
-    marginBottom: spacing.lg,
-  },
-  wordCell: {
-    width: "48%",
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingVertical: 10,
-    paddingHorizontal: 12,
-    borderRadius: radii.md,
-    backgroundColor: "rgba(255,255,255,0.03)",
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.borderSoft,
-  },
-  wordNum: {
-    fontFamily: "monospace",
-    fontSize: 11,
-    color: colors.textXLo,
-    width: 18,
-    textAlign: "right",
-  },
-  wordText: {
-    fontFamily: "monospace",
-    fontSize: 14,
-    color: colors.textHi,
-    fontWeight: "500",
-  },
-  warningBox: {
-    flexDirection: "row",
-    gap: 10,
-    padding: 14,
-    borderRadius: radii.md,
-    backgroundColor: colors.warningBg,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.warningBorder,
-    marginBottom: spacing.lg,
-  },
-  warningIcon: { color: colors.warning, fontSize: 14 },
-  warningText: { color: colors.warning, fontSize: 12, flex: 1, lineHeight: 17 },
-
-  row: {
-    flexDirection: "row",
-    gap: spacing.md,
-  },
-  smallBtn: {
-    flex: 1,
-    height: 38,
-    borderRadius: radii.md,
-    backgroundColor: "rgba(255,255,255,0.04)",
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    alignItems: "center",
-    justifyContent: "center",
-    overflow: "hidden",
-  },
-  smallBtnText: {
+  assuranceText: {
+    color: colors.textMd,
     fontSize: 12,
     fontWeight: "600",
-    color: colors.textMd,
   },
-
-  textarea: {
-    minHeight: 140,
-    backgroundColor: "rgba(255,255,255,0.04)",
+  actionPanel: {
+    borderRadius: radii.xl,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceSolid,
+    padding: spacing.xl,
+    marginTop: spacing.xxl,
+    shadowColor: "#000000",
+    shadowOpacity: 0.32,
+    shadowRadius: 24,
+    shadowOffset: { width: 0, height: 12 },
+    elevation: 10,
+  },
+  panelTitle: {
+    color: colors.textHi,
+    fontSize: 18,
+    lineHeight: 24,
+    fontWeight: "800",
+  },
+  panelBody: {
+    color: colors.textMd,
+    fontSize: 14,
+    lineHeight: 21,
+    marginTop: spacing.xs,
+  },
+  actions: {
+    gap: spacing.md,
+    marginTop: spacing.xl,
+  },
+  setupButton: {
+    minHeight: 72,
     borderRadius: radii.lg,
     borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    color: colors.textHi,
-    fontFamily: "monospace",
-    fontSize: 15,
-    lineHeight: 24,
-    padding: spacing.lg,
-  },
-  confirmStack: {
-    gap: spacing.md,
-    marginBottom: spacing.xl,
-  },
-  confirmRow: {
-    gap: 7,
-  },
-  confirmLabel: {
-    color: colors.textLo,
-    fontSize: 12,
-    fontWeight: "600",
-  },
-  confirmInput: {
-    height: 46,
-    borderRadius: radii.md,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.border,
-    backgroundColor: "rgba(255,255,255,0.04)",
-    color: colors.textHi,
-    fontFamily: "monospace",
-    fontSize: 15,
-    paddingHorizontal: spacing.lg,
-  },
-
-  backBtn: {
-    height: 40,
-    alignItems: "center",
-    justifyContent: "center",
-    marginTop: 4,
-  },
-  backText: {
-    color: colors.textLo,
-    fontSize: 13,
-  },
-
-  // Error toast
-  errorWrap: {
-    position: "absolute",
-    top: spacing.lg,
-    left: spacing.lg,
-    right: spacing.lg,
-    zIndex: 10,
-  },
-  errorBox: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 10,
-    padding: 12,
-    paddingHorizontal: 14,
+    paddingHorizontal: spacing.lg,
+    paddingVertical: spacing.md,
+  },
+  setupButtonPrimary: {
+    backgroundColor: colors.primaryDeep,
+    borderColor: "rgba(255,255,255,0.16)",
+  },
+  setupButtonSecondary: {
+    backgroundColor: colors.surfaceLow,
+    borderColor: colors.border,
+  },
+  setupButtonPressed: {
+    opacity: 0.82,
+    transform: [{ scale: 0.992 }],
+  },
+  setupButtonDisabled: { opacity: 0.46 },
+  buttonMarker: {
+    width: 44,
+    height: 44,
+    borderRadius: 14,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "rgba(167,139,250,0.10)",
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: "rgba(167,139,250,0.24)",
+  },
+  buttonMarkerPrimary: {
+    backgroundColor: "rgba(255,255,255,0.12)",
+    borderColor: "rgba(255,255,255,0.20)",
+  },
+  buttonMarkerText: {
+    color: colors.primaryHi,
+    fontSize: 24,
+    lineHeight: 28,
+    fontWeight: "500",
+  },
+  buttonMarkerTextPrimary: { color: "#ffffff" },
+  buttonCopy: {
+    flex: 1,
+    marginLeft: spacing.md,
+  },
+  buttonTitle: {
+    color: colors.textHi,
+    fontSize: 15,
+    lineHeight: 20,
+    fontWeight: "800",
+  },
+  buttonTitlePrimary: { color: "#ffffff" },
+  buttonDescription: {
+    color: colors.textMd,
+    fontSize: 12,
+    lineHeight: 17,
+    marginTop: 2,
+  },
+  buttonDescriptionPrimary: { color: "rgba(255,255,255,0.74)" },
+  chevron: {
+    color: colors.textLo,
+    fontSize: 28,
+    lineHeight: 32,
+    marginLeft: spacing.sm,
+  },
+  chevronPrimary: { color: "rgba(255,255,255,0.72)" },
+  errorBox: {
+    minHeight: 48,
+    justifyContent: "center",
     borderRadius: radii.md,
-    backgroundColor: colors.destructiveBg,
     borderWidth: StyleSheet.hairlineWidth,
     borderColor: colors.destructiveBorder,
+    backgroundColor: colors.destructiveBg,
+    paddingHorizontal: spacing.md,
+    paddingVertical: spacing.sm,
+    marginTop: spacing.lg,
   },
-  errorIcon: { color: colors.destructive, fontSize: 14 },
-  errorText: { color: colors.destructive, fontSize: 12, flex: 1, lineHeight: 17 },
+  errorText: {
+    color: colors.destructive,
+    fontSize: 13,
+    lineHeight: 19,
+  },
+  loadingText: {
+    color: colors.textLo,
+    fontSize: 12,
+    lineHeight: 18,
+    textAlign: "center",
+    marginTop: spacing.md,
+  },
+  footer: {
+    color: colors.textLo,
+    fontSize: 11,
+    lineHeight: 17,
+    textAlign: "center",
+    marginTop: spacing.xl,
+    paddingHorizontal: spacing.lg,
+  },
 });
-
-// LinearGradient is imported because TaglineCarousel/IslandButton use it indirectly.
-// Keep import alive for tree-shaking transparency.
-void LinearGradient;

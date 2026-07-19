@@ -137,10 +137,42 @@ sudo certbot certonly --webroot -w /var/www/letsencrypt \
 Replace the bootstrap vhost with the final loopback TLS vhost:
 
 ```sh
+python3 scripts/tests/check_nginx_rest_authority.py
 sudo install -m 0644 deploy/nginx/veil.erez.pro.conf /etc/nginx/sites-available/veil.erez.pro
 sudo nginx -t
 sudo systemctl reload nginx
 ```
+
+The final vhost has a temporary, strict `veil-rest-v1` authority bridge.
+Previously released desktop builds sign and send `veil.erez.pro`; Android and
+current canonical clients sign and send `veil.erez.pro:443`. Nginx accepts
+those two reviewed authority forms and maps either to the corresponding
+lowercase literal before preserving it as upstream `Host` and
+`X-Forwarded-Host`. DNS hostname matching is case-insensitive, so case variants
+of the same hostname normalize to the same literal. Any other hostname, port,
+leading-zero port alias, trailing dot, or missing authority is rejected with
+HTTP 421. Deploy and verify this bridge before publishing a client that always
+includes the effective port, and retain it while a supported released desktop
+can still send the bare authority. Do not replace the allowlist with direct
+`$host` or `$http_host` forwarding. The permanent fix is the coordinated
+configured public-origin + REST v2 + WS v3 migration, not broader ingress
+trust.
+
+Before replacement, save the active expanded configuration and vhost so the
+change has a deterministic rollback path:
+
+```sh
+sudo sh -c 'nginx -T > /root/nginx-before-veil-authority.txt'
+sudo cp -a /etc/nginx/sites-available/veil.erez.pro \
+  /root/veil.erez.pro.before-authority
+sudo sha256sum /root/nginx-before-veil-authority.txt \
+  /root/veil.erez.pro.before-authority
+```
+
+After reload, verify HTTP/1.1 and HTTP/2 preserve both allowed authorities to
+the gateway, reject an unexpected port, and keep the packaged desktop and
+Android signed REST probes green. If either client receives a new 401, restore
+the saved vhost, run `sudo nginx -t`, and reload immediately.
 
 Before publishing the managed-service privacy notice, verify that the host's
 existing Nginx logrotate policy covers `/var/log/nginx/veil.erez.pro.*.log`
@@ -215,11 +247,13 @@ dump and archives to separate storage, and verify the PostgreSQL dump with
 `pg_restore --list` before proceeding. A live copy of `veil_pgdata` is not a
 substitute for `pg_dump` or a coordinated filesystem snapshot.
 
-Two migrations are intentionally destructive and require explicit acceptance:
+Three migrations are intentionally destructive and require explicit acceptance:
 
 - `023_veil_links_and_bans.sql` drops/recreates invite data, removes voice-room
   channel rows, and drops `servers.icon_url`;
-- `025_webpush_cutover.sql` deletes all existing push subscriptions.
+- `025_webpush_cutover.sql` deletes all existing push subscriptions;
+- `028_reaction_history_bound.sql` removes invalid legacy reaction-scope rows
+  and deterministically retains only the oldest 256 reactions per message.
 
 If any of that data must survive, stop here and write a conversion migration.
 An application image rollback cannot undo these database changes.

@@ -3635,7 +3635,7 @@ enum SenderKeyHistoryInspectionOutcome {
 
 #[allow(clippy::too_many_arguments)]
 fn reconcile_sender_key_history_inspection(
-    client: &VeilClient,
+    client: &mut VeilClient,
     inspection: &veil_client::api::SenderKeyMessageContextInspectionV1,
     current_target_admission: Option<&CurrentTargetAdmissionEvidence>,
     message_created_at: &str,
@@ -4773,7 +4773,7 @@ fn sync_conversation_messages(
                                     .ok_or("Sender-Key message context conversion failed")?,
                             )?;
                             if reconcile_sender_key_history_inspection(
-                                &client,
+                                &mut client,
                                 &validation,
                                 current_target_admission,
                                 &message.created_at,
@@ -5532,6 +5532,15 @@ fn connect_to_server(
                             header,
                             server_timestamp,
                             reply_to_id,
+                            // The shared transport preserves optional wire-policy
+                            // presence for mobile's fail-closed replay boundary.
+                            // Desktop already reconciles type/expiry through its
+                            // attachment and revision-history paths; acknowledge
+                            // the fields explicitly so future event additions still
+                            // break this exhaustive consumer at compile time.
+                            msg_type: _,
+                            ttl_seconds: _,
+                            sealed: _,
                             attachments,
                             security_context,
                         } => {
@@ -8551,54 +8560,20 @@ fn validate_server_endpoint_pair(ws_raw: &str, rest_raw: &str) -> Result<(), Str
     Ok(())
 }
 
-fn explicit_url_port(raw_url: &str) -> Result<Option<u16>, String> {
-    let (_, remainder) = raw_url
-        .split_once("://")
-        .ok_or_else(|| "REST URL is missing a scheme separator".to_string())?;
-    let authority_end = remainder.find(['/', '?', '#']).unwrap_or(remainder.len());
-    let authority = &remainder[..authority_end];
-    let port = if authority.starts_with('[') {
-        let close = authority
-            .find(']')
-            .ok_or_else(|| "invalid bracketed IPv6 authority".to_string())?;
-        let suffix = &authority[close + 1..];
-        if suffix.is_empty() {
-            None
-        } else {
-            Some(
-                suffix
-                    .strip_prefix(':')
-                    .ok_or_else(|| "invalid IPv6 authority suffix".to_string())?,
-            )
-        }
-    } else {
-        authority
-            .rsplit_once(':')
-            .and_then(|(_, port)| port.chars().all(|c| c.is_ascii_digit()).then_some(port))
-    };
-    port.map(|value| {
-        value
-            .parse::<u16>()
-            .map_err(|_| "invalid REST URL port".to_string())
-    })
-    .transpose()
-}
-
-fn rest_authority(url: &reqwest::Url, raw_url: &str) -> Result<String, String> {
+fn rest_authority(url: &reqwest::Url) -> Result<String, String> {
     let host = url
         .host_str()
         .ok_or_else(|| "REST URL is missing a host".to_string())?;
     let unbracketed = host.trim_start_matches('[').trim_end_matches(']');
-    let mut authority = if unbracketed.contains(':') {
+    let host = if unbracketed.contains(':') {
         format!("[{}]", unbracketed.to_ascii_lowercase())
     } else {
         unbracketed.to_ascii_lowercase()
     };
-    if let Some(port) = explicit_url_port(raw_url)? {
-        authority.push(':');
-        authority.push_str(&port.to_string());
-    }
-    Ok(authority)
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "REST URL has no effective port".to_string())?;
+    Ok(format!("{host}:{port}"))
 }
 
 fn rest_request_target(url: &reqwest::Url) -> String {
@@ -8756,7 +8731,7 @@ async fn rest_send_raw_for_binding(
     if user_id != authenticated_user_id {
         return Err("REST user id does not match the authenticated WebSocket session".into());
     }
-    let authority = rest_authority(&parsed_url, &url)?;
+    let authority = rest_authority(&parsed_url)?;
     let request_target = rest_request_target(&parsed_url);
     let ts_ms = next_rest_timestamp_ms()?;
     let canonical = rest_canonical(
@@ -8864,7 +8839,7 @@ async fn rest_send_json_with_expected_binding(
 
     // 2. Canonical request context. Query parameters and authority are signed
     // so authenticated requests cannot be redirected across users/origins.
-    let authority = rest_authority(&parsed_url, &url)?;
+    let authority = rest_authority(&parsed_url)?;
     let request_target = rest_request_target(&parsed_url);
     let ts_ms = next_rest_timestamp_ms()?;
 
@@ -11083,7 +11058,10 @@ fn distribute_pinned_sender_key(
     let mut seen = std::collections::HashSet::new();
     let mut sent = 0u32;
     let started = Instant::now();
-    client.buffer_connection_events_during_sync();
+    if let Err(error) = client.buffer_connection_events_during_sync() {
+        client.mark_sender_key_distribution_failed(conversation_id);
+        return Err(error.to_string());
+    }
     for target in targets {
         if let Some(binding) = live_action_binding {
             if let Err(error) = require_confirmed_live_action_binding_current(state, binding) {
@@ -11117,7 +11095,10 @@ fn distribute_pinned_sender_key(
         }
         sent += 1;
         if sent.is_multiple_of(128) {
-            client.buffer_connection_events_during_sync();
+            if let Err(error) = client.buffer_connection_events_during_sync() {
+                client.mark_sender_key_distribution_failed(conversation_id);
+                return Err(error.to_string());
+            }
         }
     }
     if sent == 0 {
@@ -13908,10 +13889,27 @@ mod e2ee_rest_tests {
     }
 
     #[test]
-    fn rest_canonical_matches_server_vector_and_signs_query() {
-        let raw = "https://Example.COM:0443/v1/prekeys?device=7";
+    fn rest_authority_uses_the_canonical_effective_origin() {
+        for (raw, expected) in [
+            ("https://Example.COM/v1", "example.com:443"),
+            ("https://Example.COM:443/v1", "example.com:443"),
+            ("https://Example.COM:0443/v1", "example.com:443"),
+            ("https://Example.COM:8443/v1", "example.com:8443"),
+            ("http://LOCALHOST/v1", "localhost:80"),
+            ("http://127.0.0.1:8080/v1", "127.0.0.1:8080"),
+            ("http://[::1]/v1", "[::1]:80"),
+            ("https://[2001:DB8::A]:0443/v1", "[2001:db8::a]:443"),
+        ] {
+            let url = reqwest::Url::parse(raw).unwrap();
+            assert_eq!(rest_authority(&url).unwrap(), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rest_canonical_matches_the_common_android_and_server_vector() {
+        let raw = "https://Example.COM/v1/prekeys?device=7";
         let url = reqwest::Url::parse(raw).unwrap();
-        let authority = rest_authority(&url, raw).unwrap();
+        let authority = rest_authority(&url).unwrap();
         let target = rest_request_target(&url);
         let canonical = rest_canonical(
             &reqwest::Method::POST,
@@ -14287,7 +14285,7 @@ mod e2ee_rest_tests {
 
         assert_eq!(
             super::reconcile_sender_key_history_inspection(
-                &client,
+                &mut client,
                 &missing,
                 Some(&evidence),
                 "2026-07-13T19:05:17.714128999Z",
@@ -14331,7 +14329,7 @@ mod e2ee_rest_tests {
 
         assert_eq!(
             super::reconcile_sender_key_history_inspection(
-                &client,
+                &mut client,
                 &SenderKeyMessageContextInspectionV1::Verified,
                 Some(&evidence),
                 "2026-07-13T19:05:18Z",

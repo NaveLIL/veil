@@ -100,6 +100,10 @@ android {
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
         versionName "0.1.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+    }
+    compileOptions {
+        coreLibraryDesugaringEnabled true
     }
     sourceSets {
         main.java.srcDirs += file('../../src/native/generated/uniffi')
@@ -115,8 +119,14 @@ android {
         }
     }
     buildTypes {
-        debug {}
+        debug {
+            // Visual-feedback builds may capture only the fully authenticated
+            // ready shell. MainActivity still starts secure and re-secures on
+            // pause; RecoveryActivity and Recents are never downgraded.
+            buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "true"
+        }
         release {
+            buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "false"
             if (releaseSigningConfigured) {
                 signingConfig signingConfigs.release
             }
@@ -157,12 +167,20 @@ android {
 }
 
 dependencies {
+    coreLibraryDesugaring('com.android.tools:desugar_jdk_libs:2.1.5')
     // The version of react-native is set by the React Native Gradle Plugin
     implementation("com.facebook.react:react-android")
     implementation("net.java.dev.jna:jna:5.17.0@aar")
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
     // 3.0.10 is the newest connector built with Expo SDK 53's Kotlin 2.0.21 ABI.
     // 3.1+ requires Kotlin 2.2/2.3 and must land with the planned Expo upgrade.
     implementation("org.unifiedpush.android:connector:3.0.10")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("com.squareup.okhttp3:mockwebserver:4.12.0")
+    testImplementation("com.squareup.okhttp3:okhttp-tls:4.12.0")
+    androidTestImplementation("androidx.test:core:1.7.0")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
+    androidTestImplementation("androidx.test:runner:1.7.0")
 
     def isGifEnabled = (findProperty('expo.gif.enabled') ?: "") == "true";
     def isWebpEnabled = (findProperty('expo.webp.enabled') ?: "") == "true";
@@ -190,7 +208,10 @@ dependencies {
 }
 
 gradle.taskGraph.whenReady { graph ->
-    def requestedRelease = graph.allTasks.any { it.project == project && it.name.toLowerCase().contains('release') }
+    def requestedRelease = graph.allTasks.any {
+        def taskName = it.name.toLowerCase()
+        it.project == project && taskName.contains('release') && !taskName.contains('clean')
+    }
     if (requestedRelease && !releaseSigningConfigured) {
         throw new GradleException('Release signing is required. Set VEIL_ANDROID_KEYSTORE, VEIL_ANDROID_KEYSTORE_PASSWORD, VEIL_ANDROID_KEY_ALIAS, and VEIL_ANDROID_KEY_PASSWORD.')
     }

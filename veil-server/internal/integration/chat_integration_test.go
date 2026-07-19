@@ -5,12 +5,18 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"encoding/hex"
+	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
+
+	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
+	"github.com/google/uuid"
 )
 
 func TestChat_CreateDMHappyPath(t *testing.T) {
@@ -159,6 +165,174 @@ func TestChat_GetMessagesEmptyForNewConversation(t *testing.T) {
 	list, _ := msgs["messages"].([]any)
 	if len(list) != 0 {
 		t.Fatalf("expected empty message list, got %d", len(list))
+	}
+}
+
+func TestChat_MessageHistoryCapsLegacyCandidateLimit(t *testing.T) {
+	h := New(t)
+	alice := h.CreateUser("candidate-limit-alice")
+	bob := h.CreateUser("candidate-limit-bob")
+
+	_, _, body := h.Do(alice, http.MethodPost, "/v1/conversations/dm", map[string]string{
+		"peer_user_id": bob.ID,
+	})
+	conversationID := body["conversation_id"].(string)
+
+	const messageCount = 26
+	wantIDs := make(map[string]struct{}, messageCount)
+	for index := 0; index < messageCount; index++ {
+		messageID, _, _, err := h.Chat.HandleSendMessage(t.Context(), alice.ID, &pb.SendMessage{
+			ConversationId:  conversationID,
+			ClientMessageId: uuid.NewString(),
+			Ciphertext:      []byte(fmt.Sprintf("small-ciphertext-%02d", index)),
+			Header:          append([]byte{0x02}, make([]byte, 41)...),
+		})
+		if err != nil {
+			t.Fatalf("store small message %d: %v", index, err)
+		}
+		wantIDs[messageID] = struct{}{}
+	}
+
+	status, _, first := h.Do(bob, http.MethodGet,
+		"/v1/messages/"+conversationID+"?limit=100", nil)
+	if status != http.StatusOK {
+		t.Fatalf("first candidate page status=%d body=%v", status, first)
+	}
+	firstMessages, _ := first["messages"].([]any)
+	firstCount, _ := first["count"].(float64)
+	cursor, _ := first["next_cursor"].(string)
+	if len(firstMessages) != 25 || int(firstCount) != 25 || cursor == "" {
+		t.Fatalf("first candidate page messages/count/cursor=%d/%v/%q", len(firstMessages), first["count"], cursor)
+	}
+
+	seen := make(map[string]struct{}, messageCount)
+	for _, rawMessage := range firstMessages {
+		message := rawMessage.(map[string]any)
+		seen[message["id"].(string)] = struct{}{}
+	}
+	status, _, final := h.Do(bob, http.MethodGet,
+		fmt.Sprintf("/v1/messages/%s?limit=100&cursor=%s", conversationID, url.QueryEscape(cursor)), nil)
+	if status != http.StatusOK {
+		t.Fatalf("final candidate page status=%d body=%v", status, final)
+	}
+	finalMessages, _ := final["messages"].([]any)
+	finalCount, _ := final["count"].(float64)
+	if len(finalMessages) != 1 || int(finalCount) != 1 {
+		t.Fatalf("final candidate page messages/count=%d/%v", len(finalMessages), final["count"])
+	}
+	if cursor, present := final["next_cursor"]; present {
+		t.Fatalf("final candidate page retained next_cursor=%v", cursor)
+	}
+	seen[finalMessages[0].(map[string]any)["id"].(string)] = struct{}{}
+	if len(seen) != messageCount {
+		t.Fatalf("candidate keyset returned %d unique messages, want %d", len(seen), messageCount)
+	}
+	for messageID := range wantIDs {
+		if _, ok := seen[messageID]; !ok {
+			t.Fatalf("candidate keyset omitted message %s", messageID)
+		}
+	}
+}
+
+func TestChat_MessageHistoryPaginatesByExactWireBudget(t *testing.T) {
+	h := New(t)
+	alice := h.CreateUser("wire-budget-alice")
+	bob := h.CreateUser("wire-budget-bob")
+
+	_, _, body := h.Do(alice, http.MethodPost, "/v1/conversations/dm", map[string]string{
+		"peer_user_id": bob.ID,
+	})
+	conversationID := body["conversation_id"].(string)
+
+	const messageCount = 25
+	messageIDs := make([]string, 0, messageCount)
+	for index := 0; index < messageCount; index++ {
+		messageID, _, _, err := h.Chat.HandleSendMessage(t.Context(), alice.ID, &pb.SendMessage{
+			ConversationId:  conversationID,
+			ClientMessageId: uuid.NewString(),
+			Ciphertext:      bytes.Repeat([]byte{byte(index + 1)}, 64*1024),
+			Header:          append([]byte{0x02}, make([]byte, 41)...),
+		})
+		if err != nil {
+			t.Fatalf("store max ciphertext message %d: %v", index, err)
+		}
+		messageIDs = append(messageIDs, messageID)
+	}
+
+	// Every row remains within the public reaction admission contract, while
+	// HTML-escaped 64-byte values make the aggregate 25-row wire page exceed
+	// four MiB without relying on invalid ciphertext or database corruption.
+	if _, err := h.DB.Pool.Exec(t.Context(),
+		`INSERT INTO reactions (message_id, conversation_id, user_id, emoji)
+		 SELECT message_id, $2::uuid, $3::uuid,
+		        repeat('<', 60) || lpad(to_hex(reaction_index), 4, '0')
+		 FROM unnest($1::uuid[]) AS message_rows(message_id)
+		 CROSS JOIN generate_series(0, 95) AS reaction_rows(reaction_index)`,
+		messageIDs, conversationID, alice.ID,
+	); err != nil {
+		t.Fatalf("seed admitted worst-case reactions: %v", err)
+	}
+
+	const wireBudget = 4 * 1024 * 1024
+	seenMessages := make(map[string]struct{}, messageCount)
+	seenCursors := make(map[string]struct{})
+	target := "/v1/messages/" + conversationID + "?limit=25"
+	firstPageCount := 0
+	for pageNumber := 1; pageNumber <= messageCount; pageNumber++ {
+		status, raw, page := h.Do(bob, http.MethodGet, target, nil)
+		if status != http.StatusOK {
+			t.Fatalf("history page %d status=%d body=%v", pageNumber, status, page)
+		}
+		if len(raw) == 0 || len(raw) > wireBudget || raw[len(raw)-1] != '\n' {
+			t.Fatalf("history page %d wire size/newline=%d/%v", pageNumber, len(raw), len(raw) > 0 && raw[len(raw)-1] == '\n')
+		}
+		messages, ok := page["messages"].([]any)
+		if !ok || len(messages) == 0 {
+			t.Fatalf("history page %d is not a progressing non-empty page: %v", pageNumber, page)
+		}
+		count, ok := page["count"].(float64)
+		if !ok || int(count) != len(messages) {
+			t.Fatalf("history page %d count=%v messages=%d", pageNumber, page["count"], len(messages))
+		}
+		if pageNumber == 1 {
+			firstPageCount = len(messages)
+		}
+		for _, rawMessage := range messages {
+			message, ok := rawMessage.(map[string]any)
+			if !ok {
+				t.Fatalf("history page %d contains invalid message: %T", pageNumber, rawMessage)
+			}
+			messageID, _ := message["id"].(string)
+			if messageID == "" {
+				t.Fatalf("history page %d contains empty message id", pageNumber)
+			}
+			if _, duplicate := seenMessages[messageID]; duplicate {
+				t.Fatalf("history keyset replayed message %s", messageID)
+			}
+			seenMessages[messageID] = struct{}{}
+		}
+
+		cursor, hasMore := page["next_cursor"].(string)
+		if len(seenMessages) == messageCount {
+			if hasMore {
+				t.Fatalf("final history page retained next_cursor %q", cursor)
+			}
+			break
+		}
+		if !hasMore || cursor == "" {
+			t.Fatalf("history page %d omitted cursor with %d rows remaining", pageNumber, messageCount-len(seenMessages))
+		}
+		if _, duplicate := seenCursors[cursor]; duplicate {
+			t.Fatalf("history cursor did not progress: %q", cursor)
+		}
+		seenCursors[cursor] = struct{}{}
+		target = fmt.Sprintf("/v1/messages/%s?limit=25&cursor=%s", conversationID, url.QueryEscape(cursor))
+	}
+	if firstPageCount <= 0 || firstPageCount >= messageCount {
+		t.Fatalf("wire budget did not shorten first page: count=%d", firstPageCount)
+	}
+	if len(seenMessages) != messageCount {
+		t.Fatalf("wire pagination returned %d unique messages, want %d", len(seenMessages), messageCount)
 	}
 }
 
