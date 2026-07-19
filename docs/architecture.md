@@ -10,14 +10,14 @@ Veil — native-first E2EE messenger и self-hosted Veil Node. Текущая с
 flowchart LR
     subgraph Device["Пользовательское устройство"]
         UI["Desktop: SolidJS / Tauri"]
-        Mobile["Mobile foundation: React Native"]
+        Mobile["Android Direct Preview: React Native + Kotlin"]
         FFI["Tauri commands / UniFFI"]
         Core["Rust protocol + crypto core"]
         Store["SQLCipher + OS key storage"]
         Search["Tantivy index in process memory"]
 
         UI --> FFI
-        Mobile -. "foundation" .-> FFI
+        Mobile -. "UniFFI" .-> FFI
         FFI --> Core
         Core --> Store
         Core --> Search
@@ -46,7 +46,7 @@ native account session или долговременные E2EE-ключи deskt
 | **veil-ffi** | UniFFI boundary для native mobile integration |
 | **veil-mls** | Экспериментальный OpenMLS foundation, не включённый в текущий desktop runtime |
 | **veil-desktop** | SolidJS UI и Tauri/Rust application boundary |
-| **veil-mobile** | React Native/Expo foundation; production messaging runtime ещё не завершён |
+| **veil-mobile** | React Native shell + Kotlin/Rust Direct runtime; закрытый Android Preview |
 | **veil-server** | Go gateway, auth, messaging, Spaces/ACL, push, uploads и Veil Link |
 | **veil-proto** | Versioned wire contracts |
 | **veil-share-viewer** | Изолированный WASM viewer для one-time share capability |
@@ -60,9 +60,10 @@ native account session или долговременные E2EE-ключи deskt
 ### Устройство
 
 Приватные ключи, ratchet/Sender-Key state и расшифрованное долговременное
-хранилище принадлежат native Rust boundary. Recovery phrase может появляться в
-WebView только в ограниченном onboarding/re-auth flow. JS UI не должен
-становиться универсальным API чтения ключевого материала.
+хранилище принадлежат native Rust boundary. На Android recovery phrase
+отображается только отдельной screenshot-protected native Activity и не входит
+в React Native, clipboard, autofill, accessibility, content capture или
+системный IME. JS UI не должен становиться API чтения ключевого материала.
 
 Отправка E2EE сообщения работает fail closed: отсутствие необходимой сессии,
 roster proof или key distribution не разрешает plaintext либо ослабленный
@@ -76,7 +77,11 @@ membership и delivery state. E2EE не скрывает эту информац
 
 Canonical HTTPS origin входит в identity аккаунта. Одинаковый user ID на двух
 Node не означает одну identity. Wildcard origin, HTTP downgrade и
-автоматическое доверие self-signed сертификату нарушают эту границу.
+автоматическое доверие self-signed сертификату нарушают эту границу. Текущий
+Preview строго проверяет URL/TLS и exact legacy REST authority на managed
+ingress, но WS v2/REST v1 ещё не связывают полный canonical origin/user context
+end to end. Версионированные WS v3/REST v2 и hostile two-Node matrix остаются
+blocking gate Phase 5S.
 
 ### Локальные данные и поиск
 
@@ -121,7 +126,10 @@ reverse proxy. Конкретная схема и rollback gate описаны �
 
 - нет stable release и обещанной обратной совместимости;
 - нет независимого криптографического/security-аудита;
-- mobile production runtime, calls и MLS runtime не завершены;
+- Android Direct runtime, atomic vault и native recovery реализованы, но
+  cross-client/airplane physical matrix, connected recovery/capture
+  instrumentation, public failure codes и standalone signing ещё не закрыты;
+  calls и MLS runtime не включены;
 - key transparency отсутствует;
 - attachment, multi-device и platform signing matrices требуют дальнейшего
   release evidence;

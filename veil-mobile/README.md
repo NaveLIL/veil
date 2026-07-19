@@ -96,12 +96,28 @@ any value is missing.
   background reopen or process restart may recover it. A future explicit
   “Forget Node / remain offline” action requires a separate destructive
   contract; no hidden clear API exists in this preview.
+- Foreground authority is process-wide and restricted to exact `MainActivity`
+  and `RecoveryActivity` surfaces. Internal handoff/configuration recreation
+  cannot impersonate app background, dependency Activities cannot keep the
+  session open, and an enrollment Intent crosses the native foreground barrier
+  before its Pass is staged. Background Pass/session revocation is linearized
+  under the runtime lifecycle lock.
+- Android WSS uses an explicit per-connection `ring` provider with TLS 1.2/1.3
+  and public WebPKI roots. The managed legacy REST-v1 ingress accepts only the
+  exact bare/canonical-`:443` authority forms; this compatibility bridge does
+  not replace the Phase 5S WS v3/REST v2 origin-binding gate.
+- The write-once identity vault publishes through fsync/readback plus atomic
+  directory rename. Native recovery holds a coordinator barrier over strict
+  presence checks: READY/COMMITTING is always ambiguous, never false, so an
+  unsettled commit cannot cause the only recovery phrase to be destroyed.
 - UnifiedPush still accepts only decrypted 2048-byte generic wake records.
 
 This remains a closed Direct Preview, not a tester release or production-ready
 mobile messenger. Authenticated Direct directory/history, bounded live receive,
 native projection, per-conversation prekey establishment, guarded send/outbox,
-typed transient reconnect, and automated canonical-origin process-death
-recovery are present. Physical process-death/airplane evidence, push
-publication, Circle/Space/attachments, correct multi-device, signed standalone
-APK distribution, and the broader physical-device matrix remain gated.
+typed transient reconnect, and canonical-origin process-death recovery are
+present. Same-account force-stop recovery without a new Pass or device has been
+physically confirmed on a Samsung S23. Cross-client E2EE text/airplane/background
+evidence, connected recovery/vault/capture instrumentation, public failure
+codes, push publication, Circle/Space/attachments, correct multi-device, signed
+standalone APK distribution, and the broader physical-device matrix remain gated.
