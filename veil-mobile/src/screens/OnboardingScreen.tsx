@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useRef } from "react";
 import {
   ActivityIndicator,
   Animated,
@@ -19,49 +19,30 @@ import {
 } from "lucide-react-native";
 
 import { PhaseShiftMark } from "../components/brand/PhaseShiftMark";
+import { PublicFailureCard } from "../components/runtime/PublicFailureCard";
 import { colors, radii, spacing } from "../lib/theme";
 import {
-  beginNativeIdentitySetup,
-  type NativeIdentitySetupMode,
-} from "../native/identitySetup";
+  beginIdentitySetup,
+  useIdentitySetupStore,
+} from "../stores/identitySetup";
 
 interface OnboardingScreenProps {
-  onVerifyIdentity: () => Promise<IdentityVerificationResult>;
   reducedMotion: boolean;
 }
 
-export type IdentityVerificationResult = "present" | "absent" | "unknown";
-
-const PUBLIC_SETUP_ERROR =
-  "Secure setup could not be completed. Nothing changed. Please try again.";
-const PUBLIC_REFRESH_ERROR =
-  "Native setup reported completion, but Veil could not verify the encrypted local account. Keep the recovery phrase, close and reopen Veil, and do not start setup again yet.";
-const PUBLIC_CREATE_CANCELLED =
-  "Setup was cancelled. If a new recovery phrase was shown, it was not committed and must be destroyed before trying again.";
-const PUBLIC_CREATE_INTERRUPTION_ABSENT =
-  "Secure setup was interrupted and Veil verified that no local identity was committed. Any new recovery phrase from that attempt is invalid and must be destroyed before starting again.";
-const PUBLIC_RESTORE_INTERRUPTION_ABSENT =
-  "Secure restore was interrupted and Veil verified that no local identity was committed. Keep your existing recovery phrase and reopen Veil before trying again.";
-const PUBLIC_INTERRUPTION_UNKNOWN =
-  "Secure setup was interrupted, but Veil could not verify whether the local identity was committed. Keep any recovery phrase, close and reopen Veil, and do not start setup again until the local account check finishes.";
-
 export default function OnboardingScreen({
-  onVerifyIdentity,
   reducedMotion,
 }: OnboardingScreenProps) {
-  const [activeMode, setActiveMode] = useState<NativeIdentitySetupMode | null>(null);
-  const [publicError, setPublicError] = useState<string | null>(null);
-  const [restartBlocked, setRestartBlocked] = useState(false);
-  const mounted = useRef(true);
+  const activeMode = useIdentitySetupStore((state) => state.activeMode);
+  const publicFailureCode = useIdentitySetupStore((state) => state.publicFailureCode);
+  const recoveryNotice = useIdentitySetupStore((state) => state.recoveryNotice);
+  const restartBlocked = useIdentitySetupStore((state) => state.restartBlocked);
   const entrance = useRef(new Animated.Value(reducedMotion ? 1 : 0)).current;
 
   useEffect(() => {
-    mounted.current = true;
     if (reducedMotion) {
       entrance.setValue(1);
-      return () => {
-        mounted.current = false;
-      };
+      return undefined;
     }
 
     const animation = Animated.timing(entrance, {
@@ -72,63 +53,9 @@ export default function OnboardingScreen({
     });
     animation.start();
     return () => {
-      mounted.current = false;
       animation.stop();
     };
   }, [entrance, reducedMotion]);
-
-  const beginSetup = async (mode: NativeIdentitySetupMode): Promise<void> => {
-    if (activeMode || restartBlocked) return;
-    setPublicError(null);
-    setActiveMode(mode);
-
-    let result: Awaited<ReturnType<typeof beginNativeIdentitySetup>>;
-    try {
-      result = await beginNativeIdentitySetup(mode);
-    } catch {
-      if (mounted.current) setPublicError(PUBLIC_SETUP_ERROR);
-      if (mounted.current) setActiveMode(null);
-      return;
-    }
-
-    if (!mounted.current) return;
-    if (result === "user_cancelled") {
-      if (mode === "create") setPublicError(PUBLIC_CREATE_CANCELLED);
-      setActiveMode(null);
-      return;
-    }
-
-    let verification: IdentityVerificationResult;
-    try {
-      verification = await onVerifyIdentity();
-    } catch {
-      verification = "unknown";
-    }
-    if (!mounted.current) return;
-
-    if (result === "interrupted") {
-      if (verification === "present") {
-        setActiveMode(null);
-        return;
-      }
-      setPublicError(
-        verification === "absent"
-          ? mode === "create"
-            ? PUBLIC_CREATE_INTERRUPTION_ABSENT
-            : PUBLIC_RESTORE_INTERRUPTION_ABSENT
-          : PUBLIC_INTERRUPTION_UNKNOWN,
-      );
-      setRestartBlocked(verification === "unknown");
-      setActiveMode(null);
-      return;
-    }
-
-    if (verification !== "present") {
-      setPublicError(PUBLIC_REFRESH_ERROR);
-      setRestartBlocked(true);
-    }
-    setActiveMode(null);
-  };
 
   const busy = activeMode !== null;
   const setupDisabled = busy || restartBlocked;
@@ -204,14 +131,25 @@ export default function OnboardingScreen({
                 any time.
               </Text>
 
-              {publicError ? (
+              {publicFailureCode || recoveryNotice ? (
                 <View
                   testID="identity-setup-error"
                   accessibilityRole="alert"
                   accessibilityLiveRegion="assertive"
-                  style={styles.errorBox}
+                  style={styles.failureStack}
                 >
-                  <Text style={styles.errorText}>{publicError}</Text>
+                  {publicFailureCode ? (
+                    <PublicFailureCard code={publicFailureCode} announce={false} />
+                  ) : null}
+                  {recoveryNotice ? (
+                    <View
+                      testID="identity-recovery-notice"
+                      style={styles.recoveryBox}
+                    >
+                      <Text style={styles.recoveryLabel}>RECOVERY MATERIAL STATUS</Text>
+                      <Text style={styles.recoveryText}>{recoveryNotice}</Text>
+                    </View>
+                  ) : null}
                 </View>
               ) : null}
 
@@ -224,7 +162,7 @@ export default function OnboardingScreen({
                   variant="primary"
                   loading={activeMode === "create"}
                   disabled={setupDisabled}
-                  onPress={() => void beginSetup("create")}
+                  onPress={() => beginIdentitySetup("create")}
                 />
                 <SetupButton
                   testID="identity-setup-restore"
@@ -234,7 +172,7 @@ export default function OnboardingScreen({
                   variant="secondary"
                   loading={activeMode === "restore"}
                   disabled={setupDisabled}
-                  onPress={() => void beginSetup("restore")}
+                  onPress={() => beginIdentitySetup("restore")}
                 />
               </View>
 
@@ -527,7 +465,11 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   buttonDescriptionPrimary: { color: "rgba(255,255,255,0.74)" },
-  errorBox: {
+  failureStack: {
+    gap: spacing.sm,
+    marginTop: spacing.lg,
+  },
+  recoveryBox: {
     minHeight: 48,
     justifyContent: "center",
     borderRadius: radii.md,
@@ -536,9 +478,15 @@ const styles = StyleSheet.create({
     backgroundColor: colors.destructiveBg,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
-    marginTop: spacing.lg,
   },
-  errorText: {
+  recoveryLabel: {
+    color: colors.textLo,
+    fontSize: 9,
+    fontWeight: "900",
+    letterSpacing: 1.2,
+    marginBottom: 4,
+  },
+  recoveryText: {
     color: colors.destructive,
     fontSize: 13,
     lineHeight: 19,

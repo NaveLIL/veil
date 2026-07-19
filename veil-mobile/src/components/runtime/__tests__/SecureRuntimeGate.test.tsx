@@ -3,6 +3,7 @@ import { describe, expect, it, jest } from "@jest/globals";
 import { fireEvent, render } from "@testing-library/react-native";
 
 import type { VeilMobileRuntimeSnapshot } from "../../../native/runtime";
+import type { PublicFailureCodeV1 } from "../../../contracts/publicFailureCodesV1";
 import { SecureRuntimeGate } from "../SecureRuntimeGate";
 
 const FLOW_ID = "ab".repeat(32);
@@ -27,6 +28,7 @@ const renderGate = (
     onUnlock?: jest.Mock;
     onUsePendingAccessPass?: jest.Mock;
     onDiscardPendingAccessPass?: jest.Mock;
+    publicFailureCode?: PublicFailureCodeV1 | null;
   } = {},
 ) => {
   const onUnlock = callbacks.onUnlock ?? jest.fn();
@@ -37,7 +39,7 @@ const renderGate = (
       snapshot={snapshot}
       requiresExplicitReopen={false}
       operation={null}
-      publicError={null}
+      publicFailureCode={callbacks.publicFailureCode ?? null}
       reducedMotion
       onUnlock={onUnlock}
       onConnect={jest.fn()}
@@ -89,6 +91,18 @@ describe("SecureRuntimeGate", () => {
     fireEvent.press(view.getByTestId("discard-access-pass"));
     expect(onUsePendingAccessPass).toHaveBeenCalledWith(FLOW_ID);
     expect(onDiscardPendingAccessPass).toHaveBeenCalledWith(FLOW_ID);
+  });
+
+  it("renders a reviewed public failure card instead of native diagnostic text", () => {
+    const view = renderGate(lockedSnapshot, { publicFailureCode: "VEIL-LOCAL-002" });
+
+    expect(view.getByTestId("runtime-public-error")).toBeTruthy();
+    expect(view.getByText("Encrypted local account is unavailable")).toBeTruthy();
+    expect(view.getByTestId("public-failure-code-v1").props).toMatchObject({
+      children: "VEIL-LOCAL-002",
+      selectable: true,
+    });
+    expect(JSON.stringify(view.toJSON())).not.toContain("private native diagnostic");
   });
 
   it.each(([

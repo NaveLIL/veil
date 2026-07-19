@@ -3,7 +3,9 @@ import path from "node:path";
 import { afterAll, beforeEach, describe, expect, it, jest } from "@jest/globals";
 import { NativeModules } from "react-native";
 
-import { beginNativeIdentitySetup } from "../identitySetup";
+import {
+  beginNativeIdentitySetup,
+} from "../identitySetup";
 
 const originalModule = NativeModules.VeilIdentitySetup;
 
@@ -54,7 +56,55 @@ describe("identity setup bridge", () => {
       configurable: true,
       value: { beginNativeIdentitySetup: begin },
     });
+    await expect(beginNativeIdentitySetup("restore")).rejects.toEqual(
+      expect.objectContaining({
+        name: "NativeIdentitySetupStartError",
+        kind: "ambiguous",
+      }),
+    );
     await expect(beginNativeIdentitySetup("restore")).rejects.not.toThrow(rawMessage);
+  });
+
+  it("keeps only proven no-ceremony failures in the unavailable class", async () => {
+    const begin = jest.fn<() => Promise<unknown>>();
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      value: { beginNativeIdentitySetup: begin },
+    });
+
+    for (const code of [
+      "E_VEIL_SETUP_MODE",
+      "E_VEIL_SETUP_ACTIVITY",
+      "E_VEIL_SETUP_LAUNCH",
+    ]) {
+      begin.mockRejectedValueOnce({ code, message: "private diagnostic" });
+      await expect(beginNativeIdentitySetup("create")).rejects.toEqual(
+        expect.objectContaining({
+          kind: "unavailable",
+        }),
+      );
+    }
+  });
+
+  it("classifies busy, malformed, and unknown failures as ambiguous", async () => {
+    const begin = jest.fn<() => Promise<unknown>>();
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      value: { beginNativeIdentitySetup: begin },
+    });
+
+    for (const failure of [
+      { code: "E_VEIL_SETUP_BUSY", message: "lease exists" },
+      { code: "E_FUTURE_SETUP_CODE", message: "future detail" },
+      "malformed rejection",
+    ]) {
+      begin.mockRejectedValueOnce(failure);
+      await expect(beginNativeIdentitySetup("restore")).rejects.toEqual(
+        expect.objectContaining({
+          kind: "ambiguous",
+        }),
+      );
+    }
   });
 
   it("keeps secret-bearing bridge methods and React inputs out of the setup boundary", () => {

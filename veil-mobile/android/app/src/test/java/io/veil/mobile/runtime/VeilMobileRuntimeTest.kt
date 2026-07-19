@@ -25,6 +25,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import uniffi.veil_ffi.MobileConnectFailureReason
 import uniffi.veil_ffi.MobileDirectConversationData
 import uniffi.veil_ffi.MobileDirectDirectoryPageData
 import uniffi.veil_ffi.MobileDirectHistoryNext
@@ -96,6 +97,41 @@ class VeilMobileRuntimeTest {
 
       assertEquals("vault temporarily unavailable", error.message)
       assertEquals(1, vault.hasIdentityCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun publicSnapshotTreatsVaultFailureAsConservativePresence() {
+    val executor = daemonExecutor()
+    val vault = FakeVault().apply { failHasIdentity = true }
+    val runtime = runtime(executor, FakeSession(), vault = vault)
+    vault.hasIdentityCount = 0
+    try {
+      val snapshot = runtime.snapshot()
+
+      assertTrue(snapshot.identityExists)
+      assertEquals(NativeSessionState.LOCKED, snapshot.sessionState)
+      assertEquals(1, vault.hasIdentityCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun vaultPresenceFailureDuringOpeningPublicationDoesNotOrphanOpeningState() {
+    val executor = daemonExecutor()
+    val vault = FakeVault().apply { failHasIdentity = true }
+    val runtime = runtime(executor, FakeSession(), vault = vault)
+    try {
+      val snapshot = runtime.openSession()
+
+      assertTrue(snapshot.identityExists)
+      assertEquals(NativeSessionState.OPEN, snapshot.sessionState)
+      assertEquals(NativeSessionState.OPEN, runtime.snapshot().sessionState)
     } finally {
       runtime.lockSession()
       executor.shutdownNow()
@@ -1018,6 +1054,150 @@ class VeilMobileRuntimeTest {
     } finally {
       runtime.lockSession()
       executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun typedConnectFailuresMapToTheirExactSanitizedRuntimeCodes() {
+    data class ConnectFailureCase(
+      val failure: Throwable,
+      val expectedCode: String,
+      val expectedMessage: String,
+    )
+
+    val cases = listOf(
+      ConnectFailureCase(
+        NativeMobileRetryableException(NativeMobileRetryableReason.TRANSPORT),
+        "E_VEIL_TRANSPORT",
+        "Unable to reach the Veil Node",
+      ),
+      ConnectFailureCase(
+        NativeMobileConnectFailureException(
+          NativeMobileConnectFailureReason.AUTHENTICATION_REJECTED,
+        ),
+        "E_VEIL_AUTH_REJECTED",
+        "The Veil Node rejected this local account",
+      ),
+      ConnectFailureCase(
+        NativeMobileConnectFailureException(NativeMobileConnectFailureReason.REGISTRATION_CLOSED),
+        "E_VEIL_ACCESS_REQUIRED",
+        "Registration on this Veil Node requires a valid Node Access Pass",
+      ),
+      ConnectFailureCase(
+        NativeMobileConnectFailureException(NativeMobileConnectFailureReason.INVITE_INVALID),
+        "E_VEIL_ACCESS_PASS_REJECTED",
+        "The Node Access Pass is invalid, expired, or already used",
+      ),
+      ConnectFailureCase(
+        NativeMobileConnectFailureException(NativeMobileConnectFailureReason.EPOCH_INVALID),
+        "E_VEIL_BINDING",
+        "The Veil Node authenticated binding was rejected",
+      ),
+      ConnectFailureCase(
+        NativeMobileConnectFailureException(NativeMobileConnectFailureReason.STORAGE_UNCERTAIN),
+        "E_VEIL_LOCAL_STATE",
+        "Unable to confirm the local secure state",
+      ),
+      ConnectFailureCase(
+        NativeMobileRetryableException(NativeMobileRetryableReason.ACK_DEADLINE),
+        "E_VEIL_CONNECT",
+        "Unable to authenticate with the Veil Node",
+      ),
+    )
+
+    cases.forEach { case ->
+      val executor = daemonExecutor()
+      val runtime = runtime(executor, FakeSession(connectFailure = case.failure))
+      try {
+        runtime.openSession()
+
+        val error = assertThrows(VeilMobileRuntimeException::class.java) {
+          runtime.connect("https://access.example")
+        }
+
+        assertEquals(case.expectedCode, error.code)
+        assertEquals(case.expectedMessage, error.message)
+        assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+        assertNull(runtime.snapshot().binding)
+      } finally {
+        runtime.lockSession()
+        executor.shutdownNow()
+      }
+    }
+  }
+
+  @Test
+  fun suggestiveUnknownConnectTextCannotActAsAPublicFailureOracle() {
+    val secretCanary = "VEIL_CONNECT_SECRET_CANARY_account_invite_origin"
+    val suggestiveDetails = listOf(
+      "registration is closed $secretCanary",
+      "access pass is invalid and invite invalid $secretCanary",
+      "mobile connection attempt cancelled $secretCanary",
+    )
+
+    suggestiveDetails.forEach { detail ->
+      val executor = daemonExecutor()
+      val runtime = runtime(
+        executor,
+        FakeSession(connectFailure = VeilException.Session(detail)),
+      )
+      try {
+        runtime.openSession()
+
+        val error = assertThrows(VeilMobileRuntimeException::class.java) {
+          runtime.connect("https://access.example")
+        }
+
+        assertEquals("E_VEIL_CONNECT", error.code)
+        assertEquals("Unable to authenticate with the Veil Node", error.message)
+        assertFalse(error.message.orEmpty().contains(secretCanary))
+        assertFalse(error.message.orEmpty().contains(detail))
+      } finally {
+        runtime.lockSession()
+        executor.shutdownNow()
+      }
+    }
+  }
+
+  @Test
+  fun localPendingPassFailuresAndBindingMismatchUseUnambiguousTypedCodes() {
+    val localExecutor = daemonExecutor()
+    val localRuntime = runtime(localExecutor, FakeSession(), deterministicPassStore())
+    try {
+      val missing = assertThrows(VeilMobileRuntimeException::class.java) {
+        localRuntime.connectPendingAccessPass("missing-secret-flow")
+      }
+      assertEquals("E_VEIL_ACCESS_PASS_LOCAL", missing.code)
+
+      val malformed = assertThrows(VeilMobileRuntimeException::class.java) {
+        localRuntime.cancelPendingAccessPass("malformed-secret-flow")
+      }
+      assertEquals("E_VEIL_ACCESS_PASS_LOCAL", malformed.code)
+      assertFalse(missing.message.orEmpty().contains("missing-secret-flow"))
+      assertFalse(malformed.message.orEmpty().contains("malformed-secret-flow"))
+    } finally {
+      localRuntime.lockSession()
+      localExecutor.shutdownNow()
+    }
+
+    val bindingExecutor = daemonExecutor()
+    val bindingSession = FakeSession().apply { authenticatedUserId = "non-canonical-secret-user" }
+    val bindingRuntime = runtime(bindingExecutor, bindingSession)
+    try {
+      bindingRuntime.openSession()
+
+      val mismatch = assertThrows(VeilMobileRuntimeException::class.java) {
+        bindingRuntime.connect("https://access.example")
+      }
+
+      assertEquals("E_VEIL_BINDING", mismatch.code)
+      assertEquals("The Veil Node authenticated binding was rejected", mismatch.message)
+      assertFalse(mismatch.message.orEmpty().contains("non-canonical-secret-user"))
+      assertEquals(NativeConnectionState.ERROR, bindingRuntime.snapshot().connectionState)
+      assertNull(bindingRuntime.snapshot().binding)
+    } finally {
+      bindingRuntime.lockSession()
+      bindingExecutor.shutdownNow()
     }
   }
 
@@ -2200,8 +2380,8 @@ class VeilMobileRuntimeTest {
         runtime.connect("https://access.example")
       }
 
-      assertEquals("E_VEIL_SYNC", error.code)
-      assertEquals("Unable to complete the secure Direct bootstrap", error.message)
+      assertEquals("E_VEIL_BINDING", error.code)
+      assertEquals("The Veil Node authenticated binding was rejected", error.message)
       assertEquals(0, transport.requests.size)
       assertEquals(1, fakeSession.directLeaseCancellations)
       assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
@@ -2846,7 +3026,7 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
-  fun mobileRetryableReasonMappingIsClosedOverTheExactNativeAllowlist() {
+  fun mobileFailureMappingIsClosedOverTheExactNativeAllowlists() {
     assertEquals(
       NativeMobileRetryableReason.TRANSPORT,
       MobileRetryableReason.TRANSPORT.toNativeMobileRetryableReason(),
@@ -2856,7 +3036,7 @@ class VeilMobileRuntimeTest {
       MobileRetryableReason.ACK_DEADLINE.toNativeMobileRetryableReason(),
     )
     val translated = assertThrows(NativeMobileRetryableException::class.java) {
-      translateMobileRetryable<Unit> {
+      translateMobileFailure<Unit> {
         throw VeilException.MobileRetryable(MobileRetryableReason.ACK_DEADLINE)
       }
     }
@@ -2864,9 +3044,230 @@ class VeilMobileRuntimeTest {
 
     val terminal = VeilException.Session("transport ACK_DEADLINE retryable")
     val preserved = assertThrows(VeilException.Session::class.java) {
-      translateMobileRetryable<Unit> { throw terminal }
+      translateMobileFailure<Unit> { throw terminal }
     }
     assertTrue(preserved === terminal)
+
+    val connectReasons = listOf(
+      MobileConnectFailureReason.AUTHENTICATION_REJECTED to
+        NativeMobileConnectFailureReason.AUTHENTICATION_REJECTED,
+      MobileConnectFailureReason.REGISTRATION_CLOSED to
+        NativeMobileConnectFailureReason.REGISTRATION_CLOSED,
+      MobileConnectFailureReason.INVITE_INVALID to
+        NativeMobileConnectFailureReason.INVITE_INVALID,
+      MobileConnectFailureReason.EPOCH_INVALID to NativeMobileConnectFailureReason.EPOCH_INVALID,
+      MobileConnectFailureReason.STORAGE_UNCERTAIN to
+        NativeMobileConnectFailureReason.STORAGE_UNCERTAIN,
+    )
+    connectReasons.forEach { (generated, native) ->
+      assertEquals(native, generated.toNativeMobileConnectFailureReason())
+      val connectFailure = assertThrows(NativeMobileConnectFailureException::class.java) {
+        translateMobileFailure<Unit> { throw VeilException.MobileConnectFailure(generated) }
+      }
+      assertEquals(native, connectFailure.reason)
+    }
+  }
+
+  @Test
+  fun debugDirectFailureDiagnosticsUseOnlyClosedFixedVocabulary() {
+    assertEquals(
+      listOf(
+        "bootstrap_start",
+        "own_prekeys",
+        "directory_handoff",
+        "history",
+        "live_replay",
+        "outbox_replay",
+        "continuous_live",
+      ),
+      NativeDebugDirectFailureCheckpoint.entries.map { it.logValue },
+    )
+    assertEquals(
+      listOf(
+        "retryable_transport",
+        "retryable_ack_deadline",
+        "runtime",
+        "ffi_session",
+        "ffi_crypto",
+        "ffi_invalid_input",
+        "connect_authentication_rejected",
+        "connect_registration_closed",
+        "connect_invite_invalid",
+        "connect_epoch_invalid",
+        "connect_storage_uncertain",
+        "unexpected",
+      ),
+      NativeDebugDirectFailureCategory.entries.map { it.logValue },
+    )
+
+    assertEquals(
+      NativeDebugDirectFailureCategory.RETRYABLE_TRANSPORT,
+      classifyDebugDirectFailure(
+        NativeMobileRetryableException(NativeMobileRetryableReason.TRANSPORT),
+      ),
+    )
+    assertEquals(
+      NativeDebugDirectFailureCategory.RETRYABLE_ACK_DEADLINE,
+      classifyDebugDirectFailure(
+        NativeMobileRetryableException(NativeMobileRetryableReason.ACK_DEADLINE),
+      ),
+    )
+    assertEquals(
+      NativeDebugDirectFailureCategory.RETRYABLE_TRANSPORT,
+      classifyDebugDirectFailure(VeilException.MobileRetryable(MobileRetryableReason.TRANSPORT)),
+    )
+    assertEquals(
+      NativeDebugDirectFailureCategory.RETRYABLE_ACK_DEADLINE,
+      classifyDebugDirectFailure(
+        VeilException.MobileRetryable(MobileRetryableReason.ACK_DEADLINE),
+      ),
+    )
+    assertEquals(
+      NativeDebugDirectFailureCategory.RUNTIME,
+      classifyDebugDirectFailure(VeilMobileRuntimeException("E_TEST", "secret runtime text")),
+    )
+    assertEquals(
+      NativeDebugDirectFailureCategory.FFI_CRYPTO,
+      classifyDebugDirectFailure(VeilException.Crypto("secret crypto text")),
+    )
+    assertEquals(
+      NativeDebugDirectFailureCategory.FFI_INVALID_INPUT,
+      classifyDebugDirectFailure(VeilException.InvalidInput("secret input text")),
+    )
+    assertEquals(
+      NativeDebugDirectFailureCategory.UNEXPECTED,
+      classifyDebugDirectFailure(IllegalStateException("secret unexpected text")),
+    )
+
+    val connectCategories = listOf(
+      Triple(
+        MobileConnectFailureReason.AUTHENTICATION_REJECTED,
+        NativeMobileConnectFailureReason.AUTHENTICATION_REJECTED,
+        NativeDebugDirectFailureCategory.CONNECT_AUTHENTICATION_REJECTED,
+      ),
+      Triple(
+        MobileConnectFailureReason.REGISTRATION_CLOSED,
+        NativeMobileConnectFailureReason.REGISTRATION_CLOSED,
+        NativeDebugDirectFailureCategory.CONNECT_REGISTRATION_CLOSED,
+      ),
+      Triple(
+        MobileConnectFailureReason.INVITE_INVALID,
+        NativeMobileConnectFailureReason.INVITE_INVALID,
+        NativeDebugDirectFailureCategory.CONNECT_INVITE_INVALID,
+      ),
+      Triple(
+        MobileConnectFailureReason.EPOCH_INVALID,
+        NativeMobileConnectFailureReason.EPOCH_INVALID,
+        NativeDebugDirectFailureCategory.CONNECT_EPOCH_INVALID,
+      ),
+      Triple(
+        MobileConnectFailureReason.STORAGE_UNCERTAIN,
+        NativeMobileConnectFailureReason.STORAGE_UNCERTAIN,
+        NativeDebugDirectFailureCategory.CONNECT_STORAGE_UNCERTAIN,
+      ),
+    )
+    connectCategories.forEach { (generated, native, category) ->
+      assertEquals(
+        category,
+        classifyDebugDirectFailure(NativeMobileConnectFailureException(native)),
+      )
+      assertEquals(
+        category,
+        classifyDebugDirectFailure(VeilException.MobileConnectFailure(generated)),
+      )
+    }
+  }
+
+  @Test
+  fun debugDirectFailureDiagnosticsNeverForwardThrowableTextOrRunWhenDisabled() {
+    val secretCanary = "VEIL_SECRET_CANARY_endpoint_account_token_plaintext"
+    val error = VeilException.Session(secretCanary)
+    val captured = CopyOnWriteArrayList<
+      Pair<NativeDebugDirectFailureCheckpoint, NativeDebugDirectFailureCategory>
+    >()
+    val sink = NativeDebugDirectFailureSink { checkpoint, category ->
+      captured.add(checkpoint to category)
+    }
+
+    emitDebugDirectFailure(
+      enabled = false,
+      checkpoint = NativeDebugDirectFailureCheckpoint.HISTORY,
+      error = error,
+      sink = sink,
+    )
+    assertTrue(captured.isEmpty())
+
+    emitDebugDirectFailure(
+      enabled = true,
+      checkpoint = NativeDebugDirectFailureCheckpoint.OUTBOX_REPLAY,
+      error = error,
+      sink = sink,
+    )
+
+    assertEquals(
+      listOf(
+        NativeDebugDirectFailureCheckpoint.OUTBOX_REPLAY to
+          NativeDebugDirectFailureCategory.FFI_SESSION,
+      ),
+      captured,
+    )
+    val fixedDiagnostic = captured.single().let { (checkpoint, category) ->
+      "${checkpoint.logValue}:${category.logValue}"
+    }
+    assertFalse(fixedDiagnostic.contains(secretCanary))
+    assertFalse(fixedDiagnostic.contains(error.toString()))
+    assertEquals(
+      NativeDebugDirectFailureCategory.FFI_SESSION,
+      classifyDebugDirectFailure(VeilException.Session("different native session detail")),
+    )
+  }
+
+  @Test
+  fun debugDiagnosticSinkFailureCannotInterruptTheTerminalDirectTransition() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val sinkCalls = AtomicInteger(0)
+    val captured = AtomicReference<
+      Pair<NativeDebugDirectFailureCheckpoint, NativeDebugDirectFailureCategory>?
+    >()
+    val runtime = runtime(
+      executor,
+      fakeSession,
+      directTransport = transport,
+      debugDirectFailureSink = NativeDebugDirectFailureSink { checkpoint, category ->
+        sinkCalls.incrementAndGet()
+        captured.set(checkpoint to category)
+        throw IllegalStateException("diagnostic sink failure with secret details")
+      },
+    )
+    val conversation = directConversation("26", "Diagnostics", "27", "diagnostics", false)
+    try {
+      completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      fakeSession.nextLiveReplayFailure.set(
+        VeilException.Session("secret native session failure detail"),
+      )
+
+      executor.runCapturedDelayedTask()
+
+      assertEquals(1, sinkCalls.get())
+      assertEquals(
+        NativeDebugDirectFailureCheckpoint.CONTINUOUS_LIVE to
+          NativeDebugDirectFailureCategory.FFI_SESSION,
+        captured.get(),
+      )
+      val failed = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertNull(failed.binding)
+      assertNull(failed.directGeneration)
+      assertNull(failed.directContentRevision)
+      assertFalse(failed.directoryReady)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(1, fakeSession.directLeaseCancellations)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
   }
 
   @Test
@@ -4516,6 +4917,8 @@ class VeilMobileRuntimeTest {
     reconnectJitterMillis: (Long) -> Long = { capMillis -> capMillis },
     directBootstrapOwnerBoundary: () -> Unit = {},
     peerPreKeyInstallBoundary: () -> Unit = {},
+    debugDirectFailureSink: NativeDebugDirectFailureSink =
+      NativeDebugDirectFailureSink { _, _ -> },
   ): VeilMobileRuntime = VeilMobileRuntime(
       vault = vault,
       passStore = passStore,
@@ -4532,6 +4935,7 @@ class VeilMobileRuntimeTest {
       reconnectJitterMillis = reconnectJitterMillis,
       directBootstrapOwnerBoundary = directBootstrapOwnerBoundary,
       peerPreKeyInstallBoundary = peerPreKeyInstallBoundary,
+      debugDirectFailureSink = debugDirectFailureSink,
     ).also { runtime ->
       if (markForeground) runtime.markForeground()
     }

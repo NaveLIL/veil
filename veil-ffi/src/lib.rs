@@ -29,6 +29,18 @@ pub enum MobileRetryableReason {
     AckDeadline,
 }
 
+/// Typed, terminal mobile connection presentation vocabulary. Private
+/// diagnostics remain inside Rust, and callers must still enforce the
+/// per-reason exposure gates when constructing this error.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileConnectFailureReason {
+    AuthenticationRejected,
+    RegistrationClosed,
+    InviteInvalid,
+    EpochInvalid,
+    StorageUncertain,
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum VeilError {
     #[error("Crypto error: {msg}")]
@@ -39,6 +51,8 @@ pub enum VeilError {
     Session { msg: String },
     #[error("Mobile operation may be retried: {reason:?}")]
     MobileRetryable { reason: MobileRetryableReason },
+    #[error("Mobile connection failed: {reason:?}")]
+    MobileConnectFailure { reason: MobileConnectFailureReason },
 }
 
 // ── Record types (plain data, serialized across FFI) ────────
@@ -3696,18 +3710,24 @@ fn safe_mobile_connect_error(
         MobileConnectStopV1::RetryableTransport => VeilError::MobileRetryable {
             reason: MobileRetryableReason::Transport,
         },
-        MobileConnectStopV1::AuthenticationRejected if has_node_access_pass => {
-            let msg = match error.detail.as_str() {
-                "node access registration is closed; a valid access pass is required"
-                | "node access pass is invalid, expired, or already used" => error.detail,
-                _ => "mobile connection attempt failed".to_string(),
-            };
-            VeilError::Session { msg }
-        }
-        MobileConnectStopV1::AuthenticationRejected
-        | MobileConnectStopV1::EpochInvalid
-        | MobileConnectStopV1::StorageUncertain => VeilError::Session {
-            msg: "mobile connection attempt failed".to_string(),
+        MobileConnectStopV1::AuthenticationRejected => VeilError::MobileConnectFailure {
+            reason: MobileConnectFailureReason::AuthenticationRejected,
+        },
+        MobileConnectStopV1::RegistrationClosed => VeilError::MobileConnectFailure {
+            reason: MobileConnectFailureReason::RegistrationClosed,
+        },
+        MobileConnectStopV1::InviteInvalid => VeilError::MobileConnectFailure {
+            reason: if has_node_access_pass {
+                MobileConnectFailureReason::InviteInvalid
+            } else {
+                MobileConnectFailureReason::AuthenticationRejected
+            },
+        },
+        MobileConnectStopV1::EpochInvalid => VeilError::MobileConnectFailure {
+            reason: MobileConnectFailureReason::EpochInvalid,
+        },
+        MobileConnectStopV1::StorageUncertain => VeilError::MobileConnectFailure {
+            reason: MobileConnectFailureReason::StorageUncertain,
         },
     }
 }
@@ -4848,36 +4868,66 @@ mod tests {
     }
 
     #[test]
-    fn mobile_node_access_pass_attempt_never_reflects_server_diagnostics() {
+    fn mobile_connect_failure_mapping_is_typed_exhaustive_and_secret_free() {
         use veil_client::api::{MobileConnectErrorV1, MobileConnectStopV1};
 
-        let secret = "0123456789abcdef0123456789abcdef";
-        let error = safe_mobile_connect_error(
-            MobileConnectErrorV1 {
-                stop: MobileConnectStopV1::AuthenticationRejected,
-                detail: format!("malicious server reflected access pass: {secret}"),
-            },
-            true,
-        );
-        let rendered = error.to_string();
-        assert_eq!(rendered, "Session error: mobile connection attempt failed");
-        assert!(!rendered.contains(secret));
+        let secret = "malicious server reflected access pass: 0123456789abcdef";
+        let terminal_cases = [
+            (
+                MobileConnectStopV1::AuthenticationRejected,
+                false,
+                MobileConnectFailureReason::AuthenticationRejected,
+            ),
+            (
+                MobileConnectStopV1::AuthenticationRejected,
+                true,
+                MobileConnectFailureReason::AuthenticationRejected,
+            ),
+            (
+                MobileConnectStopV1::RegistrationClosed,
+                false,
+                MobileConnectFailureReason::RegistrationClosed,
+            ),
+            (
+                MobileConnectStopV1::RegistrationClosed,
+                true,
+                MobileConnectFailureReason::RegistrationClosed,
+            ),
+            (
+                MobileConnectStopV1::InviteInvalid,
+                false,
+                MobileConnectFailureReason::AuthenticationRejected,
+            ),
+            (
+                MobileConnectStopV1::InviteInvalid,
+                true,
+                MobileConnectFailureReason::InviteInvalid,
+            ),
+            (
+                MobileConnectStopV1::EpochInvalid,
+                false,
+                MobileConnectFailureReason::EpochInvalid,
+            ),
+            (
+                MobileConnectStopV1::StorageUncertain,
+                false,
+                MobileConnectFailureReason::StorageUncertain,
+            ),
+        ];
 
-        for safe_reason in [
-            "node access registration is closed; a valid access pass is required",
-            "node access pass is invalid, expired, or already used",
-        ] {
-            assert_eq!(
-                safe_mobile_connect_error(
-                    MobileConnectErrorV1 {
-                        stop: MobileConnectStopV1::AuthenticationRejected,
-                        detail: safe_reason.to_string(),
-                    },
-                    true,
-                )
-                .to_string(),
-                format!("Session error: {safe_reason}")
+        for (stop, has_node_access_pass, expected_reason) in terminal_cases {
+            let error = safe_mobile_connect_error(
+                MobileConnectErrorV1 {
+                    stop,
+                    detail: secret.to_string(),
+                },
+                has_node_access_pass,
             );
+            assert!(matches!(
+                &error,
+                VeilError::MobileConnectFailure { reason } if *reason == expected_reason
+            ));
+            assert!(!error.to_string().contains(secret));
         }
 
         assert!(matches!(

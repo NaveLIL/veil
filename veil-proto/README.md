@@ -7,6 +7,10 @@ All Veil components (clients, server, bots) depend on this repository as the sin
 Normative byte encodings for cryptographic device identity and conversation
 device rosters are documented in [DEVICE_BINDING_V1.md](DEVICE_BINDING_V1.md).
 
+The append-only public presentation/recovery registry is documented in
+[PUBLIC_FAILURE_CODE_V1.md](PUBLIC_FAILURE_CODE_V1.md). It intentionally does
+not add or repurpose a protobuf field.
+
 ## Structure
 
 ```

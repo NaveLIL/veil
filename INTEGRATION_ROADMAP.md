@@ -1,6 +1,6 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-07-19. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-07-20. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
@@ -1256,14 +1256,23 @@ identity хранится через Android Keystore, account/runtime state —
 history-to-live handoff, message projection и idempotent Direct text send/outbox
 принадлежат native boundary. Typed ACK deadline и guarded transient reconnect
 также готовы. Canonical-origin process-death recovery опубликован и физически
-восстановил тот же аккаунт на Samsung S23 без нового Pass или device. Это всё ещё
-закрытый Direct Preview: cross-client E2EE text/airplane/background matrix,
-`PublicFailureCodeV1` и подписанный standalone tester APK пока не готовы.
+восстановил тот же аккаунт на Samsung S23 без нового Pass или device. Append-only
+`PublicFailureCodeV1`, его CI validator, typed Rust/UniFFI/Android mapping и
+локальный Android catalog реализованы для identity setup и secure runtime gate;
+Direct session/send/delivery и consumer parity для desktop/Go остаются открытыми.
+Process-local non-secret setup receipt через App-owned continuation unit-tested
+на React onboarding unmount/remount, stale result и смену foreground epoch. Это
+не физическое доказательство RecoveryActivity pause/result ordering и не durable
+receipt: connected Activity instrumentation и React-context/OS process-death
+reconciliation результата setup остаются отдельными открытыми gates.
+Это всё ещё закрытый Direct Preview: cross-client E2EE
+text/airplane/background matrix и подписанный standalone tester APK пока не готовы.
 
-**Authoritative status sync 2026-07-19:** последний опубликованный функциональный
-checkpoint перед этим documentation sync — `b029a1f`. После цепочки
-`029d1e3`…`aaaf1df`, `e751955`, `7cae239` и `7a7802b` опубликованы отдельные
-reviewed security checkpoints:
+**Authoritative local status sync 2026-07-20:** после UI checkpoint `d65927c`
+локальная ветка содержит fail-closed connected-test guard `8e31cc1` и текущий
+PublicFailure/setup checkpoint. `origin/codex/mobile-direct-preview` остаётся на
+`08a4206`; эти новые локальные checkpoints ещё не являются remote publication.
+История на origin уже включает отдельные reviewed security checkpoints:
 
 - `6195c89` — Android WSS использует per-connection `ring`, TLS 1.2/1.3 и
   public WebPKI roots без trust-all/process-global fallback;
@@ -1292,15 +1301,30 @@ SHA-256 `48CA7F65ABD16DFA2F9893E2AB8D0DE2F25A59805D97EF3358DA2E1ED320827F`.
 16/16 Jest suites (91/91), Android JVM suite; после coordinator-barrier полный
 локальный `:app:testDebugUnitTest` прошёл 227/227. `lintDebug`, debug APK и
 androidTest APK также собираются. Connected instrumentation на реальном телефоне
-для recovery/vault/capture всё ещё открыта и не подменяется сборкой APK.
+для recovery/vault/capture всё ещё открыта и не подменяется сборкой APK. Generic
+Gradle `connected*AndroidTest` теперь fail closed до выполнения task graph и
+разрешается только явным одноразовым подтверждением, когда `ANDROID_SERIAL`
+точно связывает AGP с единственным свежим single-user emulator без установленного/
+retained `io.veil.mobile`; проверка повторяется непосредственно перед connected
+task action, а task-level `--serial` разрешён только для того же проверенного
+emulator. Lifecycle connected tests может удалить target package вместе с
+Keystore, SQLCipher и app-private state. Физический телефон запрещён, а work
+profile на account-bearing handset не считается disposable boundary. Для явно
+разрешённого phone smoke `adb install -r` является лишь non-uninstalling update
+path: новый код/миграции всё равно способны изменить state. `firstInstallTime`
+и тот же account/vault проверяются после обновления, но не считаются
+instrumentation evidence. Guard не распространяется на manual `adb`, прямые
+install/uninstall AndroidTest tasks и будущие managed-device providers; для
+physical instrumentation нужен отдельный wiped/attested workflow.
 
-**Локально и не опубликовано:** mobile Island IA/settings, Circle/Space/Rooms/
-Voice `DESIGN PREVIEW`, нижний safe-area Direct composer и диагностические/public
-error-mapping изменения. Они не являются completion evidence и должны остаться
-отдельными reviewed checkpoints. Ограниченный Samsung S23 smoke подтверждает Pass
-registration, public-WebPKI WSS/signed REST, empty Direct и same-account force-stop
-reopen; полная cross-client physical matrix и signing открыты. Ни snapshot, ни
-debug/Metro APK не являются tester release.
+**Локальные checkpoints, ещё не на origin:** `d65927c` содержит mobile Island IA/
+settings, Circle/Space/Rooms/Voice `DESIGN PREVIEW` и нижний safe-area Direct
+composer; `8e31cc1` блокирует generic connected instrumentation на физических
+устройствах. Текущий PublicFailure/setup checkpoint не превращает preview-экраны
+в runtime-функции и не закрывает app-wide error semantics. Ограниченный Samsung
+S23 smoke подтверждает Pass registration, public-WebPKI WSS/signed REST, empty
+Direct и same-account force-stop reopen; полная cross-client physical matrix и
+signing открыты. Ни snapshot, ни debug/Metro APK не являются tester release.
 
 ### Peer-prekey checkpoint 2026-07-19
 
@@ -1686,16 +1710,21 @@ process-death, autofill/accessibility и concurrent recovery остаётся о
 
 ### Public failure codes v1 — обязательный gate 5A/5B
 
-**Статус 2026-07-19: контракт спроектирован, но ещё не реализован.** Текущий
-Android bridge использует внутренние promise-коды `E_VEIL_*`, а публичный UI
-сводит их к строкам. При этом `E_VEIL_CONNECT` объединяет authentication reject,
-TLS/protocol/binding failure и другие terminal outcomes; `E_VEIL_ACCESS_PASS`
-объединяет локально недоступный Pass и серверный invalid/expired/used Pass;
-`E_VEIL_ACCESS_REQUIRED` native-side существует, но не входит в JS allowlist.
-Desktop также распознаёт Node Access outcomes по тексту. Это пригодно только как
-временная fail-closed граница Preview и не является стабильным support contract.
+**Статус 2026-07-20: Android setup/runtime-gate slice реализован, app-wide
+consumer и общий rollout ещё не закрыты.**
+Machine-readable registry, immutable history, schema/append-only validator и CI
+синхронизируют точные Kotlin/TypeScript allowlist. Rust/UniFFI передаёт typed
+`Transport`, `AuthRejected`, `RegistrationClosed`, `InviteInvalid`, `EpochInvalid`
+и `StorageUncertain`; Android не анализирует exception/server text, разделяет
+локальные Pass/binding failures и публикует только sanitised internal code плюс
+`userInfo.publicFailureCodeV1` для secure runtime gate. React Native имеет reviewed
+catalog всех 16 кодов и в setup/runtime gate закрывает unknown/malformed/conflicting
+outcomes через `VEIL-RUNTIME-999`. Однако Direct session/send/delivery bridge всё
+ещё публикует generic `E_VEIL_DIRECT_*`, а chat UI — фиксированный generic text.
+Desktop и Go consumers, локали кроме текущего Android catalog и общий cross-client
+conformance gate остаются открытыми.
 
-До подписанного tester APK вводится append-only `PublicFailureCodeV1` с единым
+До подписанного tester APK используется append-only `PublicFailureCodeV1` с единым
 machine-readable registry под `veil-proto`, одинаковым для Rust, Go, desktop,
 Android и будущих клиентов. Публичная карточка ошибки состоит из независимых
 `title + description + next action + code`; код ASCII, доступен для копирования,
@@ -1707,8 +1736,8 @@ body или `String(error)` никогда не рендерятся.
 
 | Публичный код | Стабильная семантика и безопасное действие |
 |---|---|
-| `VEIL-SETUP-001` | protected identity setup не запустился и ceremony/lease ещё не созданы; ничего не изменилось, закрыть Veil и повторить |
-| `VEIL-SETUP-002` | Activity result прерван/неоднозначен: сохранить phrase и выполнить strict native durable-vault check; уничтожать новую create-фразу и начинать заново можно только после authoritative `absent`, любая ошибка остаётся `unknown` |
+| `VEIL-SETUP-001` | protected ceremony UI не был показан; provisional native lease освобождён и durable identity change не подтверждён, закрыть Veil и повторить |
+| `VEIL-SETUP-002` | ceremony/lease/result либо публикация identity не подтверждены: сохранить phrase и блокировать новый setup; для BUSY/unknown start даже authoritative vault `absent` недостаточно, пока native не подтвердил settled ceremony/lease. Уничтожать новую create-фразу и начинать заново можно только после native-settled + authoritative `absent`, любая ошибка остаётся `unknown` |
 | `VEIL-LOCAL-001` | локальный аккаунт locked/not ready; открыть тот же аккаунт и повторить |
 | `VEIL-LOCAL-002` | encrypted vault/SQLCipher не открылся; перезапустить Veil, не создавать новую recovery phrase |
 | `VEIL-LOCAL-003` | локальное secure state нельзя подтвердить; lock/reopen, сеть и chat остаются закрытыми |

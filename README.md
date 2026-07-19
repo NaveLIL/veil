@@ -82,9 +82,11 @@ native-клиента.
   authority реализованы; отдельными checkpoint’ами опубликованы Android
   public-WebPKI TLS, atomic write-once vault, native recovery и debug Ready
   capture boundary. Cross-client E2EE/airplane matrix, connected recovery/
-  capture instrumentation, публичные коды ошибок и подписанный standalone APK
-  ещё входят в Phase 5A/5B; MLS runtime и звонки не включены как пользовательские
-  функции.
+  capture instrumentation, app-wide публичные коды ошибок и подписанный
+  standalone APK ещё входят в Phase 5A/5B. `PublicFailureCodeV1` уже покрывает
+  Android identity setup и secure runtime gate, но Direct send/delivery и
+  desktop/Go consumer parity открыты; MLS runtime и звонки не включены как
+  пользовательские функции.
 
 Публичный Windows Preview собирается только в CI и всегда сопровождается
 `SHA256SUMS`. До появления доверенного Authenticode-сертификата он явно

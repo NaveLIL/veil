@@ -35,6 +35,22 @@ cd android
 Android ABIs. Generated `.so` files and signing secrets are intentionally ignored.
 Gradle refuses to build if the Rust libraries are absent.
 
+The Android Gradle connected-test lifecycle may uninstall the target package
+after instrumentation and therefore destroy its Keystore, SQLCipher database,
+and app-private files. Generic `connected*AndroidTest` tasks are consequently
+blocked unless the current invocation supplies the explicit acknowledgement
+printed by Gradle, `ANDROID_SERIAL` names exactly the sole connected device, and
+that device is a fresh single-user emulator with no installed or retained
+`io.veil.mobile` package. The guard repeats those checks immediately before the
+connected task action and rejects a task-level `--serial` override unless it is
+the same verified emulator. Physical devices are forbidden, and a work profile
+on an account-bearing handset is not a disposable boundary. This guard does not
+cover manual `adb` or future managed-device providers. For an explicitly
+authorized phone smoke, `adb install -r` is only a non-uninstalling update path:
+upgraded code and migrations can still mutate state. Check `firstInstallTime`
+and verify the same local account/vault afterwards; neither check is
+instrumentation proof.
+
 ## Release signing
 
 Release tasks never use the debug key. Provide all four values:
@@ -117,7 +133,10 @@ mobile messenger. Authenticated Direct directory/history, bounded live receive,
 native projection, per-conversation prekey establishment, guarded send/outbox,
 typed transient reconnect, and canonical-origin process-death recovery are
 present. Same-account force-stop recovery without a new Pass or device has been
-physically confirmed on a Samsung S23. Cross-client E2EE text/airplane/background
-evidence, connected recovery/vault/capture instrumentation, public failure
-codes, push publication, Circle/Space/attachments, correct multi-device, signed
-standalone APK distribution, and the broader physical-device matrix remain gated.
+physically confirmed on a Samsung S23. `PublicFailureCodeV1` is implemented for
+identity setup and the secure runtime gate, but Direct session/send/delivery and
+desktop/Go consumer parity remain open. Cross-client E2EE text/airplane/background
+evidence, connected recovery/vault/capture instrumentation, push publication,
+Circle/Space/attachments, correct multi-device, signed standalone APK
+distribution, durable setup-result reconciliation after React-context/process
+death, and the broader physical-device matrix remain gated.

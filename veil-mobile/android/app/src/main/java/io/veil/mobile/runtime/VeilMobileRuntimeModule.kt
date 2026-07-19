@@ -151,9 +151,9 @@ internal class VeilMobileRuntimeModule(
       try {
         promise.resolve(operation())
       } catch (error: VeilMobileRuntimeException) {
-        promise.reject(error.code, error.message ?: "Native mobile runtime operation failed")
+        promise.rejectRuntimeFailure(error.code)
       } catch (_: Throwable) {
-        promise.reject("E_VEIL_RUNTIME", "Native mobile runtime operation failed")
+        promise.rejectRuntimeFailure("E_VEIL_RUNTIME")
       }
     }
   }
@@ -163,11 +163,23 @@ internal class VeilMobileRuntimeModule(
       try {
         operation()
       } catch (error: VeilMobileRuntimeException) {
-        promise.reject(error.code, error.message ?: "Native mobile runtime operation failed")
+        promise.rejectRuntimeFailure(error.code)
       } catch (_: Throwable) {
-        promise.reject("E_VEIL_RUNTIME", "Native mobile runtime operation failed")
+        promise.rejectRuntimeFailure("E_VEIL_RUNTIME")
       }
     }
+  }
+
+  private fun Promise.rejectRuntimeFailure(internalCode: String) {
+    val failure = runtimeFailureBridgeV1(internalCode)
+    val userInfo = Arguments.createMap().apply {
+      putString(
+        PUBLIC_FAILURE_CODE_KEY,
+        failure.publicCode.wireValue,
+      )
+    }
+    // Throwable/native/server text must not cross the React Native boundary.
+    reject(failure.internalCode, RUNTIME_FAILURE_MESSAGE, userInfo)
   }
 
   companion object {
@@ -178,6 +190,8 @@ internal class VeilMobileRuntimeModule(
     private const val DIRECT_SEND_REJECTED = "Direct message was rejected"
     private const val DIRECT_SEND_UNAVAILABLE_CODE = "E_VEIL_DIRECT_SEND_UNAVAILABLE"
     private const val DIRECT_SEND_UNAVAILABLE = "Direct messaging is unavailable"
+    private const val PUBLIC_FAILURE_CODE_KEY = "publicFailureCodeV1"
+    private const val RUNTIME_FAILURE_MESSAGE = "Native mobile runtime operation failed"
   }
 }
 

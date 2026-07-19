@@ -5269,6 +5269,44 @@ public object FfiConverterTypeX3dhResultData: FfiConverterRustBuffer<X3dhResultD
 
 
 
+/**
+ * Typed, terminal mobile connection presentation vocabulary. Private
+ * diagnostics remain inside Rust, and callers must still enforce the
+ * per-reason exposure gates when constructing this error.
+ */
+
+enum class MobileConnectFailureReason {
+
+    AUTHENTICATION_REJECTED,
+    REGISTRATION_CLOSED,
+    INVITE_INVALID,
+    EPOCH_INVALID,
+    STORAGE_UNCERTAIN;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileConnectFailureReason: FfiConverterRustBuffer<MobileConnectFailureReason> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileConnectFailureReason.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileConnectFailureReason) = 4UL
+
+    override fun write(value: MobileConnectFailureReason, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
 
 enum class MobileDirectHistoryOutcome {
 
@@ -5562,6 +5600,14 @@ sealed class VeilException: kotlin.Exception() {
             get() = "reason=${ `reason` }"
     }
 
+    class MobileConnectFailure(
+
+        val `reason`: MobileConnectFailureReason
+        ) : VeilException() {
+        override val message
+            get() = "reason=${ `reason` }"
+    }
+
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<VeilException> {
         override fun lift(error_buf: RustBuffer.ByValue): VeilException = FfiConverterTypeVeilError.lift(error_buf)
@@ -5590,6 +5636,9 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
             4 -> VeilException.MobileRetryable(
                 FfiConverterTypeMobileRetryableReason.read(buf),
                 )
+            5 -> VeilException.MobileConnectFailure(
+                FfiConverterTypeMobileConnectFailureReason.read(buf),
+                )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -5616,6 +5665,11 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
                 4UL
                 + FfiConverterTypeMobileRetryableReason.allocationSize(value.`reason`)
             )
+            is VeilException.MobileConnectFailure -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterTypeMobileConnectFailureReason.allocationSize(value.`reason`)
+            )
         }
     }
 
@@ -5639,6 +5693,11 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
             is VeilException.MobileRetryable -> {
                 buf.putInt(4)
                 FfiConverterTypeMobileRetryableReason.write(value.`reason`, buf)
+                Unit
+            }
+            is VeilException.MobileConnectFailure -> {
+                buf.putInt(5)
+                FfiConverterTypeMobileConnectFailureReason.write(value.`reason`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

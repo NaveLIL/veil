@@ -2,22 +2,30 @@ import React, { useEffect } from "react";
 import {
   ActivityIndicator,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   View,
 } from "react-native";
 import { GestureHandlerRootView } from "react-native-gesture-handler";
-import { SafeAreaProvider } from "react-native-safe-area-context";
+import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { StatusBar } from "expo-status-bar";
 
 import { PrivacyCurtain } from "./src/components/runtime/PrivacyCurtain";
+import { PublicFailureCard } from "./src/components/runtime/PublicFailureCard";
 import { SecureRuntimeGate } from "./src/components/runtime/SecureRuntimeGate";
+import type { PublicFailureCodeV1 } from "./src/contracts/publicFailureCodesV1";
 import { useReducedMotionPreference } from "./src/hooks/useReducedMotionPreference";
 import { useVeilRuntimeLifecycle } from "./src/hooks/useVeilRuntimeLifecycle";
 import { colors, radii, spacing } from "./src/lib/theme";
+import type { VeilMobileRuntimeSnapshot } from "./src/native/runtime";
 import { setAuthenticatedContentReady } from "./src/native/screenCapture";
 import ChatListScreen from "./src/screens/ChatListScreen";
 import OnboardingScreen from "./src/screens/OnboardingScreen";
+import {
+  registerIdentitySetupContinuation,
+  resumeIdentitySetupContinuation,
+} from "./src/stores/identitySetup";
 import {
   canRenderChat,
   useRuntimeGateStore,
@@ -32,7 +40,7 @@ export default function App() {
   const curtainVisible = useRuntimeGateStore((state) => state.curtainVisible);
   const requiresExplicitReopen = useRuntimeGateStore((state) => state.requiresExplicitReopen);
   const operation = useRuntimeGateStore((state) => state.operation);
-  const publicError = useRuntimeGateStore((state) => state.publicError);
+  const publicFailureCode = useRuntimeGateStore((state) => state.publicFailureCode);
   const allowReadyScreenshots = useMobileSettingsStore(
     (state) => state.allowReadyScreenshots,
   );
@@ -43,6 +51,21 @@ export default function App() {
     && !curtainVisible
     && operation === null
     && allowReadyScreenshots;
+
+  useEffect(() => registerIdentitySetupContinuation({
+    getAuthorityEpoch: () => {
+      const gate = useRuntimeGateStore.getState();
+      return gate.phase === "ready" && !gate.curtainVisible ? gate.epoch : null;
+    },
+    verifyIdentity: runtime.verifyIdentityPresence,
+    onIdentityPresent: runtime.retryBootstrap,
+  }), [runtime.retryBootstrap, runtime.verifyIdentityPresence]);
+
+  useEffect(() => {
+    // A native result may arrive while RecoveryActivity owns the foreground.
+    // Resume it only after this exact App runtime epoch becomes authoritative.
+    resumeIdentitySetupContinuation();
+  }, [curtainVisible, phase, snapshot?.runtimeRevision]);
 
   useEffect(() => {
     // Native owns the actual policy. In release, a renderer request can never
@@ -59,19 +82,24 @@ export default function App() {
   } else if (phase === "error" || !snapshot) {
     content = (
       <RuntimeError
-        message={publicError}
+        code={publicFailureCode ?? "VEIL-LOCAL-003"}
         onRetry={() => void runtime.retryBootstrap()}
+      />
+    );
+  } else if (canStartNativeIdentitySetup(
+    snapshot,
+    publicFailureCode,
+  )) {
+    content = (
+      <OnboardingScreen
+        reducedMotion={reducedMotion}
       />
     );
   } else if (!snapshot.identityExists) {
     content = (
-      <OnboardingScreen
-        reducedMotion={reducedMotion}
-        onVerifyIdentity={async () => {
-          const verification = await runtime.verifyIdentityPresence();
-          if (verification === "present") void runtime.retryBootstrap();
-          return verification;
-        }}
+      <RuntimeError
+        code={publicFailureCode ?? "VEIL-LOCAL-003"}
+        onRetry={() => void runtime.retryBootstrap()}
       />
     );
   } else if (chatReady) {
@@ -86,7 +114,7 @@ export default function App() {
         snapshot={snapshot}
         requiresExplicitReopen={requiresExplicitReopen}
         operation={operation}
-        publicError={publicError}
+        publicFailureCode={publicFailureCode}
         reducedMotion={reducedMotion}
         onUnlock={() => void runtime.unlock()}
         onConnect={(origin) => void runtime.connect(origin)}
@@ -114,6 +142,24 @@ export default function App() {
   );
 }
 
+export function canStartNativeIdentitySetup(
+  snapshot: VeilMobileRuntimeSnapshot,
+  publicFailureCode: PublicFailureCodeV1 | null,
+): boolean {
+  return !snapshot.identityExists
+    && Number.isSafeInteger(snapshot.runtimeRevision)
+    && snapshot.runtimeRevision >= 1
+    && snapshot.directGeneration === null
+    && snapshot.directContentRevision === null
+    && snapshot.sessionState === "locked"
+    && snapshot.connectionState === "disconnected"
+    && !snapshot.directoryReady
+    && snapshot.secureSyncState === "idle"
+    && snapshot.binding === null
+    && snapshot.directConversations.length === 0
+    && publicFailureCode === null;
+}
+
 function RuntimeBootstrap({ reducedMotion }: { reducedMotion: boolean }) {
   return (
     <View
@@ -129,28 +175,32 @@ function RuntimeBootstrap({ reducedMotion }: { reducedMotion: boolean }) {
 }
 
 function RuntimeError({
-  message,
+  code,
   onRetry,
 }: {
-  message: string | null;
+  code: PublicFailureCodeV1;
   onRetry: () => void;
 }) {
   return (
-    <View testID="runtime-error" accessibilityRole="alert" style={styles.centered}>
-      <View style={styles.errorCard}>
-        <Text accessibilityRole="header" style={styles.errorTitle}>Secure runtime unavailable</Text>
-        <Text style={styles.errorBody}>
-          {message ?? "Veil could not verify the native account boundary. No messages were opened."}
-        </Text>
-        <Pressable
-          accessibilityRole="button"
-          onPress={onRetry}
-          style={({ pressed }) => [styles.retryButton, pressed && styles.retryPressed]}
-        >
-          <Text style={styles.retryText}>Try secure verification again</Text>
-        </Pressable>
-      </View>
-    </View>
+    <SafeAreaView testID="runtime-error" style={styles.runtimeErrorRoot} edges={["top", "bottom"]}>
+      <ScrollView
+        testID="runtime-error-scroll"
+        contentContainerStyle={styles.runtimeErrorContent}
+        showsVerticalScrollIndicator
+      >
+        <View style={styles.errorCard}>
+          <PublicFailureCard code={code} />
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Try secure verification again"
+            onPress={onRetry}
+            style={({ pressed }) => [styles.retryButton, pressed && styles.retryPressed]}
+          >
+            <Text style={styles.retryText}>Try secure verification again</Text>
+          </Pressable>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
   );
 }
 
@@ -171,22 +221,17 @@ const styles = StyleSheet.create({
     textAlign: "center",
     marginTop: spacing.md,
   },
+  runtimeErrorRoot: { flex: 1, backgroundColor: colors.background },
+  runtimeErrorContent: {
+    flexGrow: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: spacing.xl,
+    paddingVertical: spacing.xxl,
+  },
   errorCard: {
     width: "100%",
     maxWidth: 460,
-    borderRadius: radii.xl,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.destructiveBorder,
-    backgroundColor: colors.surfaceSolid,
-    padding: spacing.xl,
-  },
-  errorTitle: { color: colors.textHi, fontSize: 21, fontWeight: "800", textAlign: "center" },
-  errorBody: {
-    color: colors.textMd,
-    fontSize: 15,
-    lineHeight: 22,
-    textAlign: "center",
-    marginTop: spacing.sm,
   },
   retryButton: {
     minHeight: 48,

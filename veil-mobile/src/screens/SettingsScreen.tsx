@@ -415,7 +415,12 @@ function settingsDefinition(
           {
             title: "Support",
             rows: [
-              { label: "Public error codes", value: "Registry v1 planned", tone: "warning" },
+              {
+                label: "Public error codes",
+                value: "Registry v1 · Setup/runtime gate",
+                detail: "Direct send/delivery and Desktop/Go consumer parity remain open.",
+                tone: "warning",
+              },
               { label: "Copy safe diagnostics", value: "Not connected yet", tone: "muted" },
               { label: "Project website", value: "Open", onPress: actions.openProjectWebsite },
               { label: "Licensing", value: "AGPL-3.0-or-later" },

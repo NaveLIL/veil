@@ -71,6 +71,8 @@ pub struct ConnectionConfig {
 pub enum ConnectionConnectStopV1 {
     RetryableTransport,
     AuthenticationRejected,
+    RegistrationClosed,
+    InviteInvalid,
     EpochInvalid,
 }
 
@@ -89,10 +91,25 @@ impl ConnectionConnectErrorV1 {
         }
     }
 
-    fn authentication_rejected(detail: impl Into<String>) -> Self {
+    fn authentication_rejected() -> Self {
         Self {
             stop: ConnectionConnectStopV1::AuthenticationRejected,
-            detail: detail.into(),
+            detail: "authentication failed".to_string(),
+        }
+    }
+
+    fn registration_closed() -> Self {
+        Self {
+            stop: ConnectionConnectStopV1::RegistrationClosed,
+            detail: "node access registration is closed; a valid access pass is required"
+                .to_string(),
+        }
+    }
+
+    fn invite_invalid() -> Self {
+        Self {
+            stop: ConnectionConnectStopV1::InviteInvalid,
+            detail: "node access pass is invalid, expired, or already used".to_string(),
         }
     }
 
@@ -362,23 +379,22 @@ fn validate_per_device_auth_result_classified_v1(
     expected: &DeviceBindingPublicV1,
 ) -> Result<String, ConnectionConnectErrorV1> {
     if !result.success {
-        let message = match proto::AuthFailureReason::try_from(result.failure_reason) {
+        // `error_message` is an untrusted server diagnostic. Enrollment
+        // outcomes are accepted only from the protocol enum; generic,
+        // unspecified, and future values deliberately collapse to the same
+        // local authentication rejection.
+        let error = match proto::AuthFailureReason::try_from(result.failure_reason) {
             Ok(proto::AuthFailureReason::RegistrationClosed) => {
-                "node access registration is closed; a valid access pass is required".to_string()
+                ConnectionConnectErrorV1::registration_closed()
             }
             Ok(proto::AuthFailureReason::InviteInvalid) => {
-                "node access pass is invalid, expired, or already used".to_string()
+                ConnectionConnectErrorV1::invite_invalid()
             }
-            _ => {
-                let detail = result.error_message.as_deref().unwrap_or_default().trim();
-                if detail.is_empty() {
-                    "authentication failed".to_string()
-                } else {
-                    format!("authentication failed: {detail}")
-                }
-            }
+            Ok(proto::AuthFailureReason::AuthenticationFailed)
+            | Ok(proto::AuthFailureReason::Unspecified)
+            | Err(_) => ConnectionConnectErrorV1::authentication_rejected(),
         };
-        return Err(ConnectionConnectErrorV1::authentication_rejected(message));
+        return Err(error);
     }
     if !result.per_device_secure {
         return Err(ConnectionConnectErrorV1::epoch_invalid(
@@ -2513,7 +2529,7 @@ mod url_policy_tests {
     }
 
     #[test]
-    fn maps_closed_registration_and_invalid_pass_without_server_secret_detail() {
+    fn maps_typed_auth_failures_without_server_secret_detail() {
         let binding = DeviceBindingPublicV1 {
             device_id: [1u8; 16],
             device_identity_key: [2u8; 32],
@@ -2523,40 +2539,55 @@ mod url_policy_tests {
             status: DEVICE_BINDING_STATUS_ACTIVE,
             account_signature: [4u8; 64],
         };
-        let mut failed = proto::AuthResult {
-            success: false,
-            user_id: None,
-            error_message: Some("internal invite lookup detail".to_string()),
-            per_device_secure: false,
-            device_binding_version: 0,
-            device_binding_status: 0,
-            failure_reason: proto::AuthFailureReason::RegistrationClosed as i32,
-        };
-        assert_eq!(
-            validate_per_device_auth_result(&failed, &binding).unwrap_err(),
-            "node access registration is closed; a valid access pass is required"
-        );
-        assert_eq!(
-            validate_per_device_auth_result_classified_v1(&failed, &binding)
-                .unwrap_err()
-                .stop,
-            ConnectionConnectStopV1::AuthenticationRejected
-        );
+        let secret = "server-secret-auth-diagnostic";
+        let cases = [
+            (
+                proto::AuthFailureReason::RegistrationClosed as i32,
+                ConnectionConnectStopV1::RegistrationClosed,
+                "node access registration is closed; a valid access pass is required",
+            ),
+            (
+                proto::AuthFailureReason::InviteInvalid as i32,
+                ConnectionConnectStopV1::InviteInvalid,
+                "node access pass is invalid, expired, or already used",
+            ),
+            (
+                proto::AuthFailureReason::AuthenticationFailed as i32,
+                ConnectionConnectStopV1::AuthenticationRejected,
+                "authentication failed",
+            ),
+            (
+                proto::AuthFailureReason::Unspecified as i32,
+                ConnectionConnectStopV1::AuthenticationRejected,
+                "authentication failed",
+            ),
+            (
+                i32::MAX,
+                ConnectionConnectStopV1::AuthenticationRejected,
+                "authentication failed",
+            ),
+        ];
 
-        failed.failure_reason = proto::AuthFailureReason::InviteInvalid as i32;
-        let error = validate_per_device_auth_result(&failed, &binding).unwrap_err();
-        assert_eq!(
-            error,
-            "node access pass is invalid, expired, or already used"
-        );
-        assert!(!error.contains("lookup"));
-        let classified =
-            validate_per_device_auth_result_classified_v1(&failed, &binding).unwrap_err();
-        assert_eq!(
-            classified.stop,
-            ConnectionConnectStopV1::AuthenticationRejected
-        );
-        assert_eq!(classified.into_detail(), error);
+        for (failure_reason, expected_stop, expected_detail) in cases {
+            let failed = proto::AuthResult {
+                success: false,
+                user_id: None,
+                error_message: Some(secret.to_string()),
+                per_device_secure: false,
+                device_binding_version: 0,
+                device_binding_status: 0,
+                failure_reason,
+            };
+            let classified =
+                validate_per_device_auth_result_classified_v1(&failed, &binding).unwrap_err();
+            assert_eq!(classified.stop, expected_stop);
+            assert_eq!(classified.detail, expected_detail);
+            assert!(!classified.detail.contains(secret));
+            assert_eq!(
+                validate_per_device_auth_result(&failed, &binding).unwrap_err(),
+                expected_detail
+            );
+        }
     }
 }
 

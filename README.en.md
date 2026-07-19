@@ -60,8 +60,10 @@ status and remaining physical/device matrices are tracked in
 - There is no stable, independently audited release.
 - Android still lacks the full Desktop ↔ Android send/outbox/reconnect/airplane/
   process-death device matrix, connected recovery/capture instrumentation,
-  public failure codes, and signed standalone tester distribution. Calls and
-  the MLS runtime are not enabled as complete user features.
+  app-wide public failure codes, and signed standalone tester distribution.
+  `PublicFailureCodeV1` currently covers Android identity setup and the secure
+  runtime gate; Direct session/send/delivery and desktop/Go consumers remain
+  open. Calls and the MLS runtime are not enabled as complete user features.
 - Key transparency is not implemented; the current model is service-mediated
   TOFU with explicit local fingerprint verification.
 - Platform signing, multi-device, attachment, and distributor matrices still

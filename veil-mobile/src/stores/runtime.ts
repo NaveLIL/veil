@@ -1,6 +1,10 @@
 import { create } from "zustand";
 
 import {
+  isPublicFailureCodeV1,
+  type PublicFailureCodeV1,
+} from "../contracts/publicFailureCodesV1";
+import {
   isExactAuthenticatedBinding,
   type AuthenticatedBinding,
   type VeilMobileRuntimeSnapshot,
@@ -22,20 +26,20 @@ interface RuntimeGateState {
   curtainVisible: boolean;
   requiresExplicitReopen: boolean;
   operation: RuntimeOperation;
-  publicError: string | null;
+  publicFailureCode: PublicFailureCodeV1 | null;
   beginBootstrap: () => number;
   enterPrivacy: () => number;
   enterForeground: () => number;
   commitFreshSnapshot: (epoch: number, snapshot: VeilMobileRuntimeSnapshot) => void;
   acceptRuntimeEvent: (epoch: number, snapshot: VeilMobileRuntimeSnapshot) => void;
-  failFreshSnapshot: (epoch: number) => void;
+  failFreshSnapshot: (epoch: number, failure: PublicFailureCodeV1) => void;
   beginOperation: (operation: Exclude<RuntimeOperation, null>) => number | null;
   finishOperation: (
     epoch: number,
     snapshot: VeilMobileRuntimeSnapshot,
     explicitReopen?: boolean,
   ) => void;
-  failOperation: (epoch: number) => void;
+  failOperation: (epoch: number, failure: PublicFailureCodeV1) => void;
 }
 
 const initialRuntimeState = {
@@ -45,7 +49,7 @@ const initialRuntimeState = {
   curtainVisible: false,
   requiresExplicitReopen: false,
   operation: null,
-  publicError: null,
+  publicFailureCode: null,
 };
 
 export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
@@ -59,7 +63,7 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
       snapshot: null,
       curtainVisible: false,
       operation: null,
-      publicError: null,
+      publicFailureCode: null,
     });
     return epoch;
   },
@@ -73,7 +77,7 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
       curtainVisible: true,
       requiresExplicitReopen: true,
       operation: null,
-      publicError: null,
+      publicFailureCode: null,
     });
     return epoch;
   },
@@ -88,7 +92,7 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
       // post-lock native snapshot has been read for this exact epoch.
       curtainVisible: true,
       operation: null,
-      publicError: null,
+      publicFailureCode: null,
     });
     return epoch;
   },
@@ -96,12 +100,16 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
   commitFreshSnapshot: (epoch, snapshot) => {
     const state = get();
     if (state.epoch !== epoch || state.phase === "privacy") return;
+    const publicFailureCode = publicFailureCodeForUnclassifiedSnapshot(snapshot);
     set({
       phase: "ready",
       snapshot,
       curtainVisible: false,
       operation: null,
-      publicError: null,
+      publicFailureCode,
+      requiresExplicitReopen: publicFailureCode !== null
+        ? true
+        : state.requiresExplicitReopen,
     });
   },
 
@@ -118,29 +126,36 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
       snapshot.runtimeRevision > 0 &&
       current.runtimeRevision > snapshot.runtimeRevision
     ) return;
+    const committed = current && current.runtimeRevision === snapshot.runtimeRevision
+      ? conservativelyMergeRuntimeSnapshots(current, snapshot)
+      : snapshot;
+    const publicFailureCode = publicFailureCodeForUnclassifiedSnapshot(committed);
     set({
-      snapshot: current && current.runtimeRevision === snapshot.runtimeRevision
-        ? conservativelyMergeRuntimeSnapshots(current, snapshot)
-        : snapshot,
+      snapshot: committed,
+      publicFailureCode,
+      requiresExplicitReopen: publicFailureCode !== null
+        ? true
+        : state.requiresExplicitReopen,
     });
   },
 
-  failFreshSnapshot: (epoch) => {
+  failFreshSnapshot: (epoch, failure) => {
     const state = get();
     if (state.epoch !== epoch || state.phase === "privacy") return;
     set({
       phase: "error",
       snapshot: null,
       curtainVisible: false,
+      requiresExplicitReopen: true,
       operation: null,
-      publicError: "The secure mobile runtime could not be verified. No account data was opened.",
+      publicFailureCode: failure,
     });
   },
 
   beginOperation: (operation) => {
     const state = get();
     if (state.phase !== "ready" || state.curtainVisible || state.operation !== null) return null;
-    set({ operation, publicError: null });
+    set({ operation, publicFailureCode: null });
     return state.epoch;
   },
 
@@ -157,23 +172,108 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
           ? conservativelyMergeRuntimeSnapshots(current, snapshot)
           : snapshot
       : snapshot;
+    const publicFailureCode = publicFailureCodeForUnclassifiedSnapshot(committed);
     set({
       snapshot: committed,
       operation: null,
-      publicError: null,
-      requiresExplicitReopen: explicitReopen ? false : state.requiresExplicitReopen,
+      publicFailureCode,
+      requiresExplicitReopen: publicFailureCode !== null
+        ? true
+        : explicitReopen
+          ? false
+          : state.requiresExplicitReopen,
     });
   },
 
-  failOperation: (epoch) => {
+  failOperation: (epoch, failure) => {
     const state = get();
     if (state.epoch !== epoch || state.phase !== "ready" || state.curtainVisible) return;
     set({
+      phase: "error",
+      snapshot: null,
+      requiresExplicitReopen: true,
       operation: null,
-      publicError: "That secure action could not be completed. Try again when the connection is available.",
+      publicFailureCode: failure,
     });
   },
 }));
+
+function publicFailureCodeForUnclassifiedSnapshot(
+  snapshot: VeilMobileRuntimeSnapshot,
+): PublicFailureCodeV1 | null {
+  return snapshot.runtimeRevision === 0
+    || snapshot.sessionState === "error"
+    || snapshot.connectionState === "error"
+    || snapshot.secureSyncState === "error"
+    ? "VEIL-RUNTIME-999"
+    : null;
+}
+
+/** Collapse native failures to the append-only presentation registry. */
+export function classifyRuntimeOperationFailure(error: unknown): PublicFailureCodeV1 {
+  if (!error || typeof error !== "object") return "VEIL-RUNTIME-999";
+  const record = error as Record<string, unknown>;
+  const hasOwn = (key: string, value: Record<string, unknown>): boolean =>
+    Object.prototype.hasOwnProperty.call(value, key);
+  const hasUserInfo = hasOwn("userInfo", record);
+  if (hasUserInfo && (!record.userInfo || typeof record.userInfo !== "object")) {
+    return "VEIL-RUNTIME-999";
+  }
+  const userInfo = hasUserInfo
+    ? record.userInfo as Record<string, unknown>
+    : null;
+  const hasTopLevelPublicCode = hasOwn("publicFailureCodeV1", record);
+  const hasNestedPublicCode = userInfo !== null && hasOwn("publicFailureCodeV1", userInfo);
+  if (hasTopLevelPublicCode || hasNestedPublicCode) {
+    const topLevelPublicCode = record.publicFailureCodeV1;
+    const nestedPublicCode = userInfo?.publicFailureCodeV1;
+    if (
+      hasTopLevelPublicCode
+      && hasNestedPublicCode
+      && topLevelPublicCode !== nestedPublicCode
+    ) {
+      return "VEIL-RUNTIME-999";
+    }
+    const publicCode = hasTopLevelPublicCode ? topLevelPublicCode : nestedPublicCode;
+    return isPublicFailureCodeV1(publicCode) ? publicCode : "VEIL-RUNTIME-999";
+  }
+  const code = record.code;
+  if (typeof code !== "string") return "VEIL-RUNTIME-999";
+  switch (code) {
+    case "E_VEIL_LOCKED":
+      return "VEIL-LOCAL-001";
+    case "E_VEIL_OPEN":
+      return "VEIL-LOCAL-002";
+    case "E_VEIL_LOCAL_STATE":
+      return "VEIL-LOCAL-003";
+    case "E_VEIL_ENDPOINT":
+      return "VEIL-NODE-001";
+    case "E_VEIL_TRANSPORT":
+      return "VEIL-NODE-002";
+    case "E_VEIL_AUTH_REJECTED":
+      return "VEIL-NODE-003";
+    case "E_VEIL_BINDING":
+      return "VEIL-NODE-004";
+    case "E_VEIL_ACCESS_REQUIRED":
+      return "VEIL-PASS-001";
+    case "E_VEIL_ACCESS_PASS_REJECTED":
+      return "VEIL-PASS-002";
+    case "E_VEIL_ACCESS_PASS_LOCAL":
+      return "VEIL-PASS-003";
+    case "E_VEIL_CONNECTING":
+      return "VEIL-RUNTIME-001";
+    case "E_VEIL_CANCELLED":
+      return "VEIL-RUNTIME-002";
+    case "E_VEIL_SYNC":
+      return "VEIL-SYNC-001";
+    // These legacy codes combine multiple trust states and cannot safely
+    // expose a narrower public outcome without the typed native bridge.
+    case "E_VEIL_CONNECT":
+    case "E_VEIL_ACCESS_PASS":
+    default:
+      return "VEIL-RUNTIME-999";
+  }
+}
 
 /** Accept only the exact public origin/user binding emitted by the native runtime. */
 export function hasExactAuthenticatedBinding(binding: AuthenticatedBinding | null): boolean {

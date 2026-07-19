@@ -2,7 +2,9 @@ package io.veil.mobile.runtime
 
 import android.content.Context
 import android.os.SystemClock
+import android.util.Log
 import androidx.annotation.VisibleForTesting
+import io.veil.mobile.BuildConfig
 import io.veil.mobile.crypto.NativeIdentityVault
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import io.veil.mobile.recovery.NativeIdentitySetupCoordinator
@@ -20,6 +22,7 @@ import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 import uniffi.veil_ffi.MobileAuthenticatedBinding
 import uniffi.veil_ffi.MobileConnectCancellation
+import uniffi.veil_ffi.MobileConnectFailureReason
 import uniffi.veil_ffi.MobileDirectConversationData
 import uniffi.veil_ffi.MobileDirectDirectoryPageData
 import uniffi.veil_ffi.MobileDirectHistoryNext
@@ -76,13 +79,139 @@ internal fun MobileRetryableReason.toNativeMobileRetryableReason(): NativeMobile
     MobileRetryableReason.ACK_DEADLINE -> NativeMobileRetryableReason.ACK_DEADLINE
   }
 
+/** Exact terminal connect vocabulary copied from UniFFI without native text. */
+internal enum class NativeMobileConnectFailureReason {
+  AUTHENTICATION_REJECTED,
+  REGISTRATION_CLOSED,
+  INVITE_INVALID,
+  EPOCH_INVALID,
+  STORAGE_UNCERTAIN,
+}
+
+internal class NativeMobileConnectFailureException(
+  val reason: NativeMobileConnectFailureReason,
+) : RuntimeException("typed mobile connection failure")
+
+internal fun MobileConnectFailureReason.toNativeMobileConnectFailureReason():
+  NativeMobileConnectFailureReason = when (this) {
+    MobileConnectFailureReason.AUTHENTICATION_REJECTED ->
+      NativeMobileConnectFailureReason.AUTHENTICATION_REJECTED
+    MobileConnectFailureReason.REGISTRATION_CLOSED ->
+      NativeMobileConnectFailureReason.REGISTRATION_CLOSED
+    MobileConnectFailureReason.INVITE_INVALID -> NativeMobileConnectFailureReason.INVITE_INVALID
+    MobileConnectFailureReason.EPOCH_INVALID -> NativeMobileConnectFailureReason.EPOCH_INVALID
+    MobileConnectFailureReason.STORAGE_UNCERTAIN ->
+      NativeMobileConnectFailureReason.STORAGE_UNCERTAIN
+  }
+
 @VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
-internal inline fun <T> translateMobileRetryable(operation: () -> T): T =
+internal inline fun <T> translateMobileFailure(operation: () -> T): T =
   try {
     operation()
   } catch (error: VeilException.MobileRetryable) {
     throw NativeMobileRetryableException(error.reason.toNativeMobileRetryableReason())
+  } catch (error: VeilException.MobileConnectFailure) {
+    throw NativeMobileConnectFailureException(error.reason.toNativeMobileConnectFailureReason())
   }
+
+/** Closed, non-sensitive vocabulary for native-only Direct debug diagnostics. */
+internal enum class NativeDebugDirectFailureCheckpoint(
+  val logValue: String,
+) {
+  BOOTSTRAP_START("bootstrap_start"),
+  OWN_PREKEYS("own_prekeys"),
+  DIRECTORY_HANDOFF("directory_handoff"),
+  HISTORY("history"),
+  LIVE_REPLAY("live_replay"),
+  OUTBOX_REPLAY("outbox_replay"),
+  CONTINUOUS_LIVE("continuous_live"),
+}
+
+/** Closed, non-sensitive failure classes. No native exception text is inspected. */
+internal enum class NativeDebugDirectFailureCategory(
+  val logValue: String,
+) {
+  RETRYABLE_TRANSPORT("retryable_transport"),
+  RETRYABLE_ACK_DEADLINE("retryable_ack_deadline"),
+  RUNTIME("runtime"),
+  FFI_SESSION("ffi_session"),
+  FFI_CRYPTO("ffi_crypto"),
+  FFI_INVALID_INPUT("ffi_invalid_input"),
+  CONNECT_AUTHENTICATION_REJECTED("connect_authentication_rejected"),
+  CONNECT_REGISTRATION_CLOSED("connect_registration_closed"),
+  CONNECT_INVITE_INVALID("connect_invite_invalid"),
+  CONNECT_EPOCH_INVALID("connect_epoch_invalid"),
+  CONNECT_STORAGE_UNCERTAIN("connect_storage_uncertain"),
+  UNEXPECTED("unexpected"),
+}
+
+internal fun interface NativeDebugDirectFailureSink {
+  fun record(
+    checkpoint: NativeDebugDirectFailureCheckpoint,
+    category: NativeDebugDirectFailureCategory,
+  )
+}
+
+private fun NativeMobileRetryableReason.toDebugDirectFailureCategory():
+  NativeDebugDirectFailureCategory = when (this) {
+    NativeMobileRetryableReason.TRANSPORT ->
+      NativeDebugDirectFailureCategory.RETRYABLE_TRANSPORT
+    NativeMobileRetryableReason.ACK_DEADLINE ->
+      NativeDebugDirectFailureCategory.RETRYABLE_ACK_DEADLINE
+  }
+
+private fun NativeMobileConnectFailureReason.toDebugDirectFailureCategory():
+  NativeDebugDirectFailureCategory = when (this) {
+    NativeMobileConnectFailureReason.AUTHENTICATION_REJECTED ->
+      NativeDebugDirectFailureCategory.CONNECT_AUTHENTICATION_REJECTED
+    NativeMobileConnectFailureReason.REGISTRATION_CLOSED ->
+      NativeDebugDirectFailureCategory.CONNECT_REGISTRATION_CLOSED
+    NativeMobileConnectFailureReason.INVITE_INVALID ->
+      NativeDebugDirectFailureCategory.CONNECT_INVITE_INVALID
+    NativeMobileConnectFailureReason.EPOCH_INVALID ->
+      NativeDebugDirectFailureCategory.CONNECT_EPOCH_INVALID
+    NativeMobileConnectFailureReason.STORAGE_UNCERTAIN ->
+      NativeDebugDirectFailureCategory.CONNECT_STORAGE_UNCERTAIN
+  }
+
+@VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+internal fun classifyDebugDirectFailure(error: Throwable): NativeDebugDirectFailureCategory =
+  when (error) {
+    is NativeMobileRetryableException -> error.reason.toDebugDirectFailureCategory()
+    is VeilMobileRuntimeException -> NativeDebugDirectFailureCategory.RUNTIME
+    is VeilException.Session -> NativeDebugDirectFailureCategory.FFI_SESSION
+    is VeilException.Crypto -> NativeDebugDirectFailureCategory.FFI_CRYPTO
+    is VeilException.InvalidInput -> NativeDebugDirectFailureCategory.FFI_INVALID_INPUT
+    is VeilException.MobileRetryable ->
+      error.reason.toNativeMobileRetryableReason().toDebugDirectFailureCategory()
+    is NativeMobileConnectFailureException -> error.reason.toDebugDirectFailureCategory()
+    is VeilException.MobileConnectFailure ->
+      error.reason.toNativeMobileConnectFailureReason().toDebugDirectFailureCategory()
+    else -> NativeDebugDirectFailureCategory.UNEXPECTED
+  }
+
+@VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+internal fun emitDebugDirectFailure(
+  enabled: Boolean,
+  checkpoint: NativeDebugDirectFailureCheckpoint,
+  error: Throwable,
+  sink: NativeDebugDirectFailureSink,
+) {
+  if (!enabled) return
+  val category = classifyDebugDirectFailure(error)
+  try {
+    sink.record(checkpoint, category)
+  } catch (_: Throwable) {
+    // Debug diagnostics never participate in the fail-closed runtime transition.
+  }
+}
+
+private val ANDROID_DEBUG_DIRECT_FAILURE_SINK = NativeDebugDirectFailureSink { checkpoint, category ->
+  Log.w(
+    "VeilRuntime",
+    "direct_failure checkpoint=${checkpoint.logValue} category=${category.logValue}",
+  )
+}
 
 internal enum class NativeReconnectStage {
   WAITING,
@@ -620,6 +749,9 @@ internal class VeilMobileRuntime internal constructor(
   private val directBootstrapOwnerBoundary: () -> Unit = {},
   @get:VisibleForTesting
   private val peerPreKeyInstallBoundary: () -> Unit = {},
+  @get:VisibleForTesting
+  private val debugDirectFailureSink: NativeDebugDirectFailureSink =
+    ANDROID_DEBUG_DIRECT_FAILURE_SINK,
 ) {
   constructor(context: Context) : this(
     vault = NativeIdentityVault(context.applicationContext),
@@ -1790,23 +1922,29 @@ internal class VeilMobileRuntime internal constructor(
     } catch (_: Throwable) {
       null
     } ?: throw VeilMobileRuntimeException(
-      "E_VEIL_ACCESS_PASS",
+      "E_VEIL_ACCESS_PASS_LOCAL",
       "The pending Node Access Pass is unavailable or expired",
     )
     if (view.flowId != expectedFlowId) {
-      throw VeilMobileRuntimeException("E_VEIL_ACCESS_PASS", "The pending Node Access Pass changed")
+      throw VeilMobileRuntimeException(
+        "E_VEIL_ACCESS_PASS_LOCAL",
+        "The pending Node Access Pass changed",
+      )
     }
     val origin = try {
       CanonicalServerOrigin.parse(view.canonicalOrigin, allowLoopbackHttp = false)
     } catch (_: Throwable) {
-      throw VeilMobileRuntimeException("E_VEIL_ACCESS_PASS", "The pending Node Access Pass origin is invalid")
+      throw VeilMobileRuntimeException(
+        "E_VEIL_ACCESS_PASS_LOCAL",
+        "The pending Node Access Pass origin is invalid",
+      )
     }
     val attempt = try {
       passStore.attempt(expectedFlowId, origin.value)
     } catch (_: Throwable) {
       null
     } ?: throw VeilMobileRuntimeException(
-      "E_VEIL_ACCESS_PASS",
+      "E_VEIL_ACCESS_PASS_LOCAL",
       "The pending Node Access Pass is unavailable or expired",
     )
     attempt.use {
@@ -1917,6 +2055,7 @@ internal class VeilMobileRuntime internal constructor(
       publishSnapshot()
       authenticated
     } catch (error: Throwable) {
+      var cancelledByOwnerLoss = false
       val failedSync = synchronized(stateLock) {
         val connecting = activeConnect === attempt
         if (connecting) activeConnect = null
@@ -1934,6 +2073,7 @@ internal class VeilMobileRuntime internal constructor(
           binding = null
           detached
         } else {
+          cancelledByOwnerLoss = true
           null
         }
       }
@@ -1951,7 +2091,10 @@ internal class VeilMobileRuntime internal constructor(
       }
       publishSnapshot()
       if (error is VeilMobileRuntimeException) throw error
-      throw publicConnectError(error)
+      if (cancelledByOwnerLoss) {
+        throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
+      }
+      throw publicConnectFailure(error)
     } finally {
       try {
         attempt.cancellation.close()
@@ -1972,8 +2115,8 @@ internal class VeilMobileRuntime internal constructor(
       canonicalUserId != authenticated.userId
     ) {
       throw VeilMobileRuntimeException(
-        "E_VEIL_CONNECT",
-        "Unable to authenticate with the Veil Node",
+        "E_VEIL_BINDING",
+        "The Veil Node authenticated binding was rejected",
       )
     }
   }
@@ -2044,7 +2187,10 @@ internal class VeilMobileRuntime internal constructor(
       lease.userId != authenticated.userId
     ) {
       DetachedDirectSync(active, lease.leaseToken, null, null).cancelLeaseQuietly()
-      throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
+      throw VeilMobileRuntimeException(
+        "E_VEIL_BINDING",
+        "The Veil Node authenticated binding was rejected",
+      )
     }
 
     val generation = synchronized(stateLock) {
@@ -2084,6 +2230,7 @@ internal class VeilMobileRuntime internal constructor(
     try {
       requestNextOwnPreKeyStep(sync)
     } catch (error: Throwable) {
+      recordDebugDirectFailure(NativeDebugDirectFailureCheckpoint.BOOTSTRAP_START, error)
       val reconnectScheduled = handleDirectSyncFailure(sync, error)
       if (reconnectScheduled) return
       throw VeilMobileRuntimeException("E_VEIL_SYNC", SECURE_DIRECT_BOOTSTRAP_ERROR)
@@ -2229,6 +2376,7 @@ internal class VeilMobileRuntime internal constructor(
       }
       publishSnapshot()
     } catch (error: Throwable) {
+      recordDebugDirectFailure(NativeDebugDirectFailureCheckpoint.OWN_PREKEYS, error)
       handleDirectSyncFailure(sync, error)
     } finally {
       result.wipeSensitiveBody()
@@ -2447,6 +2595,7 @@ internal class VeilMobileRuntime internal constructor(
         requestNextDirectDirectoryPage(sync)
       }
     } catch (error: Throwable) {
+      recordDebugDirectFailure(NativeDebugDirectFailureCheckpoint.DIRECTORY_HANDOFF, error)
       result.wipeSensitiveBody()
       handleDirectSyncFailure(sync, error)
     } finally {
@@ -2587,6 +2736,7 @@ internal class VeilMobileRuntime internal constructor(
         requestNextDirectHistoryPage(sync)
       }
     } catch (error: Throwable) {
+      recordDebugDirectFailure(NativeDebugDirectFailureCheckpoint.HISTORY, error)
       handleDirectSyncFailure(sync, error)
     } finally {
       result.wipeSensitiveBody()
@@ -2673,6 +2823,7 @@ internal class VeilMobileRuntime internal constructor(
       if (accepted) publishSnapshot()
       if (accepted) scheduleContinuousDirectLiveReplay(sync)
     } catch (error: Throwable) {
+      recordDebugDirectFailure(NativeDebugDirectFailureCheckpoint.LIVE_REPLAY, error)
       handleDirectSyncFailure(sync, error)
     }
   }
@@ -2728,6 +2879,7 @@ internal class VeilMobileRuntime internal constructor(
       if (accepted) publishSnapshot()
       if (accepted) scheduleContinuousDirectLiveReplay(sync)
     } catch (error: Throwable) {
+      recordDebugDirectFailure(NativeDebugDirectFailureCheckpoint.OUTBOX_REPLAY, error)
       handleDirectSyncFailure(sync, error)
     }
   }
@@ -2823,6 +2975,7 @@ internal class VeilMobileRuntime internal constructor(
         if (progress.needsImmediatePump) 0L else directLivePollIntervalMillis,
       )
     } catch (error: Throwable) {
+      recordDebugDirectFailure(NativeDebugDirectFailureCheckpoint.CONTINUOUS_LIVE, error)
       handleDirectSyncFailure(sync, error)
     }
   }
@@ -2975,6 +3128,16 @@ internal class VeilMobileRuntime internal constructor(
     return false
   }
 
+  private fun recordDebugDirectFailure(
+    checkpoint: NativeDebugDirectFailureCheckpoint,
+    error: Throwable,
+  ) = emitDebugDirectFailure(
+    enabled = BuildConfig.DEBUG,
+    checkpoint = checkpoint,
+    error = error,
+    sink = debugDirectFailureSink,
+  )
+
   private fun finalizePreparedReconnect(prepared: PreparedReconnect): Boolean {
     prepared.detachedDirectSync.cancelHttpQuietly()
     prepared.detachedDirectSync.cancelLeaseQuietly()
@@ -3105,7 +3268,10 @@ internal class VeilMobileRuntime internal constructor(
       }
       requireAuthenticatedBinding(authenticated, plan.origin)
       if (authenticated.userId != plan.expectedUserId) {
-        throw VeilMobileRuntimeException("E_VEIL_CONNECT", "Unable to authenticate with the Veil Node")
+        throw VeilMobileRuntimeException(
+          "E_VEIL_BINDING",
+          "The Veil Node authenticated binding was rejected",
+        )
       }
 
       val bootstrapOwner = synchronized(stateLock) {
@@ -3587,7 +3753,10 @@ internal class VeilMobileRuntime internal constructor(
     val cancelled = try {
       passStore.cancel(expectedFlowId)
     } catch (_: Throwable) {
-      throw VeilMobileRuntimeException("E_VEIL_ACCESS_PASS", "The pending Node Access Pass reference is invalid")
+      throw VeilMobileRuntimeException(
+        "E_VEIL_ACCESS_PASS_LOCAL",
+        "The pending Node Access Pass reference is invalid",
+      )
     }
     publishSnapshot()
     return cancelled
@@ -3643,10 +3812,13 @@ internal class VeilMobileRuntime internal constructor(
       "public mobile runtime snapshot revision exhausted"
     }
     publicSnapshotRevision += 1
+    // An unavailable Keystore/vault read is not authoritative absence. Report
+    // conservative presence so React Native keeps onboarding closed without
+    // throwing from publication and orphaning a native state transition.
     val identityExists = session != null || try {
       vault.hasIdentity()
     } catch (_: Throwable) {
-      false
+      true
     }
     return VeilMobileRuntimeSnapshot(
       identityExists = identityExists,
@@ -3684,25 +3856,41 @@ internal class VeilMobileRuntime internal constructor(
     else -> NativeSecureSyncState.IDLE
   }
 
-  private fun publicConnectError(error: Throwable): VeilMobileRuntimeException {
-    val detail = error.message.orEmpty().lowercase()
-    return when {
-      "mobile connection attempt cancelled" in detail -> VeilMobileRuntimeException(
-        "E_VEIL_CANCELLED",
-        "Connection attempt was cancelled",
+  private fun publicConnectFailure(error: Throwable): VeilMobileRuntimeException = when (error) {
+    is NativeMobileRetryableException -> when (error.reason) {
+      NativeMobileRetryableReason.TRANSPORT -> VeilMobileRuntimeException(
+        "E_VEIL_TRANSPORT",
+        "Unable to reach the Veil Node",
       )
-      "registration is closed" in detail -> VeilMobileRuntimeException(
+      NativeMobileRetryableReason.ACK_DEADLINE -> genericPublicConnectFailure()
+    }
+    is NativeMobileConnectFailureException -> when (error.reason) {
+      NativeMobileConnectFailureReason.AUTHENTICATION_REJECTED -> VeilMobileRuntimeException(
+        "E_VEIL_AUTH_REJECTED",
+        "The Veil Node rejected this local account",
+      )
+      NativeMobileConnectFailureReason.REGISTRATION_CLOSED -> VeilMobileRuntimeException(
         "E_VEIL_ACCESS_REQUIRED",
         "Registration on this Veil Node requires a valid Node Access Pass",
       )
-      "access pass is invalid" in detail || "invite" in detail && "invalid" in detail ->
-        VeilMobileRuntimeException(
-          "E_VEIL_ACCESS_PASS",
-          "The Node Access Pass is invalid, expired, or already used",
-        )
-      else -> VeilMobileRuntimeException("E_VEIL_CONNECT", "Unable to authenticate with the Veil Node")
+      NativeMobileConnectFailureReason.INVITE_INVALID -> VeilMobileRuntimeException(
+        "E_VEIL_ACCESS_PASS_REJECTED",
+        "The Node Access Pass is invalid, expired, or already used",
+      )
+      NativeMobileConnectFailureReason.EPOCH_INVALID -> VeilMobileRuntimeException(
+        "E_VEIL_BINDING",
+        "The Veil Node authenticated binding was rejected",
+      )
+      NativeMobileConnectFailureReason.STORAGE_UNCERTAIN -> VeilMobileRuntimeException(
+        "E_VEIL_LOCAL_STATE",
+        "Unable to confirm the local secure state",
+      )
     }
+    else -> genericPublicConnectFailure()
   }
+
+  private fun genericPublicConnectFailure() =
+    VeilMobileRuntimeException("E_VEIL_CONNECT", "Unable to authenticate with the Veil Node")
 
   companion object {
     private const val HTTP_GET_METHOD = "GET"
@@ -3773,7 +3961,7 @@ private class UniFfiMobileSession(
     websocketUrl: String,
     canonicalOrigin: String,
     cancellation: NativeConnectCancellation,
-  ): PublicAuthenticatedBinding = translateMobileRetryable {
+  ): PublicAuthenticatedBinding = translateMobileFailure {
     delegate.connectCancellable(
       websocketUrl,
       canonicalOrigin,
@@ -3786,7 +3974,7 @@ private class UniFfiMobileSession(
     canonicalOrigin: String,
     nodeAccessPass: ByteArray,
     cancellation: NativeConnectCancellation,
-  ): PublicAuthenticatedBinding = translateMobileRetryable {
+  ): PublicAuthenticatedBinding = translateMobileFailure {
     delegate.connectWithNodeAccessPassCancellable(
       websocketUrl,
       canonicalOrigin,
@@ -3831,17 +4019,17 @@ private class UniFfiMobileSession(
       .toNativeDirectHistoryProgress()
 
   override fun bufferDirectLiveEventsDuringSync(leaseToken: String): NativeDirectLiveBufferProgress =
-    translateMobileRetryable {
+    translateMobileFailure {
       delegate.bufferDirectLiveEventsDuringSync(leaseToken).toNativeDirectLiveBufferProgress()
     }
 
   override fun replayDirectLiveEvents(leaseToken: String): NativeDirectLiveReplayProgress =
-    translateMobileRetryable {
+    translateMobileFailure {
       delegate.replayDirectLiveEvents(leaseToken).toNativeDirectLiveReplayProgress()
     }
 
   override fun replayDirectOutbox(leaseToken: String): NativeDirectOutboxReplayProgress =
-    translateMobileRetryable {
+    translateMobileFailure {
       delegate.replayDirectOutbox(leaseToken).toNativeDirectOutboxReplayProgress()
     }
 

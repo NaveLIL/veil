@@ -9,6 +9,7 @@ import VeilRuntime, { type VeilMobileRuntimeSnapshot } from "../native/runtime";
 import { useChatStore } from "../stores/chat";
 import {
   canRenderChat,
+  classifyRuntimeOperationFailure,
   conservativelyMergeRuntimeSnapshots,
   useRuntimeGateStore,
   type RuntimeOperation,
@@ -45,6 +46,14 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
   const removeRuntimeSubscription = useCallback(() => {
     runtimeSubscriptionRef.current?.remove();
     runtimeSubscriptionRef.current = null;
+  }, []);
+
+  const removeRuntimeSubscriptionIfOwned = useCallback((
+    subscription: EmitterSubscription,
+  ): void => {
+    if (runtimeSubscriptionRef.current !== subscription) return;
+    runtimeSubscriptionRef.current = null;
+    subscription.remove();
   }, []);
 
   const epochIsCurrent = useCallback((epoch: number): boolean => {
@@ -93,6 +102,7 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
     barrier: Promise<void> = Promise.resolve(),
   ): Promise<void> => {
     removeRuntimeSubscription();
+    let subscription: EmitterSubscription | null = null;
     try {
       await barrier;
       if (!epochIsCurrent(epoch)) return;
@@ -104,7 +114,7 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
 
       let handshaking = true;
       let bufferedSnapshot: VeilMobileRuntimeSnapshot | null = null;
-      const subscription = VeilRuntime.subscribe((snapshot) => {
+      subscription = VeilRuntime.subscribe((snapshot) => {
         if (handshaking) {
           // Keep the latest event that arrives after subscription but before
           // the confirming read is committed. Dropping it could publish a
@@ -128,7 +138,7 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
       // represented by this snapshot or accepted after the gate becomes ready.
       const confirmed = await VeilRuntime.getSnapshot();
       if (!epochIsCurrent(epoch)) {
-        removeRuntimeSubscription();
+        removeRuntimeSubscriptionIfOwned(subscription);
         return;
       }
       // JavaScript callbacks cannot interleave these synchronous statements:
@@ -140,12 +150,22 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
       handshaking = false;
       useRuntimeGateStore.getState().commitFreshSnapshot(epoch, latest);
       reconcileRenderableChat(epoch);
-    } catch {
+    } catch (error) {
+      if (subscription) removeRuntimeSubscriptionIfOwned(subscription);
+      if (!epochIsCurrent(epoch)) return;
       removeRuntimeSubscription();
       useChatStore.getState().clearRenderableChat();
-      useRuntimeGateStore.getState().failFreshSnapshot(epoch);
+      useRuntimeGateStore.getState().failFreshSnapshot(
+        epoch,
+        classifyRuntimeOperationFailure(error),
+      );
     }
-  }, [epochIsCurrent, reconcileRenderableChat, removeRuntimeSubscription]);
+  }, [
+    epochIsCurrent,
+    reconcileRenderableChat,
+    removeRuntimeSubscription,
+    removeRuntimeSubscriptionIfOwned,
+  ]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -201,14 +221,20 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
     if (epoch === null) return;
     try {
       await action();
+      if (!epochIsCurrent(epoch)) return;
       const snapshot = await VeilRuntime.getSnapshot();
+      if (!epochIsCurrent(epoch)) return;
       useRuntimeGateStore.getState().finishOperation(epoch, snapshot, explicitReopen);
       reconcileRenderableChat(epoch);
-    } catch {
+    } catch (error) {
+      if (!epochIsCurrent(epoch)) return;
       useChatStore.getState().clearRenderableChat();
-      useRuntimeGateStore.getState().failOperation(epoch);
+      useRuntimeGateStore.getState().failOperation(
+        epoch,
+        classifyRuntimeOperationFailure(error),
+      );
     }
-  }, [reconcileRenderableChat]);
+  }, [epochIsCurrent, reconcileRenderableChat]);
 
   const refresh = useCallback(async (): Promise<void> => {
     await runOperation("refreshing", () => VeilRuntime.getSnapshot());

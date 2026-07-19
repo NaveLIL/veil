@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "@jest/globals";
 import type { VeilMobileRuntimeSnapshot } from "../../native/runtime";
 import {
   canRenderChat,
+  classifyRuntimeOperationFailure,
   conservativelyMergeRuntimeSnapshots,
   resetRuntimeGateStoreForTests,
   useRuntimeGateStore,
@@ -97,6 +98,58 @@ describe("runtime privacy epochs", () => {
     expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false)).toBe(false);
   });
 
+  it("publishes the deterministic unknown code for malformed bootstrap authority", () => {
+    const epoch = useRuntimeGateStore.getState().beginBootstrap();
+    useRuntimeGateStore.getState().commitFreshSnapshot(epoch, snapshot({
+      runtimeRevision: 0,
+      directGeneration: null,
+      directContentRevision: null,
+      sessionState: "error",
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+    }));
+
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "ready",
+      requiresExplicitReopen: true,
+      publicFailureCode: "VEIL-RUNTIME-999",
+    });
+    expect(canRenderChat(
+      useRuntimeGateStore.getState().snapshot,
+      useRuntimeGateStore.getState().requiresExplicitReopen,
+    )).toBe(false);
+  });
+
+  it("codes an asynchronous terminal snapshot and keeps reopen authority sticky", () => {
+    const epoch = useRuntimeGateStore.getState().beginBootstrap();
+    useRuntimeGateStore.getState().commitFreshSnapshot(epoch, snapshot());
+
+    useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({
+      runtimeRevision: 2,
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+    }));
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "ready",
+      requiresExplicitReopen: true,
+      publicFailureCode: "VEIL-RUNTIME-999",
+    });
+
+    useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({ runtimeRevision: 3 }));
+    expect(useRuntimeGateStore.getState().publicFailureCode).toBeNull();
+    expect(useRuntimeGateStore.getState().requiresExplicitReopen).toBe(true);
+    expect(canRenderChat(
+      useRuntimeGateStore.getState().snapshot,
+      useRuntimeGateStore.getState().requiresExplicitReopen,
+    )).toBe(false);
+  });
+
   it("does not let a late operation read overwrite a newer native event", () => {
     const epoch = useRuntimeGateStore.getState().beginBootstrap();
     useRuntimeGateStore.getState().commitFreshSnapshot(epoch, snapshot({ runtimeRevision: 10 }));
@@ -136,6 +189,97 @@ describe("runtime privacy epochs", () => {
     const reopened = useRuntimeGateStore.getState();
     expect(reopened.requiresExplicitReopen).toBe(false);
     expect(canRenderChat(reopened.snapshot, reopened.requiresExplicitReopen)).toBe(true);
+  });
+
+  it("keeps a fresh-snapshot exception latched across a successful retry read", () => {
+    const failedEpoch = useRuntimeGateStore.getState().beginBootstrap();
+    useRuntimeGateStore.getState().failFreshSnapshot(failedEpoch, "VEIL-LOCAL-003");
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "error",
+      snapshot: null,
+      requiresExplicitReopen: true,
+      publicFailureCode: "VEIL-LOCAL-003",
+    });
+
+    const retryEpoch = useRuntimeGateStore.getState().beginBootstrap();
+    useRuntimeGateStore.getState().commitFreshSnapshot(retryEpoch, snapshot());
+    const retried = useRuntimeGateStore.getState();
+    expect(retried.phase).toBe("ready");
+    expect(retried.requiresExplicitReopen).toBe(true);
+    expect(canRenderChat(retried.snapshot, retried.requiresExplicitReopen)).toBe(false);
+  });
+});
+
+describe("runtime operation failures", () => {
+  beforeEach(resetRuntimeGateStoreForTests);
+
+  it.each([
+    ["E_VEIL_LOCKED", "VEIL-LOCAL-001"],
+    ["E_VEIL_OPEN", "VEIL-LOCAL-002"],
+    ["E_VEIL_LOCAL_STATE", "VEIL-LOCAL-003"],
+    ["E_VEIL_ENDPOINT", "VEIL-NODE-001"],
+    ["E_VEIL_TRANSPORT", "VEIL-NODE-002"],
+    ["E_VEIL_CONNECT", "VEIL-RUNTIME-999"],
+    ["E_VEIL_AUTH_REJECTED", "VEIL-NODE-003"],
+    ["E_VEIL_BINDING", "VEIL-NODE-004"],
+    ["E_VEIL_ACCESS_REQUIRED", "VEIL-PASS-001"],
+    ["E_VEIL_ACCESS_PASS_REJECTED", "VEIL-PASS-002"],
+    ["E_VEIL_ACCESS_PASS_LOCAL", "VEIL-PASS-003"],
+    ["E_VEIL_CONNECTING", "VEIL-RUNTIME-001"],
+    ["E_VEIL_CANCELLED", "VEIL-RUNTIME-002"],
+    ["E_VEIL_SYNC", "VEIL-SYNC-001"],
+    ["E_VEIL_ACCESS_PASS", "VEIL-RUNTIME-999"],
+    ["E_UNREVIEWED", "VEIL-RUNTIME-999"],
+  ])("maps %s to the fixed %s public code", (code, expected) => {
+    expect(classifyRuntimeOperationFailure({ code, message: "must never be rendered" })).toBe(expected);
+  });
+
+  it("accepts only a reviewed additive native public code", () => {
+    expect(classifyRuntimeOperationFailure({
+      code: "E_VEIL_RUNTIME",
+      userInfo: { publicFailureCodeV1: "VEIL-PASS-002" },
+      message: "attacker-controlled native or server detail",
+    })).toBe("VEIL-PASS-002");
+    expect(classifyRuntimeOperationFailure({
+      code: "E_VEIL_SYNC",
+      userInfo: { publicFailureCodeV1: "VEIL-PASS-666" },
+    })).toBe("VEIL-RUNTIME-999");
+    expect(classifyRuntimeOperationFailure({
+      code: "E_VEIL_SYNC",
+      publicFailureCodeV1: "VEIL-SYNC-001",
+      userInfo: { publicFailureCodeV1: "VEIL-PASS-002" },
+    })).toBe("VEIL-RUNTIME-999");
+    expect(classifyRuntimeOperationFailure({
+      code: "E_VEIL_SYNC",
+      userInfo: "malformed",
+    })).toBe("VEIL-RUNTIME-999");
+  });
+
+  it("does not derive public text from malformed or attacker-controlled failures", () => {
+    expect(classifyRuntimeOperationFailure(null)).toBe("VEIL-RUNTIME-999");
+    expect(classifyRuntimeOperationFailure("E_VEIL_SYNC")).toBe("VEIL-RUNTIME-999");
+    expect(classifyRuntimeOperationFailure({ code: 7 })).toBe("VEIL-RUNTIME-999");
+  });
+
+  it("revokes a previously Ready snapshot and publishes only its reviewed code", () => {
+    const epoch = useRuntimeGateStore.getState().beginBootstrap();
+    useRuntimeGateStore.getState().commitFreshSnapshot(epoch, snapshot());
+    expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false)).toBe(true);
+    expect(useRuntimeGateStore.getState().beginOperation("connecting")).toBe(epoch);
+
+    useRuntimeGateStore.getState().failOperation(epoch, "VEIL-SYNC-001");
+
+    const failed = useRuntimeGateStore.getState();
+    expect(failed.phase).toBe("error");
+    expect(failed.snapshot).toBeNull();
+    expect(failed.requiresExplicitReopen).toBe(true);
+    expect(failed.operation).toBeNull();
+    expect(failed.publicFailureCode).toBe("VEIL-SYNC-001");
+    expect(canRenderChat(failed.snapshot, failed.requiresExplicitReopen)).toBe(false);
+
+    failed.acceptRuntimeEvent(epoch, snapshot({ runtimeRevision: 2 }));
+    expect(useRuntimeGateStore.getState().publicFailureCode).toBe("VEIL-SYNC-001");
+    expect(useRuntimeGateStore.getState().snapshot).toBeNull();
   });
 });
 

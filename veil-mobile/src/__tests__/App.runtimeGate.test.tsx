@@ -11,8 +11,16 @@ import type {
   DirectMessageProjection,
   VeilMobileRuntimeSnapshot,
 } from "../native/runtime";
+import {
+  beginNativeIdentitySetup,
+  type NativeIdentitySetupResult,
+} from "../native/identitySetup";
 import { setAuthenticatedContentReady } from "../native/screenCapture";
 import { useChatStore } from "../stores/chat";
+import {
+  resetIdentitySetupStoreForTests,
+  useIdentitySetupStore,
+} from "../stores/identitySetup";
 import {
   resetRuntimeGateStoreForTests,
   useRuntimeGateStore,
@@ -41,6 +49,13 @@ jest.mock("../native/runtime", () => ({
 
 jest.mock("../native/screenCapture", () => ({
   setAuthenticatedContentReady: jest.fn(() => Promise.resolve()),
+}));
+
+jest.mock("../native/identitySetup", () => ({
+  ...jest.requireActual<typeof import("../native/identitySetup")>(
+    "../native/identitySetup",
+  ),
+  beginNativeIdentitySetup: jest.fn(),
 }));
 
 jest.mock("../hooks/useReducedMotionPreference", () => ({
@@ -79,18 +94,16 @@ jest.mock("../screens/OnboardingScreen", () => {
   const ReactModule = jest.requireActual<typeof import("react")>("react");
   const { Pressable: NativePressable, Text: NativeText } =
     jest.requireActual<typeof import("react-native")>("react-native");
+  const { beginIdentitySetup: startIdentitySetup } =
+    jest.requireActual<typeof import("../stores/identitySetup")>("../stores/identitySetup");
   return {
     __esModule: true,
-    default: ({
-      onVerifyIdentity,
-    }: {
-      onVerifyIdentity: () => Promise<"present" | "absent" | "unknown">;
-    }) =>
+    default: () =>
       ReactModule.createElement(
         NativePressable,
         {
           testID: "mock-native-setup-committed",
-          onPress: () => void onVerifyIdentity(),
+          onPress: () => startIdentitySetup("create"),
         },
         ReactModule.createElement(NativeText, null, "ONBOARDING"),
       ),
@@ -100,8 +113,8 @@ jest.mock("../screens/OnboardingScreen", () => {
 type RuntimeMock = {
   getSnapshot: jest.Mock<() => Promise<VeilMobileRuntimeSnapshot>>;
   openSession: jest.Mock<() => Promise<VeilMobileRuntimeSnapshot>>;
-  connect: jest.Mock;
-  connectPendingAccessPass: jest.Mock;
+  connect: jest.Mock<(canonicalOrigin: string) => Promise<unknown>>;
+  connectPendingAccessPass: jest.Mock<(flowId: string) => Promise<unknown>>;
   disconnect: jest.Mock;
   lock: jest.Mock<() => Promise<VeilMobileRuntimeSnapshot>>;
   cancelPendingAccessPass: jest.Mock;
@@ -117,6 +130,9 @@ type RuntimeMock = {
 const mockRuntime = (jest.requireMock("../native/runtime") as { default: RuntimeMock }).default;
 const mockSetAuthenticatedContentReady = setAuthenticatedContentReady as jest.MockedFunction<
   typeof setAuthenticatedContentReady
+>;
+const mockBeginIdentitySetup = beginNativeIdentitySetup as jest.MockedFunction<
+  typeof beginNativeIdentitySetup
 >;
 
 const exactBinding = {
@@ -149,10 +165,12 @@ const runtimeSnapshot = (
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((settle, fail) => {
     resolve = settle;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 describe("App native runtime privacy gate", () => {
@@ -162,7 +180,9 @@ describe("App native runtime privacy gate", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     resetRuntimeGateStoreForTests();
+    resetIdentitySetupStoreForTests();
     resetMobileSettingsStoreForTests();
+    mockBeginIdentitySetup.mockResolvedValue("committed");
     useChatStore.setState({
       messagesByChannel: {
         secret: [{
@@ -191,6 +211,23 @@ describe("App native runtime privacy gate", () => {
       runtimeListener = listener;
       return { remove: jest.fn() };
     });
+  });
+
+  it.each([
+    [{ code: "E_VEIL_LOCAL_STATE", message: "private vault detail" }, "VEIL-LOCAL-003"],
+    [{ code: "E_VEIL_RUNTIME", message: "private native detail" }, "VEIL-RUNTIME-999"],
+    [new Error("unclassified private bootstrap detail"), "VEIL-RUNTIME-999"],
+  ])("classifies a failed fresh runtime snapshot as %s -> %s", async (failure, expectedCode) => {
+    mockRuntime.getSnapshot.mockRejectedValue(failure);
+
+    const view = render(<App />);
+
+    await waitFor(() => expect(view.getByTestId("runtime-error")).toBeTruthy());
+    expect(view.getByTestId("public-failure-code-v1").props.children).toBe(expectedCode);
+    expect(view.queryByText("private vault detail")).toBeNull();
+    expect(view.queryByText("private native detail")).toBeNull();
+    expect(view.queryByText("unclassified private bootstrap detail")).toBeNull();
+    expect(useRuntimeGateStore.getState().requiresExplicitReopen).toBe(true);
   });
 
   it("downgrades Ready capture for operations, privacy and the user preference", async () => {
@@ -262,6 +299,67 @@ describe("App native runtime privacy gate", () => {
     expect(mockRuntime.openSession).not.toHaveBeenCalled();
   });
 
+  it("does not let a superseded handshake failure detach the newer epoch listener", async () => {
+    const locked = runtimeSnapshot({
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    const reopened = runtimeSnapshot();
+    const staleConfirmation = deferred<VeilMobileRuntimeSnapshot>();
+    const subscriptions: {
+      listener: (snapshot: VeilMobileRuntimeSnapshot) => void;
+      remove: jest.Mock;
+    }[] = [];
+    mockRuntime.getSnapshot
+      .mockResolvedValueOnce(locked)
+      .mockReturnValueOnce(staleConfirmation.promise)
+      .mockResolvedValueOnce(reopened)
+      .mockResolvedValueOnce(reopened);
+    mockRuntime.lock.mockResolvedValue(locked);
+    mockRuntime.subscribe.mockImplementation((listener) => {
+      const subscription = { listener, remove: jest.fn() };
+      subscriptions.push(subscription);
+      return subscription;
+    });
+
+    const view = render(<App />);
+    await waitFor(() => expect(subscriptions).toHaveLength(1));
+    expect(view.getByTestId("runtime-bootstrap")).toBeTruthy();
+
+    act(() => appStateListener?.("inactive"));
+    act(() => appStateListener?.("active"));
+    await waitFor(() => expect(subscriptions).toHaveLength(2));
+    await waitFor(() => expect(useRuntimeGateStore.getState().phase).toBe("ready"));
+    expect(view.getByText("Unlock required")).toBeTruthy();
+
+    await act(async () => {
+      staleConfirmation.reject(new Error("stale private handshake detail"));
+      await Promise.resolve();
+    });
+
+    expect(subscriptions[0]?.remove).toHaveBeenCalledTimes(1);
+    expect(subscriptions[1]?.remove).not.toHaveBeenCalled();
+    expect(useRuntimeGateStore.getState().phase).toBe("ready");
+    expect(view.queryByText(/stale private handshake detail/i)).toBeNull();
+
+    act(() => subscriptions[1]?.listener(runtimeSnapshot({
+      runtimeRevision: 2,
+      directGeneration: null,
+      directContentRevision: null,
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+    })));
+    expect(useRuntimeGateStore.getState().snapshot?.sessionState).toBe("locked");
+  });
+
   it("never mounts ChatList before the verified directory is ready", async () => {
     const notReady = runtimeSnapshot({ directoryReady: false });
     mockRuntime.getSnapshot.mockResolvedValue(notReady);
@@ -326,6 +424,10 @@ describe("App native runtime privacy gate", () => {
     })));
     expect(useChatStore.getState().messagesByChannel).toEqual({});
     expect(useChatStore.getState().directGeneration).toBeNull();
+    await waitFor(() => expect(view.getByTestId("runtime-public-error")).toBeTruthy());
+    expect(view.getByTestId("public-failure-code-v1").props.children)
+      .toBe("VEIL-RUNTIME-999");
+    expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
   });
 
   it("refreshes only the explicitly selected Direct on a native content revision", async () => {
@@ -411,6 +513,88 @@ describe("App native runtime privacy gate", () => {
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
   });
 
+  it("revokes stale plaintext and renders only the reviewed code when connect fails", async () => {
+    const disconnected = runtimeSnapshot({
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(disconnected);
+    mockRuntime.lock.mockResolvedValue(disconnected);
+    mockRuntime.connect.mockRejectedValue({
+      code: "E_VEIL_SYNC",
+      message: "SECRET_SERVER_DIAGNOSTIC",
+    });
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
+
+    fireEvent.press(view.getByTestId("connect-node"));
+
+    await waitFor(() => expect(view.getByTestId("runtime-error")).toBeTruthy());
+    expect(view.getByTestId("runtime-error-scroll").props.contentContainerStyle)
+      .toMatchObject({ flexGrow: 1 });
+    expect(view.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-SYNC-001");
+    expect(view.getByText("Secure Direct sync did not complete")).toBeTruthy();
+    expect(view.queryByText("SECRET_SERVER_DIAGNOSTIC")).toBeNull();
+    expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
+    expect(useChatStore.getState().messagesByChannel).toEqual({});
+    expect(useRuntimeGateStore.getState().snapshot).toBeNull();
+    expect(mockSetAuthenticatedContentReady).toHaveBeenLastCalledWith(false);
+    expect(view.getByRole("button", { name: "Try secure verification again" })).toBeTruthy();
+  });
+
+  it("ignores an old operation failure after a new foreground epoch is Ready", async () => {
+    const locked = runtimeSnapshot({
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    const reopened = runtimeSnapshot({ directConversations: [directConversation] });
+    const oldOpen = deferred<VeilMobileRuntimeSnapshot>();
+    mockRuntime.getSnapshot.mockResolvedValue(locked);
+    mockRuntime.openSession
+      .mockReturnValueOnce(oldOpen.promise)
+      .mockResolvedValue(reopened);
+    mockRuntime.lock.mockResolvedValue(locked);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
+    fireEvent.press(view.getByTestId("unlock-account"));
+    await waitFor(() => expect(mockRuntime.openSession).toHaveBeenCalledTimes(1));
+
+    act(() => appStateListener?.("inactive"));
+    mockRuntime.getSnapshot.mockResolvedValue(reopened);
+    act(() => appStateListener?.("active"));
+    await waitFor(() => expect(view.getByText("Unlock required")).toBeTruthy());
+    fireEvent.press(view.getByTestId("unlock-account"));
+    await waitFor(() => expect(view.getByTestId("chat-runtime-ready")).toBeTruthy());
+    expect(mockRuntime.openSession).toHaveBeenCalledTimes(2);
+    expect(useChatStore.getState().runtimeBinding).toEqual(exactBinding);
+
+    await act(async () => {
+      oldOpen.reject({ code: "E_VEIL_OPEN", message: "STALE_PRIVATE_DETAIL" });
+      try {
+        await oldOpen.promise;
+      } catch {
+        // Expected: the superseded native operation failed after the new epoch.
+      }
+    });
+
+    expect(view.getByTestId("chat-runtime-ready")).toBeTruthy();
+    expect(view.queryByTestId("runtime-error")).toBeNull();
+    expect(view.queryByText("STALE_PRIVATE_DETAIL")).toBeNull();
+    expect(useRuntimeGateStore.getState().phase).toBe("ready");
+    expect(useChatStore.getState().runtimeBinding).toEqual(exactBinding);
+  });
+
   it("does not refresh or authorize when strict durable identity verification is absent", async () => {
     const noIdentity = runtimeSnapshot({
       identityExists: false,
@@ -419,6 +603,8 @@ describe("App native runtime privacy gate", () => {
       directoryReady: false,
       secureSyncState: "idle",
       binding: null,
+      directGeneration: null,
+      directContentRevision: null,
     });
     mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
     mockRuntime.lock.mockResolvedValue(noIdentity);
@@ -436,6 +622,145 @@ describe("App native runtime privacy gate", () => {
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
   });
 
+  it("returns a clean authoritative no-identity state to onboarding after foreground", async () => {
+    const noIdentity = runtimeSnapshot({
+      identityExists: false,
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
+    mockRuntime.lock.mockResolvedValue(noIdentity);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+
+    act(() => appStateListener?.("inactive"));
+    expect(view.getByTestId("privacy-curtain")).toBeTruthy();
+    act(() => appStateListener?.("active"));
+
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+    expect(view.queryByTestId("runtime-error")).toBeNull();
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+  });
+
+  it("keeps a setup result while onboarding is hidden and verifies it after foreground", async () => {
+    const noIdentity = runtimeSnapshot({
+      identityExists: false,
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    const nativeResult = deferred<NativeIdentitySetupResult>();
+    mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
+    mockRuntime.lock.mockResolvedValue(noIdentity);
+    mockRuntime.verifyIdentityPresence.mockResolvedValue(false);
+    mockBeginIdentitySetup.mockReturnValue(nativeResult.promise);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+    fireEvent.press(view.getByTestId("mock-native-setup-committed"));
+    await waitFor(() => expect(mockBeginIdentitySetup).toHaveBeenCalledWith("create"));
+
+    act(() => appStateListener?.("inactive"));
+    expect(view.queryByText("ONBOARDING")).toBeNull();
+    expect(view.getByTestId("privacy-curtain")).toBeTruthy();
+
+    await act(async () => {
+      nativeResult.resolve("interrupted");
+      await nativeResult.promise;
+      await Promise.resolve();
+    });
+    expect(mockRuntime.verifyIdentityPresence).not.toHaveBeenCalled();
+    expect(useIdentitySetupStore.getState().activeMode).toBe("create");
+
+    act(() => appStateListener?.("active"));
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+    await waitFor(() => expect(mockRuntime.verifyIdentityPresence).toHaveBeenCalledTimes(1));
+    expect(useIdentitySetupStore.getState()).toMatchObject({
+      activeMode: null,
+      publicFailureCode: "VEIL-SETUP-002",
+      restartBlocked: false,
+    });
+    expect(useIdentitySetupStore.getState().recoveryNotice).toMatch(
+      /new recovery phrase from that attempt is invalid/i,
+    );
+  });
+
+  it("preserves exact create cancellation guidance while onboarding is hidden", async () => {
+    const noIdentity = runtimeSnapshot({
+      identityExists: false,
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    const nativeResult = deferred<NativeIdentitySetupResult>();
+    mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
+    mockRuntime.lock.mockResolvedValue(noIdentity);
+    mockBeginIdentitySetup.mockReturnValue(nativeResult.promise);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+    fireEvent.press(view.getByTestId("mock-native-setup-committed"));
+    act(() => appStateListener?.("inactive"));
+
+    await act(async () => {
+      nativeResult.resolve("user_cancelled");
+      await nativeResult.promise;
+      await Promise.resolve();
+    });
+    expect(mockRuntime.verifyIdentityPresence).not.toHaveBeenCalled();
+    expect(useIdentitySetupStore.getState()).toMatchObject({
+      activeMode: null,
+      publicFailureCode: null,
+      restartBlocked: false,
+    });
+    expect(useIdentitySetupStore.getState().recoveryNotice).toMatch(
+      /new recovery phrase was shown, it was not committed and must be destroyed/i,
+    );
+
+    act(() => appStateListener?.("active"));
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+    expect(useIdentitySetupStore.getState().recoveryNotice).toMatch(/must be destroyed/i);
+  });
+
+  it("never treats an error snapshot with identity false as clean setup absence", async () => {
+    const uncertainAbsence = runtimeSnapshot({
+      identityExists: false,
+      runtimeRevision: 0,
+      directGeneration: null,
+      directContentRevision: null,
+      sessionState: "error",
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      directConversations: [],
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(uncertainAbsence);
+    mockRuntime.lock.mockResolvedValue(uncertainAbsence);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("runtime-error")).toBeTruthy());
+
+    expect(view.getByTestId("public-failure-code-v1").props.children)
+      .toBe("VEIL-RUNTIME-999");
+    expect(view.queryByText("ONBOARDING")).toBeNull();
+    expect(view.queryByTestId("mock-native-setup-committed")).toBeNull();
+  });
+
   it("refreshes native authority only after strict durable identity verification is present", async () => {
     const noIdentity = runtimeSnapshot({
       identityExists: false,
@@ -444,6 +769,8 @@ describe("App native runtime privacy gate", () => {
       directoryReady: false,
       secureSyncState: "idle",
       binding: null,
+      directGeneration: null,
+      directContentRevision: null,
     });
     mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
     mockRuntime.lock.mockResolvedValue(noIdentity);

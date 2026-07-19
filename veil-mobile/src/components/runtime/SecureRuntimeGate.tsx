@@ -13,6 +13,8 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 
 import { PhaseShiftMark } from "../brand/PhaseShiftMark";
+import { PublicFailureCard } from "./PublicFailureCard";
+import type { PublicFailureCodeV1 } from "../../contracts/publicFailureCodesV1";
 import { colors, radii, spacing, typography } from "../../lib/theme";
 import type { VeilMobileRuntimeSnapshot } from "../../native/runtime";
 import {
@@ -24,7 +26,7 @@ interface SecureRuntimeGateProps {
   snapshot: VeilMobileRuntimeSnapshot;
   requiresExplicitReopen: boolean;
   operation: RuntimeOperation;
-  publicError: string | null;
+  publicFailureCode: PublicFailureCodeV1 | null;
   reducedMotion: boolean;
   onUnlock: () => void;
   onConnect: (canonicalOrigin: string) => void;
@@ -39,7 +41,7 @@ export function SecureRuntimeGate({
   snapshot,
   requiresExplicitReopen,
   operation,
-  publicError,
+  publicFailureCode,
   reducedMotion,
   onUnlock,
   onConnect,
@@ -181,14 +183,9 @@ export function SecureRuntimeGate({
             <Text accessibilityRole="header" style={styles.cardTitle}>{status.title}</Text>
             <Text style={styles.cardBody}>{status.body}</Text>
 
-            {publicError ? (
-              <View
-                testID="runtime-public-error"
-                accessibilityRole="alert"
-                accessibilityLiveRegion="assertive"
-                style={styles.errorBox}
-              >
-                <Text style={styles.errorText}>{publicError}</Text>
+            {publicFailureCode ? (
+              <View testID="runtime-public-error">
+                <PublicFailureCard code={publicFailureCode} compact />
               </View>
             ) : null}
 
@@ -401,16 +398,6 @@ const styles = StyleSheet.create({
   buttonDisabled: { opacity: 0.46 },
   buttonText: { color: "#fff", fontSize: 15, fontWeight: "800", textAlign: "center" },
   secondaryButtonText: { color: colors.textMd },
-  errorBox: {
-    minHeight: 48,
-    justifyContent: "center",
-    borderRadius: radii.md,
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: colors.destructiveBorder,
-    backgroundColor: colors.destructiveBg,
-    padding: spacing.md,
-  },
-  errorText: { color: colors.destructive, fontSize: 14, lineHeight: 20 },
   bindingBox: {
     gap: spacing.sm,
     borderTopWidth: StyleSheet.hairlineWidth,

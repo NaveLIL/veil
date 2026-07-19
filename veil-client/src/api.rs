@@ -290,6 +290,8 @@ pub enum DirectSendErrorV1 {
 pub enum MobileConnectStopV1 {
     RetryableTransport,
     AuthenticationRejected,
+    RegistrationClosed,
+    InviteInvalid,
     EpochInvalid,
     StorageUncertain,
 }
@@ -314,6 +316,8 @@ impl MobileConnectErrorV1 {
             ConnectionConnectStopV1::AuthenticationRejected => {
                 MobileConnectStopV1::AuthenticationRejected
             }
+            ConnectionConnectStopV1::RegistrationClosed => MobileConnectStopV1::RegistrationClosed,
+            ConnectionConnectStopV1::InviteInvalid => MobileConnectStopV1::InviteInvalid,
             ConnectionConnectStopV1::EpochInvalid => MobileConnectStopV1::EpochInvalid,
         };
         Self::new(stop, error.detail)
@@ -9003,6 +9007,39 @@ impl Drop for VeilClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_connect_preserves_typed_connection_stop_reasons() {
+        for (connection_stop, mobile_stop) in [
+            (
+                ConnectionConnectStopV1::RetryableTransport,
+                MobileConnectStopV1::RetryableTransport,
+            ),
+            (
+                ConnectionConnectStopV1::AuthenticationRejected,
+                MobileConnectStopV1::AuthenticationRejected,
+            ),
+            (
+                ConnectionConnectStopV1::RegistrationClosed,
+                MobileConnectStopV1::RegistrationClosed,
+            ),
+            (
+                ConnectionConnectStopV1::InviteInvalid,
+                MobileConnectStopV1::InviteInvalid,
+            ),
+            (
+                ConnectionConnectStopV1::EpochInvalid,
+                MobileConnectStopV1::EpochInvalid,
+            ),
+        ] {
+            let mapped = MobileConnectErrorV1::from_connection(ConnectionConnectErrorV1 {
+                stop: connection_stop,
+                detail: "private diagnostic".to_string(),
+            });
+            assert_eq!(mapped.stop, mobile_stop);
+            assert_eq!(mapped.detail, "private diagnostic");
+        }
+    }
 
     #[tokio::test]
     async fn metadata_access_pass_boundary_is_exact_before_networking() {
