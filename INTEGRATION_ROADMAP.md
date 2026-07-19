@@ -41,10 +41,11 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
    desktop/transport foundation не заменяет physical attachment и native mobile
    push device matrices.
 6. Продолжить Android Direct Preview: foundation/runtime 5A, receive/read,
-   one-shot peer-prekey, shared idempotent send/outbox, typed ACK deadline и
-   transient-only reconnect уже опубликованы. Ближайший незакрытый gate —
-   canonical-origin process-death recovery, затем physical matrix и подписанный
-   tester APK. Точный checkpoint приведён в Phase 5.
+   one-shot peer-prekey, shared idempotent send/outbox, typed ACK deadline,
+   transient reconnect и automated canonical-origin process-death recovery уже
+   реализованы и проверены. Ближайший незакрытый gate — physical
+   process-death/airplane matrix и подписанный tester APK. Точный checkpoint
+   приведён в Phase 5.
 7. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
@@ -60,8 +61,8 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
-| 5A | Android foundation | core runtime подключён: Keystore/SQLCipher, Node Access Pass, authenticated origin-bound sync; signed standalone APK и physical matrix открыты |
-| 5B | Android messaging | receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK и transient reconnect опубликованы; process-death/physical matrix открыты |
+| 5A | Android foundation | core runtime подключён: Keystore/SQLCipher, Node Access Pass, authenticated origin-bound sync и fail-closed process-death target; signed standalone APK и physical matrix открыты |
+| 5B | Android messaging | receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и automated process-death recovery готовы; physical matrix открыта |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -1448,7 +1449,7 @@ Kotlin-owned transient reconnect зафиксирован отдельным cod
 
 ### Phase 5A — Android foundation
 
-**Foundation checkpoint 2026-07-18: в работе.** Android project теперь
+**Foundation checkpoint 2026-07-19: в работе.** Android project теперь
 versioned; Rust/UniFFI воспроизводимо собирается для `arm64-v8a` и `x86_64`.
 Удалён runtime crypto mock и raw sign/AEAD JS surface, release больше не может
 подписываться debug key. Recovery phrase хранится через Android Keystore-wrapped
@@ -1456,8 +1457,9 @@ AES-GCM vault, backup отключён, secret screens используют `FLA
 clipboard удалён и добавлено подтверждение слов. Состояния local identity и
 native failure разделены. Это закрывает первый пункт и часть пунктов 3–5 ниже,
 а SQLCipher, lifecycle lock policy и authenticated mobile runtime теперь
-подключены. Process-death recovery, standalone signing и physical matrix остаются
-открыты и не позволяют считать 5A завершённой.
+подключены. Fail-closed canonical-origin process-death recovery реализован и
+прошёл automated gate; standalone signing и physical matrix остаются открыты и
+не позволяют считать 5A завершённой.
 
 1. Воспроизводимый Rust build для `arm64-v8a` и `x86_64`, Expo config plugin
    либо versioned native Android project, плюс mobile CI.
@@ -1472,7 +1474,8 @@ native failure разделены. Это закрывает первый пун
    `directoryReady`; текущий `isAuthenticated` слишком грубый.
 6. Реальный endpoint config, certificate validation, signed REST/WS, offline
    outbox и атомарные crypto+message SQLCipher transactions подключены;
-   transient-only reconnect подключён, process-death recovery остаётся открытым.
+   transient reconnect и automated process-death recovery подключены. Реальная
+   airplane/process-kill matrix остаётся release evidence.
 7. Enrollment второго устройства и revoke flow как prerequisite для групп,
    server channels и MLS.
 8. Android Back закрывает dialog/sheet, затем возвращает к Rooms/Spaces либо
@@ -1494,9 +1497,20 @@ native failure разделены. Это закрывает первый пун
 **Direct text checkpoint 2026-07-19: частично готов.** Настоящие Direct list,
 authenticated history, bounded live receive, native projection, X3DH one-shot
 peer-prekey и idempotent SQLCipher-owned send/outbox опубликованы в цепочке
-`029d1e3`…`62451eb`. Typed ACK deadline и transient reconnect опубликованы;
-process-death/airplane physical matrix, private groups и остальные пункты 5B не
-готовы.
+`029d1e3`…`62451eb`. Typed ACK deadline, transient reconnect и automated
+process-death recovery реализованы; process-death/airplane physical matrix,
+private groups и остальные пункты 5B не готовы.
+
+Process-death contract хранит в SQLCipher только singleton
+`canonical_server_origin + expected_user_id`, выбранный атомарно вместе с
+immutable authenticated-self binding после успешной mobile-аутентификации.
+Node Access Pass, WebSocket URL и ключи не персистятся. При новом процессе Rust
+повторно проверяет canonical origin, exact user, self binding и текущие
+mnemonic-derived identity/signing keys; legacy БД без явного singleton не
+угадывает target. Android создаёт один zero-delay plain reconnect, сохраняет
+typed backoff с ordinal 0 после первой разрешённой ошибки и линейно уступает
+новому staged Pass. Manual disconnect остаётся non-destructive и сохраняет
+target; отдельного `Forget Node / remain offline` API пока нет.
 
 1. Сначала один честный Desktop ↔ Android DM: X3DH/Double Ratchet, history sync,
    ack/outbox, reconnect, airplane mode и process death.

@@ -38,6 +38,7 @@ import uniffi.veil_ffi.MobileDirectRestRequest
 import uniffi.veil_ffi.MobileDirectSendReadiness
 import uniffi.veil_ffi.MobileDirectSyncLease
 import uniffi.veil_ffi.MobileDirectTextSendOutcome
+import uniffi.veil_ffi.MobileReconnectTarget
 import uniffi.veil_ffi.MobileRetryableReason
 import uniffi.veil_ffi.RestSignatureData
 import uniffi.veil_ffi.VeilException
@@ -89,12 +90,18 @@ internal enum class NativeReconnectStage {
   TERMINATING,
 }
 
+internal enum class NativeReconnectTrigger {
+  STORED_TARGET,
+  RETRYABLE_FAILURE,
+}
+
 @VisibleForTesting
 internal data class NativeReconnectPlanDebug(
-  val reason: NativeMobileRetryableReason,
-  val failureOrdinal: Int,
+  val reason: NativeMobileRetryableReason?,
+  val failureOrdinal: Int?,
   val delayMillis: Long,
   val stage: NativeReconnectStage,
+  val trigger: NativeReconnectTrigger = NativeReconnectTrigger.RETRYABLE_FAILURE,
 )
 
 internal enum class NativeDirectDirectoryState {
@@ -137,6 +144,15 @@ internal data class PublicAuthenticatedBinding(
   val canonicalServerOrigin: String,
   val userId: String,
 )
+
+/** SQLCipher-owned reconnect selection. It is never a live binding or JS DTO. */
+internal data class NativeMobileReconnectTarget(
+  val canonicalServerOrigin: String,
+  val expectedUserId: String,
+) {
+  override fun toString(): String =
+    "NativeMobileReconnectTarget(canonicalServerOrigin=[REDACTED], expectedUserId=[REDACTED])"
+}
 
 /**
  * Native-only capability for one authenticated Direct sync generation.
@@ -500,6 +516,8 @@ internal fun interface NativeConnectCancellationFactory {
 }
 
 internal interface NativeMobileSession : AutoCloseable {
+  fun mobileReconnectTarget(): NativeMobileReconnectTarget?
+
   fun connect(
     websocketUrl: String,
     canonicalOrigin: String,
@@ -640,6 +658,8 @@ internal class VeilMobileRuntime internal constructor(
   // encrypted account before any visible Veil surface exists.
   private var foreground = false
   private var lifecycleEpoch = 0L
+  /** Successful process-local Pass staging linearizes against stored recovery. */
+  private var enrollmentIntentEpoch = 0L
   private var publicSnapshotRevision = 0L
   private var directGenerationCounter = 0L
   private var activeConnect: ActiveConnect? = null
@@ -684,9 +704,16 @@ internal class VeilMobileRuntime internal constructor(
     val epoch: Long,
     val origin: CanonicalServerOrigin,
     val expectedUserId: String,
+    val startedFromStoredTarget: Boolean,
+    val enrollmentIntentEpochAtStart: Long,
   ) {
     var failureCount = 0
   }
+
+  private data class StoredReconnectSelection(
+    val origin: CanonicalServerOrigin,
+    val expectedUserId: String,
+  )
 
   private class ActiveReconnect(
     val backoffScope: ReconnectBackoffScope,
@@ -694,17 +721,29 @@ internal class VeilMobileRuntime internal constructor(
     val epoch: Long,
     val origin: CanonicalServerOrigin,
     val expectedUserId: String,
-    val reason: NativeMobileRetryableReason,
-    val failureOrdinal: Int,
+    val trigger: NativeReconnectTrigger,
+    val reason: NativeMobileRetryableReason?,
+    val failureOrdinal: Int?,
     val delayMillis: Long,
   ) {
+    init {
+      check(
+        if (trigger == NativeReconnectTrigger.STORED_TARGET) {
+          reason == null && failureOrdinal == null && delayMillis == 0L
+        } else {
+          reason != null && failureOrdinal != null
+        },
+      ) { "Reconnect trigger metadata is inconsistent" }
+    }
+
     var stage = NativeReconnectStage.WAITING
     var scheduledFuture: ScheduledFuture<*>? = null
     var cancellation: NativeConnectCancellation? = null
 
     override fun toString(): String =
       "ActiveReconnect(epoch=$epoch, origin=${origin.value}, expectedUserId=[REDACTED], " +
-        "reason=$reason, failureOrdinal=$failureOrdinal, delayMillis=$delayMillis, stage=$stage)"
+        "trigger=$trigger, reason=$reason, failureOrdinal=$failureOrdinal, " +
+        "delayMillis=$delayMillis, stage=$stage)"
   }
 
   private class DirectProjectionTarget(
@@ -919,12 +958,34 @@ internal class VeilMobileRuntime internal constructor(
 
   fun consumeEnrollmentUri(raw: String): Boolean {
     if (!NodeAccessPassParser.isPotentialEnrollment(raw)) return false
-    try {
+    val staged = try {
       passStore.stage(raw)
+      true
     } catch (_: Throwable) {
       // Enrollment errors are deliberately generic. Never attach the raw URI
       // or parser input to logs, crash metadata, or a React Native event.
+      false
     }
+    val suppressed = if (staged) synchronized(stateLock) {
+      enrollmentIntentEpoch += 1L
+      val plan = activeReconnect
+      if (
+        plan != null &&
+        plan.backoffScope.startedFromStoredTarget &&
+        (plan.stage == NativeReconnectStage.WAITING || plan.stage == NativeReconnectStage.CONNECTING)
+      ) {
+        cancelActiveReconnectLocked()
+        if (reconnectBackoffScope === plan.backoffScope) reconnectBackoffScope = null
+        connectionState = NativeConnectionState.DISCONNECTED
+        binding = null
+        plan
+      } else {
+        null
+      }
+    } else {
+      null
+    }
+    suppressed?.let(::scheduleSuppressedStoredReconnectTeardown)
     publishSnapshot()
     return true
   }
@@ -941,6 +1002,7 @@ internal class VeilMobileRuntime internal constructor(
         failureOrdinal = plan.failureOrdinal,
         delayMillis = plan.delayMillis,
         stage = plan.stage,
+        trigger = plan.trigger,
       )
     }
   }
@@ -1542,7 +1604,7 @@ internal class VeilMobileRuntime internal constructor(
   }
 
   fun openSession(): VeilMobileRuntimeSnapshot {
-    val openingEpoch = synchronized(stateLock) {
+    val (openingEpoch, openingEnrollmentIntentEpoch) = synchronized(stateLock) {
       if (!foreground) {
         throw VeilMobileRuntimeException("E_VEIL_LOCKED", "Return to Veil before opening the local account")
       }
@@ -1567,7 +1629,7 @@ internal class VeilMobileRuntime internal constructor(
       directDirectoryState = NativeDirectDirectoryState.IDLE
       directHistoryState = NativeDirectHistoryState.IDLE
       directConversations = emptyList()
-      lifecycleEpoch
+      Pair(lifecycleEpoch, enrollmentIntentEpoch)
     }
     publishSnapshot()
 
@@ -1592,6 +1654,42 @@ internal class VeilMobileRuntime internal constructor(
       throw VeilMobileRuntimeException("E_VEIL_OPEN", "Unable to open the encrypted local account")
     }
 
+    val storedTarget = try {
+      candidate.mobileReconnectTarget()?.toStoredReconnectSelection()
+    } catch (_: Throwable) {
+      candidate.closeQuietly()
+      synchronized(stateLock) {
+        if (foreground && lifecycleEpoch == openingEpoch && session == null) {
+          sessionState = NativeSessionState.ERROR
+          connectionState = NativeConnectionState.DISCONNECTED
+          binding = null
+          directoryReady = false
+          ownPreKeyState = NativeOwnPreKeyState.IDLE
+          directDirectoryState = NativeDirectDirectoryState.IDLE
+          directHistoryState = NativeDirectHistoryState.IDLE
+          directConversations = emptyList()
+        }
+      }
+      publishSnapshot()
+      throw VeilMobileRuntimeException("E_VEIL_OPEN", "Unable to open the encrypted local account")
+    }
+    // A process-local Access Pass represents a newer explicit enrollment
+    // intent. Keep the old durable target intact, but do not let its zero-delay
+    // plain reconnect race and consume the single serialized transport before
+    // the UI can submit the Pass. An unreadable Pass store suppresses recovery
+    // fail-closed for this open; it never authorizes a network request.
+    val effectiveStoredTarget = if (storedTarget == null) {
+      null
+    } else {
+      val pendingPassAbsent = try {
+        passStore.snapshot() == null
+      } catch (_: Throwable) {
+        false
+      }
+      storedTarget.takeIf { pendingPassAbsent }
+    }
+
+    var initialReconnect: ActiveReconnect? = null
     val installed = synchronized(stateLock) {
       if (
         foreground &&
@@ -1601,7 +1699,24 @@ internal class VeilMobileRuntime internal constructor(
       ) {
         session = candidate
         sessionState = NativeSessionState.OPEN
-        connectionState = NativeConnectionState.DISCONNECTED
+        if (
+          effectiveStoredTarget == null ||
+          enrollmentIntentEpoch != openingEnrollmentIntentEpoch
+        ) {
+          connectionState = NativeConnectionState.DISCONNECTED
+        } else {
+          val scope = reconnectBackoffScopeForLocked(
+            session = candidate,
+            epoch = openingEpoch,
+            origin = effectiveStoredTarget.origin,
+            expectedUserId = effectiveStoredTarget.expectedUserId,
+            startedFromStoredTarget = true,
+            enrollmentIntentEpochAtStart = openingEnrollmentIntentEpoch,
+          )
+          initialReconnect = createStoredTargetReconnectPlanLocked(scope)
+          activeReconnect = initialReconnect
+          connectionState = NativeConnectionState.CONNECTING
+        }
         true
       } else {
         false
@@ -1612,7 +1727,9 @@ internal class VeilMobileRuntime internal constructor(
       publishSnapshot()
       throw VeilMobileRuntimeException("E_VEIL_LOCKED", "The local account was locked while opening")
     }
-    return publishSnapshot()
+    publishSnapshot()
+    initialReconnect?.let(::scheduleReconnectPlan)
+    return snapshot()
   }
 
   fun connect(rawOrigin: String): PublicAuthenticatedBinding {
@@ -1806,11 +1923,7 @@ internal class VeilMobileRuntime internal constructor(
     authenticated: PublicAuthenticatedBinding,
     expectedOrigin: CanonicalServerOrigin,
   ) {
-    val canonicalUserId = try {
-      UUID.fromString(authenticated.userId).toString()
-    } catch (_: IllegalArgumentException) {
-      null
-    }
+    val canonicalUserId = canonicalNonNilUserIdOrNull(authenticated.userId)
     if (
       authenticated.canonicalServerOrigin != expectedOrigin.value ||
       canonicalUserId != authenticated.userId
@@ -1820,6 +1933,29 @@ internal class VeilMobileRuntime internal constructor(
         "Unable to authenticate with the Veil Node",
       )
     }
+  }
+
+  private fun NativeMobileReconnectTarget.toStoredReconnectSelection(): StoredReconnectSelection {
+    val origin = CanonicalServerOrigin.parse(canonicalServerOrigin)
+    check(origin.value == canonicalServerOrigin) { "persisted mobile reconnect origin is not canonical" }
+    val canonicalUserId = checkNotNull(canonicalNonNilUserIdOrNull(expectedUserId)) {
+      "persisted mobile reconnect user ID is not canonical"
+    }
+    return StoredReconnectSelection(origin, canonicalUserId)
+  }
+
+  private fun canonicalNonNilUserIdOrNull(raw: String): String? = try {
+    val parsed = UUID.fromString(raw)
+    if (
+      parsed.mostSignificantBits == 0L && parsed.leastSignificantBits == 0L ||
+      parsed.toString() != raw
+    ) {
+      null
+    } else {
+      raw
+    }
+  } catch (_: IllegalArgumentException) {
+    null
   }
 
   /** Caller holds [stateLock]. */
@@ -2654,12 +2790,37 @@ internal class VeilMobileRuntime internal constructor(
     reason: NativeMobileRetryableReason,
   ): PreparedReconnect? {
     if (!isCurrentDirectSyncLocked(sync)) return null
-    val scope = reconnectBackoffScopeForLocked(
+    val reconnectOwner = activeReconnect
+    val bootstrapScope = if (reconnectOwner == null) {
+      null
+    } else {
+      if (
+        reconnectOwner.stage != NativeReconnectStage.BOOTSTRAPPING ||
+        reconnectOwner.session !== sync.session ||
+        reconnectOwner.epoch != sync.epoch ||
+        reconnectOwner.origin != sync.origin ||
+        reconnectOwner.expectedUserId != sync.userId ||
+        reconnectBackoffScope !== reconnectOwner.backoffScope
+      ) {
+        return null
+      }
+      reconnectOwner.backoffScope
+    }
+    val scope = bootstrapScope ?: reconnectBackoffScopeForLocked(
       session = sync.session,
       epoch = sync.epoch,
       origin = sync.origin,
       expectedUserId = sync.userId,
     )
+    // Staging a newer Pass is review intent, so it must not tear down an
+    // already-authenticated bootstrap. It does, however, revoke authority to
+    // create another stored-origin transport if that bootstrap later fails.
+    if (
+      scope.startedFromStoredTarget &&
+      scope.enrollmentIntentEpochAtStart != enrollmentIntentEpoch
+    ) {
+      return null
+    }
     cancelActiveReconnectLocked()
     val detached = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
     connectionState = NativeConnectionState.CONNECTING
@@ -2675,6 +2836,8 @@ internal class VeilMobileRuntime internal constructor(
     epoch: Long,
     origin: CanonicalServerOrigin,
     expectedUserId: String,
+    startedFromStoredTarget: Boolean = false,
+    enrollmentIntentEpochAtStart: Long = enrollmentIntentEpoch,
   ): ReconnectBackoffScope {
     val current = reconnectBackoffScope
     if (
@@ -2686,9 +2849,14 @@ internal class VeilMobileRuntime internal constructor(
     ) {
       return current
     }
-    return ReconnectBackoffScope(session, epoch, origin, expectedUserId).also { replacement ->
-      reconnectBackoffScope = replacement
-    }
+    return ReconnectBackoffScope(
+      session,
+      epoch,
+      origin,
+      expectedUserId,
+      startedFromStoredTarget,
+      enrollmentIntentEpochAtStart,
+    ).also { replacement -> reconnectBackoffScope = replacement }
   }
 
   /** Caller holds [stateLock]. */
@@ -2710,11 +2878,27 @@ internal class VeilMobileRuntime internal constructor(
       epoch = scope.epoch,
       origin = scope.origin,
       expectedUserId = scope.expectedUserId,
+      trigger = NativeReconnectTrigger.RETRYABLE_FAILURE,
       reason = reason,
       failureOrdinal = failureOrdinal,
       delayMillis = sampledMillis,
     )
   }
+
+  /** Caller holds [stateLock]. Initial process recovery consumes no backoff step. */
+  private fun createStoredTargetReconnectPlanLocked(
+    scope: ReconnectBackoffScope,
+  ): ActiveReconnect = ActiveReconnect(
+    backoffScope = scope,
+    session = scope.session,
+    epoch = scope.epoch,
+    origin = scope.origin,
+    expectedUserId = scope.expectedUserId,
+    trigger = NativeReconnectTrigger.STORED_TARGET,
+    reason = null,
+    failureOrdinal = null,
+    delayMillis = 0L,
+  )
 
   private fun reconnectDelayCapMillis(failureOrdinal: Int): Long {
     var capMillis = RECONNECT_BASE_DELAY_MILLIS
@@ -2797,6 +2981,33 @@ internal class VeilMobileRuntime internal constructor(
       }
     }
     if (!retained) future.cancel(false)
+  }
+
+  /**
+   * A newly staged Pass may cancel a stored-target connect while native code
+   * is returning. Serialize one exact-owner disconnect behind that operation
+   * so even a cancellation-ignoring adapter cannot leave a hidden old socket.
+   */
+  private fun scheduleSuppressedStoredReconnectTeardown(plan: ActiveReconnect) {
+    val teardown = Runnable {
+      disconnectTransportQuietlyIf(plan.session) {
+        foreground &&
+          lifecycleEpoch == plan.epoch &&
+          session === plan.session &&
+          sessionState == NativeSessionState.OPEN &&
+          activeConnect == null &&
+          activeReconnect == null &&
+          activeDirectBootstrap == null &&
+          activeDirectSync == null &&
+          connectionState == NativeConnectionState.DISCONNECTED &&
+          binding == null
+      }
+    }
+    try {
+      executor.execute(teardown)
+    } catch (_: RuntimeException) {
+      teardown.run()
+    }
   }
 
   private fun runReconnectPlan(plan: ActiveReconnect) {
@@ -3481,6 +3692,9 @@ private class UniFfiConnectCancellation(
 private class UniFfiMobileSession(
   private val delegate: VeilMobileSession,
 ) : NativeMobileSession {
+  override fun mobileReconnectTarget(): NativeMobileReconnectTarget? =
+    delegate.mobileReconnectTarget()?.toNativeMobileReconnectTarget()
+
   override fun connect(
     websocketUrl: String,
     canonicalOrigin: String,
@@ -3623,6 +3837,12 @@ private fun NativeConnectCancellation.cancelQuietly() {
 
 private fun MobileAuthenticatedBinding.toPublicBinding(): PublicAuthenticatedBinding =
   PublicAuthenticatedBinding(canonicalServerOrigin = canonicalServerOrigin, userId = userId)
+
+private fun MobileReconnectTarget.toNativeMobileReconnectTarget(): NativeMobileReconnectTarget =
+  NativeMobileReconnectTarget(
+    canonicalServerOrigin = canonicalServerOrigin,
+    expectedUserId = expectedUserId,
+  )
 
 internal fun MobileDirectSyncLease.toNativeDirectSyncLease(): NativeDirectSyncLease =
   NativeDirectSyncLease(

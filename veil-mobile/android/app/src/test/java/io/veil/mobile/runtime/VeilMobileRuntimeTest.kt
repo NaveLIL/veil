@@ -68,6 +68,564 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun openSessionWithoutStoredTargetStaysDisconnectedAndNeverTouchesNetwork() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession)
+    try {
+      val opened = runtime.openSession()
+
+      assertEquals(NativeSessionState.OPEN, opened.sessionState)
+      assertEquals(NativeConnectionState.DISCONNECTED, opened.connectionState)
+      assertNull(opened.binding)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(1, fakeSession.storedReconnectTargetLoadCount)
+      assertEquals(0, fakeSession.plainConnectCount)
+      assertEquals(0, fakeSession.accessPassConnectCount)
+      assertEquals(0, executor.immediateScheduleCount())
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun storedTargetCreatesOneImmediatePlainReconnectWithoutPublishingABindingEarly() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://resume.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val runtime = runtime(executor, fakeSession)
+    try {
+      val opened = runtime.openSession()
+
+      assertEquals(NativeSessionState.OPEN, opened.sessionState)
+      assertEquals(NativeConnectionState.CONNECTING, opened.connectionState)
+      assertNull(opened.binding)
+      assertEquals(
+        NativeReconnectPlanDebug(
+          reason = null,
+          failureOrdinal = null,
+          delayMillis = 0L,
+          stage = NativeReconnectStage.WAITING,
+          trigger = NativeReconnectTrigger.STORED_TARGET,
+        ),
+        runtime.reconnectPlanForTesting(),
+      )
+      assertEquals(1, executor.immediateScheduleCount())
+      assertEquals(0, fakeSession.plainConnectCount)
+      assertEquals(0, fakeSession.accessPassConnectCount)
+
+      // Reopening the same installed SQLCipher handle cannot create another
+      // stored-target owner or read native recovery state a second time.
+      assertEquals(NativeConnectionState.CONNECTING, runtime.openSession().connectionState)
+      assertEquals(1, fakeSession.storedReconnectTargetLoadCount)
+      assertEquals(1, executor.immediateScheduleCount())
+
+      executor.runCapturedImmediateTask()
+
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(0, fakeSession.accessPassConnectCount)
+      assertEquals("wss://resume.example:443/ws", fakeSession.websocketUrl)
+      assertEquals("https://resume.example:443", fakeSession.canonicalOrigin)
+      assertEquals(NativeConnectionState.CONNECTED, runtime.snapshot().connectionState)
+      assertEquals(USER_ID, runtime.snapshot().binding?.userId)
+      assertEquals(1, fakeSession.directSyncBeginCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun pendingAccessPassSuppressesOldStoredTargetUntilTheExplicitPassAttempt() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://old.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val passStore = deterministicPassStore()
+    val runtime = runtime(executor, fakeSession, passStore)
+    val tokenBytes = ByteArray(32) { 0x6d.toByte() }
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+    try {
+      assertTrue(runtime.consumeEnrollmentUri("https://new.example/enroll#invite=$token"))
+      val pending = checkNotNull(runtime.snapshot().pendingAccessPass)
+
+      val opened = runtime.openSession()
+      assertEquals(NativeConnectionState.DISCONNECTED, opened.connectionState)
+      assertNull(opened.binding)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(0, executor.immediateScheduleCount())
+      assertEquals(0, fakeSession.plainConnectCount)
+
+      runtime.connectPendingAccessPass(pending.flowId)
+
+      assertEquals(0, fakeSession.plainConnectCount)
+      assertEquals(1, fakeSession.accessPassConnectCount)
+      assertArrayEquals(tokenBytes, fakeSession.lastAccessPass)
+      assertEquals("https://new.example:443", fakeSession.canonicalOrigin)
+      assertNull(runtime.snapshot().pendingAccessPass)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun stagingPassAfterOpenCancelsQueuedStoredRecoveryBeforeOldOriginCanConnect() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://old.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val runtime = runtime(executor, fakeSession, deterministicPassStore())
+    val tokenBytes = ByteArray(32) { 0x6e.toByte() }
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+    try {
+      assertEquals(NativeConnectionState.CONNECTING, runtime.openSession().connectionState)
+      assertTrue(runtime.consumeEnrollmentUri("https://new.example/enroll#invite=$token"))
+      val pending = checkNotNull(runtime.snapshot().pendingAccessPass)
+
+      assertEquals(NativeConnectionState.DISCONNECTED, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertNull(runtime.reconnectPlanForTesting())
+
+      // FIFO contains the cancelled stored plan followed by its exact-owner
+      // transport teardown. Neither may authenticate the old origin.
+      executor.runCapturedImmediateTask()
+      executor.runCapturedImmediateTask()
+      assertEquals(0, fakeSession.plainConnectCount)
+      assertEquals(0, fakeSession.accessPassConnectCount)
+
+      runtime.connectPendingAccessPass(pending.flowId)
+      assertEquals(0, fakeSession.plainConnectCount)
+      assertEquals(1, fakeSession.accessPassConnectCount)
+      assertArrayEquals(tokenBytes, fakeSession.lastAccessPass)
+      assertEquals("https://new.example:443", runtime.snapshot().binding?.canonicalServerOrigin)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun stagingPassDuringStoredTargetLoadSuppressesRecoveryAtSessionInstall() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val loadEntered = CountDownLatch(1)
+    val loadRelease = CountDownLatch(1)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://old.example:443",
+        expectedUserId = USER_ID,
+      )
+      storedReconnectTargetLoadEntered = loadEntered
+      storedReconnectTargetLoadRelease = loadRelease
+    }
+    val runtime = runtime(executor, fakeSession, deterministicPassStore())
+    val opened = AtomicReference<VeilMobileRuntimeSnapshot>()
+    val openError = AtomicReference<Throwable?>()
+    val opener = thread(name = "stored-target-pass-race") {
+      try {
+        opened.set(runtime.openSession())
+      } catch (error: Throwable) {
+        openError.set(error)
+      }
+    }
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 0x6f })
+    try {
+      assertTrue("stored target load did not begin", loadEntered.await(5, TimeUnit.SECONDS))
+      assertTrue(runtime.consumeEnrollmentUri("https://new.example/enroll#invite=$token"))
+      loadRelease.countDown()
+      opener.join(TimeUnit.SECONDS.toMillis(5))
+
+      assertFalse("stored target opener did not finish", opener.isAlive)
+      assertNull(openError.get())
+      assertEquals(NativeSessionState.OPEN, opened.get()?.sessionState)
+      assertEquals(NativeConnectionState.DISCONNECTED, opened.get()?.connectionState)
+      assertNull(opened.get()?.binding)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(0, executor.immediateScheduleCount())
+      assertEquals(0, fakeSession.plainConnectCount)
+      assertTrue(runtime.snapshot().pendingAccessPass != null)
+    } finally {
+      loadRelease.countDown()
+      opener.join(TimeUnit.SECONDS.toMillis(5))
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun stagingPassCancelsConnectingStoredRecoveryEvenIfAdapterReturnsLateSuccess() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://old.example:443",
+        expectedUserId = USER_ID,
+      )
+      blockPlainConnectOnCount = 1
+      succeedBlockedPlainConnectAfterCancellation = true
+    }
+    val runtime = runtime(executor, fakeSession, deterministicPassStore())
+    val reconnect = AtomicReference<Thread>()
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 0x70 })
+    try {
+      runtime.openSession()
+      reconnect.set(thread(name = "stored-target-connect-pass-race") {
+        executor.runCapturedImmediateTask()
+      })
+      assertTrue(
+        "stored reconnect did not enter native connect",
+        fakeSession.blockedPlainConnectEntered.await(5, TimeUnit.SECONDS),
+      )
+
+      assertTrue(runtime.consumeEnrollmentUri("https://new.example/enroll#invite=$token"))
+      reconnect.get().join(TimeUnit.SECONDS.toMillis(5))
+
+      assertFalse("cancelled stored reconnect did not finish", reconnect.get().isAlive)
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(NativeConnectionState.DISCONNECTED, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(0, fakeSession.directSyncBeginCount)
+
+      executor.runCapturedImmediateTask()
+      assertTrue(fakeSession.lifecycleEvents.contains("disconnect"))
+      assertTrue(runtime.snapshot().pendingAccessPass != null)
+    } finally {
+      reconnect.get()?.join(TimeUnit.SECONDS.toMillis(5))
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun stagedPassDuringStoredBootstrapPreventsAReplacementPlainRetry() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://old.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(
+      executor,
+      fakeSession,
+      deterministicPassStore(),
+      directTransport = transport,
+    )
+    val tokenBytes = ByteArray(32) { 0x71 }
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+    try {
+      runtime.openSession()
+      executor.runCapturedImmediateTask()
+      assertEquals(NativeReconnectStage.BOOTSTRAPPING, runtime.reconnectPlanForTesting()?.stage)
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(1, transport.pendingCount())
+      val delayedSchedulesBeforeFailure = executor.delayedScheduleCount()
+
+      assertTrue(runtime.consumeEnrollmentUri("https://new.example/enroll#invite=$token"))
+      val pending = checkNotNull(runtime.snapshot().pendingAccessPass)
+      // Pass staging is review intent: the authenticated bootstrap stays live,
+      // but its stored-origin scope may no longer create another transport.
+      assertEquals(NativeReconnectStage.BOOTSTRAPPING, runtime.reconnectPlanForTesting()?.stage)
+      fakeSession.nextLiveBufferFailure.set(
+        NativeMobileRetryableException(NativeMobileRetryableReason.TRANSPORT),
+      )
+
+      transport.completeNext(
+        NativeDirectHttpResult.Success("stored-bootstrap-count".toByteArray()),
+      )
+      executor.runCapturedImmediateTask()
+
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(0, fakeSession.accessPassConnectCount)
+      assertEquals(delayedSchedulesBeforeFailure, executor.delayedScheduleCount())
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertEquals(pending.flowId, runtime.snapshot().pendingAccessPass?.flowId)
+
+      runtime.connectPendingAccessPass(pending.flowId)
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(1, fakeSession.accessPassConnectCount)
+      assertArrayEquals(tokenBytes, fakeSession.lastAccessPass)
+      assertEquals("https://new.example:443", runtime.snapshot().binding?.canonicalServerOrigin)
+    } finally {
+      tokenBytes.fill(0)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun storedTargetTaskMayRunBeforeFutureAssignmentWithoutDuplicatingItsOwner() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true).apply {
+      runNextImmediateTaskInline()
+    }
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://resume.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val runtime = runtime(executor, fakeSession)
+    try {
+      val opened = runtime.openSession()
+
+      assertEquals(NativeConnectionState.CONNECTED, opened.connectionState)
+      assertEquals(1, executor.immediateScheduleCount())
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(0, fakeSession.accessPassConnectCount)
+      assertEquals(1, fakeSession.directSyncBeginCount)
+      assertEquals(NativeReconnectStage.BOOTSTRAPPING, runtime.reconnectPlanForTesting()?.stage)
+      assertEquals(NativeReconnectTrigger.STORED_TARGET, runtime.reconnectPlanForTesting()?.trigger)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundDuringStoredTargetLoadClosesCandidateAndNeverCreatesAReconnectOwner() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val loadEntered = CountDownLatch(1)
+    val loadRelease = CountDownLatch(1)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://resume.example:443",
+        expectedUserId = USER_ID,
+      )
+      storedReconnectTargetLoadEntered = loadEntered
+      storedReconnectTargetLoadRelease = loadRelease
+    }
+    val runtime = runtime(executor, fakeSession)
+    val openError = AtomicReference<VeilMobileRuntimeException?>()
+    val opener = thread(name = "stored-target-open") {
+      try {
+        runtime.openSession()
+      } catch (error: VeilMobileRuntimeException) {
+        openError.set(error)
+      }
+    }
+    try {
+      assertTrue("stored target load did not begin", loadEntered.await(5, TimeUnit.SECONDS))
+      runtime.lockForBackground()
+      loadRelease.countDown()
+      opener.join(TimeUnit.SECONDS.toMillis(5))
+
+      assertFalse("stored target opener did not finish", opener.isAlive)
+      assertEquals("E_VEIL_LOCKED", openError.get()?.code)
+      assertTrue(fakeSession.closed)
+      assertEquals(0, fakeSession.plainConnectCount)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertNull(runtime.snapshot().binding)
+    } finally {
+      loadRelease.countDown()
+      opener.join(TimeUnit.SECONDS.toMillis(5))
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun explicitConnectSupersedesWaitingStoredTargetAndLateTaskCannotTouchNewSocket() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://old.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val runtime = runtime(executor, fakeSession)
+    try {
+      runtime.openSession()
+      val authenticated = runtime.connect("https://new.example")
+
+      assertEquals("https://new.example:443", authenticated.canonicalServerOrigin)
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertNull(runtime.reconnectPlanForTesting())
+      val disconnectsBeforeLateTask = fakeSession.lifecycleEvents.count { it == "disconnect" }
+
+      executor.runCapturedImmediateTask()
+
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(
+        disconnectsBeforeLateTask,
+        fakeSession.lifecycleEvents.count { it == "disconnect" },
+      )
+      assertEquals("https://new.example:443", runtime.snapshot().binding?.canonicalServerOrigin)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun storedTargetFirstTypedFailureStartsBackoffAtOrdinalZero() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://resume.example:443",
+        expectedUserId = USER_ID,
+      )
+      queuedConnectFailures.add(
+        NativeMobileRetryableException(NativeMobileRetryableReason.TRANSPORT),
+      )
+    }
+    val runtime = runtime(executor, fakeSession)
+    try {
+      runtime.openSession()
+      executor.runCapturedImmediateTask()
+
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(0, fakeSession.accessPassConnectCount)
+      assertEquals(
+        NativeReconnectPlanDebug(
+          reason = NativeMobileRetryableReason.TRANSPORT,
+          failureOrdinal = 0,
+          delayMillis = 1_000L,
+          stage = NativeReconnectStage.WAITING,
+        ),
+        runtime.reconnectPlanForTesting(),
+      )
+      assertEquals(1, executor.delayedScheduleCount())
+      assertEquals(NativeConnectionState.CONNECTING, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun storedTargetRejectsAValidDifferentAuthenticatedAccountWithoutRetry() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://resume.example:443",
+        expectedUserId = USER_ID,
+      )
+      authenticatedUserId = "550e8400-e29b-41d4-a716-446655440002"
+    }
+    val runtime = runtime(executor, fakeSession)
+    try {
+      runtime.openSession()
+      executor.runCapturedImmediateTask()
+
+      assertEquals(1, fakeSession.plainConnectCount)
+      assertEquals(0, fakeSession.accessPassConnectCount)
+      assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertNull(runtime.snapshot().binding)
+      assertNull(runtime.reconnectPlanForTesting())
+      assertEquals(0, fakeSession.directSyncBeginCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun malformedOrUnreadableStoredTargetFailsOpenClosedBeforeNetworkUse() {
+    val malformedExecutor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val malformedSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://RESUME.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val malformedRuntime = runtime(malformedExecutor, malformedSession)
+    try {
+      val error = assertThrows(VeilMobileRuntimeException::class.java) {
+        malformedRuntime.openSession()
+      }
+      assertEquals("E_VEIL_OPEN", error.code)
+      assertTrue(malformedSession.closed)
+      assertEquals(0, malformedSession.plainConnectCount)
+      assertEquals(0, malformedSession.accessPassConnectCount)
+      assertEquals(NativeSessionState.ERROR, malformedRuntime.snapshot().sessionState)
+      assertEquals(NativeConnectionState.DISCONNECTED, malformedRuntime.snapshot().connectionState)
+      assertNull(malformedRuntime.snapshot().binding)
+    } finally {
+      malformedRuntime.lockSession()
+      malformedExecutor.shutdownNow()
+    }
+
+    val unreadableExecutor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val unreadableSession = FakeSession().apply {
+      storedReconnectTargetFailure = IllegalStateException("synthetic SQLCipher recovery failure")
+    }
+    val unreadableRuntime = runtime(unreadableExecutor, unreadableSession)
+    try {
+      val error = assertThrows(VeilMobileRuntimeException::class.java) {
+        unreadableRuntime.openSession()
+      }
+      assertEquals("E_VEIL_OPEN", error.code)
+      assertTrue(unreadableSession.closed)
+      assertEquals(0, unreadableSession.plainConnectCount)
+      assertEquals(0, unreadableSession.accessPassConnectCount)
+      assertNull(unreadableRuntime.snapshot().binding)
+    } finally {
+      unreadableRuntime.lockSession()
+      unreadableExecutor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun backgroundOrSchedulerRejectionRevokesStoredTargetOwnerBeforeItCanConnect() {
+    val backgroundExecutor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val backgroundSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://resume.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val backgroundRuntime = runtime(backgroundExecutor, backgroundSession)
+    try {
+      backgroundRuntime.openSession()
+      backgroundRuntime.lockForBackground()
+      backgroundExecutor.runCapturedImmediateTask()
+      assertEquals(0, backgroundSession.plainConnectCount)
+      assertNull(backgroundRuntime.reconnectPlanForTesting())
+      assertNull(backgroundRuntime.snapshot().binding)
+    } finally {
+      backgroundRuntime.lockSession()
+      backgroundExecutor.shutdownNow()
+    }
+
+    val rejectedExecutor = CapturingScheduledExecutor(captureImmediateTasks = true).apply {
+      rejectImmediateTasks = true
+    }
+    val rejectedSession = FakeSession().apply {
+      storedReconnectTarget = NativeMobileReconnectTarget(
+        canonicalServerOrigin = "https://resume.example:443",
+        expectedUserId = USER_ID,
+      )
+    }
+    val rejectedRuntime = runtime(rejectedExecutor, rejectedSession)
+    try {
+      val opened = rejectedRuntime.openSession()
+      assertEquals(NativeConnectionState.ERROR, opened.connectionState)
+      assertNull(opened.binding)
+      assertNull(rejectedRuntime.reconnectPlanForTesting())
+      assertEquals(0, rejectedSession.plainConnectCount)
+      assertEquals(0, rejectedSession.accessPassConnectCount)
+    } finally {
+      rejectedRuntime.lockSession()
+      rejectedExecutor.shutdownNow()
+    }
+  }
+
+  @Test
   fun directProjectionNeverTouchesNativePlaintextBeforeTheReadyLifecycleGate() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession()
@@ -3732,17 +4290,33 @@ class VeilMobileRuntimeTest {
     Thread(operation, "veil-runtime-test").apply { isDaemon = true }
   }
 
-  private class CapturingScheduledExecutor : ScheduledThreadPoolExecutor(
+  private class CapturingScheduledExecutor(
+    private val captureImmediateTasks: Boolean = false,
+  ) : ScheduledThreadPoolExecutor(
     1,
     { operation -> Thread(operation, "veil-runtime-capturing-test").apply { isDaemon = true } },
   ) {
     private val delayedTask = AtomicReference<Runnable?>()
     private val delayedSchedules = AtomicInteger(0)
+    private val immediateTasks = ConcurrentLinkedQueue<Runnable>()
+    private val immediateSchedules = AtomicInteger(0)
     private val executeNextDelayedTaskInline = AtomicBoolean(false)
+    private val executeNextImmediateTaskInline = AtomicBoolean(false)
     @Volatile var rejectDelayedTasks = false
+    @Volatile var rejectImmediateTasks = false
 
     override fun schedule(command: Runnable, delay: Long, unit: TimeUnit): ScheduledFuture<*> {
-      if (delay <= 0L) return super.schedule(command, delay, unit)
+      if (delay <= 0L) {
+        if (!captureImmediateTasks) return super.schedule(command, delay, unit)
+        if (rejectImmediateTasks) throw RejectedExecutionException("synthetic immediate scheduler rejection")
+        immediateSchedules.incrementAndGet()
+        if (executeNextImmediateTaskInline.getAndSet(false)) {
+          command.run()
+        } else {
+          immediateTasks.add(command)
+        }
+        return super.schedule({}, 1L, TimeUnit.DAYS)
+      }
       if (rejectDelayedTasks) throw RejectedExecutionException("synthetic delayed scheduler rejection")
       delayedSchedules.incrementAndGet()
       delayedTask.set(command)
@@ -3754,11 +4328,21 @@ class VeilMobileRuntimeTest {
       checkNotNull(delayedTask.get()).run()
     }
 
+    fun runCapturedImmediateTask() {
+      checkNotNull(immediateTasks.poll()).run()
+    }
+
     fun runNextDelayedTaskInline() {
       check(executeNextDelayedTaskInline.compareAndSet(false, true))
     }
 
+    fun runNextImmediateTaskInline() {
+      check(executeNextImmediateTaskInline.compareAndSet(false, true))
+    }
+
     fun delayedScheduleCount(): Int = delayedSchedules.get()
+
+    fun immediateScheduleCount(): Int = immediateSchedules.get()
   }
 
   private fun awaitRuntimeIdle(runtime: VeilMobileRuntime) {
@@ -3956,6 +4540,11 @@ class VeilMobileRuntimeTest {
     var canonicalOrigin: String? = null
     var lastAccessPass: ByteArray? = null
     @Volatile var authenticatedUserId = USER_ID
+    @Volatile var storedReconnectTarget: NativeMobileReconnectTarget? = null
+    @Volatile var storedReconnectTargetFailure: Throwable? = null
+    @Volatile var storedReconnectTargetLoadCount = 0
+    @Volatile var storedReconnectTargetLoadEntered: CountDownLatch? = null
+    @Volatile var storedReconnectTargetLoadRelease: CountDownLatch? = null
     @Volatile var plainConnectCount = 0
     @Volatile var accessPassConnectCount = 0
     val queuedConnectFailures = ConcurrentLinkedQueue<Throwable>()
@@ -4029,6 +4618,16 @@ class VeilMobileRuntimeTest {
     val connectStarted = CountDownLatch(1)
     val closedDuringConnect = AtomicBoolean(false)
     private val inConnect = AtomicBoolean(false)
+
+    override fun mobileReconnectTarget(): NativeMobileReconnectTarget? {
+      storedReconnectTargetLoadCount += 1
+      storedReconnectTargetLoadEntered?.countDown()
+      storedReconnectTargetLoadRelease?.let { release ->
+        check(release.await(5, TimeUnit.SECONDS)) { "stored reconnect target load timed out" }
+      }
+      storedReconnectTargetFailure?.let { throw it }
+      return storedReconnectTarget
+    }
 
     override fun connect(
       websocketUrl: String,

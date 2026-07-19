@@ -83,11 +83,25 @@ any value is missing.
   cancelled by background/lock/manual lifecycle actions, and resets only after
   a new `Ready` plus durable outbox barrier. Protocol, authentication, storage,
   and accepted-session-invalid failures remain terminal.
+- A successful mobile authentication atomically selects one credential-free
+  reconnect target in SQLCipher: only the canonical server origin and exact
+  authenticated user ID. On a fresh process the native loader revalidates that
+  target against the immutable self binding and current mnemonic-derived keys;
+  Android then starts one zero-delay plain reconnect through the same guarded
+  runtime. Access Pass bytes, WebSocket URLs, and key material are never stored
+  or replayed, and an older database without an explicit selection is never
+  guessed from timestamps or existing bindings.
+- Manual disconnect is intentionally process-local and non-destructive: it
+  closes the current transport but preserves the verified target, so a later
+  background reopen or process restart may recover it. A future explicit
+  “Forget Node / remain offline” action requires a separate destructive
+  contract; no hidden clear API exists in this preview.
 - UnifiedPush still accepts only decrypted 2048-byte generic wake records.
 
 This remains a closed Direct Preview, not a tester release or production-ready
 mobile messenger. Authenticated Direct directory/history, bounded live receive,
 native projection, per-conversation prekey establishment, guarded send/outbox,
-and typed transient reconnect are present. Canonical-origin process-death
-recovery, push publication, Circle/Space/attachments, correct multi-device,
-signed standalone APK distribution, and physical-device tests remain gated.
+typed transient reconnect, and automated canonical-origin process-death
+recovery are present. Physical process-death/airplane evidence, push
+publication, Circle/Space/attachments, correct multi-device, signed standalone
+APK distribution, and the broader physical-device matrix remain gated.
