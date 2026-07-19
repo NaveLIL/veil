@@ -21,8 +21,8 @@ veil-store = { path = "../veil-store" }
 veil-search = { path = "../veil-search" }
 prost = "0.13"
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 futures-util = "0.3"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
 ed25519-dalek = { version = "2", features = ["rand_core", "zeroize"] }
 serde = { version = "1", features = ["derive"] }
@@ -43,3 +43,19 @@ rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl"]
 
 [build-dependencies]
 prost-build = "0.13"
+
+# Stock Android does not expose its platform trust store through
+# rustls-native-certs. Use rustls' pinned Mozilla roots there so WSS fails
+# closed with a real trust anchor set instead of an empty native store. The
+# tokio-tungstenite root feature also enables its public rustls TLS plumbing;
+# Veil supplies an explicit Connector, so its implicit root loader is bypassed.
+[target.'cfg(target_os = "android")'.dependencies]
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+webpki-roots = "0.26"
+
+# Desktop platforms keep respecting their native certificate stores. As on
+# Android, the convenience feature enables rustls plumbing while Veil owns the
+# actual provider and root-store construction.
+[target.'cfg(not(target_os = "android"))'.dependencies]
+rustls-native-certs = "0.8"
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["connect", "rustls-tls-native-roots"] }

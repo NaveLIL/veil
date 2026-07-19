@@ -119,6 +119,31 @@ jobs:
         with:
           targets: aarch64-linux-android,x86_64-linux-android
 
+      - name: Verify Android WebSocket TLS policy
+        shell: bash
+        run: |
+          tls_features="$(cargo tree --locked -p veil-ffi --target aarch64-linux-android -e features)"
+          if ! grep -Fq 'tokio-tungstenite feature "rustls-tls-webpki-roots"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph is missing the webpki root store." >&2
+            exit 1
+          fi
+          if grep -Fq 'tokio-tungstenite feature "rustls-tls-native-roots"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph must not use rustls native-root discovery." >&2
+            exit 1
+          fi
+          if ! grep -Fq 'rustls feature "ring"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph is missing the reviewed rustls ring provider." >&2
+            exit 1
+          fi
+          if ! grep -Fq 'rustls feature "tls12"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph must keep the reviewed TLS 1.2/1.3 transport contract." >&2
+            exit 1
+          fi
+          if grep -Fq 'rustls feature "aws_lc_rs"' <<<"${tls_features}"; then
+            echo "Android veil-ffi graph must not compile an unreviewed second rustls provider." >&2
+            exit 1
+          fi
+
       - name: Install native build prerequisites
         shell: bash
         run: |

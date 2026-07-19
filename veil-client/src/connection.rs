@@ -5,15 +5,17 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use rustls::{ClientConfig, RootCertStore};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::{
-    connect_async_with_config,
+    connect_async_tls_with_config,
     tungstenite::{
         protocol::{frame::coding::CloseCode, WebSocketConfig},
         Message as WsMessage,
     },
+    Connector,
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -220,7 +222,7 @@ fn classify_websocket_handshake_close_v1(
 
 /// Reject cleartext remote transports. Local loopback WebSockets remain
 /// available for development and integration tests.
-fn validate_websocket_url(raw: &str) -> Result<(), String> {
+fn validate_websocket_url(raw: &str) -> Result<url::Url, String> {
     let parsed = url::Url::parse(raw).map_err(|e| format!("invalid WebSocket URL: {e}"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("WebSocket URLs must not contain userinfo or passwords".to_string());
@@ -229,13 +231,106 @@ fn validate_websocket_url(raw: &str) -> Result<(), String> {
         return Err("WebSocket URLs must not contain fragments".to_string());
     }
     match parsed.scheme() {
-        "wss" => Ok(()),
+        "wss" => Ok(parsed),
         "ws" => match parsed.host_str() {
-            Some("localhost" | "127.0.0.1" | "::1" | "[::1]") => Ok(()),
+            Some("localhost" | "127.0.0.1" | "::1" | "[::1]") => Ok(parsed),
             _ => Err("insecure ws:// is allowed only for localhost/loopback".to_string()),
         },
         scheme => Err(format!(
             "unsupported WebSocket scheme {scheme:?}; use wss://"
+        )),
+    }
+}
+
+/// Build the TLS verifier roots for the current platform without falling back
+/// to an empty store. Android's stock trust store is not exposed through
+/// `rustls-native-certs`, so Android uses the reviewed Mozilla root snapshot
+/// shipped by `webpki-roots`. Desktop continues to respect its native store.
+fn websocket_tls_root_store_v1() -> Result<RootCertStore, ConnectionConnectErrorV1> {
+    let mut root_store = RootCertStore::empty();
+
+    #[cfg(target_os = "android")]
+    {
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let rustls_native_certs::CertificateResult { certs, errors, .. } =
+            rustls_native_certs::load_native_certs();
+        if !errors.is_empty() {
+            // Paths and parser details may contain local machine metadata.
+            // Keep production diagnostics to a count while accepting every
+            // independently valid native trust anchor.
+            warn!(
+                error_count = errors.len(),
+                "some native TLS trust anchors could not be loaded"
+            );
+        }
+        let total = certs.len();
+        let (added, ignored) = root_store.add_parsable_certificates(certs);
+        if ignored != 0 {
+            warn!(
+                total_certificate_count = total,
+                ignored_certificate_count = ignored,
+                "some native TLS trust anchors could not be parsed"
+            );
+        }
+        if added == 0 {
+            return Err(ConnectionConnectErrorV1::epoch_invalid(
+                "TLS trust store contains no usable root certificates",
+            ));
+        }
+    }
+
+    if root_store.is_empty() {
+        return Err(ConnectionConnectErrorV1::epoch_invalid(
+            "TLS trust store contains no usable root certificates",
+        ));
+    }
+    Ok(root_store)
+}
+
+/// Construct a client config with Veil's selected provider explicitly bound
+/// to this connector. This must not call `CryptoProvider::install_default` or
+/// `ClientConfig::builder`: Veil is embedded into native processes that may
+/// contain other rustls consumers with a different process-wide provider.
+fn websocket_tls_client_config_v1(
+    root_store: RootCertStore,
+) -> Result<ClientConfig, ConnectionConnectErrorV1> {
+    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        // Keep the transport contract identical across Android and desktop,
+        // independent of features unified by unrelated workspace crates.
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .map_err(|_| {
+            ConnectionConnectErrorV1::epoch_invalid(
+                "TLS provider does not support Veil's required protocol versions",
+            )
+        })
+        .map(|builder| {
+            builder
+                .with_root_certificates(root_store)
+                .with_no_client_auth()
+        })
+}
+
+fn websocket_tls_connector_v1() -> Result<Connector, ConnectionConnectErrorV1> {
+    let roots = websocket_tls_root_store_v1()?;
+    let config = websocket_tls_client_config_v1(roots)?;
+    Ok(Connector::Rustls(Arc::new(config)))
+}
+
+fn websocket_connector_for_validated_url_v1(
+    url: &url::Url,
+) -> Result<Connector, ConnectionConnectErrorV1> {
+    match url.scheme() {
+        "wss" => websocket_tls_connector_v1(),
+        // This branch intentionally never loads a CA store. Cleartext remains
+        // restricted by `validate_websocket_url` to local test/development
+        // endpoints, and Connector::Plain still rejects accidental WSS use.
+        "ws" => Ok(Connector::Plain),
+        _ => Err(ConnectionConnectErrorV1::epoch_invalid(
+            "validated WebSocket URL has an unsupported scheme",
         )),
     }
 }
@@ -1357,7 +1452,8 @@ impl Connection {
         node_access_invite: Option<&[u8]>,
     ) -> Result<Self, ConnectionConnectErrorV1> {
         let url = &config.server_url;
-        validate_websocket_url(url).map_err(ConnectionConnectErrorV1::epoch_invalid)?;
+        let validated_url =
+            validate_websocket_url(url).map_err(ConnectionConnectErrorV1::epoch_invalid)?;
         let node_access_invite = node_access_invite_wire_value(node_access_invite)
             .map_err(ConnectionConnectErrorV1::epoch_invalid)?;
         // Keep endpoint and account metadata out of production diagnostics.
@@ -1371,9 +1467,15 @@ impl Connection {
             max_frame_size: Some(1 << 20),
             ..WebSocketConfig::default()
         };
+        let websocket_connector = websocket_connector_for_validated_url_v1(&validated_url)?;
         let (ws_stream, _) = tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            connect_async_with_config(url, Some(websocket_config), false),
+            connect_async_tls_with_config(
+                url,
+                Some(websocket_config),
+                false,
+                Some(websocket_connector),
+            ),
         )
         .await
         .map_err(|_| {
@@ -1911,9 +2013,10 @@ mod url_policy_tests {
         client_version, node_access_invite_wire_value, signal_disconnected,
         signal_websocket_error_v1, validate_per_device_auth_result,
         validate_per_device_auth_result_classified_v1, validate_websocket_url,
-        websocket_auth_signature, Connection, ConnectionConnectErrorV1, ConnectionConnectStopV1,
-        ConnectionEvent, ConnectionEventBufferErrorV1, ConnectionEventReceiverV1,
-        ConnectionTerminalStateV1, WebSocketTerminalStopV1,
+        websocket_auth_signature, websocket_connector_for_validated_url_v1, Connection,
+        ConnectionConnectErrorV1, ConnectionConnectStopV1, ConnectionEvent,
+        ConnectionEventBufferErrorV1, ConnectionEventReceiverV1, ConnectionTerminalStateV1,
+        WebSocketTerminalStopV1,
     };
     use crate::device_identity::{
         DeviceBindingPublicV1, DEVICE_BINDING_STATUS_ACTIVE, REQUIRED_DEVICE_CAPABILITIES,
@@ -1958,6 +2061,13 @@ mod url_policy_tests {
         assert!(validate_websocket_url("ws://localhost:9080/ws").is_ok());
         assert!(validate_websocket_url("ws://127.0.0.1:9080/ws").is_ok());
         assert!(validate_websocket_url("ws://[::1]:9080/ws").is_ok());
+    }
+
+    #[test]
+    fn loopback_websocket_connector_is_plain_and_does_not_require_ca_roots() {
+        let url = validate_websocket_url("ws://127.0.0.1:9080/ws").unwrap();
+        let connector = websocket_connector_for_validated_url_v1(&url).unwrap();
+        assert!(matches!(connector, tokio_tungstenite::Connector::Plain));
     }
 
     #[test]
@@ -2990,6 +3100,41 @@ mod tests {
     const TEST_CLIENT_MESSAGE_ID: &str = "d0000000-0000-4000-8000-000000000001";
     const TEST_REPLY_ID: &str = "c0000000-0000-4000-8000-000000000002";
     const TEST_CONVERSATION_ID: &str = "b0000000-0000-4000-8000-000000000001";
+
+    #[test]
+    fn websocket_tls_config_binds_the_reviewed_ring_provider() {
+        // An empty store is sufficient to inspect construction here; the
+        // production loader rejects it before this helper can be reached.
+        let config = websocket_tls_client_config_v1(RootCertStore::empty()).unwrap();
+        let actual = config.crypto_provider();
+        let expected = rustls::crypto::ring::default_provider();
+
+        let actual_suites: Vec<_> = actual
+            .cipher_suites
+            .iter()
+            .map(|suite| suite.suite())
+            .collect();
+        let expected_suites: Vec<_> = expected
+            .cipher_suites
+            .iter()
+            .map(|suite| suite.suite())
+            .collect();
+        assert_eq!(actual_suites, expected_suites);
+
+        let actual_groups: Vec<_> = actual.kx_groups.iter().map(|group| group.name()).collect();
+        let expected_groups: Vec<_> = expected
+            .kx_groups
+            .iter()
+            .map(|group| group.name())
+            .collect();
+        assert_eq!(actual_groups, expected_groups);
+    }
+
+    #[test]
+    fn platform_tls_root_policy_never_returns_an_empty_store() {
+        let roots = websocket_tls_root_store_v1().unwrap();
+        assert!(!roots.is_empty());
+    }
 
     fn error_event_with_capacity(capacity: usize) -> ConnectionEvent {
         let mut message = String::with_capacity(capacity);
