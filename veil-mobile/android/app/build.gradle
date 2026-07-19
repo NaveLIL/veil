@@ -215,6 +215,126 @@ gradle.taskGraph.whenReady { graph ->
     if (requestedRelease && !releaseSigningConfigured) {
         throw new GradleException('Release signing is required. Set VEIL_ANDROID_KEYSTORE, VEIL_ANDROID_KEYSTORE_PASSWORD, VEIL_ANDROID_KEY_ALIAS, and VEIL_ANDROID_KEY_PASSWORD.')
     }
+
+    def connectedAndroidTestTasks = graph.allTasks.findAll {
+        it.project == project && it.name ==~ /(?i)^connected.*AndroidTest$/
+    }
+    if (!connectedAndroidTestTasks.isEmpty()) {
+        def acknowledgementProperty = 'veilConnectedAndroidTestDisposable'
+        def requiredAcknowledgement = 'I_UNDERSTAND_APP_DATA_WILL_BE_DELETED'
+        def suppliedAcknowledgement = gradle.startParameter.projectProperties[acknowledgementProperty]
+        if (suppliedAcknowledgement != requiredAcknowledgement) {
+            throw new GradleException(
+                "Connected Android instrumentation is destructive and blocked by default. " +
+                "Use only a fresh single-user disposable emulator and acknowledge this invocation with " +
+                "-P${acknowledgementProperty}=${requiredAcknowledgement}."
+            )
+        }
+
+        def adbName = System.getProperty('os.name', '').toLowerCase().contains('windows') ? 'adb.exe' : 'adb'
+        def adbExecutable = new File(android.sdkDirectory, "platform-tools/${adbName}")
+        if (!adbExecutable.isFile()) {
+            throw new GradleException('Connected Android instrumentation is blocked: the Android SDK adb executable could not be resolved.')
+        }
+
+        def runAdb = { List<String> arguments, String purpose ->
+            def command = [adbExecutable.absolutePath]
+            command.addAll(arguments)
+            def process
+            try {
+                process = new ProcessBuilder(command).redirectErrorStream(true).start()
+            } catch (Exception error) {
+                throw new GradleException("Connected Android instrumentation is blocked: adb could not start for ${purpose}.", error)
+            }
+            if (!process.waitFor(10, java.util.concurrent.TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                throw new GradleException("Connected Android instrumentation is blocked: adb timed out while checking ${purpose}.")
+            }
+            def output = process.inputStream.getText('UTF-8').trim()
+            if (process.exitValue() != 0) {
+                throw new GradleException("Connected Android instrumentation is blocked: adb failed while checking ${purpose}.")
+            }
+            output
+        }
+
+        def validateDisposableEmulator = {
+            def devicesOutput = runAdb(['devices', '-l'], 'connected devices')
+            def deviceLines = devicesOutput.readLines()
+            def devicesHeader = deviceLines.findIndexOf { it.trim() == 'List of devices attached' }
+            if (devicesHeader < 0) {
+                throw new GradleException('Connected Android instrumentation is blocked: adb device output was not recognized.')
+            }
+            def deviceRows = deviceLines.drop(devicesHeader + 1).findAll { !it.trim().isEmpty() }
+            if (deviceRows.size() != 1) {
+                throw new GradleException('Connected Android instrumentation is blocked: exactly one online disposable emulator is required.')
+            }
+            def onlineDevice = deviceRows[0] =~ /^(.+?)\s+device(?:\s|$)/
+            if (!onlineDevice.find()) {
+                throw new GradleException('Connected Android instrumentation is blocked: exactly one online disposable emulator is required.')
+            }
+            def serial = onlineDevice.group(1).trim()
+            def boundSerial = System.getenv('ANDROID_SERIAL')
+            if (boundSerial == null || boundSerial.isEmpty() || boundSerial.contains(',') || boundSerial != serial) {
+                throw new GradleException('Connected Android instrumentation is blocked: ANDROID_SERIAL must name exactly the sole verified disposable emulator.')
+            }
+
+            def emulatorMarker = runAdb(['-s', serial, 'shell', 'getprop', 'ro.kernel.qemu'], 'emulator identity')
+            if (emulatorMarker != '1') {
+                throw new GradleException('Connected Android instrumentation is blocked: physical devices are forbidden; use a fresh single-user disposable emulator.')
+            }
+
+            def usersOutput = runAdb(['-s', serial, 'shell', 'pm', 'list', 'users'], 'Android users')
+            def userLines = usersOutput.readLines().collect { it.trim() }.findAll { !it.isEmpty() }
+            def ownerUser = userLines.size() == 2 ? (userLines[1] =~ /^UserInfo\{(\d+):[^}]*\}(?:\s+.*)?$/) : null
+            if (userLines.size() != 2 || userLines[0] != 'Users:' || !ownerUser.matches() || ownerUser.group(1) != '0') {
+                throw new GradleException('Connected Android instrumentation is blocked: the disposable emulator must contain only Android user 0.')
+            }
+
+            def retainedPackage = runAdb(
+                ['-s', serial, 'shell', 'pm', 'list', 'packages', '--user', '0', '-u', 'io.veil.mobile'],
+                'retained Veil package state'
+            )
+            if (!retainedPackage.isEmpty()) {
+                throw new GradleException('Connected Android instrumentation is blocked: io.veil.mobile is already installed or retained on the emulator.')
+            }
+            serial
+        }
+
+        def verifiedSerial = validateDisposableEmulator()
+        def configuredTargetSerials = { connectedTask ->
+            if (connectedTask.metaClass.respondsTo(connectedTask, 'getTestRunnerFactory').isEmpty()) {
+                return null
+            }
+            def runnerFactory = connectedTask.getTestRunnerFactory()
+            def directSerials = runnerFactory.getDeviceSerialValues()
+            def values = directSerials.isPresent()
+                ? directSerials.get()
+                : runnerFactory.getConnectedCheckDeviceSerials().getOrElse(Collections.emptyList())
+            new ArrayList<String>(values)
+        }
+        def serialAwareConnectedTasks = connectedAndroidTestTasks.findAll {
+            !it.metaClass.respondsTo(it, 'getTestRunnerFactory').isEmpty()
+        }
+        if (serialAwareConnectedTasks.isEmpty()) {
+            throw new GradleException('Connected Android instrumentation is blocked: AGP target serial binding could not be inspected.')
+        }
+        def requireVerifiedTaskTarget = { connectedTask, String expectedSerial ->
+            def targetSerials = configuredTargetSerials(connectedTask)
+            if (targetSerials == null || (!targetSerials.isEmpty() && targetSerials != [expectedSerial])) {
+                throw new GradleException('Connected Android instrumentation is blocked: task --serial targets must be empty or exactly the verified disposable emulator.')
+            }
+        }
+        serialAwareConnectedTasks.each { connectedTask ->
+            requireVerifiedTaskTarget(connectedTask, verifiedSerial)
+            connectedTask.doFirst {
+                def executionSerial = validateDisposableEmulator()
+                if (executionSerial != verifiedSerial) {
+                    throw new GradleException('Connected Android instrumentation is blocked: the verified emulator changed before task execution.')
+                }
+                requireVerifiedTaskTarget(connectedTask, executionSerial)
+            }
+        }
+    }
 }
 
 tasks.register('verifyVeilRustLibraries') {
