@@ -1118,13 +1118,19 @@ fn require_current_direct_outbox_self_v1(
     if self_binding.user_id != scope.user_id {
         return Err("Direct outbox caller differs from authenticated self".to_string());
     }
-    let self_account =
+    // A newly registered account can legitimately have an empty conversation
+    // directory, so its presentation row is only a corroborating cache. The
+    // immutable authenticated-self binding remains the authority, and
+    // `validated_self_binding_for_origin` has already rejected every directory
+    // row that aliases or conflicts with that exact origin/user/key tuple.
+    if let Some(self_account) =
         load_account_by_origin_user(conn, &scope.canonical_server_origin, &scope.user_id)?
-            .ok_or("Direct outbox authenticated account is absent from the directory")?;
-    if self_account.locator.identity_key != self_binding.identity_key
-        || self_account.signing_key != self_binding.signing_key
     {
-        return Err("Direct outbox authenticated directory tuple changed".to_string());
+        if self_account.locator.identity_key != self_binding.identity_key
+            || self_account.signing_key != self_binding.signing_key
+        {
+            return Err("Direct outbox authenticated directory tuple changed".to_string());
+        }
     }
 
     type DeviceScopeRow = (
@@ -9253,6 +9259,35 @@ mod tests {
         }
     }
 
+    fn install_direct_outbox_self_without_directory(db: &VeilDb) -> DirectMessageOutboxScopeV1 {
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x77,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+        db.bind_authenticated_self(
+            ORIGIN_A,
+            USER_A,
+            &self_account.locator.identity_key,
+            &self_account.signing_key,
+        )
+        .unwrap();
+
+        let device_id = [0x78; 16];
+        let mut device = sample_device_identity(device_id);
+        device.account_identity_key = self_account.locator.identity_key;
+        device.account_signing_key = self_account.signing_key;
+        db.create_device_identity_v1(&device).unwrap();
+
+        DirectMessageOutboxScopeV1 {
+            canonical_server_origin: ORIGIN_A.to_string(),
+            user_id: USER_A.to_string(),
+            device_id,
+        }
+    }
+
     fn sample_direct_attachment() -> crate::models::MessageAttachment {
         crate::models::MessageAttachment {
             ordinal: 0,
@@ -13644,6 +13679,123 @@ mod tests {
             )
             .unwrap();
         assert_eq!(preserved, (vec![2, 3], 0));
+    }
+
+    #[test]
+    fn direct_outbox_empty_account_does_not_require_a_self_presentation_row() {
+        let db = VeilDb::open_memory(&[0xCF; 32]).unwrap();
+        let scope = install_direct_outbox_self_without_directory(&db);
+
+        assert_eq!(table_count(&db, "identity_directory_v1"), 0);
+        assert_eq!(table_count(&db, "direct_message_outbox_v1"), 0);
+        assert_eq!(
+            db.count_pending_direct_message_outbox_v1(&scope).unwrap(),
+            0
+        );
+        assert!(db
+            .load_pending_direct_message_outbox_v1(&scope, 1)
+            .unwrap()
+            .is_empty());
+        assert_eq!(table_count(&db, "identity_directory_v1"), 0);
+    }
+
+    #[test]
+    fn direct_outbox_empty_account_still_rejects_a_conflicting_directory_row() {
+        let db = VeilDb::open_memory(&[0xCE; 32]).unwrap();
+        let scope = install_direct_outbox_self_without_directory(&db);
+        let conflicting_identity_key = [0x79u8; 32];
+        let conflicting_signing_key = test_signing_key(0x7A);
+
+        db.conn
+            .execute(
+                "INSERT INTO identity_directory_v1
+                    (canonical_server_origin, user_id, identity_key, signing_key,
+                     username, display_name, profile_version, profile_origin,
+                     source, observed_at)
+                 VALUES (?1, ?2, ?3, ?4, 'conflict', NULL, NULL, ?1, 2,
+                         '2026-07-19T00:00:00Z')",
+                rusqlite::params![
+                    ORIGIN_A,
+                    USER_A,
+                    conflicting_identity_key.as_slice(),
+                    conflicting_signing_key.as_slice(),
+                ],
+            )
+            .unwrap();
+
+        let error = db
+            .count_pending_direct_message_outbox_v1(&scope)
+            .unwrap_err();
+        assert!(error.contains("conflicts with the authenticated self binding"));
+        assert_eq!(table_count(&db, "direct_message_outbox_v1"), 0);
+    }
+
+    #[test]
+    fn direct_outbox_self_presentation_is_an_optional_corroborating_cache() {
+        let db = VeilDb::open_memory(&[0xCD; 32]).unwrap();
+        let scope = install_direct_outbox_self_without_directory(&db);
+        let self_account = sample_account(
+            ORIGIN_A,
+            USER_A,
+            0x77,
+            AccountSnapshotSource::AuthenticatedConversationDirectory,
+            None,
+        );
+
+        db.upsert_identity_directory(std::slice::from_ref(&self_account))
+            .unwrap();
+        assert_eq!(table_count(&db, "identity_directory_v1"), 1);
+        assert_eq!(
+            db.count_pending_direct_message_outbox_v1(&scope).unwrap(),
+            0
+        );
+
+        db.conn
+            .execute(
+                "DELETE FROM identity_directory_v1
+                 WHERE canonical_server_origin = ?1 AND user_id = ?2",
+                rusqlite::params![ORIGIN_A, USER_A],
+            )
+            .unwrap();
+
+        assert_eq!(table_count(&db, "identity_directory_v1"), 0);
+        assert_eq!(
+            db.count_pending_direct_message_outbox_v1(&scope).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn direct_outbox_empty_account_keeps_exact_origin_user_and_device_guards() {
+        let db = VeilDb::open_memory(&[0xCC; 32]).unwrap();
+        let scope = install_direct_outbox_self_without_directory(&db);
+
+        let mut wrong_origin = scope.clone();
+        wrong_origin.canonical_server_origin = ORIGIN_B.to_string();
+        assert!(db
+            .count_pending_direct_message_outbox_v1(&wrong_origin)
+            .is_err());
+
+        let mut wrong_user = scope.clone();
+        wrong_user.user_id = USER_B.to_string();
+        assert!(db
+            .count_pending_direct_message_outbox_v1(&wrong_user)
+            .is_err());
+
+        let mut wrong_device = scope.clone();
+        wrong_device.device_id = [0x7B; 16];
+        assert!(db
+            .count_pending_direct_message_outbox_v1(&wrong_device)
+            .is_err());
+
+        db.conn
+            .execute(
+                "UPDATE device_identity_v1 SET status = 2 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        assert!(db.count_pending_direct_message_outbox_v1(&scope).is_err());
+        assert_eq!(table_count(&db, "direct_message_outbox_v1"), 0);
     }
 
     #[test]

@@ -5456,6 +5456,62 @@ mod tests {
     }
 
     #[test]
+    fn mobile_direct_true_empty_directory_reaches_ready_through_empty_outbox() {
+        let (session, path, token) = mobile_test_session_with_sync(123);
+        let _outbound = mobile_test_install_queued_connection(&session);
+        let request = session
+            .prepare_direct_directory_request(token.clone())
+            .unwrap();
+        let page = session
+            .install_direct_directory_page(
+                token.clone(),
+                request.request_token,
+                br#"{"conversations":[],"count":0}"#.to_vec(),
+            )
+            .unwrap();
+
+        assert!(page.directory_complete);
+        assert!(page.conversations.is_empty());
+        assert_eq!(
+            session
+                .client
+                .lock()
+                .unwrap()
+                .db()
+                .unwrap()
+                .get_conversations()
+                .unwrap()
+                .len(),
+            0
+        );
+        let histories = session
+            .prepare_next_direct_history_request(token.clone())
+            .unwrap();
+        assert!(histories.histories_terminal);
+        assert!(histories.request.is_none());
+
+        let live = session.replay_direct_live_events(token.clone()).unwrap();
+        assert_eq!(live.consumed, 0);
+        assert!(live.outbox_replay_required);
+        assert!(!live.ready);
+
+        let outbox = session.replay_direct_outbox(token).unwrap();
+        assert_eq!(outbox.visited, 0);
+        assert_eq!(outbox.enqueued, 0);
+        assert!(!outbox.needs_immediate_pump);
+        assert!(outbox.replay_complete);
+        {
+            let state = session.direct_sync.lock().unwrap();
+            let state = state.as_ref().unwrap();
+            assert_eq!(state.phase, MobileDirectSyncPhase::Ready);
+            assert!(state.outbox_replay_complete);
+        }
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn mobile_direct_live_replay_rejects_a_nonterminal_history_checkpoint() {
         let (session, path, token) = mobile_test_session_with_sync(121);
         {
