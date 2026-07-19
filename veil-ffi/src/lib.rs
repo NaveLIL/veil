@@ -20,6 +20,15 @@ uniffi::setup_scaffolding!();
 
 // ── Error type ──────────────────────────────────────────────
 
+/// Positive allow-list of mobile failures for which a native controller may
+/// create one guarded reconnect plan. Every error not represented here is
+/// terminal by default and must never become retryable through message text.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
+pub enum MobileRetryableReason {
+    Transport,
+    AckDeadline,
+}
+
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum VeilError {
     #[error("Crypto error: {msg}")]
@@ -28,6 +37,8 @@ pub enum VeilError {
     InvalidInput { msg: String },
     #[error("Session error: {msg}")]
     Session { msg: String },
+    #[error("Mobile operation may be retried: {reason:?}")]
+    MobileRetryable { reason: MobileRetryableReason },
 }
 
 // ── Record types (plain data, serialized across FFI) ────────
@@ -378,10 +389,14 @@ pub struct MobileDirectOutboxReplayProgress {
 /// `AcceptedForReplay` still means SQLCipher owns the intent. Android must not
 /// create a second intent; it closes the current lease and reconnects so the
 /// exact persisted bytes/ID can be replayed after the next Ready checkpoint.
+/// `AcceptedSessionInvalid` also owns the intent, but the socket failed a
+/// protocol/security invariant and therefore must not trigger automatic
+/// reconnect.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, uniffi::Enum)]
 pub enum MobileDirectTextSendOutcome {
     Accepted,
     AcceptedForReplay,
+    AcceptedSessionInvalid,
     NeedsPreKey,
     Rejected,
     Unavailable,
@@ -614,6 +629,33 @@ fn revoke_mobile_direct_epoch_locked(
     *binding = None;
     fail_mobile_direct_sync_sticky(state);
     client.disconnect();
+}
+
+fn mobile_direct_live_replay_error(error: veil_client::api::DirectLiveReplayErrorV1) -> VeilError {
+    mobile_direct_live_stop_error(error.stop)
+}
+
+fn mobile_direct_live_stop_error(stop: veil_client::api::DirectLiveReplayStopV1) -> VeilError {
+    use veil_client::api::DirectLiveReplayStopV1;
+
+    match stop {
+        DirectLiveReplayStopV1::RetryableTransport => VeilError::MobileRetryable {
+            reason: MobileRetryableReason::Transport,
+        },
+        DirectLiveReplayStopV1::AckDeadline => VeilError::MobileRetryable {
+            reason: MobileRetryableReason::AckDeadline,
+        },
+        DirectLiveReplayStopV1::EpochInvalid => VeilError::Session {
+            msg: "mobile Direct live epoch is invalid".to_string(),
+        },
+        DirectLiveReplayStopV1::StorageUncertain => VeilError::Session {
+            msg: "mobile Direct live storage is uncertain".to_string(),
+        },
+    }
+}
+
+fn mobile_direct_live_buffer_error(error: veil_client::api::DirectLiveBufferErrorV1) -> VeilError {
+    mobile_direct_live_stop_error(error.stop)
 }
 
 #[derive(uniffi::Record)]
@@ -1949,7 +1991,7 @@ impl VeilMobileSession {
                 msg: "mobile Direct live buffer lease is stale or unavailable".to_string(),
             });
         }
-        let binding = self.binding.lock().map_err(|error| VeilError::Session {
+        let mut binding = self.binding.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile binding: {error}"),
         })?;
         if binding.as_ref() != Some(&state.epoch) {
@@ -1960,13 +2002,11 @@ impl VeilMobileSession {
         let mut client = self.client.lock().map_err(|error| VeilError::Session {
             msg: format!("lock mobile client: {error}"),
         })?;
-        let buffered = match client.buffer_connection_events_during_sync() {
+        let buffered = match client.buffer_connection_events_during_sync_classified_v1() {
             Ok(buffered) => buffered,
-            Err(_) => {
-                fail_mobile_direct_sync_sticky(state);
-                return Err(VeilError::Session {
-                    msg: "mobile Direct live buffer terminated".to_string(),
-                });
+            Err(error) => {
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                return Err(mobile_direct_live_buffer_error(error));
             }
         };
         Ok(MobileDirectLiveBufferProgress {
@@ -2034,20 +2074,16 @@ impl VeilMobileSession {
         })?;
         let report = match self.runtime.block_on(client.replay_direct_live_events_v1()) {
             Ok(report) => report,
-            Err(_) => {
-                *binding = None;
-                fail_mobile_direct_sync_sticky(state);
-                return Err(VeilError::Session {
-                    msg: "mobile Direct live replay terminated".to_string(),
-                });
+            Err(error) => {
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                return Err(mobile_direct_live_replay_error(error));
             }
         };
         if report.consumed > veil_client::api::DIRECT_LIVE_REPLAY_MAX_BATCH_V1
             || (!report.quiescent
                 && report.consumed != veil_client::api::DIRECT_LIVE_REPLAY_MAX_BATCH_V1)
         {
-            *binding = None;
-            fail_mobile_direct_sync_sticky(state);
+            revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
             return Err(VeilError::Session {
                 msg: "mobile Direct live replay violated its batch contract".to_string(),
             });
@@ -2166,8 +2202,8 @@ impl VeilMobileSession {
 
         if report.transport_blocked {
             revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
-            return Err(VeilError::Session {
-                msg: "mobile Direct outbox replay transport is unavailable".to_string(),
+            return Err(VeilError::MobileRetryable {
+                reason: MobileRetryableReason::Transport,
             });
         }
         let progress = MobileDirectOutboxReplayProgress {
@@ -2253,14 +2289,41 @@ impl VeilMobileSession {
             .runtime
             .block_on(client.enqueue_direct_text_v1(&conversation_id, plaintext))
         {
+            Ok(report)
+                if matches!(
+                    report.transport_stop,
+                    Some(
+                        veil_client::api::DirectLiveReplayStopV1::EpochInvalid
+                            | veil_client::api::DirectLiveReplayStopV1::StorageUncertain
+                    )
+                ) =>
+            {
+                // SQLCipher already owns the exact user intent, but this
+                // source-typed terminal is outside the reconnect allowlist.
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                Ok(MobileDirectTextSendOutcome::AcceptedSessionInvalid)
+            }
+            Ok(report)
+                if matches!(
+                    report.transport_stop,
+                    Some(
+                        veil_client::api::DirectLiveReplayStopV1::RetryableTransport
+                            | veil_client::api::DirectLiveReplayStopV1::AckDeadline
+                    )
+                ) =>
+            {
+                revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
+                Ok(MobileDirectTextSendOutcome::AcceptedForReplay)
+            }
             Ok(report) if report.transport_enqueued && report.sequence > 0 => {
                 Ok(MobileDirectTextSendOutcome::Accepted)
             }
             Ok(_) => {
-                // SQLCipher already owns this exact user intent. Revoke the
-                // transport lease so only a new Ready epoch can replay it.
+                // SQLCipher already owns this exact user intent, but the
+                // native enqueue report violated its positive success
+                // contract. Fail closed without granting reconnect.
                 revoke_mobile_direct_epoch_locked(state, &mut binding, &mut client);
-                Ok(MobileDirectTextSendOutcome::AcceptedForReplay)
+                Ok(MobileDirectTextSendOutcome::AcceptedSessionInvalid)
             }
             Err(veil_client::api::DirectSendErrorV1::Rejected(_)) => {
                 Ok(MobileDirectTextSendOutcome::Rejected)
@@ -2898,7 +2961,7 @@ impl VeilMobileSession {
         clear_mobile_direct_sync_fail_closed(&self.direct_sync);
         let mut client = invalidate_mobile_session(&self.binding, &self.client)?;
         let has_node_access_pass = node_access_pass.is_some();
-        let connection = client.connect_with_client_metadata_and_access_pass(
+        let connection = client.connect_with_client_metadata_and_access_pass_classified_v1(
             &websocket_url,
             "veil-android",
             "veil-android",
@@ -2915,7 +2978,7 @@ impl VeilMobileSession {
                         &self.binding,
                     ));
                 }
-                result.map_err(|msg| safe_mobile_connect_error(msg, has_node_access_pass))?
+                result.map_err(|error| safe_mobile_connect_error(error, has_node_access_pass))?
             }
             MobileConnectOutcome::Cancelled => {
                 return Err(fail_closed_mobile_connect_cancellation(
@@ -3549,17 +3612,30 @@ fn fail_closed_mobile_connect_cancellation(
     }
 }
 
-fn safe_mobile_connect_error(msg: String, has_node_access_pass: bool) -> VeilError {
-    let msg = if has_node_access_pass {
-        match msg.as_str() {
-            "node access registration is closed; a valid access pass is required"
-            | "node access pass is invalid, expired, or already used" => msg,
-            _ => "mobile connection attempt failed".to_string(),
+fn safe_mobile_connect_error(
+    error: veil_client::api::MobileConnectErrorV1,
+    has_node_access_pass: bool,
+) -> VeilError {
+    use veil_client::api::MobileConnectStopV1;
+
+    match error.stop {
+        MobileConnectStopV1::RetryableTransport => VeilError::MobileRetryable {
+            reason: MobileRetryableReason::Transport,
+        },
+        MobileConnectStopV1::AuthenticationRejected if has_node_access_pass => {
+            let msg = match error.detail.as_str() {
+                "node access registration is closed; a valid access pass is required"
+                | "node access pass is invalid, expired, or already used" => error.detail,
+                _ => "mobile connection attempt failed".to_string(),
+            };
+            VeilError::Session { msg }
         }
-    } else {
-        msg
-    };
-    VeilError::Session { msg }
+        MobileConnectStopV1::AuthenticationRejected
+        | MobileConnectStopV1::EpochInvalid
+        | MobileConnectStopV1::StorageUncertain => VeilError::Session {
+            msg: "mobile connection attempt failed".to_string(),
+        },
+    }
 }
 
 fn clear_mobile_binding_fail_closed(binding: &Mutex<Option<MobileAuthenticatedEpoch>>) {
@@ -3665,6 +3741,74 @@ mod tests {
     use super::*;
     use bip39::Language;
     use sha2::{Digest, Sha256};
+
+    #[test]
+    fn mobile_live_retryability_is_a_positive_typed_allowlist() {
+        use veil_client::api::{
+            DirectLiveReplayErrorV1, DirectLiveReplayReportV1, DirectLiveReplayStopV1,
+        };
+
+        for (stop, expected) in [
+            (
+                DirectLiveReplayStopV1::RetryableTransport,
+                MobileRetryableReason::Transport,
+            ),
+            (
+                DirectLiveReplayStopV1::AckDeadline,
+                MobileRetryableReason::AckDeadline,
+            ),
+        ] {
+            let error = mobile_direct_live_replay_error(DirectLiveReplayErrorV1 {
+                stop,
+                report: DirectLiveReplayReportV1::default(),
+            });
+            assert!(matches!(
+                error,
+                VeilError::MobileRetryable { reason } if reason == expected
+            ));
+        }
+
+        for stop in [
+            DirectLiveReplayStopV1::EpochInvalid,
+            DirectLiveReplayStopV1::StorageUncertain,
+        ] {
+            let error = mobile_direct_live_replay_error(DirectLiveReplayErrorV1 {
+                stop,
+                report: DirectLiveReplayReportV1::default(),
+            });
+            assert!(matches!(error, VeilError::Session { .. }));
+        }
+
+        assert!(matches!(
+            mobile_direct_live_buffer_error(veil_client::api::DirectLiveBufferErrorV1 {
+                stop: DirectLiveReplayStopV1::RetryableTransport,
+                buffer_error: Some(
+                    veil_client::connection::ConnectionEventBufferErrorV1::TransportEpochEnded,
+                ),
+            }),
+            VeilError::MobileRetryable {
+                reason: MobileRetryableReason::Transport
+            }
+        ));
+        assert!(matches!(
+            mobile_direct_live_buffer_error(veil_client::api::DirectLiveBufferErrorV1 {
+                stop: DirectLiveReplayStopV1::EpochInvalid,
+                buffer_error: Some(
+                    veil_client::connection::ConnectionEventBufferErrorV1::ProtocolViolation {
+                        envelope: "test",
+                    },
+                ),
+            }),
+            VeilError::Session { .. }
+        ));
+        assert!(matches!(
+            mobile_direct_live_buffer_error(veil_client::api::DirectLiveBufferErrorV1 {
+                stop: DirectLiveReplayStopV1::StorageUncertain,
+                buffer_error: None,
+            }),
+            VeilError::Session { .. }
+        ));
+    }
 
     fn load_known_valid_restore(draft: &VeilRecoveryDraft) {
         for position in 0..11 {
@@ -4500,9 +4644,14 @@ mod tests {
 
     #[test]
     fn mobile_node_access_pass_attempt_never_reflects_server_diagnostics() {
+        use veil_client::api::{MobileConnectErrorV1, MobileConnectStopV1};
+
         let secret = "0123456789abcdef0123456789abcdef";
         let error = safe_mobile_connect_error(
-            format!("malicious server reflected access pass: {secret}"),
+            MobileConnectErrorV1 {
+                stop: MobileConnectStopV1::AuthenticationRejected,
+                detail: format!("malicious server reflected access pass: {secret}"),
+            },
             true,
         );
         let rendered = error.to_string();
@@ -4514,10 +4663,30 @@ mod tests {
             "node access pass is invalid, expired, or already used",
         ] {
             assert_eq!(
-                safe_mobile_connect_error(safe_reason.to_string(), true).to_string(),
+                safe_mobile_connect_error(
+                    MobileConnectErrorV1 {
+                        stop: MobileConnectStopV1::AuthenticationRejected,
+                        detail: safe_reason.to_string(),
+                    },
+                    true,
+                )
+                .to_string(),
                 format!("Session error: {safe_reason}")
             );
         }
+
+        assert!(matches!(
+            safe_mobile_connect_error(
+                MobileConnectErrorV1 {
+                    stop: MobileConnectStopV1::RetryableTransport,
+                    detail: "private transport diagnostic".to_string(),
+                },
+                false,
+            ),
+            VeilError::MobileRetryable {
+                reason: MobileRetryableReason::Transport
+            }
+        ));
     }
 
     #[test]
@@ -5037,22 +5206,47 @@ mod tests {
     }
 
     #[test]
-    fn mobile_direct_live_terminal_never_opens_ready() {
+    fn mobile_direct_manual_disconnect_is_not_retryable_and_never_opens_ready() {
         let (session, path, token) = mobile_test_session_with_sync(122);
         session.direct_sync.lock().unwrap().as_mut().unwrap().phase =
             MobileDirectSyncPhase::HistorySynchronizedAwaitingLive;
         session.client.lock().unwrap().disconnect();
 
-        let error = session
-            .replay_direct_live_events(token)
-            .unwrap_err()
-            .to_string();
+        let error = session.replay_direct_live_events(token).unwrap_err();
 
-        assert!(error.contains("live replay terminated"));
+        assert!(matches!(error, VeilError::Session { .. }));
         assert_eq!(
             session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
             MobileDirectSyncPhase::Failed
         );
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_live_buffer_storage_uncertainty_is_never_retryable() {
+        let (session, path, token) = mobile_test_session_with_sync(137);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .test_only_revoke_storage_uncertain_epoch_v1();
+
+        let error = session
+            .buffer_direct_live_events_during_sync(token)
+            .unwrap_err();
+
+        assert!(matches!(error, VeilError::Session { .. }));
+        assert!(session.binding.lock().unwrap().is_none());
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Failed
+        );
+        let client = session.client.lock().unwrap();
+        assert!(!client.is_connected());
+        assert!(client.db().is_none());
+        drop(client);
 
         drop(session);
         let _ = std::fs::remove_file(path);
@@ -6065,6 +6259,195 @@ mod tests {
     }
 
     #[test]
+    fn mobile_direct_ack_deadline_is_typed_retryable_and_revokes_the_lease() {
+        let (session, path, token, conversation_id, peer, mut outbound) =
+            mobile_test_ready_prekey_fixture(136);
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        assert_eq!(
+            session
+                .send_direct_text(
+                    token.clone(),
+                    conversation_id,
+                    b"deadline-owned intent".to_vec(),
+                )
+                .unwrap(),
+            MobileDirectTextSendOutcome::Accepted
+        );
+        let wire = session
+            .runtime
+            .block_on(async { outbound.recv().await })
+            .expect("accepted Direct text must enter the native transport");
+        assert!(!wire.is_empty());
+        assert_eq!(
+            session
+                .client
+                .lock()
+                .unwrap()
+                .test_only_expire_direct_ack_deadlines_v1(),
+            1
+        );
+
+        let error = session.replay_direct_live_events(token).unwrap_err();
+        assert!(matches!(
+            error,
+            VeilError::MobileRetryable {
+                reason: MobileRetryableReason::AckDeadline
+            }
+        ));
+        assert!(session.binding.lock().unwrap().is_none());
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Failed
+        );
+        let pending_count: i64 = session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1 WHERE state = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 1);
+        assert!(!session.client.lock().unwrap().is_connected());
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_committed_send_protocol_terminal_is_accepted_without_retry_permission() {
+        let (session, path, token, conversation_id, peer, _outbound) =
+            mobile_test_ready_prekey_fixture(138);
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        session
+            .client
+            .lock()
+            .unwrap()
+            .test_only_epoch_invalid_after_next_direct_commit_v1();
+
+        assert_eq!(
+            session
+                .send_direct_text(token, conversation_id, b"durable but terminal".to_vec(),)
+                .unwrap(),
+            MobileDirectTextSendOutcome::AcceptedSessionInvalid
+        );
+        assert!(session.binding.lock().unwrap().is_none());
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Failed
+        );
+        let client = session.client.lock().unwrap();
+        assert!(!client.is_connected());
+        let pending_count: i64 = client
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1 WHERE state = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 1);
+        drop(client);
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_outbox_protocol_terminal_is_never_retryable() {
+        let (session, path, token, conversation_id, peer, mut outbound) =
+            mobile_test_ready_prekey_fixture(139);
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        assert_eq!(
+            session
+                .send_direct_text(
+                    token.clone(),
+                    conversation_id,
+                    b"pending exact replay".to_vec(),
+                )
+                .unwrap(),
+            MobileDirectTextSendOutcome::Accepted
+        );
+        let first_wire = session
+            .runtime
+            .block_on(async { outbound.recv().await })
+            .unwrap();
+
+        let renewed_epoch = mobile_test_epoch(140);
+        let renewed_token = "ef".repeat(32);
+        {
+            let mut client = session.client.lock().unwrap();
+            client.disconnect();
+            client
+                .test_only_reconcile_previous_transport_before_install_v1()
+                .unwrap();
+            client
+                .test_only_restore_authenticated_user_from_durable_binding(
+                    &renewed_epoch.binding.canonical_server_origin,
+                    &renewed_epoch.binding.user_id,
+                )
+                .unwrap();
+        }
+        let mut replay_outbound = mobile_test_install_queued_connection(&session);
+        {
+            let mut sync = session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.token = renewed_token.clone();
+            state.epoch = renewed_epoch.clone();
+            state.phase = MobileDirectSyncPhase::Ready;
+            state.outbox_replay_cursor = None;
+            state.outbox_replay_complete = false;
+        }
+        *session.binding.lock().unwrap() = Some(renewed_epoch);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .test_only_epoch_invalid_after_next_direct_outbox_enqueue_v1();
+
+        let error = session.replay_direct_outbox(renewed_token).unwrap_err();
+        assert!(matches!(error, VeilError::Session { .. }));
+        assert!(session.binding.lock().unwrap().is_none());
+        assert_eq!(
+            session.direct_sync.lock().unwrap().as_ref().unwrap().phase,
+            MobileDirectSyncPhase::Failed
+        );
+        let replay_wire = session
+            .runtime
+            .block_on(async { replay_outbound.recv().await })
+            .unwrap();
+        assert_eq!(replay_wire, first_wire);
+
+        drop(session);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn mobile_direct_text_send_needs_prekey_without_accepting_an_intent() {
         let (session, path, token, conversation_id, _peer, mut outbound) =
             mobile_test_ready_prekey_fixture(131);
@@ -6098,7 +6481,7 @@ mod tests {
 
     #[test]
     fn mobile_direct_text_transport_loss_keeps_intent_and_revokes_the_lease() {
-        let (session, path, token, conversation_id, peer, outbound) =
+        let (session, path, token, conversation_id, peer, mut outbound) =
             mobile_test_ready_prekey_fixture(132);
         let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
         session
@@ -6107,7 +6490,11 @@ mod tests {
             .unwrap()
             .establish_session(&peer_identity_key, &bundle)
             .unwrap();
-        drop(outbound);
+        session
+            .client
+            .lock()
+            .unwrap()
+            .test_only_retryable_after_next_direct_commit_v1();
 
         assert_eq!(
             session
@@ -6115,6 +6502,7 @@ mod tests {
                 .unwrap(),
             MobileDirectTextSendOutcome::AcceptedForReplay
         );
+        assert!(outbound.try_recv().is_ok());
         assert!(session.binding.lock().unwrap().is_none());
         assert_eq!(
             session.direct_sync.lock().unwrap().as_ref().unwrap().phase,

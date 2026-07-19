@@ -10,7 +10,10 @@ use subtle::ConstantTimeEq;
 use tokio::sync::{mpsc, watch, Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio_tungstenite::{
     connect_async_with_config,
-    tungstenite::{protocol::WebSocketConfig, Message as WsMessage},
+    tungstenite::{
+        protocol::{frame::coding::CloseCode, WebSocketConfig},
+        Message as WsMessage,
+    },
 };
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -57,6 +60,164 @@ pub struct ConnectionConfig {
     pub server_url: String,
 }
 
+/// Source-classified reason that a WebSocket connection attempt stopped.
+///
+/// Only `RetryableTransport` is safe for an automatic reconnect controller.
+/// Authentication denials and every malformed, locally inconsistent, TLS,
+/// HTTP, protocol, or bounded-buffer outcome remain fail-closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionConnectStopV1 {
+    RetryableTransport,
+    AuthenticationRejected,
+    EpochInvalid,
+}
+
+/// Typed connection-attempt failure with the legacy diagnostic preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionConnectErrorV1 {
+    pub stop: ConnectionConnectStopV1,
+    pub detail: String,
+}
+
+impl ConnectionConnectErrorV1 {
+    fn retryable_transport(detail: impl Into<String>) -> Self {
+        Self {
+            stop: ConnectionConnectStopV1::RetryableTransport,
+            detail: detail.into(),
+        }
+    }
+
+    fn authentication_rejected(detail: impl Into<String>) -> Self {
+        Self {
+            stop: ConnectionConnectStopV1::AuthenticationRejected,
+            detail: detail.into(),
+        }
+    }
+
+    fn epoch_invalid(detail: impl Into<String>) -> Self {
+        Self {
+            stop: ConnectionConnectStopV1::EpochInvalid,
+            detail: detail.into(),
+        }
+    }
+
+    pub fn into_detail(self) -> String {
+        self.detail
+    }
+}
+
+impl fmt::Display for ConnectionConnectErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for ConnectionConnectErrorV1 {}
+
+/// Fail-closed source classification shared by the authentication handshake
+/// and the detached post-authentication socket loops.
+///
+/// This is deliberately a positive allowlist: rendered diagnostics never
+/// participate in reconnect policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WebSocketTerminalStopV1 {
+    RetryableTransport,
+    EpochInvalid,
+}
+
+fn classify_websocket_error_stop_v1(
+    error: &tokio_tungstenite::tungstenite::Error,
+) -> WebSocketTerminalStopV1 {
+    use tokio_tungstenite::tungstenite::{error::ProtocolError, Error as WsError};
+
+    match error {
+        WsError::ConnectionClosed => WebSocketTerminalStopV1::RetryableTransport,
+        WsError::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::HostUnreachable
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NetworkDown
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::WouldBlock
+            ) =>
+        {
+            WebSocketTerminalStopV1::RetryableTransport
+        }
+        WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake) => {
+            WebSocketTerminalStopV1::RetryableTransport
+        }
+        // Protocol/capacity/TLS failures and local configuration errors such
+        // as missing native CA roots are not ordinary network loss. Every
+        // unlisted source therefore invalidates the authenticated epoch.
+        _ => WebSocketTerminalStopV1::EpochInvalid,
+    }
+}
+
+fn classify_websocket_close_stop_v1(code: Option<CloseCode>) -> WebSocketTerminalStopV1 {
+    match code {
+        None
+        | Some(
+            CloseCode::Normal
+            | CloseCode::Away
+            | CloseCode::Abnormal
+            | CloseCode::Error
+            | CloseCode::Restart
+            | CloseCode::Again,
+        ) => WebSocketTerminalStopV1::RetryableTransport,
+        // In particular, Protocol, Policy, Unsupported, Invalid, and Size
+        // close statuses are authenticated epoch failures, not reconnect
+        // hints. Unknown/private codes also fail closed by default.
+        Some(_) => WebSocketTerminalStopV1::EpochInvalid,
+    }
+}
+
+fn websocket_close_detail_v1(context: &'static str, code: Option<CloseCode>) -> String {
+    match code {
+        Some(code) => format!("{context}: WebSocket close code {code}"),
+        None => format!("{context}: WebSocket close without a status code"),
+    }
+}
+
+fn classify_websocket_handshake_error_v1(
+    context: &'static str,
+    error: tokio_tungstenite::tungstenite::Error,
+) -> ConnectionConnectErrorV1 {
+    let stop = classify_websocket_error_stop_v1(&error);
+    let detail = format!("{context}: {error}");
+    match stop {
+        WebSocketTerminalStopV1::RetryableTransport => {
+            ConnectionConnectErrorV1::retryable_transport(detail)
+        }
+        WebSocketTerminalStopV1::EpochInvalid => {
+            // In particular, HTTP and TLS errors are deliberately not retried
+            // by default. A future narrower policy must classify their typed
+            // source, never their rendered diagnostic.
+            ConnectionConnectErrorV1::epoch_invalid(detail)
+        }
+    }
+}
+
+fn classify_websocket_handshake_close_v1(
+    context: &'static str,
+    code: Option<CloseCode>,
+) -> ConnectionConnectErrorV1 {
+    let detail = websocket_close_detail_v1(context, code);
+    match classify_websocket_close_stop_v1(code) {
+        WebSocketTerminalStopV1::RetryableTransport => {
+            ConnectionConnectErrorV1::retryable_transport(detail)
+        }
+        WebSocketTerminalStopV1::EpochInvalid => ConnectionConnectErrorV1::epoch_invalid(detail),
+    }
+}
+
 /// Reject cleartext remote transports. Local loopback WebSockets remain
 /// available for development and integration tests.
 fn validate_websocket_url(raw: &str) -> Result<(), String> {
@@ -101,10 +262,10 @@ fn websocket_auth_signature(
     Ok(signature)
 }
 
-fn validate_per_device_auth_result(
+fn validate_per_device_auth_result_classified_v1(
     result: &proto::AuthResult,
     expected: &DeviceBindingPublicV1,
-) -> Result<String, String> {
+) -> Result<String, ConnectionConnectErrorV1> {
     if !result.success {
         let message = match proto::AuthFailureReason::try_from(result.failure_reason) {
             Ok(proto::AuthFailureReason::RegistrationClosed) => {
@@ -122,27 +283,41 @@ fn validate_per_device_auth_result(
                 }
             }
         };
-        return Err(message);
+        return Err(ConnectionConnectErrorV1::authentication_rejected(message));
     }
     if !result.per_device_secure {
-        return Err(
-            "server authenticated only the legacy account identity; per-device proof missing"
-                .to_string(),
-        );
+        return Err(ConnectionConnectErrorV1::epoch_invalid(
+            "server authenticated only the legacy account identity; per-device proof missing",
+        ));
     }
     if result.device_binding_version != expected.version {
-        return Err("server confirmed a different device binding version".to_string());
+        return Err(ConnectionConnectErrorV1::epoch_invalid(
+            "server confirmed a different device binding version",
+        ));
     }
     if result.device_binding_status != i32::from(DEVICE_BINDING_STATUS_ACTIVE)
         || result.device_binding_status != i32::from(expected.status)
     {
-        return Err("server did not confirm an active device binding".to_string());
+        return Err(ConnectionConnectErrorV1::epoch_invalid(
+            "server did not confirm an active device binding",
+        ));
     }
     let user_id = result.user_id.clone().unwrap_or_default();
     if user_id.is_empty() {
-        return Err("server authenticated without a user id".to_string());
+        return Err(ConnectionConnectErrorV1::epoch_invalid(
+            "server authenticated without a user id",
+        ));
     }
     Ok(user_id)
+}
+
+#[cfg(test)]
+fn validate_per_device_auth_result(
+    result: &proto::AuthResult,
+    expected: &DeviceBindingPublicV1,
+) -> Result<String, String> {
+    validate_per_device_auth_result_classified_v1(result, expected)
+        .map_err(ConnectionConnectErrorV1::into_detail)
 }
 
 /// Events emitted by the connection to the application layer.
@@ -823,8 +998,11 @@ struct ConnectionTerminalInnerV1 {
 
 #[derive(Clone)]
 enum ConnectionTerminalCauseV1 {
-    Transport(String),
-    Buffer(ConnectionEventBufferErrorV1),
+    RetryableTransport(String),
+    EpochInvalid {
+        detail: String,
+        typed_failure: ConnectionEventBufferErrorV1,
+    },
 }
 
 #[derive(Default)]
@@ -834,22 +1012,38 @@ struct ConnectionTerminalStateV1 {
 }
 
 impl ConnectionTerminalStateV1 {
-    fn report_transport(&self, mut reason: String) -> bool {
-        if reason.len() > MAX_TERMINAL_REASON_BYTES {
+    fn truncate_detail(mut detail: String) -> String {
+        if detail.len() > MAX_TERMINAL_REASON_BYTES {
             let mut boundary = MAX_TERMINAL_REASON_BYTES;
-            while !reason.is_char_boundary(boundary) {
+            while !detail.is_char_boundary(boundary) {
                 boundary -= 1;
             }
-            reason.truncate(boundary);
+            detail.truncate(boundary);
         }
+        detail
+    }
+
+    fn report_cause(&self, cause: ConnectionTerminalCauseV1) -> bool {
         let mut state = self
             .inner
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        if state.cause.is_some() {
+        let upgrades_unconsumed_transport = !state.delivered
+            && matches!(
+                (&state.cause, &cause),
+                (
+                    Some(ConnectionTerminalCauseV1::RetryableTransport(_)),
+                    ConnectionTerminalCauseV1::EpochInvalid { .. }
+                )
+            );
+        if state.cause.is_some() && !upgrades_unconsumed_transport {
             return false;
         }
-        state.cause = Some(ConnectionTerminalCauseV1::Transport(reason));
+        // A protocol/security failure has higher precedence than an ordinary
+        // transport loss racing it from the other socket half. Upgrade only
+        // before the sole receiver consumes the terminal; delivery remains
+        // exactly once and can never be rewritten afterwards.
+        state.cause = Some(cause);
         drop(state);
         // There is exactly one receiver. `notify_one` retains a permit when
         // termination races the receiver between its state check and await.
@@ -857,20 +1051,29 @@ impl ConnectionTerminalStateV1 {
         true
     }
 
+    fn report_retryable_transport(&self, detail: String) -> bool {
+        self.report_cause(ConnectionTerminalCauseV1::RetryableTransport(
+            Self::truncate_detail(detail),
+        ))
+    }
+
+    fn report_epoch_invalid(
+        &self,
+        detail: String,
+        typed_failure: ConnectionEventBufferErrorV1,
+    ) -> bool {
+        self.report_cause(ConnectionTerminalCauseV1::EpochInvalid {
+            detail: Self::truncate_detail(detail),
+            typed_failure,
+        })
+    }
+
     fn report_buffer_failure(&self, error: ConnectionEventBufferErrorV1) -> bool {
-        let mut state = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        if state.cause.is_some() {
-            return false;
+        if error == ConnectionEventBufferErrorV1::TransportEpochEnded {
+            self.report_retryable_transport(error.to_string())
+        } else {
+            self.report_epoch_invalid(error.to_string(), error)
         }
-        state.cause = Some(ConnectionTerminalCauseV1::Buffer(error));
-        drop(state);
-        // There is exactly one receiver. `notify_one` retains a permit when
-        // termination races the receiver between its state check and await.
-        self.notify.notify_one();
-        true
     }
 
     fn is_reported(&self) -> bool {
@@ -879,6 +1082,21 @@ impl ConnectionTerminalStateV1 {
             .unwrap_or_else(|poison| poison.into_inner())
             .cause
             .is_some()
+    }
+
+    fn buffer_error_for_policy(&self) -> Option<ConnectionEventBufferErrorV1> {
+        let state = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match state.cause.as_ref()? {
+            ConnectionTerminalCauseV1::RetryableTransport(_) => {
+                Some(ConnectionEventBufferErrorV1::TransportEpochEnded)
+            }
+            ConnectionTerminalCauseV1::EpochInvalid { typed_failure, .. } => {
+                Some(typed_failure.clone())
+            }
+        }
     }
 
     fn take_for_delivery(&self) -> Option<ConnectionTerminalCauseV1> {
@@ -924,16 +1142,28 @@ impl ConnectionEventReceiverV1 {
         self.receiver.close();
         while self.receiver.try_recv().is_ok() {}
         self.terminal.take_for_delivery().map(|cause| match cause {
-            ConnectionTerminalCauseV1::Transport(reason) => {
-                BudgetedConnectionEventV1::terminal(ConnectionEvent::Disconnected { reason }, None)
+            ConnectionTerminalCauseV1::RetryableTransport(detail) => {
+                BudgetedConnectionEventV1::terminal(
+                    ConnectionEvent::Disconnected { reason: detail },
+                    None,
+                )
             }
-            ConnectionTerminalCauseV1::Buffer(error) => BudgetedConnectionEventV1::terminal(
-                ConnectionEvent::Disconnected {
-                    reason: error.to_string(),
-                },
-                Some(error),
+            ConnectionTerminalCauseV1::EpochInvalid {
+                detail,
+                typed_failure,
+            } => BudgetedConnectionEventV1::terminal(
+                ConnectionEvent::Disconnected { reason: detail },
+                Some(typed_failure),
             ),
         })
+    }
+
+    pub(crate) fn queued_len_v1(&self) -> usize {
+        self.receiver.len()
+    }
+
+    pub(crate) fn terminal_buffer_error_v1(&self) -> Option<ConnectionEventBufferErrorV1> {
+        self.terminal.buffer_error_for_policy()
     }
 
     pub(crate) fn try_recv_budgeted(
@@ -987,6 +1217,25 @@ impl ConnectionEventReceiverV1 {
 /// Sender half — used to send protobuf envelopes to the server.
 pub type WsSender = mpsc::Sender<Vec<u8>>;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConnectionSendErrorV1 {
+    Rejected(String),
+    QueueTimeout,
+    QueueClosed,
+}
+
+impl ConnectionSendErrorV1 {
+    fn into_detail(self) -> String {
+        match self {
+            Self::Rejected(detail) => detail,
+            Self::QueueTimeout => {
+                "send timed out waiting for the bounded WebSocket queue".to_string()
+            }
+            Self::QueueClosed => "bounded WebSocket send queue is closed".to_string(),
+        }
+    }
+}
+
 /// Manages a WebSocket connection to the Veil gateway.
 pub struct Connection {
     /// Send raw protobuf bytes to the WS write loop.
@@ -1009,9 +1258,57 @@ fn signal_disconnected(
     reason: String,
 ) {
     // Closing either half makes the split WebSocket unusable. Stop its peer
-    // immediately and emit exactly one terminal event for the connection.
+    // only after the source-typed terminal is visible. Otherwise the peer can
+    // drop the bounded send receiver first and make an EpochInvalid source
+    // look like an unclassified queue closure to a committed Direct send.
+    terminal.report_retryable_transport(reason);
+    debug_assert!(terminal.is_reported());
     let _ = shutdown.send(true);
-    terminal.report_transport(reason);
+}
+
+fn signal_websocket_error_v1(
+    terminal: &ConnectionTerminalStateV1,
+    shutdown: &watch::Sender<bool>,
+    context: &'static str,
+    error: tokio_tungstenite::tungstenite::Error,
+) {
+    let stop = classify_websocket_error_stop_v1(&error);
+    let detail = format!("{context}: {error}");
+    match stop {
+        WebSocketTerminalStopV1::RetryableTransport => {
+            terminal.report_retryable_transport(detail);
+        }
+        WebSocketTerminalStopV1::EpochInvalid => {
+            terminal.report_epoch_invalid(
+                detail,
+                ConnectionEventBufferErrorV1::ProtocolViolation { envelope: context },
+            );
+        }
+    }
+    debug_assert!(terminal.is_reported());
+    let _ = shutdown.send(true);
+}
+
+fn signal_websocket_close_v1(
+    terminal: &ConnectionTerminalStateV1,
+    shutdown: &watch::Sender<bool>,
+    context: &'static str,
+    code: Option<CloseCode>,
+) {
+    let detail = websocket_close_detail_v1(context, code);
+    match classify_websocket_close_stop_v1(code) {
+        WebSocketTerminalStopV1::RetryableTransport => {
+            terminal.report_retryable_transport(detail);
+        }
+        WebSocketTerminalStopV1::EpochInvalid => {
+            terminal.report_epoch_invalid(
+                detail,
+                ConnectionEventBufferErrorV1::ProtocolViolation { envelope: context },
+            );
+        }
+    }
+    debug_assert!(terminal.is_reported());
+    let _ = shutdown.send(true);
 }
 
 fn signal_event_buffer_failure(
@@ -1019,8 +1316,9 @@ fn signal_event_buffer_failure(
     shutdown: &watch::Sender<bool>,
     error: ConnectionEventBufferErrorV1,
 ) {
-    let _ = shutdown.send(true);
     terminal.report_buffer_failure(error);
+    debug_assert!(terminal.is_reported());
+    let _ = shutdown.send(true);
 }
 
 impl Connection {
@@ -1034,9 +1332,34 @@ impl Connection {
         client_id: &str,
         node_access_invite: Option<&[u8]>,
     ) -> Result<Self, String> {
+        Self::connect_classified_v1(
+            config,
+            identity,
+            device_identity,
+            device_name,
+            client_id,
+            node_access_invite,
+        )
+        .await
+        .map_err(ConnectionConnectErrorV1::into_detail)
+    }
+
+    /// Typed source boundary for a complete WebSocket authentication attempt.
+    ///
+    /// Callers may automatically retry only `RetryableTransport`. No rendered
+    /// diagnostic is part of the retry policy.
+    pub async fn connect_classified_v1(
+        config: &ConnectionConfig,
+        identity: &IdentityKeyPair,
+        device_identity: &DeviceIdentityV1,
+        device_name: &str,
+        client_id: &str,
+        node_access_invite: Option<&[u8]>,
+    ) -> Result<Self, ConnectionConnectErrorV1> {
         let url = &config.server_url;
-        validate_websocket_url(url)?;
-        let node_access_invite = node_access_invite_wire_value(node_access_invite)?;
+        validate_websocket_url(url).map_err(ConnectionConnectErrorV1::epoch_invalid)?;
+        let node_access_invite = node_access_invite_wire_value(node_access_invite)
+            .map_err(ConnectionConnectErrorV1::epoch_invalid)?;
         // Keep endpoint and account metadata out of production diagnostics.
         info!("connecting to validated WebSocket endpoint");
 
@@ -1053,8 +1376,12 @@ impl Connection {
             connect_async_with_config(url, Some(websocket_config), false),
         )
         .await
-        .map_err(|_| format!("ws connect timed out after 8s: {url}"))?
-        .map_err(|e| format!("ws connect failed: {e}"))?;
+        .map_err(|_| {
+            ConnectionConnectErrorV1::retryable_transport(format!(
+                "ws connect timed out after 8s: {url}"
+            ))
+        })?
+        .map_err(|error| classify_websocket_handshake_error_v1("ws connect failed", error))?;
 
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
@@ -1068,22 +1395,51 @@ impl Connection {
             loop {
                 match ws_read.next().await {
                     Some(Ok(WsMessage::Binary(data))) => {
-                        let env = proto::Envelope::decode(data.as_ref())
-                            .map_err(|e| format!("decode challenge: {e}"))?;
+                        let env = proto::Envelope::decode(data.as_ref()).map_err(|error| {
+                            ConnectionConnectErrorV1::epoch_invalid(format!(
+                                "decode challenge: {error}"
+                            ))
+                        })?;
                         if let Some(proto::envelope::Payload::AuthChallenge(ch)) = env.payload {
-                            return Ok::<_, String>(ch.challenge);
+                            return Ok::<_, ConnectionConnectErrorV1>(ch.challenge);
                         }
                         warn!("expected auth_challenge, got other payload");
+                        return Err(ConnectionConnectErrorV1::epoch_invalid(
+                            "unexpected envelope before authentication challenge",
+                        ));
                     }
-                    Some(Ok(WsMessage::Ping(_))) => continue,
-                    Some(Err(e)) => return Err(format!("ws read error during auth: {e}")),
-                    None => return Err("connection closed before auth challenge".into()),
-                    _ => continue,
+                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        return Err(classify_websocket_handshake_close_v1(
+                            "connection closed before auth challenge",
+                            frame.as_ref().map(|frame| frame.code),
+                        ))
+                    }
+                    None => {
+                        return Err(ConnectionConnectErrorV1::retryable_transport(
+                            "connection closed before auth challenge",
+                        ))
+                    }
+                    Some(Err(error)) => {
+                        return Err(classify_websocket_handshake_error_v1(
+                            "ws read error during auth",
+                            error,
+                        ))
+                    }
+                    Some(Ok(WsMessage::Text(_) | WsMessage::Frame(_))) => {
+                        return Err(ConnectionConnectErrorV1::epoch_invalid(
+                            "unexpected WebSocket data before authentication challenge",
+                        ))
+                    }
                 }
             }
         })
         .await
-        .map_err(|_| "timed out waiting for authentication challenge".to_string())??;
+        .map_err(|_| {
+            ConnectionConnectErrorV1::retryable_transport(
+                "timed out waiting for authentication challenge",
+            )
+        })??;
 
         info!("received auth challenge ({} bytes)", challenge.len());
 
@@ -1091,8 +1447,11 @@ impl Connection {
         // The server challenge is an ephemeral X25519 public key. Binding its
         // DH result into the Ed25519 signature prevents cross-protocol signing
         // and proves that the client owns the advertised X25519 identity.
-        let sig = websocket_auth_signature(identity, &challenge)?;
-        let device_sig = device_identity.auth_signature(identity, &challenge)?;
+        let sig = websocket_auth_signature(identity, &challenge)
+            .map_err(ConnectionConnectErrorV1::epoch_invalid)?;
+        let device_sig = device_identity
+            .auth_signature(identity, &challenge)
+            .map_err(ConnectionConnectErrorV1::epoch_invalid)?;
         let binding = device_identity.binding();
         let mut auth_resp = proto::Envelope {
             seq: 2,
@@ -1126,7 +1485,7 @@ impl Connection {
         ws_write
             .send(WsMessage::Binary(auth_bytes))
             .await
-            .map_err(|e| format!("send auth_response: {e}"))?;
+            .map_err(|error| classify_websocket_handshake_error_v1("send auth_response", error))?;
 
         // --- Step 3: Receive retained encrypted control state, then AuthResult. ---
         // The server queues every retained SKDM before AuthResult and publishes
@@ -1139,18 +1498,22 @@ impl Connection {
             loop {
                 match ws_read.next().await {
                     Some(Ok(WsMessage::Binary(data))) => {
-                        let env = proto::Envelope::decode(data.as_ref())
-                            .map_err(|e| format!("decode auth_result: {e}"))?;
+                        let env = proto::Envelope::decode(data.as_ref()).map_err(|error| {
+                            ConnectionConnectErrorV1::epoch_invalid(format!(
+                                "decode auth_result: {error}"
+                            ))
+                        })?;
                         match env.payload.as_ref() {
                             Some(proto::envelope::Payload::AuthResult(r)) => {
-                                return validate_per_device_auth_result(r, binding);
+                                return validate_per_device_auth_result_classified_v1(r, binding);
                             }
                             Some(proto::envelope::Payload::SenderKeyDist(skd)) => {
                                 if sender_key_route_from_proto(skd).is_none()
                                     || retained_before_auth.len() >= MAX_RETAINED_SKDM_EVENTS
                                 {
-                                    return Err("invalid or excessive retained sender-key state"
-                                        .to_string());
+                                    return Err(ConnectionConnectErrorV1::epoch_invalid(
+                                        "invalid or excessive retained sender-key state",
+                                    ));
                                 }
                                 // Count the complete protobuf except the bounded ciphertext
                                 // bytes themselves. This automatically includes every routing
@@ -1159,43 +1522,72 @@ impl Connection {
                                     .encoded_len()
                                     .checked_sub(skd.sender_key_message.len())
                                     .ok_or_else(|| {
-                                        "retained sender-key metadata count overflow".to_string()
+                                        ConnectionConnectErrorV1::epoch_invalid(
+                                            "retained sender-key metadata count overflow",
+                                        )
                                     })?;
                                 retained_metadata_bytes = retained_metadata_bytes
                                     .checked_add(metadata_bytes)
                                     .ok_or_else(|| {
-                                        "retained sender-key metadata count overflow".to_string()
+                                        ConnectionConnectErrorV1::epoch_invalid(
+                                            "retained sender-key metadata count overflow",
+                                        )
                                     })?;
                                 retained_wire_bytes = retained_wire_bytes
                                     .checked_add(skd.sender_key_message.len())
                                     .ok_or_else(|| {
-                                        "retained sender-key wire count overflow".to_string()
+                                        ConnectionConnectErrorV1::epoch_invalid(
+                                            "retained sender-key wire count overflow",
+                                        )
                                     })?;
                                 if retained_wire_bytes > MAX_RETAINED_SKDM_WIRE_TOTAL_BYTES
                                     || retained_metadata_bytes > MAX_RETAINED_SKDM_METADATA_BYTES
                                 {
-                                    return Err("retained sender-key state exceeds client limit"
-                                        .to_string());
+                                    return Err(ConnectionConnectErrorV1::epoch_invalid(
+                                        "retained sender-key state exceeds client limit",
+                                    ));
                                 }
                                 retained_before_auth.push(env);
                             }
                             _ => {
-                                return Err(
-                                    "unexpected non-control envelope before authentication barrier"
-                                        .to_string(),
-                                );
+                                return Err(ConnectionConnectErrorV1::epoch_invalid(
+                                    "unexpected non-control envelope before authentication barrier",
+                                ));
                             }
                         }
                     }
-                    Some(Ok(WsMessage::Ping(_))) => continue,
-                    Some(Err(e)) => return Err(format!("ws read error during auth: {e}")),
-                    None => return Err("connection closed during auth".into()),
-                    _ => continue,
+                    Some(Ok(WsMessage::Ping(_) | WsMessage::Pong(_))) => continue,
+                    Some(Ok(WsMessage::Close(frame))) => {
+                        return Err(classify_websocket_handshake_close_v1(
+                            "connection closed during auth",
+                            frame.as_ref().map(|frame| frame.code),
+                        ))
+                    }
+                    None => {
+                        return Err(ConnectionConnectErrorV1::retryable_transport(
+                            "connection closed during auth",
+                        ))
+                    }
+                    Some(Err(error)) => {
+                        return Err(classify_websocket_handshake_error_v1(
+                            "ws read error during auth",
+                            error,
+                        ))
+                    }
+                    Some(Ok(WsMessage::Text(_) | WsMessage::Frame(_))) => {
+                        return Err(ConnectionConnectErrorV1::epoch_invalid(
+                            "unexpected WebSocket data before authentication barrier",
+                        ))
+                    }
                 }
             }
         })
         .await
-        .map_err(|_| "timed out waiting for authentication result".to_string())??;
+        .map_err(|_| {
+            ConnectionConnectErrorV1::retryable_transport(
+                "timed out waiting for authentication result",
+            )
+        })??;
 
         info!("authenticated WebSocket session");
 
@@ -1203,12 +1595,16 @@ impl Connection {
         let mut retained_events = VecDeque::with_capacity(retained_before_auth.len());
         for envelope in retained_before_auth {
             let event = connection_event_from_envelope(envelope)
-                .map_err(|_| "invalid retained sender-key event".to_string())?
-                .ok_or_else(|| "invalid retained sender-key event".to_string())?;
+                .map_err(|_| {
+                    ConnectionConnectErrorV1::epoch_invalid("invalid retained sender-key event")
+                })?
+                .ok_or_else(|| {
+                    ConnectionConnectErrorV1::epoch_invalid("invalid retained sender-key event")
+                })?;
             retained_events.push_back(
                 event_budget
                     .try_wrap(event)
-                    .map_err(|error| error.to_string())?,
+                    .map_err(|error| ConnectionConnectErrorV1::epoch_invalid(error.to_string()))?,
             );
         }
         // Channel: WS read loop → app. Retained controls live in their own
@@ -1232,7 +1628,7 @@ impl Connection {
                 user_id: user_id.clone(),
             })
             .await
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| ConnectionConnectErrorV1::epoch_invalid(error.to_string()))?;
 
         // Both halves share a terminal signal. A write failure must stop the
         // reader as well (and vice versa), otherwise the application can keep
@@ -1255,10 +1651,11 @@ impl Connection {
                             break;
                         };
                         if let Err(error) = ws_write.send(WsMessage::Binary(data)).await {
-                            signal_disconnected(
+                            signal_websocket_error_v1(
                                 &write_terminal,
                                 &write_shutdown,
-                                format!("ws write error: {error}"),
+                                "WebSocket write transport",
+                                error,
                             );
                             break;
                         }
@@ -1285,11 +1682,12 @@ impl Connection {
                         match incoming {
                             Some(Ok(message)) => match dispatch_authenticated_ws_message(&evt, message).await {
                                 Ok(AuthenticatedWsMessageOutcomeV1::Continue) => continue,
-                                Ok(AuthenticatedWsMessageOutcomeV1::Closed) => {
-                                    signal_disconnected(
+                                Ok(AuthenticatedWsMessageOutcomeV1::Closed(code)) => {
+                                    signal_websocket_close_v1(
                                         &read_terminal,
                                         &read_shutdown,
-                                        "server closed".into(),
+                                        "WebSocket peer close",
+                                        code,
                                     );
                                     break;
                                 }
@@ -1311,10 +1709,11 @@ impl Connection {
                                 break;
                             }
                             Some(Err(error)) => {
-                                signal_disconnected(
+                                signal_websocket_error_v1(
                                     &read_terminal,
                                     &read_shutdown,
-                                    format!("ws read error: {error}"),
+                                    "WebSocket read transport",
+                                    error,
                                 );
                                 break;
                             }
@@ -1363,7 +1762,8 @@ impl Connection {
         validate_preencoded_send_message_payload_v1(exact_send_message_bytes)?;
         let seq = self.next_seq().await;
         self.send_preencoded_send_message_with_seq_v1(seq, exact_send_message_bytes)
-            .await?;
+            .await
+            .map_err(ConnectionSendErrorV1::into_detail)?;
         Ok(seq)
     }
 
@@ -1373,19 +1773,25 @@ impl Connection {
         &self,
         seq: u64,
         exact_send_message_bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<(), ConnectionSendErrorV1> {
         if seq == 0 {
-            return Err("SendMessage envelope sequence must be positive".to_string());
+            return Err(ConnectionSendErrorV1::Rejected(
+                "SendMessage envelope sequence must be positive".to_string(),
+            ));
         }
-        validate_preencoded_send_message_payload_v1(exact_send_message_bytes)?;
-        let payload_len = u64::try_from(exact_send_message_bytes.len())
-            .map_err(|_| "SendMessage payload length overflow".to_string())?;
+        validate_preencoded_send_message_payload_v1(exact_send_message_bytes)
+            .map_err(ConnectionSendErrorV1::Rejected)?;
+        let payload_len = u64::try_from(exact_send_message_bytes.len()).map_err(|_| {
+            ConnectionSendErrorV1::Rejected("SendMessage payload length overflow".to_string())
+        })?;
         let capacity = 1usize
             .checked_add(protobuf_varint_len(seq))
             .and_then(|size| size.checked_add(2))
             .and_then(|size| size.checked_add(protobuf_varint_len(payload_len)))
             .and_then(|size| size.checked_add(exact_send_message_bytes.len()))
-            .ok_or_else(|| "SendMessage envelope size overflow".to_string())?;
+            .ok_or_else(|| {
+                ConnectionSendErrorV1::Rejected("SendMessage envelope size overflow".to_string())
+            })?;
         let mut envelope = Vec::with_capacity(capacity);
         // Envelope.seq = field 1, wire type varint.
         envelope.push(0x08);
@@ -1398,8 +1804,8 @@ impl Connection {
 
         tokio::time::timeout(OUTBOUND_QUEUE_TIMEOUT, self.sender.send(envelope))
             .await
-            .map_err(|_| "send timed out waiting for the bounded WebSocket queue".to_string())?
-            .map_err(|error| format!("send failed: {error}"))
+            .map_err(|_| ConnectionSendErrorV1::QueueTimeout)?
+            .map_err(|_| ConnectionSendErrorV1::QueueClosed)
     }
 
     #[cfg(any(test, feature = "test-utils"))]
@@ -1423,6 +1829,27 @@ impl Connection {
             },
             outbound,
         )
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn test_only_report_websocket_error_v1(
+        &self,
+        error: tokio_tungstenite::tungstenite::Error,
+    ) {
+        let detail = format!("test post-auth WebSocket source: {error}");
+        match classify_websocket_error_stop_v1(&error) {
+            WebSocketTerminalStopV1::RetryableTransport => {
+                self.events.terminal.report_retryable_transport(detail);
+            }
+            WebSocketTerminalStopV1::EpochInvalid => {
+                self.events.terminal.report_epoch_invalid(
+                    detail,
+                    ConnectionEventBufferErrorV1::ProtocolViolation {
+                        envelope: "test post-auth WebSocket source",
+                    },
+                );
+            }
+        }
     }
 
     /// Stop background I/O immediately. Dropping the client calls this through
@@ -1479,15 +1906,27 @@ impl Drop for Connection {
 #[allow(clippy::items_after_test_module)]
 mod url_policy_tests {
     use super::{
+        classify_websocket_close_stop_v1, classify_websocket_error_stop_v1,
+        classify_websocket_handshake_close_v1, classify_websocket_handshake_error_v1,
         client_version, node_access_invite_wire_value, signal_disconnected,
-        validate_per_device_auth_result, validate_websocket_url, websocket_auth_signature,
-        Connection, ConnectionEvent, ConnectionEventReceiverV1, ConnectionTerminalStateV1,
+        signal_websocket_error_v1, validate_per_device_auth_result,
+        validate_per_device_auth_result_classified_v1, validate_websocket_url,
+        websocket_auth_signature, Connection, ConnectionConnectErrorV1, ConnectionConnectStopV1,
+        ConnectionEvent, ConnectionEventBufferErrorV1, ConnectionEventReceiverV1,
+        ConnectionTerminalStateV1, WebSocketTerminalStopV1,
     };
     use crate::device_identity::{
         DeviceBindingPublicV1, DEVICE_BINDING_STATUS_ACTIVE, REQUIRED_DEVICE_CAPABILITIES,
     };
     use crate::protocol::proto;
+    use std::io;
     use std::sync::Arc;
+    use tokio_tungstenite::tungstenite::{
+        error::{CapacityError, ProtocolError, TlsError},
+        http::Response,
+        protocol::frame::coding::CloseCode,
+        Error as WsError,
+    };
     use veil_crypto::keys::IdentityKeyPair;
 
     #[test]
@@ -1528,6 +1967,215 @@ mod url_policy_tests {
         assert!(validate_websocket_url("https://chat.example.test/ws").is_err());
         assert!(validate_websocket_url("wss://user@chat.example.test/ws").is_err());
         assert!(validate_websocket_url("wss://chat.example.test/ws#fragment").is_err());
+    }
+
+    #[test]
+    fn classifies_only_allowlisted_websocket_loss_as_retryable_transport() {
+        let io_error = classify_websocket_handshake_error_v1(
+            "ws read error during auth",
+            WsError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "peer reset")),
+        );
+        assert_eq!(io_error.stop, ConnectionConnectStopV1::RetryableTransport);
+        assert_eq!(
+            io_error.detail,
+            "ws read error during auth: IO error: peer reset"
+        );
+
+        let eof = classify_websocket_handshake_error_v1(
+            "ws read error during auth",
+            WsError::ConnectionClosed,
+        );
+        assert_eq!(eof.stop, ConnectionConnectStopV1::RetryableTransport);
+
+        let unexpected_eof = classify_websocket_handshake_error_v1(
+            "ws read error during auth",
+            WsError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "tls stream ended",
+            )),
+        );
+        assert_eq!(
+            unexpected_eof.stop,
+            ConnectionConnectStopV1::RetryableTransport
+        );
+
+        let reset_without_close = classify_websocket_handshake_error_v1(
+            "ws read error during auth",
+            WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        );
+        assert_eq!(
+            reset_without_close.stop,
+            ConnectionConnectStopV1::RetryableTransport
+        );
+
+        let already_closed =
+            classify_websocket_handshake_error_v1("send auth_response", WsError::AlreadyClosed);
+        assert_eq!(already_closed.stop, ConnectionConnectStopV1::EpochInvalid);
+
+        let missing_native_roots = classify_websocket_handshake_error_v1(
+            "ws connect failed",
+            WsError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "native root store missing",
+            )),
+        );
+        assert_eq!(
+            missing_native_roots.stop,
+            ConnectionConnectStopV1::EpochInvalid
+        );
+    }
+
+    #[test]
+    fn post_auth_websocket_error_classifier_is_a_positive_typed_allowlist() {
+        for retryable in [
+            WsError::Io(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "server restarting",
+            )),
+            WsError::Io(io::Error::new(io::ErrorKind::ConnectionReset, "peer reset")),
+            WsError::Io(io::Error::new(
+                io::ErrorKind::NetworkUnreachable,
+                "device offline",
+            )),
+            WsError::Io(io::Error::new(
+                io::ErrorKind::HostUnreachable,
+                "gateway unreachable",
+            )),
+            WsError::Io(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "connection aborted",
+            )),
+            WsError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "socket write failed",
+            )),
+            WsError::Io(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "socket detached",
+            )),
+            WsError::Io(io::Error::new(io::ErrorKind::TimedOut, "read timeout")),
+            WsError::Io(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "truncated stream",
+            )),
+            WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        ] {
+            assert_eq!(
+                classify_websocket_error_stop_v1(&retryable),
+                WebSocketTerminalStopV1::RetryableTransport
+            );
+        }
+
+        for epoch_invalid in [
+            WsError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                "native roots missing",
+            )),
+            WsError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid certificate",
+            )),
+            WsError::Protocol(ProtocolError::InvalidOpcode(3)),
+            WsError::Capacity(CapacityError::MessageTooLong {
+                size: 2,
+                max_size: 1,
+            }),
+            WsError::Tls(TlsError::InvalidDnsName),
+        ] {
+            assert_eq!(
+                classify_websocket_error_stop_v1(&epoch_invalid),
+                WebSocketTerminalStopV1::EpochInvalid
+            );
+        }
+    }
+
+    #[test]
+    fn websocket_close_classifier_retries_only_transient_or_orderly_shutdowns() {
+        for code in [
+            None,
+            Some(CloseCode::Normal),
+            Some(CloseCode::Away),
+            Some(CloseCode::Abnormal),
+            Some(CloseCode::Error),
+            Some(CloseCode::Restart),
+            Some(CloseCode::Again),
+        ] {
+            assert_eq!(
+                classify_websocket_close_stop_v1(code),
+                WebSocketTerminalStopV1::RetryableTransport
+            );
+            assert_eq!(
+                classify_websocket_handshake_close_v1("closed during auth", code).stop,
+                ConnectionConnectStopV1::RetryableTransport
+            );
+        }
+
+        for code in [
+            CloseCode::Protocol,
+            CloseCode::Unsupported,
+            CloseCode::Invalid,
+            CloseCode::Policy,
+            CloseCode::Size,
+            CloseCode::Extension,
+            CloseCode::Tls,
+            CloseCode::Iana(3001),
+        ] {
+            assert_eq!(
+                classify_websocket_close_stop_v1(Some(code)),
+                WebSocketTerminalStopV1::EpochInvalid
+            );
+            assert_eq!(
+                classify_websocket_handshake_close_v1("closed during auth", Some(code)).stop,
+                ConnectionConnectStopV1::EpochInvalid
+            );
+        }
+    }
+
+    #[test]
+    fn http_and_tls_handshake_failures_are_not_retryable_by_default() {
+        let http = classify_websocket_handshake_error_v1(
+            "ws connect failed",
+            WsError::Http(Response::builder().status(503).body(None).unwrap()),
+        );
+        assert_eq!(http.stop, ConnectionConnectStopV1::EpochInvalid);
+        assert_eq!(
+            http.detail,
+            "ws connect failed: HTTP error: 503 Service Unavailable"
+        );
+
+        let tls = classify_websocket_handshake_error_v1(
+            "ws connect failed",
+            WsError::Tls(TlsError::InvalidDnsName),
+        );
+        assert_eq!(tls.stop, ConnectionConnectStopV1::EpochInvalid);
+        assert_eq!(tls.detail, "ws connect failed: TLS error: Invalid DNS name");
+
+        // tokio-rustls reports certificate and handshake parsing failures as
+        // InvalidData IO errors, so that typed form must not enter reconnect.
+        let rustls_wrapped = classify_websocket_handshake_error_v1(
+            "ws connect failed",
+            WsError::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid peer certificate",
+            )),
+        );
+        assert_eq!(rustls_wrapped.stop, ConnectionConnectStopV1::EpochInvalid);
+    }
+
+    #[test]
+    fn typed_connection_error_preserves_legacy_rendering() {
+        let error = ConnectionConnectErrorV1::retryable_transport(
+            "timed out waiting for authentication challenge",
+        );
+        assert_eq!(error.stop, ConnectionConnectStopV1::RetryableTransport);
+        assert_eq!(
+            error.to_string(),
+            "timed out waiting for authentication challenge"
+        );
+        assert_eq!(
+            error.into_detail(),
+            "timed out waiting for authentication challenge"
+        );
     }
 
     #[tokio::test]
@@ -1588,6 +2236,105 @@ mod url_policy_tests {
         ));
     }
 
+    #[tokio::test]
+    async fn post_auth_protocol_source_reaches_typed_epoch_invalid_terminal() {
+        let (_event_tx, event_rx) = tokio::sync::mpsc::channel(2);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let mut event_rx = ConnectionEventReceiverV1 {
+            receiver: event_rx,
+            terminal: terminal.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        signal_websocket_error_v1(
+            &terminal,
+            &shutdown_tx,
+            "WebSocket read transport",
+            WsError::Capacity(CapacityError::MessageTooLong {
+                size: 2,
+                max_size: 1,
+            }),
+        );
+
+        let terminal_event = event_rx.try_recv_budgeted().unwrap();
+        assert_eq!(
+            terminal_event.terminal_failure(),
+            Some(&ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "WebSocket read transport"
+            })
+        );
+        assert!(matches!(
+            terminal_event.into_event(),
+            ConnectionEvent::Disconnected { reason }
+                if reason.starts_with("WebSocket read transport: Space limit exceeded")
+        ));
+        assert!(*shutdown_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn post_auth_reset_reaches_retryable_terminal_without_failure_metadata() {
+        let (_event_tx, event_rx) = tokio::sync::mpsc::channel(2);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let mut event_rx = ConnectionEventReceiverV1 {
+            receiver: event_rx,
+            terminal: terminal.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+        signal_websocket_error_v1(
+            &terminal,
+            &shutdown_tx,
+            "WebSocket read transport",
+            WsError::Protocol(ProtocolError::ResetWithoutClosingHandshake),
+        );
+
+        let terminal_event = event_rx.try_recv_budgeted().unwrap();
+        assert_eq!(terminal_event.terminal_failure(), None);
+        assert!(matches!(
+            terminal_event.into_event(),
+            ConnectionEvent::Disconnected { reason }
+                if reason.contains("Connection reset without closing handshake")
+        ));
+        assert!(*shutdown_rx.borrow());
+    }
+
+    #[test]
+    fn unconsumed_epoch_invalid_terminal_upgrades_a_racing_transport_loss() {
+        let (_event_tx, event_rx) = tokio::sync::mpsc::channel(2);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let mut event_rx = ConnectionEventReceiverV1 {
+            receiver: event_rx,
+            terminal: terminal.clone(),
+        };
+        assert!(terminal.report_retryable_transport("racing reset".to_string()));
+        assert!(terminal.report_epoch_invalid(
+            "authenticated protocol failure".to_string(),
+            ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "racing authenticated frame",
+            },
+        ));
+        assert!(!terminal.report_retryable_transport("late reset".to_string()));
+
+        let terminal_event = event_rx.try_recv_budgeted().unwrap();
+        assert_eq!(
+            terminal_event.terminal_failure(),
+            Some(&ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "racing authenticated frame",
+            })
+        );
+        assert!(matches!(
+            terminal_event.into_event(),
+            ConnectionEvent::Disconnected { reason }
+                if reason == "authenticated protocol failure"
+        ));
+        assert!(!terminal.report_epoch_invalid(
+            "cannot rewrite delivered terminal".to_string(),
+            ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "late frame",
+            },
+        ));
+    }
+
     #[test]
     fn websocket_auth_signature_is_domain_separated_x25519_pop() {
         let identity = IdentityKeyPair::generate();
@@ -1639,6 +2386,12 @@ mod url_policy_tests {
         let mut legacy = secure.clone();
         legacy.per_device_secure = false;
         assert!(validate_per_device_auth_result(&legacy, &binding).is_err());
+        assert_eq!(
+            validate_per_device_auth_result_classified_v1(&legacy, &binding)
+                .unwrap_err()
+                .stop,
+            ConnectionConnectStopV1::EpochInvalid
+        );
 
         let mut wrong_version = secure.clone();
         wrong_version.device_binding_version = 2;
@@ -1673,6 +2426,12 @@ mod url_policy_tests {
             validate_per_device_auth_result(&failed, &binding).unwrap_err(),
             "node access registration is closed; a valid access pass is required"
         );
+        assert_eq!(
+            validate_per_device_auth_result_classified_v1(&failed, &binding)
+                .unwrap_err()
+                .stop,
+            ConnectionConnectStopV1::AuthenticationRejected
+        );
 
         failed.failure_reason = proto::AuthFailureReason::InviteInvalid as i32;
         let error = validate_per_device_auth_result(&failed, &binding).unwrap_err();
@@ -1681,6 +2440,13 @@ mod url_policy_tests {
             "node access pass is invalid, expired, or already used"
         );
         assert!(!error.contains("lookup"));
+        let classified =
+            validate_per_device_auth_result_classified_v1(&failed, &binding).unwrap_err();
+        assert_eq!(
+            classified.stop,
+            ConnectionConnectStopV1::AuthenticationRejected
+        );
+        assert_eq!(classified.into_detail(), error);
     }
 }
 
@@ -2190,7 +2956,7 @@ async fn dispatch_authenticated_binary_frame(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AuthenticatedWsMessageOutcomeV1 {
     Continue,
-    Closed,
+    Closed(Option<CloseCode>),
 }
 
 async fn dispatch_authenticated_ws_message(
@@ -2210,7 +2976,9 @@ async fn dispatch_authenticated_ws_message(
         // but keep the boundary exhaustive and fail closed if that changes.
         WsMessage::Frame(_) => Err(protocol_violation("WebSocket raw data frame")),
         WsMessage::Ping(_) | WsMessage::Pong(_) => Ok(AuthenticatedWsMessageOutcomeV1::Continue),
-        WsMessage::Close(_) => Ok(AuthenticatedWsMessageOutcomeV1::Closed),
+        WsMessage::Close(frame) => Ok(AuthenticatedWsMessageOutcomeV1::Closed(
+            frame.as_ref().map(|frame| frame.code),
+        )),
     }
 }
 
@@ -2400,7 +3168,7 @@ mod tests {
         };
         let receive = tokio::spawn(async move { receiver.recv().await });
         tokio::task::yield_now().await;
-        assert!(terminal.report_transport("closed during wait".to_string()));
+        assert!(terminal.report_retryable_transport("closed during wait".to_string()));
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), receive)
             .await
             .expect("terminal notification was lost")

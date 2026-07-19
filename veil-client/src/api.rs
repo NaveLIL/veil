@@ -3,7 +3,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
 use veil_crypto::kdf;
 use veil_crypto::keys::{generate_mnemonic, validate_mnemonic, IdentityKeyPair};
@@ -13,8 +13,8 @@ use veil_crypto::x3dh;
 use veil_search::Indexer;
 use veil_store::db::{
     DeviceBindingPinV1, DeviceRosterSnapshotV1, DirectMessageOutboxEnqueueV1,
-    DirectMessageOutboxScopeV1, HistoricalDeviceBindingProofV1, IncomingSenderKeyRouteV1,
-    LocalPreKey, LocalPreKeyPublicationV1, PendingDirectMessageOutboxV1,
+    DirectMessageOutboxReceiptV1, DirectMessageOutboxScopeV1, HistoricalDeviceBindingProofV1,
+    IncomingSenderKeyRouteV1, LocalPreKey, LocalPreKeyPublicationV1, PendingDirectMessageOutboxV1,
     PendingSenderKeyDeviceEnvelopeV1, VeilDb, DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1,
 };
 use veil_store::models::{
@@ -25,9 +25,10 @@ use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSec
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::connection::{
-    BudgetedConnectionEventV1, ConfirmedMutation, Connection, ConnectionConfig, ConnectionEvent,
-    ConnectionEventBudgetGuardV1, ConnectionEventBufferErrorV1, LIVE_EVENT_QUEUE_CAPACITY,
-    LIVE_EVENT_RETAINED_BYTES,
+    BudgetedConnectionEventV1, ConfirmedMutation, Connection, ConnectionConfig,
+    ConnectionConnectErrorV1, ConnectionConnectStopV1, ConnectionEvent,
+    ConnectionEventBudgetGuardV1, ConnectionEventBufferErrorV1, ConnectionSendErrorV1,
+    LIVE_EVENT_QUEUE_CAPACITY, LIVE_EVENT_RETAINED_BYTES,
 };
 use crate::device_identity::{
     device_binding_signing_bytes, DeviceIdentityV1, DEVICE_BINDING_STATUS_ACTIVE,
@@ -70,6 +71,11 @@ struct PendingOutgoingMessage {
     /// step in `direct_message_outbox_v1`. ACK/Error reconciliation must use
     /// that durable receipt instead of the legacy message-only helpers.
     durable_direct_outbox: bool,
+    /// Process-local monotonic deadline for the ACK of an exact durable Direct
+    /// frame accepted by the current transport queue. It is deliberately not
+    /// persisted: a new socket epoch installs a fresh sequence correlation and
+    /// deadline while SQLCipher continues to own the immutable retry bytes.
+    direct_ack_deadline: Option<Instant>,
 }
 
 struct PreparedDirectCiphertextV1 {
@@ -77,6 +83,42 @@ struct PreparedDirectCiphertextV1 {
     candidate: RatchetSession,
     ciphertext: Vec<u8>,
     header: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageAckCorrelationV1 {
+    CurrentOutgoing,
+    RepeatedDirectReceipt,
+    Mutation,
+    SenderKey,
+    Generic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorCorrelationV1 {
+    CurrentOutgoing,
+    RepeatedDirectReceipt,
+    PendingCommand,
+    Generic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionReconciliationV1 {
+    None,
+    MessageAck(MessageAckCorrelationV1),
+    Error(ErrorCorrelationV1),
+}
+
+enum ConnectionReconciliationValidationErrorV1 {
+    ProtocolViolation(String),
+    StorageUncertain(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirectLiveEmptyPollV1 {
+    Quiescent,
+    ContinueFrozenFifo,
+    AckDeadline,
 }
 
 impl Drop for PendingOutgoingMessage {
@@ -239,6 +281,57 @@ pub enum DirectSendErrorV1 {
     StorageUncertain(String),
 }
 
+/// Source-classified failure for a complete authenticated client connection.
+///
+/// Only `RetryableTransport` may be used by a native reconnect controller.
+/// Rendered diagnostics are retained for legacy/manual callers but are never a
+/// retry policy input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobileConnectStopV1 {
+    RetryableTransport,
+    AuthenticationRejected,
+    EpochInvalid,
+    StorageUncertain,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MobileConnectErrorV1 {
+    pub stop: MobileConnectStopV1,
+    pub detail: String,
+}
+
+impl MobileConnectErrorV1 {
+    fn new(stop: MobileConnectStopV1, detail: impl Into<String>) -> Self {
+        Self {
+            stop,
+            detail: detail.into(),
+        }
+    }
+
+    fn from_connection(error: ConnectionConnectErrorV1) -> Self {
+        let stop = match error.stop {
+            ConnectionConnectStopV1::RetryableTransport => MobileConnectStopV1::RetryableTransport,
+            ConnectionConnectStopV1::AuthenticationRejected => {
+                MobileConnectStopV1::AuthenticationRejected
+            }
+            ConnectionConnectStopV1::EpochInvalid => MobileConnectStopV1::EpochInvalid,
+        };
+        Self::new(stop, error.detail)
+    }
+
+    pub fn into_detail(self) -> String {
+        self.detail
+    }
+}
+
+impl std::fmt::Display for MobileConnectErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for MobileConnectErrorV1 {}
+
 /// Durable enqueue result for one native Direct user intent. A false
 /// `transport_enqueued` still means the SQLCipher outbox owns the intent and a
 /// later Ready lease must replay it; callers must not create a second intent.
@@ -246,6 +339,10 @@ pub enum DirectSendErrorV1 {
 pub struct DirectMessageEnqueueReportV1 {
     pub sequence: u64,
     pub transport_enqueued: bool,
+    /// Source-typed terminal observed at the enqueue boundary. Every failed
+    /// enqueue has an explicit stop; `None` is valid only when the exact frame
+    /// entered the bounded queue and no concurrent terminal was published.
+    pub transport_stop: Option<DirectLiveReplayStopV1>,
 }
 
 /// One bounded pass over the durable Direct outbox. Queue cursors are opaque
@@ -278,7 +375,9 @@ fn send_message_request_digest_v1(exact_send_message_payload: &[u8]) -> [u8; 32]
 }
 
 fn is_retryable_correlated_send_error_v1(code: u32, reason: Option<&str>) -> bool {
-    code == 429 || code >= 500 || (code == 401 && reason == Some("not_authenticated"))
+    code == 429
+        || (500..=599).contains(&code)
+        || (code == 401 && reason == Some("not_authenticated"))
 }
 
 /// Internal classification for initiator-side X3DH persistence. Cryptographic
@@ -304,6 +403,15 @@ impl DirectSessionEstablishErrorV1 {
 /// authenticated socket events. The caller must schedule another turn when
 /// `quiescent` is false, giving lifecycle/terminal checks a bounded cadence.
 pub const DIRECT_LIVE_REPLAY_MAX_BATCH_V1: usize = 64;
+/// A queued exact Direct frame must either receive its correlated ACK/error or
+/// relinquish the current socket epoch within this monotonic interval.
+const DIRECT_ACK_DEADLINE_V1: Duration = Duration::from_secs(15);
+
+fn next_direct_ack_deadline_v1() -> Instant {
+    Instant::now()
+        .checked_add(DIRECT_ACK_DEADLINE_V1)
+        .expect("15-second Direct ACK deadline fits the monotonic clock")
+}
 /// Shared upper bound used by native controllers when validating aggregate
 /// durable Direct outbox replay reports. Individual queue orders and IDs stay
 /// inside the client/store boundary.
@@ -330,10 +438,26 @@ pub struct DirectLiveReplayReportV1 {
 /// Fail-closed reason which stopped Direct live replay globally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DirectLiveReplayStopV1 {
-    /// The authenticated transport epoch ended or its bounded FIFO failed.
-    TransportTerminal,
+    /// The authenticated transport ended without invalidating native state.
+    RetryableTransport,
+    /// An exact durable Direct frame remained unacknowledged past its
+    /// process-local monotonic deadline.
+    AckDeadline,
+    /// The authenticated epoch violated a protocol, routing, authentication,
+    /// or bounded-buffer invariant and must not be retried automatically.
+    EpochInvalid,
     /// A native mutation could not establish whether durable state committed.
     StorageUncertain,
+}
+
+/// Typed failure from the pre-history live-buffer boundary. The legacy buffer
+/// error is retained only for desktop compatibility; native retry policy uses
+/// `stop` and therefore cannot confuse sticky SQLCipher ambiguity with an
+/// ordinary ended socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectLiveBufferErrorV1 {
+    pub stop: DirectLiveReplayStopV1,
+    pub buffer_error: Option<ConnectionEventBufferErrorV1>,
 }
 
 /// Typed global stop with the aggregate work completed before the stop.
@@ -346,8 +470,14 @@ pub struct DirectLiveReplayErrorV1 {
 impl std::fmt::Display for DirectLiveReplayErrorV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.stop {
-            DirectLiveReplayStopV1::TransportTerminal => {
-                formatter.write_str("authenticated Direct live transport ended")
+            DirectLiveReplayStopV1::RetryableTransport => {
+                formatter.write_str("authenticated Direct live transport ended and may be retried")
+            }
+            DirectLiveReplayStopV1::AckDeadline => {
+                formatter.write_str("authenticated Direct acknowledgement deadline elapsed")
+            }
+            DirectLiveReplayStopV1::EpochInvalid => {
+                formatter.write_str("authenticated Direct live epoch is invalid")
             }
             DirectLiveReplayStopV1::StorageUncertain => {
                 formatter.write_str("Direct live SQLCipher state is uncertain")
@@ -881,6 +1011,21 @@ pub struct VeilClient {
     /// ratchet in this process could diverge from durable state, so only a
     /// successful native reinitialization may clear it.
     direct_live_storage_uncertain: bool,
+    /// Typed terminal cause for the current authenticated Direct socket epoch.
+    /// Storage uncertainty has higher precedence and is also guarded by the
+    /// process-wide sticky bit above.
+    direct_live_stop: Option<DirectLiveReplayStopV1>,
+    /// Per-sequence number of events that were already ahead of each expired
+    /// durable Direct correlation when that deadline was first observed. A
+    /// separate finite FIFO watermark prevents a later-expiring send from
+    /// inheriting another send's partially drained grace window.
+    direct_ack_expiry_grace_remaining: HashMap<u64, usize>,
+    #[cfg(any(test, feature = "test-utils"))]
+    test_only_epoch_invalid_after_direct_commit: bool,
+    #[cfg(any(test, feature = "test-utils"))]
+    test_only_retryable_after_direct_commit: bool,
+    #[cfg(any(test, feature = "test-utils"))]
+    test_only_epoch_invalid_after_direct_outbox_enqueue: bool,
     /// Optional local-only full-text index. Index calls are best-effort and never fatal.
     indexer: Option<Arc<Indexer>>,
 }
@@ -956,6 +1101,14 @@ impl VeilClient {
             failed_sender_key_distributions: HashSet::new(),
             direct_live_blocked_conversations: HashSet::new(),
             direct_live_storage_uncertain: false,
+            direct_live_stop: None,
+            direct_ack_expiry_grace_remaining: HashMap::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_only_epoch_invalid_after_direct_commit: false,
+            #[cfg(any(test, feature = "test-utils"))]
+            test_only_retryable_after_direct_commit: false,
+            #[cfg(any(test, feature = "test-utils"))]
+            test_only_epoch_invalid_after_direct_outbox_enqueue: false,
             indexer: None,
         }
     }
@@ -1000,6 +1153,14 @@ impl VeilClient {
             failed_sender_key_distributions: HashSet::new(),
             direct_live_blocked_conversations: HashSet::new(),
             direct_live_storage_uncertain: false,
+            direct_live_stop: None,
+            direct_ack_expiry_grace_remaining: HashMap::new(),
+            #[cfg(any(test, feature = "test-utils"))]
+            test_only_epoch_invalid_after_direct_commit: false,
+            #[cfg(any(test, feature = "test-utils"))]
+            test_only_retryable_after_direct_commit: false,
+            #[cfg(any(test, feature = "test-utils"))]
+            test_only_epoch_invalid_after_direct_outbox_enqueue: false,
             indexer: None,
         }
     }
@@ -1160,6 +1321,8 @@ impl VeilClient {
         self.db = Some(db);
         self.direct_live_blocked_conversations.clear();
         self.direct_live_storage_uncertain = false;
+        self.direct_live_stop = None;
+        self.direct_ack_expiry_grace_remaining.clear();
         Ok(())
     }
 
@@ -1850,7 +2013,26 @@ impl VeilClient {
         client_id: &str,
         node_access_pass: Option<&[u8]>,
     ) -> Result<String, String> {
-        self.connect_with_client_metadata_and_node_access(
+        self.connect_with_client_metadata_and_access_pass_classified_v1(
+            server_url,
+            device_name,
+            client_id,
+            node_access_pass,
+        )
+        .await
+        .map_err(MobileConnectErrorV1::into_detail)
+    }
+
+    /// Typed mobile/native connection boundary. Automatic reconnect is
+    /// permitted only when the returned stop is `RetryableTransport`.
+    pub async fn connect_with_client_metadata_and_access_pass_classified_v1(
+        &mut self,
+        server_url: &str,
+        device_name: &str,
+        client_id: &str,
+        node_access_pass: Option<&[u8]>,
+    ) -> Result<String, MobileConnectErrorV1> {
+        self.connect_with_client_metadata_and_node_access_classified_v1(
             server_url,
             device_name,
             client_id,
@@ -1866,14 +2048,38 @@ impl VeilClient {
         client_id: &str,
         node_access_invite: Option<&[u8]>,
     ) -> Result<String, String> {
+        self.connect_with_client_metadata_and_node_access_classified_v1(
+            server_url,
+            device_name,
+            client_id,
+            node_access_invite,
+        )
+        .await
+        .map_err(MobileConnectErrorV1::into_detail)
+    }
+
+    async fn connect_with_client_metadata_and_node_access_classified_v1(
+        &mut self,
+        server_url: &str,
+        device_name: &str,
+        client_id: &str,
+        node_access_invite: Option<&[u8]>,
+    ) -> Result<String, MobileConnectErrorV1> {
         // An uncertain SQLCipher outcome invalidates the whole native epoch.
         // Reconnect cannot repair that ambiguity; only a successful unlock
         // reconstructs runtime state from durable storage.
-        self.require_crypto_runtime_active_v1()?;
-        let authenticated_server_origin =
-            canonical_server_origin_from_websocket_url_v1(server_url)?;
+        self.require_crypto_runtime_active_v1().map_err(|detail| {
+            MobileConnectErrorV1::new(MobileConnectStopV1::StorageUncertain, detail)
+        })?;
+        let authenticated_server_origin = canonical_server_origin_from_websocket_url_v1(server_url)
+            .map_err(|detail| {
+                MobileConnectErrorV1::new(MobileConnectStopV1::EpochInvalid, detail)
+            })?;
         if node_access_invite.is_some_and(|invite| invite.len() != 32) {
-            return Err("node access pass must contain exactly 32 bytes".to_string());
+            return Err(MobileConnectErrorV1::new(
+                MobileConnectStopV1::EpochInvalid,
+                "node access pass must contain exactly 32 bytes",
+            ));
         }
         if device_name.is_empty()
             || device_name.len() > 128
@@ -1881,7 +2087,10 @@ impl VeilClient {
                 character.is_control() || matches!(character, '\u{2028}' | '\u{2029}')
             })
         {
-            return Err("device name is invalid".to_string());
+            return Err(MobileConnectErrorV1::new(
+                MobileConnectStopV1::EpochInvalid,
+                "device name is invalid",
+            ));
         }
         if client_id.is_empty()
             || client_id.len() > 64
@@ -1889,18 +2098,25 @@ impl VeilClient {
                 .bytes()
                 .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         {
-            return Err("client id is invalid".to_string());
+            return Err(MobileConnectErrorV1::new(
+                MobileConnectStopV1::EpochInvalid,
+                "client id is invalid",
+            ));
         }
-        let identity = self.identity.as_ref().ok_or("not initialized")?;
-        let device_identity = self
-            .device_identity
-            .as_ref()
-            .ok_or("per-device identity is missing; unlock migration is required")?;
+        let identity = self.identity.as_ref().ok_or_else(|| {
+            MobileConnectErrorV1::new(MobileConnectStopV1::EpochInvalid, "not initialized")
+        })?;
+        let device_identity = self.device_identity.as_ref().ok_or_else(|| {
+            MobileConnectErrorV1::new(
+                MobileConnectStopV1::EpochInvalid,
+                "per-device identity is missing; unlock migration is required",
+            )
+        })?;
         let config = ConnectionConfig {
             server_url: server_url.to_string(),
         };
 
-        let mut conn = Connection::connect(
+        let mut conn = Connection::connect_classified_v1(
             &config,
             identity,
             device_identity,
@@ -1908,7 +2124,8 @@ impl VeilClient {
             client_id,
             node_access_invite,
         )
-        .await?;
+        .await
+        .map_err(MobileConnectErrorV1::from_connection)?;
 
         // Drain the Authenticated event to get user_id
         let user_id = match conn.events.try_recv() {
@@ -1917,16 +2134,24 @@ impl VeilClient {
         };
 
         if user_id.is_empty() {
-            return Err("server authenticated without a user id".to_string());
+            return Err(MobileConnectErrorV1::new(
+                MobileConnectStopV1::EpochInvalid,
+                "server authenticated without a user id",
+            ));
         }
 
         // Sequence numbers restart for every WebSocket. Resolve all old
         // pending entries before installing the new connection so a new ACK
         // can never confirm an unrelated pre-reconnect message or mutation.
-        self.reconcile_previous_transport_before_install_v1()?;
+        self.reconcile_previous_transport_before_install_v1()
+            .map_err(|detail| {
+                MobileConnectErrorV1::new(MobileConnectStopV1::StorageUncertain, detail)
+            })?;
         // REST backlog is authoritative for anything not processed from the
         // previous socket. Never replay its deferred events in the new epoch.
         self.deferred_connection_events.reset_for_new_epoch();
+        self.direct_live_stop = None;
+        self.direct_ack_expiry_grace_remaining.clear();
         self.authenticated_user_id = Some(user_id.clone());
         self.authenticated_server_origin = Some(authenticated_server_origin);
         self.connection = Some(conn);
@@ -1943,6 +2168,7 @@ impl VeilClient {
         self.authenticated_user_id = None;
         self.authenticated_server_origin = None;
         self.deferred_connection_events.reset_for_new_epoch();
+        self.direct_ack_expiry_grace_remaining.clear();
     }
 
     /// Install retained SKDMs that were authenticated before the WS AuthResult
@@ -2114,8 +2340,24 @@ impl VeilClient {
     pub fn buffer_connection_events_during_sync(
         &mut self,
     ) -> Result<usize, ConnectionEventBufferErrorV1> {
+        self.buffer_connection_events_during_sync_classified_v1()
+            .map_err(|error| {
+                error
+                    .buffer_error
+                    .unwrap_or(ConnectionEventBufferErrorV1::TransportEpochEnded)
+            })
+    }
+
+    /// Source-typed native buffer boundary. Unlike the legacy wrapper above,
+    /// sticky SQLCipher revocation is never represented as transport loss.
+    pub fn buffer_connection_events_during_sync_classified_v1(
+        &mut self,
+    ) -> Result<usize, DirectLiveBufferErrorV1> {
         if self.direct_live_storage_uncertain {
-            return Err(ConnectionEventBufferErrorV1::TransportEpochEnded);
+            return Err(DirectLiveBufferErrorV1 {
+                stop: DirectLiveReplayStopV1::StorageUncertain,
+                buffer_error: None,
+            });
         }
         let mut incoming = Vec::new();
         if let Some(connection) = self.connection.as_mut() {
@@ -2127,16 +2369,159 @@ impl VeilClient {
             Ok(append) if !append.terminal => Ok(append.buffered),
             Ok(_) => {
                 self.terminate_connection_after_deferred_failure_v1();
-                Err(ConnectionEventBufferErrorV1::TransportEpochEnded)
+                Err(DirectLiveBufferErrorV1 {
+                    stop: self
+                        .current_direct_live_stop_v1()
+                        .unwrap_or(DirectLiveReplayStopV1::RetryableTransport),
+                    buffer_error: Some(ConnectionEventBufferErrorV1::TransportEpochEnded),
+                })
             }
             Err(error) => {
                 self.terminate_connection_after_deferred_failure_v1();
-                Err(error)
+                Err(DirectLiveBufferErrorV1 {
+                    stop: self
+                        .current_direct_live_stop_v1()
+                        .unwrap_or_else(|| Self::direct_live_stop_for_buffer_error_v1(&error)),
+                    buffer_error: Some(error),
+                })
             }
         }
     }
 
+    fn direct_live_stop_for_buffer_error_v1(
+        error: &ConnectionEventBufferErrorV1,
+    ) -> DirectLiveReplayStopV1 {
+        match error {
+            ConnectionEventBufferErrorV1::TransportEpochEnded => {
+                DirectLiveReplayStopV1::RetryableTransport
+            }
+            ConnectionEventBufferErrorV1::EventCountLimitExceeded { .. }
+            | ConnectionEventBufferErrorV1::RetainedSizeLimitExceeded { .. }
+            | ConnectionEventBufferErrorV1::RetainedSizeAccountingOverflow
+            | ConnectionEventBufferErrorV1::AuthenticationEpochAnomaly { .. }
+            | ConnectionEventBufferErrorV1::ProtocolViolation { .. } => {
+                DirectLiveReplayStopV1::EpochInvalid
+            }
+        }
+    }
+
+    fn direct_live_stop_precedence_v1(stop: DirectLiveReplayStopV1) -> u8 {
+        match stop {
+            DirectLiveReplayStopV1::RetryableTransport | DirectLiveReplayStopV1::AckDeadline => 1,
+            DirectLiveReplayStopV1::EpochInvalid => 2,
+            DirectLiveReplayStopV1::StorageUncertain => 3,
+        }
+    }
+
+    fn record_direct_live_stop_v1(&mut self, stop: DirectLiveReplayStopV1) {
+        if self.direct_live_stop.is_none_or(|current| {
+            Self::direct_live_stop_precedence_v1(stop)
+                > Self::direct_live_stop_precedence_v1(current)
+        }) {
+            self.direct_live_stop = Some(stop);
+        }
+    }
+
+    fn current_direct_live_stop_v1(&self) -> Option<DirectLiveReplayStopV1> {
+        if self.direct_live_storage_uncertain {
+            return Some(DirectLiveReplayStopV1::StorageUncertain);
+        }
+        let inferred = if let Some(error) = self.deferred_connection_events.failure() {
+            Some(Self::direct_live_stop_for_buffer_error_v1(&error))
+        } else if self.deferred_connection_events.is_terminal()
+            && self.deferred_connection_events.events.is_empty()
+        {
+            Some(DirectLiveReplayStopV1::RetryableTransport)
+        } else if self.direct_live_stop.is_none()
+            && (self.authenticated_user_id.is_none() || self.authenticated_server_origin.is_none())
+        {
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        } else {
+            None
+        };
+        match (self.direct_live_stop, inferred) {
+            (Some(current), Some(inferred))
+                if Self::direct_live_stop_precedence_v1(inferred)
+                    > Self::direct_live_stop_precedence_v1(current) =>
+            {
+                Some(inferred)
+            }
+            (Some(current), _) => Some(current),
+            (None, inferred) => inferred,
+        }
+    }
+
+    fn observe_connection_terminal_stop_v1(&mut self) -> Option<DirectLiveReplayStopV1> {
+        let error = self
+            .connection
+            .as_ref()
+            .and_then(|connection| connection.events.terminal_buffer_error_v1())?;
+        let stop = Self::direct_live_stop_for_buffer_error_v1(&error);
+        self.record_direct_live_stop_v1(stop);
+        self.current_direct_live_stop_v1()
+    }
+
+    fn classify_direct_enqueue_result_v1(
+        &mut self,
+        result: &Result<(), ConnectionSendErrorV1>,
+    ) -> Option<DirectLiveReplayStopV1> {
+        let observed = self.observe_connection_terminal_stop_v1();
+        if let Err(error) = result {
+            match error {
+                ConnectionSendErrorV1::QueueTimeout => {
+                    self.record_direct_live_stop_v1(DirectLiveReplayStopV1::RetryableTransport);
+                }
+                ConnectionSendErrorV1::QueueClosed if observed.is_none() => {
+                    // A source helper must publish its typed terminal before
+                    // closing the peer queue. Closure without that source is
+                    // an invariant failure, never reconnect permission.
+                    self.record_direct_live_stop_v1(DirectLiveReplayStopV1::EpochInvalid);
+                }
+                ConnectionSendErrorV1::Rejected(_) => {
+                    // The exact payload has already passed the caller's
+                    // construction/persistence boundary. A local envelope
+                    // rejection is deterministic epoch corruption.
+                    self.record_direct_live_stop_v1(DirectLiveReplayStopV1::EpochInvalid);
+                }
+                ConnectionSendErrorV1::QueueClosed => {}
+            }
+        }
+        self.current_direct_live_stop_v1()
+    }
+
+    fn stop_direct_outbox_replay_if_terminal_v1(
+        &mut self,
+        report: &mut DirectOutboxReplayReportV1,
+    ) -> Result<bool, DirectSendErrorV1> {
+        let stop = self
+            .observe_connection_terminal_stop_v1()
+            .or_else(|| self.current_direct_live_stop_v1());
+        match stop {
+            Some(DirectLiveReplayStopV1::EpochInvalid) => Err(DirectSendErrorV1::rejected(
+                "authenticated Direct transport epoch is invalid",
+            )),
+            Some(DirectLiveReplayStopV1::StorageUncertain) => Err(DirectSendErrorV1::storage(
+                "Direct outbox replay storage is uncertain",
+            )),
+            Some(
+                DirectLiveReplayStopV1::RetryableTransport | DirectLiveReplayStopV1::AckDeadline,
+            ) => {
+                report.transport_blocked = true;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn terminate_connection_after_deferred_failure_v1(&mut self) {
+        let stop = self
+            .deferred_connection_events
+            .failure()
+            .as_ref()
+            .map(Self::direct_live_stop_for_buffer_error_v1)
+            .unwrap_or(DirectLiveReplayStopV1::RetryableTransport);
+        self.record_direct_live_stop_v1(stop);
+        self.direct_ack_expiry_grace_remaining.clear();
         if let Some(connection) = self.connection.take() {
             connection.disconnect();
         }
@@ -2217,43 +2602,88 @@ impl VeilClient {
             self.terminate_connection_after_deferred_failure_v1();
             return Err(error.to_string());
         }
-        let reconciliation = (|| -> Result<(), String> {
-            match event.as_mut() {
-                Some(ConnectionEvent::MessageAcked {
-                    message_id,
-                    server_timestamp,
-                    ref_seq,
-                    client_message_id,
-                    local_message_id,
-                    mutation,
-                    sender_key,
-                }) => {
-                    *local_message_id = self.finalize_outgoing_message(
-                        *ref_seq,
-                        client_message_id.as_deref(),
-                        message_id,
-                        *server_timestamp,
-                    )?;
-                    self.confirm_initial_message(*ref_seq)?;
-                    self.confirm_sender_key_distribution(*ref_seq, sender_key.as_ref())?;
-                    // Move a confirmed edit (and its plaintext) into the
-                    // caller-visible event only after every fallible ACK
-                    // reconciliation step has completed. Otherwise a later
-                    // Sender-Key/initial-session failure would drop the
-                    // event-local plaintext outside the explicit revoke
-                    // zeroization path.
-                    *mutation = self.confirm_pending_mutation(*ref_seq, *server_timestamp)?;
+        let reconciliation_plan = match event.as_ref() {
+            Some(event) => match self.validate_connection_reconciliation_event_v1(event) {
+                Ok(plan) => plan,
+                Err(ConnectionReconciliationValidationErrorV1::ProtocolViolation(detail)) => {
+                    // All authenticated ACK/error correlation and routing
+                    // fields are validated before the first SQLCipher or
+                    // in-memory mutation. A deterministic mismatch poisons
+                    // only this socket epoch; it must never masquerade as
+                    // uncertain storage.
+                    self.deferred_connection_events.fail(
+                        ConnectionEventBufferErrorV1::ProtocolViolation {
+                            envelope: "ACK/error reconciliation",
+                        },
+                    );
+                    self.terminate_connection_after_deferred_failure_v1();
+                    return Err(detail);
                 }
-                Some(ConnectionEvent::Error {
-                    code,
-                    ref_seq: Some(ref_seq),
-                    client_message_id,
-                    reason,
-                    local_message_id,
-                    conversation_id,
-                    stale_roster_context,
-                    ..
-                }) => {
+                Err(ConnectionReconciliationValidationErrorV1::StorageUncertain(detail)) => {
+                    self.revoke_after_storage_uncertain_v1();
+                    return Err(detail);
+                }
+            },
+            None => ConnectionReconciliationV1::None,
+        };
+        let reconciliation = (|| -> Result<(), String> {
+            match (event.as_mut(), reconciliation_plan) {
+                (
+                    Some(ConnectionEvent::MessageAcked {
+                        message_id,
+                        server_timestamp,
+                        ref_seq,
+                        client_message_id,
+                        local_message_id,
+                        mutation,
+                        sender_key,
+                    }),
+                    ConnectionReconciliationV1::MessageAck(correlation),
+                ) => match correlation {
+                    MessageAckCorrelationV1::CurrentOutgoing => {
+                        *local_message_id = self.finalize_outgoing_message(
+                            *ref_seq,
+                            client_message_id.as_deref(),
+                            message_id,
+                            *server_timestamp,
+                        )?;
+                        self.confirm_initial_message(*ref_seq)?;
+                    }
+                    MessageAckCorrelationV1::RepeatedDirectReceipt => {
+                        *local_message_id = self.finalize_outgoing_message(
+                            *ref_seq,
+                            client_message_id.as_deref(),
+                            message_id,
+                            *server_timestamp,
+                        )?;
+                    }
+                    MessageAckCorrelationV1::Mutation => {
+                        self.confirm_initial_message(*ref_seq)?;
+                        // Move a confirmed edit (and its plaintext) into the
+                        // caller-visible event only after the fallible initial
+                        // session persistence has completed. Otherwise that
+                        // later failure would drop plaintext outside the
+                        // explicit revoke/zeroization path.
+                        *mutation = self.confirm_pending_mutation(*ref_seq, *server_timestamp)?;
+                    }
+                    MessageAckCorrelationV1::SenderKey => {
+                        self.confirm_sender_key_distribution(*ref_seq, sender_key.as_ref())?;
+                    }
+                    MessageAckCorrelationV1::Generic => {}
+                },
+                (
+                    Some(ConnectionEvent::Error {
+                        code,
+                        ref_seq: Some(ref_seq),
+                        client_message_id,
+                        reason,
+                        local_message_id,
+                        conversation_id,
+                        stale_roster_context,
+                        ..
+                    }),
+                    ConnectionReconciliationV1::Error(_),
+                ) => {
                     let retryable_direct_error = self
                         .pending_outgoing_messages
                         .get(ref_seq)
@@ -2288,6 +2718,7 @@ impl VeilClient {
                         reason.as_deref(),
                     )?;
                     if retryable_direct_error {
+                        self.record_direct_live_stop_v1(DirectLiveReplayStopV1::RetryableTransport);
                         self.mark_all_pending_sequences_unknown().map_err(|error| {
                             format!("persist retryable Direct transport loss: {error}")
                         })?;
@@ -2303,12 +2734,13 @@ impl VeilClient {
                         self.deferred_connection_events.close_epoch();
                     }
                 }
-                Some(ConnectionEvent::Disconnected { .. }) => {
+                (Some(ConnectionEvent::Disconnected { .. }), ConnectionReconciliationV1::None) => {
                     // There can be no trustworthy delivery conclusion once the
                     // socket epoch ends: a frame may have reached the gateway
                     // and only its ACK may have been lost. Legacy rows become
                     // DeliveryUnknown; exact Direct outbox rows remain Sending
                     // and may replay only their original protobuf payload.
+                    self.record_direct_live_stop_v1(DirectLiveReplayStopV1::RetryableTransport);
                     self.connection = None;
                     self.authenticated_user_id = None;
                     self.authenticated_server_origin = None;
@@ -2316,7 +2748,8 @@ impl VeilClient {
                     self.mark_all_pending_sequences_unknown()
                         .map_err(|error| format!("persist disconnected delivery state: {error}"))?;
                 }
-                _ => {}
+                (_, ConnectionReconciliationV1::None) => {}
+                _ => unreachable!("validated reconciliation plan must match its event"),
             }
             Ok(())
         })();
@@ -2503,6 +2936,8 @@ impl VeilClient {
     /// outcome. This path deliberately performs no further database writes.
     fn revoke_after_storage_uncertain_v1(&mut self) {
         self.direct_live_storage_uncertain = true;
+        self.direct_live_stop = Some(DirectLiveReplayStopV1::StorageUncertain);
+        self.direct_ack_expiry_grace_remaining.clear();
         if let Some(connection) = self.connection.take() {
             connection.disconnect();
         }
@@ -2715,22 +3150,8 @@ impl VeilClient {
         &self,
         report: DirectLiveReplayReportV1,
     ) -> Result<(), DirectLiveReplayErrorV1> {
-        if self.direct_live_storage_uncertain {
-            return Err(Self::direct_live_replay_error_v1(
-                DirectLiveReplayStopV1::StorageUncertain,
-                report,
-            ));
-        }
-        if self.deferred_connection_events.failure().is_some()
-            || (self.deferred_connection_events.is_terminal()
-                && self.deferred_connection_events.events.is_empty())
-            || self.authenticated_user_id.is_none()
-            || self.authenticated_server_origin.is_none()
-        {
-            return Err(Self::direct_live_replay_error_v1(
-                DirectLiveReplayStopV1::TransportTerminal,
-                report,
-            ));
+        if let Some(stop) = self.current_direct_live_stop_v1() {
+            return Err(Self::direct_live_replay_error_v1(stop, report));
         }
         Ok(())
     }
@@ -3033,6 +3454,127 @@ impl VeilClient {
         self.replay_direct_live_events_inner_v1(|_, _| {}).await
     }
 
+    fn has_expired_direct_ack_deadline_v1(&self, now: Instant) -> bool {
+        self.pending_outgoing_messages.values().any(|pending| {
+            pending.durable_direct_outbox
+                && pending
+                    .direct_ack_deadline
+                    .is_some_and(|deadline| deadline <= now)
+        })
+    }
+
+    fn direct_ack_expiry_fifo_snapshot_v1(&self) -> usize {
+        let deferred = self.deferred_connection_events.events.len();
+        // Retained pre-auth Sender-Key controls are consumed only by the
+        // explicit sync barrier and can never contain a Direct ACK. Counting
+        // them here would create grace that poll_event cannot drain.
+        let connection = self
+            .connection
+            .as_ref()
+            .map_or(0, |connection| connection.events.queued_len_v1());
+        deferred
+            .checked_add(connection)
+            .expect("bounded Direct ACK grace snapshot fits usize")
+    }
+
+    /// Freeze the exact number of events already queued when each ACK expiry
+    /// is first observed. FIFO ordering means consuming that sequence's
+    /// snapshot is sufficient for its already-queued ACK to reconcile. Later
+    /// arrivals sit behind the watermark and cannot replenish it.
+    fn refresh_direct_ack_expiry_grace_v1(&mut self, now: Instant) {
+        let pending_outgoing_messages = &self.pending_outgoing_messages;
+        self.direct_ack_expiry_grace_remaining
+            .retain(|sequence, _| {
+                pending_outgoing_messages
+                    .get(sequence)
+                    .is_some_and(|pending| {
+                        pending.durable_direct_outbox
+                            && pending
+                                .direct_ack_deadline
+                                .is_some_and(|deadline| deadline <= now)
+                    })
+            });
+        let newly_expired: Vec<u64> = self
+            .pending_outgoing_messages
+            .iter()
+            .filter_map(|(sequence, pending)| {
+                (pending.durable_direct_outbox
+                    && pending
+                        .direct_ack_deadline
+                        .is_some_and(|deadline| deadline <= now)
+                    && !self
+                        .direct_ack_expiry_grace_remaining
+                        .contains_key(sequence))
+                .then_some(*sequence)
+            })
+            .collect();
+        if !newly_expired.is_empty() {
+            let snapshot = self.direct_ack_expiry_fifo_snapshot_v1();
+            for sequence in newly_expired {
+                self.direct_ack_expiry_grace_remaining
+                    .insert(sequence, snapshot);
+            }
+        }
+    }
+
+    fn consume_direct_ack_expiry_grace_event_v1(&mut self, now: Instant) {
+        // Only watermarks that existed before this event include it. A
+        // correlation whose deadline crossed while poll_event was running
+        // snapshots the remaining FIFO afterwards and must not charge the
+        // already-consumed event.
+        for remaining in self.direct_ack_expiry_grace_remaining.values_mut() {
+            *remaining = remaining
+                .checked_sub(1)
+                .expect("an ACK-expiry grace event is consumed only after polling one event");
+        }
+        self.refresh_direct_ack_expiry_grace_v1(now);
+    }
+
+    fn has_exhausted_direct_ack_expiry_grace_v1(&self) -> bool {
+        self.direct_ack_expiry_grace_remaining
+            .values()
+            .any(|remaining| *remaining == 0)
+    }
+
+    fn classify_direct_live_empty_poll_v1(&mut self, now: Instant) -> DirectLiveEmptyPollV1 {
+        // The deadline may cross after the pre-loop refresh, while a socket
+        // task concurrently queues the ACK just after poll_event observed an
+        // empty FIFO. Freeze that newly visible FIFO before deciding to end
+        // the epoch.
+        self.refresh_direct_ack_expiry_grace_v1(now);
+        if !self.has_expired_direct_ack_deadline_v1(now) {
+            DirectLiveEmptyPollV1::Quiescent
+        } else if self.has_exhausted_direct_ack_expiry_grace_v1() {
+            DirectLiveEmptyPollV1::AckDeadline
+        } else {
+            DirectLiveEmptyPollV1::ContinueFrozenFifo
+        }
+    }
+
+    /// End the socket epoch after an exact durable Direct correlation missed
+    /// its monotonic ACK deadline. SQLCipher keeps the immutable outbox row in
+    /// Sending state; only the ephemeral sequence correlation is discarded.
+    fn terminate_after_direct_ack_deadline_v1(&mut self) -> DirectLiveReplayStopV1 {
+        self.record_direct_live_stop_v1(DirectLiveReplayStopV1::AckDeadline);
+        self.direct_ack_expiry_grace_remaining.clear();
+        if let Some(connection) = self.connection.take() {
+            connection.disconnect();
+        }
+        if let Some(mut user_id) = self.authenticated_user_id.take() {
+            user_id.zeroize();
+        }
+        if let Some(mut origin) = self.authenticated_server_origin.take() {
+            origin.zeroize();
+        }
+        self.deferred_connection_events.close_epoch();
+        if self.mark_all_pending_sequences_unknown().is_err() {
+            self.revoke_after_storage_uncertain_v1();
+            DirectLiveReplayStopV1::StorageUncertain
+        } else {
+            DirectLiveReplayStopV1::AckDeadline
+        }
+    }
+
     async fn replay_direct_live_events_inner_v1<F>(
         &mut self,
         mut after_event: F,
@@ -3043,25 +3585,28 @@ impl VeilClient {
         let mut report = DirectLiveReplayReportV1::default();
         while report.consumed < DIRECT_LIVE_REPLAY_MAX_BATCH_V1 {
             self.direct_live_terminal_precheck_v1(report)?;
+            self.refresh_direct_ack_expiry_grace_v1(Instant::now());
+            if self.has_exhausted_direct_ack_expiry_grace_v1() {
+                let stop = self.terminate_after_direct_ack_deadline_v1();
+                return Err(Self::direct_live_replay_error_v1(stop, report));
+            }
             let event = match self.poll_event().await {
                 Ok(Some(event)) => event,
-                Ok(None) => {
-                    report.quiescent = true;
-                    return Ok(report);
-                }
-                Err(_) if self.direct_live_storage_uncertain => {
-                    return Err(Self::direct_live_replay_error_v1(
-                        DirectLiveReplayStopV1::StorageUncertain,
-                        report,
-                    ));
-                }
-                Err(_) if self.deferred_connection_events.failure().is_some() => {
-                    return Err(Self::direct_live_replay_error_v1(
-                        DirectLiveReplayStopV1::TransportTerminal,
-                        report,
-                    ));
-                }
+                Ok(None) => match self.classify_direct_live_empty_poll_v1(Instant::now()) {
+                    DirectLiveEmptyPollV1::AckDeadline => {
+                        let stop = self.terminate_after_direct_ack_deadline_v1();
+                        return Err(Self::direct_live_replay_error_v1(stop, report));
+                    }
+                    DirectLiveEmptyPollV1::ContinueFrozenFifo => continue,
+                    DirectLiveEmptyPollV1::Quiescent => {
+                        report.quiescent = true;
+                        return Ok(report);
+                    }
+                },
                 Err(_) => {
+                    if let Some(stop) = self.current_direct_live_stop_v1() {
+                        return Err(Self::direct_live_replay_error_v1(stop, report));
+                    }
                     self.revoke_after_storage_uncertain_v1();
                     return Err(Self::direct_live_replay_error_v1(
                         DirectLiveReplayStopV1::StorageUncertain,
@@ -3070,10 +3615,11 @@ impl VeilClient {
                 }
             };
             report.consumed += 1;
+            self.consume_direct_ack_expiry_grace_event_v1(Instant::now());
 
             if matches!(event, ConnectionEvent::Disconnected { .. }) {
                 return Err(Self::direct_live_replay_error_v1(
-                    DirectLiveReplayStopV1::TransportTerminal,
+                    DirectLiveReplayStopV1::RetryableTransport,
                     report,
                 ));
             }
@@ -3097,11 +3643,9 @@ impl VeilClient {
                             },
                         );
                         self.terminate_connection_after_deferred_failure_v1();
-                        let stop = if self.direct_live_storage_uncertain {
-                            DirectLiveReplayStopV1::StorageUncertain
-                        } else {
-                            DirectLiveReplayStopV1::TransportTerminal
-                        };
+                        let stop = self
+                            .current_direct_live_stop_v1()
+                            .unwrap_or(DirectLiveReplayStopV1::EpochInvalid);
                         return Err(Self::direct_live_replay_error_v1(stop, report));
                     }
                 }
@@ -3165,6 +3709,462 @@ impl VeilClient {
             }
         }
         Ok(matched)
+    }
+
+    fn validate_outgoing_message_ack_v1(
+        &self,
+        sequence: u64,
+        client_message_id: Option<&str>,
+        server_message_id: &str,
+        server_timestamp: u64,
+    ) -> Result<(), String> {
+        let pending = self.pending_outgoing_messages.get(&sequence);
+        if !server_message_id.is_empty() {
+            let timestamp_ms = i64::try_from(server_timestamp / 1_000_000)
+                .map_err(|_| "server message timestamp exceeds i64".to_string())?;
+            if timestamp_ms <= 0 {
+                return Err(
+                    "server message timestamp is below the durable millisecond contract"
+                        .to_string(),
+                );
+            }
+        }
+        if pending.is_none() && client_message_id.is_none() {
+            return Ok(());
+        }
+        if let Some(client_message_id) = client_message_id {
+            if self
+                .pending_outgoing_sequence_for_client_id_v1(client_message_id)?
+                .is_some_and(|authoritative_sequence| authoritative_sequence != sequence)
+            {
+                return Err(
+                    "message ACK sequence does not match its live client message correlation"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(pending) = pending {
+            if client_message_id != Some(pending.local_message_id.as_str()) {
+                return Err("message ACK client id does not match the pending send".to_string());
+            }
+        }
+        if server_message_id.is_empty() {
+            return Err("message ACK is missing the server message id".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_outgoing_error_v1(
+        &self,
+        sequence: u64,
+        code: u32,
+        client_message_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<(), String> {
+        let pending = self.pending_outgoing_messages.get(&sequence);
+        if !(400..=599).contains(&code) {
+            return Err(
+                "correlated send error code is outside the HTTP error contract".to_string(),
+            );
+        }
+        if let Some(client_message_id) = client_message_id {
+            if self
+                .pending_outgoing_sequence_for_client_id_v1(client_message_id)?
+                .is_some_and(|authoritative_sequence| authoritative_sequence != sequence)
+            {
+                return Err(
+                    "send error sequence does not match its live client message correlation"
+                        .to_string(),
+                );
+            }
+        }
+        if let Some(pending) = pending {
+            if client_message_id != Some(pending.local_message_id.as_str()) || reason.is_none() {
+                return Err("send error does not match its exact client message id".to_string());
+            }
+        }
+        if reason == Some("client_message_id_conflict") {
+            return Err("server rejected a reused client message id".to_string());
+        }
+        if client_message_id.is_some()
+            && pending.is_none()
+            && is_retryable_correlated_send_error_v1(code, reason)
+        {
+            return Err(
+                "retryable send error references no current Direct outbox sequence".to_string(),
+            );
+        }
+        if client_message_id.is_some()
+            && !is_retryable_correlated_send_error_v1(code, reason)
+            && reason.is_none()
+        {
+            return Err("correlated Direct send error omitted its stable rejection reason".into());
+        }
+        Ok(())
+    }
+
+    fn validate_sender_key_ack_v1(
+        &self,
+        sequence: u64,
+        ack: Option<&crate::connection::SenderKeyAckMetadataV1>,
+    ) -> Result<(), String> {
+        if let Some(receipt) = self.pending_sender_key_receipt_sequences.get(&sequence) {
+            let ack = ack.ok_or("Sender-Key receipt acknowledgement omitted exact metadata")?;
+            if ack.conversation_id != receipt.conversation_id
+                || ack.generation != receipt.generation
+                || ack.target_device_id != receipt.target_device_id
+                || ack.roster_version != receipt.roster_version
+                || ack.envelope_commitment != receipt.envelope_commitment
+            {
+                return Err("Sender-Key receipt acknowledgement metadata mismatch".to_string());
+            }
+            return Ok(());
+        }
+        let Some(pending) = self.pending_sender_key_sequences.get(&sequence) else {
+            return if ack.is_some() {
+                Err("unexpected Sender-Key acknowledgement sequence".to_string())
+            } else {
+                Ok(())
+            };
+        };
+        let ack = ack.ok_or("Sender-Key acknowledgement omitted exact route metadata")?;
+        if ack.conversation_id != pending.conversation_id
+            || ack.generation != pending.generation
+            || ack.target_device_id != pending.target_device_id
+            || ack.roster_version != pending.roster_version
+            || ack.envelope_commitment != pending.envelope_commitment
+        {
+            return Err("Sender-Key acknowledgement route metadata mismatch".to_string());
+        }
+        let roster = self
+            .device_rosters
+            .get(&pending.conversation_id)
+            .ok_or("Sender-Key acknowledgement arrived without a current roster proof")?;
+        if roster.version != pending.roster_version
+            || roster.commitment != pending.roster_commitment
+        {
+            return Err("Sender-Key acknowledgement belongs to a stale roster".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_message_ack_correlation_v1(
+        &self,
+        sequence: u64,
+        client_message_id: Option<&str>,
+        server_message_id: &str,
+        server_timestamp: u64,
+        sender_key: Option<&crate::connection::SenderKeyAckMetadataV1>,
+    ) -> Result<MessageAckCorrelationV1, String> {
+        let outgoing = self.pending_outgoing_messages.contains_key(&sequence);
+        let mutation = self.pending_mutations.contains_key(&sequence);
+        let initial = self.pending_initial_sequences.contains_key(&sequence);
+        let sender_key_distribution = self.pending_sender_key_sequences.contains_key(&sequence);
+        let sender_key_receipt = self
+            .pending_sender_key_receipt_sequences
+            .contains_key(&sequence);
+
+        self.validate_outgoing_message_ack_v1(
+            sequence,
+            client_message_id,
+            server_message_id,
+            server_timestamp,
+        )?;
+
+        if client_message_id.is_some() {
+            if sender_key.is_some() || mutation || sender_key_distribution || sender_key_receipt {
+                return Err(
+                    "chat ACK sequence collides with a non-message live correlation".to_string(),
+                );
+            }
+            if outgoing {
+                // An initial X3DH send deliberately owns both the outgoing
+                // message and initial-session maps under the same sequence.
+                return Ok(MessageAckCorrelationV1::CurrentOutgoing);
+            }
+            if initial {
+                return Err(
+                    "repeated Direct ACK sequence collides with an initial-session correlation"
+                        .to_string(),
+                );
+            }
+            // The durable receipt is validated by client_message_id during
+            // finalization. Its stale wire ref_seq is otherwise inert and may
+            // never select a live correlation from another command.
+            return Ok(MessageAckCorrelationV1::RepeatedDirectReceipt);
+        }
+
+        if outgoing {
+            return Err("outgoing message ACK omitted its exact client message id".to_string());
+        }
+        if sender_key_distribution || sender_key_receipt || sender_key.is_some() {
+            if sender_key_distribution && sender_key_receipt {
+                return Err(
+                    "Sender-Key ACK sequence has multiple live route correlations".to_string(),
+                );
+            }
+            if mutation || initial {
+                return Err(
+                    "Sender-Key ACK sequence collides with another live correlation".to_string(),
+                );
+            }
+            self.validate_sender_key_ack_v1(sequence, sender_key)?;
+            return Ok(MessageAckCorrelationV1::SenderKey);
+        }
+        if mutation {
+            // An edit may legitimately be the first X3DH packet, so its
+            // mutation and initial-session maps share one sequence.
+            let expected_message_id = match self
+                .pending_mutations
+                .get(&sequence)
+                .expect("mutation correlation was checked above")
+            {
+                ConfirmedMutation::Edit { message_id, .. }
+                | ConfirmedMutation::Delete { message_id, .. }
+                | ConfirmedMutation::Reaction { message_id, .. } => message_id,
+            };
+            if server_message_id != expected_message_id {
+                return Err(
+                    "mutation ACK message id does not match its live correlation".to_string(),
+                );
+            }
+            return Ok(MessageAckCorrelationV1::Mutation);
+        }
+        if initial {
+            return Err(
+                "initial-session ACK has no matching outgoing command correlation".to_string(),
+            );
+        }
+        if !server_message_id.is_empty() {
+            return Err("chat-shaped ACK has no live message correlation".to_string());
+        }
+        Ok(MessageAckCorrelationV1::Generic)
+    }
+
+    fn validate_error_correlation_v1(
+        &self,
+        sequence: u64,
+        code: u32,
+        client_message_id: Option<&str>,
+        reason: Option<&str>,
+    ) -> Result<ErrorCorrelationV1, String> {
+        let outgoing = self.pending_outgoing_messages.contains_key(&sequence);
+        let mutation = self.pending_mutations.contains_key(&sequence);
+        let initial = self.pending_initial_sequences.contains_key(&sequence);
+        let sender_key_distribution = self.pending_sender_key_sequences.contains_key(&sequence);
+        let sender_key_receipt = self
+            .pending_sender_key_receipt_sequences
+            .contains_key(&sequence);
+
+        self.validate_outgoing_error_v1(sequence, code, client_message_id, reason)?;
+
+        if client_message_id.is_some() {
+            if mutation || sender_key_distribution || sender_key_receipt {
+                return Err(
+                    "correlated send error sequence collides with a non-message live correlation"
+                        .to_string(),
+                );
+            }
+            if outgoing {
+                // A failed initial X3DH message clears both correlations.
+                return Ok(ErrorCorrelationV1::CurrentOutgoing);
+            }
+            if initial {
+                return Err(
+                    "repeated Direct error sequence collides with an initial-session correlation"
+                        .to_string(),
+                );
+            }
+            return Ok(ErrorCorrelationV1::RepeatedDirectReceipt);
+        }
+
+        if outgoing {
+            return Err("outgoing send error omitted its exact client message id".to_string());
+        }
+        if mutation {
+            if sender_key_distribution || sender_key_receipt {
+                return Err(
+                    "mutation error sequence collides with a Sender-Key live correlation"
+                        .to_string(),
+                );
+            }
+            // As with its ACK, an initial encrypted edit legitimately shares
+            // the initial-session sequence and both are rejected together.
+            return Ok(ErrorCorrelationV1::PendingCommand);
+        }
+        if sender_key_distribution || sender_key_receipt {
+            if sender_key_distribution && sender_key_receipt {
+                return Err(
+                    "Sender-Key error sequence has multiple live route correlations".to_string(),
+                );
+            }
+            if initial {
+                return Err(
+                    "Sender-Key error sequence collides with an initial-session correlation"
+                        .to_string(),
+                );
+            }
+            return Ok(ErrorCorrelationV1::PendingCommand);
+        }
+        if initial {
+            return Err(
+                "initial-session error has no matching outgoing command correlation".to_string(),
+            );
+        }
+        Ok(ErrorCorrelationV1::Generic)
+    }
+
+    fn validate_repeated_direct_ack_receipt_v1(
+        &self,
+        client_message_id: &str,
+        server_message_id: &str,
+        server_timestamp: u64,
+    ) -> Result<(), ConnectionReconciliationValidationErrorV1> {
+        let server_timestamp_ms = i64::try_from(server_timestamp / 1_000_000).map_err(|_| {
+            ConnectionReconciliationValidationErrorV1::ProtocolViolation(
+                "server message timestamp exceeds i64".to_string(),
+            )
+        })?;
+        let scope = self
+            .current_direct_outbox_scope_v1()
+            .map_err(|error| match error {
+                DirectSendErrorV1::Rejected(detail) => {
+                    ConnectionReconciliationValidationErrorV1::ProtocolViolation(detail)
+                }
+                DirectSendErrorV1::StorageUncertain(detail) => {
+                    ConnectionReconciliationValidationErrorV1::StorageUncertain(detail)
+                }
+            })?;
+        let receipt = self
+            .db
+            .as_ref()
+            .ok_or_else(|| {
+                ConnectionReconciliationValidationErrorV1::StorageUncertain(
+                    "SQLCipher database is unavailable during repeated Direct ACK validation"
+                        .to_string(),
+                )
+            })?
+            .load_direct_message_outbox_receipt_v1(&scope, client_message_id)
+            .map_err(ConnectionReconciliationValidationErrorV1::StorageUncertain)?;
+        match receipt.as_ref() {
+            Some(DirectMessageOutboxReceiptV1::Acknowledged {
+                server_message_id: durable_server_message_id,
+                server_timestamp_ms: durable_server_timestamp_ms,
+                ..
+            }) if durable_server_message_id == server_message_id
+                && *durable_server_timestamp_ms == server_timestamp_ms =>
+            {
+                Ok(())
+            }
+            _ => Err(
+                ConnectionReconciliationValidationErrorV1::ProtocolViolation(
+                    "repeated Direct ACK conflicts with its durable receipt".to_string(),
+                ),
+            ),
+        }
+    }
+
+    fn validate_repeated_direct_error_receipt_v1(
+        &self,
+        client_message_id: &str,
+        rejection_reason: &str,
+    ) -> Result<(), ConnectionReconciliationValidationErrorV1> {
+        let scope = self
+            .current_direct_outbox_scope_v1()
+            .map_err(|error| match error {
+                DirectSendErrorV1::Rejected(detail) => {
+                    ConnectionReconciliationValidationErrorV1::ProtocolViolation(detail)
+                }
+                DirectSendErrorV1::StorageUncertain(detail) => {
+                    ConnectionReconciliationValidationErrorV1::StorageUncertain(detail)
+                }
+            })?;
+        let receipt = self
+            .db
+            .as_ref()
+            .ok_or_else(|| {
+                ConnectionReconciliationValidationErrorV1::StorageUncertain(
+                    "SQLCipher database is unavailable during repeated Direct error validation"
+                        .to_string(),
+                )
+            })?
+            .load_direct_message_outbox_receipt_v1(&scope, client_message_id)
+            .map_err(ConnectionReconciliationValidationErrorV1::StorageUncertain)?;
+        match receipt.as_ref() {
+            Some(DirectMessageOutboxReceiptV1::Rejected {
+                rejection_reason: durable_rejection_reason,
+                ..
+            }) if durable_rejection_reason == rejection_reason => Ok(()),
+            _ => Err(
+                ConnectionReconciliationValidationErrorV1::ProtocolViolation(
+                    "repeated Direct error conflicts with its durable receipt".to_string(),
+                ),
+            ),
+        }
+    }
+
+    fn validate_connection_reconciliation_event_v1(
+        &self,
+        event: &ConnectionEvent,
+    ) -> Result<ConnectionReconciliationV1, ConnectionReconciliationValidationErrorV1> {
+        match event {
+            ConnectionEvent::MessageAcked {
+                message_id,
+                server_timestamp,
+                ref_seq,
+                client_message_id,
+                sender_key,
+                ..
+            } => {
+                let correlation = self
+                    .validate_message_ack_correlation_v1(
+                        *ref_seq,
+                        client_message_id.as_deref(),
+                        message_id,
+                        *server_timestamp,
+                        sender_key.as_ref(),
+                    )
+                    .map_err(ConnectionReconciliationValidationErrorV1::ProtocolViolation)?;
+                if correlation == MessageAckCorrelationV1::RepeatedDirectReceipt {
+                    self.validate_repeated_direct_ack_receipt_v1(
+                        client_message_id
+                            .as_deref()
+                            .expect("repeated Direct ACK has a validated client message id"),
+                        message_id,
+                        *server_timestamp,
+                    )?;
+                }
+                Ok(ConnectionReconciliationV1::MessageAck(correlation))
+            }
+            ConnectionEvent::Error {
+                code,
+                ref_seq: Some(ref_seq),
+                client_message_id,
+                reason,
+                ..
+            } => {
+                let correlation = self
+                    .validate_error_correlation_v1(
+                        *ref_seq,
+                        *code,
+                        client_message_id.as_deref(),
+                        reason.as_deref(),
+                    )
+                    .map_err(ConnectionReconciliationValidationErrorV1::ProtocolViolation)?;
+                if correlation == ErrorCorrelationV1::RepeatedDirectReceipt {
+                    self.validate_repeated_direct_error_receipt_v1(
+                        client_message_id
+                            .as_deref()
+                            .expect("repeated Direct error has a validated client message id"),
+                        reason
+                            .as_deref()
+                            .expect("repeated Direct error has a validated stable reason"),
+                    )?;
+                }
+                Ok(ConnectionReconciliationV1::Error(correlation))
+            }
+            _ => Ok(ConnectionReconciliationV1::None),
+        }
     }
 
     fn reconcile_previous_transport_before_install_v1(&mut self) -> Result<(), String> {
@@ -3848,6 +4848,7 @@ impl VeilClient {
                 sender_identity_key: our_key,
                 plaintext: plaintext.to_string(),
                 durable_direct_outbox: false,
+                direct_ack_deadline: None,
             },
         );
 
@@ -3876,6 +4877,11 @@ impl VeilClient {
         conversation_id: &str,
         plaintext: &str,
     ) -> Result<DirectMessageEnqueueReportV1, DirectSendErrorV1> {
+        if !self.is_connected() {
+            return Err(DirectSendErrorV1::rejected(
+                "authenticated transport is unavailable",
+            ));
+        }
         let scope = self.current_direct_outbox_scope_v1()?;
         let pending_count = self
             .db
@@ -4028,8 +5034,9 @@ impl VeilClient {
         }
 
         // Publish the already-committed candidate only after SQLCipher owns
-        // the corresponding exact payload. From here on transport failure is
-        // retryable and must never roll the ratchet or local row back.
+        // the corresponding exact payload. From here on delivery is unknown;
+        // only source-typed, allowlisted transport failures are retryable, and
+        // no failure may roll the ratchet or local row back.
         self.ratchet_sessions
             .insert(peer_identity_key, prepared.candidate);
         if let Some(indexer) = self.indexer.as_ref() {
@@ -4042,15 +5049,47 @@ impl VeilClient {
             );
         }
 
+        #[cfg(any(test, feature = "test-utils"))]
+        if std::mem::take(&mut self.test_only_epoch_invalid_after_direct_commit) {
+            self.connection
+                .as_ref()
+                .expect("Direct outbox scope requires a live connection handle")
+                .test_only_report_websocket_error_v1(
+                    tokio_tungstenite::tungstenite::Error::Capacity(
+                        tokio_tungstenite::tungstenite::error::CapacityError::MessageTooLong {
+                            size: 2,
+                            max_size: 1,
+                        },
+                    ),
+                );
+        }
+
+        #[cfg(any(test, feature = "test-utils"))]
+        if std::mem::take(&mut self.test_only_retryable_after_direct_commit) {
+            self.connection
+                .as_ref()
+                .expect("Direct outbox scope requires a live connection handle")
+                .test_only_report_websocket_error_v1(
+                    tokio_tungstenite::tungstenite::Error::Protocol(
+                        tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                    ),
+                );
+        }
+
         let connection = self
             .connection
             .as_ref()
             .expect("Direct outbox scope requires a live connection handle");
         let sequence = connection.next_seq().await;
-        let transport_enqueued = connection
+        let enqueue_result = connection
             .send_preencoded_send_message_with_seq_v1(sequence, &exact_send_message_payload)
-            .await
-            .is_ok();
+            .await;
+        let transport_enqueued = enqueue_result.is_ok();
+        // The read/write task can publish a terminal concurrently with a
+        // successful bounded mpsc enqueue. Preserve that typed source even in
+        // the success race so native code never returns plain Accepted for an
+        // already invalid socket epoch.
+        let transport_stop = self.classify_direct_enqueue_result_v1(&enqueue_result);
         if transport_enqueued {
             self.pending_outgoing_messages.insert(
                 sequence,
@@ -4060,12 +5099,14 @@ impl VeilClient {
                     sender_identity_key: our_identity_key,
                     plaintext: plaintext.to_string(),
                     durable_direct_outbox: true,
+                    direct_ack_deadline: Some(next_direct_ack_deadline_v1()),
                 },
             );
         }
         Ok(DirectMessageEnqueueReportV1 {
             sequence,
             transport_enqueued,
+            transport_stop,
         })
     }
 
@@ -4096,6 +5137,34 @@ impl VeilClient {
                 "Direct outbox replay limit is invalid",
             ));
         }
+        let terminal_stop = self
+            .observe_connection_terminal_stop_v1()
+            .or_else(|| self.current_direct_live_stop_v1());
+        match terminal_stop {
+            Some(DirectLiveReplayStopV1::EpochInvalid) => {
+                return Err(DirectSendErrorV1::rejected(
+                    "authenticated Direct transport epoch is invalid",
+                ));
+            }
+            Some(DirectLiveReplayStopV1::StorageUncertain) => {
+                return Err(DirectSendErrorV1::storage(
+                    "Direct outbox replay storage is uncertain",
+                ));
+            }
+            Some(
+                DirectLiveReplayStopV1::RetryableTransport | DirectLiveReplayStopV1::AckDeadline,
+            ) if self.connection.is_none()
+                || self.authenticated_user_id.is_none()
+                || self.authenticated_server_origin.is_none() =>
+            {
+                return Ok(DirectOutboxReplayReportV1 {
+                    next_queue_order: after_queue_order,
+                    transport_blocked: true,
+                    ..DirectOutboxReplayReportV1::default()
+                });
+            }
+            _ => {}
+        }
         let scope = self.current_direct_outbox_scope_v1()?;
         let pending_rows = self
             .db
@@ -4109,8 +5178,24 @@ impl VeilClient {
             next_queue_order: after_queue_order,
             ..DirectOutboxReplayReportV1::default()
         };
+        if matches!(
+            terminal_stop,
+            Some(DirectLiveReplayStopV1::RetryableTransport | DirectLiveReplayStopV1::AckDeadline)
+        ) {
+            report.pending_total = self
+                .db
+                .as_ref()
+                .ok_or_else(|| DirectSendErrorV1::rejected("SQLCipher database is unavailable"))?
+                .count_pending_direct_message_outbox_v1(&scope)
+                .map_err(DirectSendErrorV1::storage)?;
+            report.transport_blocked = true;
+            return Ok(report);
+        }
 
         for pending in pending_rows {
+            if self.stop_direct_outbox_replay_if_terminal_v1(&mut report)? {
+                break;
+            }
             report.visited = report
                 .visited
                 .checked_add(1)
@@ -4137,16 +5222,33 @@ impl VeilClient {
                 DirectSendErrorV1::rejected("authenticated transport is unavailable")
             })?;
             let sequence = connection.next_seq().await;
-            if connection
+            let enqueue_result = connection
                 .send_preencoded_send_message_with_seq_v1(
                     sequence,
                     &pending.exact_send_message_payload,
                 )
-                .await
-                .is_err()
-            {
-                report.transport_blocked = true;
-                break;
+                .await;
+            if enqueue_result.is_err() {
+                match self.classify_direct_enqueue_result_v1(&enqueue_result) {
+                    Some(DirectLiveReplayStopV1::EpochInvalid) => {
+                        return Err(DirectSendErrorV1::rejected(
+                            "authenticated Direct transport epoch is invalid",
+                        ));
+                    }
+                    Some(DirectLiveReplayStopV1::StorageUncertain) => {
+                        return Err(DirectSendErrorV1::storage(
+                            "Direct outbox replay storage is uncertain",
+                        ));
+                    }
+                    Some(
+                        DirectLiveReplayStopV1::RetryableTransport
+                        | DirectLiveReplayStopV1::AckDeadline,
+                    )
+                    | None => {
+                        report.transport_blocked = true;
+                        break;
+                    }
+                }
             }
             self.pending_outgoing_messages.insert(
                 sequence,
@@ -4158,13 +5260,25 @@ impl VeilClient {
                     // if the ACK renames the provisional UUID.
                     plaintext: pending.plaintext.clone(),
                     durable_direct_outbox: true,
+                    direct_ack_deadline: Some(next_direct_ack_deadline_v1()),
                 },
             );
+            #[cfg(any(test, feature = "test-utils"))]
+            if std::mem::take(&mut self.test_only_epoch_invalid_after_direct_outbox_enqueue) {
+                self.test_only_report_epoch_invalid_transport_v1();
+            }
             report.enqueued = report
                 .enqueued
                 .checked_add(1)
                 .ok_or_else(|| DirectSendErrorV1::storage("Direct replay counter overflow"))?;
             report.next_queue_order = Some(pending.queue_order);
+            // A WebSocket task may publish a typed terminal after the bounded
+            // channel accepted the exact frame. Retain the live sequence and
+            // ACK deadline for those queued bytes, but never report Ready for
+            // an already invalid or retry-required transport epoch.
+            if self.stop_direct_outbox_replay_if_terminal_v1(&mut report)? {
+                break;
+            }
         }
         report.pending_total = self
             .db
@@ -4172,13 +5286,105 @@ impl VeilClient {
             .ok_or_else(|| DirectSendErrorV1::rejected("SQLCipher database is unavailable"))?
             .count_pending_direct_message_outbox_v1(&scope)
             .map_err(DirectSendErrorV1::storage)?;
+        // Close the same race for an empty page and for the final row (which
+        // may already have had a process-local correlation before this turn).
+        self.stop_direct_outbox_replay_if_terminal_v1(&mut report)?;
         report.reached_end = !report.transport_blocked && page_len < limit;
         Ok(report)
     }
 
     /// Check if we're connected to the server.
     pub fn is_connected(&self) -> bool {
-        self.connection.is_some()
+        if self.current_direct_live_stop_v1().is_some() {
+            return false;
+        }
+        self.connection
+            .as_ref()
+            .is_some_and(|connection| connection.events.terminal_buffer_error_v1().is_none())
+    }
+
+    /// Deterministically expire every current durable Direct ACK correlation
+    /// without sleeping or changing the production timeout.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_expire_direct_ack_deadlines_v1(&mut self) -> usize {
+        self.direct_ack_expiry_grace_remaining.clear();
+        let expired = Instant::now();
+        let mut count = 0usize;
+        for pending in self.pending_outgoing_messages.values_mut() {
+            if pending.durable_direct_outbox {
+                pending.direct_ack_deadline = Some(expired);
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Cross-crate proof that sticky SQLCipher ambiguity never crosses a typed
+    /// mobile boundary as retryable transport loss.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_revoke_storage_uncertain_epoch_v1(&mut self) {
+        self.revoke_after_storage_uncertain_v1();
+    }
+
+    /// Publish a deterministic post-auth protocol terminal without consuming
+    /// it, so cross-crate tests can prove send/outbox policy remains typed.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_report_epoch_invalid_transport_v1(&self) -> bool {
+        let Some(connection) = self.connection.as_ref() else {
+            return false;
+        };
+        connection.test_only_report_websocket_error_v1(
+            tokio_tungstenite::tungstenite::Error::Capacity(
+                tokio_tungstenite::tungstenite::error::CapacityError::MessageTooLong {
+                    size: 2,
+                    max_size: 1,
+                },
+            ),
+        );
+        true
+    }
+
+    /// Publish an allowlisted retryable post-auth transport loss for native
+    /// cross-crate policy tests. No diagnostic text selects retryability.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_report_retryable_transport_v1(&self) -> bool {
+        let Some(connection) = self.connection.as_ref() else {
+            return false;
+        };
+        connection.test_only_report_websocket_error_v1(
+            tokio_tungstenite::tungstenite::Error::Protocol(
+                tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            ),
+        );
+        true
+    }
+
+    /// Deterministically publish an epoch-invalid terminal after SQLCipher has
+    /// accepted the next Direct intent but before its transport enqueue.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_epoch_invalid_after_next_direct_commit_v1(&mut self) {
+        self.test_only_epoch_invalid_after_direct_commit = true;
+    }
+
+    /// Deterministically publish a retryable transport terminal after
+    /// SQLCipher has accepted the next Direct intent but before enqueue.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_retryable_after_next_direct_commit_v1(&mut self) {
+        self.test_only_retryable_after_direct_commit = true;
+    }
+
+    /// Deterministically publish an epoch-invalid terminal after the next
+    /// exact outbox frame enters the bounded transport queue.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_epoch_invalid_after_next_direct_outbox_enqueue_v1(&mut self) {
+        self.test_only_epoch_invalid_after_direct_outbox_enqueue = true;
     }
 
     /// Install an in-memory transport for cross-crate native integration tests.
@@ -7802,6 +9008,18 @@ mod tests {
     async fn metadata_access_pass_boundary_is_exact_before_networking() {
         let mut client = VeilClient::new();
 
+        let classified = client
+            .connect_with_client_metadata_and_access_pass_classified_v1(
+                "wss://chat.example.test/ws",
+                "veil-android",
+                "veil-android",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(classified.stop, MobileConnectStopV1::EpochInvalid);
+        assert_eq!(classified.detail, "not initialized");
+
         assert_eq!(
             client
                 .connect_with_client_metadata_and_access_pass(
@@ -7830,6 +9048,20 @@ mod tests {
         );
 
         for invalid in [vec![0x42; 31], vec![0x42; 33]] {
+            let classified = client
+                .connect_with_client_metadata_and_access_pass_classified_v1(
+                    "wss://chat.example.test/ws",
+                    "veil-android",
+                    "veil-android",
+                    Some(&invalid),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(classified.stop, MobileConnectStopV1::EpochInvalid);
+            assert_eq!(
+                classified.detail,
+                "node access pass must contain exactly 32 bytes"
+            );
             assert_eq!(
                 client
                     .connect_with_client_metadata_and_access_pass(
@@ -7843,6 +9075,18 @@ mod tests {
                 "node access pass must contain exactly 32 bytes"
             );
         }
+
+        client.revoke_storage_uncertain_epoch_v1();
+        let classified = client
+            .connect_with_client_metadata_and_access_pass_classified_v1(
+                "wss://chat.example.test/ws",
+                "veil-android",
+                "veil-android",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(classified.stop, MobileConnectStopV1::StorageUncertain);
     }
 
     fn test_roster_commitment(candidate: &DeviceRosterCandidateV1) -> [u8; 32] {
@@ -10664,6 +11908,1206 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_outbox_enqueue_racing_protocol_terminal_never_reports_ready() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "replay terminal race")
+            .await
+            .unwrap();
+        let first_wire = fixture.outbound.recv().await.unwrap();
+        fixture.client.mark_all_pending_sequences_unknown().unwrap();
+        fixture.outbound = fixture.client.test_only_install_queued_connection();
+        fixture
+            .client
+            .test_only_epoch_invalid_after_next_direct_outbox_enqueue_v1();
+
+        let error = fixture
+            .client
+            .replay_direct_outbox_v1(None, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DirectSendErrorV1::Rejected(_)));
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.client.direct_live_storage_uncertain);
+        assert_eq!(fixture.client.pending_outgoing_messages.len(), 1);
+        let replay_wire = fixture.outbound.recv().await.unwrap();
+        assert_eq!(
+            replay_wire, first_wire,
+            "the terminal race must not change exact replay bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_direct_ack_deadline_revokes_transport_and_replays_exact_outbox() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "deadline exact retry")
+            .await
+            .unwrap();
+        assert!(queued.transport_enqueued);
+        let first_wire = fixture.outbound.recv().await.unwrap();
+        let (_, first_send) = DirectOutboxClientFixture::decode_send(&first_wire);
+        let exact_payload = first_send.encode_to_vec();
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+
+        assert_eq!(fixture.client.test_only_expire_direct_ack_deadlines_v1(), 1);
+        let error = fixture
+            .client
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap_err();
+        assert_eq!(error.stop, DirectLiveReplayStopV1::AckDeadline);
+        assert_eq!(error.report, DirectLiveReplayReportV1::default());
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::AckDeadline)
+        );
+        assert!(fixture.client.connection.is_none());
+        assert!(fixture.client.authenticated_user_id.is_none());
+        assert!(fixture.client.authenticated_server_origin.is_none());
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .get_messages(&fixture.conversation_id, 10)
+                .unwrap()[0]
+                .status,
+            veil_store::models::MessageStatus::Sending
+        );
+
+        // Model the successful authenticated reconnect boundary. Only the new
+        // socket correlation/deadline changes; SQLCipher supplies the exact
+        // previously committed SendMessage bytes.
+        fixture
+            .client
+            .deferred_connection_events
+            .reset_for_new_epoch();
+        fixture.client.direct_live_stop = None;
+        fixture.client.authenticated_user_id = Some(fixture.self_user_id.clone());
+        fixture.client.authenticated_server_origin = Some(DIRECT_LIVE_TEST_ORIGIN.to_string());
+        fixture.outbound = fixture.client.test_only_install_queued_connection();
+        let replay = fixture
+            .client
+            .replay_direct_outbox_v1(None, 10)
+            .await
+            .unwrap();
+        assert_eq!(replay.enqueued, 1);
+        assert!(replay.reached_end);
+        let replay_wire = fixture.outbound.recv().await.unwrap();
+        let (_, replay_send) = DirectOutboxClientFixture::decode_send(&replay_wire);
+        assert_eq!(replay_send.encode_to_vec(), exact_payload);
+        assert_eq!(fixture.client.test_only_expire_direct_ack_deadlines_v1(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_direct_ack_wins_over_an_expired_monotonic_deadline() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "queued ACK wins")
+            .await
+            .unwrap();
+        let wire = fixture.outbound.recv().await.unwrap();
+        let (_, send) = DirectOutboxClientFixture::decode_send(&wire);
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        assert_eq!(fixture.client.test_only_expire_direct_ack_deadlines_v1(), 1);
+
+        let server_message_id =
+            uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00A1).to_string();
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: server_message_id.clone(),
+                    server_timestamp: 1_700_000_001_234_000_000,
+                    ref_seq: queued.sequence,
+                    client_message_id: Some(send.client_message_id),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+
+        let report = fixture.client.replay_direct_live_events_v1().await.unwrap();
+        assert_eq!(report.consumed, 1);
+        assert!(report.quiescent);
+        assert_eq!(fixture.client.direct_live_stop, None);
+        assert!(fixture.client.connection.is_some());
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            0
+        );
+        let messages = fixture
+            .client
+            .db()
+            .unwrap()
+            .get_messages(&fixture.conversation_id, 10)
+            .unwrap();
+        assert_eq!(messages[0].id, server_message_id);
+        assert_eq!(messages[0].status, veil_store::models::MessageStatus::Sent);
+    }
+
+    #[tokio::test]
+    async fn queued_direct_ack_beyond_one_batch_wins_the_finite_expiry_snapshot() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "deep queued ACK wins")
+            .await
+            .unwrap();
+        let wire = fixture.outbound.recv().await.unwrap();
+        let (_, send) = DirectOutboxClientFixture::decode_send(&wire);
+        assert_eq!(fixture.client.test_only_expire_direct_ack_deadlines_v1(), 1);
+
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        let mut events = (0..DIRECT_LIVE_REPLAY_MAX_BATCH_V1)
+            .map(|index| {
+                budget
+                    .try_wrap(ConnectionEvent::TypingEvent {
+                        conversation_id: format!("queued-before-ack-{index}"),
+                        identity_key: vec![0xA5; 32],
+                        started: true,
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let server_message_id =
+            uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00A2).to_string();
+        events.push(
+            budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: server_message_id.clone(),
+                    server_timestamp: 1_700_000_001_235_000_000,
+                    ref_seq: queued.sequence,
+                    client_message_id: Some(send.client_message_id),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap(),
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(events)
+            .unwrap();
+
+        let first = fixture.client.replay_direct_live_events_v1().await.unwrap();
+        assert_eq!(first.consumed, DIRECT_LIVE_REPLAY_MAX_BATCH_V1);
+        assert!(!first.quiescent);
+        assert_eq!(
+            fixture
+                .client
+                .direct_ack_expiry_grace_remaining
+                .get(&queued.sequence)
+                .copied(),
+            Some(1)
+        );
+
+        let second = fixture.client.replay_direct_live_events_v1().await.unwrap();
+        assert_eq!(second.consumed, 1);
+        assert!(second.quiescent);
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        assert!(fixture.client.direct_ack_expiry_grace_remaining.is_empty());
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .get_messages(&fixture.conversation_id, 10)
+                .unwrap()[0]
+                .id,
+            server_message_id
+        );
+    }
+
+    #[tokio::test]
+    async fn staggered_direct_deadlines_keep_independent_fifo_snapshots() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let first = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "first staggered deadline")
+            .await
+            .unwrap();
+        let (_, first_send) =
+            DirectOutboxClientFixture::decode_send(&fixture.outbound.recv().await.unwrap());
+        let second = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "second staggered deadline")
+            .await
+            .unwrap();
+        let (_, second_send) =
+            DirectOutboxClientFixture::decode_send(&fixture.outbound.recv().await.unwrap());
+        let now = Instant::now();
+        fixture
+            .client
+            .pending_outgoing_messages
+            .get_mut(&first.sequence)
+            .unwrap()
+            .direct_ack_deadline = Some(now);
+        fixture
+            .client
+            .pending_outgoing_messages
+            .get_mut(&second.sequence)
+            .unwrap()
+            .direct_ack_deadline = Some(now.checked_add(Duration::from_secs(60)).unwrap());
+
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        let first_server_id =
+            uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00c1).to_string();
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: first_server_id,
+                    server_timestamp: 1_700_000_001_250_000_000,
+                    ref_seq: first.sequence,
+                    client_message_id: Some(first_send.client_message_id),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+        fixture.client.refresh_direct_ack_expiry_grace_v1(now);
+        assert_eq!(
+            fixture
+                .client
+                .direct_ack_expiry_grace_remaining
+                .get(&first.sequence),
+            Some(&1)
+        );
+
+        assert!(matches!(
+            fixture.client.poll_event().await.unwrap(),
+            Some(ConnectionEvent::MessageAcked { .. })
+        ));
+        fixture
+            .client
+            .pending_outgoing_messages
+            .get_mut(&second.sequence)
+            .unwrap()
+            .direct_ack_deadline = Some(now);
+        let second_server_id =
+            uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00c2).to_string();
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: second_server_id,
+                    server_timestamp: 1_700_000_001_251_000_000,
+                    ref_seq: second.sequence,
+                    client_message_id: Some(second_send.client_message_id),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+        fixture.client.consume_direct_ack_expiry_grace_event_v1(now);
+        assert_eq!(
+            fixture
+                .client
+                .direct_ack_expiry_grace_remaining
+                .get(&second.sequence),
+            Some(&1),
+            "the second correlation must snapshot its own queued ACK"
+        );
+        assert!(!fixture.client.has_exhausted_direct_ack_expiry_grace_v1());
+
+        assert!(matches!(
+            fixture.client.poll_event().await.unwrap(),
+            Some(ConnectionEvent::MessageAcked { .. })
+        ));
+        fixture.client.consume_direct_ack_expiry_grace_event_v1(now);
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        assert!(fixture.client.direct_ack_expiry_grace_remaining.is_empty());
+        assert_eq!(fixture.client.direct_live_stop, None);
+    }
+
+    #[tokio::test]
+    async fn ack_queued_after_empty_poll_at_deadline_gets_a_frozen_fifo_turn() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "empty-poll deadline race")
+            .await
+            .unwrap();
+        let (_, send) =
+            DirectOutboxClientFixture::decode_send(&fixture.outbound.recv().await.unwrap());
+        let before_expiry = Instant::now();
+        fixture
+            .client
+            .pending_outgoing_messages
+            .get_mut(&queued.sequence)
+            .unwrap()
+            .direct_ack_deadline =
+            Some(before_expiry.checked_add(Duration::from_secs(60)).unwrap());
+        fixture
+            .client
+            .refresh_direct_ack_expiry_grace_v1(before_expiry);
+        assert!(fixture.client.direct_ack_expiry_grace_remaining.is_empty());
+        assert!(fixture.client.poll_event().await.unwrap().is_none());
+
+        let observed_expiry = Instant::now();
+        fixture
+            .client
+            .pending_outgoing_messages
+            .get_mut(&queued.sequence)
+            .unwrap()
+            .direct_ack_deadline = Some(observed_expiry);
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00c3)
+                        .to_string(),
+                    server_timestamp: 1_700_000_001_254_000_000,
+                    ref_seq: queued.sequence,
+                    client_message_id: Some(send.client_message_id),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+        assert_eq!(
+            fixture
+                .client
+                .classify_direct_live_empty_poll_v1(observed_expiry),
+            DirectLiveEmptyPollV1::ContinueFrozenFifo
+        );
+        assert_eq!(
+            fixture
+                .client
+                .direct_ack_expiry_grace_remaining
+                .get(&queued.sequence),
+            Some(&1)
+        );
+
+        let report = fixture.client.replay_direct_live_events_v1().await.unwrap();
+        assert_eq!(report.consumed, 1);
+        assert!(report.quiescent);
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        assert_eq!(fixture.client.direct_live_stop, None);
+    }
+
+    #[tokio::test]
+    async fn post_expiry_unrelated_traffic_cannot_replenish_the_fifo_grace() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "bounded deadline grace")
+            .await
+            .unwrap();
+        fixture.outbound.recv().await.unwrap();
+        assert_eq!(fixture.client.test_only_expire_direct_ack_deadlines_v1(), 1);
+
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        let initial_count = DIRECT_LIVE_REPLAY_MAX_BATCH_V1 + 1;
+        let initial = (0..initial_count)
+            .map(|index| {
+                budget
+                    .try_wrap(ConnectionEvent::TypingEvent {
+                        conversation_id: format!("expiry-snapshot-{index}"),
+                        identity_key: vec![0xB6; 32],
+                        started: true,
+                    })
+                    .unwrap()
+            })
+            .collect();
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(initial)
+            .unwrap();
+
+        let refill_budget = budget.clone();
+        let first = fixture
+            .client
+            .replay_direct_live_events_inner_v1(move |client, consumed| {
+                client
+                    .deferred_connection_events
+                    .try_extend(vec![refill_budget
+                        .try_wrap(ConnectionEvent::TypingEvent {
+                            conversation_id: format!("arrived-after-expiry-{consumed}"),
+                            identity_key: vec![0xC7; 32],
+                            started: false,
+                        })
+                        .unwrap()])
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+        assert_eq!(first.consumed, DIRECT_LIVE_REPLAY_MAX_BATCH_V1);
+        assert_eq!(
+            fixture
+                .client
+                .direct_ack_expiry_grace_remaining
+                .get(&queued.sequence)
+                .copied(),
+            Some(1)
+        );
+
+        let error = fixture
+            .client
+            .replay_direct_live_events_inner_v1(|client, consumed| {
+                client
+                    .deferred_connection_events
+                    .try_extend(vec![budget
+                        .try_wrap(ConnectionEvent::TypingEvent {
+                            conversation_id: format!("second-refill-{consumed}"),
+                            identity_key: vec![0xD8; 32],
+                            started: false,
+                        })
+                        .unwrap()])
+                    .unwrap();
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.stop, DirectLiveReplayStopV1::AckDeadline);
+        assert_eq!(error.report.consumed, 1);
+        assert!(fixture.client.connection.is_none());
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+    }
+
+    #[tokio::test]
+    async fn direct_ack_correlation_mismatch_is_epoch_invalid_not_storage_uncertain() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "mismatch remains durable")
+            .await
+            .unwrap();
+        let wire = fixture.outbound.recv().await.unwrap();
+        let (_, send) = DirectOutboxClientFixture::decode_send(&wire);
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: uuid::Uuid::new_v4().hyphenated().to_string(),
+                    server_timestamp: 1_700_000_001_236_000_000,
+                    ref_seq: queued.sequence + 1,
+                    client_message_id: Some(send.client_message_id),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+
+        let detail = fixture.client.poll_event().await.unwrap_err();
+        assert!(detail.contains("sequence does not match"));
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.client.direct_live_storage_uncertain);
+        assert!(fixture.client.db().is_some());
+        assert!(fixture.client.identity.is_some());
+        assert!(fixture.client.connection.is_none());
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fixture
+                .client
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap_err()
+                .stop,
+            DirectLiveReplayStopV1::EpochInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_millisecond_direct_ack_is_epoch_invalid_before_sqlcipher_mutation() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "timestamp remains pending")
+            .await
+            .unwrap();
+        let (_, send) =
+            DirectOutboxClientFixture::decode_send(&fixture.outbound.recv().await.unwrap());
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00d1)
+                        .to_string(),
+                    server_timestamp: 1,
+                    ref_seq: queued.sequence,
+                    client_message_id: Some(send.client_message_id),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+
+        let detail = fixture.client.poll_event().await.unwrap_err();
+        assert!(detail.contains("durable millisecond contract"));
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.client.direct_live_storage_uncertain);
+        assert!(fixture.client.db().is_some());
+        assert!(fixture.client.identity.is_some());
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_shaped_ack_must_match_the_pending_mutation_target() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let baseline = fixture.peers[peer].next_event("mutation target remains unchanged");
+        let message_id = match &baseline {
+            ConnectionEvent::MessageReceived { message_id, .. } => message_id.clone(),
+            _ => unreachable!(),
+        };
+        fixture.enqueue(vec![baseline]);
+        fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        let sequence = 0xD2;
+        fixture.receiver.pending_mutations.insert(
+            sequence,
+            ConfirmedMutation::Edit {
+                message_id: message_id.clone(),
+                conversation_id: fixture.peers[peer].conversation_id.clone(),
+                new_text: "must not be selected by another message id".to_string(),
+            },
+        );
+        fixture.enqueue(vec![ConnectionEvent::MessageAcked {
+            message_id: uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00d2)
+                .to_string(),
+            server_timestamp: 1_700_000_001_252_000_000,
+            ref_seq: sequence,
+            client_message_id: None,
+            local_message_id: None,
+            mutation: None,
+            sender_key: None,
+        }]);
+
+        let detail = fixture.receiver.poll_event().await.unwrap_err();
+        assert!(detail.contains("mutation ACK message id does not match"));
+        assert_eq!(
+            fixture.receiver.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.receiver.direct_live_storage_uncertain);
+        let persisted = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .get_messages(&fixture.peers[peer].conversation_id, 10)
+            .unwrap();
+        assert!(persisted.iter().any(|message| {
+            message.id == message_id && message.plaintext == "mutation target remains unchanged"
+        }));
+    }
+
+    #[tokio::test]
+    async fn exact_chat_shaped_mutation_ack_commits_the_pending_edit() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let baseline = fixture.peers[peer].next_event("positive mutation target");
+        let message_id = match &baseline {
+            ConnectionEvent::MessageReceived { message_id, .. } => message_id.clone(),
+            _ => unreachable!(),
+        };
+        fixture.enqueue(vec![baseline]);
+        fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        let sequence = 0xD4;
+        fixture.receiver.pending_mutations.insert(
+            sequence,
+            ConfirmedMutation::Edit {
+                message_id: message_id.clone(),
+                conversation_id: fixture.peers[peer].conversation_id.clone(),
+                new_text: "exact mutation ACK committed".to_string(),
+            },
+        );
+        fixture.enqueue(vec![ConnectionEvent::MessageAcked {
+            message_id: message_id.clone(),
+            server_timestamp: 1_700_000_001_253_000_000,
+            ref_seq: sequence,
+            client_message_id: None,
+            local_message_id: None,
+            mutation: None,
+            sender_key: None,
+        }]);
+
+        assert!(matches!(
+            fixture.receiver.poll_event().await.unwrap(),
+            Some(ConnectionEvent::MessageAcked {
+                mutation: Some(ConfirmedMutation::Edit { .. }),
+                ..
+            })
+        ));
+        assert!(fixture.receiver.pending_mutations.is_empty());
+        assert_eq!(fixture.receiver.direct_live_stop, None);
+        let persisted = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .get_messages(&fixture.peers[peer].conversation_id, 10)
+            .unwrap();
+        assert!(persisted.iter().any(|message| {
+            message.id == message_id && message.plaintext == "exact mutation ACK committed"
+        }));
+    }
+
+    #[tokio::test]
+    async fn out_of_contract_correlated_error_is_epoch_invalid_before_rejection() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let peer = fixture.add_peer();
+        let baseline = fixture.peers[peer].next_event("error target remains unchanged");
+        let message_id = match &baseline {
+            ConnectionEvent::MessageReceived { message_id, .. } => message_id.clone(),
+            _ => unreachable!(),
+        };
+        fixture.enqueue(vec![baseline]);
+        fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap();
+        let sequence = 0xD3;
+        fixture.receiver.pending_mutations.insert(
+            sequence,
+            ConfirmedMutation::Delete {
+                message_id: message_id.clone(),
+                conversation_id: fixture.peers[peer].conversation_id.clone(),
+            },
+        );
+        fixture.enqueue(vec![ConnectionEvent::Error {
+            code: 600,
+            message: "out-of-contract status".to_string(),
+            ref_seq: Some(sequence),
+            client_message_id: None,
+            reason: Some("unknown_status".to_string()),
+            local_message_id: None,
+            conversation_id: None,
+            stale_roster_context: false,
+        }]);
+
+        let detail = fixture.receiver.poll_event().await.unwrap_err();
+        assert!(detail.contains("outside the HTTP error contract"));
+        assert_eq!(
+            fixture.receiver.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.receiver.direct_live_storage_uncertain);
+        assert!(fixture
+            .receiver
+            .db()
+            .unwrap()
+            .get_messages(&fixture.peers[peer].conversation_id, 10)
+            .unwrap()
+            .iter()
+            .any(|message| message.id == message_id));
+    }
+
+    #[tokio::test]
+    async fn repeated_direct_ack_cannot_confirm_a_new_mutation_by_stale_sequence() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "original durable Direct text")
+            .await
+            .unwrap();
+        let wire = fixture.outbound.recv().await.unwrap();
+        let (_, send) = DirectOutboxClientFixture::decode_send(&wire);
+        let server_message_id =
+            uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00a1).to_string();
+        let server_timestamp = 1_700_000_001_240_000_000u64;
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: server_message_id.clone(),
+                    server_timestamp,
+                    ref_seq: queued.sequence,
+                    client_message_id: Some(send.client_message_id.clone()),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+        assert!(matches!(
+            fixture.client.poll_event().await.unwrap(),
+            Some(ConnectionEvent::MessageAcked { .. })
+        ));
+
+        let mutation_sequence = queued.sequence.checked_add(0x100).unwrap();
+        fixture.client.pending_mutations.insert(
+            mutation_sequence,
+            ConfirmedMutation::Edit {
+                message_id: server_message_id.clone(),
+                conversation_id: fixture.conversation_id.clone(),
+                new_text: "stale ACK must not persist this edit".to_string(),
+            },
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: server_message_id.clone(),
+                    server_timestamp,
+                    ref_seq: mutation_sequence,
+                    client_message_id: Some(send.client_message_id),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+
+        let detail = fixture.client.poll_event().await.unwrap_err();
+        assert!(detail.contains("collides with a non-message live correlation"));
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.client.direct_live_storage_uncertain);
+        let persisted = fixture
+            .client
+            .db()
+            .unwrap()
+            .get_messages(&fixture.conversation_id, 10)
+            .unwrap();
+        assert!(persisted.iter().any(|message| {
+            message.id == server_message_id && message.plaintext == "original durable Direct text"
+        }));
+    }
+
+    #[tokio::test]
+    async fn repeated_direct_error_cannot_alias_a_new_command_sequence() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "definitely rejected Direct text")
+            .await
+            .unwrap();
+        let wire = fixture.outbound.recv().await.unwrap();
+        let (_, send) = DirectOutboxClientFixture::decode_send(&wire);
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        let rejection = || ConnectionEvent::Error {
+            code: 400,
+            message: "invalid Direct payload".to_string(),
+            ref_seq: Some(queued.sequence),
+            client_message_id: Some(send.client_message_id.clone()),
+            reason: Some("invalid_message".to_string()),
+            local_message_id: None,
+            conversation_id: None,
+            stale_roster_context: false,
+        };
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget.try_wrap(rejection()).unwrap()])
+            .unwrap();
+        assert!(matches!(
+            fixture.client.poll_event().await.unwrap(),
+            Some(ConnectionEvent::Error { .. })
+        ));
+
+        let mutation_sequence = queued.sequence.checked_add(0x200).unwrap();
+        fixture.client.pending_mutations.insert(
+            mutation_sequence,
+            ConfirmedMutation::Edit {
+                message_id: send.client_message_id.clone(),
+                conversation_id: fixture.conversation_id.clone(),
+                new_text: "stale error must not select this edit".to_string(),
+            },
+        );
+        let mut repeated = rejection();
+        let ConnectionEvent::Error {
+            ref mut ref_seq, ..
+        } = repeated
+        else {
+            unreachable!()
+        };
+        *ref_seq = Some(mutation_sequence);
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget.try_wrap(repeated).unwrap()])
+            .unwrap();
+
+        let detail = fixture.client.poll_event().await.unwrap_err();
+        assert!(detail.contains("collides with a non-message live correlation"));
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.client.direct_live_storage_uncertain);
+        let persisted = fixture
+            .client
+            .db()
+            .unwrap()
+            .get_messages(&fixture.conversation_id, 10)
+            .unwrap();
+        assert!(persisted.iter().any(|message| {
+            message.id == send.client_message_id
+                && message.plaintext == "definitely rejected Direct text"
+                && message.status == veil_store::models::MessageStatus::Failed
+        }));
+    }
+
+    #[tokio::test]
+    async fn unknown_repeated_direct_ack_is_epoch_invalid_not_storage_uncertain() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "unrelated durable intent")
+            .await
+            .unwrap();
+        fixture.outbound.recv().await.unwrap();
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::MessageAcked {
+                    message_id: uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00b1)
+                        .to_string(),
+                    server_timestamp: 1_700_000_001_241_000_000,
+                    ref_seq: queued.sequence.checked_add(0x300).unwrap(),
+                    client_message_id: Some(
+                        uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00b2)
+                            .to_string(),
+                    ),
+                    local_message_id: None,
+                    mutation: None,
+                    sender_key: None,
+                })
+                .unwrap()])
+            .unwrap();
+
+        let detail = fixture.client.poll_event().await.unwrap_err();
+        assert!(detail.contains("conflicts with its durable receipt"));
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.client.direct_live_storage_uncertain);
+        assert!(fixture.client.db().is_some());
+        assert!(fixture.client.identity.is_some());
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_repeated_direct_error_is_epoch_invalid_not_storage_uncertain() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        let queued = fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "second unrelated durable intent")
+            .await
+            .unwrap();
+        fixture.outbound.recv().await.unwrap();
+        let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
+        let budget = crate::connection::ConnectionEventBudgetV1::with_limits(
+            LIVE_EVENT_QUEUE_CAPACITY,
+            LIVE_EVENT_RETAINED_BYTES,
+        );
+        fixture
+            .client
+            .deferred_connection_events
+            .try_extend(vec![budget
+                .try_wrap(ConnectionEvent::Error {
+                    code: 400,
+                    message: "unknown rejection receipt".to_string(),
+                    ref_seq: Some(queued.sequence.checked_add(0x400).unwrap()),
+                    client_message_id: Some(
+                        uuid::Uuid::from_u128(0x7400_0000_0000_0000_0000_0000_0000_00b3)
+                            .to_string(),
+                    ),
+                    reason: Some("invalid_message".to_string()),
+                    local_message_id: None,
+                    conversation_id: None,
+                    stale_roster_context: false,
+                })
+                .unwrap()])
+            .unwrap();
+
+        let detail = fixture.client.poll_event().await.unwrap_err();
+        assert!(detail.contains("conflicts with its durable receipt"));
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(!fixture.client.direct_live_storage_uncertain);
+        assert!(fixture.client.db().is_some());
+        assert!(fixture.client.identity.is_some());
+        assert_eq!(
+            fixture
+                .client
+                .db()
+                .unwrap()
+                .count_pending_direct_message_outbox_v1(&scope)
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn storage_uncertainty_dominates_transport_and_protocol_stops() {
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        client.record_direct_live_stop_v1(DirectLiveReplayStopV1::RetryableTransport);
+        client.record_direct_live_stop_v1(DirectLiveReplayStopV1::EpochInvalid);
+        client.revoke_after_storage_uncertain_v1();
+        client.record_direct_live_stop_v1(DirectLiveReplayStopV1::RetryableTransport);
+        assert_eq!(
+            client.current_direct_live_stop_v1(),
+            Some(DirectLiveReplayStopV1::StorageUncertain)
+        );
+        assert!(client.direct_live_storage_uncertain);
+    }
+
+    #[test]
+    fn correlated_send_retry_allowlist_has_finite_status_boundaries() {
+        for (code, reason, expected) in [
+            (499, Some("client_error"), false),
+            (500, Some("internal_error"), true),
+            (599, Some("server_error"), true),
+            (600, Some("unknown"), false),
+            (u32::MAX, Some("unknown"), false),
+            (429, Some("rate_limited"), true),
+            (401, Some("not_authenticated"), true),
+            (401, Some("other"), false),
+        ] {
+            assert_eq!(
+                is_retryable_correlated_send_error_v1(code, reason),
+                expected,
+                "unexpected retry classification for code {code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn direct_enqueue_queue_errors_preserve_typed_retry_policy() {
+        let mut timeout = DirectOutboxClientFixture::new();
+        assert_eq!(
+            timeout
+                .client
+                .classify_direct_enqueue_result_v1(&Err(ConnectionSendErrorV1::QueueTimeout,)),
+            Some(DirectLiveReplayStopV1::RetryableTransport)
+        );
+
+        let mut rejected = DirectOutboxClientFixture::new();
+        assert_eq!(
+            rejected.client.classify_direct_enqueue_result_v1(&Err(
+                ConnectionSendErrorV1::Rejected("invalid exact envelope".to_string()),
+            )),
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+
+        let mut untyped_closed = DirectOutboxClientFixture::new();
+        assert_eq!(
+            untyped_closed
+                .client
+                .classify_direct_enqueue_result_v1(&Err(ConnectionSendErrorV1::QueueClosed)),
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+
+        let mut source_typed_closed = DirectOutboxClientFixture::new();
+        source_typed_closed
+            .client
+            .connection
+            .as_ref()
+            .unwrap()
+            .test_only_report_websocket_error_v1(tokio_tungstenite::tungstenite::Error::Protocol(
+                tokio_tungstenite::tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+            ));
+        assert_eq!(
+            source_typed_closed
+                .client
+                .classify_direct_enqueue_result_v1(&Err(ConnectionSendErrorV1::QueueClosed)),
+            Some(DirectLiveReplayStopV1::RetryableTransport)
+        );
+
+        let mut protocol_closed = DirectOutboxClientFixture::new();
+        assert!(protocol_closed
+            .client
+            .test_only_report_epoch_invalid_transport_v1());
+        assert_eq!(
+            protocol_closed
+                .client
+                .classify_direct_enqueue_result_v1(&Err(ConnectionSendErrorV1::QueueClosed)),
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+    }
+
+    #[tokio::test]
+    async fn ack_deadline_delivery_reconciliation_failure_escalates_to_storage_uncertain() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        fixture
+            .client
+            .enqueue_direct_text_v1(&fixture.conversation_id, "durable deadline intent")
+            .await
+            .unwrap();
+        fixture.outbound.recv().await.unwrap();
+
+        // Add one legacy correlation so transport-loss reconciliation must
+        // execute a fallible SQLCipher status transition in the same batch.
+        let legacy_id = uuid::Uuid::new_v4().to_string();
+        let self_identity_key = fixture.client.identity_key().unwrap();
+        fixture
+            .client
+            .db()
+            .unwrap()
+            .insert_outgoing_pending_message(
+                &legacy_id,
+                &fixture.conversation_id,
+                &self_identity_key,
+                "legacy correlation",
+                None,
+            )
+            .unwrap();
+        fixture.client.pending_outgoing_messages.insert(
+            0xA11,
+            PendingOutgoingMessage {
+                local_message_id: legacy_id,
+                conversation_id: fixture.conversation_id.clone(),
+                sender_identity_key: self_identity_key,
+                plaintext: "legacy correlation".to_string(),
+                durable_direct_outbox: false,
+                direct_ack_deadline: None,
+            },
+        );
+        fixture
+            .client
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch(
+                "CREATE TRIGGER reject_deadline_delivery_state
+                 BEFORE UPDATE OF status ON messages
+                 BEGIN SELECT RAISE(FAIL, 'forced ACK deadline reconciliation failure'); END;",
+            )
+            .unwrap();
+
+        assert_eq!(fixture.client.test_only_expire_direct_ack_deadlines_v1(), 1);
+        let error = fixture
+            .client
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap_err();
+        assert_eq!(error.stop, DirectLiveReplayStopV1::StorageUncertain);
+        assert!(fixture.client.direct_live_storage_uncertain);
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::StorageUncertain)
+        );
+        assert!(fixture.client.connection.is_none());
+        assert!(fixture.client.db().is_none());
+        assert!(fixture.client.identity.is_none());
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
+    }
+
+    #[tokio::test]
     async fn direct_outbox_error_keeps_retryable_bytes_and_compacts_definite_rejection() {
         let mut retryable = DirectOutboxClientFixture::new();
         let queued = retryable
@@ -10738,6 +13182,19 @@ mod tests {
         assert!(retryable.client.authenticated_user_id.is_none());
         assert!(retryable.client.authenticated_server_origin.is_none());
         assert!(retryable.client.pending_outgoing_messages.is_empty());
+        assert_eq!(
+            retryable.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::RetryableTransport)
+        );
+        assert_eq!(
+            retryable
+                .client
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap_err()
+                .stop,
+            DirectLiveReplayStopV1::RetryableTransport
+        );
         assert_eq!(
             retryable
                 .client
@@ -10843,7 +13300,12 @@ mod tests {
             .await
             .unwrap();
         assert!(!queued.transport_enqueued);
+        assert_eq!(
+            queued.transport_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
         assert!(queued.sequence > 0);
+        assert!(!fixture.client.is_connected());
         assert!(fixture.client.pending_outgoing_messages.is_empty());
         let scope = fixture.client.current_direct_outbox_scope_v1().unwrap();
         let pending = fixture
@@ -10913,7 +13375,9 @@ mod tests {
                     .session_data
             )
             .unwrap());
-
+        // Model a newly authenticated socket epoch. Production connect resets
+        // the typed stop only after its full pre-install reconciliation.
+        fixture.client.direct_live_stop = None;
         fixture.outbound = fixture.client.test_only_install_queued_connection();
         let replay = fixture
             .client
@@ -11105,16 +13569,16 @@ mod tests {
         fixture.client.mark_all_pending_sequences_unknown().unwrap();
         fixture.outbound = fixture.client.test_only_install_queued_connection();
         fixture.outbound.close();
-        let blocked = fixture
+        let error = fixture
             .client
             .replay_direct_outbox_v1(None, 1)
             .await
-            .unwrap();
-        assert_eq!(blocked.visited, 1);
-        assert_eq!(blocked.enqueued, 0);
-        assert_eq!(blocked.next_queue_order, None);
-        assert!(blocked.transport_blocked);
-        assert!(!blocked.reached_end);
+            .unwrap_err();
+        assert!(matches!(error, DirectSendErrorV1::Rejected(_)));
+        assert_eq!(
+            fixture.client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
     }
 
     #[tokio::test]
@@ -11693,6 +14157,7 @@ mod tests {
                     sender_identity_key: fixture.receiver_identity_key,
                     plaintext: plaintext.to_string(),
                     durable_direct_outbox: false,
+                    direct_ack_deadline: None,
                 },
             );
         }
@@ -11799,7 +14264,7 @@ mod tests {
             )
             .unwrap();
         fixture.enqueue(vec![ConnectionEvent::MessageAcked {
-            message_id: uuid::Uuid::new_v4().to_string(),
+            message_id: message_id.clone(),
             server_timestamp: 1_700_000_000_000_000_000,
             ref_seq: 0xB1,
             client_message_id: None,
@@ -11880,7 +14345,7 @@ mod tests {
             )
             .unwrap();
         fixture.enqueue(vec![ConnectionEvent::MessageAcked {
-            message_id: uuid::Uuid::new_v4().to_string(),
+            message_id: message_id.clone(),
             server_timestamp: 1_700_000_000_000_000_000,
             ref_seq: sequence,
             client_message_id: None,
@@ -12249,6 +14714,7 @@ mod tests {
                 sender_identity_key: fixture.receiver_identity_key,
                 plaintext: "ambiguous reconnect draft".to_string(),
                 durable_direct_outbox: false,
+                direct_ack_deadline: None,
             },
         );
         fixture
@@ -12296,7 +14762,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert_eq!(error.stop, DirectLiveReplayStopV1::TransportTerminal);
+        assert_eq!(error.stop, DirectLiveReplayStopV1::RetryableTransport);
         assert_eq!(
             error.report,
             DirectLiveReplayReportV1 {
@@ -12316,6 +14782,98 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn direct_live_buffer_and_protocol_failures_are_epoch_invalid() {
+        for failure in [
+            ConnectionEventBufferErrorV1::EventCountLimitExceeded { limit: 1 },
+            ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "test authenticated envelope",
+            },
+        ] {
+            let mut fixture = DirectLiveReplayFixture::new();
+            fixture
+                .receiver
+                .deferred_connection_events
+                .fail(failure.clone());
+
+            let error = fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap_err();
+            assert_eq!(error.stop, DirectLiveReplayStopV1::EpochInvalid);
+            assert_eq!(error.report, DirectLiveReplayReportV1::default());
+            assert_eq!(
+                fixture
+                    .receiver
+                    .replay_direct_live_events_v1()
+                    .await
+                    .unwrap_err()
+                    .stop,
+                DirectLiveReplayStopV1::EpochInvalid
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn post_auth_websocket_protocol_terminal_never_becomes_retryable_in_api() {
+        let mut fixture = DirectLiveReplayFixture::new();
+        let _outbound = fixture.receiver.test_only_install_queued_connection();
+        fixture
+            .receiver
+            .connection
+            .as_ref()
+            .unwrap()
+            .test_only_report_websocket_error_v1(tokio_tungstenite::tungstenite::Error::Capacity(
+                tokio_tungstenite::tungstenite::error::CapacityError::MessageTooLong {
+                    size: 2,
+                    max_size: 1,
+                },
+            ));
+
+        let error = fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap_err();
+        assert_eq!(error.stop, DirectLiveReplayStopV1::EpochInvalid);
+        assert_ne!(error.stop, DirectLiveReplayStopV1::RetryableTransport);
+        assert!(!fixture.receiver.direct_live_storage_uncertain);
+        assert_eq!(
+            fixture.receiver.direct_live_stop,
+            Some(DirectLiveReplayStopV1::EpochInvalid)
+        );
+        assert!(fixture.receiver.connection.is_none());
+    }
+
+    #[tokio::test]
+    async fn already_reported_protocol_terminal_rejects_direct_intent_before_sqlcipher_commit() {
+        let mut fixture = DirectOutboxClientFixture::new();
+        assert!(fixture.client.test_only_report_epoch_invalid_transport_v1());
+        assert!(!fixture.client.is_connected());
+
+        assert!(matches!(
+            fixture
+                .client
+                .enqueue_direct_text_v1(&fixture.conversation_id, "must not be accepted")
+                .await,
+            Err(DirectSendErrorV1::Rejected(_))
+        ));
+        let pending_count: i64 = fixture
+            .client
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1 WHERE state = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 0);
+        assert!(fixture.client.pending_outgoing_messages.is_empty());
     }
 
     #[tokio::test]
@@ -12559,6 +15117,7 @@ mod tests {
                 sender_identity_key: fixture.receiver_identity_key,
                 plaintext: "pending plaintext must be erased".to_string(),
                 durable_direct_outbox: false,
+                direct_ack_deadline: None,
             },
         );
         fixture.receiver.pending_mutations.insert(
@@ -13064,7 +15623,7 @@ mod tests {
             .replay_direct_live_events_v1()
             .await
             .unwrap_err();
-        assert_eq!(error.stop, DirectLiveReplayStopV1::TransportTerminal);
+        assert_eq!(error.stop, DirectLiveReplayStopV1::EpochInvalid);
         assert_eq!(error.report.consumed, 1);
         assert!(!error.report.quiescent);
         assert_eq!(error.report.stored, 0);
@@ -13079,7 +15638,7 @@ mod tests {
             .replay_direct_live_events_v1()
             .await
             .unwrap_err();
-        assert_eq!(sticky.stop, DirectLiveReplayStopV1::TransportTerminal);
+        assert_eq!(sticky.stop, DirectLiveReplayStopV1::EpochInvalid);
         assert_eq!(sticky.report, DirectLiveReplayReportV1::default());
     }
 
@@ -15223,6 +17782,7 @@ mod tests {
                 sender_identity_key: our_identity,
                 plaintext: "do not lose this".to_string(),
                 durable_direct_outbox: false,
+                direct_ack_deadline: None,
             },
         );
 
@@ -15266,6 +17826,7 @@ mod tests {
                 sender_identity_key: our_identity,
                 plaintext: "may already be delivered".to_string(),
                 durable_direct_outbox: false,
+                direct_ack_deadline: None,
             },
         );
 
@@ -15318,6 +17879,7 @@ mod tests {
                     sender_identity_key: our_identity,
                     plaintext: plaintext.to_string(),
                     durable_direct_outbox: false,
+                    direct_ack_deadline: None,
                 },
             );
         }
@@ -15339,6 +17901,10 @@ mod tests {
             client.poll_event().await.unwrap(),
             Some(ConnectionEvent::Disconnected { .. })
         ));
+        assert_eq!(
+            client.direct_live_stop,
+            Some(DirectLiveReplayStopV1::RetryableTransport)
+        );
         assert!(client.pending_outgoing_messages.is_empty());
         let messages = client
             .db()
@@ -15505,6 +18071,7 @@ mod tests {
                 sender_identity_key: our_key,
                 plaintext: "hello".to_string(),
                 durable_direct_outbox: false,
+                direct_ack_deadline: None,
             },
         );
 

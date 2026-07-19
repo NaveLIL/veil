@@ -162,6 +162,25 @@ pub struct DirectMessageOutboxRejectResultV1 {
     pub already_rejected: bool,
 }
 
+/// Read-only durable state used by the authenticated client to distinguish a
+/// harmless repeated receipt from an unknown or conflicting wire result
+/// before any ACK/Error reconciliation mutates SQLCipher or process memory.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
+pub enum DirectMessageOutboxReceiptV1 {
+    Pending {
+        local_message_id: String,
+    },
+    Acknowledged {
+        local_message_id: String,
+        server_message_id: String,
+        server_timestamp_ms: i64,
+    },
+    Rejected {
+        local_message_id: String,
+        rejection_reason: String,
+    },
+}
+
 /// Serialized ratchet state and the CAS revision that protects its next write.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct RatchetSessionWithRevisionV1 {
@@ -5030,6 +5049,83 @@ impl VeilDb {
         tx.commit()
             .map_err(|error| format!("commit Direct outbox count transaction: {error}"))?;
         Ok(count)
+    }
+
+    /// Load and fully validate one durable receipt without changing it.
+    /// `Ok(None)` is an authoritative absence, while `Err` means the
+    /// SQLCipher read or its persisted invariants could not be trusted.
+    pub fn load_direct_message_outbox_receipt_v1(
+        &self,
+        scope: &DirectMessageOutboxScopeV1,
+        client_message_id: &str,
+    ) -> Result<Option<DirectMessageOutboxReceiptV1>, String> {
+        validate_direct_message_outbox_scope_v1(scope)?;
+        validate_canonical_uuid("Direct outbox receipt client message id", client_message_id)?;
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Deferred)
+            .map_err(|error| format!("begin Direct outbox receipt read: {error}"))?;
+        let self_binding = require_current_direct_outbox_self_v1(&tx, scope)?;
+        let sql = format!(
+            "SELECT {DIRECT_MESSAGE_OUTBOX_SELECT_V1}
+             FROM direct_message_outbox_v1
+             WHERE client_message_id = ?1
+               AND canonical_server_origin = ?2
+               AND user_id = ?3 AND device_id = ?4"
+        );
+        let Some(row) = tx
+            .query_row(
+                &sql,
+                rusqlite::params![
+                    client_message_id,
+                    &scope.canonical_server_origin,
+                    &scope.user_id,
+                    scope.device_id.as_slice(),
+                ],
+                stored_direct_message_outbox_row_v1,
+            )
+            .optional()
+            .map_err(|error| format!("load Direct outbox receipt row: {error}"))?
+        else {
+            tx.commit()
+                .map_err(|error| format!("commit empty Direct outbox receipt read: {error}"))?;
+            return Ok(None);
+        };
+        let route = if row.state == 0 {
+            Some(resolve_current_direct_outbox_route_v1(
+                &tx,
+                scope,
+                &self_binding,
+                &row.conversation_id,
+            )?)
+        } else {
+            None
+        };
+        validate_stored_direct_outbox_row_v1(&row, scope, route.as_ref())?;
+        let receipt = match row.state {
+            0 => DirectMessageOutboxReceiptV1::Pending {
+                local_message_id: row.local_message_id.clone(),
+            },
+            1 => DirectMessageOutboxReceiptV1::Acknowledged {
+                local_message_id: row.local_message_id.clone(),
+                server_message_id: row
+                    .server_message_id
+                    .clone()
+                    .expect("validated acknowledged receipt has a server message id"),
+                server_timestamp_ms: row
+                    .server_timestamp_ms
+                    .expect("validated acknowledged receipt has a server timestamp"),
+            },
+            2 => DirectMessageOutboxReceiptV1::Rejected {
+                local_message_id: row.local_message_id.clone(),
+                rejection_reason: row
+                    .rejection_reason
+                    .clone()
+                    .expect("validated rejected receipt has a stable reason"),
+            },
+            _ => unreachable!("validated Direct outbox receipt state"),
+        };
+        tx.commit()
+            .map_err(|error| format!("commit Direct outbox receipt read: {error}"))?;
+        Ok(Some(receipt))
     }
 
     /// Commit the authoritative ACK result and erase retry bytes atomically.
@@ -13236,6 +13332,51 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
+    #[test]
+    fn direct_outbox_receipt_loader_never_aliases_a_foreign_scope_uuid() {
+        let db = VeilDb::open_memory(&[0xD8; 32]).unwrap();
+        let fixture = install_direct_outbox_fixture(&db);
+        let input = direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, b"scope-isolated receipt", 0);
+        db.enqueue_direct_message_outbox_v1(&input).unwrap();
+        assert!(matches!(
+            db.load_direct_message_outbox_receipt_v1(&fixture.scope, DIRECT_CLIENT_ID_1)
+                .unwrap(),
+            Some(DirectMessageOutboxReceiptV1::Pending {
+                ref local_message_id,
+            })
+                if local_message_id == DIRECT_CLIENT_ID_1
+        ));
+
+        db.conn
+            .execute(
+                "UPDATE direct_message_outbox_v1 SET device_id = ?1
+                 WHERE client_message_id = ?2",
+                rusqlite::params![[0x76_u8; 16].as_slice(), DIRECT_CLIENT_ID_1],
+            )
+            .unwrap();
+        assert!(db
+            .load_direct_message_outbox_receipt_v1(&fixture.scope, DIRECT_CLIENT_ID_1)
+            .unwrap()
+            .is_none());
+
+        db.conn
+            .execute(
+                "UPDATE direct_message_outbox_v1
+                 SET device_id = ?1, canonical_server_origin = ?2
+                 WHERE client_message_id = ?3",
+                rusqlite::params![
+                    fixture.scope.device_id.as_slice(),
+                    ORIGIN_B,
+                    DIRECT_CLIENT_ID_1
+                ],
+            )
+            .unwrap();
+        assert!(db
+            .load_direct_message_outbox_receipt_v1(&fixture.scope, DIRECT_CLIENT_ID_1)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
