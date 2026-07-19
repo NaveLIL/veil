@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect } from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -15,12 +15,14 @@ import { SecureRuntimeGate } from "./src/components/runtime/SecureRuntimeGate";
 import { useReducedMotionPreference } from "./src/hooks/useReducedMotionPreference";
 import { useVeilRuntimeLifecycle } from "./src/hooks/useVeilRuntimeLifecycle";
 import { colors, radii, spacing } from "./src/lib/theme";
+import { setAuthenticatedContentReady } from "./src/native/screenCapture";
 import ChatListScreen from "./src/screens/ChatListScreen";
 import OnboardingScreen from "./src/screens/OnboardingScreen";
 import {
   canRenderChat,
   useRuntimeGateStore,
 } from "./src/stores/runtime";
+import { useMobileSettingsStore } from "./src/stores/settings";
 
 export default function App() {
   const runtime = useVeilRuntimeLifecycle();
@@ -31,8 +33,25 @@ export default function App() {
   const requiresExplicitReopen = useRuntimeGateStore((state) => state.requiresExplicitReopen);
   const operation = useRuntimeGateStore((state) => state.operation);
   const publicError = useRuntimeGateStore((state) => state.publicError);
+  const allowReadyScreenshots = useMobileSettingsStore(
+    (state) => state.allowReadyScreenshots,
+  );
 
   const chatReady = canRenderChat(snapshot, requiresExplicitReopen);
+  const captureReady = phase === "ready"
+    && chatReady
+    && !curtainVisible
+    && operation === null
+    && allowReadyScreenshots;
+
+  useEffect(() => {
+    // Native owns the actual policy. In release, a renderer request can never
+    // clear FLAG_SECURE; debug builds allow only this fully verified Ready UI.
+    void setAuthenticatedContentReady(captureReady);
+    return () => {
+      void setAuthenticatedContentReady(false);
+    };
+  }, [captureReady]);
 
   let content: React.ReactNode;
   if (phase === "bootstrapping" || phase === "privacy") {

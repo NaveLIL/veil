@@ -119,8 +119,14 @@ android {
         }
     }
     buildTypes {
-        debug {}
+        debug {
+            // Visual-feedback builds may capture only the fully authenticated
+            // ready shell. MainActivity still starts secure and re-secures on
+            // pause; RecoveryActivity and Recents are never downgraded.
+            buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "true"
+        }
         release {
+            buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "false"
             if (releaseSigningConfigured) {
                 signingConfig signingConfigs.release
             }

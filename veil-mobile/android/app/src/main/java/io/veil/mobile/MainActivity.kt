@@ -13,8 +13,13 @@ import com.facebook.react.defaults.DefaultReactActivityDelegate
 import expo.modules.ReactActivityDelegateWrapper
 
 class MainActivity : ReactActivity() {
+  private val readyScreenCaptureGate = ReadyScreenCaptureGate()
+
+  @Volatile
+  private var publishedReadyScreenCaptureGeneration = 0L
+
   override fun onCreate(savedInstanceState: Bundle?) {
-    consumeEnrollmentIntent(intent)
+    revokeReadyScreenCaptureEligibility()
     // Set the theme to AppTheme BEFORE onCreate to support
     // coloring the background, status bar, and navigation bar.
     // This is required for expo-splash-screen.
@@ -24,6 +29,9 @@ class MainActivity : ReactActivity() {
     // A future user-facing screenshot preference must preserve recovery and
     // task-switcher protection as separate non-optional boundaries.
     window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    // No enrollment capability is parsed until the receiving window is
+    // non-capturable, including the process' first Activity launch.
+    consumeEnrollmentIntent(intent)
     super.onCreate(null)
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
       setRecentsScreenshotEnabled(false)
@@ -31,9 +39,38 @@ class MainActivity : ReactActivity() {
   }
 
   override fun onNewIntent(intent: Intent) {
+    revokeReadyScreenCaptureEligibility()
+    // Enrollment must become non-capturable before any new capability is
+    // consumed or reflected into the React runtime.
+    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
     consumeEnrollmentIntent(intent)
     super.onNewIntent(intent)
     setIntent(intent)
+  }
+
+  override fun onResume() {
+    super.onResume()
+    publishedReadyScreenCaptureGeneration = readyScreenCaptureGate.grantForeground()
+  }
+
+  override fun onPause() {
+    revokeReadyScreenCaptureEligibility()
+    // Re-apply before Android is allowed to snapshot or background the task.
+    // A ready debug shell may explicitly clear this again after foreground
+    // runtime verification; Recents itself remains permanently disabled.
+    window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+    super.onPause()
+  }
+
+  internal fun captureReadyScreenCaptureGeneration(): Long =
+    publishedReadyScreenCaptureGeneration
+
+  /** Must be called on the Activity main thread. */
+  internal fun acceptsReadyScreenCaptureGeneration(expectedGeneration: Long): Boolean =
+    readyScreenCaptureGate.accepts(expectedGeneration)
+
+  private fun revokeReadyScreenCaptureEligibility() {
+    publishedReadyScreenCaptureGeneration = readyScreenCaptureGate.revoke()
   }
 
   /**
@@ -94,4 +131,32 @@ class MainActivity : ReactActivity() {
       // because it's doing more than [Activity.moveTaskToBack] in fact.
       super.invokeDefaultOnBackPressed()
   }
+}
+
+/**
+ * Main-thread state machine for the debug-only Ready capture exception.
+ *
+ * A generation is invalidated before every sensitive/background transition and
+ * a fresh generation is granted only after the Activity resumes. A clear
+ * request posted before a transition therefore cannot become valid again after
+ * a later resume.
+ */
+internal class ReadyScreenCaptureGate {
+  private var generation = 0L
+  private var foregroundEligible = false
+
+  fun revoke(): Long {
+    foregroundEligible = false
+    generation += 1
+    return generation
+  }
+
+  fun grantForeground(): Long {
+    foregroundEligible = true
+    generation += 1
+    return generation
+  }
+
+  fun accepts(expectedGeneration: Long): Boolean =
+    foregroundEligible && expectedGeneration == generation
 }

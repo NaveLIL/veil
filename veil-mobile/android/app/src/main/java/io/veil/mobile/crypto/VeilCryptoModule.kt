@@ -6,6 +6,8 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.LifecycleEventListener
 import android.view.WindowManager
+import io.veil.mobile.BuildConfig
+import io.veil.mobile.MainActivity
 import uniffi.veil_ffi.VeilIdentity
 
 class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaModule(context), LifecycleEventListener {
@@ -37,18 +39,39 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
   }
 
   @ReactMethod
-  fun setSensitiveScreen(_enabled: Boolean, promise: Promise) {
+  fun setSensitiveScreen(enabled: Boolean, promise: Promise) {
     val activity = currentActivity
     if (activity == null) {
       promise.reject("E_VEIL_WINDOW", "current activity is unavailable")
       return
     }
+    val trustedReadyActivity = if (activity.javaClass == MainActivity::class.java) {
+      activity as MainActivity
+    } else {
+      null
+    }
+    val expectedGeneration = trustedReadyActivity?.captureReadyScreenCaptureGeneration()
     activity.runOnUiThread {
       try {
-        // FLAG_SECURE is Activity-wide for the closed preview. The legacy
-        // recovery UI may request stronger protection, but its cleanup must
-        // never downgrade the global task/screenshot boundary.
-        activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        val isCurrentTrustedReadyActivity = trustedReadyActivity != null &&
+          currentActivity === trustedReadyActivity
+        val foregroundGenerationCurrent = expectedGeneration != null &&
+          trustedReadyActivity?.acceptsReadyScreenCaptureGeneration(expectedGeneration) == true
+        if (ReadyScreenCapturePolicy.mayClearProtection(
+            protectionRequested = enabled,
+            buildAllowsCapture = BuildConfig.ALLOW_READY_SCREEN_CAPTURE,
+            isTrustedReadyActivity = isCurrentTrustedReadyActivity,
+            foregroundGenerationCurrent = foregroundGenerationCurrent,
+          )) {
+          // Compile-time debug exception for the already authenticated Ready
+          // shell. Release builds cannot reach this downgrade even if renderer
+          // code is modified. Only the exact MainActivity class is eligible;
+          // RecoveryActivity and dependency Activities stay secure regardless
+          // of renderer input. MainActivity re-secures before pause/new intent.
+          activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        } else {
+          activity.window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        }
         promise.resolve(true)
       } catch (_: Throwable) {
         promise.reject("E_VEIL_WINDOW", "Unable to update sensitive screen protection")
@@ -111,6 +134,18 @@ class VeilCryptoModule(context: ReactApplicationContext) : ReactContextBaseJavaM
       promise.reject("E_VEIL_CRYPTO", "Native cryptographic operation failed")
     }
   }
+}
+
+internal object ReadyScreenCapturePolicy {
+  fun mayClearProtection(
+    protectionRequested: Boolean,
+    buildAllowsCapture: Boolean,
+    isTrustedReadyActivity: Boolean,
+    foregroundGenerationCurrent: Boolean,
+  ): Boolean = !protectionRequested &&
+    buildAllowsCapture &&
+    isTrustedReadyActivity &&
+    foregroundGenerationCurrent
 }
 
 private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
