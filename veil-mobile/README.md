@@ -59,9 +59,9 @@ any value is missing.
   private signing key, ratchet state, database key, or a raw signing/AEAD oracle.
 - Node Access Pass registration, the authenticated WebSocket generation,
   per-device prekey publication, the origin-bound Direct directory, and
-  immutable legacy Direct-text history are owned by Rust/Kotlin. JavaScript sees
-  only coarse `publishing_keys`, `syncing_directory`, `syncing_history`, and
-  `history_synchronized` progress.
+  immutable legacy Direct-text history are owned by Rust/Kotlin. Idempotent text
+  send/outbox mutation and its delivery state also stay behind that boundary.
+  JavaScript sees only bounded public projections and coarse sync progress.
 - History uses one native-owned HTTP capability at a time, a deterministic UUID
   order, a 4 MiB response ceiling, and a single in-memory conversation state.
   Unsupported or incomplete history blocks only that Direct conversation;
@@ -77,11 +77,17 @@ any value is missing.
   an idle authenticated generation polls every 250 ms. Only a native aggregate
   content revision can refresh the conversation the user explicitly selected;
   ordinary snapshot reads never trigger another plaintext projection.
+- Only typed native `Transport` and `AckDeadline` failures may create one
+  account/origin/session-scoped reconnect plan. It uses full-jitter exponential
+  backoff capped at 60 seconds, never retains or replays a Node Access Pass, is
+  cancelled by background/lock/manual lifecycle actions, and resets only after
+  a new `Ready` plus durable outbox barrier. Protocol, authentication, storage,
+  and accepted-session-invalid failures remain terminal.
 - UnifiedPush still accepts only decrypted 2048-byte generic wake records.
 
 This remains a closed Direct Preview, not a tester release or production-ready
 mobile messenger. Authenticated Direct directory/history, bounded live receive,
-and a read-only real-message UI are present. Native per-conversation prekey
-readiness, guarded send/outbox UI, polished reconnect, push publication,
-Circle/Space/attachments, signed standalone APK distribution, and physical-device
-tests remain gated.
+native projection, per-conversation prekey establishment, guarded send/outbox,
+and typed transient reconnect are present. Canonical-origin process-death
+recovery, push publication, Circle/Space/attachments, correct multi-device,
+signed standalone APK distribution, and physical-device tests remain gated.
