@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AccessibilityInfo, Animated, BackHandler, findNodeHandle, Modal, Pressable, ScrollView, StyleSheet, Text, useWindowDimensions, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { ChevronLeft, X } from "lucide-react-native";
 import type { Member } from "../../stores/chat";
 import { colors, radii, spacing } from "../../lib/theme";
 import { UserAvatar } from "./UserAvatar";
@@ -142,14 +143,55 @@ export const IdentityIslandSheet: React.FC<Props> = ({ profile, contextLabel, re
         <Pressable accessibilityRole="button" accessibilityLabel="Close identity" style={StyleSheet.absoluteFill} onPress={requestClose}>
           <Animated.View style={[StyleSheet.absoluteFill, styles.scrim, { opacity: progress }]} />
         </Pressable>
-        <Animated.View style={[styles.sheet, { paddingBottom: Math.max(insets.bottom, spacing.md), transform: [{ translateY: progress.interpolate({ inputRange: [0, 1], outputRange: [Math.max(windowHeight, 1), 0] }) }] }]}>
+        <Animated.View
+          testID="identity-sheet-surface"
+          style={[styles.sheet, { paddingBottom: insets.bottom + spacing.md, transform: [{ translateY: progress.interpolate({ inputRange: [0, 1], outputRange: [Math.max(windowHeight, 1), 0] }) }] }]}
+        >
           <View style={styles.handle} />
-          <View style={styles.header}>
-            <Pressable accessibilityRole="button" onPress={requestClose} hitSlop={12}><Text style={styles.back}>‹ {returnLabel}</Text></Pressable>
+          <View
+            testID="identity-sheet-header"
+            style={[
+              styles.header,
+              {
+                paddingLeft: Math.max(spacing.lg, insets.left),
+                paddingRight: Math.max(spacing.lg, insets.right),
+              },
+            ]}
+          >
+            <Pressable
+              accessibilityRole="button"
+              accessibilityLabel={`Back to ${returnLabel}`}
+              onPress={requestClose}
+              hitSlop={8}
+              style={styles.headerSide}
+            >
+              <ChevronLeft size={17} strokeWidth={2.2} color={colors.primaryHi} />
+              <Text numberOfLines={1} style={styles.back}>{returnLabel}</Text>
+            </Pressable>
             <Text accessibilityRole="header" style={styles.headerTitle}>Identity</Text>
-            <Pressable ref={closeButtonRef} focusable accessibilityRole="button" accessibilityLabel="Close" onPress={requestClose} hitSlop={12}><Text style={styles.close}>×</Text></Pressable>
+            <Pressable
+              ref={closeButtonRef}
+              focusable
+              accessibilityRole="button"
+              accessibilityLabel="Close"
+              onPress={requestClose}
+              hitSlop={8}
+              style={[styles.headerSide, styles.headerSideEnd]}
+            >
+              <X size={21} strokeWidth={2} color={colors.textMd} />
+            </Pressable>
           </View>
-          <ScrollView contentContainerStyle={styles.content} showsVerticalScrollIndicator={false}>
+          <ScrollView
+            testID="identity-sheet-content"
+            contentContainerStyle={[
+              styles.content,
+              {
+                paddingLeft: Math.max(spacing.md, insets.left),
+                paddingRight: Math.max(spacing.md, insets.right),
+              },
+            ]}
+            showsVerticalScrollIndicator={false}
+          >
             <View style={styles.section}>
               <Text accessibilityRole="header" style={styles.sectionTitle}>Person</Text>
               <View style={styles.person}>
@@ -199,12 +241,15 @@ const styles = StyleSheet.create({
   sheet: { maxHeight: "88%", backgroundColor: "#192735", borderTopLeftRadius: 26, borderTopRightRadius: 26, borderWidth: StyleSheet.hairlineWidth, borderColor: "rgba(124,107,245,0.3)", overflow: "hidden" },
   handle: { width: 42, height: 4, borderRadius: 2, backgroundColor: colors.textXLo, alignSelf: "center", marginTop: 8 },
   header: { height: 52, paddingHorizontal: spacing.lg, flexDirection: "row", alignItems: "center", justifyContent: "space-between", borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: colors.border },
-  back: { color: colors.primaryHi, fontSize: 13 }, headerTitle: { color: colors.textHi, fontWeight: "800", letterSpacing: 1.4, textTransform: "uppercase", fontSize: 12 }, close: { color: colors.textMd, fontSize: 24 },
+  headerSide: { width: 92, minHeight: 44, flexDirection: "row", alignItems: "center", gap: 2 },
+  headerSideEnd: { justifyContent: "flex-end" },
+  back: { flexShrink: 1, color: colors.primaryHi, fontSize: 13 },
+  headerTitle: { flex: 1, color: colors.textHi, fontWeight: "800", letterSpacing: 1.4, textTransform: "uppercase", textAlign: "center", fontSize: 12 },
   content: { padding: spacing.md, gap: spacing.md }, section: { padding: spacing.md, borderRadius: radii.lg, borderWidth: StyleSheet.hairlineWidth, borderColor: colors.border, backgroundColor: "rgba(255,255,255,0.025)" },
   sectionTitle: { color: colors.textLo, fontSize: 10, fontWeight: "800", letterSpacing: 1.5, textTransform: "uppercase", marginBottom: spacing.md }, person: { alignItems: "center" }, name: { color: colors.textHi, fontSize: 18, fontWeight: "800", marginTop: 10 }, username: { color: colors.textLo, fontSize: 12, marginTop: 2 }, about: { color: colors.textMd, fontSize: 13, lineHeight: 19, textAlign: "center", marginTop: 10 },
   profilePrivacy: { color: colors.textLo, fontSize: 10, lineHeight: 15, textAlign: "center", marginTop: 10 },
   detail: { marginTop: 8 }, detailLabel: { color: colors.textLo, fontSize: 10 }, detailValue: { color: colors.textHi, fontSize: 12, marginTop: 3 }, mono: { fontFamily: "monospace", fontSize: 11 },
   role: { alignSelf: "flex-start", marginTop: 12, paddingHorizontal: 9, paddingVertical: 4, borderRadius: radii.pill, borderWidth: 1, borderColor: colors.warningBorder, backgroundColor: colors.warningBg }, roleText: { color: colors.warning, fontSize: 10, textTransform: "uppercase", fontWeight: "800" },
   proofTitle: { color: colors.warning, fontSize: 14, fontWeight: "800" }, proofUnavailable: { color: "#f87171", fontSize: 14, fontWeight: "800" }, note: { color: colors.textLo, fontSize: 11, lineHeight: 17, marginTop: 8 },
-  message: { height: 46, borderRadius: radii.lg, backgroundColor: colors.primary, alignItems: "center", justifyContent: "center" }, messageText: { color: "white", fontSize: 14, fontWeight: "800" },
+  message: { minHeight: 48, borderRadius: radii.lg, backgroundColor: colors.primary, alignItems: "center", justifyContent: "center" }, messageText: { color: "white", fontSize: 14, fontWeight: "800" },
 });

@@ -53,6 +53,10 @@ describe("SecureRuntimeGate", () => {
   it("shows a polished explicit unlock action for an existing locked identity", () => {
     const { getByTestId, getByText, onUnlock } = renderGate();
 
+    expect(
+      getByTestId("runtime-brand-phase-shift-mark", { includeHiddenElements: true }),
+    ).toBeTruthy();
+    expect(() => getByText("V")).toThrow();
     expect(getByText("Local account locked")).toBeTruthy();
     fireEvent.press(getByTestId("unlock-account"));
     expect(onUnlock).toHaveBeenCalledTimes(1);
@@ -72,6 +76,9 @@ describe("SecureRuntimeGate", () => {
     };
     const view = renderGate(snapshot, { onUsePendingAccessPass, onDiscardPendingAccessPass });
 
+    expect(
+      view.getByTestId("runtime-brand-phase-shift-mark", { includeHiddenElements: true }),
+    ).toBeTruthy();
     expect(view.getByTestId("access-pass-origin").props.children).toBe("https://veil.erez.pro:443");
     expect(view.getByTestId("access-pass-reference").props.children).toBe("1a2b3c4d5e6f");
     expect(view.getByTestId("access-pass-ttl").props.children).toBe("2m 05s");

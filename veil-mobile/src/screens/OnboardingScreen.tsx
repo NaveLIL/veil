@@ -11,8 +11,14 @@ import {
 } from "react-native";
 import { LinearGradient } from "expo-linear-gradient";
 import { SafeAreaView } from "react-native-safe-area-context";
-import Svg, { Path, Rect } from "react-native-svg";
+import {
+  ChevronRight,
+  Plus,
+  RotateCcw,
+  type LucideIcon,
+} from "lucide-react-native";
 
+import { PhaseShiftMark } from "../components/brand/PhaseShiftMark";
 import { colors, radii, spacing } from "../lib/theme";
 import {
   beginNativeIdentitySetup,
@@ -162,7 +168,13 @@ export default function OnboardingScreen({
             style={[styles.content, animatedStyle]}
           >
             <View style={styles.brandBlock}>
-              <PhaseShiftMark />
+              <View style={styles.markFrame}>
+                <PhaseShiftMark
+                  size={64}
+                  label="Veil Phase Shift mark"
+                  testID="brand-phase-shift-mark"
+                />
+              </View>
               <Text accessibilityRole="header" style={styles.brandName}>
                 VEIL
               </Text>
@@ -208,7 +220,7 @@ export default function OnboardingScreen({
                   testID="identity-setup-create"
                   title="Create identity"
                   description="Start with a new device-local identity"
-                  marker="+"
+                  icon={Plus}
                   variant="primary"
                   loading={activeMode === "create"}
                   disabled={setupDisabled}
@@ -218,7 +230,7 @@ export default function OnboardingScreen({
                   testID="identity-setup-restore"
                   title="Restore identity"
                   description="Recover an identity you already control"
-                  marker="↙"
+                  icon={RotateCcw}
                   variant="secondary"
                   loading={activeMode === "restore"}
                   disabled={setupDisabled}
@@ -247,28 +259,6 @@ export default function OnboardingScreen({
   );
 }
 
-function PhaseShiftMark() {
-  return (
-    <View style={styles.markFrame}>
-      <Svg
-        testID="brand-phase-shift-mark"
-        accessibilityRole="image"
-        accessibilityLabel="Veil Phase Shift mark"
-        width={64}
-        height={64}
-        viewBox="0 0 24 24"
-      >
-        {/* Exact geometry and colors from assets/brand/phase-shift-mark.svg. */}
-        <Rect x="0.5" y="0.5" width="23" height="23" rx="5.5" fill="#0d0e14" stroke="#2e2e50" />
-        <Path
-          fill="#a78bfa"
-          d="M4 4H8V11.8L4 13ZM4 16L8 14.8V20H4ZM10 2H14V10.5L10 11.7ZM10 14.7L14 13.5V22H10ZM16 5H20V8.2L16 9.4ZM16 12.4L20 11.2V19H16Z"
-        />
-      </Svg>
-    </View>
-  );
-}
-
 function AssuranceItem({ label }: { label: string }) {
   return (
     <View style={styles.assuranceItem}>
@@ -282,7 +272,7 @@ interface SetupButtonProps {
   testID: string;
   title: string;
   description: string;
-  marker: string;
+  icon: LucideIcon;
   variant: "primary" | "secondary";
   loading: boolean;
   disabled: boolean;
@@ -293,7 +283,7 @@ function SetupButton({
   testID,
   title,
   description,
-  marker,
+  icon: Icon,
   variant,
   loading,
   disabled,
@@ -320,9 +310,7 @@ function SetupButton({
         {loading ? (
           <ActivityIndicator size="small" color={primary ? "#ffffff" : colors.primaryHi} />
         ) : (
-          <Text style={[styles.buttonMarkerText, primary && styles.buttonMarkerTextPrimary]}>
-            {marker}
-          </Text>
+          <Icon size={22} strokeWidth={2.1} color={primary ? "#ffffff" : colors.primaryHi} />
         )}
       </View>
       <View style={styles.buttonCopy}>
@@ -331,9 +319,11 @@ function SetupButton({
           {description}
         </Text>
       </View>
-      <Text importantForAccessibility="no" style={[styles.chevron, primary && styles.chevronPrimary]}>
-        ›
-      </Text>
+      <ChevronRight
+        size={22}
+        strokeWidth={2}
+        color={primary ? "rgba(255,255,255,0.72)" : colors.textLo}
+      />
     </Pressable>
   );
 }
@@ -519,13 +509,6 @@ const styles = StyleSheet.create({
     backgroundColor: "rgba(255,255,255,0.12)",
     borderColor: "rgba(255,255,255,0.20)",
   },
-  buttonMarkerText: {
-    color: colors.primaryHi,
-    fontSize: 24,
-    lineHeight: 28,
-    fontWeight: "500",
-  },
-  buttonMarkerTextPrimary: { color: "#ffffff" },
   buttonCopy: {
     flex: 1,
     marginLeft: spacing.md,
@@ -544,13 +527,6 @@ const styles = StyleSheet.create({
     marginTop: 2,
   },
   buttonDescriptionPrimary: { color: "rgba(255,255,255,0.74)" },
-  chevron: {
-    color: colors.textLo,
-    fontSize: 28,
-    lineHeight: 32,
-    marginLeft: spacing.sm,
-  },
-  chevronPrimary: { color: "rgba(255,255,255,0.72)" },
   errorBox: {
     minHeight: 48,
     justifyContent: "center",

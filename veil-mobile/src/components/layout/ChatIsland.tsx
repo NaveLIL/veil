@@ -16,8 +16,18 @@ import { Island } from "../ui/Island";
 const EMPTY_MESSAGES: never[] = [];
 
 export const ChatIsland: React.FC<{
+  bottomInset?: number;
+  leftInset?: number;
   onOpenIdentity?: (member: Member, triggerHandle: string | number) => void;
-}> = ({ onOpenIdentity }) => {
+  rightInset?: number;
+  showHeader?: boolean;
+}> = ({
+  bottomInset = 0,
+  leftInset = 0,
+  onOpenIdentity,
+  rightInset = 0,
+  showHeader = true,
+}) => {
   const selectedServerId = useChatStore((state) => state.selectedServerId);
   const selectedChannelId = useChatStore((state) => state.selectedChannelId);
   const selectedDmId = useChatStore((state) => state.selectedDmId);
@@ -93,12 +103,24 @@ export const ChatIsland: React.FC<{
   };
 
   return (
-    <View style={styles.wrap}>
-      <Island padding={0} style={styles.island}>
-        <View style={styles.header}>
-          <Text numberOfLines={1} style={styles.title}>{title}</Text>
-          <Text style={styles.headerHint}>swipe ◀ conversations · details ▶</Text>
-        </View>
+    <View
+      testID="chat-island-wrap"
+      style={[
+        styles.wrap,
+        {
+          paddingBottom: spacing.md + Math.max(0, bottomInset),
+          paddingLeft: Math.max(spacing.md, leftInset),
+          paddingRight: Math.max(spacing.md, rightInset),
+        },
+      ]}
+    >
+      <Island variant="solid" glow={false} padding={0} style={styles.island}>
+        {showHeader ? (
+          <View style={styles.header}>
+            <Text numberOfLines={1} style={styles.title}>{title}</Text>
+            <Text style={styles.headerHint}>Direct conversation</Text>
+          </View>
+        ) : null}
 
         <ScrollView
           ref={scrollRef}
@@ -142,6 +164,7 @@ export const ChatIsland: React.FC<{
                   accessibilityRole="button"
                   accessibilityLabel={`View identity for ${message.author.name}`}
                   onPress={(event) => onOpenIdentity?.(message.author, event.nativeEvent.target)}
+                  style={styles.identityTrigger}
                 >
                   <UserAvatar
                     identityKey={message.author.identityKey}
@@ -210,7 +233,7 @@ export const ChatIsland: React.FC<{
 };
 
 const styles = StyleSheet.create({
-  wrap: { flex: 1, paddingHorizontal: spacing.md, paddingBottom: spacing.md },
+  wrap: { flex: 1 },
   island: { flex: 1 },
   header: {
     paddingHorizontal: spacing.md,
@@ -234,7 +257,7 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   retry: {
-    minHeight: 38,
+    minHeight: 48,
     alignItems: "center",
     justifyContent: "center",
     borderRadius: radii.pill,
@@ -246,6 +269,7 @@ const styles = StyleSheet.create({
   retryPressed: { opacity: 0.72 },
   retryText: { color: colors.primaryHi, fontSize: 12, fontWeight: "700" },
   messageRow: { flexDirection: "row", gap: spacing.sm },
+  identityTrigger: { minWidth: 48, minHeight: 48, alignItems: "center", justifyContent: "center" },
   messageBody: { flex: 1, minWidth: 0 },
   messageHead: { flexDirection: "row", alignItems: "baseline", gap: spacing.sm },
   author: { fontSize: 13, fontWeight: "700" },
@@ -270,14 +294,15 @@ const styles = StyleSheet.create({
     flex: 1,
     color: colors.textHi,
     fontSize: 13,
-    minHeight: 42,
+    minHeight: 48,
     paddingHorizontal: spacing.md,
     paddingVertical: spacing.sm,
     borderRadius: radii.lg,
     backgroundColor: "rgba(255,255,255,0.04)",
   },
   sendButton: {
-    minHeight: 36,
+    minWidth: 48,
+    minHeight: 48,
     paddingHorizontal: spacing.sm,
     borderRadius: radii.pill,
     borderWidth: StyleSheet.hairlineWidth,

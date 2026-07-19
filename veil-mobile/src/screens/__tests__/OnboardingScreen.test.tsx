@@ -33,7 +33,18 @@ jest.mock("react-native-svg", () => {
   const { View: NativeView } = jest.requireActual<typeof import("react-native")>("react-native");
   const VectorNode = ({ children, ...props }: { children?: React.ReactNode }) =>
     ReactModule.createElement(NativeView, props, children);
-  return { __esModule: true, default: VectorNode, Path: VectorNode, Rect: VectorNode };
+  return {
+    __esModule: true,
+    default: VectorNode,
+    Svg: VectorNode,
+    Circle: VectorNode,
+    Ellipse: VectorNode,
+    Line: VectorNode,
+    Path: VectorNode,
+    Polygon: VectorNode,
+    Polyline: VectorNode,
+    Rect: VectorNode,
+  };
 });
 
 const mockBeginSetup = beginNativeIdentitySetup as jest.MockedFunction<

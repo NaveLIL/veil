@@ -1,15 +1,24 @@
 import React, { useMemo } from "react";
 import { Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { Hash, UsersRound, Volume2 } from "lucide-react-native";
 import { Island } from "../ui/Island";
 import { colors, radii, spacing } from "../../lib/theme";
 import { DM_HOME_ID, useChatStore } from "../../stores/chat";
 import { UserAvatar } from "../identity/UserAvatar";
 
 interface Props {
-  onSelect: () => void;
+  onSelect: (targetId: string) => void;
+  bottomInset?: number;
+  leftInset?: number;
+  rightInset?: number;
 }
 
-export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
+export const ChannelsIsland: React.FC<Props> = ({
+  onSelect,
+  bottomInset = 0,
+  leftInset = 0,
+  rightInset = 0,
+}) => {
   const serverId = useChatStore((s) => s.selectedServerId);
   const servers = useChatStore((s) => s.servers);
   const allChannels = useChatStore((s) => s.channels);
@@ -27,10 +36,20 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
   );
 
   return (
-    <View style={styles.wrap}>
-      <Island padding={spacing.md} style={styles.island}>
+    <View
+      testID="channels-island-wrap"
+      style={[
+        styles.wrap,
+        {
+          paddingBottom: Math.max(spacing.md, bottomInset),
+          paddingLeft: Math.max(spacing.md, leftInset),
+          paddingRight: Math.max(spacing.md, rightInset),
+        },
+      ]}
+    >
+      <Island variant="solid" glow={false} padding={spacing.md} style={styles.island}>
         <Text style={styles.title}>{isDmHome ? "Direct messages" : server?.name ?? "Channels"}</Text>
-        <Text style={styles.sub}>{isDmHome ? "authenticated native directory" : "channels"}</Text>
+        <Text style={styles.sub}>{isDmHome ? "private conversations" : "rooms"}</Text>
 
         <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.list}>
           {isDmHome && dms.length === 0 ? (
@@ -47,9 +66,12 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
                 return (
                   <Pressable
                     key={dm.id}
+                    accessibilityRole="button"
+                    accessibilityLabel={`${dm.name}. Direct conversation`}
+                    accessibilityState={{ selected: active }}
                     onPress={() => {
                       selectDm(dm.id);
-                      onSelect();
+                      onSelect(dm.id);
                     }}
                     style={({ pressed }) => [
                       styles.dmRow,
@@ -63,7 +85,7 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
                         accessibilityRole="image"
                         style={[styles.groupAvatar, { borderColor: `${dm.color}55` }]}
                       >
-                        <Text style={[styles.groupAvatarText, { color: dm.color }]}>◇</Text>
+                        <UsersRound size={21} strokeWidth={1.9} color={dm.color} />
                       </View>
                     ) : (
                       <UserAvatar
@@ -92,12 +114,13 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
             : channels.map((ch) => {
                 const active = ch.id === selectedChannelId;
                 const isVoice = ch.category === "VOICE";
+                const PrefixIcon = isVoice ? Volume2 : Hash;
                 return (
                   <Pressable
                     key={ch.id}
                     onPress={() => {
                       selectChannel(ch.id);
-                      onSelect();
+                      onSelect(ch.id);
                     }}
                     style={({ pressed }) => [
                       styles.chRow,
@@ -105,9 +128,13 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
                       pressed && { opacity: 0.7 },
                     ]}
                   >
-                    <Text style={[styles.chPrefix, active && styles.chActive]}>
-                      {isVoice ? "🔊" : "#"}
-                    </Text>
+                    <View style={styles.chPrefix}>
+                      <PrefixIcon
+                        size={16}
+                        strokeWidth={2}
+                        color={active ? colors.primary : colors.textLo}
+                      />
+                    </View>
                     <Text
                       numberOfLines={1}
                       style={[
@@ -132,7 +159,7 @@ export const ChannelsIsland: React.FC<Props> = ({ onSelect }) => {
 };
 
 const styles = StyleSheet.create({
-  wrap: { flex: 1, paddingHorizontal: spacing.md, paddingBottom: spacing.md },
+  wrap: { flex: 1 },
   island: { flex: 1 },
   title: { color: colors.textHi, fontSize: 18, fontWeight: "700" },
   sub: { color: colors.textLo, fontSize: 11, marginTop: 2, marginBottom: spacing.md, textTransform: "uppercase", letterSpacing: 1.5 },
@@ -151,6 +178,7 @@ const styles = StyleSheet.create({
 
   // channel row
   chRow: {
+    minHeight: 48,
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.sm,
@@ -158,8 +186,7 @@ const styles = StyleSheet.create({
     paddingVertical: 10,
     borderRadius: radii.md,
   },
-  chPrefix: { color: colors.textLo, fontSize: 16, width: 22, textAlign: "center" },
-  chActive: { color: colors.primary },
+  chPrefix: { width: 22, alignItems: "center", justifyContent: "center" },
   chName: { color: colors.textMd, fontSize: 15, flex: 1 },
   chNameActive: { color: colors.textHi, fontWeight: "600" },
 
@@ -181,7 +208,6 @@ const styles = StyleSheet.create({
     borderWidth: 1,
     backgroundColor: "rgba(124,107,245,0.10)",
   },
-  groupAvatarText: { fontSize: 22, fontWeight: "700" },
   dmMeta: { flex: 1, minWidth: 0 },
   dmHead: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
   dmName: { color: colors.textHi, fontSize: 14, fontWeight: "600", flex: 1 },

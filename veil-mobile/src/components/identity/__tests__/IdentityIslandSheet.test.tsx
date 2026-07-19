@@ -6,6 +6,7 @@ import {
   Animated,
   BackHandler,
   Modal,
+  StyleSheet,
   Text,
 } from "react-native";
 import type { Member } from "../../../stores/chat";
@@ -22,7 +23,7 @@ jest.mock("react-native", () => {
 });
 
 jest.mock("react-native-safe-area-context", () => ({
-  useSafeAreaInsets: () => ({ top: 0, right: 0, bottom: 18, left: 0 }),
+  useSafeAreaInsets: () => ({ top: 0, right: 20, bottom: 18, left: 44 }),
 }));
 
 jest.mock("../UserAvatar", () => {
@@ -114,6 +115,11 @@ describe("IdentityIslandSheet interaction and accessibility boundary", () => {
     expect(root.findAll((node) =>
       node.props.accessibilityRole === "button" && node.props.accessibilityLabel === "Close identity",
     ).length).toBeGreaterThan(0);
+    expect(StyleSheet.flatten(root.findByProps({ testID: "identity-sheet-header" }).props.style))
+      .toMatchObject({ paddingLeft: 44, paddingRight: 20 });
+    expect(StyleSheet.flatten(
+      root.findByProps({ testID: "identity-sheet-content" }).props.contentContainerStyle,
+    )).toMatchObject({ paddingLeft: 44, paddingRight: 20 });
 
     act(() => root.findByType(Modal).props.onShow());
     expect(setAccessibilityFocus).toHaveBeenCalledTimes(1);

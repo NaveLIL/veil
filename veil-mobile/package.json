@@ -16,6 +16,7 @@
     "android": "expo run:android",
     "ios": "expo run:ios",
     "native:android": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android-native.ps1",
+    "verify:android-production-bundle": "node scripts/verify-android-production-bundle.mjs",
     "lint": "eslint .",
     "test": "jest"
   },
@@ -28,6 +29,7 @@
     "expo-secure-store": "~14.2.4",
     "expo-status-bar": "~2.2.0",
     "expo-system-ui": "~5.0.11",
+    "lucide-react-native": "^1.25.0",
     "react": "19.0.0",
     "react-native": "0.79.6",
     "react-native-gesture-handler": "~2.24.0",
@@ -53,8 +55,11 @@
   },
   "jest": {
     "preset": "jest-expo",
+    "moduleNameMapper": {
+      "^lucide-react-native$": "<rootDir>/node_modules/lucide-react-native/dist/cjs/lucide-react-native.js"
+    },
     "transformIgnorePatterns": [
-      "node_modules[\\\\/](?!(?:\\.pnpm[\\\\/][^\\\\/]+[\\\\/]node_modules[\\\\/])?(?:(?:jest-)?react-native(?:[\\\\/]|$)|@react-native(?:[\\\\/]|$)|expo[^\\\\/]*(?:[\\\\/]|$)|@expo(?:nent)?(?:[\\\\/]|$)|react-navigation(?:[\\\\/]|$)|@react-navigation(?:[\\\\/]|$)|react-native-svg(?:[\\\\/]|$)))"
+      "node_modules[\\\\/](?!(?:\\.pnpm[\\\\/][^\\\\/]+[\\\\/]node_modules[\\\\/])?(?:(?:jest-)?react-native(?:[\\\\/]|$)|@react-native(?:[\\\\/]|$)|expo[^\\\\/]*(?:[\\\\/]|$)|@expo(?:nent)?(?:[\\\\/]|$)|react-navigation(?:[\\\\/]|$)|@react-navigation(?:[\\\\/]|$)|react-native-svg(?:[\\\\/]|$)|lucide-react-native(?:[\\\\/]|$)))"
     ]
   },
   "pnpm": {

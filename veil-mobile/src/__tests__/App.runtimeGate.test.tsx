@@ -11,8 +11,16 @@ import type {
   DirectMessageProjection,
   VeilMobileRuntimeSnapshot,
 } from "../native/runtime";
+import { setAuthenticatedContentReady } from "../native/screenCapture";
 import { useChatStore } from "../stores/chat";
-import { resetRuntimeGateStoreForTests } from "../stores/runtime";
+import {
+  resetRuntimeGateStoreForTests,
+  useRuntimeGateStore,
+} from "../stores/runtime";
+import {
+  resetMobileSettingsStoreForTests,
+  useMobileSettingsStore,
+} from "../stores/settings";
 
 jest.mock("../native/runtime", () => ({
   __esModule: true,
@@ -29,6 +37,10 @@ jest.mock("../native/runtime", () => ({
     getDirectMessages: jest.fn(),
     subscribe: jest.fn(),
   },
+}));
+
+jest.mock("../native/screenCapture", () => ({
+  setAuthenticatedContentReady: jest.fn(() => Promise.resolve()),
 }));
 
 jest.mock("../hooks/useReducedMotionPreference", () => ({
@@ -103,6 +115,9 @@ type RuntimeMock = {
 };
 
 const mockRuntime = (jest.requireMock("../native/runtime") as { default: RuntimeMock }).default;
+const mockSetAuthenticatedContentReady = setAuthenticatedContentReady as jest.MockedFunction<
+  typeof setAuthenticatedContentReady
+>;
 
 const exactBinding = {
   canonicalServerOrigin: "https://veil.erez.pro:443",
@@ -147,6 +162,7 @@ describe("App native runtime privacy gate", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     resetRuntimeGateStoreForTests();
+    resetMobileSettingsStoreForTests();
     useChatStore.setState({
       messagesByChannel: {
         secret: [{
@@ -175,6 +191,30 @@ describe("App native runtime privacy gate", () => {
       runtimeListener = listener;
       return { remove: jest.fn() };
     });
+  });
+
+  it("downgrades Ready capture for operations, privacy and the user preference", async () => {
+    const ready = runtimeSnapshot();
+    mockRuntime.getSnapshot.mockResolvedValue(ready);
+    mockRuntime.lock.mockResolvedValue(ready);
+
+    render(<App />);
+    await waitFor(() => expect(mockSetAuthenticatedContentReady).toHaveBeenLastCalledWith(true));
+
+    act(() => useRuntimeGateStore.setState({ operation: "refreshing" }));
+    await waitFor(() => expect(mockSetAuthenticatedContentReady).toHaveBeenLastCalledWith(false));
+
+    act(() => useRuntimeGateStore.setState({ operation: null }));
+    await waitFor(() => expect(mockSetAuthenticatedContentReady).toHaveBeenLastCalledWith(true));
+
+    act(() => useRuntimeGateStore.setState({ curtainVisible: true }));
+    await waitFor(() => expect(mockSetAuthenticatedContentReady).toHaveBeenLastCalledWith(false));
+
+    act(() => {
+      useRuntimeGateStore.setState({ curtainVisible: false });
+      useMobileSettingsStore.getState().setAllowReadyScreenshots(false);
+    });
+    await waitFor(() => expect(mockSetAuthenticatedContentReady).toHaveBeenLastCalledWith(false));
   });
 
   it("shows an opaque curtain synchronously, clears plaintext, and waits for committed lock", async () => {

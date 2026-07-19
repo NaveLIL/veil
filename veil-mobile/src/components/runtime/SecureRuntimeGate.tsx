@@ -12,6 +12,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 
+import { PhaseShiftMark } from "../brand/PhaseShiftMark";
 import { colors, radii, spacing, typography } from "../../lib/theme";
 import type { VeilMobileRuntimeSnapshot } from "../../native/runtime";
 import {
@@ -140,9 +141,7 @@ export function SecureRuntimeGate({
           showsVerticalScrollIndicator={false}
         >
           <View style={styles.brandBlock} accessible accessibilityRole="header">
-            <View style={styles.brandMark} importantForAccessibility="no">
-              <Text style={styles.brandMarkText}>V</Text>
-            </View>
+            <PhaseShiftMark size={56} testID="runtime-brand-phase-shift-mark" />
             <Text style={styles.brand}>VEIL</Text>
             <Text style={styles.brandSub}>Native secure session</Text>
           </View>
@@ -339,17 +338,6 @@ const styles = StyleSheet.create({
     gap: spacing.lg,
   },
   brandBlock: { alignItems: "center", marginBottom: spacing.sm },
-  brandMark: {
-    width: 56,
-    height: 56,
-    borderRadius: radii.lg,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(124,107,245,0.17)",
-    borderWidth: StyleSheet.hairlineWidth,
-    borderColor: "rgba(155,138,251,0.38)",
-  },
-  brandMarkText: { color: colors.primaryHi, fontSize: 22, fontWeight: "800" },
   brand: {
     color: colors.textHi,
     fontSize: 17,

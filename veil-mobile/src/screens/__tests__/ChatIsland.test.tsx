@@ -1,6 +1,7 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
 import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
+import { StyleSheet } from "react-native";
 
 import { ChatIsland } from "../../components/layout/ChatIsland";
 import type {
@@ -72,6 +73,20 @@ describe("ChatIsland native Direct projection", () => {
 
   afterEach(() => {
     jest.restoreAllMocks();
+  });
+
+  it("keeps the composer above the bottom safe area", async () => {
+    runtime.getDirectMessages.mockResolvedValue({ availability: "available", messages: [] });
+    const view = render(<ChatIsland bottomInset={34} leftInset={44} rightInset={10} />);
+
+    expect(view.getByTestId("chat-island-wrap").props.style).toContainEqual({
+      paddingBottom: 46,
+      paddingLeft: 44,
+      paddingRight: 12,
+    });
+    expect(StyleSheet.flatten(view.getByTestId("direct-send-button").props.style))
+      .toMatchObject({ minWidth: 48, minHeight: 48 });
+    await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
   });
 
   it("does not project plaintext from an offscreen mount before explicit selection", () => {
