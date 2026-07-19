@@ -1,0 +1,6 @@
+<resources>
+  <!-- Non-secret physical-test anchors; recovery words remain inaccessible. -->
+  <item name="recovery_secure_scroll" type="id" />
+  <item name="recovery_secure_root" type="id" />
+  <item name="recovery_stage_island" type="id" />
+</resources>

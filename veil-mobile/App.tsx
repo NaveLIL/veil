@@ -67,7 +67,11 @@ export default function App() {
     content = (
       <OnboardingScreen
         reducedMotion={reducedMotion}
-        onCommitted={runtime.retryBootstrap}
+        onVerifyIdentity={async () => {
+          const verification = await runtime.verifyIdentityPresence();
+          if (verification === "present") void runtime.retryBootstrap();
+          return verification;
+        }}
       />
     );
   } else if (chatReady) {

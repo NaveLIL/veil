@@ -1,6 +1,8 @@
 package io.veil.mobile.runtime
 
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
+import io.veil.mobile.recovery.NativeIdentitySetupCoordinator
+import io.veil.mobile.recovery.NativeIdentitySetupUnsettledException
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
@@ -42,6 +44,122 @@ import uniffi.veil_ffi.RestSignatureData
 import uniffi.veil_ffi.VeilException
 
 class VeilMobileRuntimeTest {
+  @Test
+  fun strictIdentityPresenceDoesNotReadVaultDuringUnsettledRecovery() {
+    NativeIdentitySetupCoordinator.resetForTest()
+    val lease = requireNotNull(NativeIdentitySetupCoordinator.acquire())
+    val executor = daemonExecutor()
+    val vault = FakeVault()
+    val runtime = runtime(executor, FakeSession(), vault = vault)
+    vault.hasIdentityCount = 0
+    try {
+      assertThrows(NativeIdentitySetupUnsettledException::class.java) {
+        runtime.verifyIdentityPresence()
+      }
+      assertEquals(0, vault.hasIdentityCount)
+    } finally {
+      NativeIdentitySetupCoordinator.release(lease)
+      NativeIdentitySetupCoordinator.resetForTest()
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun strictIdentityPresenceReturnsDurablePresentAndAbsentWithoutSnapshotFallback() {
+    val executor = daemonExecutor()
+    val vault = FakeVault()
+    val runtime = runtime(executor, FakeSession(), vault = vault)
+    vault.hasIdentityCount = 0
+    try {
+      assertTrue(runtime.verifyIdentityPresence())
+
+      vault.identityExists = false
+      assertFalse(runtime.verifyIdentityPresence())
+      assertEquals(2, vault.hasIdentityCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun strictIdentityPresencePropagatesVaultFailureInsteadOfReportingAbsent() {
+    val executor = daemonExecutor()
+    val vault = FakeVault().apply { failHasIdentity = true }
+    val runtime = runtime(executor, FakeSession(), vault = vault)
+    vault.hasIdentityCount = 0
+    try {
+      val error = assertThrows(IllegalStateException::class.java) {
+        runtime.verifyIdentityPresence()
+      }
+
+      assertEquals("vault temporarily unavailable", error.message)
+      assertEquals(1, vault.hasIdentityCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun strictIdentityPresenceRequiresCurrentForegroundAuthority() {
+    val executor = daemonExecutor()
+    val vault = FakeVault()
+    val runtime = runtime(executor, FakeSession(), vault = vault, markForeground = false)
+    try {
+      val error = assertThrows(VeilMobileRuntimeException::class.java) {
+        runtime.verifyIdentityPresence()
+      }
+
+      assertEquals("E_VEIL_LOCKED", error.code)
+      assertEquals(0, vault.hasIdentityCount)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun strictIdentityPresenceRejectsAResultSupersededByBackgroundLock() {
+    val executor = daemonExecutor()
+    val readEntered = CountDownLatch(1)
+    val releaseRead = CountDownLatch(1)
+    val blockNextRead = AtomicBoolean(false)
+    val vault = object : NativeIdentityVaultAccess {
+      override fun hasIdentity(): Boolean {
+        if (blockNextRead.compareAndSet(true, false)) {
+          readEntered.countDown()
+          check(releaseRead.await(5, TimeUnit.SECONDS)) { "identity read was not released" }
+        }
+        return true
+      }
+
+      override fun <T> withMnemonicBytes(operation: (ByteArray) -> T): T =
+        error("mnemonic access is not expected")
+    }
+    val runtime = runtime(executor, FakeSession(), vault = vault)
+    val result = AtomicReference<Throwable?>()
+    blockNextRead.set(true)
+    val verifier = thread(start = true, isDaemon = true, name = "identity-presence-test") {
+      result.set(runCatching { runtime.verifyIdentityPresence() }.exceptionOrNull())
+    }
+    try {
+      assertTrue("strict identity read did not start", readEntered.await(5, TimeUnit.SECONDS))
+      runtime.lockForBackground()
+      releaseRead.countDown()
+      verifier.join(5_000L)
+
+      val error = result.get()
+      assertTrue(error is VeilMobileRuntimeException)
+      assertEquals("E_VEIL_LOCKED", (error as VeilMobileRuntimeException).code)
+    } finally {
+      releaseRead.countDown()
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
   @Test
   fun freshRuntimeRejectsAccountAccessUntilForegroundAuthorityIsGranted() {
     val executor = daemonExecutor()
@@ -4652,11 +4770,14 @@ class VeilMobileRuntimeTest {
   )
 
   private class FakeVault : NativeIdentityVaultAccess {
+    var identityExists = true
     var failHasIdentity = false
+    var hasIdentityCount = 0
 
     override fun hasIdentity(): Boolean {
+      hasIdentityCount += 1
       if (failHasIdentity) throw IllegalStateException("vault temporarily unavailable")
-      return true
+      return identityExists
     }
 
     override fun <T> withMnemonicBytes(operation: (ByteArray) -> T): T {

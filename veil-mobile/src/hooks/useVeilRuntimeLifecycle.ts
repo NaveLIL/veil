@@ -19,6 +19,7 @@ type SecureOperation = Exclude<RuntimeOperation, null>;
 export interface VeilRuntimeController {
   refresh: () => Promise<void>;
   retryBootstrap: () => Promise<void>;
+  verifyIdentityPresence: () => Promise<"present" | "absent" | "unknown">;
   unlock: () => Promise<void>;
   connect: (canonicalOrigin: string) => Promise<void>;
   usePendingAccessPass: (flowId: string) => Promise<void>;
@@ -219,6 +220,26 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
     await attachAfterFreshSnapshot(epoch, lockBarrierRef.current);
   }, [attachAfterFreshSnapshot]);
 
+  const verifyIdentityPresence = useCallback(async (): Promise<
+    "present" | "absent" | "unknown"
+  > => {
+    if (!mountedRef.current || !isActive(appStateRef.current)) return "unknown";
+    const gate = useRuntimeGateStore.getState();
+    const epoch = gate.epoch;
+    if (gate.phase !== "ready" || gate.curtainVisible) return "unknown";
+    try {
+      await lockBarrierRef.current;
+      if (!epochIsCurrent(epoch)) return "unknown";
+      const identityExists = await VeilRuntime.verifyIdentityPresence();
+      if (!epochIsCurrent(epoch)) return "unknown";
+      return identityExists ? "present" : "absent";
+    } catch {
+      // A failed or superseded read is ambiguous. Never tell the user to
+      // destroy recovery material without an authoritative absent snapshot.
+      return "unknown";
+    }
+  }, [epochIsCurrent]);
+
   const unlock = useCallback(async (): Promise<void> => {
     await runOperation("unlocking", () => VeilRuntime.openSession(), true);
   }, [runOperation]);
@@ -257,6 +278,7 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
   return useMemo(() => ({
     refresh,
     retryBootstrap,
+    verifyIdentityPresence,
     unlock,
     connect,
     usePendingAccessPass,
@@ -268,5 +290,6 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
     retryBootstrap,
     unlock,
     usePendingAccessPass,
+    verifyIdentityPresence,
   ]);
 }

@@ -4,6 +4,10 @@ import java.lang.ref.WeakReference
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
+/** Strict identity presence is ambiguous while a recovery ceremony can still publish. */
+internal class NativeIdentitySetupUnsettledException :
+  IllegalStateException("native identity setup has not reached a terminal state")
+
 /** Process-wide owner for one identity ceremony and its irreversible commit. */
 internal object NativeIdentitySetupCoordinator {
   @JvmInline
@@ -62,6 +66,24 @@ internal object NativeIdentitySetupCoordinator {
     val lease = Lease(nextId++)
     active = Active(lease)
     lease
+  }
+
+  /**
+   * Runs one strict durable-identity read only when no ceremony can still
+   * publish a record.
+   *
+   * The coordinator lock deliberately remains held for the complete read. A
+   * READY or COMMITTING ceremony is ambiguous and performs no read, while an
+   * acquire/beginCommit cannot linearize between the settled-state check and
+   * the filesystem result. TERMINAL work has already closed all owned secret
+   * buffers before [complete] publishes that phase, so it is safe to read.
+   */
+  fun <T> withSettledIdentityRead(read: () -> T): T = synchronized(lock) {
+    val phase = active?.phase
+    if (phase == Phase.READY || phase == Phase.COMMITTING) {
+      throw NativeIdentitySetupUnsettledException()
+    }
+    read()
   }
 
   /**

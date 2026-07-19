@@ -48,7 +48,10 @@ describe("native-only identity welcome", () => {
   it("renders no React Native secret input surface", () => {
     const timing = jest.spyOn(Animated, "timing");
     const view = render(
-      <OnboardingScreen reducedMotion onCommitted={jest.fn<() => void>()} />,
+      <OnboardingScreen
+        reducedMotion
+        onVerifyIdentity={jest.fn<() => Promise<"unknown">>().mockResolvedValue("unknown")}
+      />,
     );
 
     expect(timing).not.toHaveBeenCalled();
@@ -60,57 +63,45 @@ describe("native-only identity welcome", () => {
   });
 
   it("refreshes authoritative runtime only after native commit", async () => {
-    const onCommitted = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"present">>()
+      .mockResolvedValue("present");
     mockBeginSetup.mockResolvedValue("committed");
     const view = render(
-      <OnboardingScreen reducedMotion onCommitted={onCommitted} />,
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
     );
 
     fireEvent.press(view.getByTestId("identity-setup-create"));
 
     await waitFor(() => expect(mockBeginSetup).toHaveBeenCalledWith("create"));
-    await waitFor(() => expect(onCommitted).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(onVerifyIdentity).toHaveBeenCalledTimes(1));
   });
 
-  it("treats native cancellation as no state change", async () => {
-    const onCommitted = jest.fn<() => Promise<void>>().mockResolvedValue(undefined);
-    mockBeginSetup.mockResolvedValue("cancelled");
+  it("treats explicit user cancellation as no state change", async () => {
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"unknown">>()
+      .mockResolvedValue("unknown");
+    mockBeginSetup.mockResolvedValue("user_cancelled");
     const view = render(
-      <OnboardingScreen reducedMotion onCommitted={onCommitted} />,
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
     );
 
     fireEvent.press(view.getByTestId("identity-setup-restore"));
 
     await waitFor(() => expect(mockBeginSetup).toHaveBeenCalledWith("restore"));
     await waitFor(() => expect(view.queryByTestId("identity-setup-loading")).toBeNull());
-    expect(onCommitted).not.toHaveBeenCalled();
+    expect(onVerifyIdentity).not.toHaveBeenCalled();
     expect(view.getByTestId("native-identity-welcome")).toBeTruthy();
+    expect(view.queryByTestId("identity-setup-error")).toBeNull();
   });
 
-  it("never reflects native diagnostics into the public error", async () => {
-    const onCommitted = jest.fn<() => void>();
-    mockBeginSetup.mockRejectedValue(
-      new Error("private native diagnostic with implementation details"),
-    );
+  it("marks only a newly shown create phrase for destruction after explicit cancellation", async () => {
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"unknown">>()
+      .mockResolvedValue("unknown");
+    mockBeginSetup.mockResolvedValue("user_cancelled");
     const view = render(
-      <OnboardingScreen reducedMotion onCommitted={onCommitted} />,
-    );
-
-    fireEvent.press(view.getByTestId("identity-setup-create"));
-
-    await waitFor(() => expect(view.getByTestId("identity-setup-error")).toBeTruthy());
-    expect(view.getByText("Secure setup could not be completed. Nothing changed. Please try again.")).toBeTruthy();
-    expect(view.queryByText(/private native diagnostic/i)).toBeNull();
-    expect(onCommitted).not.toHaveBeenCalled();
-  });
-
-  it("reports a generic refresh problem without claiming native commit was rolled back", async () => {
-    const onCommitted = jest
-      .fn<() => Promise<void>>()
-      .mockRejectedValue(new Error("runtime internals"));
-    mockBeginSetup.mockResolvedValue("committed");
-    const view = render(
-      <OnboardingScreen reducedMotion onCommitted={onCommitted} />,
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
     );
 
     fireEvent.press(view.getByTestId("identity-setup-create"));
@@ -118,9 +109,129 @@ describe("native-only identity welcome", () => {
     await waitFor(() => expect(view.getByTestId("identity-setup-error")).toBeTruthy());
     expect(
       view.getByText(
-        "Identity setup finished, but secure status could not be refreshed. Close Veil and reopen it.",
+        "Setup was cancelled. If a new recovery phrase was shown, it was not committed and must be destroyed before trying again.",
+      ),
+    ).toBeTruthy();
+    expect(onVerifyIdentity).not.toHaveBeenCalled();
+  });
+
+  it("destroys an interrupted phrase only after native verifies no identity exists", async () => {
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"absent">>()
+      .mockResolvedValue("absent");
+    mockBeginSetup.mockResolvedValue("interrupted");
+    const view = render(
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
+    );
+
+    fireEvent.press(view.getByTestId("identity-setup-create"));
+
+    await waitFor(() => expect(mockBeginSetup).toHaveBeenCalledWith("create"));
+    await waitFor(() => expect(view.getByTestId("identity-setup-error")).toBeTruthy());
+    expect(
+      view.getByText(
+        "Secure setup was interrupted and Veil verified that no local identity was committed. Any new recovery phrase from that attempt is invalid and must be destroyed before starting again.",
+      ),
+    ).toBeTruthy();
+    expect(view.queryByTestId("identity-setup-loading")).toBeNull();
+    expect(onVerifyIdentity).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an ambiguous recovery phrase when vault verification is unavailable", async () => {
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"unknown">>()
+      .mockResolvedValue("unknown");
+    mockBeginSetup.mockResolvedValue("interrupted");
+    const view = render(
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
+    );
+
+    fireEvent.press(view.getByTestId("identity-setup-create"));
+
+    await waitFor(() => expect(view.getByTestId("identity-setup-error")).toBeTruthy());
+    expect(
+      view.getByText(
+        "Secure setup was interrupted, but Veil could not verify whether the local identity was committed. Keep any recovery phrase, close and reopen Veil, and do not start setup again until the local account check finishes.",
+      ),
+    ).toBeTruthy();
+    expect(view.getByTestId("identity-setup-create").props.accessibilityState.disabled).toBe(true);
+    expect(view.getByTestId("identity-setup-restore").props.accessibilityState.disabled).toBe(true);
+  });
+
+  it("never tells a restore user to destroy their existing recovery phrase", async () => {
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"absent">>()
+      .mockResolvedValue("absent");
+    mockBeginSetup.mockResolvedValue("interrupted");
+    const view = render(
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
+    );
+
+    fireEvent.press(view.getByTestId("identity-setup-restore"));
+
+    await waitFor(() => expect(view.getByTestId("identity-setup-error")).toBeTruthy());
+    expect(
+      view.getByText(
+        "Secure restore was interrupted and Veil verified that no local identity was committed. Keep your existing recovery phrase and reopen Veil before trying again.",
+      ),
+    ).toBeTruthy();
+    expect(view.queryByText(/must be destroyed/i)).toBeNull();
+  });
+
+  it("accepts a committed identity after an interrupted Activity result", async () => {
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"present">>()
+      .mockResolvedValue("present");
+    mockBeginSetup.mockResolvedValue("interrupted");
+    const view = render(
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
+    );
+
+    fireEvent.press(view.getByTestId("identity-setup-create"));
+
+    await waitFor(() => expect(onVerifyIdentity).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(view.queryByTestId("identity-setup-loading")).toBeNull());
+    expect(view.queryByTestId("identity-setup-error")).toBeNull();
+  });
+
+  it("never reflects native diagnostics into the public error", async () => {
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"unknown">>()
+      .mockResolvedValue("unknown");
+    mockBeginSetup.mockRejectedValue(
+      new Error("private native diagnostic with implementation details"),
+    );
+    const view = render(
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
+    );
+
+    fireEvent.press(view.getByTestId("identity-setup-create"));
+
+    await waitFor(() => expect(view.getByTestId("identity-setup-error")).toBeTruthy());
+    expect(view.getByText("Secure setup could not be completed. Nothing changed. Please try again.")).toBeTruthy();
+    expect(view.queryByText(/private native diagnostic/i)).toBeNull();
+    expect(onVerifyIdentity).not.toHaveBeenCalled();
+  });
+
+  it("reports a generic refresh problem without claiming native commit was rolled back", async () => {
+    const onVerifyIdentity = jest
+      .fn<() => Promise<"present">>()
+      .mockRejectedValue(new Error("runtime internals"));
+    mockBeginSetup.mockResolvedValue("committed");
+    const view = render(
+      <OnboardingScreen reducedMotion onVerifyIdentity={onVerifyIdentity} />,
+    );
+
+    fireEvent.press(view.getByTestId("identity-setup-create"));
+
+    await waitFor(() => expect(view.getByTestId("identity-setup-error")).toBeTruthy());
+    expect(
+      view.getByText(
+        "Native setup reported completion, but Veil could not verify the encrypted local account. Keep the recovery phrase, close and reopen Veil, and do not start setup again yet.",
       ),
     ).toBeTruthy();
     expect(view.queryByText(/runtime internals/i)).toBeNull();
+    expect(view.getByTestId("identity-setup-create").props.accessibilityState.disabled).toBe(true);
+    expect(view.getByTestId("identity-setup-restore").props.accessibilityState.disabled).toBe(true);
   });
 });

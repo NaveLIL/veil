@@ -28,12 +28,16 @@ const readySnapshot = (overrides: Record<string, unknown> = {}) => ({
   ...overrides,
 });
 
-function installRuntime(result: unknown) {
+function installRuntime(
+  result: unknown,
+  verifyIdentityPresence = jest.fn<() => Promise<unknown>>().mockResolvedValue(true),
+) {
   const getRuntimeSnapshot = jest.fn<() => Promise<unknown>>().mockResolvedValue(result);
   Object.defineProperty(NativeModules, "VeilMobileRuntime", {
     configurable: true,
     value: {
       getRuntimeSnapshot,
+      verifyIdentityPresence,
       addListener: jest.fn(),
       removeListeners: jest.fn(),
     },
@@ -81,6 +85,29 @@ describe("native runtime snapshot projection", () => {
     }));
 
     await expect(runtime.getSnapshot()).resolves.toEqual(readySnapshot());
+  });
+
+  it("preserves strict durable identity present and absent results", async () => {
+    const present = jest.fn<() => Promise<unknown>>().mockResolvedValue(true);
+    await expect(installRuntime(readySnapshot(), present).verifyIdentityPresence()).resolves.toBe(true);
+    expect(present).toHaveBeenCalledTimes(1);
+
+    const absent = jest.fn<() => Promise<unknown>>().mockResolvedValue(false);
+    await expect(installRuntime(readySnapshot(), absent).verifyIdentityPresence()).resolves.toBe(false);
+    expect(absent).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects vault and malformed bridge results instead of collapsing them to absent", async () => {
+    const vaultError = Object.assign(new Error("native failure"), { code: "E_VEIL_RUNTIME" });
+    const failed = jest.fn<() => Promise<unknown>>().mockRejectedValue(vaultError);
+    await expect(installRuntime(readySnapshot(), failed).verifyIdentityPresence()).rejects.toBe(
+      vaultError,
+    );
+
+    const malformed = jest.fn<() => Promise<unknown>>().mockResolvedValue("false");
+    await expect(installRuntime(readySnapshot(), malformed).verifyIdentityPresence()).rejects.toThrow(
+      "invalid identity-presence result",
+    );
   });
 
   it("collapses a malformed directory as one restrictive snapshot", async () => {

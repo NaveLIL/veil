@@ -121,20 +121,19 @@ internal class VeilIdentitySetupModule(
     val expected = synchronized(lock) { pending }
     if (expected == null || requestCode != expected.requestCode) return
     val returnedLeaseId = data?.let(RecoveryActivity::resultLeaseId)
-    if (
-      !correlatesResult(
-        expectedRequestCode = expected.requestCode,
-        expectedLeaseId = expected.lease.id,
-        requestCode = requestCode,
-        resultCode = resultCode,
-        hasResultData = data != null,
-        returnedLeaseId = returnedLeaseId,
-      )
-    ) return
+    val outcome = classifyResult(
+      expectedRequestCode = expected.requestCode,
+      expectedLeaseId = expected.lease.id,
+      requestCode = requestCode,
+      resultCode = resultCode,
+      hasResultData = data != null,
+      returnedLeaseId = returnedLeaseId,
+      returnedOutcome = data?.let(RecoveryActivity::resultOutcome),
+    ) ?: return
     val request = takePending(expected.id) ?: return
     NativeIdentitySetupCoordinator.release(request.lease)
-    // The result Intent contains only the non-secret lease correlation id.
-    request.promise.resolve(if (resultCode == Activity.RESULT_OK) "committed" else "cancelled")
+    // The result Intent contains only a non-secret outcome and lease correlation id.
+    request.promise.resolve(outcome.bridgeValue)
   }
 
   override fun onNewIntent(intent: Intent) = Unit
@@ -164,7 +163,7 @@ internal class VeilIdentitySetupModule(
         NativeIdentitySetupCoordinator.release(pendingSetup.lease)
       }
     }
-    request?.promise?.resolve("cancelled")
+    request?.promise?.resolve(NativeIdentitySetupOutcome.INTERRUPTED.bridgeValue)
     reactApplicationContext.removeActivityEventListener(this)
     reactApplicationContext.removeLifecycleEventListener(this)
     super.invalidate()
@@ -187,23 +186,36 @@ internal class VeilIdentitySetupModule(
     private const val ERROR_LAUNCH = "E_VEIL_SETUP_LAUNCH"
 
     /**
-     * A normal Veil result must carry the exact non-secret lease token. Android
-     * may instead synthesize an empty RESULT_CANCELED when it destroys the
-     * child Activity; the unique per-process request code safely identifies
-     * that one system cancellation without weakening successful correlation.
+     * Only an exact, internally consistent success can commit. Once Android
+     * returns the expected request code, a missing, mismatched, or contradictory
+     * payload is consumed as an interruption so the lease cannot hang or become
+     * a false success. Android's synthetic empty RESULT_CANCELED follows the
+     * same fail-closed path.
      */
-    internal fun correlatesResult(
+    internal fun classifyResult(
       expectedRequestCode: Int,
       expectedLeaseId: Long,
       requestCode: Int,
       resultCode: Int,
       hasResultData: Boolean,
       returnedLeaseId: Long?,
-    ): Boolean {
-      if (requestCode != expectedRequestCode) return false
-      if (resultCode != Activity.RESULT_OK && resultCode != Activity.RESULT_CANCELED) return false
-      if (!hasResultData) return resultCode == Activity.RESULT_CANCELED
-      return returnedLeaseId == expectedLeaseId
+      returnedOutcome: NativeIdentitySetupOutcome?,
+    ): NativeIdentitySetupOutcome? {
+      if (requestCode != expectedRequestCode) return null
+      if (!hasResultData) return NativeIdentitySetupOutcome.INTERRUPTED
+      if (returnedLeaseId != expectedLeaseId) return NativeIdentitySetupOutcome.INTERRUPTED
+      return when {
+        resultCode == Activity.RESULT_OK &&
+          returnedOutcome == NativeIdentitySetupOutcome.COMMITTED ->
+          NativeIdentitySetupOutcome.COMMITTED
+        resultCode == Activity.RESULT_CANCELED &&
+          returnedOutcome == NativeIdentitySetupOutcome.USER_CANCELLED ->
+          NativeIdentitySetupOutcome.USER_CANCELLED
+        resultCode == Activity.RESULT_CANCELED &&
+          returnedOutcome == NativeIdentitySetupOutcome.INTERRUPTED ->
+          NativeIdentitySetupOutcome.INTERRUPTED
+        else -> NativeIdentitySetupOutcome.INTERRUPTED
+      }
     }
 
     private fun allocateRequestCode(): Int {

@@ -93,6 +93,7 @@ export class DirectTextSendError extends Error {
 
 interface VeilMobileRuntimeNative {
   getRuntimeSnapshot(): Promise<unknown>;
+  verifyIdentityPresence(): Promise<unknown>;
   openSession(): Promise<unknown>;
   connect(canonicalOrigin: string): Promise<unknown>;
   connectPendingAccessPass(flowId: string): Promise<unknown>;
@@ -476,6 +477,13 @@ function nativeErrorCode(value: unknown): string | null {
 const VeilRuntime = {
   getSnapshot: async (): Promise<VeilMobileRuntimeSnapshot> =>
     runtimeSnapshot(await requireRuntime().getRuntimeSnapshot()),
+  verifyIdentityPresence: async (): Promise<boolean> => {
+    const identityExists = await requireRuntime().verifyIdentityPresence();
+    if (typeof identityExists !== "boolean") {
+      throw new Error("Native mobile runtime returned an invalid identity-presence result");
+    }
+    return identityExists;
+  },
   openSession: async (): Promise<VeilMobileRuntimeSnapshot> =>
     runtimeSnapshot(await requireRuntime().openSession()),
   connect: async (canonicalOrigin: string): Promise<AuthenticatedBinding> => {

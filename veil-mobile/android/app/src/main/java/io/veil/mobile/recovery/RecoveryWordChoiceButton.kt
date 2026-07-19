@@ -2,12 +2,14 @@ package io.veil.mobile.recovery
 
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
 import android.os.Build
 import android.util.TypedValue
 import android.view.View
 import android.view.ViewStructure
+import io.veil.mobile.R
+import kotlin.math.ceil
+import kotlin.math.max
 
 /** A word-choice control whose selected scalar can be overwritten on detach. */
 internal class RecoveryWordChoiceButton(
@@ -18,8 +20,12 @@ internal class RecoveryWordChoiceButton(
 ) : View(context) {
   private var publicWord = word
   private var mutableWordIndex = wordIndex
+  private val restingBackgroundColor = context.getColor(R.color.recoverySurfaceRaised)
+  private val pressedBackgroundColor = context.getColor(R.color.recoverySurfaceFocused)
+  private val restingBorderColor = context.getColor(R.color.recoveryBorder)
+  private val activeBorderColor = context.getColor(R.color.recoveryText)
   private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-    color = Color.rgb(0xf4, 0xf8, 0xfc)
+    color = context.getColor(R.color.recoveryText)
     textSize = TypedValue.applyDimension(
       TypedValue.COMPLEX_UNIT_SP,
       15f,
@@ -32,7 +38,12 @@ internal class RecoveryWordChoiceButton(
     )
   }
   private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-    color = Color.rgb(0x18, 0x32, 0x49)
+    color = restingBackgroundColor
+  }
+  private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    color = restingBorderColor
+    style = Paint.Style.STROKE
+    strokeWidth = dp(1).toFloat()
   }
 
   init {
@@ -54,16 +65,24 @@ internal class RecoveryWordChoiceButton(
   }
 
   override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+    val fontMetrics = paint.fontMetrics
+    val desiredHeight = max(
+      suggestedMinimumHeight,
+      ceil(fontMetrics.descent - fontMetrics.ascent).toInt() + dp(VERTICAL_PADDING_DP),
+    )
     setMeasuredDimension(
       resolveSize(suggestedMinimumWidth, widthMeasureSpec),
-      resolveSize(dp(48), heightMeasureSpec),
+      resolveSize(desiredHeight, heightMeasureSpec),
     )
   }
 
   override fun onDraw(canvas: Canvas) {
     super.onDraw(canvas)
+    val active = isPressed || isFocused
     backgroundPaint.color =
-      if (isPressed || isFocused) Color.rgb(0x23, 0x48, 0x65) else Color.rgb(0x18, 0x32, 0x49)
+      if (active) pressedBackgroundColor else restingBackgroundColor
+    borderPaint.color = if (active) activeBorderColor else restingBorderColor
+    borderPaint.strokeWidth = dp(if (active) 2 else 1).toFloat()
     canvas.drawRoundRect(
       0f,
       0f,
@@ -72,6 +91,15 @@ internal class RecoveryWordChoiceButton(
       dp(12).toFloat(),
       dp(12).toFloat(),
       backgroundPaint,
+    )
+    canvas.drawRoundRect(
+      0f,
+      0f,
+      width.toFloat(),
+      height.toFloat(),
+      dp(12).toFloat(),
+      dp(12).toFloat(),
+      borderPaint,
     )
     val baseline = (height - paint.fontMetrics.ascent - paint.fontMetrics.descent) / 2f
     canvas.drawText(publicWord, width / 2f, baseline, paint)
@@ -106,4 +134,8 @@ internal class RecoveryWordChoiceButton(
   }
 
   private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+  companion object {
+    private const val VERTICAL_PADDING_DP = 20
+  }
 }

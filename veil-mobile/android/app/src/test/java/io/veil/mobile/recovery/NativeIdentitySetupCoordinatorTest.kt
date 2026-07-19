@@ -5,7 +5,9 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -216,6 +218,92 @@ class NativeIdentitySetupCoordinatorTest {
     NativeIdentitySetupCoordinator.detach(lostClientLease, adoptedActivity)
 
     assertTrue(NativeIdentitySetupCoordinator.acquire() != null)
+  }
+
+  @Test
+  fun strictIdentityReadRejectsReadyAndCommittingThenReadsAfterTerminal() {
+    val reads = AtomicInteger(0)
+    val lease = requireNotNull(NativeIdentitySetupCoordinator.acquire())
+
+    assertThrowsUnsettled {
+      NativeIdentitySetupCoordinator.withSettledIdentityRead {
+        reads.incrementAndGet()
+        false
+      }
+    }
+    assertEquals(0, reads.get())
+
+    val owner = RecordingCeremony()
+    assertEquals(
+      NativeIdentitySetupCoordinator.Attachment.OWNER,
+      NativeIdentitySetupCoordinator.attachOrAdopt(lease, owner),
+    )
+    val work = BlockingWork()
+    assertTrue(NativeIdentitySetupCoordinator.beginCommit(lease, owner, work))
+    assertTrue(work.started.await(5, TimeUnit.SECONDS))
+
+    assertThrowsUnsettled {
+      NativeIdentitySetupCoordinator.withSettledIdentityRead {
+        reads.incrementAndGet()
+        false
+      }
+    }
+    assertEquals(0, reads.get())
+
+    work.release.countDown()
+    assertTrue(owner.delivered.await(5, TimeUnit.SECONDS))
+    assertEquals(NativeIdentitySetupCoordinator.CoordinatorEvent.COMMITTED, owner.event.get())
+    assertTrue(
+      NativeIdentitySetupCoordinator.withSettledIdentityRead {
+        reads.incrementAndGet()
+        true
+      },
+    )
+    assertEquals(1, reads.get())
+  }
+
+  @Test
+  fun acquireCannotLinearizeInsideASettledIdentityRead() {
+    val readStarted = CountDownLatch(1)
+    val releaseRead = CountDownLatch(1)
+    val readFinished = CountDownLatch(1)
+    val acquireStarted = CountDownLatch(1)
+    val acquireFinished = CountDownLatch(1)
+    val acquired = AtomicReference<NativeIdentitySetupCoordinator.Lease?>()
+
+    val reader = thread(start = true, isDaemon = true, name = "settled-identity-read-test") {
+      NativeIdentitySetupCoordinator.withSettledIdentityRead {
+        readStarted.countDown()
+        check(releaseRead.await(5, TimeUnit.SECONDS)) { "identity read was not released" }
+        true
+      }
+      readFinished.countDown()
+    }
+    assertTrue(readStarted.await(5, TimeUnit.SECONDS))
+
+    val acquirer = thread(start = true, isDaemon = true, name = "identity-acquire-test") {
+      acquireStarted.countDown()
+      acquired.set(NativeIdentitySetupCoordinator.acquire())
+      acquireFinished.countDown()
+    }
+    assertTrue(acquireStarted.await(5, TimeUnit.SECONDS))
+    assertFalse(acquireFinished.await(100, TimeUnit.MILLISECONDS))
+
+    releaseRead.countDown()
+    assertTrue(readFinished.await(5, TimeUnit.SECONDS))
+    assertTrue(acquireFinished.await(5, TimeUnit.SECONDS))
+    reader.join(5_000L)
+    acquirer.join(5_000L)
+    assertTrue(acquired.get() != null)
+  }
+
+  private fun assertThrowsUnsettled(operation: () -> Unit) {
+    try {
+      operation()
+      throw AssertionError("expected NativeIdentitySetupUnsettledException")
+    } catch (_: NativeIdentitySetupUnsettledException) {
+      // Expected: the strict read must remain ambiguous until terminal.
+    }
   }
 
   private class RecordingCeremony : NativeIdentitySetupCoordinator.Ceremony {

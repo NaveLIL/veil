@@ -20,21 +20,32 @@ import {
 } from "../native/identitySetup";
 
 interface OnboardingScreenProps {
-  onCommitted: () => void | Promise<void>;
+  onVerifyIdentity: () => Promise<IdentityVerificationResult>;
   reducedMotion: boolean;
 }
+
+export type IdentityVerificationResult = "present" | "absent" | "unknown";
 
 const PUBLIC_SETUP_ERROR =
   "Secure setup could not be completed. Nothing changed. Please try again.";
 const PUBLIC_REFRESH_ERROR =
-  "Identity setup finished, but secure status could not be refreshed. Close Veil and reopen it.";
+  "Native setup reported completion, but Veil could not verify the encrypted local account. Keep the recovery phrase, close and reopen Veil, and do not start setup again yet.";
+const PUBLIC_CREATE_CANCELLED =
+  "Setup was cancelled. If a new recovery phrase was shown, it was not committed and must be destroyed before trying again.";
+const PUBLIC_CREATE_INTERRUPTION_ABSENT =
+  "Secure setup was interrupted and Veil verified that no local identity was committed. Any new recovery phrase from that attempt is invalid and must be destroyed before starting again.";
+const PUBLIC_RESTORE_INTERRUPTION_ABSENT =
+  "Secure restore was interrupted and Veil verified that no local identity was committed. Keep your existing recovery phrase and reopen Veil before trying again.";
+const PUBLIC_INTERRUPTION_UNKNOWN =
+  "Secure setup was interrupted, but Veil could not verify whether the local identity was committed. Keep any recovery phrase, close and reopen Veil, and do not start setup again until the local account check finishes.";
 
 export default function OnboardingScreen({
-  onCommitted,
+  onVerifyIdentity,
   reducedMotion,
 }: OnboardingScreenProps) {
   const [activeMode, setActiveMode] = useState<NativeIdentitySetupMode | null>(null);
   const [publicError, setPublicError] = useState<string | null>(null);
+  const [restartBlocked, setRestartBlocked] = useState(false);
   const mounted = useRef(true);
   const entrance = useRef(new Animated.Value(reducedMotion ? 1 : 0)).current;
 
@@ -61,11 +72,11 @@ export default function OnboardingScreen({
   }, [entrance, reducedMotion]);
 
   const beginSetup = async (mode: NativeIdentitySetupMode): Promise<void> => {
-    if (activeMode) return;
+    if (activeMode || restartBlocked) return;
     setPublicError(null);
     setActiveMode(mode);
 
-    let result: "committed" | "cancelled";
+    let result: Awaited<ReturnType<typeof beginNativeIdentitySetup>>;
     try {
       result = await beginNativeIdentitySetup(mode);
     } catch {
@@ -74,21 +85,47 @@ export default function OnboardingScreen({
       return;
     }
 
-    if (!mounted.current || result === "cancelled") {
-      if (mounted.current) setActiveMode(null);
+    if (!mounted.current) return;
+    if (result === "user_cancelled") {
+      if (mode === "create") setPublicError(PUBLIC_CREATE_CANCELLED);
+      setActiveMode(null);
       return;
     }
 
+    let verification: IdentityVerificationResult;
     try {
-      await onCommitted();
+      verification = await onVerifyIdentity();
     } catch {
-      if (mounted.current) setPublicError(PUBLIC_REFRESH_ERROR);
-    } finally {
-      if (mounted.current) setActiveMode(null);
+      verification = "unknown";
     }
+    if (!mounted.current) return;
+
+    if (result === "interrupted") {
+      if (verification === "present") {
+        setActiveMode(null);
+        return;
+      }
+      setPublicError(
+        verification === "absent"
+          ? mode === "create"
+            ? PUBLIC_CREATE_INTERRUPTION_ABSENT
+            : PUBLIC_RESTORE_INTERRUPTION_ABSENT
+          : PUBLIC_INTERRUPTION_UNKNOWN,
+      );
+      setRestartBlocked(verification === "unknown");
+      setActiveMode(null);
+      return;
+    }
+
+    if (verification !== "present") {
+      setPublicError(PUBLIC_REFRESH_ERROR);
+      setRestartBlocked(true);
+    }
+    setActiveMode(null);
   };
 
   const busy = activeMode !== null;
+  const setupDisabled = busy || restartBlocked;
   const animatedStyle = reducedMotion
     ? undefined
     : {
@@ -174,7 +211,7 @@ export default function OnboardingScreen({
                   marker="+"
                   variant="primary"
                   loading={activeMode === "create"}
-                  disabled={busy}
+                  disabled={setupDisabled}
                   onPress={() => void beginSetup("create")}
                 />
                 <SetupButton
@@ -184,7 +221,7 @@ export default function OnboardingScreen({
                   marker="↙"
                   variant="secondary"
                   loading={activeMode === "restore"}
-                  disabled={busy}
+                  disabled={setupDisabled}
                   onPress={() => void beginSetup("restore")}
                 />
               </View>

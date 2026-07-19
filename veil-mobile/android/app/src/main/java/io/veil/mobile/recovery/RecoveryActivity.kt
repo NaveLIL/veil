@@ -6,12 +6,16 @@ import android.content.Intent
 import android.content.res.Configuration
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
+import android.graphics.drawable.StateListDrawable
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
+import android.view.ViewTreeObserver
+import android.view.WindowInsets
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.GridLayout
@@ -28,18 +32,22 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Process-local, screenshot-proof recovery ceremony.
  *
  * Only a non-secret create/restore mode and process lease enter this Activity,
- * and only an empty RESULT_OK/RESULT_CANCELED leaves it. Recovery words never cross Intent,
- * Bundle, React Native, clipboard, autofill, accessibility, or the system IME.
+ * and only a non-secret terminal outcome plus lease correlation leaves it. Recovery words never
+ * cross Intent, Bundle, React Native, clipboard, autofill, accessibility, or the system IME.
  */
 internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Ceremony {
   private val terminal = AtomicBoolean(false)
   private val commitStarted = AtomicBoolean(false)
   private val foregroundGate = RecoveryForegroundGate()
+  private val setupActionGuard = RecoverySetupActionGuard(ADVANCING_ACTION_DEBOUNCE_MS)
   private var pendingMode: RecoveryMode? = null
   private var controller: RecoveryFlowController? = null
   private var dictionary: RecoveryWordDictionary? = null
   private var provisioner: NativeIdentityProvisioner? = null
   private var sensitiveRoot: ViewGroup? = null
+  private var secureScroll: ScrollView? = null
+  private var renderedStage: RecoveryStage? = null
+  private var activeRenderGeneration = 0L
   private var backCallback: Any? = null
   private var setupLease: NativeIdentitySetupCoordinator.Lease? = null
   private var coordinatorAttached = false
@@ -65,7 +73,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     val mode = intent?.getStringExtra(EXTRA_MODE)?.let(RecoveryMode::fromBridge)
     val leaseId = intent?.getLongExtra(EXTRA_LEASE_ID, INVALID_LEASE_ID) ?: INVALID_LEASE_ID
     if (mode == null || leaseId <= 0) {
-      finishCancelled()
+      finishInterrupted()
       return
     }
     val lease = NativeIdentitySetupCoordinator.Lease(leaseId)
@@ -91,7 +99,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       }
       NativeIdentitySetupCoordinator.Attachment.REJECTED -> {
         NativeIdentitySetupCoordinator.discardRejected(lease)
-        finishCancelled()
+        finishInterrupted()
         return
       }
     }
@@ -107,8 +115,8 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       pendingMode = mode
     } catch (_: Throwable) {
       // Do not reflect crypto, word-list, or storage diagnostics into another
-      // Activity. The bridge receives only the cancelled terminal status.
-      finishCancelled()
+      // Activity. The bridge receives only the interrupted terminal status.
+      finishInterrupted()
     }
   }
 
@@ -177,7 +185,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
           if (transactionUi == TransactionUi.COMMITTING) {
             handleVisibilityLoss()
           } else {
-            finishCancelled()
+            finishInterrupted()
           }
         }
         NativeIdentitySetupCoordinator.CoordinatorEvent.COMMITTED -> finishCommitted()
@@ -216,21 +224,20 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     if (!interactive || terminal.get()) return
     when (transactionUi) {
       TransactionUi.SETUP -> renderSetup()
-      TransactionUi.COMMITTING -> {
-        val root = newSecureRoot()
-        root.addView(brandHeader())
-        root.addView(space(24))
-        renderCommitting(root)
-        installSecureRoot(root)
-      }
-      TransactionUi.FAILED -> {
-        val root = newSecureRoot()
-        root.addView(brandHeader())
-        root.addView(space(24))
-        renderFailed(root)
-        installSecureRoot(root)
-      }
+      TransactionUi.COMMITTING -> renderTransactionUi(::renderCommitting)
+      TransactionUi.FAILED -> renderTransactionUi(::renderFailed)
     }
+  }
+
+  private fun renderTransactionUi(render: (LinearLayout) -> Unit) {
+    renderedStage = null
+    val root = beginSecureRoot()
+    root.addView(brandHeader())
+    root.addView(space(20))
+    val island = newStageIsland()
+    root.addView(island, islandLayout())
+    render(island)
+    installSecureRoot(root)
   }
 
   private fun renderSetup() {
@@ -243,23 +250,31 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     }
     val flow = controller ?: return
     val words = dictionary ?: return
-    clearSensitiveViews()
-
-    val root = newSecureRoot()
+    val stage = flow.stage
+    val retainedScrollY = RecoveryUiSafety.retainedScrollY(
+      previousStage = renderedStage,
+      nextStage = stage,
+      currentScrollY = secureScroll?.scrollY ?: 0,
+    )
+    val root = beginSecureRoot()
+    val generation = activeRenderGeneration
     root.addView(brandHeader())
-    root.addView(space(24))
+    root.addView(space(20))
+    val island = newStageIsland()
+    root.addView(island, islandLayout())
 
-    when (flow.stage) {
-      RecoveryStage.CREATE_REVIEW -> renderCreateReview(root, flow, words)
-      RecoveryStage.CREATE_CHALLENGE -> renderCreateChallenge(root, flow, words)
-      RecoveryStage.RESTORE_ENTRY -> renderRestoreEntry(root, flow, words)
-      RecoveryStage.READY_TO_COMMIT -> renderReady(root, flow)
-      RecoveryStage.COMMITTING -> renderCommitting(root)
-      RecoveryStage.CLOSED -> renderFailed(root)
+    when (stage) {
+      RecoveryStage.CREATE_REVIEW -> renderCreateReview(island, flow, words, generation)
+      RecoveryStage.CREATE_CHALLENGE -> renderCreateChallenge(island, flow, words, generation)
+      RecoveryStage.RESTORE_ENTRY -> renderRestoreEntry(island, flow, words, generation)
+      RecoveryStage.READY_TO_COMMIT -> renderReady(island, flow, generation)
+      RecoveryStage.COMMITTING -> renderCommitting(island)
+      RecoveryStage.CLOSED -> renderFailed(island)
       RecoveryStage.COMMITTED -> Unit
     }
 
-    installSecureRoot(root)
+    renderedStage = stage
+    installSecureRoot(root, retainedScrollY)
   }
 
   private fun ensureSetupInitialized(): Boolean {
@@ -285,26 +300,93 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
         true
       }
     } catch (_: Throwable) {
-      finishCancelledTerminal()
+      finishTerminal(NativeIdentitySetupOutcome.INTERRUPTED)
       false
     }
   }
 
   private fun newSecureRoot(): LinearLayout = LinearLayout(this).apply {
+    id = R.id.recovery_secure_root
     orientation = LinearLayout.VERTICAL
-    setPadding(dp(24), dp(24), dp(24), dp(40))
+    gravity = Gravity.CENTER_HORIZONTAL
+    applyRecoveryInsets()
     setBackgroundColor(color(R.color.recoveryBackground))
-    fitsSystemWindows = true
     excludeFromAutofill(hideDescendants = true)
     excludeFromContentCapture(hideDescendants = true)
     filterTouchesWhenObscured = true
   }
 
-  private fun installSecureRoot(root: LinearLayout) {
+  /** Registers the root before any secret child or callback can be constructed. */
+  private fun beginSecureRoot(): LinearLayout {
     clearSensitiveViews()
+    return newSecureRoot().also { root -> sensitiveRoot = root }
+  }
+
+  @Suppress("DEPRECATION")
+  private fun View.applyRecoveryInsets() {
+    val baseHorizontal = dp(ROOT_HORIZONTAL_INSET_DP)
+    val baseTop = dp(20)
+    val baseBottom = dp(40)
+    setPadding(baseHorizontal, baseTop, baseHorizontal, baseBottom)
+    setOnApplyWindowInsetsListener { view, insets ->
+      val left: Int
+      val top: Int
+      val right: Int
+      val bottom: Int
+      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        val safeInsets = insets.getInsets(
+          WindowInsets.Type.systemBars() or WindowInsets.Type.displayCutout(),
+        )
+        left = safeInsets.left
+        top = safeInsets.top
+        right = safeInsets.right
+        bottom = safeInsets.bottom
+      } else {
+        val cutoutSafe =
+          if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) Api28Cutout.safeInsets(insets) else null
+        left = maxOf(insets.systemWindowInsetLeft, cutoutSafe?.left ?: 0)
+        top = maxOf(insets.systemWindowInsetTop, cutoutSafe?.top ?: 0)
+        right = maxOf(insets.systemWindowInsetRight, cutoutSafe?.right ?: 0)
+        bottom = maxOf(insets.systemWindowInsetBottom, cutoutSafe?.bottom ?: 0)
+      }
+      view.setPadding(
+        baseHorizontal + left,
+        baseTop + top,
+        baseHorizontal + right,
+        baseBottom + bottom,
+      )
+      insets
+    }
+  }
+
+  private fun newStageIsland(): LinearLayout = RecoveryIslandLayout(
+    context = this,
+    maxWidthDp = ISLAND_MAX_WIDTH_DP,
+  ).apply {
+    id = R.id.recovery_stage_island
+    orientation = LinearLayout.VERTICAL
+    setPadding(dp(20), dp(22), dp(20), dp(22))
+    background = roundedSurface(R.color.recoverySurface, 20, R.color.recoveryBorder)
+    excludeFromAutofill(hideDescendants = true)
+    excludeFromContentCapture(hideDescendants = true)
+    filterTouchesWhenObscured = true
+  }
+
+  private fun islandLayout(): LinearLayout.LayoutParams = LinearLayout.LayoutParams(
+    ViewGroup.LayoutParams.MATCH_PARENT,
+    ViewGroup.LayoutParams.WRAP_CONTENT,
+  ).apply {
+    gravity = Gravity.CENTER_HORIZONTAL
+  }
+
+  private fun installSecureRoot(root: LinearLayout, retainedScrollY: Int = 0) {
+    check(sensitiveRoot === root) { "secure recovery root ownership changed" }
     val scroll = ScrollView(this).apply {
+      id = R.id.recovery_secure_scroll
       isFillViewport = true
       isSaveEnabled = false
+      isVerticalScrollBarEnabled = false
+      overScrollMode = View.OVER_SCROLL_NEVER
       addView(
         root,
         ViewGroup.LayoutParams(
@@ -313,34 +395,55 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
         ),
       )
     }
-    sensitiveRoot = root
+    secureScroll = scroll
     setContentView(scroll)
+    restoreScrollBeforeFirstDraw(scroll, retainedScrollY)
+  }
+
+  private fun restoreScrollBeforeFirstDraw(scroll: ScrollView, retainedScrollY: Int) {
+    if (retainedScrollY <= 0) return
+    scroll.viewTreeObserver.addOnPreDrawListener(
+      object : ViewTreeObserver.OnPreDrawListener {
+        override fun onPreDraw(): Boolean {
+          if (scroll.viewTreeObserver.isAlive) {
+            scroll.viewTreeObserver.removeOnPreDrawListener(this)
+          }
+          if (secureScroll !== scroll || terminal.get()) return true
+          val child = scroll.getChildAt(0) ?: return true
+          val viewport = (scroll.height - scroll.paddingTop - scroll.paddingBottom).coerceAtLeast(0)
+          val maxScrollY = (child.measuredHeight - viewport).coerceAtLeast(0)
+          scroll.scrollTo(0, retainedScrollY.coerceIn(0, maxScrollY))
+          return true
+        }
+      },
+    )
   }
 
   private fun renderCreateReview(
     root: LinearLayout,
     flow: RecoveryFlowController,
     words: RecoveryWordDictionary,
+    generation: Long,
   ) {
     root.addView(titleText(getString(R.string.recovery_create_title)))
     root.addView(bodyText(getString(R.string.recovery_create_intro)))
     root.addView(space(18))
-    root.addView(recoveryWordGrid(flow, words))
+    addRecoveryWordGrid(root, flow, words)
     root.addView(space(12))
     root.addView(privacyNotice())
     root.addView(space(24))
-    root.addView(primaryButton(getString(R.string.recovery_continue)) {
-      flow.continueFromCreateReview()
-      renderCurrentUi()
+    root.addOwnedButton(primaryButton(getString(R.string.recovery_continue)) {
+      performAdvancingSetupAction(generation) { flow.continueFromCreateReview() }
     })
     root.addView(space(10))
-    root.addView(secondaryButton(getString(R.string.recovery_cancel)) { finishCancelled() })
+    root.addOwnedButton(cancelSetupButton(generation))
   }
 
   private fun renderCreateChallenge(
     root: LinearLayout,
     flow: RecoveryFlowController,
     words: RecoveryWordDictionary,
+    generation: Long,
   ) {
     root.addView(titleText(getString(R.string.recovery_challenge_title)))
     root.addView(
@@ -355,32 +458,42 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
 
     val secretChoices = LinearLayout(this).apply {
       orientation = LinearLayout.VERTICAL
+      layoutParams = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+      )
       importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
       excludeFromAutofill(hideDescendants = true)
       excludeFromContentCapture(hideDescendants = true)
     }
+    root.addView(secretChoices)
     val choices = flow.challengeChoices()
     try {
       for (index in choices) {
-        secretChoices.addView(secretChoiceButton(words.word(index), index) { chosen ->
-          flow.chooseChallengeWord(chosen)
-          renderCurrentUi()
-        })
+        val button = secretChoiceButton(words.word(index), index) { chosen ->
+          performAdvancingSetupAction(generation) { flow.chooseChallengeWord(chosen) }
+        }
+        try {
+          secretChoices.addView(button)
+        } catch (failure: Throwable) {
+          button.wipe()
+          throw failure
+        }
         secretChoices.addView(space(10))
       }
     } finally {
       choices.fill(-1)
     }
-    root.addView(secretChoices)
     root.addView(privacyNotice())
     root.addView(space(18))
-    root.addView(secondaryButton(getString(R.string.recovery_cancel)) { finishCancelled() })
+    root.addOwnedButton(cancelSetupButton(generation))
   }
 
   private fun renderRestoreEntry(
     root: LinearLayout,
     flow: RecoveryFlowController,
     words: RecoveryWordDictionary,
+    generation: Long,
   ) {
     root.addView(titleText(getString(R.string.recovery_restore_title)))
     root.addView(bodyText(getString(R.string.recovery_restore_intro)))
@@ -398,78 +511,126 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       root.addView(issueText(getString(R.string.recovery_invalid_phrase)))
     }
     root.addView(space(12))
-    root.addView(recoveryWordGrid(flow, words))
+    addRecoveryWordGrid(root, flow, words)
     root.addView(space(16))
 
     val secretInput = LinearLayout(this).apply {
       orientation = LinearLayout.VERTICAL
+      layoutParams = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+      )
       setPadding(dp(16), dp(14), dp(16), dp(14))
-      background = roundedSurface(R.color.recoverySurfaceRaised, 14)
+      background = roundedSurface(R.color.recoverySurfaceLow, 14, R.color.recoveryBorder)
       importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
       excludeFromAutofill(hideDescendants = true)
       excludeFromContentCapture(hideDescendants = true)
     }
+    root.addView(secretInput)
     secretInput.addView(eyebrowText(getString(R.string.recovery_private_input)))
     val inputChars = flow.inputCopy()
     try {
-      secretInput.addView(RecoveryPrivateInputView(this, inputChars))
+      val inputView = RecoveryPrivateInputView(this, inputChars)
+      try {
+        secretInput.addView(
+          inputView,
+          LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+          ),
+        )
+      } catch (failure: Throwable) {
+        inputView.wipe()
+        throw failure
+      }
     } finally {
       inputChars.fill('\u0000')
     }
     secretInput.addView(space(10))
 
-    val suggestions = flow.suggestions()
+    val suggestionRow = GridLayout(this).apply {
+      columnCount = if (isLargeFont()) 1 else SUGGESTION_COLUMN_COUNT
+      layoutParams = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+      )
+      importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+      excludeFromAutofill(hideDescendants = true)
+      excludeFromContentCapture(hideDescendants = true)
+    }
+    secretInput.addView(suggestionRow)
+    val suggestions = flow.suggestions(SUGGESTION_SLOT_COUNT)
     try {
-      if (suggestions.isNotEmpty()) {
-        val suggestionRow = GridLayout(this).apply {
-          columnCount = 2
-          importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
-        }
-        for (index in suggestions) {
-          val button = secretChoiceButton(words.word(index), index) { chosen ->
-            flow.chooseImportWord(chosen)
-            renderCurrentUi()
-          }
-          suggestionRow.addView(button, gridCell())
-        }
-        secretInput.addView(suggestionRow)
+      for (index in suggestions) {
+        addSecretChoiceCell(
+          suggestionRow,
+          secretChoiceButton(words.word(index), index) { chosen ->
+            performAdvancingSetupAction(generation) { flow.chooseImportWord(chosen) }
+          },
+        )
+      }
+      repeat(
+        RecoveryUiSafety.placeholderCount(
+          actualSuggestions = suggestions.size,
+          reservedSlots = SUGGESTION_SLOT_COUNT,
+        ),
+      ) {
+        addSecretChoiceCell(suggestionRow, secretChoicePlaceholder())
       }
     } finally {
       suggestions.fill(-1)
     }
-    root.addView(secretInput)
     root.addView(space(14))
-    root.addView(alphabetKeyboard(flow))
+    addAlphabetKeyboard(root, flow, generation)
     root.addView(space(10))
 
-    val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-    actions.addView(
+    val actions = LinearLayout(this).apply {
+      orientation = if (isLargeFont()) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+      layoutParams = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+      )
+    }
+    root.addView(actions)
+    val actionCell = if (isLargeFont()) fullWidthCell() else weightedCell()
+    actions.addOwnedButton(
       secondaryButton(getString(R.string.recovery_erase)) {
-        flow.eraseInput()
-        renderCurrentUi()
+        performSetupAction(generation) { flow.eraseInput() }
       },
-      weightedCell(),
+      actionCell,
     )
     actions.addView(space(10))
-    actions.addView(
+    actions.addOwnedButton(
       secondaryButton(getString(R.string.recovery_clear)) {
-        while (flow.eraseInput()) Unit
-        renderCurrentUi()
+        performSetupAction(generation) { while (flow.eraseInput()) Unit }
       },
-      weightedCell(),
+      if (isLargeFont()) fullWidthCell() else weightedCell(),
     )
-    root.addView(actions)
     root.addView(space(12))
     root.addView(privacyNotice())
     root.addView(space(18))
-    root.addView(secondaryButton(getString(R.string.recovery_cancel)) { finishCancelled() })
+    root.addOwnedButton(cancelSetupButton(generation))
   }
 
-  private fun renderReady(root: LinearLayout, flow: RecoveryFlowController) {
+  private fun renderReady(
+    root: LinearLayout,
+    flow: RecoveryFlowController,
+    generation: Long,
+  ) {
     root.addView(titleText(getString(R.string.recovery_ready_title)))
-    root.addView(bodyText(getString(R.string.recovery_ready_body)))
-    root.addView(space(28))
     root.addView(
+      bodyText(
+        getString(
+          if (flow.mode == RecoveryMode.CREATE) {
+            R.string.recovery_ready_body_create
+          } else {
+            R.string.recovery_ready_body_restore
+          },
+        ),
+      ),
+    )
+    root.addView(space(28))
+    root.addOwnedButton(
       primaryButton(
         getString(
           if (flow.mode == RecoveryMode.CREATE) {
@@ -478,10 +639,12 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
             R.string.recovery_commit_restore
           },
         ),
-      ) { beginCommit() },
+      ) {
+        performAdvancingSetupAction(generation, renderAfterAction = false) { beginCommit() }
+      },
     )
     root.addView(space(10))
-    root.addView(secondaryButton(getString(R.string.recovery_cancel)) { finishCancelled() })
+    root.addOwnedButton(cancelSetupButton(generation))
   }
 
   private fun renderCommitting(root: LinearLayout) {
@@ -499,7 +662,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     root.addView(titleText(getString(R.string.recovery_failed_title)))
     root.addView(bodyText(getString(R.string.recovery_failed_body)))
     root.addView(space(28))
-    root.addView(primaryButton(getString(R.string.recovery_close)) { finishCancelled() })
+    root.addOwnedButton(primaryButton(getString(R.string.recovery_close)) { finishInterrupted() })
   }
 
   private fun beginCommit() {
@@ -560,36 +723,147 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   private fun handleBack() {
     if (transactionUi == TransactionUi.COMMITTING) return
     if (transactionUi == TransactionUi.FAILED) {
-      finishCancelled()
+      finishInterrupted()
       return
     }
     val flow = controller
     if (flow == null) {
-      finishCancelled()
+      finishInterrupted()
       return
     }
-    when (flow.handleBack()) {
-      RecoveryBackResult.UPDATED -> renderCurrentUi()
-      RecoveryBackResult.CANCEL -> finishCancelled()
-      RecoveryBackResult.BLOCKED -> Unit
+    performSetupAction(activeRenderGeneration) {
+      when (flow.handleBack()) {
+        RecoveryBackResult.UPDATED -> Unit
+        RecoveryBackResult.CANCEL -> finishUserCancelled()
+        RecoveryBackResult.BLOCKED -> Unit
+      }
     }
   }
 
-  private fun finishCancelled() {
+  private fun performSetupAction(
+    expectedGeneration: Long,
+    renderAfterAction: Boolean = true,
+    action: () -> Unit,
+  ) {
+    setupActionGuard.perform(
+      expectedGeneration = expectedGeneration,
+      currentGeneration = activeRenderGeneration,
+      setupEnabled = !terminal.get() && transactionUi == TransactionUi.SETUP,
+      advancing = false,
+      nowMs = 0L,
+      action = action,
+      render = { if (renderAfterAction) renderCurrentUi() },
+      failClosed = ::failSetupUi,
+    )
+  }
+
+  private fun performAdvancingSetupAction(
+    expectedGeneration: Long,
+    renderAfterAction: Boolean = true,
+    action: () -> Unit,
+  ) {
+    setupActionGuard.perform(
+      expectedGeneration = expectedGeneration,
+      currentGeneration = activeRenderGeneration,
+      setupEnabled = !terminal.get() && transactionUi == TransactionUi.SETUP,
+      advancing = true,
+      nowMs = SystemClock.elapsedRealtime(),
+      action = action,
+      render = { if (renderAfterAction) renderCurrentUi() },
+      failClosed = ::failSetupUi,
+    )
+  }
+
+  private fun failSetupUi() {
+    if (terminal.get() || transactionUi == TransactionUi.COMMITTING) return
+    try {
+      val failedController = controller
+      controller = null
+      dictionary = null
+      provisioner = null
+      transactionUi = TransactionUi.FAILED
+      try {
+        failedController?.markSetupFailed()
+      } catch (_: Throwable) {
+        try {
+          failedController?.close()
+        } catch (_: Throwable) {
+          // The generic terminal UI still must not expose the native failure.
+        }
+      }
+      clearSensitiveViews()
+      if (interactive) {
+        try {
+          renderCurrentUi()
+        } catch (_: Throwable) {
+          forceFinishCancelledAfterUiFailure()
+        }
+      }
+    } catch (_: Throwable) {
+      forceFinishCancelledAfterUiFailure()
+    }
+  }
+
+  /** Last-resort no-throw terminal path used only when even generic failure UI cannot render. */
+  private fun forceFinishCancelledAfterUiFailure() {
+    terminal.set(true)
+    try {
+      foregroundGate.markBackground()
+    } catch (_: Throwable) {
+      // Continue removing every remaining reference.
+    }
+    try {
+      clearSensitiveViews()
+    } catch (_: Throwable) {
+      // clearSensitiveViews is no-throw by construction; retain the outer guard.
+    }
+    val abandonedController = controller
+    controller = null
+    dictionary = null
+    provisioner = null
+    pendingMode = null
+    try {
+      abandonedController?.close()
+    } catch (_: Throwable) {
+      // Native cleanup failure must not re-enter the main loop.
+    }
+    try {
+      setTerminalResult(NativeIdentitySetupOutcome.INTERRUPTED)
+    } catch (_: Throwable) {
+      try {
+        setResult(RESULT_CANCELED)
+      } catch (_: Throwable) {
+        // Activity teardown remains the final boundary.
+      }
+    }
+    try {
+      finish()
+    } catch (_: Throwable) {
+      // No recovery material or diagnostic is reflected outside this Activity.
+    }
+  }
+
+  private fun finishInterrupted() {
     if (transactionUi == TransactionUi.COMMITTING) {
       handleVisibilityLoss()
       return
     }
-    finishCancelledTerminal()
+    finishTerminal(NativeIdentitySetupOutcome.INTERRUPTED)
   }
 
-  private fun finishCancelledTerminal() {
+  private fun finishUserCancelled() {
+    if (transactionUi == TransactionUi.COMMITTING) return
+    finishTerminal(NativeIdentitySetupOutcome.USER_CANCELLED)
+  }
+
+  private fun finishTerminal(outcome: NativeIdentitySetupOutcome) {
+    check(outcome != NativeIdentitySetupOutcome.COMMITTED)
     if (!terminal.compareAndSet(false, true)) return
     foregroundGate.markBackground()
     clearSensitiveViews()
     controller?.close()
     controller = null
-    setTerminalResult(RESULT_CANCELED)
+    setTerminalResult(outcome)
     finish()
   }
 
@@ -601,20 +875,17 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     if (!terminal.compareAndSet(false, true)) return
     foregroundGate.markBackground()
     clearSensitiveViews()
-    setTerminalResult(RESULT_OK)
+    setTerminalResult(NativeIdentitySetupOutcome.COMMITTED)
     finish()
   }
 
-  private fun setTerminalResult(resultCode: Int) {
+  private fun setTerminalResult(outcome: NativeIdentitySetupOutcome) {
+    val resultCode =
+      if (outcome == NativeIdentitySetupOutcome.COMMITTED) RESULT_OK else RESULT_CANCELED
+    val result = Intent().putExtra(EXTRA_RESULT_OUTCOME, outcome.bridgeValue)
     val lease = setupLease
-    if (lease == null) {
-      setResult(resultCode)
-    } else {
-      setResult(
-        resultCode,
-        Intent().putExtra(EXTRA_RESULT_LEASE_ID, lease.id),
-      )
-    }
+    if (lease != null) result.putExtra(EXTRA_RESULT_LEASE_ID, lease.id)
+    setResult(resultCode, result)
   }
 
   private fun handleVisibilityLoss() {
@@ -622,7 +893,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     clearSensitiveViews()
     if (transactionUi == TransactionUi.COMMITTING) return
     if (!isChangingConfigurations && !isFinishing && !terminal.get()) {
-      finishCancelledTerminal()
+      finishTerminal(NativeIdentitySetupOutcome.INTERRUPTED)
     }
   }
 
@@ -641,58 +912,94 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   }
 
   private fun brandHeader(): View {
+    val stacked = isLargeFont()
     val row = LinearLayout(this).apply {
-      orientation = LinearLayout.HORIZONTAL
-      gravity = Gravity.CENTER_VERTICAL
+      orientation = if (stacked) LinearLayout.VERTICAL else LinearLayout.HORIZONTAL
+      gravity = if (stacked) Gravity.CENTER else Gravity.CENTER_VERTICAL
+      layoutParams = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+      ).apply {
+        gravity = Gravity.CENTER_HORIZONTAL
+      }
     }
     row.addView(
       PhaseShiftMarkView(this),
       LinearLayout.LayoutParams(dp(40), dp(40)),
     )
     row.addView(space(12))
-    row.addView(eyebrowText(getString(R.string.recovery_brand)))
+    row.addView(eyebrowText(getString(R.string.recovery_brand)).apply {
+      if (stacked) gravity = Gravity.CENTER
+    })
     return row
   }
 
-  private fun recoveryWordGrid(
+  private fun addRecoveryWordGrid(
+    parent: ViewGroup,
     flow: RecoveryFlowController,
     words: RecoveryWordDictionary,
-  ): View {
-    val indices = IntArray(flow.wordCount()) { position -> flow.wordIndex(position) }
-    return try {
-      RecoveryPhraseGridView(
+  ) {
+    val ownedIndices = IntArray(flow.wordCount()) { position -> flow.wordIndex(position) }
+    var grid: RecoveryPhraseGridView? = null
+    var ownershipTransferred = false
+    try {
+      grid = RecoveryPhraseGridView(
         context = this,
         dictionary = words,
-        sourceIndices = indices,
+        ownedIndices = ownedIndices,
       ).apply {
         setPadding(dp(10), dp(10), dp(10), dp(10))
+        layoutParams = LinearLayout.LayoutParams(
+          ViewGroup.LayoutParams.MATCH_PARENT,
+          ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
         tag = SECRET_VIEW_TAG
       }
+      parent.addView(grid)
+      ownershipTransferred = true
+    } catch (failure: Throwable) {
+      grid?.wipe()
+      throw failure
     } finally {
-      indices.fill(-1)
+      if (!ownershipTransferred) ownedIndices.fill(-1)
     }
   }
 
-  private fun alphabetKeyboard(flow: RecoveryFlowController): View {
+  private fun addAlphabetKeyboard(
+    parent: ViewGroup,
+    flow: RecoveryFlowController,
+    generation: Long,
+  ) {
     val grid = GridLayout(this).apply {
-      columnCount = if (resources.configuration.screenWidthDp >= 600) 8 else 5
+      columnCount = RecoveryUiSafety.alphabetColumns(
+        screenWidthDp = resources.configuration.screenWidthDp,
+        fontScale = resources.configuration.fontScale,
+      )
       alignmentMode = GridLayout.ALIGN_BOUNDS
       useDefaultMargins = false
+      layoutParams = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+      )
     }
+    parent.addView(grid)
     for (letter in 'A'..'Z') {
       val button = compactButton(letter.toString()) {
-        flow.appendInput(letter.lowercaseChar())
-        renderCurrentUi()
+        performSetupAction(generation) { flow.appendInput(letter.lowercaseChar()) }
       }
-      grid.addView(button, gridCell(minimumHeightDp = 48))
+      try {
+        grid.addView(button, gridCell())
+      } catch (failure: Throwable) {
+        button.setOnClickListener(null)
+        throw failure
+      }
     }
-    return grid
   }
 
   private fun titleText(value: String): TextView = TextView(this).apply {
     text = value
     setTextColor(color(R.color.recoveryText))
-    textSize = 28f
+    textSize = 26f
     typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
     setLineSpacing(0f, 1.08f)
   }
@@ -700,7 +1007,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   private fun bodyText(value: String): TextView = TextView(this).apply {
     text = value
     setTextColor(color(R.color.recoveryTextMuted))
-    textSize = 16f
+    textSize = 15f
     setLineSpacing(0f, 1.25f)
     setPadding(0, dp(10), 0, 0)
   }
@@ -727,21 +1034,73 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   }
 
   private fun primaryButton(value: String, action: () -> Unit): Button =
-    actionButton(value, R.color.recoveryPrimary, R.color.recoveryBackground, action)
+    actionButton(
+      value,
+      R.color.recoveryPrimary,
+      R.color.recoveryPrimaryPressed,
+      R.color.recoveryPrimaryText,
+      action,
+    )
 
   private fun secondaryButton(value: String, action: () -> Unit): Button =
-    actionButton(value, R.color.recoverySurfaceRaised, R.color.recoveryText, action)
+    actionButton(
+      value,
+      R.color.recoverySurfaceRaised,
+      R.color.recoverySurfaceFocused,
+      R.color.recoveryText,
+      action,
+    )
+
+  private fun cancelSetupButton(generation: Long): Button =
+    secondaryButton(getString(R.string.recovery_cancel)) {
+      performSetupAction(generation, renderAfterAction = false) { finishUserCancelled() }
+    }
 
   private fun secretChoiceButton(
     value: String,
     wordIndex: Int,
     action: (Int) -> Unit,
-  ): View = RecoveryWordChoiceButton(this, value, wordIndex, action).apply {
+  ): RecoveryWordChoiceButton = RecoveryWordChoiceButton(this, value, wordIndex, action).apply {
+    layoutParams = LinearLayout.LayoutParams(
+      ViewGroup.LayoutParams.MATCH_PARENT,
+      ViewGroup.LayoutParams.WRAP_CONTENT,
+    )
     tag = SECRET_VIEW_TAG
   }
 
+  private fun secretChoicePlaceholder(): RecoveryWordChoiceButton =
+    RecoveryWordChoiceButton(this, "", -1, null).apply {
+      layoutParams = LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT,
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+      )
+      visibility = View.INVISIBLE
+      isClickable = false
+      isFocusable = false
+      setOnClickListener(null)
+      tag = SECRET_VIEW_TAG
+    }
+
+  private fun addSecretChoiceCell(
+    parent: GridLayout,
+    button: RecoveryWordChoiceButton,
+  ) {
+    try {
+      parent.addView(button, gridCell())
+    } catch (failure: Throwable) {
+      button.wipe()
+      throw failure
+    }
+  }
+
   private fun compactButton(value: String, action: () -> Unit): Button =
-    actionButton(value, R.color.recoverySurface, R.color.recoveryText, action).apply {
+    actionButton(
+      value,
+      R.color.recoverySurfaceRaised,
+      R.color.recoverySurfaceFocused,
+      R.color.recoveryText,
+      action,
+    ).apply {
       minWidth = dp(48)
       setPadding(dp(4), 0, dp(4), 0)
     }
@@ -749,6 +1108,7 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   private fun actionButton(
     value: String,
     backgroundColor: Int,
+    activeBackgroundColor: Int,
     textColor: Int,
     action: () -> Unit,
   ): Button = Button(this).apply {
@@ -756,7 +1116,16 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     isAllCaps = false
     textSize = 15f
     setTextColor(color(textColor))
-    background = roundedSurface(backgroundColor, 12)
+    background = statefulRoundedSurface(
+      restingColorResource = backgroundColor,
+      activeColorResource = activeBackgroundColor,
+      radiusDp = 12,
+      strokeColorResource = R.color.recoveryBorder,
+    )
+    layoutParams = LinearLayout.LayoutParams(
+      ViewGroup.LayoutParams.MATCH_PARENT,
+      ViewGroup.LayoutParams.WRAP_CONTENT,
+    )
     minHeight = dp(48)
     minimumHeight = dp(48)
     filterTouchesWhenObscured = true
@@ -764,35 +1133,123 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     setOnClickListener { action() }
   }
 
-  private fun roundedSurface(colorResource: Int, radiusDp: Int): GradientDrawable =
+  private fun ViewGroup.addOwnedButton(
+    button: Button,
+    params: ViewGroup.LayoutParams? = null,
+  ) {
+    try {
+      if (params == null) addView(button) else addView(button, params)
+    } catch (failure: Throwable) {
+      button.setOnClickListener(null)
+      throw failure
+    }
+  }
+
+  private fun roundedSurface(
+    colorResource: Int,
+    radiusDp: Int,
+    strokeColorResource: Int? = null,
+    strokeWidthDp: Int = 1,
+  ): GradientDrawable =
     GradientDrawable().apply {
       shape = GradientDrawable.RECTANGLE
       cornerRadius = dp(radiusDp).toFloat()
       setColor(color(colorResource))
+      if (strokeColorResource != null) setStroke(dp(strokeWidthDp), color(strokeColorResource))
     }
 
+  private fun statefulRoundedSurface(
+    restingColorResource: Int,
+    activeColorResource: Int,
+    radiusDp: Int,
+    strokeColorResource: Int,
+  ): StateListDrawable = StateListDrawable().apply {
+    val active = roundedSurface(
+      activeColorResource,
+      radiusDp,
+      R.color.recoveryPrimaryText,
+      ACTIVE_OUTLINE_WIDTH_DP,
+    )
+    addState(intArrayOf(android.R.attr.state_pressed), active)
+    addState(
+      intArrayOf(android.R.attr.state_focused),
+      roundedSurface(
+        activeColorResource,
+        radiusDp,
+        R.color.recoveryPrimaryText,
+        ACTIVE_OUTLINE_WIDTH_DP,
+      ),
+    )
+    addState(
+      intArrayOf(android.R.attr.state_hovered),
+      roundedSurface(
+        activeColorResource,
+        radiusDp,
+        R.color.recoveryPrimaryText,
+        ACTIVE_OUTLINE_WIDTH_DP,
+      ),
+    )
+    addState(
+      intArrayOf(),
+      roundedSurface(restingColorResource, radiusDp, strokeColorResource),
+    )
+  }
+
   private fun clearSensitiveViews() {
+    activeRenderGeneration =
+      if (activeRenderGeneration == Long.MAX_VALUE) 1L else activeRenderGeneration + 1L
+    val root = sensitiveRoot
+    sensitiveRoot = null
+    secureScroll = null
+
     fun clear(view: View) {
-      if (view is RecoveryPhraseGridView) view.wipe()
-      if (view is RecoveryPrivateInputView) view.wipe()
-      if (view is RecoveryWordChoiceButton) view.wipe()
-      if (view.tag === SECRET_VIEW_TAG && view is TextView) view.text = ""
+      try {
+        if (view is Button) view.setOnClickListener(null)
+        if (view is RecoveryPhraseGridView) view.wipe()
+        if (view is RecoveryPrivateInputView) view.wipe()
+        if (view is RecoveryWordChoiceButton) view.wipe()
+        if (view.tag === SECRET_VIEW_TAG && view is TextView) view.text = ""
+      } catch (_: Throwable) {
+        // Continue wiping the rest of the owned tree.
+      }
       if (view is ViewGroup) {
-        for (index in 0 until view.childCount) clear(view.getChildAt(index))
+        val childCount = try {
+          view.childCount
+        } catch (_: Throwable) {
+          0
+        }
+        for (index in 0 until childCount) {
+          try {
+            clear(view.getChildAt(index))
+          } catch (_: Throwable) {
+            // One malformed child must not prevent cleanup of its siblings.
+          }
+        }
       }
     }
-    sensitiveRoot?.let(::clear)
-    sensitiveRoot?.removeAllViews()
-    sensitiveRoot = null
+    if (root != null) {
+      clear(root)
+      try {
+        root.removeAllViews()
+      } catch (_: Throwable) {
+        // References above are already invalidated and callbacks were cleared.
+      }
+    }
   }
 
   private fun weightedCell(): LinearLayout.LayoutParams =
     LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
 
-  private fun gridCell(minimumHeightDp: Int = 52): GridLayout.LayoutParams =
+  private fun fullWidthCell(): LinearLayout.LayoutParams =
+    LinearLayout.LayoutParams(
+      ViewGroup.LayoutParams.MATCH_PARENT,
+      ViewGroup.LayoutParams.WRAP_CONTENT,
+    )
+
+  private fun gridCell(): GridLayout.LayoutParams =
     GridLayout.LayoutParams().apply {
       width = 0
-      height = dp(minimumHeightDp)
+      height = ViewGroup.LayoutParams.WRAP_CONTENT
       columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
       setMargins(dp(4), dp(4), dp(4), dp(4))
     }
@@ -809,6 +1266,9 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   }
 
   private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
+
+  private fun isLargeFont(): Boolean =
+    resources.configuration.fontScale >= LARGE_FONT_SCALE
 
   private fun View.excludeFromAutofill(hideDescendants: Boolean = false) {
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -829,7 +1289,15 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     private const val EXTRA_MODE = "io.veil.mobile.recovery.MODE"
     private const val EXTRA_LEASE_ID = "io.veil.mobile.recovery.LEASE_ID"
     private const val EXTRA_RESULT_LEASE_ID = "io.veil.mobile.recovery.RESULT_LEASE_ID"
+    private const val EXTRA_RESULT_OUTCOME = "io.veil.mobile.recovery.RESULT_OUTCOME"
     private const val INVALID_LEASE_ID = -1L
+    private const val ROOT_HORIZONTAL_INSET_DP = 20
+    private const val ISLAND_MAX_WIDTH_DP = 520
+    private const val ADVANCING_ACTION_DEBOUNCE_MS = 400L
+    private const val SUGGESTION_COLUMN_COUNT = 2
+    private const val SUGGESTION_SLOT_COUNT = 4
+    private const val LARGE_FONT_SCALE = 1.5f
+    private const val ACTIVE_OUTLINE_WIDTH_DP = 2
     private val SECRET_VIEW_TAG = Any()
 
     fun intent(
@@ -845,7 +1313,20 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
 
     fun resultLeaseId(data: Intent?): Long? {
       if (data == null || !data.hasExtra(EXTRA_RESULT_LEASE_ID)) return null
-      return data.getLongExtra(EXTRA_RESULT_LEASE_ID, INVALID_LEASE_ID)
+      return try {
+        data.getLongExtra(EXTRA_RESULT_LEASE_ID, INVALID_LEASE_ID)
+      } catch (_: Throwable) {
+        null
+      }
+    }
+
+    fun resultOutcome(data: Intent?): NativeIdentitySetupOutcome? {
+      if (data == null || !data.hasExtra(EXTRA_RESULT_OUTCOME)) return null
+      return try {
+        NativeIdentitySetupOutcome.fromBridge(data.getStringExtra(EXTRA_RESULT_OUTCOME))
+      } catch (_: Throwable) {
+        null
+      }
     }
   }
 }
@@ -854,6 +1335,57 @@ private enum class TransactionUi {
   SETUP,
   COMMITTING,
   FAILED,
+}
+
+internal enum class NativeIdentitySetupOutcome(val bridgeValue: String) {
+  COMMITTED("committed"),
+  USER_CANCELLED("user_cancelled"),
+  INTERRUPTED("interrupted");
+
+  companion object {
+    fun fromBridge(value: String?): NativeIdentitySetupOutcome? =
+      entries.firstOrNull { outcome -> outcome.bridgeValue == value }
+  }
+}
+
+@android.annotation.SuppressLint("ViewConstructor")
+private class RecoveryIslandLayout(
+  context: Context,
+  maxWidthDp: Int,
+) : LinearLayout(context) {
+  private val maxWidthPx = (maxWidthDp * resources.displayMetrics.density).toInt()
+
+  override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+    val widthMode = View.MeasureSpec.getMode(widthMeasureSpec)
+    val widthSize = View.MeasureSpec.getSize(widthMeasureSpec)
+    val cappedWidth = minOf(widthSize, maxWidthPx)
+    val cappedWidthSpec = when (widthMode) {
+      View.MeasureSpec.EXACTLY -> View.MeasureSpec.makeMeasureSpec(cappedWidth, View.MeasureSpec.EXACTLY)
+      View.MeasureSpec.AT_MOST -> View.MeasureSpec.makeMeasureSpec(cappedWidth, View.MeasureSpec.AT_MOST)
+      else -> View.MeasureSpec.makeMeasureSpec(maxWidthPx, View.MeasureSpec.AT_MOST)
+    }
+    super.onMeasure(cappedWidthSpec, heightMeasureSpec)
+  }
+}
+
+private data class RecoverySafeInsets(
+  val left: Int,
+  val top: Int,
+  val right: Int,
+  val bottom: Int,
+)
+
+@android.annotation.TargetApi(Build.VERSION_CODES.P)
+private object Api28Cutout {
+  fun safeInsets(insets: WindowInsets): RecoverySafeInsets {
+    val cutout = insets.displayCutout
+    return RecoverySafeInsets(
+      left = cutout?.safeInsetLeft ?: 0,
+      top = cutout?.safeInsetTop ?: 0,
+      right = cutout?.safeInsetRight ?: 0,
+      bottom = cutout?.safeInsetBottom ?: 0,
+    )
+  }
 }
 
 @android.annotation.TargetApi(Build.VERSION_CODES.TIRAMISU)

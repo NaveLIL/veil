@@ -25,6 +25,7 @@ jest.mock("../native/runtime", () => ({
     disconnect: jest.fn(),
     lock: jest.fn(),
     cancelPendingAccessPass: jest.fn(),
+    verifyIdentityPresence: jest.fn(),
     getDirectMessages: jest.fn(),
     subscribe: jest.fn(),
   },
@@ -68,10 +69,17 @@ jest.mock("../screens/OnboardingScreen", () => {
     jest.requireActual<typeof import("react-native")>("react-native");
   return {
     __esModule: true,
-    default: ({ onCommitted }: { onCommitted: () => Promise<void> }) =>
+    default: ({
+      onVerifyIdentity,
+    }: {
+      onVerifyIdentity: () => Promise<"present" | "absent" | "unknown">;
+    }) =>
       ReactModule.createElement(
         NativePressable,
-        { testID: "mock-native-setup-committed", onPress: onCommitted },
+        {
+          testID: "mock-native-setup-committed",
+          onPress: () => void onVerifyIdentity(),
+        },
         ReactModule.createElement(NativeText, null, "ONBOARDING"),
       ),
   };
@@ -85,6 +93,7 @@ type RuntimeMock = {
   disconnect: jest.Mock;
   lock: jest.Mock<() => Promise<VeilMobileRuntimeSnapshot>>;
   cancelPendingAccessPass: jest.Mock;
+  verifyIdentityPresence: jest.Mock<() => Promise<boolean>>;
   getDirectMessages: jest.Mock<
     (conversationId: string) => Promise<DirectMessageProjection>
   >;
@@ -362,7 +371,7 @@ describe("App native runtime privacy gate", () => {
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
   });
 
-  it("refreshes native authority after commit but does not authorize from the callback", async () => {
+  it("does not refresh or authorize when strict durable identity verification is absent", async () => {
     const noIdentity = runtimeSnapshot({
       identityExists: false,
       sessionState: "locked",
@@ -373,6 +382,7 @@ describe("App native runtime privacy gate", () => {
     });
     mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
     mockRuntime.lock.mockResolvedValue(noIdentity);
+    mockRuntime.verifyIdentityPresence.mockResolvedValue(false);
 
     const view = render(<App />);
     await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
@@ -380,6 +390,31 @@ describe("App native runtime privacy gate", () => {
 
     fireEvent.press(view.getByTestId("mock-native-setup-committed"));
 
+    await waitFor(() => expect(mockRuntime.verifyIdentityPresence).toHaveBeenCalledTimes(1));
+    expect(mockRuntime.getSnapshot).toHaveBeenCalledTimes(2);
+    expect(view.getByText("ONBOARDING")).toBeTruthy();
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+  });
+
+  it("refreshes native authority only after strict durable identity verification is present", async () => {
+    const noIdentity = runtimeSnapshot({
+      identityExists: false,
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
+    mockRuntime.lock.mockResolvedValue(noIdentity);
+    mockRuntime.verifyIdentityPresence.mockResolvedValue(true);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+
+    fireEvent.press(view.getByTestId("mock-native-setup-committed"));
+
+    await waitFor(() => expect(mockRuntime.verifyIdentityPresence).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(mockRuntime.getSnapshot).toHaveBeenCalledTimes(4));
     expect(view.getByText("ONBOARDING")).toBeTruthy();
     expect(view.queryByTestId("chat-runtime-ready")).toBeNull();

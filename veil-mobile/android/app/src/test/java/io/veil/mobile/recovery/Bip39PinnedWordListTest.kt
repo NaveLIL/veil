@@ -83,10 +83,10 @@ class Bip39PinnedWordListTest {
       .findAll(source)
       .map { match -> match.groupValues[1] }
       .toList()
-    assertEquals(3, Regex("putExtra\\(").findAll(source).count())
-    assertEquals(3, intentExtraNames.size)
+    assertEquals(4, Regex("putExtra\\(").findAll(source).count())
+    assertEquals(4, intentExtraNames.size)
     assertEquals(
-      setOf("EXTRA_MODE", "EXTRA_LEASE_ID", "EXTRA_RESULT_LEASE_ID"),
+      setOf("EXTRA_MODE", "EXTRA_LEASE_ID", "EXTRA_RESULT_LEASE_ID", "EXTRA_RESULT_OUTCOME"),
       intentExtraNames.toSet(),
     )
     assertTrue(source.contains("RecoveryPrivateInputView"))

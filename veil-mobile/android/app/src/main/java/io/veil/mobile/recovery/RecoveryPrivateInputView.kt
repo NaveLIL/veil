@@ -2,12 +2,14 @@ package io.veil.mobile.recovery
 
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Paint
 import android.os.Build
 import android.util.TypedValue
 import android.view.View
 import android.view.ViewStructure
+import io.veil.mobile.R
+import kotlin.math.ceil
+import kotlin.math.max
 
 /** Mutable, Canvas-only recovery-word prefix; no TextView/IME/translation text. */
 internal class RecoveryPrivateInputView(
@@ -17,7 +19,7 @@ internal class RecoveryPrivateInputView(
   private val characters = CharArray(PinnedBip39EnglishWords.MAX_WORD_LENGTH)
   private var length = source.size
   private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-    color = Color.rgb(0xf4, 0xf8, 0xfc)
+    color = context.getColor(R.color.recoveryText)
     textSize = TypedValue.applyDimension(
       TypedValue.COMPLEX_UNIT_SP,
       22f,
@@ -41,9 +43,14 @@ internal class RecoveryPrivateInputView(
   }
 
   override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+    val fontMetrics = paint.fontMetrics
+    val desiredHeight = max(
+      suggestedMinimumHeight,
+      ceil(fontMetrics.descent - fontMetrics.ascent).toInt() + dp(VERTICAL_PADDING_DP),
+    )
     setMeasuredDimension(
       resolveSize(suggestedMinimumWidth, widthMeasureSpec),
-      resolveSize(dp(48), heightMeasureSpec),
+      resolveSize(desiredHeight, heightMeasureSpec),
     )
   }
 
@@ -81,6 +88,7 @@ internal class RecoveryPrivateInputView(
   private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
   companion object {
+    private const val VERTICAL_PADDING_DP = 20
     private const val EMPTY_LABEL = "...."
   }
 }

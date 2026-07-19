@@ -5,6 +5,7 @@ import android.os.SystemClock
 import androidx.annotation.VisibleForTesting
 import io.veil.mobile.crypto.NativeIdentityVault
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
+import io.veil.mobile.recovery.NativeIdentitySetupCoordinator
 import java.io.File
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
@@ -998,6 +999,42 @@ internal class VeilMobileRuntime internal constructor(
 
   fun snapshot(): VeilMobileRuntimeSnapshot = synchronized(stateLock) {
     snapshotLocked()
+  }
+
+  /**
+   * Read the durable identity record without snapshot fallback semantics.
+   *
+   * Unlike [snapshotLocked], a vault failure is intentionally propagated: a
+   * recovery caller must distinguish a definitely absent record from an
+   * unreadable or superseded check before advising the user about their only
+   * recovery phrase. The lifecycle epoch is checked on both sides of the
+   * filesystem read so a result obtained across a background/lock transition
+   * never reaches JavaScript as authoritative.
+   */
+  fun verifyIdentityPresence(): Boolean {
+    val verificationEpoch = synchronized(stateLock) {
+      if (!foreground) {
+        throw VeilMobileRuntimeException(
+          "E_VEIL_LOCKED",
+          "Return to Veil before checking the local account",
+        )
+      }
+      lifecycleEpoch
+    }
+
+    val identityExists = NativeIdentitySetupCoordinator.withSettledIdentityRead {
+      vault.hasIdentity()
+    }
+
+    return synchronized(stateLock) {
+      if (!foreground || lifecycleEpoch != verificationEpoch) {
+        throw VeilMobileRuntimeException(
+          "E_VEIL_LOCKED",
+          "Return to Veil before checking the local account",
+        )
+      }
+      identityExists
+    }
   }
 
   @VisibleForTesting

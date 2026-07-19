@@ -7,8 +7,8 @@ import { beginNativeIdentitySetup } from "../identitySetup";
 
 const originalModule = NativeModules.VeilIdentitySetup;
 
-function installNative(result: "committed" | "cancelled" | "unexpected") {
-  const begin = jest.fn<() => Promise<string>>().mockResolvedValue(result);
+function installNative(result: unknown) {
+  const begin = jest.fn<() => Promise<unknown>>().mockResolvedValue(result);
   Object.defineProperty(NativeModules, "VeilIdentitySetup", {
     configurable: true,
     value: { beginNativeIdentitySetup: begin },
@@ -33,19 +33,23 @@ describe("identity setup bridge", () => {
     await expect(beginNativeIdentitySetup("create")).resolves.toBe("committed");
     expect(begin).toHaveBeenCalledWith("create");
 
-    begin.mockResolvedValue("cancelled");
-    await expect(beginNativeIdentitySetup("restore")).resolves.toBe("cancelled");
+    begin.mockResolvedValue("user_cancelled");
+    await expect(beginNativeIdentitySetup("restore")).resolves.toBe("user_cancelled");
     expect(begin).toHaveBeenCalledWith("restore");
+
+    begin.mockResolvedValue("interrupted");
+    await expect(beginNativeIdentitySetup("create")).resolves.toBe("interrupted");
   });
 
-  it("rejects unexpected results and redacts native errors", async () => {
+  it("maps malformed results to interruption and redacts rejected native errors", async () => {
     installNative("unexpected");
-    await expect(beginNativeIdentitySetup("create")).rejects.toThrow(
-      "Secure identity setup is unavailable. Close Veil and try again.",
-    );
+    await expect(beginNativeIdentitySetup("create")).resolves.toBe("interrupted");
+
+    installNative({ status: "committed" });
+    await expect(beginNativeIdentitySetup("restore")).resolves.toBe("interrupted");
 
     const rawMessage = "native stack contains protected implementation data";
-    const begin = jest.fn<() => Promise<string>>().mockRejectedValue(new Error(rawMessage));
+    const begin = jest.fn<() => Promise<unknown>>().mockRejectedValue(new Error(rawMessage));
     Object.defineProperty(NativeModules, "VeilIdentitySetup", {
       configurable: true,
       value: { beginNativeIdentitySetup: begin },

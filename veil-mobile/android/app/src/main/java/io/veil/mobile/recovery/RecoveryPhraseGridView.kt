@@ -8,6 +8,8 @@ import android.os.Build
 import android.util.TypedValue
 import android.view.View
 import io.veil.mobile.R
+import kotlin.math.ceil
+import kotlin.math.max
 
 /**
  * Draws a recovery phrase without constructing a phrase-shaped JVM String.
@@ -19,20 +21,28 @@ import io.veil.mobile.R
 internal class RecoveryPhraseGridView(
   context: Context,
   private val dictionary: RecoveryWordDictionary,
-  sourceIndices: IntArray,
+  ownedIndices: IntArray,
 ) : View(context) {
-  private val indices = sourceIndices.copyOf()
+  private val indices = ownedIndices
   private val surfacePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-    color = context.colorCompat(R.color.recoverySurface)
+    color = context.colorCompat(R.color.recoverySurfaceLow)
+  }
+  private val cellPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    color = context.colorCompat(R.color.recoverySurfaceRaised)
+  }
+  private val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+    color = context.colorCompat(R.color.recoveryBorder)
+    style = Paint.Style.STROKE
+    strokeWidth = dp(1).toFloat()
   }
   private val positionPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
     color = context.colorCompat(R.color.recoveryTextMuted)
-    textSize = sp(12f)
+    textSize = sp(11f)
     typeface = android.graphics.Typeface.create("monospace", android.graphics.Typeface.NORMAL)
   }
   private val wordPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
     color = context.colorCompat(R.color.recoveryText)
-    textSize = sp(15f)
+    textSize = sp(14f)
     typeface = android.graphics.Typeface.create("monospace", android.graphics.Typeface.BOLD)
   }
   private val bounds = RectF()
@@ -55,7 +65,7 @@ internal class RecoveryPhraseGridView(
     val width = resolveSize(suggestedMinimumWidth, widthMeasureSpec)
     val columns = columnsFor(width)
     val rows = (indices.size + columns - 1) / columns
-    val desiredHeight = paddingTop + paddingBottom + rows * dp(CELL_HEIGHT_DP)
+    val desiredHeight = paddingTop + paddingBottom + rows * cellHeight()
     setMeasuredDimension(width, resolveSize(desiredHeight, heightMeasureSpec))
   }
 
@@ -65,27 +75,44 @@ internal class RecoveryPhraseGridView(
 
     bounds.set(0f, 0f, width.toFloat(), height.toFloat())
     canvas.drawRoundRect(bounds, dp(16).toFloat(), dp(16).toFloat(), surfacePaint)
+    canvas.drawRoundRect(bounds, dp(16).toFloat(), dp(16).toFloat(), borderPaint)
     val columns = columnsFor(width)
+    val cellHeight = cellHeight()
     val cellWidth = (width - paddingLeft - paddingRight).toFloat() / columns
-    val baselineOffset = dp(31).toFloat()
+    val fontMetrics = wordPaint.fontMetrics
+    val baselineOffset = (cellHeight - fontMetrics.ascent - fontMetrics.descent) / 2f
+    val positionLabelWidth = positionLabelWidth()
 
     for (position in indices.indices) {
       val row = position / columns
       val column = position % columns
-      val left = paddingLeft + column * cellWidth + dp(10)
-      val baseline = paddingTop + row * dp(CELL_HEIGHT_DP) + baselineOffset
+      val cellLeft = paddingLeft + column * cellWidth + dp(4)
+      val cellTop = paddingTop + row * cellHeight + dp(4)
+      val cellRight = paddingLeft + (column + 1) * cellWidth - dp(4)
+      val cellBottom = paddingTop + (row + 1) * cellHeight - dp(4)
+      canvas.drawRoundRect(
+        cellLeft,
+        cellTop.toFloat(),
+        cellRight,
+        cellBottom.toFloat(),
+        dp(10).toFloat(),
+        dp(10).toFloat(),
+        cellPaint,
+      )
+      val left = cellLeft + dp(10)
+      val baseline = paddingTop + row * cellHeight + baselineOffset
       canvas.drawText(POSITION_LABELS[position], left, baseline, positionPaint)
 
       val wordIndex = indices[position]
       if (wordIndex >= 0) {
         canvas.drawText(
           dictionary.word(wordIndex),
-          left + dp(POSITION_LABEL_WIDTH_DP),
+          left + positionLabelWidth,
           baseline,
           wordPaint,
         )
       } else {
-        canvas.drawText(UNSET_LABEL, left + dp(POSITION_LABEL_WIDTH_DP), baseline, wordPaint)
+        canvas.drawText(UNSET_LABEL, left + positionLabelWidth, baseline, wordPaint)
       }
     }
   }
@@ -102,7 +129,24 @@ internal class RecoveryPhraseGridView(
     super.onDetachedFromWindow()
   }
 
-  private fun columnsFor(availableWidth: Int): Int = if (availableWidth >= dp(600)) 3 else 2
+  private fun columnsFor(availableWidth: Int): Int = when {
+    resources.configuration.fontScale >= LARGE_FONT_SCALE -> 1
+    availableWidth >= dp(THREE_COLUMN_MIN_WIDTH_DP) -> 3
+    else -> 2
+  }
+
+  private fun cellHeight(): Int {
+    val tallestText = max(
+      positionPaint.fontMetrics.descent - positionPaint.fontMetrics.ascent,
+      wordPaint.fontMetrics.descent - wordPaint.fontMetrics.ascent,
+    )
+    return max(dp(CELL_HEIGHT_DP), ceil(tallestText).toInt() + dp(CELL_VERTICAL_PADDING_DP))
+  }
+
+  private fun positionLabelWidth(): Float = max(
+    dp(POSITION_LABEL_WIDTH_DP).toFloat(),
+    positionPaint.measureText(POSITION_LABELS.last()) + dp(POSITION_LABEL_GAP_DP),
+  )
 
   private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 
@@ -110,8 +154,12 @@ internal class RecoveryPhraseGridView(
     TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_SP, value, resources.displayMetrics)
 
   companion object {
-    private const val CELL_HEIGHT_DP = 52
+    private const val CELL_HEIGHT_DP = 50
+    private const val CELL_VERTICAL_PADDING_DP = 20
+    private const val THREE_COLUMN_MIN_WIDTH_DP = 420
+    private const val LARGE_FONT_SCALE = 1.5f
     private const val POSITION_LABEL_WIDTH_DP = 30
+    private const val POSITION_LABEL_GAP_DP = 8
     private const val UNSET_INDEX = -1
     private const val UNSET_LABEL = "\u2014"
     private val POSITION_LABELS = Array(24) { position -> (position + 1).toString() + "." }

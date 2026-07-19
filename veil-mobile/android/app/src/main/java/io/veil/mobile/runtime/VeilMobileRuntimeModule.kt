@@ -42,6 +42,11 @@ internal class VeilMobileRuntimeModule(
   }
 
   @ReactMethod
+  fun verifyIdentityPresence(promise: Promise) = onRuntime(promise) {
+    runtime.verifyIdentityPresence()
+  }
+
+  @ReactMethod
   fun openSession(promise: Promise) = onRuntime(promise) {
     runtime.openSession().toWritableMap()
   }

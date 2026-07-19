@@ -1,12 +1,12 @@
 import { NativeModules, Platform } from "react-native";
 
 export type NativeIdentitySetupMode = "create" | "restore";
-export type NativeIdentitySetupResult = "committed" | "cancelled";
+export type NativeIdentitySetupResult = "committed" | "user_cancelled" | "interrupted";
 
 interface VeilIdentitySetupNative {
   beginNativeIdentitySetup(
     mode: NativeIdentitySetupMode,
-  ): Promise<NativeIdentitySetupResult>;
+  ): Promise<unknown>;
 }
 
 const PUBLIC_SETUP_ERROR =
@@ -16,7 +16,9 @@ const PUBLIC_SETUP_ERROR =
  * Opens the protected platform-owned identity flow.
  *
  * No recovery material or identity key crosses this boundary. JavaScript
- * receives only whether native storage committed or the user cancelled.
+ * receives only whether native storage reported a commit, the user explicitly
+ * cancelled, or the Activity result was interrupted/ambiguous. Callers must
+ * strictly verify durable vault presence after both commit and interruption.
  */
 export async function beginNativeIdentitySetup(
   mode: NativeIdentitySetupMode,
@@ -30,10 +32,16 @@ export async function beginNativeIdentitySetup(
 
   try {
     const result = await native.beginNativeIdentitySetup(mode);
-    if (result !== "committed" && result !== "cancelled") {
-      throw new Error(PUBLIC_SETUP_ERROR);
+    if (
+      result === "committed" ||
+      result === "user_cancelled" ||
+      result === "interrupted"
+    ) {
+      return result;
     }
-    return result;
+    // An unknown native payload must never be interpreted as either a commit or
+    // a rollback. The interruption path requires a strict durable-vault check.
+    return "interrupted";
   } catch {
     // Native diagnostics can contain implementation details. The public UI
     // deliberately exposes one stable, non-sensitive recovery instruction.
