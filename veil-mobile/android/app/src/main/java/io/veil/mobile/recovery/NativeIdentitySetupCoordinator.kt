@@ -166,13 +166,20 @@ internal object NativeIdentitySetupCoordinator {
     return true
   }
 
-  /** Detaches exactly [ceremony]; in-flight work remains the sole owner. */
+  /**
+   * Detaches exactly [ceremony]; in-flight work remains the sole owner.
+   *
+   * READY has no transferred commit work, while TERMINAL is published only
+   * after the worker has closed every owned secret buffer. Both phases can
+   * therefore release the process lease here. This is also the recovery path
+   * when Android recreates the process and the original React client (and its
+   * pending Promise) no longer exists to call [release].
+   */
   fun detach(lease: Lease, ceremony: Ceremony) = synchronized(lock) {
     val current = active ?: return@synchronized
     if (current.lease != lease || current.ceremony?.get() !== ceremony) return@synchronized
     current.ceremony = null
-    if (current.phase == Phase.READY) active = null
-    if (current.phase == Phase.TERMINAL && current.clientReleased) active = null
+    if (current.phase != Phase.COMMITTING) active = null
   }
 
   fun revoke(lease: Lease) {

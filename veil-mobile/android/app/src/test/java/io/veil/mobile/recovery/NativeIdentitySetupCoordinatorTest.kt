@@ -186,6 +186,38 @@ class NativeIdentitySetupCoordinatorTest {
     )
   }
 
+  @Test
+  fun processRecreatedTerminalDetachDoesNotRequireTheLostBridgeClient() {
+    val lostClientLease = requireNotNull(NativeIdentitySetupCoordinator.acquire())
+    NativeIdentitySetupCoordinator.resetForTest()
+    val adoptedActivity = RecordingCeremony()
+    assertEquals(
+      NativeIdentitySetupCoordinator.Attachment.OWNER,
+      NativeIdentitySetupCoordinator.attachOrAdopt(lostClientLease, adoptedActivity),
+    )
+    val failedWork = FailedWork()
+    assertTrue(
+      NativeIdentitySetupCoordinator.beginCommit(
+        lostClientLease,
+        adoptedActivity,
+        failedWork,
+      ),
+    )
+    assertTrue(adoptedActivity.delivered.await(5, TimeUnit.SECONDS))
+    assertEquals(
+      NativeIdentitySetupCoordinator.CoordinatorEvent.FAILED,
+      adoptedActivity.event.get(),
+    )
+    assertTrue(failedWork.closed.get())
+    assertNull(NativeIdentitySetupCoordinator.acquire())
+
+    // The pre-death bridge and its Promise cannot call release(). Once the
+    // terminal Activity detaches, no transaction or secret owner remains.
+    NativeIdentitySetupCoordinator.detach(lostClientLease, adoptedActivity)
+
+    assertTrue(NativeIdentitySetupCoordinator.acquire() != null)
+  }
+
   private class RecordingCeremony : NativeIdentitySetupCoordinator.Ceremony {
     val event = AtomicReference<NativeIdentitySetupCoordinator.CoordinatorEvent?>()
     val delivered = CountDownLatch(1)
@@ -204,6 +236,11 @@ class NativeIdentitySetupCoordinatorTest {
     override fun close() {
       closed.set(true)
     }
+  }
+
+  private class FailedWork : RecordingWork() {
+    override fun run(): NativeIdentitySetupCoordinator.CommitOutcome =
+      NativeIdentitySetupCoordinator.CommitOutcome.FAILED
   }
 
   private class BlockingWork : RecordingWork() {
