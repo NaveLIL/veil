@@ -45,7 +45,7 @@ export default function App() {
     (state) => state.allowReadyScreenshots,
   );
 
-  const chatReady = canRenderChat(snapshot, requiresExplicitReopen);
+  const chatReady = canRenderChat(snapshot, requiresExplicitReopen, publicFailureCode);
   const captureReady = phase === "ready"
     && chatReady
     && !curtainVisible
@@ -156,6 +156,7 @@ export function canStartNativeIdentitySetup(
     && !snapshot.directoryReady
     && snapshot.secureSyncState === "idle"
     && snapshot.binding === null
+    && snapshot.publicFailureCodeV1 === null
     && snapshot.directConversations.length === 0
     && publicFailureCode === null;
 }

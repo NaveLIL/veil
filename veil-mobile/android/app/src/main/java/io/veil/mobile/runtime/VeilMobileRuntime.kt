@@ -63,6 +63,25 @@ internal enum class NativeConnectionState {
   ERROR,
 }
 
+/**
+ * PublicFailureCodeV1 values that may describe a process-local terminal
+ * runtime snapshot. Operation-only outcomes (for example lifecycle
+ * cancellation or a busy operation) must never become durable-looking state.
+ */
+private fun PublicFailureCodeV1.isTerminalRuntimeSnapshotCode(): Boolean = when (this) {
+  PublicFailureCodeV1.LOCAL_002,
+  PublicFailureCodeV1.LOCAL_003,
+  PublicFailureCodeV1.NODE_002,
+  PublicFailureCodeV1.NODE_003,
+  PublicFailureCodeV1.NODE_004,
+  PublicFailureCodeV1.PASS_001,
+  PublicFailureCodeV1.PASS_002,
+  PublicFailureCodeV1.SYNC_001,
+  PublicFailureCodeV1.RUNTIME_999,
+  -> true
+  else -> false
+}
+
 /** Exact positive allow-list copied from the UniFFI boundary without text parsing. */
 internal enum class NativeMobileRetryableReason {
   TRANSPORT,
@@ -615,6 +634,8 @@ internal data class VeilMobileRuntimeSnapshot(
   val directContentRevision: Long?,
   val sessionState: NativeSessionState,
   val connectionState: NativeConnectionState,
+  /** Closed presentation-only cause for this exact process-local ERROR state. */
+  val publicFailureCodeV1: PublicFailureCodeV1?,
   val directoryReady: Boolean,
   /** Coarse bootstrap progress; contains no keys, capabilities, targets, or response bytes. */
   val secureSyncState: NativeSecureSyncState,
@@ -779,6 +800,11 @@ internal class VeilMobileRuntime internal constructor(
   private var session: NativeMobileSession? = null
   private var sessionState = NativeSessionState.LOCKED
   private var connectionState = NativeConnectionState.DISCONNECTED
+  /**
+   * Cause of the exact stateLock-owned terminal generation. This is never
+   * persisted and never participates in retry, reconnect, or trust decisions.
+   */
+  private var terminalPublicFailureCodeV1: PublicFailureCodeV1? = null
   private var binding: PublicAuthenticatedBinding? = null
   private var directoryReady = false
   private var ownPreKeyState = NativeOwnPreKeyState.IDLE
@@ -858,6 +884,8 @@ internal class VeilMobileRuntime internal constructor(
     val reason: NativeMobileRetryableReason?,
     val failureOrdinal: Int?,
     val delayMillis: Long,
+    /** Presentation fallback only; never grants retry authority. */
+    val terminalFallbackCodeV1: PublicFailureCodeV1,
   ) {
     init {
       check(
@@ -867,6 +895,9 @@ internal class VeilMobileRuntime internal constructor(
           reason != null && failureOrdinal != null
         },
       ) { "Reconnect trigger metadata is inconsistent" }
+      check(terminalFallbackCodeV1.isTerminalRuntimeSnapshotCode()) {
+        "Reconnect terminal fallback is not snapshot-safe"
+      }
     }
 
     var stage = NativeReconnectStage.WAITING
@@ -1371,8 +1402,9 @@ internal class VeilMobileRuntime internal constructor(
       NativeDirectTextSendOutcome.ACCEPTED -> {
         sync.directSessionAction = null
           if (sync.contentRevision >= MAX_PUBLIC_SNAPSHOT_REVISION) {
-            val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
-            connectionState = NativeConnectionState.ERROR
+            val failureCode = PublicFailureCodeV1.RUNTIME_999
+            val detached = detachDirectSyncForFailureLocked(failureCode)
+            markConnectionErrorLocked(failureCode)
             binding = null
             reconnectBackoffScope = null
             DirectSendTransition(
@@ -1406,8 +1438,9 @@ internal class VeilMobileRuntime internal constructor(
         // security terminal. Preserve acceptance while keeping this source
         // outside the automatic reconnect allowlist.
         sync.directSessionAction = null
-        val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
-        connectionState = NativeConnectionState.ERROR
+        val failureCode = PublicFailureCodeV1.RUNTIME_999
+        val detached = detachDirectSyncForFailureLocked(failureCode)
+        markConnectionErrorLocked(failureCode)
         binding = null
         reconnectBackoffScope = null
         DirectSendTransition(
@@ -1804,6 +1837,7 @@ internal class VeilMobileRuntime internal constructor(
       directDirectoryState = NativeDirectDirectoryState.IDLE
       directHistoryState = NativeDirectHistoryState.IDLE
       directConversations = emptyList()
+      clearTerminalFailureAfterRecoveryLocked()
       Pair(lifecycleEpoch, enrollmentIntentEpoch)
     }
     publishSnapshot()
@@ -1815,7 +1849,7 @@ internal class VeilMobileRuntime internal constructor(
     } catch (_: Throwable) {
       synchronized(stateLock) {
         if (foreground && lifecycleEpoch == openingEpoch && session == null) {
-          sessionState = NativeSessionState.ERROR
+          markSessionErrorLocked(PublicFailureCodeV1.LOCAL_002)
           connectionState = NativeConnectionState.DISCONNECTED
           binding = null
           directoryReady = false
@@ -1835,7 +1869,7 @@ internal class VeilMobileRuntime internal constructor(
       candidate.closeQuietly()
       synchronized(stateLock) {
         if (foreground && lifecycleEpoch == openingEpoch && session == null) {
-          sessionState = NativeSessionState.ERROR
+          markSessionErrorLocked(PublicFailureCodeV1.LOCAL_002)
           connectionState = NativeConnectionState.DISCONNECTED
           binding = null
           directoryReady = false
@@ -1986,6 +2020,7 @@ internal class VeilMobileRuntime internal constructor(
       activeConnect = pending
       connectionState = NativeConnectionState.CONNECTING
       binding = null
+      clearTerminalFailureAfterRecoveryLocked()
       ConnectStart(pending, detachedDirectSync)
     }
     val attempt = start.attempt
@@ -2055,6 +2090,10 @@ internal class VeilMobileRuntime internal constructor(
       publishSnapshot()
       authenticated
     } catch (error: Throwable) {
+      val terminalCode = terminalConnectFailureCodeV1(
+        error = error,
+        usedAccessPass = accessAttempt != null,
+      )
       var cancelledByOwnerLoss = false
       val failedSync = synchronized(stateLock) {
         val connecting = activeConnect === attempt
@@ -2068,8 +2107,8 @@ internal class VeilMobileRuntime internal constructor(
           current
         ) {
           if (ownsBootstrap) activeDirectBootstrap = null
-          val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
-          connectionState = NativeConnectionState.ERROR
+          val detached = detachDirectSyncForFailureLocked(terminalCode)
+          markConnectionErrorLocked(terminalCode)
           binding = null
           detached
         } else {
@@ -2094,7 +2133,7 @@ internal class VeilMobileRuntime internal constructor(
       if (cancelledByOwnerLoss) {
         throw VeilMobileRuntimeException("E_VEIL_CANCELLED", "Connection attempt was cancelled")
       }
-      throw publicConnectFailure(error)
+      throw publicConnectFailure(error, usedAccessPass = accessAttempt != null)
     } finally {
       try {
         attempt.cancellation.close()
@@ -3017,11 +3056,17 @@ internal class VeilMobileRuntime internal constructor(
     ) {
       return null
     }
+    val terminalFallbackCodeV1 = if (directoryReady) {
+      PublicFailureCodeV1.RUNTIME_999
+    } else {
+      PublicFailureCodeV1.SYNC_001
+    }
     cancelActiveReconnectLocked()
     val detached = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
     connectionState = NativeConnectionState.CONNECTING
     binding = null
-    val plan = createReconnectPlanLocked(scope, reason)
+    clearTerminalFailureAfterRecoveryLocked()
+    val plan = createReconnectPlanLocked(scope, reason, terminalFallbackCodeV1)
     activeReconnect = plan
     return PreparedReconnect(plan, detached)
   }
@@ -3059,6 +3104,7 @@ internal class VeilMobileRuntime internal constructor(
   private fun createReconnectPlanLocked(
     scope: ReconnectBackoffScope,
     reason: NativeMobileRetryableReason,
+    terminalFallbackCodeV1: PublicFailureCodeV1,
   ): ActiveReconnect {
     val failureOrdinal = scope.failureCount.coerceAtMost(MAX_RECONNECT_FAILURE_ORDINAL)
     val capMillis = reconnectDelayCapMillis(failureOrdinal)
@@ -3078,6 +3124,7 @@ internal class VeilMobileRuntime internal constructor(
       reason = reason,
       failureOrdinal = failureOrdinal,
       delayMillis = sampledMillis,
+      terminalFallbackCodeV1 = terminalFallbackCodeV1,
     )
   }
 
@@ -3094,6 +3141,7 @@ internal class VeilMobileRuntime internal constructor(
     reason = null,
     failureOrdinal = null,
     delayMillis = 0L,
+    terminalFallbackCodeV1 = PublicFailureCodeV1.RUNTIME_999,
   )
 
   private fun reconnectDelayCapMillis(failureOrdinal: Int): Long {
@@ -3171,7 +3219,7 @@ internal class VeilMobileRuntime internal constructor(
         TimeUnit.MILLISECONDS,
       )
     } catch (_: RuntimeException) {
-      failReconnectPlanTerminal(plan)
+      failReconnectPlanTerminal(plan, plan.terminalFallbackCodeV1)
       return
     }
     val retained = synchronized(stateLock) {
@@ -3220,7 +3268,7 @@ internal class VeilMobileRuntime internal constructor(
     val cancellation = try {
       cancellationFactory.create()
     } catch (_: Throwable) {
-      failReconnectPlanTerminal(plan)
+      failReconnectPlanTerminal(plan, plan.terminalFallbackCodeV1)
       return
     }
     val started = synchronized(stateLock) {
@@ -3242,6 +3290,7 @@ internal class VeilMobileRuntime internal constructor(
         plan.scheduledFuture = null
         plan.cancellation = cancellation
         connectionState = NativeConnectionState.CONNECTING
+        clearTerminalFailureAfterRecoveryLocked()
         true
       }
     }
@@ -3302,7 +3351,7 @@ internal class VeilMobileRuntime internal constructor(
         }
       }
       if (bootstrapOwner == null) {
-        failReconnectPlanTerminal(plan)
+        failReconnectPlanTerminal(plan, PublicFailureCodeV1.RUNTIME_999)
         return
       }
       directBootstrapOwnerBoundary()
@@ -3310,8 +3359,11 @@ internal class VeilMobileRuntime internal constructor(
       publishSnapshot()
     } catch (error: NativeMobileRetryableException) {
       retryReconnectPlan(plan, error.reason)
-    } catch (_: Throwable) {
-      failReconnectPlanTerminal(plan)
+    } catch (error: Throwable) {
+      failReconnectPlanTerminal(
+        plan,
+        terminalConnectFailureCodeV1(error, usedAccessPass = false),
+      )
     } finally {
       closeConnectCancellationQuietly(cancellation)
     }
@@ -3344,15 +3396,22 @@ internal class VeilMobileRuntime internal constructor(
         failed.scheduledFuture?.cancel(false)
         failed.scheduledFuture = null
         failed.cancellation = null
-        val next = createReconnectPlanLocked(failed.backoffScope, reason)
+        val next = createReconnectPlanLocked(
+          failed.backoffScope,
+          reason,
+          failed.terminalFallbackCodeV1,
+        )
         activeReconnect = next
         connectionState = NativeConnectionState.CONNECTING
         binding = null
+        clearTerminalFailureAfterRecoveryLocked()
         next
       }
     }
     if (replacement == null) {
-      if (terminalizeUnexpectedOwner) failReconnectPlanTerminal(failed)
+      if (terminalizeUnexpectedOwner) {
+        failReconnectPlanTerminal(failed, PublicFailureCodeV1.RUNTIME_999)
+      }
       return
     }
     disconnectTransportQuietlyIf(failed.session) {
@@ -3367,7 +3426,10 @@ internal class VeilMobileRuntime internal constructor(
     scheduleReconnectPlan(replacement)
   }
 
-  private fun failReconnectPlanTerminal(plan: ActiveReconnect) {
+  private fun failReconnectPlanTerminal(
+    plan: ActiveReconnect,
+    terminalCode: PublicFailureCodeV1,
+  ) {
     val detached = synchronized(stateLock) {
       if (activeReconnect !== plan) return
       plan.stage = NativeReconnectStage.TERMINATING
@@ -3375,11 +3437,11 @@ internal class VeilMobileRuntime internal constructor(
       plan.scheduledFuture = null
       plan.cancellation?.cancelQuietly()
       plan.cancellation = null
-      connectionState = NativeConnectionState.ERROR
+      markConnectionErrorLocked(terminalCode)
       binding = null
       if (activeDirectBootstrap?.reconnectPlan === plan) activeDirectBootstrap = null
       if (reconnectBackoffScope === plan.backoffScope) reconnectBackoffScope = null
-      detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+      detachDirectSyncForFailureLocked(terminalCode)
     }
     detached.cancelHttpQuietly()
     detached.cancelLeaseQuietly()
@@ -3452,16 +3514,21 @@ internal class VeilMobileRuntime internal constructor(
   private fun failDirectSync(sync: ActiveDirectSync) {
     val detached = synchronized(stateLock) {
       if (activeDirectSync !== sync) return
+      val terminalCode = if (directoryReady) {
+        PublicFailureCodeV1.RUNTIME_999
+      } else {
+        PublicFailureCodeV1.SYNC_001
+      }
       cancelActiveReconnectLocked()
       reconnectBackoffScope = null
-      val selected = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+      val selected = detachDirectSyncForFailureLocked(terminalCode)
       ownPreKeyState = NativeOwnPreKeyState.ERROR
       if (
         foreground &&
         lifecycleEpoch == sync.epoch &&
         session === sync.session
       ) {
-        connectionState = NativeConnectionState.ERROR
+        markConnectionErrorLocked(terminalCode)
         binding = null
       }
       selected
@@ -3493,7 +3560,61 @@ internal class VeilMobileRuntime internal constructor(
       currentBinding.userId == sync.userId
   }
 
+  /** Caller holds [stateLock]. */
+  private fun hasTerminalErrorLocked(): Boolean =
+    sessionState == NativeSessionState.ERROR ||
+      connectionState == NativeConnectionState.ERROR ||
+      ownPreKeyState == NativeOwnPreKeyState.ERROR ||
+      directDirectoryState == NativeDirectDirectoryState.ERROR ||
+      directHistoryState == NativeDirectHistoryState.ERROR
+
+  /** Caller holds [stateLock]. Codes are presentation-only state, never authority. */
+  private fun latchTerminalFailureLocked(code: PublicFailureCodeV1) {
+    check(code.isTerminalRuntimeSnapshotCode()) {
+      "Operation-only public failure cannot describe terminal runtime state"
+    }
+    terminalPublicFailureCodeV1 = code
+  }
+
+  /** Caller holds [stateLock] after every ERROR component has been superseded. */
+  private fun clearTerminalFailureAfterRecoveryLocked() {
+    check(!hasTerminalErrorLocked()) {
+      "Terminal public failure cannot clear while runtime state is ERROR"
+    }
+    terminalPublicFailureCodeV1 = null
+  }
+
+  /** Caller holds [stateLock]. */
+  private fun markSessionErrorLocked(code: PublicFailureCodeV1) {
+    sessionState = NativeSessionState.ERROR
+    latchTerminalFailureLocked(code)
+  }
+
+  /** Caller holds [stateLock]. */
+  private fun markConnectionErrorLocked(code: PublicFailureCodeV1) {
+    connectionState = NativeConnectionState.ERROR
+    latchTerminalFailureLocked(code)
+  }
+
+  /** Caller holds [stateLock]. */
+  private fun detachDirectSyncForFailureLocked(
+    code: PublicFailureCodeV1,
+  ): DetachedDirectSync? {
+    latchTerminalFailureLocked(code)
+    return detachDirectSyncStateLocked(NativeDirectDirectoryState.ERROR)
+  }
+
   private fun detachDirectSyncLocked(
+    nextState: NativeDirectDirectoryState,
+  ): DetachedDirectSync? {
+    check(nextState != NativeDirectDirectoryState.ERROR) {
+      "Direct ERROR requires an explicit terminal public failure"
+    }
+    return detachDirectSyncStateLocked(nextState)
+  }
+
+  /** Caller holds [stateLock]. */
+  private fun detachDirectSyncStateLocked(
     nextState: NativeDirectDirectoryState,
   ): DetachedDirectSync? {
     val selected = activeDirectSync
@@ -3571,11 +3692,13 @@ internal class VeilMobileRuntime internal constructor(
       activeDirectBootstrap = null
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
-      Triple(
+      val selected = Triple(
         session,
         lifecycleEpoch,
         detachDirectSyncLocked(NativeDirectDirectoryState.IDLE),
       )
+      if (!hasTerminalErrorLocked()) clearTerminalFailureAfterRecoveryLocked()
+      selected
     }
     val active = target.first
     target.third.cancelHttpQuietly()
@@ -3613,7 +3736,7 @@ internal class VeilMobileRuntime internal constructor(
           connectionState == NativeConnectionState.DISCONNECTED &&
           binding == null
         ) {
-          connectionState = NativeConnectionState.ERROR
+          markConnectionErrorLocked(PublicFailureCodeV1.RUNTIME_999)
           binding = null
           directoryReady = false
         }
@@ -3657,6 +3780,7 @@ internal class VeilMobileRuntime internal constructor(
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
       val detachedDirectSync = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
+      clearTerminalFailureAfterRecoveryLocked()
       // Clear only capabilities that linearized before this lock. A new
       // enrollment Intent may stage another Pass after stateLock is released;
       // slow transport teardown must never erase that newer capability.
@@ -3711,6 +3835,7 @@ internal class VeilMobileRuntime internal constructor(
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
       val detachedDirectSync = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
+      clearTerminalFailureAfterRecoveryLocked()
       // Linearize Pass revocation with the Activity background transition.
       // A later foreground Intent stages a distinct capability after this lock.
       passStore.close()
@@ -3827,6 +3952,7 @@ internal class VeilMobileRuntime internal constructor(
       directContentRevision = activeDirectSync?.contentRevision,
       sessionState = sessionState,
       connectionState = connectionState,
+      publicFailureCodeV1 = terminalPublicFailureCodeForSnapshotLocked(),
       directoryReady = directoryReady,
       secureSyncState = secureSyncStateLocked(),
       ownPreKeyState = ownPreKeyState,
@@ -3840,6 +3966,18 @@ internal class VeilMobileRuntime internal constructor(
         null
       },
     )
+  }
+
+  /**
+   * Return only an exact closed terminal cause. A future transition that
+   * forgets to latch a cause still publishes the generic fail-closed code;
+   * stale process-local causes are never projected onto a healthy state.
+   */
+  private fun terminalPublicFailureCodeForSnapshotLocked(): PublicFailureCodeV1? {
+    if (!hasTerminalErrorLocked()) return null
+    return terminalPublicFailureCodeV1
+      ?.takeIf(PublicFailureCodeV1::isTerminalRuntimeSnapshotCode)
+      ?: PublicFailureCodeV1.RUNTIME_999
   }
 
   private fun secureSyncStateLocked(): NativeSecureSyncState = when {
@@ -3856,7 +3994,44 @@ internal class VeilMobileRuntime internal constructor(
     else -> NativeSecureSyncState.IDLE
   }
 
-  private fun publicConnectFailure(error: Throwable): VeilMobileRuntimeException = when (error) {
+  /**
+   * Closed terminal snapshot mapping. The context bit is local operation state,
+   * never server text: registration-closed is meaningful only without a Pass,
+   * while invite-invalid is meaningful only when a Pass was actually used.
+   */
+  private fun terminalConnectFailureCodeV1(
+    error: Throwable,
+    usedAccessPass: Boolean,
+  ): PublicFailureCodeV1 {
+    val internalCode = if (error is VeilMobileRuntimeException) {
+      error.code
+    } else {
+      publicConnectFailure(error, usedAccessPass).code
+    }
+    val mapped = publicFailureCodeV1ForInternalRuntimeCode(internalCode)
+    val contextual = when (mapped) {
+      PublicFailureCodeV1.PASS_001 -> if (usedAccessPass) {
+        PublicFailureCodeV1.RUNTIME_999
+      } else {
+        PublicFailureCodeV1.PASS_001
+      }
+      PublicFailureCodeV1.PASS_002 -> if (usedAccessPass) {
+        PublicFailureCodeV1.PASS_002
+      } else {
+        PublicFailureCodeV1.RUNTIME_999
+      }
+      // Lifecycle cancellation describes one operation, not retained ERROR state.
+      PublicFailureCodeV1.RUNTIME_002 -> PublicFailureCodeV1.RUNTIME_999
+      else -> mapped
+    }
+    return contextual.takeIf { it.isTerminalRuntimeSnapshotCode() }
+      ?: PublicFailureCodeV1.RUNTIME_999
+  }
+
+  private fun publicConnectFailure(
+    error: Throwable,
+    usedAccessPass: Boolean,
+  ): VeilMobileRuntimeException = when (error) {
     is NativeMobileRetryableException -> when (error.reason) {
       NativeMobileRetryableReason.TRANSPORT -> VeilMobileRuntimeException(
         "E_VEIL_TRANSPORT",
@@ -3869,14 +4044,22 @@ internal class VeilMobileRuntime internal constructor(
         "E_VEIL_AUTH_REJECTED",
         "The Veil Node rejected this local account",
       )
-      NativeMobileConnectFailureReason.REGISTRATION_CLOSED -> VeilMobileRuntimeException(
-        "E_VEIL_ACCESS_REQUIRED",
-        "Registration on this Veil Node requires a valid Node Access Pass",
-      )
-      NativeMobileConnectFailureReason.INVITE_INVALID -> VeilMobileRuntimeException(
-        "E_VEIL_ACCESS_PASS_REJECTED",
-        "The Node Access Pass is invalid, expired, or already used",
-      )
+      NativeMobileConnectFailureReason.REGISTRATION_CLOSED -> if (usedAccessPass) {
+        genericPublicConnectFailure()
+      } else {
+        VeilMobileRuntimeException(
+          "E_VEIL_ACCESS_REQUIRED",
+          "Registration on this Veil Node requires a valid Node Access Pass",
+        )
+      }
+      NativeMobileConnectFailureReason.INVITE_INVALID -> if (usedAccessPass) {
+        VeilMobileRuntimeException(
+          "E_VEIL_ACCESS_PASS_REJECTED",
+          "The Node Access Pass is invalid, expired, or already used",
+        )
+      } else {
+        genericPublicConnectFailure()
+      }
       NativeMobileConnectFailureReason.EPOCH_INVALID -> VeilMobileRuntimeException(
         "E_VEIL_BINDING",
         "The Veil Node authenticated binding was rejected",

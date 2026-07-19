@@ -228,7 +228,8 @@ internal fun VeilMobileRuntimeSnapshot.toPublicDirectDirectoryPublication():
         current.canonicalServerOrigin
     }.getOrDefault(false)
   } == true
-  val hasPublishAuthority = identityExists &&
+  val hasPublishAuthority = publicFailureCodeV1 == null &&
+    identityExists &&
     runtimeRevision in 1L..MAX_PUBLIC_SNAPSHOT_REVISION &&
     directGeneration?.let { it in 1L..MAX_PUBLIC_SNAPSHOT_REVISION } == true &&
     directContentRevision?.let { it in 0L..MAX_PUBLIC_SNAPSHOT_REVISION } == true &&
@@ -320,6 +321,9 @@ private fun String.isSafePublicDirectoryText(maxBytes: Int): Boolean {
   return true
 }
 
+internal fun VeilMobileRuntimeSnapshot.publicFailureCodeV1WireValue(): String? =
+  publicFailureCodeV1?.wireValue
+
 private fun VeilMobileRuntimeSnapshot.toWritableMap(): WritableMap = Arguments.createMap().apply {
   val publicDirectory = toPublicDirectDirectoryPublication()
   putBoolean("identityExists", identityExists)
@@ -330,6 +334,9 @@ private fun VeilMobileRuntimeSnapshot.toWritableMap(): WritableMap = Arguments.c
     ?: putNull("directContentRevision")
   putString("sessionState", sessionState.name.lowercase())
   putString("connectionState", connectionState.name.lowercase())
+  publicFailureCodeV1WireValue()?.let { wireValue ->
+    putString(RUNTIME_SNAPSHOT_PUBLIC_FAILURE_CODE_KEY, wireValue)
+  } ?: putNull(RUNTIME_SNAPSHOT_PUBLIC_FAILURE_CODE_KEY)
   putBoolean("directoryReady", publicDirectory.ready)
   putString("secureSyncState", secureSyncState.name.lowercase())
   putMap("binding", binding?.toWritableMap())
@@ -340,6 +347,8 @@ private fun VeilMobileRuntimeSnapshot.toWritableMap(): WritableMap = Arguments.c
     }
   })
 }
+
+private const val RUNTIME_SNAPSHOT_PUBLIC_FAILURE_CODE_KEY = "publicFailureCodeV1"
 
 private fun PublicDirectConversationView.toWritableMap(): WritableMap = Arguments.createMap().apply {
   putString("conversationId", conversationId)

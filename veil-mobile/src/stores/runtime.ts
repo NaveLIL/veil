@@ -6,6 +6,7 @@ import {
 } from "../contracts/publicFailureCodesV1";
 import {
   isExactAuthenticatedBinding,
+  isTerminalRuntimePublicFailureCodeV1,
   type AuthenticatedBinding,
   type VeilMobileRuntimeSnapshot,
 } from "../native/runtime";
@@ -39,7 +40,11 @@ interface RuntimeGateState {
     snapshot: VeilMobileRuntimeSnapshot,
     explicitReopen?: boolean,
   ) => void;
-  failOperation: (epoch: number, failure: PublicFailureCodeV1) => void;
+  failOperation: (
+    epoch: number,
+    failure: PublicFailureCodeV1,
+    freshSnapshot: VeilMobileRuntimeSnapshot | null,
+  ) => void;
 }
 
 const initialRuntimeState = {
@@ -107,9 +112,10 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
       curtainVisible: false,
       operation: null,
       publicFailureCode,
-      requiresExplicitReopen: publicFailureCode !== null
-        ? true
-        : state.requiresExplicitReopen,
+      // Bootstrap has no previously rendered authority to revoke. A terminal
+      // snapshot blocks chat through its public code without pretending that
+      // an already-open local session needs to be opened again.
+      requiresExplicitReopen: state.requiresExplicitReopen,
     });
   },
 
@@ -129,13 +135,26 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
     const committed = current && current.runtimeRevision === snapshot.runtimeRevision
       ? conservativelyMergeRuntimeSnapshots(current, snapshot)
       : snapshot;
-    const publicFailureCode = publicFailureCodeForUnclassifiedSnapshot(committed);
+    const classifiedFailure = publicFailureCodeForUnclassifiedSnapshot(committed);
+    // An operation whose native state could not be reread remains unknown
+    // until an explicit retry/bootstrap or a newer typed terminal snapshot.
+    // A clean unsolicited event alone cannot prove that rejection harmless.
+    const publicFailureCode = state.operation !== null
+      && state.publicFailureCode !== null
+      && classifiedFailure === null
+      ? state.publicFailureCode
+      : state.operation === null
+        && state.publicFailureCode === "VEIL-RUNTIME-999"
+        && classifiedFailure === null
+        ? "VEIL-RUNTIME-999"
+        : classifiedFailure;
+    const isAsyncRevocation = state.operation === null
+      && state.publicFailureCode === null
+      && publicFailureCode !== null;
     set({
       snapshot: committed,
       publicFailureCode,
-      requiresExplicitReopen: publicFailureCode !== null
-        ? true
-        : state.requiresExplicitReopen,
+      requiresExplicitReopen: isAsyncRevocation ? true : state.requiresExplicitReopen,
     });
   },
 
@@ -155,7 +174,11 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
   beginOperation: (operation) => {
     const state = get();
     if (state.phase !== "ready" || state.curtainVisible || state.operation !== null) return null;
-    set({ operation, publicFailureCode: null });
+    // A prior operation may have left a valid-looking snapshot paired with the
+    // only fail-closed deny code after its confirming read failed. Keep that
+    // code latched throughout revalidation; only finishOperation with an
+    // authoritative snapshot may clear it.
+    set({ operation });
     return state.epoch;
   },
 
@@ -173,27 +196,59 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
           : snapshot
       : snapshot;
     const publicFailureCode = publicFailureCodeForUnclassifiedSnapshot(committed);
+    const explicitLocalReopenConfirmed = explicitReopen
+      && committed.identityExists
+      && committed.runtimeRevision >= 1
+      && committed.sessionState === "open";
     set({
       snapshot: committed,
       operation: null,
       publicFailureCode,
-      requiresExplicitReopen: publicFailureCode !== null
-        ? true
-        : explicitReopen
-          ? false
-          : state.requiresExplicitReopen,
+      // A successful explicit local reopen is authoritative even when a
+      // separate terminal Node state remains. That Node failure still blocks
+      // chat through publicFailureCode and the snapshot state.
+      requiresExplicitReopen: explicitLocalReopenConfirmed
+        ? false
+        : state.requiresExplicitReopen,
     });
   },
 
-  failOperation: (epoch, failure) => {
+  failOperation: (epoch, failure, freshSnapshot) => {
     const state = get();
     if (state.epoch !== epoch || state.phase !== "ready" || state.curtainVisible) return;
+    const current = state.snapshot;
+    const committed = freshSnapshot === null
+      ? current
+      : current
+        && current.runtimeRevision > 0
+        && freshSnapshot.runtimeRevision > 0
+        ? current.runtimeRevision > freshSnapshot.runtimeRevision
+          ? current
+          : current.runtimeRevision === freshSnapshot.runtimeRevision
+            ? conservativelyMergeRuntimeSnapshots(current, freshSnapshot)
+            : freshSnapshot
+        : freshSnapshot;
+    if (committed !== null) {
+      const publicFailureCode = freshSnapshot === null
+        ? "VEIL-RUNTIME-999"
+        : reconcileOperationFailureWithSnapshot(failure, committed);
+      set({
+        phase: "ready",
+        snapshot: committed,
+        operation: null,
+        publicFailureCode,
+        // Operation-owned failures are already non-renderable through the
+        // code above. Do not turn them into a fake local-unlock requirement.
+        requiresExplicitReopen: state.requiresExplicitReopen,
+      });
+      return;
+    }
     set({
       phase: "error",
       snapshot: null,
       requiresExplicitReopen: true,
       operation: null,
-      publicFailureCode: failure,
+      publicFailureCode: "VEIL-RUNTIME-999",
     });
   },
 }));
@@ -201,12 +256,30 @@ export const useRuntimeGateStore = create<RuntimeGateState>((set, get) => ({
 function publicFailureCodeForUnclassifiedSnapshot(
   snapshot: VeilMobileRuntimeSnapshot,
 ): PublicFailureCodeV1 | null {
-  return snapshot.runtimeRevision === 0
-    || snapshot.sessionState === "error"
+  const hasTerminalErrorState = snapshot.sessionState === "error"
     || snapshot.connectionState === "error"
-    || snapshot.secureSyncState === "error"
-    ? "VEIL-RUNTIME-999"
-    : null;
+    || snapshot.secureSyncState === "error";
+  if (snapshot.runtimeRevision === 0) return "VEIL-RUNTIME-999";
+  if (snapshot.publicFailureCodeV1 === null) {
+    return hasTerminalErrorState ? "VEIL-RUNTIME-999" : null;
+  }
+  return hasTerminalErrorState
+    && isTerminalRuntimePublicFailureCodeV1(snapshot.publicFailureCodeV1)
+    ? snapshot.publicFailureCodeV1
+    : "VEIL-RUNTIME-999";
+}
+
+function reconcileOperationFailureWithSnapshot(
+  operationFailure: PublicFailureCodeV1,
+  snapshot: VeilMobileRuntimeSnapshot,
+): PublicFailureCodeV1 {
+  const snapshotFailure = publicFailureCodeForUnclassifiedSnapshot(snapshot);
+  if (isTerminalRuntimePublicFailureCodeV1(operationFailure)) {
+    return snapshotFailure === operationFailure ? operationFailure : "VEIL-RUNTIME-999";
+  }
+  // Operation-only outcomes are intentionally absent from native snapshots.
+  // They are trustworthy only when the fresh snapshot is itself nonterminal.
+  return snapshotFailure === null ? operationFailure : "VEIL-RUNTIME-999";
 }
 
 /** Collapse native failures to the append-only presentation registry. */
@@ -283,6 +356,7 @@ export function hasExactAuthenticatedBinding(binding: AuthenticatedBinding | nul
 export function canRenderChat(
   snapshot: VeilMobileRuntimeSnapshot | null,
   requiresExplicitReopen: boolean,
+  publicFailureCode: PublicFailureCodeV1 | null,
 ): boolean {
   return Boolean(
     snapshot?.identityExists
@@ -295,6 +369,8 @@ export function canRenderChat(
       && Number.isSafeInteger(snapshot.directContentRevision)
       && snapshot.directContentRevision >= 0
       && !requiresExplicitReopen
+      && publicFailureCode === null
+      && snapshot.publicFailureCodeV1 === null
       && snapshot.sessionState === "open"
       && snapshot.connectionState === "connected"
       && snapshot.secureSyncState === "history_synchronized"
@@ -320,6 +396,9 @@ export function conservativelyMergeRuntimeSnapshots(
     confirmed.runtimeRevision !== observed.runtimeRevision
   ) {
     return confirmed.runtimeRevision > observed.runtimeRevision ? confirmed : observed;
+  }
+  if (confirmed.publicFailureCodeV1 !== observed.publicFailureCodeV1) {
+    return restrictiveMergedRuntimeSnapshot();
   }
   const identityAgrees = confirmed.identityExists === observed.identityExists;
   const mergedSessionState = moreRestrictiveSessionState(
@@ -375,6 +454,13 @@ export function conservativelyMergeRuntimeSnapshots(
     && confirmed.pendingAccessPass.flowId === observed.pendingAccessPass.flowId
     && confirmed.pendingAccessPass.canonicalOrigin === observed.pendingAccessPass.canonicalOrigin
     && confirmed.pendingAccessPass.tokenRef === observed.pendingAccessPass.tokenRef;
+  const publicFailureCodeV1 = confirmed.publicFailureCodeV1;
+  const mergedHasTerminalError = sessionState === "error"
+    || connectionState === "error"
+    || secureSyncState === "error";
+  if (mergedHasTerminalError !== (publicFailureCodeV1 !== null)) {
+    return restrictiveMergedRuntimeSnapshot();
+  }
 
   return {
     // Showing the locked-account gate is safer than accidentally offering a
@@ -397,7 +483,25 @@ export function conservativelyMergeRuntimeSnapshots(
           ),
         }
       : null,
+    publicFailureCodeV1,
     directConversations: directoryReady ? confirmed.directConversations : [],
+  };
+}
+
+function restrictiveMergedRuntimeSnapshot(): VeilMobileRuntimeSnapshot {
+  return {
+    identityExists: true,
+    runtimeRevision: 0,
+    directGeneration: null,
+    directContentRevision: null,
+    sessionState: "error",
+    connectionState: "error",
+    directoryReady: false,
+    secureSyncState: "error",
+    binding: null,
+    pendingAccessPass: null,
+    publicFailureCodeV1: "VEIL-RUNTIME-999",
+    directConversations: [],
   };
 }
 

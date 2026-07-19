@@ -506,6 +506,7 @@ class VeilMobileRuntimeTest {
       assertEquals(delayedSchedulesBeforeFailure, executor.delayedScheduleCount())
       assertNull(runtime.reconnectPlanForTesting())
       assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertEquals(PublicFailureCodeV1.SYNC_001, runtime.snapshot().publicFailureCodeV1)
       assertNull(runtime.snapshot().binding)
       assertEquals(pending.flowId, runtime.snapshot().pendingAccessPass?.flowId)
 
@@ -679,12 +680,51 @@ class VeilMobileRuntimeTest {
       assertEquals(1, fakeSession.plainConnectCount)
       assertEquals(0, fakeSession.accessPassConnectCount)
       assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertEquals(PublicFailureCodeV1.NODE_004, runtime.snapshot().publicFailureCodeV1)
       assertNull(runtime.snapshot().binding)
       assertNull(runtime.reconnectPlanForTesting())
       assertEquals(0, fakeSession.directSyncBeginCount)
     } finally {
       runtime.lockSession()
       executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun storedTargetReconnectLatchesOnlyContextValidTypedTerminalCauses() {
+    val cases = listOf(
+      NativeMobileConnectFailureReason.AUTHENTICATION_REJECTED to PublicFailureCodeV1.NODE_003,
+      NativeMobileConnectFailureReason.REGISTRATION_CLOSED to PublicFailureCodeV1.PASS_001,
+      NativeMobileConnectFailureReason.INVITE_INVALID to PublicFailureCodeV1.RUNTIME_999,
+      NativeMobileConnectFailureReason.EPOCH_INVALID to PublicFailureCodeV1.NODE_004,
+      NativeMobileConnectFailureReason.STORAGE_UNCERTAIN to PublicFailureCodeV1.LOCAL_003,
+    )
+
+    cases.forEach { (reason, expectedCode) ->
+      val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+      val fakeSession = FakeSession().apply {
+        storedReconnectTarget = NativeMobileReconnectTarget(
+          canonicalServerOrigin = "https://resume.example:443",
+          expectedUserId = USER_ID,
+        )
+        queuedConnectFailures.add(NativeMobileConnectFailureException(reason))
+      }
+      val runtime = runtime(executor, fakeSession)
+      try {
+        runtime.openSession()
+        executor.runCapturedImmediateTask()
+
+        val terminal = runtime.snapshot()
+        assertEquals(NativeConnectionState.ERROR, terminal.connectionState)
+        assertEquals(expectedCode, terminal.publicFailureCodeV1)
+        assertNull(terminal.binding)
+        assertNull(runtime.reconnectPlanForTesting())
+        assertEquals(1, fakeSession.plainConnectCount)
+        assertEquals(0, fakeSession.accessPassConnectCount)
+      } finally {
+        runtime.lockSession()
+        executor.shutdownNow()
+      }
     }
   }
 
@@ -707,6 +747,10 @@ class VeilMobileRuntimeTest {
       assertEquals(0, malformedSession.plainConnectCount)
       assertEquals(0, malformedSession.accessPassConnectCount)
       assertEquals(NativeSessionState.ERROR, malformedRuntime.snapshot().sessionState)
+      assertEquals(
+        PublicFailureCodeV1.LOCAL_002,
+        malformedRuntime.snapshot().publicFailureCodeV1,
+      )
       assertEquals(NativeConnectionState.DISCONNECTED, malformedRuntime.snapshot().connectionState)
       assertNull(malformedRuntime.snapshot().binding)
     } finally {
@@ -727,6 +771,7 @@ class VeilMobileRuntimeTest {
       assertTrue(unreadableSession.closed)
       assertEquals(0, unreadableSession.plainConnectCount)
       assertEquals(0, unreadableSession.accessPassConnectCount)
+      assertEquals(PublicFailureCodeV1.LOCAL_002, unreadableRuntime.snapshot().publicFailureCodeV1)
       assertNull(unreadableRuntime.snapshot().binding)
     } finally {
       unreadableRuntime.lockSession()
@@ -769,6 +814,7 @@ class VeilMobileRuntimeTest {
     try {
       val opened = rejectedRuntime.openSession()
       assertEquals(NativeConnectionState.ERROR, opened.connectionState)
+      assertEquals(PublicFailureCodeV1.RUNTIME_999, opened.publicFailureCodeV1)
       assertNull(opened.binding)
       assertNull(rejectedRuntime.reconnectPlanForTesting())
       assertEquals(0, rejectedSession.plainConnectCount)
@@ -1009,6 +1055,34 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun disconnectFailurePublishesOnlyTheGenericTerminalSnapshotCause() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession)
+    try {
+      runtime.openSession()
+      runtime.connect("https://access.example")
+      fakeSession.disconnectFailure = IllegalStateException(
+        "secret transport teardown diagnostic",
+      )
+
+      val error = assertThrows(VeilMobileRuntimeException::class.java) {
+        runtime.disconnect()
+      }
+
+      assertEquals("E_VEIL_DISCONNECT", error.code)
+      val terminal = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, terminal.connectionState)
+      assertEquals(PublicFailureCodeV1.RUNTIME_999, terminal.publicFailureCodeV1)
+      assertNull(terminal.binding)
+    } finally {
+      fakeSession.disconnectFailure = null
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun pendingPassNeverEntersSnapshotAndClearsOnlyAfterSuccess() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession()
@@ -1063,6 +1137,7 @@ class VeilMobileRuntimeTest {
       val failure: Throwable,
       val expectedCode: String,
       val expectedMessage: String,
+      val expectedSnapshotCode: PublicFailureCodeV1,
     )
 
     val cases = listOf(
@@ -1070,6 +1145,7 @@ class VeilMobileRuntimeTest {
         NativeMobileRetryableException(NativeMobileRetryableReason.TRANSPORT),
         "E_VEIL_TRANSPORT",
         "Unable to reach the Veil Node",
+        PublicFailureCodeV1.NODE_002,
       ),
       ConnectFailureCase(
         NativeMobileConnectFailureException(
@@ -1077,31 +1153,37 @@ class VeilMobileRuntimeTest {
         ),
         "E_VEIL_AUTH_REJECTED",
         "The Veil Node rejected this local account",
+        PublicFailureCodeV1.NODE_003,
       ),
       ConnectFailureCase(
         NativeMobileConnectFailureException(NativeMobileConnectFailureReason.REGISTRATION_CLOSED),
         "E_VEIL_ACCESS_REQUIRED",
         "Registration on this Veil Node requires a valid Node Access Pass",
+        PublicFailureCodeV1.PASS_001,
       ),
       ConnectFailureCase(
         NativeMobileConnectFailureException(NativeMobileConnectFailureReason.INVITE_INVALID),
-        "E_VEIL_ACCESS_PASS_REJECTED",
-        "The Node Access Pass is invalid, expired, or already used",
+        "E_VEIL_CONNECT",
+        "Unable to authenticate with the Veil Node",
+        PublicFailureCodeV1.RUNTIME_999,
       ),
       ConnectFailureCase(
         NativeMobileConnectFailureException(NativeMobileConnectFailureReason.EPOCH_INVALID),
         "E_VEIL_BINDING",
         "The Veil Node authenticated binding was rejected",
+        PublicFailureCodeV1.NODE_004,
       ),
       ConnectFailureCase(
         NativeMobileConnectFailureException(NativeMobileConnectFailureReason.STORAGE_UNCERTAIN),
         "E_VEIL_LOCAL_STATE",
         "Unable to confirm the local secure state",
+        PublicFailureCodeV1.LOCAL_003,
       ),
       ConnectFailureCase(
         NativeMobileRetryableException(NativeMobileRetryableReason.ACK_DEADLINE),
         "E_VEIL_CONNECT",
         "Unable to authenticate with the Veil Node",
+        PublicFailureCodeV1.RUNTIME_999,
       ),
     )
 
@@ -1117,9 +1199,137 @@ class VeilMobileRuntimeTest {
 
         assertEquals(case.expectedCode, error.code)
         assertEquals(case.expectedMessage, error.message)
-        assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
-        assertNull(runtime.snapshot().binding)
+        val terminal = runtime.snapshot()
+        assertEquals(NativeConnectionState.ERROR, terminal.connectionState)
+        assertEquals(case.expectedSnapshotCode, terminal.publicFailureCodeV1)
+        assertNull(terminal.binding)
       } finally {
+        runtime.lockSession()
+        executor.shutdownNow()
+      }
+    }
+  }
+
+  @Test
+  fun registrationClosedCauseSurvivesSnapshotsListenerReattachAndPassStagingUntilRealConnect() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession, deterministicPassStore())
+    val firstPublications = CopyOnWriteArrayList<VeilMobileRuntimeSnapshot>()
+    val secondPublications = CopyOnWriteArrayList<VeilMobileRuntimeSnapshot>()
+    val firstListener: (VeilMobileRuntimeSnapshot) -> Unit = firstPublications::add
+    val secondListener: (VeilMobileRuntimeSnapshot) -> Unit = secondPublications::add
+    val tokenBytes = ByteArray(32) { 0x6a }
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+    try {
+      runtime.openSession()
+      runtime.addListener(firstListener)
+      fakeSession.queuedConnectFailures.add(
+        NativeMobileConnectFailureException(NativeMobileConnectFailureReason.REGISTRATION_CLOSED),
+      )
+
+      val error = assertThrows(VeilMobileRuntimeException::class.java) {
+        runtime.connect("https://access.example")
+      }
+
+      assertEquals("E_VEIL_ACCESS_REQUIRED", error.code)
+      assertTrue(firstPublications.any { it.connectionState == NativeConnectionState.CONNECTING })
+      val firstTerminalEvents = firstPublications.filter {
+        it.connectionState == NativeConnectionState.ERROR
+      }
+      assertTrue(firstTerminalEvents.isNotEmpty())
+      assertTrue(firstTerminalEvents.all {
+        it.publicFailureCodeV1 == PublicFailureCodeV1.PASS_001
+      })
+      repeat(3) {
+        val reread = runtime.snapshot()
+        assertEquals(NativeConnectionState.ERROR, reread.connectionState)
+        assertEquals(PublicFailureCodeV1.PASS_001, reread.publicFailureCodeV1)
+      }
+
+      // Simulate a React listener being destroyed and recreated while the same
+      // native process/runtime remains authoritative.
+      runtime.removeListener(firstListener)
+      runtime.addListener(secondListener)
+      assertTrue(runtime.consumeEnrollmentUri("https://access.example/enroll#invite=$token"))
+      val staged = runtime.snapshot()
+      val pending = checkNotNull(staged.pendingAccessPass)
+      assertEquals(NativeConnectionState.ERROR, staged.connectionState)
+      assertEquals(PublicFailureCodeV1.PASS_001, staged.publicFailureCodeV1)
+      assertTrue(secondPublications.any {
+        it.connectionState == NativeConnectionState.ERROR &&
+          it.publicFailureCodeV1 == PublicFailureCodeV1.PASS_001 &&
+          it.pendingAccessPass?.flowId == pending.flowId
+      })
+
+      runtime.connectPendingAccessPass(pending.flowId)
+
+      val recovered = runtime.snapshot()
+      assertEquals(NativeConnectionState.CONNECTED, recovered.connectionState)
+      assertNull(recovered.publicFailureCodeV1)
+      assertNull(recovered.pendingAccessPass)
+      assertTrue(secondPublications.any {
+        it.connectionState == NativeConnectionState.CONNECTING &&
+          it.publicFailureCodeV1 == null
+      })
+      assertTrue(secondPublications.filter {
+        it.connectionState == NativeConnectionState.ERROR
+      }.all { it.publicFailureCodeV1 == PublicFailureCodeV1.PASS_001 })
+    } finally {
+      tokenBytes.fill(0)
+      runtime.removeListener(firstListener)
+      runtime.removeListener(secondListener)
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun enrollmentTerminalCodesRequireTheExactConnectContextAndPreserveThePass() {
+    data class EnrollmentFailureCase(
+      val reason: NativeMobileConnectFailureReason,
+      val expectedInternalCode: String,
+      val expectedPublicCode: PublicFailureCodeV1,
+    )
+
+    val cases = listOf(
+      EnrollmentFailureCase(
+        NativeMobileConnectFailureReason.REGISTRATION_CLOSED,
+        "E_VEIL_CONNECT",
+        PublicFailureCodeV1.RUNTIME_999,
+      ),
+      EnrollmentFailureCase(
+        NativeMobileConnectFailureReason.INVITE_INVALID,
+        "E_VEIL_ACCESS_PASS_REJECTED",
+        PublicFailureCodeV1.PASS_002,
+      ),
+    )
+
+    cases.forEachIndexed { index, case ->
+      val executor = daemonExecutor()
+      val fakeSession = FakeSession()
+      val runtime = runtime(executor, fakeSession, deterministicPassStore())
+      val tokenBytes = ByteArray(32) { (0x40 + index).toByte() }
+      val token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+      try {
+        runtime.openSession()
+        assertTrue(runtime.consumeEnrollmentUri("https://access.example/enroll#invite=$token"))
+        val pending = checkNotNull(runtime.snapshot().pendingAccessPass)
+        fakeSession.queuedConnectFailures.add(NativeMobileConnectFailureException(case.reason))
+
+        val error = assertThrows(VeilMobileRuntimeException::class.java) {
+          runtime.connectPendingAccessPass(pending.flowId)
+        }
+
+        assertEquals(case.expectedInternalCode, error.code)
+        val terminal = runtime.snapshot()
+        assertEquals(NativeConnectionState.ERROR, terminal.connectionState)
+        assertEquals(case.expectedPublicCode, terminal.publicFailureCodeV1)
+        assertEquals(pending.flowId, terminal.pendingAccessPass?.flowId)
+        assertEquals(1, fakeSession.accessPassConnectCount)
+        assertEquals(0, fakeSession.plainConnectCount)
+      } finally {
+        tokenBytes.fill(0)
         runtime.lockSession()
         executor.shutdownNow()
       }
@@ -1429,6 +1639,7 @@ class VeilMobileRuntimeTest {
       assertTrue(executorDrained.await(5, TimeUnit.SECONDS))
       assertEquals("E_VEIL_CANCELLED", connectError.get()?.code)
       assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+      assertNull(runtime.snapshot().publicFailureCodeV1)
       assertNull(runtime.snapshot().binding)
       assertFalse(connectedWasPublished.get())
       assertTrue(
@@ -1718,7 +1929,10 @@ class VeilMobileRuntimeTest {
 
       assertTrue(
         "continuous native replay did not publish its aggregate invalidation",
-        awaitCondition { runtime.snapshot().directContentRevision == 1L },
+        awaitCondition {
+          runtime.snapshot().directContentRevision == 1L &&
+            publishedContentRevisions.contains(1L)
+        },
       )
       val ready = runtime.snapshot()
       assertTrue(ready.directoryReady)
@@ -1766,6 +1980,7 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
       assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
       assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertEquals(PublicFailureCodeV1.RUNTIME_999, failed.publicFailureCodeV1)
       assertNull(failed.directGeneration)
       assertNull(failed.directContentRevision)
       assertNull(failed.binding)
@@ -1803,6 +2018,7 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
       assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
       assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertEquals(PublicFailureCodeV1.RUNTIME_999, failed.publicFailureCodeV1)
       assertNull(failed.directGeneration)
       assertNull(failed.directContentRevision)
       assertNull(failed.binding)
@@ -2133,6 +2349,7 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
       assertEquals(NativeDirectHistoryState.ERROR, failed.directHistoryState)
       assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertEquals(PublicFailureCodeV1.SYNC_001, failed.publicFailureCodeV1)
       assertNull(failed.binding)
       assertFalse(failed.directoryReady)
     } finally {
@@ -2348,6 +2565,7 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeDirectDirectoryState.ERROR, failed.directDirectoryState)
       assertEquals(NativeOwnPreKeyState.ERROR, failed.ownPreKeyState)
       assertEquals(NativeSecureSyncState.ERROR, failed.secureSyncState)
+      assertEquals(PublicFailureCodeV1.SYNC_001, failed.publicFailureCodeV1)
       assertNull(failed.binding)
       assertTrue(failed.directConversations.isEmpty())
       assertFalse(failed.directoryReady)
@@ -3003,6 +3221,7 @@ class VeilMobileRuntimeTest {
       assertTrue(fakeSession.directTextPlaintextReferences.single().all { it == 0.toByte() })
       val revoked = runtime.snapshot()
       assertEquals(NativeConnectionState.ERROR, revoked.connectionState)
+      assertEquals(PublicFailureCodeV1.RUNTIME_999, revoked.publicFailureCodeV1)
       assertNull(revoked.directGeneration)
       assertNull(revoked.directContentRevision)
       assertNull(revoked.binding)
@@ -3393,6 +3612,7 @@ class VeilMobileRuntimeTest {
           assertNull(runtime.reconnectPlanForTesting())
           assertEquals(schedulesBeforeConnect, executor.delayedScheduleCount())
           assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+          assertEquals(PublicFailureCodeV1.RUNTIME_999, runtime.snapshot().publicFailureCodeV1)
         }
         assertEquals(2, fakeSession.plainConnectCount)
         assertNull(runtime.snapshot().binding)
@@ -3506,6 +3726,7 @@ class VeilMobileRuntimeTest {
       val failed = runtime.snapshot()
       assertEquals(2, fakeSession.plainConnectCount)
       assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(PublicFailureCodeV1.NODE_004, failed.publicFailureCodeV1)
       assertNull(failed.binding)
       assertNull(failed.directGeneration)
       assertNull(runtime.reconnectPlanForTesting())
@@ -3768,6 +3989,41 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun staleReconnectOwnerCannotOverwriteANewerRegistrationClosedCause() {
+    val executor = CapturingScheduledExecutor()
+    val fakeSession = FakeSession()
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("54", "Stale cause", "55", "stale-cause", false)
+    try {
+      establishWaitingReconnect(runtime, fakeSession, transport, conversation)
+      fakeSession.queuedConnectFailures.add(
+        NativeMobileConnectFailureException(NativeMobileConnectFailureReason.REGISTRATION_CLOSED),
+      )
+
+      val error = assertThrows(VeilMobileRuntimeException::class.java) {
+        runtime.connect("https://access.example")
+      }
+      assertEquals("E_VEIL_ACCESS_REQUIRED", error.code)
+      val current = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, current.connectionState)
+      assertEquals(PublicFailureCodeV1.PASS_001, current.publicFailureCodeV1)
+      assertNull(runtime.reconnectPlanForTesting())
+
+      executor.runCapturedDelayedTask()
+
+      val afterStaleTask = runtime.snapshot()
+      assertEquals(2, fakeSession.plainConnectCount)
+      assertEquals(NativeConnectionState.ERROR, afterStaleTask.connectionState)
+      assertEquals(PublicFailureCodeV1.PASS_001, afterStaleTask.publicFailureCodeV1)
+      assertNull(afterStaleTask.binding)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun sameAccountManualConnectSupersedesAnAuthenticatedReconnectBeforeLeaseBegin() {
     val executor = CapturingScheduledExecutor()
     val bootstrapTurn = AtomicInteger(0)
@@ -3871,6 +4127,7 @@ class VeilMobileRuntimeTest {
 
       assertEquals("E_VEIL_SYNC", error.code)
       assertEquals(NativeConnectionState.ERROR, runtime.snapshot().connectionState)
+      assertEquals(PublicFailureCodeV1.SYNC_001, runtime.snapshot().publicFailureCodeV1)
       assertNull(runtime.snapshot().binding)
       assertNull(runtime.reconnectPlanForTesting())
     } finally {
@@ -3898,6 +4155,7 @@ class VeilMobileRuntimeTest {
       assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
       val failed = runtime.snapshot()
       assertEquals(NativeConnectionState.ERROR, failed.connectionState)
+      assertEquals(PublicFailureCodeV1.RUNTIME_999, failed.publicFailureCodeV1)
       assertNull(failed.binding)
       assertNull(failed.directGeneration)
       assertNull(runtime.reconnectPlanForTesting())
@@ -4830,6 +5088,23 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun publicDirectoryProjectionDeniesEveryFailureOnAnOtherwiseReadySnapshot() {
+    val ready = readyPublicDirectorySnapshot(
+      listOf(directConversation("10", "Alice", "11", "alice", needsPreKey = false)),
+    )
+    assertNull(ready.publicFailureCodeV1WireValue())
+
+    PublicFailureCodeV1.entries.forEach { failureCode ->
+      val failed = ready.copy(publicFailureCodeV1 = failureCode)
+      val denied = failed.toPublicDirectDirectoryPublication()
+
+      assertFalse(failureCode.wireValue, denied.ready)
+      assertTrue(failureCode.wireValue, denied.conversations.isEmpty())
+      assertEquals(failureCode.wireValue, failed.publicFailureCodeV1WireValue())
+    }
+  }
+
+  @Test
   fun publicDirectoryProjectionRejectsMalformedRowsWithoutPublishingAPrefix() {
     val valid = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
     val invalidDirectories = listOf(
@@ -5160,6 +5435,7 @@ class VeilMobileRuntimeTest {
     directContentRevision = 0L,
     sessionState = NativeSessionState.OPEN,
     connectionState = NativeConnectionState.CONNECTED,
+    publicFailureCodeV1 = null,
     directoryReady = true,
     secureSyncState = NativeSecureSyncState.HISTORY_SYNCHRONIZED,
     ownPreKeyState = NativeOwnPreKeyState.PUBLISHED,
@@ -5282,6 +5558,7 @@ class VeilMobileRuntimeTest {
     val closedDuringConnect = AtomicBoolean(false)
     @Volatile var disconnectEntered: CountDownLatch? = null
     @Volatile var disconnectRelease: CountDownLatch? = null
+    @Volatile var disconnectFailure: Throwable? = null
     private val inConnect = AtomicBoolean(false)
 
     override fun mobileReconnectTarget(): NativeMobileReconnectTarget? {
@@ -5616,6 +5893,7 @@ class VeilMobileRuntimeTest {
       disconnectRelease?.let { release ->
         check(release.await(5, TimeUnit.SECONDS)) { "synthetic disconnect timed out" }
       }
+      disconnectFailure?.let { throw it }
     }
 
     override fun close() {

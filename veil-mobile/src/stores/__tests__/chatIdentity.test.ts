@@ -63,6 +63,7 @@ const snapshot = (
   secureSyncState: "history_synchronized",
   binding,
   pendingAccessPass: null,
+  publicFailureCodeV1: null,
   runtimeRevision,
   directGeneration,
   directContentRevision: 0,

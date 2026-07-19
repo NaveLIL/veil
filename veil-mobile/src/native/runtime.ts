@@ -12,6 +12,11 @@ import {
   type EmitterSubscription,
 } from "react-native";
 
+import {
+  isPublicFailureCodeV1,
+  type PublicFailureCodeV1,
+} from "../contracts/publicFailureCodesV1";
+
 export type NativeSessionState = "locked" | "opening" | "open" | "closing" | "error";
 export type NativeConnectionState = "disconnected" | "connecting" | "connected" | "error";
 export type NativeSecureSyncState =
@@ -51,6 +56,8 @@ export interface VeilMobileRuntimeSnapshot {
   secureSyncState: NativeSecureSyncState;
   binding: AuthenticatedBinding | null;
   pendingAccessPass: PendingNodeAccessPass | null;
+  /** Reviewed terminal native state, never an exception or server diagnostic. */
+  publicFailureCodeV1: PublicFailureCodeV1 | null;
   /** Public metadata from the complete authenticated Direct directory only. */
   directConversations: DirectConversationView[];
 }
@@ -349,13 +356,34 @@ const restrictiveRuntimeSnapshot = (): VeilMobileRuntimeSnapshot => ({
   secureSyncState: "error",
   binding: null,
   pendingAccessPass: null,
+  publicFailureCodeV1: "VEIL-RUNTIME-999",
   directConversations: [],
 });
+
+const TERMINAL_RUNTIME_PUBLIC_FAILURE_CODES_V1 = new Set<PublicFailureCodeV1>([
+  "VEIL-LOCAL-002",
+  "VEIL-LOCAL-003",
+  "VEIL-NODE-002",
+  "VEIL-NODE-003",
+  "VEIL-NODE-004",
+  "VEIL-PASS-001",
+  "VEIL-PASS-002",
+  "VEIL-SYNC-001",
+  "VEIL-RUNTIME-999",
+]);
+
+/** Snapshot-persistable terminal subset; operation-only outcomes are excluded. */
+export function isTerminalRuntimePublicFailureCodeV1(
+  value: unknown,
+): value is PublicFailureCodeV1 {
+  return isPublicFailureCodeV1(value) && TERMINAL_RUNTIME_PUBLIC_FAILURE_CODES_V1.has(value);
+}
 
 function runtimeSnapshot(value: unknown): VeilMobileRuntimeSnapshot {
   if (!value || typeof value !== "object") return restrictiveRuntimeSnapshot();
   const record = value as Record<string, unknown>;
   if (
+    !Object.prototype.hasOwnProperty.call(record, "publicFailureCodeV1") ||
     typeof record.identityExists !== "boolean" ||
     typeof record.runtimeRevision !== "number" ||
     !Number.isSafeInteger(record.runtimeRevision) ||
@@ -385,11 +413,31 @@ function runtimeSnapshot(value: unknown): VeilMobileRuntimeSnapshot {
   const pendingAccessPass = record.pendingAccessPass === null
     ? null
     : pendingNodeAccessPass(record.pendingAccessPass);
+  const publicFailureCodeV1 = record.publicFailureCodeV1 === null
+    ? null
+    : isTerminalRuntimePublicFailureCodeV1(record.publicFailureCodeV1)
+      ? record.publicFailureCodeV1
+      : undefined;
   const directConversations = directConversationDirectory(record.directConversations);
   if (
     (record.binding !== null && binding === null) ||
     (record.pendingAccessPass !== null && pendingAccessPass === null) ||
+    publicFailureCodeV1 === undefined ||
     directConversations === null
+  ) return restrictiveRuntimeSnapshot();
+
+  const hasTerminalErrorState = record.sessionState === "error"
+    || record.connectionState === "error"
+    || record.secureSyncState === "error";
+  const localOpenFailureWithoutIdentity = publicFailureCodeV1 === "VEIL-LOCAL-002"
+    && record.sessionState === "error"
+    && record.identityExists === false;
+  if (
+    (hasTerminalErrorState !== (publicFailureCodeV1 !== null))
+    || (publicFailureCodeV1 !== null && (
+      (record.identityExists !== true && !localOpenFailureWithoutIdentity)
+      || binding !== null
+    ))
   ) return restrictiveRuntimeSnapshot();
 
   const hasDirectGenerationAuthority = record.identityExists === true &&
@@ -419,6 +467,7 @@ function runtimeSnapshot(value: unknown): VeilMobileRuntimeSnapshot {
     secureSyncState: record.secureSyncState as NativeSecureSyncState,
     binding,
     pendingAccessPass,
+    publicFailureCodeV1,
     directConversations,
   };
 }

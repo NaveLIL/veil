@@ -134,9 +134,12 @@ native projection, per-conversation prekey establishment, guarded send/outbox,
 typed transient reconnect, and canonical-origin process-death recovery are
 present. Same-account force-stop recovery without a new Pass or device has been
 physically confirmed on a Samsung S23. `PublicFailureCodeV1` is implemented for
-identity setup and the secure runtime gate, but Direct session/send/delivery and
-desktop/Go consumer parity remain open. Cross-client E2EE text/airplane/background
-evidence, connected recovery/vault/capture instrumentation, push publication,
+identity setup and the secure runtime gate. A reviewed terminal subset is now
+retained by the native process across snapshot reads and React recreation, but
+it is deliberately not persisted across OS process death and has not yet passed
+the deferred physical matrix. Direct session/send/delivery and desktop/Go
+consumer parity remain open. Cross-client E2EE text/airplane/background evidence,
+connected recovery/vault/capture instrumentation, push publication,
 Circle/Space/attachments, correct multi-device, signed standalone APK
 distribution, durable setup-result reconciliation after React-context/process
 death, and the broader physical-device matrix remain gated.

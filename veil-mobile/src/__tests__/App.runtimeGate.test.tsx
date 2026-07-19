@@ -33,6 +33,17 @@ import {
 jest.mock("../native/runtime", () => ({
   __esModule: true,
   isExactAuthenticatedBinding: (binding: unknown) => Boolean(binding),
+  isTerminalRuntimePublicFailureCodeV1: (value: unknown) => new Set([
+    "VEIL-LOCAL-002",
+    "VEIL-LOCAL-003",
+    "VEIL-NODE-002",
+    "VEIL-NODE-003",
+    "VEIL-NODE-004",
+    "VEIL-PASS-001",
+    "VEIL-PASS-002",
+    "VEIL-SYNC-001",
+    "VEIL-RUNTIME-999",
+  ]).has(value as string),
   default: {
     getSnapshot: jest.fn(),
     openSession: jest.fn(),
@@ -156,6 +167,7 @@ const runtimeSnapshot = (
   secureSyncState: "history_synchronized",
   binding: exactBinding,
   pendingAccessPass: null,
+  publicFailureCodeV1: null,
   runtimeRevision: 1,
   directGeneration: 1,
   directContentRevision: 0,
@@ -522,10 +534,24 @@ describe("App native runtime privacy gate", () => {
       directGeneration: null,
       directContentRevision: null,
     });
-    mockRuntime.getSnapshot.mockResolvedValue(disconnected);
+    const syncFailed = runtimeSnapshot({
+      runtimeRevision: 2,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+      publicFailureCodeV1: "VEIL-SYNC-001",
+    });
+    mockRuntime.getSnapshot
+      .mockResolvedValueOnce(disconnected)
+      .mockResolvedValueOnce(disconnected)
+      .mockResolvedValue(syncFailed);
     mockRuntime.lock.mockResolvedValue(disconnected);
     mockRuntime.connect.mockRejectedValue({
       code: "E_VEIL_SYNC",
+      userInfo: { publicFailureCodeV1: "VEIL-SYNC-001" },
       message: "SECRET_SERVER_DIAGNOSTIC",
     });
 
@@ -534,17 +560,239 @@ describe("App native runtime privacy gate", () => {
 
     fireEvent.press(view.getByTestId("connect-node"));
 
-    await waitFor(() => expect(view.getByTestId("runtime-error")).toBeTruthy());
-    expect(view.getByTestId("runtime-error-scroll").props.contentContainerStyle)
-      .toMatchObject({ flexGrow: 1 });
+    await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
     expect(view.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-SYNC-001");
     expect(view.getByText("Secure Direct sync did not complete")).toBeTruthy();
     expect(view.queryByText("SECRET_SERVER_DIAGNOSTIC")).toBeNull();
     expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
     expect(useChatStore.getState().messagesByChannel).toEqual({});
-    expect(useRuntimeGateStore.getState().snapshot).toBeNull();
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "ready",
+      snapshot: syncFailed,
+      requiresExplicitReopen: false,
+      publicFailureCode: "VEIL-SYNC-001",
+    });
     expect(mockSetAuthenticatedContentReady).toHaveBeenLastCalledWith(false);
-    expect(view.getByRole("button", { name: "Try secure verification again" })).toBeTruthy();
+    expect(view.queryByTestId("runtime-error")).toBeNull();
+  });
+
+  it("keeps PASS-001 through staging and opens chat only after the explicit Pass succeeds", async () => {
+    const disconnected = runtimeSnapshot({
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    const passRequired = runtimeSnapshot({
+      runtimeRevision: 2,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+      publicFailureCodeV1: "VEIL-PASS-001",
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(disconnected);
+    mockRuntime.lock.mockResolvedValue(disconnected);
+    mockRuntime.connect.mockImplementation(async () => {
+      mockRuntime.getSnapshot.mockResolvedValue(passRequired);
+      runtimeListener?.(passRequired);
+      throw {
+        code: "E_VEIL_ACCESS_REQUIRED",
+        userInfo: { publicFailureCodeV1: "VEIL-PASS-001" },
+        message: "PRIVATE_NODE_DIAGNOSTIC",
+      };
+    });
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
+    fireEvent.press(view.getByTestId("connect-node"));
+
+    await waitFor(() => {
+      expect(view.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-PASS-001");
+    });
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "ready",
+      requiresExplicitReopen: false,
+      publicFailureCode: "VEIL-PASS-001",
+    });
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+    expect(view.queryByText("PRIVATE_NODE_DIAGNOSTIC")).toBeNull();
+
+    const flowId = "ab".repeat(32);
+    const staged = {
+      ...passRequired,
+      runtimeRevision: 3,
+      pendingAccessPass: {
+        flowId,
+        canonicalOrigin: "https://veil.erez.pro:443",
+        tokenRef: "0123456789ab",
+        expiresInSeconds: 120,
+      },
+    };
+    act(() => runtimeListener?.(staged));
+    await waitFor(() => expect(view.getByTestId("access-pass-review")).toBeTruthy());
+    expect(view.queryByTestId("connect-node")).toBeNull();
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+    expect(view.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-PASS-001");
+
+    const finalSnapshot = deferred<VeilMobileRuntimeSnapshot>();
+    mockRuntime.connectPendingAccessPass.mockResolvedValue(exactBinding);
+    mockRuntime.getSnapshot.mockReturnValue(finalSnapshot.promise);
+    fireEvent.press(view.getByTestId("use-access-pass"));
+    await waitFor(() => expect(mockRuntime.connectPendingAccessPass).toHaveBeenCalledWith(flowId));
+    expect(mockRuntime.openSession).not.toHaveBeenCalled();
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+
+    const ready = runtimeSnapshot({
+      runtimeRevision: 4,
+      directConversations: [directConversation],
+    });
+    await act(async () => {
+      finalSnapshot.resolve(ready);
+      await finalSnapshot.promise;
+    });
+    await waitFor(() => expect(view.getByTestId("chat-runtime-ready")).toBeTruthy());
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "ready",
+      requiresExplicitReopen: false,
+      publicFailureCode: null,
+      snapshot: { publicFailureCodeV1: null, pendingAccessPass: null },
+    });
+  });
+
+  it("restores PASS-001 from native authority after the React tree is reloaded", async () => {
+    const passRequired = runtimeSnapshot({
+      runtimeRevision: 9,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+      publicFailureCodeV1: "VEIL-PASS-001",
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(passRequired);
+    mockRuntime.lock.mockResolvedValue(passRequired);
+
+    const first = render(<App />);
+    await waitFor(() => {
+      expect(first.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-PASS-001");
+    });
+    first.unmount();
+    resetRuntimeGateStoreForTests();
+
+    const reloaded = render(<App />);
+    await waitFor(() => {
+      expect(reloaded.getByTestId("public-failure-code-v1").props.children)
+        .toBe("VEIL-PASS-001");
+    });
+    expect(mockRuntime.connect).not.toHaveBeenCalled();
+    expect(reloaded.queryByTestId("chat-runtime-ready")).toBeNull();
+    expect(reloaded.queryByText("ONBOARDING")).toBeNull();
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "ready",
+      publicFailureCode: "VEIL-PASS-001",
+      snapshot: { publicFailureCodeV1: "VEIL-PASS-001" },
+    });
+  });
+
+  it("collapses a Promise/snapshot public failure disagreement to RUNTIME-999", async () => {
+    const disconnected = runtimeSnapshot({
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    const passRejected = runtimeSnapshot({
+      runtimeRevision: 2,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+      publicFailureCodeV1: "VEIL-PASS-002",
+    });
+    mockRuntime.getSnapshot
+      .mockResolvedValueOnce(disconnected)
+      .mockResolvedValueOnce(disconnected)
+      .mockResolvedValue(passRejected);
+    mockRuntime.lock.mockResolvedValue(disconnected);
+    mockRuntime.connect.mockRejectedValue({
+      code: "E_VEIL_ACCESS_REQUIRED",
+      userInfo: { publicFailureCodeV1: "VEIL-PASS-001" },
+      message: "CONFLICTING_PRIVATE_DETAIL",
+    });
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("secure-runtime-gate")).toBeTruthy());
+    fireEvent.press(view.getByTestId("connect-node"));
+    await waitFor(() => {
+      expect(view.getByTestId("public-failure-code-v1").props.children)
+        .toBe("VEIL-RUNTIME-999");
+    });
+    expect(view.queryByText("CONFLICTING_PRIVATE_DETAIL")).toBeNull();
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "ready",
+      publicFailureCode: "VEIL-RUNTIME-999",
+    });
+  });
+
+  it("keeps the authenticated shell closed during deferred revalidation after a missing read", async () => {
+    const initiallyReady = runtimeSnapshot({ directConversations: [directConversation] });
+    mockRuntime.getSnapshot.mockResolvedValue(initiallyReady);
+    mockRuntime.lock.mockResolvedValue(initiallyReady);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("chat-runtime-ready")).toBeTruthy());
+
+    act(() => {
+      const gate = useRuntimeGateStore.getState();
+      const epoch = gate.beginOperation("connecting");
+      if (epoch === null) throw new Error("expected operation authority");
+      useRuntimeGateStore.getState().failOperation(epoch, "VEIL-NODE-002", null);
+    });
+    await waitFor(() => {
+      expect(view.getByTestId("public-failure-code-v1").props.children)
+        .toBe("VEIL-RUNTIME-999");
+    });
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+    expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
+
+    const revalidation = deferred<VeilMobileRuntimeSnapshot>();
+    mockRuntime.getSnapshot.mockReturnValue(revalidation.promise);
+    fireEvent.press(view.getByTestId("refresh-runtime"));
+    await waitFor(() => {
+      expect(useRuntimeGateStore.getState()).toMatchObject({
+        operation: "refreshing",
+        publicFailureCode: "VEIL-RUNTIME-999",
+      });
+    });
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+    expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
+
+    act(() => runtimeListener?.(runtimeSnapshot({ runtimeRevision: 2 })));
+    expect(useRuntimeGateStore.getState().publicFailureCode).toBe("VEIL-RUNTIME-999");
+    expect(view.queryByTestId("chat-runtime-ready")).toBeNull();
+    expect(view.queryByText("CHAT_PLAINTEXT")).toBeNull();
+
+    const confirmed = runtimeSnapshot({
+      runtimeRevision: 3,
+      directConversations: [directConversation],
+    });
+    await act(async () => {
+      revalidation.resolve(confirmed);
+      await revalidation.promise;
+    });
+    await waitFor(() => expect(view.getByTestId("chat-runtime-ready")).toBeTruthy());
+    expect(useRuntimeGateStore.getState().publicFailureCode).toBeNull();
   });
 
   it("ignores an old operation failure after a new foreground epoch is Ready", async () => {

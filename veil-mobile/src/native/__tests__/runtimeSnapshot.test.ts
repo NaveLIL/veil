@@ -24,6 +24,7 @@ const readySnapshot = (overrides: Record<string, unknown> = {}) => ({
   secureSyncState: "history_synchronized",
   binding,
   pendingAccessPass: null,
+  publicFailureCodeV1: null,
   directConversations: [conversation],
   ...overrides,
 });
@@ -62,6 +63,7 @@ const restrictiveSnapshot = {
   secureSyncState: "error",
   binding: null,
   pendingAccessPass: null,
+  publicFailureCodeV1: "VEIL-RUNTIME-999",
   directConversations: [],
 };
 
@@ -198,5 +200,116 @@ describe("native runtime snapshot projection", () => {
       directConversations: [{ ...conversation, name: `${exactName}+` }],
     });
     await expect(installRuntime(oversized).getSnapshot()).resolves.toEqual(restrictiveSnapshot);
+  });
+
+  it("preserves an exact terminal PASS-001 snapshot across repeated React reads", async () => {
+    const passRequired = readySnapshot({
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      pendingAccessPass: {
+        flowId: "ab".repeat(32),
+        canonicalOrigin: "https://veil.erez.pro:443",
+        tokenRef: "0123456789ab",
+        expiresInSeconds: 120,
+      },
+      publicFailureCodeV1: "VEIL-PASS-001",
+      directConversations: [],
+      serverDiagnostic: "must-not-cross",
+    });
+    const expected = { ...passRequired };
+    delete (expected as Record<string, unknown>).serverDiagnostic;
+    const runtime = installRuntime(passRequired);
+
+    await expect(runtime.getSnapshot()).resolves.toEqual(expected);
+    await expect(runtime.getSnapshot()).resolves.toEqual(expected);
+  });
+
+  it("preserves LOCAL-002 when opening fails without a confirmed identity", async () => {
+    const localOpenFailed = readySnapshot({
+      identityExists: false,
+      directGeneration: null,
+      directContentRevision: null,
+      sessionState: "error",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      publicFailureCodeV1: "VEIL-LOCAL-002",
+      directConversations: [],
+    });
+
+    await expect(installRuntime(localOpenFailed).getSnapshot()).resolves.toEqual(localOpenFailed);
+  });
+
+  it("collapses missing, malformed, unknown, and operation-only failure codes", async () => {
+    const terminal = readySnapshot({
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      directConversations: [],
+    });
+    const missing = { ...terminal };
+    delete (missing as Record<string, unknown>).publicFailureCodeV1;
+    const invalidCodes: unknown[] = [
+      undefined,
+      7,
+      "VEIL-PASS-666",
+      "VEIL-SETUP-001",
+      "VEIL-SETUP-002",
+      "VEIL-LOCAL-001",
+      "VEIL-NODE-001",
+      "VEIL-PASS-003",
+      "VEIL-RUNTIME-001",
+      "VEIL-RUNTIME-002",
+    ];
+
+    await expect(installRuntime(missing).getSnapshot()).resolves.toEqual(restrictiveSnapshot);
+    for (const publicFailureCodeV1 of invalidCodes) {
+      await expect(
+        installRuntime({ ...terminal, publicFailureCodeV1 }).getSnapshot(),
+      ).resolves.toEqual(restrictiveSnapshot);
+    }
+  });
+
+  it("collapses terminal-null and nonterminal-code contradictions to RUNTIME-999", async () => {
+    const terminalWithoutCode = readySnapshot({
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      publicFailureCodeV1: null,
+      directConversations: [],
+    });
+    const readyWithCode = readySnapshot({ publicFailureCodeV1: "VEIL-PASS-001" });
+    const terminalWithoutIdentity = {
+      ...terminalWithoutCode,
+      identityExists: false,
+      publicFailureCodeV1: "VEIL-PASS-001",
+    };
+    const terminalWithBinding = {
+      ...terminalWithoutCode,
+      binding,
+      publicFailureCodeV1: "VEIL-PASS-001",
+    };
+
+    for (const contradictory of [
+      terminalWithoutCode,
+      readyWithCode,
+      terminalWithoutIdentity,
+      terminalWithBinding,
+    ]) {
+      await expect(
+        installRuntime(contradictory).getSnapshot(),
+      ).resolves.toEqual(restrictiveSnapshot);
+    }
   });
 });

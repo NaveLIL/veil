@@ -126,12 +126,12 @@ reverse proxy. Конкретная схема и rollback gate описаны �
 
 - нет stable release и обещанной обратной совместимости;
 - нет независимого криптографического/security-аудита;
-- Android Direct runtime, atomic vault и native recovery реализованы, но
-  cross-client/airplane physical matrix, connected recovery/capture
-  instrumentation, app-wide public failure codes и standalone signing ещё не
-  закрыты; `PublicFailureCodeV1` ограничен Android identity setup/secure runtime
-  gate, а Direct send/delivery и desktop/Go consumers открыты; calls и MLS
-  runtime не включены;
+- Android Direct runtime, atomic vault, native recovery и process-local typed
+  terminal failure snapshot реализованы, но cross-client/airplane physical
+  matrix, connected recovery/capture instrumentation, app-wide public failure
+  codes и standalone signing ещё не закрыты; `PublicFailureCodeV1` ограничен
+  Android identity setup/secure runtime gate, а Direct send/delivery и
+  desktop/Go consumers открыты; calls и MLS runtime не включены;
 - key transparency отсутствует;
 - attachment, multi-device и platform signing matrices требуют дальнейшего
   release evidence;

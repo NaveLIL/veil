@@ -19,6 +19,7 @@ const lockedSnapshot: VeilMobileRuntimeSnapshot = {
   secureSyncState: "idle",
   binding: null,
   pendingAccessPass: null,
+  publicFailureCodeV1: null,
   directConversations: [],
 };
 
@@ -91,6 +92,28 @@ describe("SecureRuntimeGate", () => {
     fireEvent.press(view.getByTestId("discard-access-pass"));
     expect(onUsePendingAccessPass).toHaveBeenCalledWith(FLOW_ID);
     expect(onDiscardPendingAccessPass).toHaveBeenCalledWith(FLOW_ID);
+  });
+
+  it("keeps an open terminal account on the Pass path without a competing plain connect", () => {
+    const snapshot: VeilMobileRuntimeSnapshot = {
+      ...lockedSnapshot,
+      sessionState: "open",
+      connectionState: "error",
+      secureSyncState: "error",
+      publicFailureCodeV1: "VEIL-PASS-001",
+      pendingAccessPass: {
+        flowId: FLOW_ID,
+        canonicalOrigin: "https://veil.erez.pro:443",
+        tokenRef: "1a2b3c4d5e6f",
+        expiresInSeconds: 125,
+      },
+    };
+    const view = renderGate(snapshot, { publicFailureCode: "VEIL-PASS-001" });
+
+    expect(view.getByTestId("access-pass-review")).toBeTruthy();
+    expect(view.getByTestId("public-failure-code-v1").props.children).toBe("VEIL-PASS-001");
+    expect(view.queryByTestId("connect-node")).toBeNull();
+    expect(view.queryByTestId("unlock-account")).toBeNull();
   });
 
   it("renders a reviewed public failure card instead of native diagnostic text", () => {

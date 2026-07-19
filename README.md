@@ -80,13 +80,14 @@ native-клиента.
   Keystore/SQLCipher runtime, authenticated receive/read, one-shot peer-prekey,
   idempotent native send/outbox, guarded reconnect и whole-app lifecycle/Pass
   authority реализованы; отдельными checkpoint’ами опубликованы Android
-  public-WebPKI TLS, atomic write-once vault, native recovery и debug Ready
-  capture boundary. Cross-client E2EE/airplane matrix, connected recovery/
-  capture instrumentation, app-wide публичные коды ошибок и подписанный
-  standalone APK ещё входят в Phase 5A/5B. `PublicFailureCodeV1` уже покрывает
-  Android identity setup и secure runtime gate, но Direct send/delivery и
-  desktop/Go consumer parity открыты; MLS runtime и звонки не включены как
-  пользовательские функции.
+  public-WebPKI TLS, atomic write-once vault, native recovery, debug Ready
+  capture boundary и process-local terminal failure snapshot. Cross-client
+  E2EE/airplane matrix, connected recovery/capture instrumentation, app-wide
+  публичные коды ошибок и подписанный standalone APK ещё входят в Phase 5A/5B.
+  `PublicFailureCodeV1` покрывает Android identity setup и secure runtime gate,
+  включая сохранение точной terminal-причины при React recreation, но Direct
+  send/delivery и desktop/Go consumer parity открыты; MLS runtime и звонки не
+  включены как пользовательские функции.
 
 Публичный Windows Preview собирается только в CI и всегда сопровождается
 `SHA256SUMS`. До появления доверенного Authenticode-сертификата он явно

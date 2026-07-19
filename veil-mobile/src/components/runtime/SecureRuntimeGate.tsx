@@ -127,7 +127,8 @@ export function SecureRuntimeGate({
   ]);
 
   const needsUnlock = requiresExplicitReopen || snapshot.sessionState !== "open";
-  const canEnterOrigin = !needsUnlock
+  const canEnterOrigin = pending === null
+    && !needsUnlock
     && (snapshot.connectionState === "disconnected" || snapshot.connectionState === "error");
   const bindingIsExact = hasExactAuthenticatedBinding(snapshot.binding);
 

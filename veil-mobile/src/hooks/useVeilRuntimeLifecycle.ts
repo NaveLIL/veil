@@ -72,7 +72,11 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
       : null;
     if (
       committedSnapshot
-      && canRenderChat(committedSnapshot, gate.requiresExplicitReopen)
+      && canRenderChat(
+        committedSnapshot,
+        gate.requiresExplicitReopen,
+        gate.publicFailureCode,
+      )
     ) {
       const before = useChatStore.getState();
       const selectedBefore = before.selectedDmId;
@@ -229,10 +233,22 @@ export function useVeilRuntimeLifecycle(): VeilRuntimeController {
     } catch (error) {
       if (!epochIsCurrent(epoch)) return;
       useChatStore.getState().clearRenderableChat();
+      const operationFailure = classifyRuntimeOperationFailure(error);
+      let freshSnapshot: VeilMobileRuntimeSnapshot | null = null;
+      try {
+        freshSnapshot = await VeilRuntime.getSnapshot();
+      } catch {
+        // The rejected operation no longer has an authoritative native state
+        // to reconcile against. Keep any prior sanitized snapshot, but expose
+        // only the unknown fail-closed outcome.
+      }
+      if (!epochIsCurrent(epoch)) return;
       useRuntimeGateStore.getState().failOperation(
         epoch,
-        classifyRuntimeOperationFailure(error),
+        freshSnapshot === null ? "VEIL-RUNTIME-999" : operationFailure,
+        freshSnapshot,
       );
+      reconcileRenderableChat(epoch);
     }
   }, [epochIsCurrent, reconcileRenderableChat]);
 

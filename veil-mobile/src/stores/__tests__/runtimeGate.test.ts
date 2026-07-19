@@ -27,6 +27,7 @@ const snapshot = (
   secureSyncState: "history_synchronized",
   binding: exactBinding,
   pendingAccessPass: null,
+  publicFailureCodeV1: null,
   directConversations: [],
   ...overrides,
 });
@@ -75,7 +76,7 @@ describe("runtime privacy epochs", () => {
       binding: null,
     }));
     expect(useRuntimeGateStore.getState().snapshot?.runtimeRevision).toBe(11);
-    expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false)).toBe(false);
+    expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false, null)).toBe(false);
   });
 
   it("keeps an unordered malformed-event denial sticky until a fresh read", () => {
@@ -95,7 +96,7 @@ describe("runtime privacy epochs", () => {
 
     useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({ runtimeRevision: 11 }));
     expect(useRuntimeGateStore.getState().snapshot?.runtimeRevision).toBe(0);
-    expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false)).toBe(false);
+    expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false, null)).toBe(false);
   });
 
   it("publishes the deterministic unknown code for malformed bootstrap authority", () => {
@@ -113,12 +114,13 @@ describe("runtime privacy epochs", () => {
 
     expect(useRuntimeGateStore.getState()).toMatchObject({
       phase: "ready",
-      requiresExplicitReopen: true,
+      requiresExplicitReopen: false,
       publicFailureCode: "VEIL-RUNTIME-999",
     });
     expect(canRenderChat(
       useRuntimeGateStore.getState().snapshot,
       useRuntimeGateStore.getState().requiresExplicitReopen,
+      useRuntimeGateStore.getState().publicFailureCode,
     )).toBe(false);
   });
 
@@ -134,6 +136,7 @@ describe("runtime privacy epochs", () => {
       directoryReady: false,
       secureSyncState: "error",
       binding: null,
+      publicFailureCodeV1: "VEIL-RUNTIME-999",
     }));
     expect(useRuntimeGateStore.getState()).toMatchObject({
       phase: "ready",
@@ -142,11 +145,12 @@ describe("runtime privacy epochs", () => {
     });
 
     useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({ runtimeRevision: 3 }));
-    expect(useRuntimeGateStore.getState().publicFailureCode).toBeNull();
+    expect(useRuntimeGateStore.getState().publicFailureCode).toBe("VEIL-RUNTIME-999");
     expect(useRuntimeGateStore.getState().requiresExplicitReopen).toBe(true);
     expect(canRenderChat(
       useRuntimeGateStore.getState().snapshot,
       useRuntimeGateStore.getState().requiresExplicitReopen,
+      useRuntimeGateStore.getState().publicFailureCode,
     )).toBe(false);
   });
 
@@ -169,7 +173,7 @@ describe("runtime privacy epochs", () => {
     useRuntimeGateStore.getState().finishOperation(epoch, snapshot({ runtimeRevision: 11 }));
 
     expect(useRuntimeGateStore.getState().snapshot?.runtimeRevision).toBe(12);
-    expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false)).toBe(false);
+    expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false, null)).toBe(false);
     expect(useRuntimeGateStore.getState().operation).toBeNull();
   });
 
@@ -180,7 +184,11 @@ describe("runtime privacy epochs", () => {
 
     const postLock = useRuntimeGateStore.getState();
     expect(postLock.requiresExplicitReopen).toBe(true);
-    expect(canRenderChat(postLock.snapshot, postLock.requiresExplicitReopen)).toBe(false);
+    expect(canRenderChat(
+      postLock.snapshot,
+      postLock.requiresExplicitReopen,
+      postLock.publicFailureCode,
+    )).toBe(false);
 
     const operationEpoch = postLock.beginOperation("unlocking");
     expect(operationEpoch).toBe(foregroundEpoch);
@@ -188,7 +196,11 @@ describe("runtime privacy epochs", () => {
 
     const reopened = useRuntimeGateStore.getState();
     expect(reopened.requiresExplicitReopen).toBe(false);
-    expect(canRenderChat(reopened.snapshot, reopened.requiresExplicitReopen)).toBe(true);
+    expect(canRenderChat(
+      reopened.snapshot,
+      reopened.requiresExplicitReopen,
+      reopened.publicFailureCode,
+    )).toBe(true);
   });
 
   it("keeps a fresh-snapshot exception latched across a successful retry read", () => {
@@ -206,7 +218,11 @@ describe("runtime privacy epochs", () => {
     const retried = useRuntimeGateStore.getState();
     expect(retried.phase).toBe("ready");
     expect(retried.requiresExplicitReopen).toBe(true);
-    expect(canRenderChat(retried.snapshot, retried.requiresExplicitReopen)).toBe(false);
+    expect(canRenderChat(
+      retried.snapshot,
+      retried.requiresExplicitReopen,
+      retried.publicFailureCode,
+    )).toBe(false);
   });
 });
 
@@ -261,39 +277,302 @@ describe("runtime operation failures", () => {
     expect(classifyRuntimeOperationFailure({ code: 7 })).toBe("VEIL-RUNTIME-999");
   });
 
-  it("revokes a previously Ready snapshot and publishes only its reviewed code", () => {
+  it("keeps a failed operation in the ready gate and accepts a staged Access Pass", () => {
     const epoch = useRuntimeGateStore.getState().beginBootstrap();
-    useRuntimeGateStore.getState().commitFreshSnapshot(epoch, snapshot());
-    expect(canRenderChat(useRuntimeGateStore.getState().snapshot, false)).toBe(true);
+    const disconnected = snapshot({
+      runtimeRevision: 1,
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+    });
+    useRuntimeGateStore.getState().commitFreshSnapshot(epoch, disconnected);
     expect(useRuntimeGateStore.getState().beginOperation("connecting")).toBe(epoch);
 
-    useRuntimeGateStore.getState().failOperation(epoch, "VEIL-SYNC-001");
+    const passRequired = snapshot({
+      runtimeRevision: 2,
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      publicFailureCodeV1: "VEIL-PASS-001",
+    });
+    useRuntimeGateStore.getState().failOperation(epoch, "VEIL-PASS-001", passRequired);
 
     const failed = useRuntimeGateStore.getState();
-    expect(failed.phase).toBe("error");
-    expect(failed.snapshot).toBeNull();
-    expect(failed.requiresExplicitReopen).toBe(true);
+    expect(failed.phase).toBe("ready");
+    expect(failed.snapshot).toEqual(passRequired);
+    expect(failed.requiresExplicitReopen).toBe(false);
     expect(failed.operation).toBeNull();
-    expect(failed.publicFailureCode).toBe("VEIL-SYNC-001");
-    expect(canRenderChat(failed.snapshot, failed.requiresExplicitReopen)).toBe(false);
+    expect(failed.publicFailureCode).toBe("VEIL-PASS-001");
+    expect(canRenderChat(
+      failed.snapshot,
+      failed.requiresExplicitReopen,
+      failed.publicFailureCode,
+    )).toBe(false);
 
-    failed.acceptRuntimeEvent(epoch, snapshot({ runtimeRevision: 2 }));
-    expect(useRuntimeGateStore.getState().publicFailureCode).toBe("VEIL-SYNC-001");
-    expect(useRuntimeGateStore.getState().snapshot).toBeNull();
+    const staged = {
+      ...passRequired,
+      runtimeRevision: 3,
+      pendingAccessPass: {
+        flowId: "ab".repeat(32),
+        canonicalOrigin: "https://veil.erez.pro:443",
+        tokenRef: "0123456789ab",
+        expiresInSeconds: 120,
+      },
+    };
+    failed.acceptRuntimeEvent(epoch, staged);
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      phase: "ready",
+      requiresExplicitReopen: false,
+      publicFailureCode: "VEIL-PASS-001",
+      snapshot: { pendingAccessPass: staged.pendingAccessPass },
+    });
+  });
+
+  it("collapses snapshot/promise disagreement and a missing fresh read to RUNTIME-999", () => {
+    const epoch = useRuntimeGateStore.getState().beginBootstrap();
+    const disconnected = snapshot({
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+    });
+    useRuntimeGateStore.getState().commitFreshSnapshot(epoch, disconnected);
+    useRuntimeGateStore.getState().beginOperation("connecting");
+    useRuntimeGateStore.getState().failOperation(epoch, "VEIL-PASS-001", snapshot({
+      runtimeRevision: 2,
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      publicFailureCodeV1: "VEIL-PASS-002",
+    }));
+    expect(useRuntimeGateStore.getState().publicFailureCode).toBe("VEIL-RUNTIME-999");
+
+    useRuntimeGateStore.getState().beginOperation("refreshing");
+    useRuntimeGateStore.getState().failOperation(epoch, "VEIL-PASS-001", null);
+    const unknown = useRuntimeGateStore.getState();
+    expect(unknown.phase).toBe("ready");
+    expect(unknown.snapshot).not.toBeNull();
+    expect(unknown.publicFailureCode).toBe("VEIL-RUNTIME-999");
+    expect(canRenderChat(
+      unknown.snapshot,
+      unknown.requiresExplicitReopen,
+      unknown.publicFailureCode,
+    )).toBe(false);
+  });
+
+  it("keeps a missing-read deny latched throughout deferred revalidation", () => {
+    const epoch = useRuntimeGateStore.getState().beginBootstrap();
+    useRuntimeGateStore.getState().commitFreshSnapshot(epoch, snapshot());
+
+    expect(useRuntimeGateStore.getState().beginOperation("connecting")).toBe(epoch);
+    useRuntimeGateStore.getState().failOperation(epoch, "VEIL-NODE-002", null);
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      operation: null,
+      publicFailureCode: "VEIL-RUNTIME-999",
+    });
+    expect(canRenderChat(
+      useRuntimeGateStore.getState().snapshot,
+      useRuntimeGateStore.getState().requiresExplicitReopen,
+      useRuntimeGateStore.getState().publicFailureCode,
+    )).toBe(false);
+
+    expect(useRuntimeGateStore.getState().beginOperation("refreshing")).toBe(epoch);
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      operation: "refreshing",
+      publicFailureCode: "VEIL-RUNTIME-999",
+    });
+    expect(canRenderChat(
+      useRuntimeGateStore.getState().snapshot,
+      useRuntimeGateStore.getState().requiresExplicitReopen,
+      useRuntimeGateStore.getState().publicFailureCode,
+    )).toBe(false);
+
+    useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({ runtimeRevision: 2 }));
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      operation: "refreshing",
+      publicFailureCode: "VEIL-RUNTIME-999",
+      snapshot: { runtimeRevision: 2 },
+    });
+    expect(canRenderChat(
+      useRuntimeGateStore.getState().snapshot,
+      useRuntimeGateStore.getState().requiresExplicitReopen,
+      useRuntimeGateStore.getState().publicFailureCode,
+    )).toBe(false);
+
+    useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({
+      runtimeRevision: 3,
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      publicFailureCodeV1: "VEIL-PASS-001",
+    }));
+    expect(useRuntimeGateStore.getState()).toMatchObject({
+      operation: "refreshing",
+      publicFailureCode: "VEIL-PASS-001",
+      snapshot: { runtimeRevision: 3, publicFailureCodeV1: "VEIL-PASS-001" },
+    });
+
+    useRuntimeGateStore.getState().finishOperation(epoch, snapshot({ runtimeRevision: 4 }));
+    expect(useRuntimeGateStore.getState().publicFailureCode).toBeNull();
+    expect(canRenderChat(
+      useRuntimeGateStore.getState().snapshot,
+      useRuntimeGateStore.getState().requiresExplicitReopen,
+      useRuntimeGateStore.getState().publicFailureCode,
+    )).toBe(true);
+  });
+
+  it("opens chat only after the explicit Pass flow commits a failure-free Ready snapshot", () => {
+    const epoch = useRuntimeGateStore.getState().beginBootstrap();
+    const passRequired = snapshot({
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      publicFailureCodeV1: "VEIL-PASS-001",
+      pendingAccessPass: {
+        flowId: "ab".repeat(32),
+        canonicalOrigin: "https://veil.erez.pro:443",
+        tokenRef: "0123456789ab",
+        expiresInSeconds: 120,
+      },
+    });
+    useRuntimeGateStore.getState().commitFreshSnapshot(epoch, passRequired);
+    const operationEpoch = useRuntimeGateStore.getState().beginOperation("using_access_pass");
+    expect(operationEpoch).toBe(epoch);
+    expect(canRenderChat(
+      useRuntimeGateStore.getState().snapshot,
+      false,
+      useRuntimeGateStore.getState().publicFailureCode,
+    )).toBe(false);
+
+    useRuntimeGateStore.getState().acceptRuntimeEvent(epoch, snapshot({
+      runtimeRevision: 2,
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "connecting",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+    }));
+    expect(canRenderChat(
+      useRuntimeGateStore.getState().snapshot,
+      false,
+      useRuntimeGateStore.getState().publicFailureCode,
+    )).toBe(false);
+
+    useRuntimeGateStore.getState().finishOperation(epoch, snapshot({ runtimeRevision: 3 }), true);
+    const ready = useRuntimeGateStore.getState();
+    expect(ready.publicFailureCode).toBeNull();
+    expect(ready.requiresExplicitReopen).toBe(false);
+    expect(canRenderChat(
+      ready.snapshot,
+      ready.requiresExplicitReopen,
+      ready.publicFailureCode,
+    )).toBe(true);
   });
 });
 
 describe("chat render authorization", () => {
   it("requires directory readiness in addition to open, connected, and exact binding", () => {
-    expect(canRenderChat(snapshot({ directoryReady: false }), false)).toBe(false);
-    expect(canRenderChat(snapshot({ sessionState: "locked" }), false)).toBe(false);
-    expect(canRenderChat(snapshot({ connectionState: "disconnected" }), false)).toBe(false);
-    expect(canRenderChat(snapshot({ secureSyncState: "syncing_history" }), false)).toBe(false);
-    expect(canRenderChat(snapshot({ binding: null }), false)).toBe(false);
+    expect(canRenderChat(snapshot({ directoryReady: false }), false, null)).toBe(false);
+    expect(canRenderChat(snapshot({ sessionState: "locked" }), false, null)).toBe(false);
+    expect(canRenderChat(snapshot({ connectionState: "disconnected" }), false, null)).toBe(false);
+    expect(canRenderChat(snapshot({ secureSyncState: "syncing_history" }), false, null)).toBe(false);
+    expect(canRenderChat(snapshot({ binding: null }), false, null)).toBe(false);
     expect(canRenderChat(snapshot({
       binding: { ...exactBinding, canonicalServerOrigin: "https://veil.erez.pro" },
-    }), false)).toBe(false);
-    expect(canRenderChat(snapshot(), false)).toBe(true);
+    }), false, null)).toBe(false);
+    expect(canRenderChat(snapshot(), false, null)).toBe(true);
+    expect(canRenderChat(snapshot(), false, "VEIL-PASS-001")).toBe(false);
+    expect(canRenderChat(snapshot({
+      publicFailureCodeV1: "VEIL-PASS-001",
+    }), false, null)).toBe(false);
+  });
+
+  it("turns equal-revision public-failure disagreement into one restrictive sentinel", () => {
+    const passRequired = snapshot({
+      runtimeRevision: 7,
+      directGeneration: null,
+      directContentRevision: null,
+      connectionState: "error",
+      directoryReady: false,
+      secureSyncState: "error",
+      binding: null,
+      publicFailureCodeV1: "VEIL-PASS-001",
+    });
+    const passRejected = {
+      ...passRequired,
+      publicFailureCodeV1: "VEIL-PASS-002" as const,
+    };
+
+    for (const merged of [
+      conservativelyMergeRuntimeSnapshots(passRequired, passRejected),
+      conservativelyMergeRuntimeSnapshots(passRequired, snapshot({ runtimeRevision: 7 })),
+    ]) {
+      expect(merged).toMatchObject({
+        identityExists: true,
+        runtimeRevision: 0,
+        directGeneration: null,
+        directContentRevision: null,
+        sessionState: "error",
+        connectionState: "error",
+        directoryReady: false,
+        secureSyncState: "error",
+        binding: null,
+        pendingAccessPass: null,
+        publicFailureCodeV1: "VEIL-RUNTIME-999",
+        directConversations: [],
+      });
+      expect(canRenderChat(merged, false, "VEIL-RUNTIME-999")).toBe(false);
+    }
+
+    expect(conservativelyMergeRuntimeSnapshots(passRequired, { ...passRequired }))
+      .toMatchObject({
+        runtimeRevision: 7,
+        publicFailureCodeV1: "VEIL-PASS-001",
+        connectionState: "error",
+        secureSyncState: "error",
+      });
+
+    const crossComponentConflict = conservativelyMergeRuntimeSnapshots(
+      {
+        ...passRequired,
+        sessionState: "locked",
+        connectionState: "error",
+        secureSyncState: "error",
+        publicFailureCodeV1: "VEIL-RUNTIME-999",
+      },
+      {
+        ...passRequired,
+        sessionState: "error",
+        connectionState: "disconnected",
+        secureSyncState: "idle",
+        publicFailureCodeV1: "VEIL-RUNTIME-999",
+      },
+    );
+    expect(crossComponentConflict).toMatchObject({
+      runtimeRevision: 0,
+      sessionState: "error",
+      connectionState: "error",
+      secureSyncState: "error",
+      publicFailureCodeV1: "VEIL-RUNTIME-999",
+    });
   });
 
   it("retains Direct rows only when both handshake snapshots agree exactly", () => {
@@ -317,7 +596,7 @@ describe("chat render authorization", () => {
     });
     expect(disputed.directoryReady).toBe(false);
     expect(disputed.directConversations).toEqual([]);
-    expect(canRenderChat(disputed, false)).toBe(false);
+    expect(canRenderChat(disputed, false, null)).toBe(false);
   });
 
   it("fails closed for both OPEN/LOCKED handshake orderings without a native revision", () => {
@@ -339,7 +618,7 @@ describe("chat render authorization", () => {
       expect(merged.directoryReady).toBe(false);
       expect(merged.secureSyncState).toBe("idle");
       expect(merged.binding).toBeNull();
-      expect(canRenderChat(merged, false)).toBe(false);
+      expect(canRenderChat(merged, false, null)).toBe(false);
     }
 
     const disputedIdentity = conservativelyMergeRuntimeSnapshots(
@@ -350,6 +629,6 @@ describe("chat render authorization", () => {
     expect(disputedIdentity.sessionState).toBe("locked");
     expect(disputedIdentity.secureSyncState).toBe("idle");
     expect(disputedIdentity.binding).toBeNull();
-    expect(canRenderChat(disputedIdentity, false)).toBe(false);
+    expect(canRenderChat(disputedIdentity, false, null)).toBe(false);
   });
 });
