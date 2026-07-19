@@ -63,7 +63,10 @@ internal class VeilMobileRuntimeModule(
 
   @ReactMethod
   fun lockSession(promise: Promise) = onRuntime(promise) {
-    runtime.lockSession().toWritableMap()
+    // JavaScript calls this only from AppState. The process-wide Activity gate
+    // owns the authoritative fail-closed lock, so a delayed callback from an
+    // older inactive event must not revoke a newer native foreground epoch.
+    runtime.lockSessionIfBackground().toWritableMap()
   }
 
   @ReactMethod

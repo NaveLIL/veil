@@ -758,6 +758,12 @@ internal class VeilMobileRuntime internal constructor(
     val detachedDirectSync: DetachedDirectSync?,
   )
 
+  private data class SessionLockRequest(
+    val epoch: Long,
+    val session: NativeMobileSession?,
+    val detachedDirectSync: DetachedDirectSync?,
+  )
+
   private class ActiveDirectSync(
     val session: NativeMobileSession,
     val epoch: Long,
@@ -3415,8 +3421,25 @@ internal class VeilMobileRuntime internal constructor(
     return publishSnapshot()
   }
 
-  fun lockSession(): VeilMobileRuntimeSnapshot {
+  /** Explicit caller-owned lock. Foreground state never weakens this action. */
+  fun lockSession(): VeilMobileRuntimeSnapshot = lockSessionInternal(onlyIfBackground = false)
+
+  /**
+   * Best-effort companion to [lockForBackground] for a React Native AppState
+   * callback. Android Activity lifecycle is authoritative: a queued callback
+   * from an older background transition must not revoke a newly foregrounded
+   * session or a freshly staged Node Access Pass.
+   *
+   * The foreground check and lock selection share [stateLock], so either this
+   * call observes foreground and changes nothing, or it owns the complete
+   * fail-closed lock transition before [markForeground] can linearize.
+   */
+  fun lockSessionIfBackground(): VeilMobileRuntimeSnapshot =
+    lockSessionInternal(onlyIfBackground = true)
+
+  private fun lockSessionInternal(onlyIfBackground: Boolean): VeilMobileRuntimeSnapshot {
     val target = synchronized(stateLock) {
+      if (onlyIfBackground && foreground) return snapshotLocked()
       lifecycleEpoch += 1
       // Cancel while holding the same lock that owns activeConnect. The
       // connect finalizer cannot clear the attempt and close its UniFFI handle
@@ -3431,22 +3454,33 @@ internal class VeilMobileRuntime internal constructor(
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
       val detachedDirectSync = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
-      Pair(session.also { session = null }, detachedDirectSync)
+      // Clear only capabilities that linearized before this lock. A new
+      // enrollment Intent may stage another Pass after stateLock is released;
+      // slow transport teardown must never erase that newer capability.
+      passStore.close()
+      SessionLockRequest(
+        epoch = lifecycleEpoch,
+        session = session.also { session = null },
+        detachedDirectSync = detachedDirectSync,
+      )
     }
-    val active = target.first
-    target.second.cancelHttpQuietly()
+    val active = target.session
+    target.detachedDirectSync.cancelHttpQuietly()
     publishSnapshot()
     try {
-      target.second.cancelLeaseQuietly()
+      target.detachedDirectSync.cancelLeaseQuietly()
       if (active != null) disconnectTransportQuietly(active)
     } catch (_: Throwable) {
       // Lock remains fail-closed even if transport teardown reports an error.
     } finally {
       active?.closeQuietly()
-      passStore.close()
     }
     synchronized(stateLock) {
-      sessionState = NativeSessionState.LOCKED
+      if (lifecycleEpoch == target.epoch && session == null) {
+        sessionState = NativeSessionState.LOCKED
+        connectionState = NativeConnectionState.DISCONNECTED
+        binding = null
+      }
     }
     return publishSnapshot()
   }
@@ -3464,7 +3498,8 @@ internal class VeilMobileRuntime internal constructor(
       foreground = false
       lifecycleEpoch += 1
       // See lockSession(): selecting and cancelling the capability must be one
-      // linearized state transition so onStop cannot race a UniFFI close.
+      // linearized state transition so the application background callback
+      // cannot race a UniFFI close.
       activeConnect?.cancellation?.cancelQuietly()
       cancelActiveReconnectLocked()
       reconnectBackoffScope = null
@@ -3473,10 +3508,12 @@ internal class VeilMobileRuntime internal constructor(
       connectionState = NativeConnectionState.DISCONNECTED
       binding = null
       val detachedDirectSync = detachDirectSyncLocked(NativeDirectDirectoryState.IDLE)
+      // Linearize Pass revocation with the Activity background transition.
+      // A later foreground Intent stages a distinct capability after this lock.
+      passStore.close()
       BackgroundLockRequest(lifecycleEpoch, detachedDirectSync)
     }
     request.detachedDirectSync.cancelHttpQuietly()
-    passStore.close()
     publishSnapshot()
     execute {
       finalizeBackgroundLock(request)

@@ -36,18 +36,6 @@ class MainActivity : ReactActivity() {
     setIntent(intent)
   }
 
-  override fun onStart() {
-    super.onStart()
-    (application as MainApplication).veilMobileRuntime.markForeground()
-  }
-
-  override fun onStop() {
-    if (!isChangingConfigurations) {
-      (application as MainApplication).veilMobileRuntime.lockForBackground()
-    }
-    super.onStop()
-  }
-
   /**
    * Enrollment capabilities are consumed before ReactActivity/Linking sees the
    * Intent. Only a sanitized runtime snapshot is ever published to JavaScript.
@@ -55,7 +43,12 @@ class MainActivity : ReactActivity() {
   private fun consumeEnrollmentIntent(intent: Intent?) {
     if (intent?.action != Intent.ACTION_VIEW) return
     val raw = intent.dataString ?: return
-    if (!(application as MainApplication).veilMobileRuntime.consumeEnrollmentUri(raw)) return
+    val app = application as MainApplication
+    // Android may invoke onNewIntent before onStart. Cross the native
+    // foreground barrier first so a stale AppState lock cannot erase the new
+    // Pass between parsing and the Activity lifecycle callback.
+    app.prepareForEnrollmentIntent()
+    if (!app.veilMobileRuntime.consumeEnrollmentUri(raw)) return
     intent.data = null
     intent.clipData = null
     intent.selector = null

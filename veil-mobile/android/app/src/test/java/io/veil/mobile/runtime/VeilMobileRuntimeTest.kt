@@ -922,6 +922,144 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun lifecycleBridgeLockStillClosesSessionAndPassWhileActuallyBackgrounded() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession, deterministicPassStore())
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 0x23 })
+    try {
+      runtime.openSession()
+      runtime.consumeEnrollmentUri("https://access.example/enroll#invite=$token")
+      assertTrue(runtime.snapshot().pendingAccessPass != null)
+
+      runtime.lockForBackground()
+      val locked = runtime.lockSessionIfBackground()
+
+      assertEquals(NativeSessionState.LOCKED, locked.sessionState)
+      assertNull(locked.pendingAccessPass)
+      assertTrue(fakeSession.closed)
+    } finally {
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun staleLifecycleBridgeLockAfterForegroundAndBackgroundFinalizerPreservesFreshPass() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession, deterministicPassStore())
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 0x24 })
+    try {
+      runtime.openSession()
+
+      runtime.lockForBackground()
+      assertEquals(NativeSessionState.CLOSING, runtime.snapshot().sessionState)
+      assertNull(runtime.snapshot().pendingAccessPass)
+
+      // Android can deliver the new enrollment Intent before React Native's
+      // callback from the previous inactive epoch reaches the native module.
+      runtime.consumeEnrollmentUri("https://access.example/enroll#invite=$token")
+      val pending = checkNotNull(runtime.snapshot().pendingAccessPass)
+      runtime.markForeground()
+
+      // Finish the Activity-owned background teardown first. This must close
+      // only the old session; it must not clear a capability staged later.
+      executor.runCapturedImmediateTask()
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+      assertEquals(pending.flowId, runtime.snapshot().pendingAccessPass?.flowId)
+      assertTrue(fakeSession.closed)
+
+      // The old AppState callback finally crosses the bridge after onStart.
+      val unchanged = runtime.lockSessionIfBackground()
+
+      assertEquals(NativeSessionState.LOCKED, unchanged.sessionState)
+      assertEquals(pending.flowId, unchanged.pendingAccessPass?.flowId)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun foregroundLifecycleBridgeBarrierMayResolveBeforeBackgroundFinalizerWithoutWipingPass() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession, deterministicPassStore())
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 0x25 })
+    try {
+      runtime.openSession()
+      runtime.lockForBackground()
+      runtime.consumeEnrollmentUri("https://access.example/enroll#invite=$token")
+      val pending = checkNotNull(runtime.snapshot().pendingAccessPass)
+      runtime.markForeground()
+
+      // The bridge Promise is a lifecycle barrier for the stale JS call, not
+      // a join on MainActivity's queued transport/session finalizer.
+      val barrierSnapshot = runtime.lockSessionIfBackground()
+      assertEquals(NativeSessionState.CLOSING, barrierSnapshot.sessionState)
+      assertEquals(pending.flowId, barrierSnapshot.pendingAccessPass?.flowId)
+      assertFalse(fakeSession.closed)
+
+      executor.runCapturedImmediateTask()
+
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+      assertEquals(pending.flowId, runtime.snapshot().pendingAccessPass?.flowId)
+      assertTrue(fakeSession.closed)
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
+  fun inFlightBackgroundBridgeLockCannotErasePassStagedAfterForegroundReturns() {
+    val executor = CapturingScheduledExecutor(captureImmediateTasks = true)
+    val fakeSession = FakeSession()
+    val runtime = runtime(executor, fakeSession, deterministicPassStore())
+    val token = Base64.getUrlEncoder().withoutPadding().encodeToString(ByteArray(32) { 0x26 })
+    val disconnectEntered = CountDownLatch(1)
+    val disconnectRelease = CountDownLatch(1)
+    val lockCompleted = CountDownLatch(1)
+    val lockFailure = AtomicReference<Throwable?>()
+    fakeSession.disconnectEntered = disconnectEntered
+    fakeSession.disconnectRelease = disconnectRelease
+    try {
+      runtime.openSession()
+      runtime.lockForBackground()
+
+      Thread({
+        try {
+          runtime.lockSessionIfBackground()
+        } catch (error: Throwable) {
+          lockFailure.set(error)
+        } finally {
+          lockCompleted.countDown()
+        }
+      }, "veil-runtime-in-flight-background-lock-test").apply {
+        isDaemon = true
+        start()
+      }
+
+      assertTrue("background bridge lock did not enter transport teardown", disconnectEntered.await(5, TimeUnit.SECONDS))
+      runtime.markForeground()
+      assertTrue(runtime.consumeEnrollmentUri("https://access.example/enroll#invite=$token"))
+      val pending = checkNotNull(runtime.snapshot().pendingAccessPass)
+
+      disconnectRelease.countDown()
+      assertTrue("background bridge lock did not finish", lockCompleted.await(5, TimeUnit.SECONDS))
+      lockFailure.get()?.let { throw AssertionError("background bridge lock failed", it) }
+
+      assertEquals(NativeSessionState.LOCKED, runtime.snapshot().sessionState)
+      assertEquals(pending.flowId, runtime.snapshot().pendingAccessPass?.flowId)
+      assertTrue(fakeSession.closed)
+    } finally {
+      disconnectRelease.countDown()
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun liveSessionDoesNotDependOnASecondVaultRead() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession()
@@ -4617,6 +4755,8 @@ class VeilMobileRuntimeTest {
     val lifecycleEvents = CopyOnWriteArrayList<String>()
     val connectStarted = CountDownLatch(1)
     val closedDuringConnect = AtomicBoolean(false)
+    @Volatile var disconnectEntered: CountDownLatch? = null
+    @Volatile var disconnectRelease: CountDownLatch? = null
     private val inConnect = AtomicBoolean(false)
 
     override fun mobileReconnectTarget(): NativeMobileReconnectTarget? {
@@ -4947,6 +5087,10 @@ class VeilMobileRuntimeTest {
 
     override fun disconnect() {
       lifecycleEvents.add("disconnect")
+      disconnectEntered?.countDown()
+      disconnectRelease?.let { release ->
+        check(release.await(5, TimeUnit.SECONDS)) { "synthetic disconnect timed out" }
+      }
     }
 
     override fun close() {
