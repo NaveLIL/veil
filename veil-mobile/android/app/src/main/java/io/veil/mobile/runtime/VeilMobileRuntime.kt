@@ -378,6 +378,7 @@ internal enum class NativeDirectSendReadiness {
 internal enum class NativeDirectTextSendOutcome {
   ACCEPTED,
   ACCEPTED_FOR_REPLAY,
+  ACCEPTED_SESSION_INVALID,
   NEEDS_PRE_KEY,
   REJECTED,
   UNAVAILABLE,
@@ -1033,6 +1034,19 @@ internal class VeilMobileRuntime internal constructor(
         // Rust has already committed and revoked its transport authority. Drop
         // the action before detaching so cancellation cannot turn acceptance
         // into an unavailable result and invite a duplicate user intent.
+        sync.directSessionAction = null
+        val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
+        connectionState = NativeConnectionState.ERROR
+        binding = null
+        DirectSendTransition(
+          result = NativeDirectTextSendResult.ACCEPTED,
+          detached = detached,
+        )
+      }
+      NativeDirectTextSendOutcome.ACCEPTED_SESSION_INVALID -> {
+        // The exact intent is durable, but Rust observed a typed protocol or
+        // security terminal. Preserve acceptance while keeping this source
+        // outside the automatic reconnect allowlist.
         sync.directSessionAction = null
         val detached = detachDirectSyncLocked(NativeDirectDirectoryState.ERROR)
         connectionState = NativeConnectionState.ERROR
@@ -3117,6 +3131,8 @@ internal fun MobileDirectTextSendOutcome.toNativeDirectTextSendOutcome(): Native
     MobileDirectTextSendOutcome.ACCEPTED -> NativeDirectTextSendOutcome.ACCEPTED
     MobileDirectTextSendOutcome.ACCEPTED_FOR_REPLAY ->
       NativeDirectTextSendOutcome.ACCEPTED_FOR_REPLAY
+    MobileDirectTextSendOutcome.ACCEPTED_SESSION_INVALID ->
+      NativeDirectTextSendOutcome.ACCEPTED_SESSION_INVALID
     MobileDirectTextSendOutcome.NEEDS_PRE_KEY -> NativeDirectTextSendOutcome.NEEDS_PRE_KEY
     MobileDirectTextSendOutcome.REJECTED -> NativeDirectTextSendOutcome.REJECTED
     MobileDirectTextSendOutcome.UNAVAILABLE -> NativeDirectTextSendOutcome.UNAVAILABLE

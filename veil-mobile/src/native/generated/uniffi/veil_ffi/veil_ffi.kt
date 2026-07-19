@@ -5382,12 +5382,16 @@ public object FfiConverterTypeMobileDirectSendReadiness: FfiConverterRustBuffer<
  * `AcceptedForReplay` still means SQLCipher owns the intent. Android must not
  * create a second intent; it closes the current lease and reconnects so the
  * exact persisted bytes/ID can be replayed after the next Ready checkpoint.
+ * `AcceptedSessionInvalid` also owns the intent, but the socket failed a
+ * protocol/security invariant and therefore must not trigger automatic
+ * reconnect.
  */
 
 enum class MobileDirectTextSendOutcome {
 
     ACCEPTED,
     ACCEPTED_FOR_REPLAY,
+    ACCEPTED_SESSION_INVALID,
     NEEDS_PRE_KEY,
     REJECTED,
     UNAVAILABLE;
@@ -5408,6 +5412,41 @@ public object FfiConverterTypeMobileDirectTextSendOutcome: FfiConverterRustBuffe
     override fun allocationSize(value: MobileDirectTextSendOutcome) = 4UL
 
     override fun write(value: MobileDirectTextSendOutcome, buf: ByteBuffer) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+
+
+
+
+/**
+ * Positive allow-list of mobile failures for which a native controller may
+ * create one guarded reconnect plan. Every error not represented here is
+ * terminal by default and must never become retryable through message text.
+ */
+
+enum class MobileRetryableReason {
+
+    TRANSPORT,
+    ACK_DEADLINE;
+    companion object
+}
+
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeMobileRetryableReason: FfiConverterRustBuffer<MobileRetryableReason> {
+    override fun read(buf: ByteBuffer) = try {
+        MobileRetryableReason.values()[buf.getInt() - 1]
+    } catch (e: IndexOutOfBoundsException) {
+        throw RuntimeException("invalid enum value, something is very wrong!!", e)
+    }
+
+    override fun allocationSize(value: MobileRetryableReason) = 4UL
+
+    override fun write(value: MobileRetryableReason, buf: ByteBuffer) {
         buf.putInt(value.ordinal + 1)
     }
 }
@@ -5444,6 +5483,14 @@ sealed class VeilException: kotlin.Exception() {
             get() = "msg=${ `msg` }"
     }
 
+    class MobileRetryable(
+
+        val `reason`: MobileRetryableReason
+        ) : VeilException() {
+        override val message
+            get() = "reason=${ `reason` }"
+    }
+
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<VeilException> {
         override fun lift(error_buf: RustBuffer.ByValue): VeilException = FfiConverterTypeVeilError.lift(error_buf)
@@ -5469,6 +5516,9 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
             3 -> VeilException.Session(
                 FfiConverterString.read(buf),
                 )
+            4 -> VeilException.MobileRetryable(
+                FfiConverterTypeMobileRetryableReason.read(buf),
+                )
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
     }
@@ -5490,6 +5540,11 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
                 4UL
                 + FfiConverterString.allocationSize(value.`msg`)
             )
+            is VeilException.MobileRetryable -> (
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                4UL
+                + FfiConverterTypeMobileRetryableReason.allocationSize(value.`reason`)
+            )
         }
     }
 
@@ -5508,6 +5563,11 @@ public object FfiConverterTypeVeilError : FfiConverterRustBuffer<VeilException> 
             is VeilException.Session -> {
                 buf.putInt(3)
                 FfiConverterString.write(value.`msg`, buf)
+                Unit
+            }
+            is VeilException.MobileRetryable -> {
+                buf.putInt(4)
+                FfiConverterTypeMobileRetryableReason.write(value.`reason`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

@@ -1881,6 +1881,57 @@ class VeilMobileRuntimeTest {
   }
 
   @Test
+  fun acceptedSessionInvalidCompletesOnceAndRevokesWithoutRetryPermission() {
+    val executor = daemonExecutor()
+    val fakeSession = FakeSession().apply {
+      directTextSendOutcomes.add(NativeDirectTextSendOutcome.ACCEPTED_SESSION_INVALID)
+    }
+    val transport = ControllableDirectTransport()
+    val runtime = runtime(executor, fakeSession, directTransport = transport)
+    val conversation = directConversation("10", "Alice", "11", "alice", needsPreKey = false)
+    val publishedAfterSend = CopyOnWriteArrayList<VeilMobileRuntimeSnapshot>()
+    try {
+      val generation = completeDirectReadyBootstrap(runtime, fakeSession, transport, conversation)
+      val requestCount = transport.requests.size
+      val result = DirectTextSendCapture()
+      runtime.addListener(publishedAfterSend::add)
+
+      runtime.sendDirectText(
+        conversation.conversationId,
+        generation,
+        "durable locally but the authenticated session is invalid",
+        result,
+      )
+
+      assertEquals(NativeDirectTextSendResult.ACCEPTED, result.await())
+      assertEquals(1, result.completionCount.get())
+      assertEquals(1, fakeSession.directTextSendCount)
+      assertEquals(requestCount, transport.requests.size)
+      assertTrue(fakeSession.directTextPlaintextReferences.single().all { it == 0.toByte() })
+      val revoked = runtime.snapshot()
+      assertEquals(NativeConnectionState.ERROR, revoked.connectionState)
+      assertNull(revoked.directGeneration)
+      assertNull(revoked.directContentRevision)
+      assertNull(revoked.binding)
+      assertFalse(revoked.directoryReady)
+      assertEquals(1, fakeSession.directLeaseCancellations)
+      assertTrue(
+        "React listeners must observe the non-retryable session revoke",
+        publishedAfterSend.any { published ->
+          published.connectionState == NativeConnectionState.ERROR &&
+            published.directGeneration == null &&
+            published.directContentRevision == null &&
+            published.binding == null &&
+            !published.directoryReady
+        },
+      )
+    } finally {
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun backgroundRevokesPendingDirectTextAndLatePreKeyResponseOnlyWipesItsBody() {
     val executor = daemonExecutor()
     val fakeSession = FakeSession().apply {
