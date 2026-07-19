@@ -54,6 +54,8 @@ class IdentityRecordRepositoryTest {
       listOf(
         Failure.FILE_SYNC,
         Failure.TEMP_READBACK_MISMATCH,
+        Failure.TEMP_DIRECTORY_SYNC,
+        Failure.STAGING_PARENT_SYNC,
         Failure.PUBLISH_BEFORE,
         Failure.DIRECTORY_SYNC,
         Failure.OPEN_BASE,

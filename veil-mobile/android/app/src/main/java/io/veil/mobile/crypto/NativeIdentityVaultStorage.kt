@@ -1,5 +1,6 @@
 package io.veil.mobile.crypto
 
+import android.system.ErrnoException
 import android.system.Os
 import android.system.OsConstants
 import java.io.Closeable
@@ -153,7 +154,16 @@ internal interface DurableIdentityFileOps {
 
   fun openTemp(): InputStream
 
-  /** Atomically publishes temp while refusing to replace an existing base identity. */
+  /** Makes the staged record name durable before publication. */
+  fun syncTempDirectory()
+
+  /**
+   * Atomically publishes a non-empty staging directory at the base path.
+   *
+   * The base path may already be the legacy regular-file format. A conforming
+   * implementation must never replace that file or a previously published,
+   * non-empty directory.
+   */
   fun publishTempToBaseIfAbsent()
 
   fun syncDirectory()
@@ -164,10 +174,16 @@ internal interface DurableIdentityFileOps {
 /**
  * Immutable single-record protocol.
  *
- * A write is successful only after `.new` is file-synced, closed and read back
- * exactly; then it is atomically hard-linked to an absent base name, the
- * directory is synced, `.new` is removed and synced, and base is read back.
- * The base identity is never overwritten or deleted.
+ * A write is successful only after the record inside `.new` is file-synced,
+ * closed and read back exactly. The staging directory and its parent are then
+ * synced before the non-empty directory is atomically renamed to the base
+ * path. The parent is synced again and the published record is read back.
+ *
+ * Older builds stored the encoded record directly at the same base path. New
+ * builds use a non-empty directory there. POSIX rename cannot replace either
+ * a legacy regular file with a directory or an existing non-empty directory,
+ * so both formats retain the same write-once namespace without link(2), which
+ * Android SELinux may deny inside an otherwise writable app sandbox.
  */
 internal class WriteOnceIdentityRecordStorage(
   private val files: DurableIdentityFileOps,
@@ -176,7 +192,7 @@ internal class WriteOnceIdentityRecordStorage(
     try {
       if (files.baseExists()) {
         // If publish succeeded but its directory sync was interrupted, make
-        // the base link durable before removing the remaining temp link.
+        // the base name durable before removing any stale staging directory.
         files.syncDirectory()
         if (files.tempExists()) cleanupTemp()
       } else {
@@ -215,6 +231,11 @@ internal class WriteOnceIdentityRecordStorage(
       output = null
 
       verifyExact(files.openTemp(), encoded, "temporary")
+      files.syncTempDirectory()
+      // Persist the staging directory entry before rename. If power is lost
+      // before the post-rename sync, recovery sees either this old name or the
+      // published base name, never a partially written published record.
+      files.syncDirectory()
 
       if (files.baseExists()) {
         throw IdentityVaultException("identity vault record already exists")
@@ -224,10 +245,9 @@ internal class WriteOnceIdentityRecordStorage(
         throw IdentityVaultException("identity vault publish did not commit")
       }
       files.syncDirectory()
-      if (!files.tempExists()) {
-        throw IdentityVaultException("identity vault temporary link disappeared early")
+      if (files.tempExists()) {
+        throw IdentityVaultException("identity vault staging directory remained after publish")
       }
-      cleanupTemp()
 
       verifyExact(files.openBase(), encoded, "base")
     } catch (error: Throwable) {
@@ -239,7 +259,7 @@ internal class WriteOnceIdentityRecordStorage(
         }
       }
       // Publish may have succeeded before an error was reported. Never delete
-      // base. If both links exist, sync base first, then remove only `.new`.
+      // base. Remove only an unpublished staging directory that still exists.
       try {
         if (files.tempExists()) {
           if (files.baseExists()) files.syncDirectory()
@@ -310,21 +330,45 @@ internal class WriteOnceIdentityRecordStorage(
 internal class AndroidDurableIdentityFileOps(baseFile: File) : DurableIdentityFileOps {
   private val base = baseFile
   private val temp = File(baseFile.parentFile, baseFile.name + ".new")
+  private val tempRecord = File(temp, PUBLISHED_RECORD_FILE_NAME)
   private val parent =
     baseFile.parentFile ?: throw IdentityVaultException("identity vault directory is unavailable")
 
-  override fun baseExists(): Boolean = base.exists()
+  override fun baseExists(): Boolean = pathExists(base)
 
-  override fun tempExists(): Boolean = temp.exists()
+  override fun tempExists(): Boolean = pathExists(temp)
 
   override fun deleteTemp() {
-    if (temp.exists()) Os.remove(temp.absolutePath)
+    val mode = lstatModeOrNull(temp) ?: return
+    when {
+      OsConstants.S_ISREG(mode) -> {
+        // Read compatibility includes cleanup of a `.new` regular file left
+        // by the former hard-link publication protocol.
+        Os.remove(temp.absolutePath)
+      }
+      OsConstants.S_ISDIR(mode) -> {
+        val children = listDirectoryStrict(temp, "identity vault staging directory")
+        if (children.isNotEmpty()) {
+          if (children.size != 1 || children.single() != PUBLISHED_RECORD_FILE_NAME) {
+            throw IdentityVaultException("identity vault staging directory is invalid")
+          }
+          requireRegularFile(tempRecord, "identity vault staged record")
+          Os.remove(tempRecord.absolutePath)
+        }
+        Os.remove(temp.absolutePath)
+      }
+      else -> throw IdentityVaultException("identity vault staging path type is invalid")
+    }
   }
 
   override fun openTempExclusively(): DurableIdentityTempOutput {
+    Os.mkdir(
+      temp.absolutePath,
+      OsConstants.S_IRUSR or OsConstants.S_IWUSR or OsConstants.S_IXUSR,
+    )
     val descriptor =
       Os.open(
-        temp.absolutePath,
+        tempRecord.absolutePath,
         OsConstants.O_WRONLY or
           OsConstants.O_CREAT or
           OsConstants.O_EXCL or
@@ -343,21 +387,94 @@ internal class AndroidDurableIdentityFileOps(baseFile: File) : DurableIdentityFi
     }
   }
 
-  override fun openTemp(): InputStream = FileInputStream(temp)
+  override fun openTemp(): InputStream {
+    requirePublishedDirectory(temp, "identity vault staging directory")
+    return FileInputStream(tempRecord)
+  }
+
+  override fun syncTempDirectory() {
+    requirePublishedDirectory(temp, "identity vault staging directory")
+    syncDirectoryPath(temp)
+  }
 
   override fun publishTempToBaseIfAbsent() {
-    // link(2) fails with EEXIST atomically; unlike rename(2), it can never
-    // replace an identity created by another process between our checks.
-    Os.link(temp.absolutePath, base.absolutePath)
-    if (!base.exists() || !temp.exists()) {
+    requirePublishedDirectory(temp, "identity vault staging directory")
+    // Both supported base layouts reject this rename atomically if another
+    // writer wins: a directory cannot replace the legacy regular file, and a
+    // non-empty directory cannot replace the published directory layout.
+    Os.rename(temp.absolutePath, base.absolutePath)
+    if (!pathExists(base) || pathExists(temp)) {
       throw IOException("identity vault publish result is invalid")
     }
+    requireReadableBaseLayout()
   }
 
   override fun syncDirectory() {
+    syncDirectoryPath(parent)
+  }
+
+  override fun openBase(): InputStream {
+    return when (val mode = lstatModeOrNull(base)) {
+      null -> throw IdentityVaultException("identity vault record is unavailable")
+      else -> when {
+        OsConstants.S_ISREG(mode) -> FileInputStream(base)
+        OsConstants.S_ISDIR(mode) -> {
+          requirePublishedDirectory(base, "identity vault published directory")
+          FileInputStream(File(base, PUBLISHED_RECORD_FILE_NAME))
+        }
+        else -> throw IdentityVaultException("identity vault base path type is invalid")
+      }
+    }
+  }
+
+  private fun requireReadableBaseLayout() {
+    val mode = lstatModeOrNull(base)
+      ?: throw IdentityVaultException("identity vault record is unavailable")
+    when {
+      OsConstants.S_ISREG(mode) -> Unit
+      OsConstants.S_ISDIR(mode) ->
+        requirePublishedDirectory(base, "identity vault published directory")
+      else -> throw IdentityVaultException("identity vault base path type is invalid")
+    }
+  }
+
+  private fun requirePublishedDirectory(directory: File, label: String) {
+    val mode = lstatModeOrNull(directory)
+      ?: throw IdentityVaultException("$label is unavailable")
+    if (!OsConstants.S_ISDIR(mode)) {
+      throw IdentityVaultException("$label type is invalid")
+    }
+    val children = listDirectoryStrict(directory, label)
+    if (children.size != 1 || children.single() != PUBLISHED_RECORD_FILE_NAME) {
+      throw IdentityVaultException("$label contents are invalid")
+    }
+    requireRegularFile(File(directory, PUBLISHED_RECORD_FILE_NAME), "$label record")
+  }
+
+  private fun requireRegularFile(file: File, label: String) {
+    val mode = lstatModeOrNull(file)
+      ?: throw IdentityVaultException("$label is unavailable")
+    if (!OsConstants.S_ISREG(mode)) {
+      throw IdentityVaultException("$label type is invalid")
+    }
+  }
+
+  private fun listDirectoryStrict(directory: File, label: String): List<String> =
+    directory.list()?.toList() ?: throw IdentityVaultException("$label cannot be listed")
+
+  private fun pathExists(file: File): Boolean = lstatModeOrNull(file) != null
+
+  private fun lstatModeOrNull(file: File): Int? =
+    try {
+      Os.lstat(file.absolutePath).st_mode
+    } catch (error: ErrnoException) {
+      if (error.errno == OsConstants.ENOENT) null else throw error
+    }
+
+  private fun syncDirectoryPath(directory: File) {
     val descriptor =
       Os.open(
-        parent.absolutePath,
+        directory.absolutePath,
         OsConstants.O_RDONLY or LINUX_O_CLOEXEC,
         0,
       )
@@ -376,7 +493,9 @@ internal class AndroidDurableIdentityFileOps(baseFile: File) : DurableIdentityFi
     }
   }
 
-  override fun openBase(): InputStream = FileInputStream(base)
+  companion object {
+    private const val PUBLISHED_RECORD_FILE_NAME = "record.bin"
+  }
 }
 
 // O_CLOEXEC is part of the Linux UAPI used by every supported Android ABI

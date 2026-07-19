@@ -3,6 +3,9 @@ package io.veil.mobile.crypto
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
+import java.nio.file.Files
+import java.nio.file.Path
+import java.nio.file.Paths
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -29,9 +32,9 @@ class WriteOnceIdentityRecordStorageTest {
         "file-sync",
         "close",
         "open-temp-read",
-        "publish",
+        "temp-dir-sync",
         "dir-sync",
-        "delete-temp",
+        "publish",
         "dir-sync",
         "open-base",
       ),
@@ -50,6 +53,32 @@ class WriteOnceIdentityRecordStorageTest {
 
     assertArrayEquals(original, files.base)
     assertFalse(files.events.contains("open-temp"))
+    assertFalse(files.events.contains("publish"))
+  }
+
+  @Test
+  fun legacyRegularFileRecordAtTheBasePathRemainsReadable() {
+    val legacyRecord = byteArrayOf(8, 6, 7, 5, 3, 0, 9)
+    val files = FakeDurableIdentityFileOps(base = legacyRecord)
+
+    val loaded = WriteOnceIdentityRecordStorage(files).readOrNull()
+
+    assertArrayEquals(legacyRecord, loaded)
+    assertArrayEquals(legacyRecord, files.base)
+    assertEquals(listOf("dir-sync", "open-base"), files.events)
+  }
+
+  @Test
+  fun invalidBaseLayoutFailsClosedWithoutDeletingOrReplacingIt() {
+    val invalidBase = byteArrayOf(7, 7, 7)
+    val files = FakeDurableIdentityFileOps(base = invalidBase).apply { failure = Failure.OPEN_BASE }
+
+    assertThrows(IdentityVaultException::class.java) {
+      WriteOnceIdentityRecordStorage(files).readOrNull()
+    }
+
+    assertArrayEquals(invalidBase, files.base)
+    assertFalse(files.events.contains("delete-temp"))
     assertFalse(files.events.contains("publish"))
   }
 
@@ -77,6 +106,34 @@ class WriteOnceIdentityRecordStorageTest {
     assertNull(files.base)
     assertNull(files.temp)
     assertTrue(files.events.contains("delete-temp"))
+    assertFalse(files.events.contains("publish"))
+  }
+
+  @Test
+  fun stagingDirectorySyncFailureRemovesTempAndNeverCreatesBase() {
+    val files = FakeDurableIdentityFileOps().apply { failure = Failure.TEMP_DIRECTORY_SYNC }
+
+    assertThrows(IdentityVaultException::class.java) {
+      WriteOnceIdentityRecordStorage(files).write(RECORD)
+    }
+
+    assertNull(files.base)
+    assertNull(files.temp)
+    assertTrue(files.events.contains("temp-dir-sync"))
+    assertFalse(files.events.contains("publish"))
+  }
+
+  @Test
+  fun stagingParentSyncFailureRemovesTempAndNeverCreatesBase() {
+    val files = FakeDurableIdentityFileOps().apply { failure = Failure.STAGING_PARENT_SYNC }
+
+    assertThrows(IdentityVaultException::class.java) {
+      WriteOnceIdentityRecordStorage(files).write(RECORD)
+    }
+
+    assertNull(files.base)
+    assertNull(files.temp)
+    assertTrue(files.events.containsAll(listOf("temp-dir-sync", "dir-sync", "delete-temp")))
     assertFalse(files.events.contains("publish"))
   }
 
@@ -192,6 +249,30 @@ class WriteOnceIdentityRecordStorageTest {
     assertEquals("dir-sync", files.events.first())
   }
 
+  @Test
+  fun androidPublisherUsesSamePathDirectoryRenameAndNeverHardLinks() {
+    val source = Files.readAllBytes(
+      projectFile("src/main/java/io/veil/mobile/crypto/NativeIdentityVaultStorage.kt"),
+    ).toString(Charsets.UTF_8)
+
+    assertFalse(source.contains("Os.link("))
+    assertTrue(source.contains("Os.rename(temp.absolutePath, base.absolutePath)"))
+    assertTrue(source.contains("private val tempRecord = File(temp, PUBLISHED_RECORD_FILE_NAME)"))
+    assertTrue(source.contains("Os.lstat(file.absolutePath)"))
+    assertTrue(source.contains("OsConstants.S_ISREG(mode)"))
+    assertTrue(source.contains("OsConstants.S_ISDIR(mode)"))
+  }
+
+  private fun projectFile(relative: String): Path {
+    val candidates = listOf(
+      Paths.get(relative),
+      Paths.get("app").resolve(relative),
+      Paths.get("veil-mobile/android/app").resolve(relative),
+    )
+    return candidates.firstOrNull(Files::isRegularFile)
+      ?: error("cannot locate Android project file $relative from ${Paths.get("").toAbsolutePath()}")
+  }
+
   companion object {
     private val RECORD = byteArrayOf(1, 2, 3, 4, 5)
     private val COMPETING_RECORD = byteArrayOf(9, 9, 9)
@@ -206,6 +287,8 @@ internal enum class Failure {
   CLOSE,
   OPEN_TEMP,
   TEMP_READBACK_MISMATCH,
+  TEMP_DIRECTORY_SYNC,
+  STAGING_PARENT_SYNC,
   PUBLISH_BEFORE,
   PUBLISH_AFTER,
   PUBLISH_RACE,
@@ -273,6 +356,13 @@ internal class FakeDurableIdentityFileOps(
     return ByteArrayInputStream(result)
   }
 
+  override fun syncTempDirectory() {
+    events += "temp-dir-sync"
+    if (failure == Failure.TEMP_DIRECTORY_SYNC) {
+      throw IllegalStateException("injected staging directory sync failure")
+    }
+  }
+
   override fun publishTempToBaseIfAbsent() {
     events += "publish"
     check(base == null) { "refusing overwrite" }
@@ -284,6 +374,7 @@ internal class FakeDurableIdentityFileOps(
       throw IllegalStateException("injected no-replace race")
     }
     base = checkNotNull(temp).copyOf()
+    temp = null
     if (failure == Failure.PUBLISH_AFTER) {
       throw IllegalStateException("injected post-publish failure")
     }
@@ -291,7 +382,10 @@ internal class FakeDurableIdentityFileOps(
 
   override fun syncDirectory() {
     events += "dir-sync"
-    if (failure == Failure.DIRECTORY_SYNC) {
+    if (failure == Failure.STAGING_PARENT_SYNC && base == null && temp != null) {
+      throw IllegalStateException("injected staging parent sync failure")
+    }
+    if (failure == Failure.DIRECTORY_SYNC && base != null) {
       throw IllegalStateException("injected directory sync failure")
     }
   }
