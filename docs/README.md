@@ -20,6 +20,7 @@ evidence для completion gates. Veil остаётся pre-release проект
 
 - [ADR-0001: Authenticated Sender Keys v5 for server channels](adr/0001-authenticated-sender-keys-v5-for-server-channels.md)
 - [ADR-0002: Origin-bound one-time Node Access Passes](adr/0002-origin-bound-node-access-passes.md)
+- [ADR-0003: Origin-bound transport authentication](adr/0003-origin-bound-transport-authentication.md)
 
 ADR фиксирует принятое решение и причины. Изменение такого решения должно
 добавлять новый ADR, а не незаметно переписывать исторический документ.
@@ -52,6 +53,7 @@ ADR фиксирует принятое решение и причины. Изм
 - [Phase 5S Direct-v1 transcript checkpoint](reviews/phase-5s-direct-v1-transcript-checkpoint.md)
 - [Phase 5S Direct-v1 key-validation checkpoint](reviews/phase-5s-direct-v1-key-validation-checkpoint.md)
 - [Phase 5S Direct-v1 skipped-key/state checkpoint](reviews/phase-5s-direct-v1-skipped-key-state-checkpoint.md)
+- [Phase 5S exact-origin transport-auth contract checkpoint](reviews/phase-5s-hostile-node-auth-contract-checkpoint.md)
 
 Эти документы являются внутренними инженерными review и evidence, а не
 заключением независимого внешнего аудитора.

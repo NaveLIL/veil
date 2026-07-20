@@ -11,9 +11,13 @@
 
 pub mod api;
 pub mod attachments;
+pub mod auth_contract;
 pub mod connection;
 mod device_identity;
 pub mod direct;
 pub mod direct_history;
 pub mod prekeys;
 pub mod protocol;
+
+#[cfg(test)]
+mod auth_contract_fixture_tests;

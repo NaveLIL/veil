@@ -6,6 +6,7 @@ on:
     paths:
       - "veil-server/**"
       - "veil-proto/**"
+      - "test-vectors/transport-auth/**"
       - "deploy/**"
       - "scripts/apply-migrations.sh"
       - "scripts/tests/check_nginx_rest_authority.py"
@@ -26,6 +27,7 @@ on:
     paths:
       - "veil-server/**"
       - "veil-proto/**"
+      - "test-vectors/transport-auth/**"
       - "deploy/**"
       - "scripts/apply-migrations.sh"
       - "scripts/tests/check_nginx_rest_authority.py"

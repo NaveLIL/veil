@@ -72,7 +72,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; durable setup-result reconciliation реализован и host-tested в текущем локальном checkpoint; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
-| 5S | Direct protocol assurance & hostile Node | immutable shared-Rust Direct-v1 transcript/SQLCipher checkpoint реализован; Android/desktop cross-runtime fixtures, exact-spec review, `libsignal` spike, key-transparency ADR и независимый аудит открыты; legacy REST authority mismatch mitigated, но cryptographic cross-Node credential scope WS v2/REST v1 остаётся P1 |
+| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher и pure Rust↔Go exact-origin WS v3/REST v2 contract checkpoints реализованы; runtime configured-origin cutover/two-Node relay, Android consumption, `libsignal` spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -2123,6 +2123,24 @@ Interim checkpoints `91fd2f8` и `88c87bd` закрывают конкретно
 canonical `:443`, передаёт literal Host/XFH и отклоняет остальное 421, а desktop
 подписывает effective port. Это не добавляет cryptographic canonical-origin/user
 binding и не закрывает WS v3/REST v2/two-Node hostile-relay exit gate.
+
+**Local checkpoint 5S.3A 2026-07-20:** без активации transport добавлен один
+binary exact-origin authentication contract для Rust и Go. Domain-separated
+Node Access Pass commitment связывает bearer с canonical origin; WS v3
+аутентифицирует origin, challenge, account keys, device id, предварительно
+проверенный binding commitment и явный existing/open/Pass intent двумя
+связанными account/device proofs; REST v2 подписывает origin, UUID пользователя,
+method, exact bounded request target, timestamp, fresh nonce и digest exact body.
+Immutable synthetic fixture
+`test-vectors/transport-auth/v1.json` с SHA-256
+`c90f7aac7619d178e06c0ac0d7aab6084511ceffb505b8fcf7058ba6812ad9bc`
+исполняется обоими runtime languages. Точный контракт и non-claims записаны в
+[`docs/adr/0003-origin-bound-transport-authentication.md`](docs/adr/0003-origin-bound-transport-authentication.md)
+и
+[`docs/reviews/phase-5s-hostile-node-auth-contract-checkpoint.md`](docs/reviews/phase-5s-hostile-node-auth-contract-checkpoint.md).
+Ни gateway/protobuf/middleware, ни Node config/deploy/compatibility policy этим
+checkpoint не меняются: P1 остаётся открытым до mandatory configured origin,
+live fail-closed cutover и реальной two-Node relay matrix.
 
 Private/E2EE keys при этом не извлекаются, но A может получить authenticated
 control/metadata context на B и злоупотреблять server-authoritative actions,
