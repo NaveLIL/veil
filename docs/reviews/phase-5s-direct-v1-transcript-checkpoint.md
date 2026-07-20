@@ -109,8 +109,16 @@ not silently repair or accept them:
    frozen initial transcript has no skipped keys and does not close canonical
    serialization, corruption, exhaustion, or rollback work.
 
-Owners, resolution/acceptance criteria, and external review remain part of the
-Phase 5S gate. None of these findings authorizes plaintext fallback, automatic
+### Follow-up ledger — 2026-07-20
+
+| Finding | Current host-only status |
+| --- | --- |
+| 1, exact peer/bundle identity | Hardened by the host-tested [Direct-v1 key-validation checkpoint](phase-5s-direct-v1-key-validation-checkpoint.md) |
+| 2, contributory received ratchet DH | Hardened by the same key-validation checkpoint using the actual X25519 shared result before state publication |
+| 3–5 | Open; AAD review/origin-device binding and skipped-key serialization/exhaustion/rollback remain Phase 5S work |
+
+Owners, residual resolution/acceptance criteria, and external review remain part
+of the Phase 5S gate. No ledger entry authorizes plaintext fallback, automatic
 session reset, or a weakened origin boundary.
 
 ## Evidence and non-claims

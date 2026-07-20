@@ -5718,6 +5718,11 @@ impl VeilClient {
         peer_identity_key: &[u8; 32],
         bundle: &x3dh::PreKeyBundle,
     ) -> Result<(), DirectSessionEstablishErrorV1> {
+        if peer_identity_key != &bundle.identity_key {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "peer identity key does not match prekey bundle identity",
+            ));
+        }
         self.require_crypto_runtime_active_v1()
             .map_err(DirectSessionEstablishErrorV1::rejected)?;
         let identity = self
@@ -15835,6 +15840,164 @@ mod tests {
             DecryptedPayload::Text(text) => assert!(text.is_empty()),
             DecryptedPayload::Control => panic!("empty text decoded as control"),
         }
+    }
+
+    fn test_peer_prekey_bundle() -> ([u8; 32], x3dh::PreKeyBundle) {
+        let peer_identity = IdentityKeyPair::generate();
+        let peer_identity_key = peer_identity.x25519_public_bytes();
+        let peer_signing_key = peer_identity.ed25519_public_bytes();
+        let mut peer = VeilClient::from_identity(peer_identity);
+        let peer_prekeys = peer.generate_prekeys().unwrap();
+        let (one_time_prekey, one_time_prekey_id) = peer_prekeys.otk_publics[0];
+        (
+            peer_identity_key,
+            x3dh::PreKeyBundle {
+                identity_key: peer_identity_key,
+                signing_key: peer_signing_key,
+                signed_prekey: peer_prekeys.spk_public,
+                signed_prekey_signature: peer_prekeys.spk_signature,
+                signed_prekey_id: peer_prekeys.spk_id,
+                one_time_prekey: Some(one_time_prekey),
+                one_time_prekey_id: Some(one_time_prekey_id),
+            },
+        )
+    }
+
+    #[test]
+    fn establish_session_rejects_peer_bundle_identity_mismatch_without_mutation() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path = std::env::temp_dir().join(format!(
+            "veil-establish-session-identity-mismatch-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&path);
+
+        let mut client = VeilClient::new();
+        client.init_with_mnemonic(&mnemonic, &path).unwrap();
+        let local_identity_before = client.identity_key().unwrap();
+        let (bundle_identity_key, bundle) = test_peer_prekey_bundle();
+        let requested_peer_identity_key = IdentityKeyPair::generate().x25519_public_bytes();
+        assert_ne!(requested_peer_identity_key, bundle_identity_key);
+        assert!(client.ratchet_sessions.is_empty());
+        assert!(client.pending_initial_headers.is_empty());
+        assert!(client
+            .db()
+            .unwrap()
+            .load_pending_initial_headers()
+            .unwrap()
+            .is_empty());
+
+        let error = client
+            .establish_session(&requested_peer_identity_key, &bundle)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "peer identity key does not match prekey bundle identity"
+        );
+        assert_eq!(client.identity_key().unwrap(), local_identity_before);
+        assert!(!client.has_session(&requested_peer_identity_key));
+        assert!(!client.has_session(&bundle_identity_key));
+        assert!(client.ratchet_sessions.is_empty());
+        assert!(client.pending_initial_headers.is_empty());
+        assert!(client.pending_initial_sequences.is_empty());
+        assert!(client
+            .db()
+            .unwrap()
+            .load_ratchet_session(&requested_peer_identity_key)
+            .unwrap()
+            .is_none());
+        assert!(client
+            .db()
+            .unwrap()
+            .load_ratchet_session(&bundle_identity_key)
+            .unwrap()
+            .is_none());
+        assert!(client
+            .db()
+            .unwrap()
+            .load_pending_initial_headers()
+            .unwrap()
+            .is_empty());
+        drop(client);
+
+        let mut reopened = VeilClient::new();
+        reopened.init_with_mnemonic(&mnemonic, &path).unwrap();
+        assert!(!reopened.has_session(&requested_peer_identity_key));
+        assert!(!reopened.has_session(&bundle_identity_key));
+        assert!(reopened.pending_initial_headers.is_empty());
+        assert!(reopened
+            .db()
+            .unwrap()
+            .load_pending_initial_headers()
+            .unwrap()
+            .is_empty());
+        drop(reopened);
+        remove_test_database(&path);
+    }
+
+    #[test]
+    fn establish_session_matching_peer_persists_only_the_exact_session() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path = std::env::temp_dir().join(format!(
+            "veil-establish-session-identity-match-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&path);
+
+        let mut client = VeilClient::new();
+        client.init_with_mnemonic(&mnemonic, &path).unwrap();
+        let (peer_identity_key, bundle) = test_peer_prekey_bundle();
+        assert_eq!(peer_identity_key, bundle.identity_key);
+
+        client
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+
+        assert!(client.has_session(&peer_identity_key));
+        assert_eq!(client.ratchet_sessions.len(), 1);
+        assert_eq!(client.pending_initial_headers.len(), 1);
+        assert!(client
+            .pending_initial_headers
+            .contains_key(&peer_identity_key));
+        let persisted_session = client
+            .db()
+            .unwrap()
+            .load_ratchet_session(&peer_identity_key)
+            .unwrap()
+            .expect("matching peer session must be durable");
+        let persisted_headers = client.db().unwrap().load_pending_initial_headers().unwrap();
+        assert_eq!(persisted_headers.len(), 1);
+        assert_eq!(persisted_headers[0].0, peer_identity_key);
+        drop(client);
+
+        let mut reopened = VeilClient::new();
+        reopened.init_with_mnemonic(&mnemonic, &path).unwrap();
+        assert!(reopened.has_session(&peer_identity_key));
+        assert_eq!(reopened.ratchet_sessions.len(), 1);
+        assert_eq!(reopened.pending_initial_headers.len(), 1);
+        assert!(reopened
+            .pending_initial_headers
+            .contains_key(&peer_identity_key));
+        assert_eq!(
+            reopened
+                .db()
+                .unwrap()
+                .load_ratchet_session(&peer_identity_key)
+                .unwrap()
+                .as_deref(),
+            Some(persisted_session.as_slice())
+        );
+        assert_eq!(
+            reopened
+                .db()
+                .unwrap()
+                .load_pending_initial_headers()
+                .unwrap(),
+            persisted_headers
+        );
+        drop(reopened);
+        remove_test_database(&path);
     }
 
     #[test]

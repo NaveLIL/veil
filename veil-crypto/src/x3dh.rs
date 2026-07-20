@@ -1,36 +1,14 @@
 use ed25519_dalek::Signer;
 use rand::rngs::OsRng;
-use x25519_dalek::{
-    PublicKey as X25519PublicKey, SharedSecret as X25519SharedSecret,
-    StaticSecret as X25519StaticSecret,
-};
+use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::kdf;
 use crate::keys::IdentityKeyPair;
+use crate::x25519::require_contributory;
 
 /// Domain separator for Ed25519 signatures over X3DH signed prekeys.
 pub const SIGNED_PREKEY_SIGNATURE_DOMAIN: &[u8] = b"veil-x3dh-spk-v1\0";
-
-/// Reject X25519 inputs that collapse a DH term to the identity element.
-///
-/// RFC 7748 requires protocols to check the all-zero shared-secret result.
-/// X25519 accepts several equivalent/low-order public encodings, so checking
-/// the received bytes for `[0; 32]` is insufficient. Keeping the check here,
-/// immediately after every DH operation, protects all callers before X3DH can
-/// derive a root key or publish a Double Ratchet session.
-fn require_contributory(
-    shared_secret: &X25519SharedSecret,
-    peer_key_kind: &str,
-) -> Result<(), String> {
-    if shared_secret.was_contributory() {
-        Ok(())
-    } else {
-        Err(format!(
-            "non-contributory X25519 {peer_key_kind} was rejected"
-        ))
-    }
-}
 
 /// Build the canonical message covered by an X3DH signed-prekey signature.
 ///

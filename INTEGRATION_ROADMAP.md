@@ -2008,8 +2008,17 @@ production randomness не ослаблена. Это покрывает shared 
 не Android FFI/UI или отдельный desktop runtime consumer. Точный scope, findings
 и non-claims записаны в
 [`docs/reviews/phase-5s-direct-v1-transcript-checkpoint.md`](docs/reviews/phase-5s-direct-v1-transcript-checkpoint.md).
-Hostile Node, key transparency, session lifecycle, cross-client consumption,
-`libsignal` spike и независимый аудит остаются открытыми.
+
+**Local checkpoint 5S.1B 2026-07-20:** findings 1–2 получили host-only
+hardening: public `VeilClient::establish_session` требует exact совпадение
+peer/bundle identity до mutation, а received ratchet DH проверяет фактический
+X25519 contributory result до публикации state. Frozen Direct-v1 SHA
+`DAD0A84E5D7366E5189B24C9FB230C4BDD4CC67245607C148B3E3003D9915C2E`, wire и
+stored-state format не изменились. Scope, host evidence и non-claims
+зафиксированы в
+[`docs/reviews/phase-5s-direct-v1-key-validation-checkpoint.md`](docs/reviews/phase-5s-direct-v1-key-validation-checkpoint.md).
+Findings 3–5, hostile Node, key transparency, session lifecycle, cross-client
+consumption, `libsignal` spike и независимый аудит остаются открытыми.
 
 ### 5S.1 — Зафиксировать и атаковать текущий Direct v1
 

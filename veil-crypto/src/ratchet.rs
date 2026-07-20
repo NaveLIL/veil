@@ -7,6 +7,7 @@ use zeroize::Zeroize;
 
 use crate::aead;
 use crate::kdf;
+use crate::x25519::require_contributory;
 
 /// Type alias for the skipped message keys map: (ratchet_public_key, message_number) -> message_key.
 type SkippedKeysMap = HashMap<([u8; 32], u32), [u8; 32]>;
@@ -452,47 +453,56 @@ impl RatchetSession {
     where
         F: FnOnce() -> X25519StaticSecret,
     {
-        self.prev_send_count = self.send_count;
-        self.send_count = 0;
-        self.recv_count = 0;
-
-        self.dh_receiving = Some(*peer_ratchet_key);
-
         // DH with our current sending key and peer's new ratchet key
         let peer_key = X25519PublicKey::from(*peer_ratchet_key);
         let our_secret = self.reconstruct_secret()?;
         let dh_output = our_secret.diffie_hellman(&peer_key);
+        require_contributory(&dh_output, "ratchet key")?;
+
+        // Generate and validate the next sending DH before deriving or
+        // publishing either root transition. A rejected peer key therefore
+        // leaves every counter, chain, and key byte unchanged.
+        let new_secret = next_ratchet_secret();
+        let new_public = X25519PublicKey::from(&new_secret);
+        let dh_output2 = new_secret.diffie_hellman(&peer_key);
+        require_contributory(&dh_output2, "ratchet key")?;
 
         // KDF_RK → new root key + receiving chain key
         let mut kdf_out =
             kdf::hkdf_sha256(&self.root_key, dh_output.as_bytes(), b"veil-ratchet-v1", 64);
-        self.root_key.copy_from_slice(&kdf_out[..32]);
+        let mut receiving_root_key = [0u8; 32];
+        receiving_root_key.copy_from_slice(&kdf_out[..32]);
         let mut recv_ck = [0u8; 32];
         recv_ck.copy_from_slice(&kdf_out[32..]);
-        self.receiving_chain_key = Some(recv_ck);
         kdf_out.zeroize();
-
-        // The production caller supplies an OsRng-generated key. Crate tests
-        // may supply one reviewed fixed key to freeze an exact transcript.
-        let new_secret = next_ratchet_secret();
-        let new_public = X25519PublicKey::from(&new_secret);
-        let dh_output2 = new_secret.diffie_hellman(&peer_key);
 
         // KDF_RK → new root key + sending chain key
         let mut kdf_out2 = kdf::hkdf_sha256(
-            &self.root_key,
+            &receiving_root_key,
             dh_output2.as_bytes(),
             b"veil-ratchet-v1",
             64,
         );
-        self.root_key.copy_from_slice(&kdf_out2[..32]);
+        let mut sending_root_key = [0u8; 32];
+        sending_root_key.copy_from_slice(&kdf_out2[..32]);
         let mut send_ck = [0u8; 32];
         send_ck.copy_from_slice(&kdf_out2[32..]);
-        self.sending_chain_key = Some(send_ck);
         kdf_out2.zeroize();
 
+        self.prev_send_count = self.send_count;
+        self.send_count = 0;
+        self.recv_count = 0;
+        self.dh_receiving = Some(*peer_ratchet_key);
+        self.root_key = sending_root_key;
+        self.receiving_chain_key = Some(recv_ck);
+        self.sending_chain_key = Some(send_ck);
         self.dh_sending_secret = Some(new_secret.to_bytes().to_vec());
         self.dh_sending_public = Some(*new_public.as_bytes());
+
+        receiving_root_key.zeroize();
+        sending_root_key.zeroize();
+        recv_ck.zeroize();
+        send_ck.zeroize();
 
         Ok(())
     }
@@ -900,6 +910,34 @@ mod tests {
         assert_eq!(
             bob.decrypt(&header, &ciphertext).unwrap(),
             b"authenticated header"
+        );
+    }
+
+    #[test]
+    fn non_contributory_received_ratchet_keys_do_not_mutate_session() {
+        let (mut alice, mut bob) = setup_sessions();
+        let (authentic_header, authentic_ciphertext) =
+            alice.encrypt(b"still authentic after rejected DH").unwrap();
+        let before = bob.serialize().unwrap();
+
+        let mut non_zero_low_order = [0u8; 32];
+        non_zero_low_order[0] = 1;
+        for ratchet_key in [[0u8; 32], non_zero_low_order] {
+            let hostile_header = MessageHeader {
+                ratchet_key,
+                ..authentic_header.clone()
+            };
+            let error = bob
+                .decrypt(&hostile_header, &authentic_ciphertext)
+                .unwrap_err();
+            assert!(error.contains("non-contributory X25519 ratchet key"));
+            assert_serialized_session_eq(bob.serialize().unwrap(), before.clone());
+        }
+
+        assert_eq!(
+            bob.decrypt(&authentic_header, &authentic_ciphertext)
+                .unwrap(),
+            b"still authentic after rejected DH"
         );
     }
 

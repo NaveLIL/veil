@@ -583,6 +583,27 @@ fn direct_v1_fixed_packet_failures_do_not_consume_responder_state() {
         "cross-conversation authentication failure must not consume an OPK or install a session"
     );
 
+    let mut low_order_ratchet_header = full_header.clone();
+    low_order_ratchet_header[42..74].fill(0);
+    low_order_ratchet_header[42] = 1;
+    let low_order_error = bob
+        .decrypt_from(
+            &alice_identity_key,
+            &fixture.inputs.conversation_id,
+            &low_order_ratchet_header,
+            &transport,
+        )
+        .unwrap_err();
+    assert!(
+        low_order_error.contains("non-contributory X25519 ratchet key"),
+        "unexpected low-order ratchet rejection: {low_order_error}"
+    );
+    assert_eq!(
+        receiver_persistence_snapshot(&bob, &alice_identity_key, fixture.inputs.one_time_prekey_id,),
+        untouched,
+        "a non-contributory INITIAL ratchet key must leave the runtime session, SQLCipher session, and OPK state byte-identical"
+    );
+
     let mut changed_header = full_header.clone();
     changed_header[1] ^= 1;
     assert!(bob

@@ -27,6 +27,7 @@ pub mod ratchet;
 pub mod sender_key;
 pub mod share;
 pub mod signature;
+mod x25519;
 pub mod x3dh;
 
 pub use keys::{IdentityKeyPair, KeyBundle};
