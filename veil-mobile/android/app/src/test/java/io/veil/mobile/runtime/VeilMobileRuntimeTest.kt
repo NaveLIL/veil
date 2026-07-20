@@ -5,6 +5,7 @@ import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import io.veil.mobile.recovery.NativeIdentitySetupCoordinator
 import io.veil.mobile.recovery.NativeIdentitySetupUnsettledException
 import java.util.Base64
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CopyOnWriteArrayList
@@ -47,9 +48,48 @@ import uniffi.veil_ffi.VeilException
 
 class VeilMobileRuntimeTest {
   @Test
+  fun identitySetupAuthorityDefersOutsideForegroundAndPublishesOnlyStableEpoch() {
+    NativeIdentitySetupCoordinator.resetForTest()
+    val executor = daemonExecutor()
+    val runtime = runtime(executor, FakeSession(), markForeground = false)
+    val invoked = AtomicBoolean(false)
+    try {
+      assertNull(
+        runtime.withForegroundIdentitySetupAuthority {
+          invoked.set(true)
+          "background-result"
+        },
+      )
+      assertFalse(invoked.get())
+
+      runtime.markForeground()
+      assertEquals(
+        "foreground-result",
+        runtime.withForegroundIdentitySetupAuthority { "foreground-result" },
+      )
+
+      assertNull(
+        runtime.withForegroundIdentitySetupAuthority {
+          runtime.lockForBackground()
+          "superseded-result"
+        },
+      )
+    } finally {
+      NativeIdentitySetupCoordinator.resetForTest()
+      runtime.lockSession()
+      executor.shutdownNow()
+    }
+  }
+
+  @Test
   fun strictIdentityPresenceDoesNotReadVaultDuringUnsettledRecovery() {
     NativeIdentitySetupCoordinator.resetForTest()
-    val lease = requireNotNull(NativeIdentitySetupCoordinator.acquire())
+    val lease = requireNotNull(
+      NativeIdentitySetupCoordinator.acquire(
+        UUID.fromString("123e4567-e89b-42d3-a456-426614174000"),
+        UUID.fromString("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"),
+      ),
+    )
     val executor = daemonExecutor()
     val vault = FakeVault()
     val runtime = runtime(executor, FakeSession(), vault = vault)

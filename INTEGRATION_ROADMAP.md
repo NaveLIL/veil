@@ -69,7 +69,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
-| 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred recovery/vault/capture physical matrix открыты |
+| 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; durable setup-result reconciliation реализован и host-tested в текущем локальном checkpoint; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
 | 5S | Direct protocol assurance & hostile Node | immutable shared-Rust Direct-v1 transcript/SQLCipher checkpoint реализован; Android/desktop cross-runtime fixtures, exact-spec review, `libsignal` spike, key-transparency ADR и независимый аудит открыты; legacy REST authority mismatch mitigated, но cryptographic cross-Node credential scope WS v2/REST v1 остаётся P1 |
@@ -1262,11 +1262,15 @@ history-to-live handoff, message projection и idempotent Direct text send/outbo
 `PublicFailureCodeV1`, его CI validator, typed Rust/UniFFI/Android mapping и
 локальный Android catalog реализованы для identity setup и secure runtime gate;
 Direct session/send/delivery и consumer parity для desktop/Go остаются открытыми.
-Process-local non-secret setup receipt через App-owned continuation unit-tested
-на React onboarding unmount/remount, stale result и смену foreground epoch. Это
-не физическое доказательство RecoveryActivity pause/result ordering и не durable
-receipt: connected Activity instrumentation и React-context/OS process-death
-reconciliation результата setup остаются отдельными открытыми gates.
+Identity setup теперь использует native durable non-secret v1 journal в
+`noBackupFilesDir`: он хранит только random attempt/process UUID, create/restore
+mode и ограниченные phase/outcome/revision, без recovery phrase, identity/account
+data, origin, Pass или diagnostics. Reconciliation линейризуется с exact
+coordinator ownership и strict write-once vault; vault остаётся authority,
+terminal receipt сохраняется для at-least-once delivery, а React route остаётся
+opaque до проверки текущего foreground epoch. Host-only JVM/Jest gates покрывают
+state/fault/replay policy, но не доказывают Android Activity/OS scheduling.
+Connected A04/A05 и physical recovery matrix остаются открытыми.
 Это всё ещё закрытый Direct Preview: cross-client E2EE text/airplane/background
 matrix не готова. Изолированный `internalTester` package/signing contract,
 fail-closed APK verifier и ручной protected workflow реализованы, но stable

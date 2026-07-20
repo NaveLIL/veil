@@ -20,6 +20,7 @@ import com.facebook.soloader.SoLoader
 import expo.modules.ApplicationLifecycleDispatcher
 import expo.modules.ReactNativeHostWrapper
 import io.veil.mobile.crypto.VeilCryptoPackage
+import io.veil.mobile.recovery.NativeIdentitySetupJournal
 import io.veil.mobile.recovery.RecoveryActivity
 import io.veil.mobile.recovery.VeilIdentitySetupPackage
 import io.veil.mobile.runtime.VeilMobileRuntime
@@ -38,13 +39,30 @@ class MainApplication : Application(), ReactApplication, Application.ActivityLif
     VeilMobileRuntime(this)
   }
 
+  /**
+   * One process-incarnation owner for the non-secret setup journal.
+   *
+   * Activity and React bridges must share this exact instance: constructing a
+   * second journal would mint a different process correlation identifier and
+   * make a live native ceremony look like stale process-death state.
+   */
+  internal val identitySetupJournal: NativeIdentitySetupJournal by
+    lazy(LazyThreadSafetyMode.SYNCHRONIZED) {
+      NativeIdentitySetupJournal(noBackupFilesDir)
+    }
+
   override val reactNativeHost: ReactNativeHost = ReactNativeHostWrapper(
         this,
         object : DefaultReactNativeHost(this) {
           override fun getPackages(): List<ReactPackage> {
             val packages = PackageList(this).packages
             packages.add(VeilCryptoPackage())
-            packages.add(VeilIdentitySetupPackage())
+            packages.add(
+              VeilIdentitySetupPackage(
+                this@MainApplication.veilMobileRuntime,
+                this@MainApplication.identitySetupJournal,
+              ),
+            )
             packages.add(VeilMobileRuntimePackage(this@MainApplication.veilMobileRuntime))
             return packages
           }

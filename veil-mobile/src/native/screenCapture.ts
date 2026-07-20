@@ -13,10 +13,20 @@ interface VeilWindowSecurityNative {
  */
 export async function setAuthenticatedContentReady(ready: boolean): Promise<void> {
   if (Platform.OS !== "android") return;
-  const native = NativeModules.VeilCrypto as VeilWindowSecurityNative | undefined;
-  if (!native || typeof native.setSensitiveScreen !== "function") return;
+  let native: VeilWindowSecurityNative | undefined;
+  let update: VeilWindowSecurityNative["setSensitiveScreen"] | undefined;
   try {
-    await native.setSensitiveScreen(!ready);
+    native = NativeModules.VeilCrypto as VeilWindowSecurityNative | undefined;
+    update = native?.setSensitiveScreen;
+  } catch {
+    // A lazy/hostile module proxy is equivalent to an unavailable bridge.
+    // Android remains secure and no native diagnostic may become an unhandled
+    // renderer rejection.
+    return;
+  }
+  if (!native || typeof update !== "function") return;
+  try {
+    await Reflect.apply(update, native, [!ready]);
   } catch {
     // MainActivity starts secure. A bridge failure must not affect rendering or
     // invite retries, and native diagnostics never become public UI text.

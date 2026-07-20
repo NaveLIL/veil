@@ -12,6 +12,7 @@ import {
 import {
   registerIdentitySetupContinuation,
   resetIdentitySetupStoreForTests,
+  useIdentitySetupStore,
   type IdentityVerificationResult,
 } from "../../stores/identitySetup";
 
@@ -65,12 +66,12 @@ const mockBeginSetup = beginNativeIdentitySetup as jest.MockedFunction<
 
 interface HarnessProps {
   onVerifyIdentity: () => Promise<IdentityVerificationResult>;
-  onIdentityPresent?: () => Promise<void> | void;
+  onIdentityPresent?: () => Promise<"confirmed"> | "confirmed";
 }
 
 function SetupHarness({
   onVerifyIdentity,
-  onIdentityPresent = () => undefined,
+  onIdentityPresent = () => "confirmed",
 }: HarnessProps) {
   useEffect(() => registerIdentitySetupContinuation({
     getAuthorityEpoch: () => 1,
@@ -95,6 +96,7 @@ describe("native-only identity welcome", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     resetIdentitySetupStoreForTests();
+    useIdentitySetupStore.setState({ nativeReconciliation: "ready" });
   });
 
   it("renders no React Native secret input surface", () => {
@@ -117,7 +119,9 @@ describe("native-only identity welcome", () => {
 
   it("refreshes App-owned runtime authority only after a strict native commit check", async () => {
     const onVerifyIdentity = jest.fn<() => Promise<"present">>().mockResolvedValue("present");
-    const onIdentityPresent = jest.fn<() => Promise<void>>().mockResolvedValue();
+    const onIdentityPresent = jest
+      .fn<() => Promise<"confirmed">>()
+      .mockResolvedValue("confirmed");
     mockBeginSetup.mockResolvedValue("committed");
     const view = render(
       <SetupHarness

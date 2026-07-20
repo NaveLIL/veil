@@ -45,6 +45,7 @@ ADR фиксирует принятое решение и причины. Изм
 - [Phase 4E Veil Link schema/security review](reviews/phase-4e-veil-link-schema-security-review.md)
 - [Phase 4P device push client review](reviews/phase-4p-device-push-client-review.md)
 - [Android runtime terminal failure review](reviews/android-runtime-terminal-failure-review.md)
+- [Android identity setup reconciliation review](reviews/android-identity-setup-reconciliation-review.md)
 - [Android tester artifact contract](reviews/android-tester-artifact-contract.md)
 - [Android Direct Preview physical test plan](reviews/android-direct-preview-physical-test-plan.md)
 - [Phase 5S Direct-v1 transcript checkpoint](reviews/phase-5s-direct-v1-transcript-checkpoint.md)

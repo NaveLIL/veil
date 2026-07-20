@@ -179,6 +179,16 @@ physical-device result is claimed. See the
   directory rename. Native recovery holds a coordinator barrier over strict
   presence checks: READY/COMMITTING is always ambiguous, never false, so an
   unsettled commit cannot cause the only recovery phrase to be destroyed.
+- Identity setup writes a fixed 80-byte, non-secret v1 receipt under
+  `noBackupFilesDir` before protected UI becomes authoritative. It contains only
+  random attempt/process correlation, create/restore mode, constrained
+  phase/outcome/revision, and no phrase, seed, key, identity/account data,
+  origin, Pass, or diagnostic. Journal writes are lock/CAS serialized with
+  exclusive staging, fsync/readback, atomic rename, directory sync, and strict
+  version/size/checksum validation. Reconciliation is serialized with the exact
+  coordinator and strict write-once vault; vault presence is authoritative,
+  ambiguous I/O or ownership fails closed, and terminal receipts remain
+  available for at-least-once delivery.
 - UnifiedPush still accepts only decrypted 2048-byte generic wake records.
 
 This remains a closed Direct Preview, not a tester release or production-ready
@@ -188,12 +198,13 @@ typed transient reconnect, and canonical-origin process-death recovery are
 present, and the ambiguous-ACK D03 path has the host-only precursor described
 above. Same-account force-stop recovery without a new Pass or device has been
 physically confirmed on a Samsung S23. `PublicFailureCodeV1` is implemented for
-identity setup and the secure runtime gate. A reviewed terminal subset is now
-retained by the native process across snapshot reads and React recreation, but
-it is deliberately not persisted across OS process death and has not yet passed
-the deferred physical matrix. Direct session/send/delivery and desktop/Go
-consumer parity remain open. Cross-client E2EE text/airplane/background evidence,
-connected recovery/vault/capture instrumentation, push publication,
-Circle/Space/attachments, correct multi-device, signed standalone APK
-distribution, durable setup-result reconciliation after React-context/process
-death, and the broader physical-device matrix remain gated.
+identity setup and the secure runtime gate. The reviewed runtime terminal-failure
+subset remains process-local and is not persisted across OS process death.
+Separately, identity-setup results now have a durable native journal/reconciler
+and a fail-closed React bootstrap gate. This implementation has host-only
+automated evidence; Activity recreation and OS process-death cases A04/A05 have
+not been executed. Direct session/send/delivery and desktop/Go consumer parity
+remain open. Cross-client E2EE text/airplane/background evidence, connected
+recovery/vault/capture instrumentation, push publication, Circle/Space/
+attachments, correct multi-device, signed standalone APK distribution, and the
+broader physical-device matrix remain gated.

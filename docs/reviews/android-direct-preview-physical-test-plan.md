@@ -79,6 +79,13 @@ message IDs, raw origins with paths, ciphertext, and native/server text are not.
 | A09 | Lock/unlock and process restart | Keystore/SQLCipher reopen the same identity; plaintext remains absent before explicit authority |
 | A10 | Keystore/DB unavailable simulation on disposable target | Fail closed with LOCAL code; never offer a second onboarding flow from uncertainty |
 
+A04/A05 now have a host-only automated precursor covering the fixed-schema
+journal state machine, persistence/fault handling, exact coordinator/vault
+reconciliation policy, malformed bridge results, retained terminal replay, and
+the opaque App bootstrap gate. No Activity recreation, low-memory kill, Android
+filesystem/Keystore timing, or physical OS process-death was exercised; A04 and
+A05 remain open.
+
 ## Matrix B — Node Access Pass and exact origin
 
 | ID | Scenario | Required result |

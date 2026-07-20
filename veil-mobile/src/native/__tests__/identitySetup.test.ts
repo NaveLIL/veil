@@ -5,9 +5,13 @@ import { NativeModules } from "react-native";
 
 import {
   beginNativeIdentitySetup,
+  reconcileNativeIdentitySetup,
+  type NativeIdentitySetupReconciliationResult,
 } from "../identitySetup";
 
 const originalModule = NativeModules.VeilIdentitySetup;
+const ATTEMPT_ID = "123e4567-e89b-42d3-a456-426614174000";
+const PROCESS_INCARNATION_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
 
 function installNative(result: unknown) {
   const begin = jest.fn<() => Promise<unknown>>().mockResolvedValue(result);
@@ -16,6 +20,18 @@ function installNative(result: unknown) {
     value: { beginNativeIdentitySetup: begin },
   });
   return begin;
+}
+
+function installReconciler(result: unknown) {
+  const reconcile = jest.fn<() => Promise<unknown>>().mockResolvedValue(result);
+  Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+    configurable: true,
+    value: {
+      beginNativeIdentitySetup: jest.fn<() => Promise<unknown>>(),
+      reconcileNativeIdentitySetup: reconcile,
+    },
+  });
+  return reconcile;
 }
 
 describe("identity setup bridge", () => {
@@ -104,6 +120,262 @@ describe("identity setup bridge", () => {
           kind: "ambiguous",
         }),
       );
+    }
+  });
+
+  it("treats inherited, accessor, and hostile rejection codes as ambiguous", async () => {
+    const begin = jest.fn<() => Promise<unknown>>();
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      value: { beginNativeIdentitySetup: begin },
+    });
+
+    const inherited = Object.create({ code: "E_VEIL_SETUP_ACTIVITY" }) as object;
+    let accessorRead = false;
+    const accessor = {};
+    Object.defineProperty(accessor, "code", {
+      enumerable: true,
+      get() {
+        accessorRead = true;
+        throw new Error("NATIVE-START-CODE-CANARY");
+      },
+    });
+    const hostileDescriptor = new Proxy({}, {
+      getOwnPropertyDescriptor() {
+        throw new Error("NATIVE-START-DESCRIPTOR-CANARY");
+      },
+    });
+
+    for (const failure of [inherited, accessor, hostileDescriptor]) {
+      begin.mockRejectedValueOnce(failure);
+      await expect(beginNativeIdentitySetup("create")).rejects.toEqual(
+        expect.objectContaining({
+          name: "NativeIdentitySetupStartError",
+          kind: "ambiguous",
+        }),
+      );
+    }
+    expect(accessorRead).toBe(false);
+  });
+
+  it("sanitizes hostile native-module and method lookup failures", async () => {
+    const nativeCanary = "NATIVE-START-MODULE-CANARY";
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      get() {
+        throw new Error(nativeCanary);
+      },
+    });
+
+    let moduleFailure: unknown;
+    try {
+      await beginNativeIdentitySetup("restore");
+    } catch (error) {
+      moduleFailure = error;
+    }
+    expect(moduleFailure).toEqual(expect.objectContaining({
+      name: "NativeIdentitySetupStartError",
+      kind: "ambiguous",
+    }));
+    expect(String(moduleFailure)).not.toContain(nativeCanary);
+
+    const native = {};
+    Object.defineProperty(native, "beginNativeIdentitySetup", {
+      enumerable: true,
+      get() {
+        throw new Error(nativeCanary);
+      },
+    });
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      value: native,
+    });
+    await expect(beginNativeIdentitySetup("create")).rejects.toEqual(
+      expect.objectContaining({ kind: "ambiguous" }),
+    );
+  });
+
+  it("accepts only the exact closed reconciliation shapes", async () => {
+    const reconcile = installReconciler({ status: "none" });
+    await expect(reconcileNativeIdentitySetup()).resolves.toEqual({ status: "none" });
+    expect(reconcile).toHaveBeenCalledWith();
+
+    reconcile.mockResolvedValue({ status: "unconfirmed" });
+    await expect(reconcileNativeIdentitySetup()).resolves.toEqual({
+      status: "unconfirmed",
+    });
+
+    for (const status of [
+      "in_progress",
+      "committed",
+      "user_cancelled",
+      "interrupted",
+    ] as const) {
+      const expected: NativeIdentitySetupReconciliationResult = {
+        status,
+        attemptId: ATTEMPT_ID,
+        processIncarnationId: PROCESS_INCARNATION_ID,
+        mode: status === "in_progress" ? "create" : "restore",
+      };
+      const nativePayload = { ...expected };
+      reconcile.mockResolvedValue(nativePayload);
+
+      const result = await reconcileNativeIdentitySetup();
+      expect(result).toEqual(expected);
+      expect(result).not.toBe(nativePayload);
+    }
+  });
+
+  it("maps every malformed or non-exact reconciliation payload to unconfirmed", async () => {
+    const valid = {
+      status: "committed",
+      attemptId: ATTEMPT_ID,
+      processIncarnationId: PROCESS_INCARNATION_ID,
+      mode: "create",
+    } as const;
+    const symbolExtra = Symbol("hidden native field");
+    const inherited = Object.assign(
+      Object.create({ inherited: true }) as Record<string, unknown>,
+      valid,
+    );
+    const malformed: readonly (readonly [string, unknown])[] = [
+      ["null", null],
+      ["undefined", undefined],
+      ["scalar", "committed"],
+      ["array", []],
+      ["missing status", {}],
+      ["none with extra field", { status: "none", extra: true }],
+      ["unconfirmed with extra field", { status: "unconfirmed", extra: true }],
+      ["attempt fields missing", { status: "committed" }],
+      ["unknown status", { ...valid, status: "future" }],
+      ["uppercase UUID", { ...valid, attemptId: ATTEMPT_ID.toUpperCase() }],
+      [
+        "wrong UUID version",
+        { ...valid, attemptId: "11111111-2222-5333-8444-555555555555" },
+      ],
+      [
+        "wrong UUID variant",
+        { ...valid, attemptId: "11111111-2222-4333-7444-555555555555" },
+      ],
+      ["UUID suffix", { ...valid, attemptId: `${ATTEMPT_ID} ` }],
+      ["non-string process UUID", { ...valid, processIncarnationId: 42 }],
+      ["same attempt and process UUID", { ...valid, processIncarnationId: ATTEMPT_ID }],
+      [
+        "wrong process UUID variant",
+        {
+          ...valid,
+          processIncarnationId: "aaaaaaaa-bbbb-4ccc-7ddd-eeeeeeeeeeee",
+        },
+      ],
+      ["unknown mode", { ...valid, mode: "CREATE" }],
+      ["extra field", { ...valid, extra: true }],
+      ["symbol field", { ...valid, [symbolExtra]: true }],
+      ["custom prototype", inherited],
+    ];
+    const reconcile = installReconciler(undefined);
+
+    for (const [caseName, payload] of malformed) {
+      reconcile.mockResolvedValueOnce(payload);
+      const result = await reconcileNativeIdentitySetup();
+      expect({ caseName, result }).toEqual({
+        caseName,
+        result: { status: "unconfirmed" },
+      });
+    }
+  });
+
+  it("sanitizes missing bridges, native rejections, and hostile payload access", async () => {
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      value: undefined,
+    });
+    await expect(reconcileNativeIdentitySetup()).resolves.toEqual({
+      status: "unconfirmed",
+    });
+
+    const nativeCanary = "NATIVE-SETUP-ERROR-SECRET-CANARY";
+    const reconcile = jest
+      .fn<() => Promise<unknown>>()
+      .mockRejectedValue({
+        code: "E_PRIVATE_NATIVE_FAILURE",
+        message: nativeCanary,
+        nativeStack: nativeCanary,
+      });
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      value: { reconcileNativeIdentitySetup: reconcile },
+    });
+    const rejected = await reconcileNativeIdentitySetup();
+    expect(rejected).toEqual({ status: "unconfirmed" });
+    expect(JSON.stringify(rejected)).not.toContain(nativeCanary);
+
+    let accessorRead = false;
+    const hostilePayload: Record<string, unknown> = {};
+    Object.defineProperty(hostilePayload, "status", {
+      enumerable: true,
+      get() {
+        accessorRead = true;
+        throw new Error(nativeCanary);
+      },
+    });
+    reconcile.mockResolvedValue(hostilePayload);
+    const hostile = await reconcileNativeIdentitySetup();
+    expect(hostile).toEqual({ status: "unconfirmed" });
+    expect(accessorRead).toBe(false);
+    expect(JSON.stringify(hostile)).not.toContain(nativeCanary);
+  });
+
+  it("sanitizes hostile reconciliation module and method lookup", async () => {
+    const nativeCanary = "NATIVE-RECONCILIATION-LOOKUP-CANARY";
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      get() {
+        throw new Error(nativeCanary);
+      },
+    });
+    await expect(reconcileNativeIdentitySetup()).resolves.toEqual({
+      status: "unconfirmed",
+    });
+
+    const native = {};
+    Object.defineProperty(native, "reconcileNativeIdentitySetup", {
+      enumerable: true,
+      get() {
+        throw new Error(nativeCanary);
+      },
+    });
+    Object.defineProperty(NativeModules, "VeilIdentitySetup", {
+      configurable: true,
+      value: native,
+    });
+    await expect(reconcileNativeIdentitySetup()).resolves.toEqual({
+      status: "unconfirmed",
+    });
+  });
+
+  it("never forwards secret-bearing or diagnostic native fields", async () => {
+    const nativeCanary = "NATIVE-SETUP-PROTECTED-CANARY";
+    const reconcile = installReconciler(undefined);
+    const extraFields = [
+      "lease",
+      "recoveryPhrase",
+      "privateKey",
+      "canonicalOrigin",
+      "nodeAccessPass",
+      "diagnostics",
+    ];
+
+    for (const field of extraFields) {
+      reconcile.mockResolvedValueOnce({
+        status: "in_progress",
+        attemptId: ATTEMPT_ID,
+        processIncarnationId: PROCESS_INCARNATION_ID,
+        mode: "restore",
+        [field]: nativeCanary,
+      });
+      const result = await reconcileNativeIdentitySetup();
+      expect(result).toEqual({ status: "unconfirmed" });
+      expect(JSON.stringify(result)).not.toContain(nativeCanary);
     }
   });
 

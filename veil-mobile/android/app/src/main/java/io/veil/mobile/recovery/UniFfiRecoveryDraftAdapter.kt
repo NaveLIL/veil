@@ -11,10 +11,9 @@ internal object UniFfiRecoveryDraftFactory : RecoveryDraftFactory {
     UniFfiRecoveryDraftAdapter(
       mode = mode,
       native =
-        if (mode == RecoveryMode.CREATE) {
-          VeilRecoveryDraft.newCreate()
-        } else {
-          VeilRecoveryDraft.newRestore()
+        when (mode) {
+          RecoveryMode.CREATE -> VeilRecoveryDraft.newCreate()
+          RecoveryMode.RESTORE -> VeilRecoveryDraft.newRestore()
         },
     )
 }

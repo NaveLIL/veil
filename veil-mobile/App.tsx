@@ -25,6 +25,8 @@ import OnboardingScreen from "./src/screens/OnboardingScreen";
 import {
   registerIdentitySetupContinuation,
   resumeIdentitySetupContinuation,
+  retryIdentitySetupReconciliation,
+  useIdentitySetupStore,
 } from "./src/stores/identitySetup";
 import {
   canRenderChat,
@@ -34,6 +36,8 @@ import { useMobileSettingsStore } from "./src/stores/settings";
 
 export default function App() {
   const runtime = useVeilRuntimeLifecycle();
+  const verifyIdentityPresence = runtime.verifyIdentityPresence;
+  const retryIdentityBootstrap = runtime.retryBootstrap;
   const reducedMotion = useReducedMotionPreference();
   const phase = useRuntimeGateStore((state) => state.phase);
   const snapshot = useRuntimeGateStore((state) => state.snapshot);
@@ -41,12 +45,16 @@ export default function App() {
   const requiresExplicitReopen = useRuntimeGateStore((state) => state.requiresExplicitReopen);
   const operation = useRuntimeGateStore((state) => state.operation);
   const publicFailureCode = useRuntimeGateStore((state) => state.publicFailureCode);
+  const identityReconciliation = useIdentitySetupStore(
+    (state) => state.nativeReconciliation,
+  );
   const allowReadyScreenshots = useMobileSettingsStore(
     (state) => state.allowReadyScreenshots,
   );
 
   const chatReady = canRenderChat(snapshot, requiresExplicitReopen, publicFailureCode);
   const captureReady = phase === "ready"
+    && identityReconciliation === "ready"
     && chatReady
     && !curtainVisible
     && operation === null
@@ -57,9 +65,44 @@ export default function App() {
       const gate = useRuntimeGateStore.getState();
       return gate.phase === "ready" && !gate.curtainVisible ? gate.epoch : null;
     },
-    verifyIdentity: runtime.verifyIdentityPresence,
-    onIdentityPresent: runtime.retryBootstrap,
-  }), [runtime.retryBootstrap, runtime.verifyIdentityPresence]);
+    getDurableReconciliationAuthorityEpoch: () => {
+      const gate = useRuntimeGateStore.getState();
+      return gate.curtainVisible || gate.phase === "privacy" ? null : gate.epoch;
+    },
+    verifyIdentity: verifyIdentityPresence,
+    onIdentityPresent: async (expectedDurableAuthorityEpoch) => {
+      const before = useRuntimeGateStore.getState();
+      if (
+        expectedDurableAuthorityEpoch !== undefined
+        && (
+          before.curtainVisible
+          || before.phase === "privacy"
+          || before.epoch !== expectedDurableAuthorityEpoch
+        )
+      ) {
+        return "superseded" as const;
+      }
+      await retryIdentityBootstrap();
+      const gate = useRuntimeGateStore.getState();
+      if (
+        expectedDurableAuthorityEpoch !== undefined
+        && gate.epoch !== expectedDurableAuthorityEpoch + 1
+      ) {
+        return "superseded" as const;
+      }
+      if (
+        gate.phase !== "ready"
+        || gate.curtainVisible
+        || gate.snapshot?.identityExists !== true
+      ) {
+        // The controller catches native diagnostics internally. Reject with a
+        // local sentinel so setup presentation can fail closed without text.
+        throw new Error("identity-present bootstrap was not confirmed");
+      }
+      return "confirmed" as const;
+    },
+    enableDurableReconciliation: true,
+  }), [retryIdentityBootstrap, verifyIdentityPresence]);
 
   useEffect(() => {
     // A native result may arrive while RecoveryActivity owns the foreground.
@@ -77,7 +120,19 @@ export default function App() {
   }, [captureReady]);
 
   let content: React.ReactNode;
-  if (phase === "bootstrapping" || phase === "privacy") {
+  if (identityReconciliation === "checking") {
+    content = <RuntimeBootstrap reducedMotion={reducedMotion} />;
+  } else if (identityReconciliation === "blocked") {
+    content = (
+      <RuntimeError
+        code="VEIL-SETUP-002"
+        onRetry={() => {
+          retryIdentitySetupReconciliation();
+          void runtime.retryBootstrap();
+        }}
+      />
+    );
+  } else if (phase === "bootstrapping" || phase === "privacy") {
     content = <RuntimeBootstrap reducedMotion={reducedMotion} />;
   } else if (phase === "error" || !snapshot) {
     content = (

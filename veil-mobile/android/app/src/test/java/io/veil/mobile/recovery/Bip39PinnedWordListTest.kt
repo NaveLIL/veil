@@ -79,14 +79,23 @@ class Bip39PinnedWordListTest {
     assertFalse(source.contains("android.util.Log"))
     assertFalse(source.contains("joinToString"))
     assertFalse(source.contains("mnemonic: String"))
-    val intentExtraNames = Regex("putExtra\\((EXTRA_[A-Z_]+)")
+    val intentExtraNames = Regex("putExtra\\(\\s*(EXTRA_[A-Z_]+)")
       .findAll(source)
       .map { match -> match.groupValues[1] }
       .toList()
-    assertEquals(4, Regex("putExtra\\(").findAll(source).count())
-    assertEquals(4, intentExtraNames.size)
+    assertEquals(8, Regex("putExtra\\(").findAll(source).count())
+    assertEquals(8, intentExtraNames.size)
     assertEquals(
-      setOf("EXTRA_MODE", "EXTRA_LEASE_ID", "EXTRA_RESULT_LEASE_ID", "EXTRA_RESULT_OUTCOME"),
+      setOf(
+        "EXTRA_MODE",
+        "EXTRA_LEASE_ID",
+        "EXTRA_ATTEMPT_ID",
+        "EXTRA_PROCESS_INCARNATION_ID",
+        "EXTRA_RESULT_LEASE_ID",
+        "EXTRA_RESULT_ATTEMPT_ID",
+        "EXTRA_RESULT_PROCESS_INCARNATION_ID",
+        "EXTRA_RESULT_OUTCOME",
+      ),
       intentExtraNames.toSet(),
     )
     assertTrue(source.contains("RecoveryPrivateInputView"))

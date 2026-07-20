@@ -8,6 +8,8 @@ import io.veil.mobile.BuildConfig
 import io.veil.mobile.crypto.NativeIdentityVault
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import io.veil.mobile.recovery.NativeIdentitySetupCoordinator
+import io.veil.mobile.recovery.NativeIdentitySetupReconciler
+import io.veil.mobile.recovery.NativeIdentitySetupReconciliationResult
 import java.io.File
 import java.nio.CharBuffer
 import java.nio.charset.CharacterCodingException
@@ -1162,6 +1164,38 @@ internal class VeilMobileRuntime internal constructor(
 
   fun snapshot(): VeilMobileRuntimeSnapshot = synchronized(stateLock) {
     snapshotLocked()
+  }
+
+  /**
+   * Runs durable setup reconciliation only inside one visible lifecycle epoch.
+   *
+   * A null result means the caller must retain/defer its Promise. The
+   * reconciler may already have advanced the monotonic journal before a
+   * background transition wins; that receipt is intentionally re-read on the
+   * next foreground epoch instead of publishing a stale classification.
+   */
+  fun reconcileIdentitySetup(
+    reconciler: NativeIdentitySetupReconciler,
+  ): NativeIdentitySetupReconciliationResult? =
+    withForegroundIdentitySetupAuthority { reconciler.reconcile() }
+
+  /**
+   * Narrow native setup transaction boundary used to reconcile/replace one
+   * terminal receipt and prepare its successor without an intervening
+   * ceremony acquire. Callers must not perform UI work inside this operation.
+   */
+  fun <T> withForegroundIdentitySetupAuthority(operation: () -> T): T? {
+    val reconciliationEpoch = synchronized(stateLock) {
+      if (!foreground) return null
+      lifecycleEpoch
+    }
+
+    val result = NativeIdentitySetupCoordinator.withReconciliationBarrier {
+      operation()
+    }
+    return synchronized(stateLock) {
+      if (!foreground || lifecycleEpoch != reconciliationEpoch) null else result
+    }
   }
 
   /**

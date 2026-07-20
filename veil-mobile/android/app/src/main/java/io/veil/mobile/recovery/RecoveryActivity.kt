@@ -24,12 +24,14 @@ import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.Space
 import android.widget.TextView
+import io.veil.mobile.MainApplication
 import io.veil.mobile.R
 import io.veil.mobile.crypto.NativeIdentityVault
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Process-local, screenshot-proof recovery ceremony.
+ * Screenshot-proof native recovery ceremony with durable non-secret correlation.
  *
  * Only a non-secret create/restore mode and process lease enter this Activity,
  * and only a non-secret terminal outcome plus lease correlation leaves it. Recovery words never
@@ -50,6 +52,8 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   private var activeRenderGeneration = 0L
   private var backCallback: Any? = null
   private var setupLease: NativeIdentitySetupCoordinator.Lease? = null
+  private var setupJournal: NativeIdentitySetupJournal? = null
+  private var setupRecord: NativeIdentitySetupJournalRecord? = null
   private var coordinatorAttached = false
   private var transactionUi = TransactionUi.SETUP
   private var resumed = false
@@ -70,36 +74,96 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       backCallback = callback
     }
 
-    val mode = intent?.getStringExtra(EXTRA_MODE)?.let(RecoveryMode::fromBridge)
-    val leaseId = intent?.getLongExtra(EXTRA_LEASE_ID, INVALID_LEASE_ID) ?: INVALID_LEASE_ID
-    if (mode == null || leaseId <= 0) {
-      finishInterrupted()
+    val launch = readLaunchCorrelation(intent)
+    val journal = try {
+      (application as? MainApplication)?.identitySetupJournal
+    } catch (_: Throwable) {
+      null
+    }
+    if (
+      launch == null ||
+        journal == null ||
+        launch.processIncarnationId != journal.processIncarnationId
+    ) {
+      finishWithoutCorrelatedResult()
       return
     }
-    val lease = NativeIdentitySetupCoordinator.Lease(leaseId)
+    val mode = launch.mode
+    val leaseId = launch.leaseId
+    val attemptId = launch.attemptId
+    val processIncarnationId = launch.processIncarnationId
+    setupJournal = journal
+    val record = try {
+      journal.readOrNull()
+    } catch (_: Throwable) {
+      null
+    }
+    if (
+      record == null ||
+        record.attemptId != attemptId ||
+        record.processIncarnationId != processIncarnationId ||
+        record.mode != mode.toJournalMode()
+    ) {
+      finishWithoutCorrelatedResult()
+      return
+    }
+    setupRecord = record
+
+    // A recreated setup UI must never materialize a second phrase. The native
+    // draft is intentionally not persisted. A commit worker, however, remains
+    // process-owned and may safely receive a new observer.
+    if (
+      savedInstanceState != null &&
+        record.phase != NativeIdentitySetupJournalPhase.COMMITTING
+    ) {
+      ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
+      finishWithoutCorrelatedResult()
+      return
+    }
+    if (record.phase == NativeIdentitySetupJournalPhase.TERMINAL) {
+      finishWithoutCorrelatedResult()
+      return
+    }
+
+    val lease = NativeIdentitySetupCoordinator.Lease(
+      leaseId,
+      attemptId,
+      processIncarnationId,
+    )
     setupLease = lease
     when (NativeIdentitySetupCoordinator.attachOrAdopt(lease, this)) {
-      NativeIdentitySetupCoordinator.Attachment.OWNER -> coordinatorAttached = true
+      NativeIdentitySetupCoordinator.Attachment.OWNER -> {
+        coordinatorAttached = true
+        if (record.phase != NativeIdentitySetupJournalPhase.PREPARED) {
+          ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
+          finishWithoutCorrelatedResult()
+          return
+        }
+      }
       NativeIdentitySetupCoordinator.Attachment.COMMITTING -> {
         coordinatorAttached = true
+        if (record.phase != NativeIdentitySetupJournalPhase.COMMITTING) {
+          finishWithoutCorrelatedResult()
+          return
+        }
         commitStarted.set(true)
         transactionUi = TransactionUi.COMMITTING
         return
       }
       NativeIdentitySetupCoordinator.Attachment.COMMITTED -> {
         coordinatorAttached = true
-        finishCommitted()
+        finishCommitted(NativeIdentitySetupJournalOutcome.COMMITTED)
         return
       }
       NativeIdentitySetupCoordinator.Attachment.FAILED -> {
         coordinatorAttached = true
         commitStarted.set(true)
-        transactionUi = TransactionUi.FAILED
+        finishAfterSettledFailure()
         return
       }
       NativeIdentitySetupCoordinator.Attachment.REJECTED -> {
         NativeIdentitySetupCoordinator.discardRejected(lease)
-        finishInterrupted()
+        finishWithoutCorrelatedResult()
         return
       }
     }
@@ -139,6 +203,12 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
 
   override fun onDestroy() {
     foregroundGate.markBackground()
+    if (!terminal.get() && transactionUi != TransactionUi.COMMITTING) {
+      // A same-process Activity loss has no surviving draft/worker. Publish a
+      // best-effort interruption so reconciliation need not wait for process
+      // death to distinguish it from a live ceremony.
+      ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
+    }
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
       backCallback?.let { Api33Back.unregister(this, it) }
     }
@@ -154,6 +224,8 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     }
     coordinatorAttached = false
     setupLease = null
+    setupRecord = null
+    setupJournal = null
     super.onDestroy()
   }
 
@@ -188,12 +260,9 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
             finishInterrupted()
           }
         }
-        NativeIdentitySetupCoordinator.CoordinatorEvent.COMMITTED -> finishCommitted()
-        NativeIdentitySetupCoordinator.CoordinatorEvent.FAILED -> {
-          transactionUi = TransactionUi.FAILED
-          clearSensitiveViews()
-          if (interactive) renderCurrentUi()
-        }
+        NativeIdentitySetupCoordinator.CoordinatorEvent.COMMITTED ->
+          finishCommitted(NativeIdentitySetupJournalOutcome.COMMITTED)
+        NativeIdentitySetupCoordinator.CoordinatorEvent.FAILED -> finishAfterSettledFailure()
       }
     }
   }
@@ -281,6 +350,12 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     if (controller != null) return true
     val mode = pendingMode ?: return false
     return try {
+      val activeRecord = transitionJournalPhase(NativeIdentitySetupJournalPhase.ACTIVE)
+        ?: run {
+          finishWithoutCorrelatedResult()
+          return false
+        }
+      setupRecord = activeRecord
       val identityVault = NativeIdentityVault(applicationContext)
       if (identityVault.hasIdentity()) {
         finishAlreadyProvisioned()
@@ -621,10 +696,9 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     root.addView(
       bodyText(
         getString(
-          if (flow.mode == RecoveryMode.CREATE) {
-            R.string.recovery_ready_body_create
-          } else {
-            R.string.recovery_ready_body_restore
+          when (flow.mode) {
+            RecoveryMode.CREATE -> R.string.recovery_ready_body_create
+            RecoveryMode.RESTORE -> R.string.recovery_ready_body_restore
           },
         ),
       ),
@@ -633,10 +707,9 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     root.addOwnedButton(
       primaryButton(
         getString(
-          if (flow.mode == RecoveryMode.CREATE) {
-            R.string.recovery_commit_create
-          } else {
-            R.string.recovery_commit_restore
+          when (flow.mode) {
+            RecoveryMode.CREATE -> R.string.recovery_commit_create
+            RecoveryMode.RESTORE -> R.string.recovery_commit_restore
           },
         ),
       ) {
@@ -687,9 +760,25 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       // Keep the fallback reference until the owner object exists. If any
       // allocation above fails, the catch path still overwrites the copy.
       indices = null
+      val committingRecord = transitionJournalPhase(
+        NativeIdentitySetupJournalPhase.COMMITTING,
+      )
+      if (committingRecord == null) {
+        work.close()
+        work = null
+        ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
+        controller = null
+        dictionary = null
+        provisioner = null
+        transactionUi = TransactionUi.FAILED
+        renderCurrentUi()
+        return
+      }
+      setupRecord = committingRecord
       if (!NativeIdentitySetupCoordinator.beginCommit(lease, this, work)) {
         work.close()
         work = null
+        ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
         controller = null
         dictionary = null
         provisioner = null
@@ -715,6 +804,9 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       dictionary = null
       provisioner = null
       transactionUi = TransactionUi.FAILED
+      if (setupRecord?.phase == NativeIdentitySetupJournalPhase.COMMITTING) {
+        ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
+      }
       clearSensitiveViews()
       renderCurrentUi()
     }
@@ -806,6 +898,9 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
 
   /** Last-resort no-throw terminal path used only when even generic failure UI cannot render. */
   private fun forceFinishCancelledAfterUiFailure() {
+    val journalTerminal = ensureJournalTerminal(
+      NativeIdentitySetupJournalOutcome.INTERRUPTED,
+    )
     terminal.set(true)
     try {
       foregroundGate.markBackground()
@@ -827,13 +922,11 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     } catch (_: Throwable) {
       // Native cleanup failure must not re-enter the main loop.
     }
-    try {
-      setTerminalResult(NativeIdentitySetupOutcome.INTERRUPTED)
-    } catch (_: Throwable) {
+    if (journalTerminal) {
       try {
-        setResult(RESULT_CANCELED)
+        setTerminalResult(NativeIdentitySetupOutcome.INTERRUPTED)
       } catch (_: Throwable) {
-        // Activity teardown remains the final boundary.
+        // A malformed/missing explicit result remains only a reconciliation wake.
       }
     }
     try {
@@ -858,6 +951,17 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
 
   private fun finishTerminal(outcome: NativeIdentitySetupOutcome) {
     check(outcome != NativeIdentitySetupOutcome.COMMITTED)
+    val durableOutcome = when (outcome) {
+      NativeIdentitySetupOutcome.USER_CANCELLED ->
+        NativeIdentitySetupJournalOutcome.USER_CANCELLED
+      NativeIdentitySetupOutcome.INTERRUPTED ->
+        NativeIdentitySetupJournalOutcome.INTERRUPTED
+      NativeIdentitySetupOutcome.COMMITTED -> error("committed outcome is handled separately")
+    }
+    if (!ensureJournalTerminal(durableOutcome)) {
+      finishWithoutCorrelatedResult()
+      return
+    }
     if (!terminal.compareAndSet(false, true)) return
     foregroundGate.markBackground()
     clearSensitiveViews()
@@ -868,10 +972,17 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   }
 
   private fun finishAlreadyProvisioned() {
-    finishCommitted()
+    // The pre-existing vault is authoritative, while PREPARED/ACTIVE can only
+    // persist an interrupted tombstone. Reconciliation upgrades it to
+    // committed after the strict vault read.
+    finishCommitted(NativeIdentitySetupJournalOutcome.INTERRUPTED)
   }
 
-  private fun finishCommitted() {
+  private fun finishCommitted(durableOutcome: NativeIdentitySetupJournalOutcome) {
+    if (!ensureJournalTerminal(durableOutcome)) {
+      finishWithoutCorrelatedResult()
+      return
+    }
     if (!terminal.compareAndSet(false, true)) return
     foregroundGate.markBackground()
     clearSensitiveViews()
@@ -879,13 +990,123 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     finish()
   }
 
+  private fun finishAfterSettledFailure() {
+    val vaultPresent = try {
+      NativeIdentityVault(applicationContext).hasIdentity()
+    } catch (_: Throwable) {
+      null
+    }
+    if (vaultPresent == true) {
+      finishCommitted(NativeIdentitySetupJournalOutcome.COMMITTED)
+      return
+    }
+    if (vaultPresent == false) {
+      ensureJournalTerminal(NativeIdentitySetupJournalOutcome.INTERRUPTED)
+    }
+    transactionUi = TransactionUi.FAILED
+    clearSensitiveViews()
+    if (interactive) renderCurrentUi()
+  }
+
   private fun setTerminalResult(outcome: NativeIdentitySetupOutcome) {
+    val record = setupRecord ?: return
+    val lease = setupLease ?: return
+    if (
+      record.phase != NativeIdentitySetupJournalPhase.TERMINAL ||
+        record.attemptId != lease.attemptId ||
+        record.processIncarnationId != lease.ownerProcessIncarnationId
+    ) return
     val resultCode =
       if (outcome == NativeIdentitySetupOutcome.COMMITTED) RESULT_OK else RESULT_CANCELED
     val result = Intent().putExtra(EXTRA_RESULT_OUTCOME, outcome.bridgeValue)
-    val lease = setupLease
-    if (lease != null) result.putExtra(EXTRA_RESULT_LEASE_ID, lease.id)
+    result.putExtra(EXTRA_RESULT_LEASE_ID, lease.id)
+    result.putExtra(EXTRA_RESULT_ATTEMPT_ID, lease.attemptId.toString())
+    result.putExtra(
+      EXTRA_RESULT_PROCESS_INCARNATION_ID,
+      lease.ownerProcessIncarnationId.toString(),
+    )
     setResult(resultCode, result)
+  }
+
+  private fun transitionJournalPhase(
+    nextPhase: NativeIdentitySetupJournalPhase,
+  ): NativeIdentitySetupJournalRecord? {
+    val durableJournal = setupJournal ?: return null
+    repeat(2) {
+      val expected = setupRecord ?: return null
+      if (expected.phase == nextPhase) return expected
+      try {
+        return durableJournal.transition(expected, nextPhase)
+          .also { setupRecord = it }
+      } catch (_: Throwable) {
+        val current = readExactAttemptOrNull() ?: return null
+        if (current == expected) return null
+        if (!expected.isAllowedSuccessor(current)) return null
+        setupRecord = current
+      }
+    }
+    return null
+  }
+
+  private fun ensureJournalTerminal(
+    outcome: NativeIdentitySetupJournalOutcome,
+  ): Boolean {
+    val durableJournal = setupJournal ?: return false
+    repeat(3) {
+      val expected = setupRecord ?: return false
+      if (expected.phase == NativeIdentitySetupJournalPhase.TERMINAL) {
+        return expected.outcome == outcome
+      }
+      try {
+        val terminalRecord = durableJournal.transition(
+          expected = expected,
+          nextPhase = NativeIdentitySetupJournalPhase.TERMINAL,
+          outcome = outcome,
+        )
+        setupRecord = terminalRecord
+        return true
+      } catch (_: Throwable) {
+        val current = readExactAttemptOrNull() ?: return false
+        if (current == expected) return false
+        if (!expected.isAllowedSuccessor(current)) return false
+        setupRecord = current
+      }
+    }
+    return false
+  }
+
+  private fun readExactAttemptOrNull(): NativeIdentitySetupJournalRecord? {
+    val expected = setupRecord ?: return null
+    val current = try {
+      setupJournal?.readOrNull()
+    } catch (_: Throwable) {
+      null
+    } ?: return null
+    return current.takeIf { record ->
+      record.attemptId == expected.attemptId &&
+        record.processIncarnationId == expected.processIncarnationId &&
+        record.mode == expected.mode
+    }
+  }
+
+  private fun finishWithoutCorrelatedResult() {
+    if (!terminal.compareAndSet(false, true)) return
+    try {
+      foregroundGate.markBackground()
+    } catch (_: Throwable) {
+      // Continue wiping and closing the Activity without an explicit result.
+    }
+    clearSensitiveViews()
+    try {
+      controller?.close()
+    } catch (_: Throwable) {
+      // No diagnostic crosses the Activity boundary.
+    }
+    controller = null
+    dictionary = null
+    provisioner = null
+    pendingMode = null
+    finish()
   }
 
   private fun handleVisibilityLoss() {
@@ -1288,7 +1509,13 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
   companion object {
     private const val EXTRA_MODE = "io.veil.mobile.recovery.MODE"
     private const val EXTRA_LEASE_ID = "io.veil.mobile.recovery.LEASE_ID"
+    private const val EXTRA_ATTEMPT_ID = "io.veil.mobile.recovery.ATTEMPT_ID"
+    private const val EXTRA_PROCESS_INCARNATION_ID =
+      "io.veil.mobile.recovery.PROCESS_INCARNATION_ID"
     private const val EXTRA_RESULT_LEASE_ID = "io.veil.mobile.recovery.RESULT_LEASE_ID"
+    private const val EXTRA_RESULT_ATTEMPT_ID = "io.veil.mobile.recovery.RESULT_ATTEMPT_ID"
+    private const val EXTRA_RESULT_PROCESS_INCARNATION_ID =
+      "io.veil.mobile.recovery.RESULT_PROCESS_INCARNATION_ID"
     private const val EXTRA_RESULT_OUTCOME = "io.veil.mobile.recovery.RESULT_OUTCOME"
     private const val INVALID_LEASE_ID = -1L
     private const val ROOT_HORIZONTAL_INSET_DP = 20
@@ -1299,6 +1526,9 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
     private const val LARGE_FONT_SCALE = 1.5f
     private const val ACTIVE_OUTLINE_WIDTH_DP = 2
     private val SECRET_VIEW_TAG = Any()
+    private val CANONICAL_UUID_V4 = Regex(
+      "^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    )
 
     fun intent(
       context: Context,
@@ -1306,29 +1536,91 @@ internal class RecoveryActivity : Activity(), NativeIdentitySetupCoordinator.Cer
       lease: NativeIdentitySetupCoordinator.Lease,
     ): Intent =
       Intent(context, RecoveryActivity::class.java).apply {
-        putExtra(EXTRA_MODE, if (mode == RecoveryMode.CREATE) "create" else "restore")
+        putExtra(EXTRA_MODE, mode.toBridge())
         putExtra(EXTRA_LEASE_ID, lease.id)
+        putExtra(EXTRA_ATTEMPT_ID, lease.attemptId.toString())
+        putExtra(
+          EXTRA_PROCESS_INCARNATION_ID,
+          lease.ownerProcessIncarnationId.toString(),
+        )
         addFlags(Intent.FLAG_ACTIVITY_EXCLUDE_FROM_RECENTS)
       }
 
     fun resultLeaseId(data: Intent?): Long? {
-      if (data == null || !data.hasExtra(EXTRA_RESULT_LEASE_ID)) return null
+      if (data == null) return null
       return try {
-        data.getLongExtra(EXTRA_RESULT_LEASE_ID, INVALID_LEASE_ID)
+        if (!data.hasExtra(EXTRA_RESULT_LEASE_ID)) return null
+        data.getLongExtra(EXTRA_RESULT_LEASE_ID, INVALID_LEASE_ID).takeIf { it > 0L }
       } catch (_: Throwable) {
         null
       }
     }
 
     fun resultOutcome(data: Intent?): NativeIdentitySetupOutcome? {
-      if (data == null || !data.hasExtra(EXTRA_RESULT_OUTCOME)) return null
+      if (data == null) return null
       return try {
+        if (!data.hasExtra(EXTRA_RESULT_OUTCOME)) return null
         NativeIdentitySetupOutcome.fromBridge(data.getStringExtra(EXTRA_RESULT_OUTCOME))
       } catch (_: Throwable) {
         null
       }
     }
+
+    fun resultAttemptId(data: Intent?): UUID? =
+      resultUuid(data, EXTRA_RESULT_ATTEMPT_ID)
+
+    fun resultProcessIncarnationId(data: Intent?): UUID? =
+      resultUuid(data, EXTRA_RESULT_PROCESS_INCARNATION_ID)
+
+    private fun resultUuid(data: Intent?, key: String): UUID? {
+      if (data == null) return null
+      return try {
+        if (!data.hasExtra(key)) return null
+        parseCanonicalUuid(data.getStringExtra(key))
+      } catch (_: Throwable) {
+        null
+      }
+    }
+
+    private fun parseCanonicalUuid(value: String?): UUID? {
+      if (value == null || !CANONICAL_UUID_V4.matches(value)) return null
+      return try {
+        UUID.fromString(value).takeIf { uuid -> uuid.version() == 4 && uuid.variant() == 2 }
+      } catch (_: IllegalArgumentException) {
+        null
+      }
+    }
+
+    private fun readLaunchCorrelation(data: Intent?): RecoveryLaunchCorrelation? {
+      if (data == null) return null
+      return try {
+        if (
+          !data.hasExtra(EXTRA_MODE) ||
+            !data.hasExtra(EXTRA_LEASE_ID) ||
+            !data.hasExtra(EXTRA_ATTEMPT_ID) ||
+            !data.hasExtra(EXTRA_PROCESS_INCARNATION_ID)
+        ) return null
+        val mode = data.getStringExtra(EXTRA_MODE)?.let(RecoveryMode::fromBridge) ?: return null
+        val leaseId = data.getLongExtra(EXTRA_LEASE_ID, INVALID_LEASE_ID)
+        val attemptId = parseCanonicalUuid(data.getStringExtra(EXTRA_ATTEMPT_ID)) ?: return null
+        val processIncarnationId =
+          parseCanonicalUuid(data.getStringExtra(EXTRA_PROCESS_INCARNATION_ID)) ?: return null
+        if (leaseId <= 0L || attemptId == processIncarnationId) return null
+        RecoveryLaunchCorrelation(mode, leaseId, attemptId, processIncarnationId)
+      } catch (_: Throwable) {
+        null
+      }
+    }
   }
+}
+
+private class RecoveryLaunchCorrelation(
+  val mode: RecoveryMode,
+  val leaseId: Long,
+  val attemptId: UUID,
+  val processIncarnationId: UUID,
+) {
+  override fun toString(): String = "RecoveryLaunchCorrelation(redacted)"
 }
 
 private enum class TransactionUi {

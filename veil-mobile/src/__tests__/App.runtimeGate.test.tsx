@@ -13,6 +13,8 @@ import type {
 } from "../native/runtime";
 import {
   beginNativeIdentitySetup,
+  reconcileNativeIdentitySetup,
+  type NativeIdentitySetupReconciliationResult,
   type NativeIdentitySetupResult,
 } from "../native/identitySetup";
 import { setAuthenticatedContentReady } from "../native/screenCapture";
@@ -67,6 +69,7 @@ jest.mock("../native/identitySetup", () => ({
     "../native/identitySetup",
   ),
   beginNativeIdentitySetup: jest.fn(),
+  reconcileNativeIdentitySetup: jest.fn(),
 }));
 
 jest.mock("../hooks/useReducedMotionPreference", () => ({
@@ -145,6 +148,9 @@ const mockSetAuthenticatedContentReady = setAuthenticatedContentReady as jest.Mo
 const mockBeginIdentitySetup = beginNativeIdentitySetup as jest.MockedFunction<
   typeof beginNativeIdentitySetup
 >;
+const mockReconcileIdentitySetup = reconcileNativeIdentitySetup as jest.MockedFunction<
+  typeof reconcileNativeIdentitySetup
+>;
 
 const exactBinding = {
   canonicalServerOrigin: "https://veil.erez.pro:443",
@@ -195,6 +201,7 @@ describe("App native runtime privacy gate", () => {
     resetIdentitySetupStoreForTests();
     resetMobileSettingsStoreForTests();
     mockBeginIdentitySetup.mockResolvedValue("committed");
+    mockReconcileIdentitySetup.mockResolvedValue({ status: "none" });
     useChatStore.setState({
       messagesByChannel: {
         secret: [{
@@ -223,6 +230,83 @@ describe("App native runtime privacy gate", () => {
       runtimeListener = listener;
       return { remove: jest.fn() };
     });
+  });
+
+  it("never renders onboarding while cold durable reconciliation is unresolved", async () => {
+    const noIdentity = runtimeSnapshot({
+      identityExists: false,
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    const reconciliation = deferred<NativeIdentitySetupReconciliationResult>();
+    mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
+    mockRuntime.lock.mockResolvedValue(noIdentity);
+    mockReconcileIdentitySetup.mockReturnValue(reconciliation.promise);
+    useMobileSettingsStore.getState().setAllowReadyScreenshots(true);
+
+    const view = render(<App />);
+    expect(view.getByTestId("runtime-bootstrap")).toBeTruthy();
+    expect(view.queryByText("ONBOARDING")).toBeNull();
+    expect(view.queryByTestId("mock-native-setup-committed")).toBeNull();
+    await waitFor(() => expect(mockReconcileIdentitySetup).toHaveBeenCalledTimes(1));
+    expect(mockSetAuthenticatedContentReady).not.toHaveBeenCalledWith(true);
+    expect(view.getByTestId("runtime-bootstrap")).toBeTruthy();
+    expect(view.queryByText("ONBOARDING")).toBeNull();
+
+    await act(async () => {
+      reconciliation.resolve({ status: "none" });
+      await reconciliation.promise;
+    });
+    await waitFor(() => expect(view.getByText("ONBOARDING")).toBeTruthy());
+  });
+
+  it("routes an unconfirmed durable receipt to global SETUP-002", async () => {
+    const ready = runtimeSnapshot();
+    mockRuntime.getSnapshot.mockResolvedValue(ready);
+    mockRuntime.lock.mockResolvedValue(ready);
+    mockReconcileIdentitySetup.mockResolvedValue({ status: "unconfirmed" });
+    useMobileSettingsStore.getState().setAllowReadyScreenshots(true);
+
+    const view = render(<App />);
+    await waitFor(() => expect(view.getByTestId("runtime-error")).toBeTruthy());
+    expect(view.getByTestId("public-failure-code-v1").props.children)
+      .toBe("VEIL-SETUP-002");
+    expect(view.queryByText("ONBOARDING")).toBeNull();
+    expect(view.queryByTestId("mock-native-setup-committed")).toBeNull();
+    expect(mockSetAuthenticatedContentReady).not.toHaveBeenCalledWith(true);
+  });
+
+  it("does not open the route when committed reconciliation refreshes to identity absent", async () => {
+    const noIdentity = runtimeSnapshot({
+      identityExists: false,
+      sessionState: "locked",
+      connectionState: "disconnected",
+      directoryReady: false,
+      secureSyncState: "idle",
+      binding: null,
+      directGeneration: null,
+      directContentRevision: null,
+    });
+    mockRuntime.getSnapshot.mockResolvedValue(noIdentity);
+    mockRuntime.lock.mockResolvedValue(noIdentity);
+    mockReconcileIdentitySetup.mockResolvedValue({
+      status: "committed",
+      attemptId: "11111111-1111-4111-8111-111111111111",
+      processIncarnationId: "22222222-2222-4222-8222-222222222222",
+      mode: "create",
+    });
+
+    const view = render(<App />);
+    expect(view.queryByText("ONBOARDING")).toBeNull();
+    await waitFor(() => expect(view.getByTestId("runtime-error")).toBeTruthy());
+    expect(view.getByTestId("public-failure-code-v1").props.children)
+      .toBe("VEIL-SETUP-002");
+    expect(view.queryByText("ONBOARDING")).toBeNull();
   });
 
   it.each([

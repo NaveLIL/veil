@@ -45,4 +45,28 @@ describe("ready screen-capture bridge", () => {
     update.mockRejectedValueOnce(new Error("private native window state"));
     await expect(setAuthenticatedContentReady(true)).resolves.toBeUndefined();
   });
+
+  it("sanitizes hostile module and method lookup failures", async () => {
+    const nativeCanary = "NATIVE-WINDOW-POLICY-CANARY";
+    Object.defineProperty(NativeModules, "VeilCrypto", {
+      configurable: true,
+      get() {
+        throw new Error(nativeCanary);
+      },
+    });
+    await expect(setAuthenticatedContentReady(true)).resolves.toBeUndefined();
+
+    const native = {};
+    Object.defineProperty(native, "setSensitiveScreen", {
+      enumerable: true,
+      get() {
+        throw new Error(nativeCanary);
+      },
+    });
+    Object.defineProperty(NativeModules, "VeilCrypto", {
+      configurable: true,
+      value: native,
+    });
+    await expect(setAuthenticatedContentReady(true)).resolves.toBeUndefined();
+  });
 });

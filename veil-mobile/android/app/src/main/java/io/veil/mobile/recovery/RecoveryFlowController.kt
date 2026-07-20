@@ -4,6 +4,11 @@ internal enum class RecoveryMode {
   CREATE,
   RESTORE;
 
+  fun toBridge(): String = when (this) {
+    CREATE -> "create"
+    RESTORE -> "restore"
+  }
+
   companion object {
     fun fromBridge(value: String): RecoveryMode? = when (value) {
       "create" -> CREATE
@@ -96,15 +101,16 @@ internal class RecoveryFlowController(
     val count = draft.wordCount()
     require(count in ALLOWED_WORD_COUNTS)
     indices = IntArray(count) { UNSET_WORD }
-    stage = if (draft.mode == RecoveryMode.CREATE) {
-      for (position in indices.indices) {
-        indices[position] = checkedWordIndex(draft.wordIndex(position))
+    stage = when (draft.mode) {
+      RecoveryMode.CREATE -> {
+        for (position in indices.indices) {
+          indices[position] = checkedWordIndex(draft.wordIndex(position))
+        }
+        require(draft.challengeCount() in 1..indices.size)
+        require(draft.challengeChoiceCount() in 2..MAX_CHALLENGE_CHOICES)
+        RecoveryStage.CREATE_REVIEW
       }
-      require(draft.challengeCount() in 1..indices.size)
-      require(draft.challengeChoiceCount() in 2..MAX_CHALLENGE_CHOICES)
-      RecoveryStage.CREATE_REVIEW
-    } else {
-      RecoveryStage.RESTORE_ENTRY
+      RecoveryMode.RESTORE -> RecoveryStage.RESTORE_ENTRY
     }
   }
 

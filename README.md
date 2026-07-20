@@ -81,7 +81,9 @@ native-клиента.
   idempotent native send/outbox, guarded reconnect и whole-app lifecycle/Pass
   authority реализованы; отдельными checkpoint’ами опубликованы Android
   public-WebPKI TLS, atomic write-once vault, native recovery, debug Ready
-  capture boundary и process-local terminal failure snapshot. Cross-client
+  capture boundary и process-local terminal failure snapshot. Durable
+  non-secret identity-setup reconciliation реализован и host-tested в текущем
+  локальном checkpoint. A04/A05 и cross-client
   E2EE/airplane matrix, connected recovery/capture instrumentation, app-wide
   публичные коды ошибок и подписанный standalone APK ещё входят в Phase 5A/5B.
   `PublicFailureCodeV1` покрывает Android identity setup и secure runtime gate,

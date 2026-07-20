@@ -126,8 +126,9 @@ reverse proxy. Конкретная схема и rollback gate описаны �
 
 - нет stable release и обещанной обратной совместимости;
 - нет независимого криптографического/security-аудита;
-- Android Direct runtime, atomic vault, native recovery и process-local typed
-  terminal failure snapshot реализованы, но cross-client/airplane physical
+- Android Direct runtime, atomic vault, native recovery, process-local typed
+  terminal failure snapshot и host-tested durable non-secret setup journal/
+  reconciler реализованы, но A04/A05 и cross-client/airplane physical
   matrix, connected recovery/capture instrumentation, app-wide public failure
   codes и standalone signing ещё не закрыты; `PublicFailureCodeV1` ограничен
   Android identity setup/secure runtime gate, а Direct send/delivery и

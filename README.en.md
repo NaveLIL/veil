@@ -48,7 +48,9 @@ Substantial Preview implementations exist for:
 - a closed Android Direct Preview through React Native, Kotlin, and UniFFI:
   Node Access Pass registration, Keystore/SQLCipher runtime, receive/read,
   one-shot peer-prekey, idempotent send/outbox, guarded reconnect, atomic vault,
-  native recovery, and whole-app lifecycle authority are implemented.
+  native recovery, whole-app lifecycle authority, and host-tested durable
+  non-secret identity-setup reconciliation are implemented. Android Activity
+  recreation and OS process-death cases A04/A05 remain unexecuted.
 
 Implemented code is not the same as release evidence. The authoritative phase
 status and remaining physical/device matrices are tracked in

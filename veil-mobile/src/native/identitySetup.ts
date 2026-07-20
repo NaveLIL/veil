@@ -3,15 +3,41 @@ import { NativeModules, Platform } from "react-native";
 export type NativeIdentitySetupMode = "create" | "restore";
 export type NativeIdentitySetupResult = "committed" | "user_cancelled" | "interrupted";
 export type NativeIdentitySetupStartFailureKind = "unavailable" | "ambiguous";
+export type NativeIdentitySetupDurableStatus =
+  | "in_progress"
+  | NativeIdentitySetupResult;
+export type NativeIdentitySetupReconciliationStatus =
+  | "none"
+  | "unconfirmed"
+  | NativeIdentitySetupDurableStatus;
+export type NativeIdentitySetupReconciliationResult =
+  | { readonly status: "none" }
+  | { readonly status: "unconfirmed" }
+  | {
+      readonly status: NativeIdentitySetupDurableStatus;
+      readonly attemptId: string;
+      readonly processIncarnationId: string;
+      readonly mode: NativeIdentitySetupMode;
+    };
 
 interface VeilIdentitySetupNative {
   beginNativeIdentitySetup(
     mode: NativeIdentitySetupMode,
   ): Promise<unknown>;
+  reconcileNativeIdentitySetup?(): Promise<unknown>;
 }
 
 const PUBLIC_SETUP_ERROR =
   "Secure identity setup is unavailable. Close Veil and try again.";
+const CANONICAL_LOWERCASE_UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const STATUS_RESULT_KEYS = ["status"] as const;
+const ATTEMPT_RESULT_KEYS = [
+  "status",
+  "attemptId",
+  "processIncarnationId",
+  "mode",
+] as const;
 
 /**
  * Sanitized start failure. `unavailable` is reserved for native failures that
@@ -48,13 +74,25 @@ export async function beginNativeIdentitySetup(
 ): Promise<NativeIdentitySetupResult> {
   if (Platform.OS === "web") throw new NativeIdentitySetupStartError("unavailable");
 
-  const native = NativeModules.VeilIdentitySetup as VeilIdentitySetupNative | undefined;
-  if (!native || typeof native.beginNativeIdentitySetup !== "function") {
+  let native: VeilIdentitySetupNative | undefined;
+  let begin: VeilIdentitySetupNative["beginNativeIdentitySetup"] | undefined;
+  try {
+    native = NativeModules.VeilIdentitySetup as
+      | VeilIdentitySetupNative
+      | undefined;
+    begin = native?.beginNativeIdentitySetup;
+  } catch {
+    // A hostile/malformed native module proxy cannot prove that setup never
+    // started. Collapse lookup and method-access failures to the ambiguous
+    // public class without allowing native diagnostic text to escape.
+    throw new NativeIdentitySetupStartError("ambiguous");
+  }
+  if (!native || typeof begin !== "function") {
     throw new NativeIdentitySetupStartError("unavailable");
   }
 
   try {
-    const result = await native.beginNativeIdentitySetup(mode);
+    const result = await Reflect.apply(begin, native, [mode]);
     if (
       result === "committed" ||
       result === "user_cancelled" ||
@@ -73,9 +111,121 @@ export async function beginNativeIdentitySetup(
   }
 }
 
+/**
+ * Reconciles the closed durable setup classification after startup or an
+ * interrupted Activity result. Native payloads are copied only after an exact
+ * shape check. An unavailable bridge, rejection, or malformed value is always
+ * reduced to the same public `unconfirmed` result.
+ */
+export async function reconcileNativeIdentitySetup(): Promise<NativeIdentitySetupReconciliationResult> {
+  if (Platform.OS === "web") return { status: "unconfirmed" };
+
+  try {
+    const native = NativeModules.VeilIdentitySetup as
+      | VeilIdentitySetupNative
+      | undefined;
+    if (!native || typeof native.reconcileNativeIdentitySetup !== "function") {
+      return { status: "unconfirmed" };
+    }
+
+    return parseNativeIdentitySetupReconciliation(
+      await native.reconcileNativeIdentitySetup(),
+    );
+  } catch {
+    return { status: "unconfirmed" };
+  }
+}
+
+function parseNativeIdentitySetupReconciliation(
+  value: unknown,
+): NativeIdentitySetupReconciliationResult {
+  if (!isPlainRecord(value)) return { status: "unconfirmed" };
+
+  const statusFields = readExactOwnDataFields(value, STATUS_RESULT_KEYS);
+  if (statusFields) {
+    const status = statusFields.status;
+    return status === "none" || status === "unconfirmed"
+      ? { status }
+      : { status: "unconfirmed" };
+  }
+
+  const attemptFields = readExactOwnDataFields(value, ATTEMPT_RESULT_KEYS);
+  if (!attemptFields) return { status: "unconfirmed" };
+  const { status, attemptId, processIncarnationId, mode } = attemptFields;
+  if (
+    !isDurableStatus(status) ||
+    typeof attemptId !== "string" ||
+    !CANONICAL_LOWERCASE_UUID_V4.test(attemptId) ||
+    typeof processIncarnationId !== "string" ||
+    !CANONICAL_LOWERCASE_UUID_V4.test(processIncarnationId) ||
+    attemptId === processIncarnationId ||
+    (mode !== "create" && mode !== "restore")
+  ) {
+    return { status: "unconfirmed" };
+  }
+
+  return {
+    status,
+    attemptId,
+    processIncarnationId,
+    mode,
+  };
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function readExactOwnDataFields(
+  value: Record<string, unknown>,
+  expected: readonly string[],
+): Record<string, unknown> | null {
+  const actual = Reflect.ownKeys(value);
+  if (
+    actual.length !== expected.length ||
+    !actual.every((key) => typeof key === "string" && expected.includes(key))
+  ) return null;
+
+  const fields: Record<string, unknown> = {};
+  for (const key of expected) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) {
+      return null;
+    }
+    fields[key] = descriptor.value;
+  }
+  return fields;
+}
+
+function isDurableStatus(value: unknown): value is NativeIdentitySetupDurableStatus {
+  return (
+    value === "in_progress" ||
+    value === "committed" ||
+    value === "user_cancelled" ||
+    value === "interrupted"
+  );
+}
+
 function classifyStartFailure(error: unknown): NativeIdentitySetupStartFailureKind {
-  if (!error || typeof error !== "object") return "ambiguous";
-  const code = (error as Record<string, unknown>).code;
+  if (
+    !error ||
+    (typeof error !== "object" && typeof error !== "function")
+  ) return "ambiguous";
+
+  let code: unknown;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+    if (
+      !descriptor ||
+      !("value" in descriptor) ||
+      !descriptor.enumerable
+    ) return "ambiguous";
+    code = descriptor.value;
+  } catch {
+    return "ambiguous";
+  }
   switch (code) {
     case "E_VEIL_SETUP_MODE":
     case "E_VEIL_SETUP_ACTIVITY":
