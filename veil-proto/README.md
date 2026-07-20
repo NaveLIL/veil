@@ -52,3 +52,13 @@ the `.proto` source and regenerated Go diff in the same change.
   the first stable release
 - Breaking changes → `v2` (new directory)
 - Additive changes (new fields, new oneof variants) are backwards compatible
+
+### WebSocket authentication versions
+
+`AuthChallengeV3`, `AuthResponseV3`, and `AuthResultV3` are an additive,
+versioned foundation only. Their Envelope tags are 14, 15, and 16; legacy auth
+keeps tags 10, 11, and 12. The current `/ws` endpoint still speaks only the
+legacy exchange. Generated support for the v3 messages does not advertise or
+activate them, and clients must never attempt an automatic v3-to-v2 fallback.
+A separately reviewed endpoint or subprotocol negotiation is required before
+runtime activation.

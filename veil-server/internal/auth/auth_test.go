@@ -11,6 +11,7 @@ import (
 
 	"github.com/NaveLIL/veil/veil-server/internal/auth"
 	"github.com/NaveLIL/veil/veil-server/internal/config"
+	"github.com/NaveLIL/veil/veil-server/internal/nodeorigin"
 	"golang.org/x/crypto/curve25519"
 )
 
@@ -59,6 +60,20 @@ func newTestService() *auth.Service {
 	return auth.NewService(nil, cfg)
 }
 
+func newTestServiceWithPublicOrigin(t *testing.T, origin string) *auth.Service {
+	t.Helper()
+	canonicalOrigin, err := nodeorigin.ParseCanonical(origin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &config.Config{
+		PublicOrigin:     canonicalOrigin,
+		AuthChallengeTTL: 5 * time.Second,
+		AuthMaxAttempts:  3,
+	}
+	return auth.NewService(nil, cfg)
+}
+
 func TestCreateChallenge(t *testing.T) {
 	svc := newTestService()
 
@@ -88,6 +103,97 @@ func TestCreateChallenge_Unique(t *testing.T) {
 
 	if n1 == n2 {
 		t.Fatal("two challenges produced the same nonce")
+	}
+}
+
+func TestCreateChallengeV3RequiresPublicOrigin(t *testing.T) {
+	svc := newTestService()
+
+	challenge, err := svc.CreateChallengeV3("v3-no-origin")
+	if !errors.Is(err, auth.ErrPublicOriginRequired) {
+		t.Fatalf("CreateChallengeV3 error = %v, want ErrPublicOriginRequired", err)
+	}
+	if challenge != (auth.ChallengeV3{}) {
+		t.Fatalf("failed CreateChallengeV3 returned material: %+v", challenge)
+	}
+}
+
+func TestCreateChallengeV3ReturnsExactFreshMaterial(t *testing.T) {
+	const origin = "https://veil.example:443"
+	svc := newTestServiceWithPublicOrigin(t, origin)
+
+	first, err := svc.CreateChallengeV3("v3-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := svc.CreateChallengeV3("v3-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if auth.WSAuthProtocolVersionV3 != 3 {
+		t.Fatalf("WSAuthProtocolVersionV3 = %d, want 3", auth.WSAuthProtocolVersionV3)
+	}
+
+	for index, challenge := range []auth.ChallengeV3{first, second} {
+		if challenge.ProtocolVersion != auth.WSAuthProtocolVersionV3 {
+			t.Errorf("challenge %d protocol version = %d, want 3", index, challenge.ProtocolVersion)
+		}
+		if challenge.CanonicalOrigin != origin {
+			t.Errorf("challenge %d origin = %q, want exact %q", index, challenge.CanonicalOrigin, origin)
+		}
+		if challenge.ServerEphemeral == ([32]byte{}) {
+			t.Errorf("challenge %d server ephemeral is zero", index)
+		}
+	}
+	if first.ServerEphemeral == second.ServerEphemeral {
+		t.Fatal("two v3 challenges produced the same server ephemeral")
+	}
+}
+
+func TestVerifyResponseV2ConsumesAndRejectsV3Challenge(t *testing.T) {
+	svc := newTestServiceWithPublicOrigin(t, "https://veil.example:443")
+	if _, err := svc.CreateChallengeV3("v3-via-v2"); err != nil {
+		t.Fatal(err)
+	}
+
+	verify := func() error {
+		_, err := svc.VerifyResponseV2(
+			context.Background(), "v3-via-v2",
+			make([]byte, 32), signingPublicKey(t), make([]byte, ed25519.SignatureSize),
+			make([]byte, 16), "test", nil, nil, nil,
+		)
+		return err
+	}
+	if err := verify(); !errors.Is(err, auth.ErrAuthProtocolMismatch) {
+		t.Fatalf("first VerifyResponseV2 error = %v, want ErrAuthProtocolMismatch", err)
+	}
+	if err := verify(); !errors.Is(err, auth.ErrChallengeUnknown) {
+		t.Fatalf("second VerifyResponseV2 error = %v, want ErrChallengeUnknown", err)
+	}
+}
+
+func TestVerifyResponseV2InvalidInputDoesNotConsumeV2Challenge(t *testing.T) {
+	svc := newTestService()
+	if _, err := svc.CreateChallenge("v2-validation-order"); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := svc.VerifyResponseV2(
+		context.Background(), "v2-validation-order",
+		make([]byte, 31), make([]byte, ed25519.PublicKeySize), make([]byte, ed25519.SignatureSize),
+		make([]byte, 16), "test", nil, nil, nil,
+	)
+	if !errors.Is(err, auth.ErrBadKeyLength) {
+		t.Fatalf("invalid input error = %v, want ErrBadKeyLength", err)
+	}
+
+	_, err = svc.VerifyResponseV2(
+		context.Background(), "v2-validation-order",
+		make([]byte, 32), signingPublicKey(t), make([]byte, ed25519.SignatureSize),
+		make([]byte, 16), "test", nil, nil, nil,
+	)
+	if !errors.Is(err, auth.ErrBadIdentityProof) {
+		t.Fatalf("post-validation VerifyResponseV2 error = %v, want ErrBadIdentityProof", err)
 	}
 }
 
@@ -243,6 +349,36 @@ func TestVerifyResponse_ChallengeConsumedOnce(t *testing.T) {
 	}
 }
 
+func TestVerifyResponse_ConcurrentConsumersObserveOneShotChallenge(t *testing.T) {
+	svc := newTestService()
+	if _, err := svc.CreateChallenge("concurrent-one-shot"); err != nil {
+		t.Fatal(err)
+	}
+	signingKey := signingPublicKey(t)
+	start := make(chan struct{})
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			<-start
+			_, err := svc.VerifyResponseV2(
+				context.Background(), "concurrent-one-shot",
+				make([]byte, 32), signingKey, make([]byte, ed25519.SignatureSize),
+				make([]byte, 16), "test", nil, nil, nil,
+			)
+			results <- err
+		}()
+	}
+	close(start)
+
+	counts := map[error]int{}
+	for range 2 {
+		counts[<-results]++
+	}
+	if counts[auth.ErrBadIdentityProof] != 1 || counts[auth.ErrChallengeUnknown] != 1 {
+		t.Fatalf("concurrent one-shot results = %#v, want one identity failure and one unknown", counts)
+	}
+}
+
 func TestVerifyResponse_ExpiredChallenge(t *testing.T) {
 	cfg := &config.Config{
 		AuthChallengeTTL: 1 * time.Millisecond, // Very short TTL
@@ -264,5 +400,10 @@ func TestVerifyResponse_ExpiredChallenge(t *testing.T) {
 		identityKey, []byte(pub), sig, deviceID, "test")
 	if err != auth.ErrChallengeTooOld {
 		t.Fatalf("expected ErrChallengeTooOld, got %v", err)
+	}
+	_, err = svc.VerifyResponse(context.Background(), "conn-1",
+		identityKey, []byte(pub), sig, deviceID, "test")
+	if err != auth.ErrChallengeUnknown {
+		t.Fatalf("expected expired challenge to be consumed, got %v", err)
 	}
 }

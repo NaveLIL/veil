@@ -119,6 +119,19 @@ server code MUST verify the account proof strictly before constructing or
 accepting the device proof. Runtime integration SHOULD make that ordering
 type-safe with an opaque verified-proof value.
 
+The v3 result is also fail-closed. Every result repeats protocol version 3 and
+the exact canonical origin. Success requires a canonical non-nil user UUID, an
+active matching positive binding version/status, `per_device_secure = true`,
+an unspecified failure reason, and no diagnostic error. Failure has no user
+UUID or binding state and uses one known non-zero reason. `REGISTRATION_CLOSED`
+is coherent only with the signed `OPEN` intent, while
+`NODE_ACCESS_PASS_INVALID` is coherent only with the signed `PASS` intent;
+unknown, unspecified, or contradictory outcomes are protocol-invalid rather
+than aliases for a generic rejection. Diagnostic text never selects client
+behavior. The expected origin, binding version/status, and intent used to
+validate a result MUST be carried from the same prepared proof attempt rather
+than reconstructed from caller-supplied comparison values.
+
 ### Signed REST auth v2
 
 The exact request signing message is:

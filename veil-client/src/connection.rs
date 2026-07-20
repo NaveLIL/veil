@@ -3125,6 +3125,9 @@ async fn dispatch_event(
         Some(proto::envelope::Payload::AuthChallenge(_)) => Some("AuthChallenge"),
         Some(proto::envelope::Payload::AuthResponse(_)) => Some("AuthResponse"),
         Some(proto::envelope::Payload::AuthResult(_)) => Some("AuthResult"),
+        Some(proto::envelope::Payload::AuthChallengeV3(_)) => Some("AuthChallengeV3"),
+        Some(proto::envelope::Payload::AuthResponseV3(_)) => Some("AuthResponseV3"),
+        Some(proto::envelope::Payload::AuthResultV3(_)) => Some("AuthResultV3"),
         _ => None,
     };
     if let Some(envelope) = authentication_envelope {
@@ -3617,6 +3620,47 @@ mod tests {
                 ConnectionEventBufferErrorV1::ProtocolViolation {
                     envelope: "MessageAck"
                 }
+            );
+            assert!(matches!(
+                raw_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn every_v3_auth_envelope_is_terminal_after_authenticated_barrier() {
+        let budget = ConnectionEventBudgetV1::with_limits(3, LIVE_EVENT_RETAINED_BYTES);
+        let (raw_tx, mut raw_rx) = mpsc::channel(3);
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget,
+        };
+
+        for (payload, name) in [
+            (
+                proto::envelope::Payload::AuthChallengeV3(Default::default()),
+                "AuthChallengeV3",
+            ),
+            (
+                proto::envelope::Payload::AuthResponseV3(Default::default()),
+                "AuthResponseV3",
+            ),
+            (
+                proto::envelope::Payload::AuthResultV3(Default::default()),
+                "AuthResultV3",
+            ),
+        ] {
+            let wire = proto::Envelope {
+                payload: Some(payload),
+                ..Default::default()
+            }
+            .encode_to_vec();
+            assert_eq!(
+                dispatch_authenticated_binary_frame(&sender, &wire)
+                    .await
+                    .unwrap_err(),
+                ConnectionEventBufferErrorV1::AuthenticationEpochAnomaly { envelope: name }
             );
             assert!(matches!(
                 raw_rx.try_recv(),

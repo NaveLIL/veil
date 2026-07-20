@@ -18,6 +18,7 @@ pub mod direct;
 pub mod direct_history;
 pub mod prekeys;
 pub mod protocol;
+mod ws_auth_v3;
 
 #[cfg(test)]
 mod auth_contract_fixture_tests;

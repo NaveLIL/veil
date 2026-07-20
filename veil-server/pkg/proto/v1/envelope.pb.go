@@ -70,6 +70,9 @@ type Envelope struct {
 	//	*Envelope_SyncRequest
 	//	*Envelope_SyncBatch
 	//	*Envelope_Error
+	//	*Envelope_AuthChallengeV3
+	//	*Envelope_AuthResponseV3
+	//	*Envelope_AuthResultV3
 	Payload       isEnvelope_Payload `protobuf_oneof:"payload"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -477,6 +480,33 @@ func (x *Envelope) GetError() *Error {
 	return nil
 }
 
+func (x *Envelope) GetAuthChallengeV3() *AuthChallengeV3 {
+	if x != nil {
+		if x, ok := x.Payload.(*Envelope_AuthChallengeV3); ok {
+			return x.AuthChallengeV3
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetAuthResponseV3() *AuthResponseV3 {
+	if x != nil {
+		if x, ok := x.Payload.(*Envelope_AuthResponseV3); ok {
+			return x.AuthResponseV3
+		}
+	}
+	return nil
+}
+
+func (x *Envelope) GetAuthResultV3() *AuthResultV3 {
+	if x != nil {
+		if x, ok := x.Payload.(*Envelope_AuthResultV3); ok {
+			return x.AuthResultV3
+		}
+	}
+	return nil
+}
+
 type isEnvelope_Payload interface {
 	isEnvelope_Payload()
 }
@@ -649,6 +679,22 @@ type Envelope_Error struct {
 	Error *Error `protobuf:"bytes,100,opt,name=error,proto3,oneof"`
 }
 
+type Envelope_AuthChallengeV3 struct {
+	// Dedicated v3 foundation. Appended after every legacy oneof declaration
+	// to preserve generated descriptor indexes. The current /ws runtime stays
+	// legacy and does not emit or authenticate these variants before explicit
+	// activation; wire tags remain the reserved auth-adjacent values 14–16.
+	AuthChallengeV3 *AuthChallengeV3 `protobuf:"bytes,14,opt,name=auth_challenge_v3,json=authChallengeV3,proto3,oneof"`
+}
+
+type Envelope_AuthResponseV3 struct {
+	AuthResponseV3 *AuthResponseV3 `protobuf:"bytes,15,opt,name=auth_response_v3,json=authResponseV3,proto3,oneof"`
+}
+
+type Envelope_AuthResultV3 struct {
+	AuthResultV3 *AuthResultV3 `protobuf:"bytes,16,opt,name=auth_result_v3,json=authResultV3,proto3,oneof"`
+}
+
 func (*Envelope_AuthChallenge) isEnvelope_Payload() {}
 
 func (*Envelope_AuthResponse) isEnvelope_Payload() {}
@@ -726,6 +772,12 @@ func (*Envelope_SyncRequest) isEnvelope_Payload() {}
 func (*Envelope_SyncBatch) isEnvelope_Payload() {}
 
 func (*Envelope_Error) isEnvelope_Payload() {}
+
+func (*Envelope_AuthChallengeV3) isEnvelope_Payload() {}
+
+func (*Envelope_AuthResponseV3) isEnvelope_Payload() {}
+
+func (*Envelope_AuthResultV3) isEnvelope_Payload() {}
 
 type Error struct {
 	state   protoimpl.MessageState `protogen:"open.v1"`
@@ -810,7 +862,7 @@ var File_veil_v1_envelope_proto protoreflect.FileDescriptor
 
 const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\n" +
-	"\x16veil/v1/envelope.proto\x12\aveil.v1\x1a\x12veil/v1/auth.proto\x1a\x12veil/v1/chat.proto\x1a\x16veil/v1/presence.proto\x1a\x13veil/v1/share.proto\x1a\x14veil/v1/server.proto\x1a\x13veil/v1/media.proto\x1a\x13veil/v1/voice.proto\x1a\x15veil/v1/friends.proto\x1a\x15veil/v1/profile.proto\"\xc9\x14\n" +
+	"\x16veil/v1/envelope.proto\x12\aveil.v1\x1a\x12veil/v1/auth.proto\x1a\x12veil/v1/chat.proto\x1a\x16veil/v1/presence.proto\x1a\x13veil/v1/share.proto\x1a\x14veil/v1/server.proto\x1a\x13veil/v1/media.proto\x1a\x13veil/v1/voice.proto\x1a\x15veil/v1/friends.proto\x1a\x15veil/v1/profile.proto\"\x95\x16\n" +
 	"\bEnvelope\x12\x10\n" +
 	"\x03seq\x18\x01 \x01(\x04R\x03seq\x12\x1c\n" +
 	"\ttimestamp\x18\x02 \x01(\x04R\ttimestamp\x12?\n" +
@@ -857,7 +909,10 @@ const file_veil_v1_envelope_proto_rawDesc = "" +
 	"\fsync_request\x18Z \x01(\v2\x14.veil.v1.SyncRequestH\x00R\vsyncRequest\x123\n" +
 	"\n" +
 	"sync_batch\x18[ \x01(\v2\x12.veil.v1.SyncBatchH\x00R\tsyncBatch\x12&\n" +
-	"\x05error\x18d \x01(\v2\x0e.veil.v1.ErrorH\x00R\x05errorB\t\n" +
+	"\x05error\x18d \x01(\v2\x0e.veil.v1.ErrorH\x00R\x05error\x12F\n" +
+	"\x11auth_challenge_v3\x18\x0e \x01(\v2\x18.veil.v1.AuthChallengeV3H\x00R\x0fauthChallengeV3\x12C\n" +
+	"\x10auth_response_v3\x18\x0f \x01(\v2\x17.veil.v1.AuthResponseV3H\x00R\x0eauthResponseV3\x12=\n" +
+	"\x0eauth_result_v3\x18\x10 \x01(\v2\x15.veil.v1.AuthResultV3H\x00R\fauthResultV3B\t\n" +
 	"\apayload\"\xce\x01\n" +
 	"\x05Error\x12\x12\n" +
 	"\x04code\x18\x01 \x01(\rR\x04code\x12\x18\n" +
@@ -924,6 +979,9 @@ var file_veil_v1_envelope_proto_goTypes = []any{
 	(*VoiceToken)(nil),            // 37: veil.v1.VoiceToken
 	(*SyncRequest)(nil),           // 38: veil.v1.SyncRequest
 	(*SyncBatch)(nil),             // 39: veil.v1.SyncBatch
+	(*AuthChallengeV3)(nil),       // 40: veil.v1.AuthChallengeV3
+	(*AuthResponseV3)(nil),        // 41: veil.v1.AuthResponseV3
+	(*AuthResultV3)(nil),          // 42: veil.v1.AuthResultV3
 }
 var file_veil_v1_envelope_proto_depIdxs = []int32{
 	2,  // 0: veil.v1.Envelope.auth_challenge:type_name -> veil.v1.AuthChallenge
@@ -965,11 +1023,14 @@ var file_veil_v1_envelope_proto_depIdxs = []int32{
 	38, // 36: veil.v1.Envelope.sync_request:type_name -> veil.v1.SyncRequest
 	39, // 37: veil.v1.Envelope.sync_batch:type_name -> veil.v1.SyncBatch
 	1,  // 38: veil.v1.Envelope.error:type_name -> veil.v1.Error
-	39, // [39:39] is the sub-list for method output_type
-	39, // [39:39] is the sub-list for method input_type
-	39, // [39:39] is the sub-list for extension type_name
-	39, // [39:39] is the sub-list for extension extendee
-	0,  // [0:39] is the sub-list for field type_name
+	40, // 39: veil.v1.Envelope.auth_challenge_v3:type_name -> veil.v1.AuthChallengeV3
+	41, // 40: veil.v1.Envelope.auth_response_v3:type_name -> veil.v1.AuthResponseV3
+	42, // 41: veil.v1.Envelope.auth_result_v3:type_name -> veil.v1.AuthResultV3
+	42, // [42:42] is the sub-list for method output_type
+	42, // [42:42] is the sub-list for method input_type
+	42, // [42:42] is the sub-list for extension type_name
+	42, // [42:42] is the sub-list for extension extendee
+	0,  // [0:42] is the sub-list for field type_name
 }
 
 func init() { file_veil_v1_envelope_proto_init() }
@@ -1026,6 +1087,9 @@ func file_veil_v1_envelope_proto_init() {
 		(*Envelope_SyncRequest)(nil),
 		(*Envelope_SyncBatch)(nil),
 		(*Envelope_Error)(nil),
+		(*Envelope_AuthChallengeV3)(nil),
+		(*Envelope_AuthResponseV3)(nil),
+		(*Envelope_AuthResultV3)(nil),
 	}
 	file_veil_v1_envelope_proto_msgTypes[1].OneofWrappers = []any{}
 	type x struct{}

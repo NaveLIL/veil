@@ -25,28 +25,53 @@ import (
 )
 
 var (
-	ErrChallengeTooOld    = errors.New("challenge expired")
-	ErrChallengeUnknown   = errors.New("unknown challenge")
-	ErrBadSignature       = errors.New("invalid signature")
-	ErrSigningKeyMismatch = errors.New("signing key does not match registered identity")
-	ErrBadIdentityProof   = errors.New("invalid X25519 identity proof")
-	ErrBadKeyLength       = errors.New("key must be exactly 32 bytes")
-	ErrBadSigningKey      = errors.New("invalid Ed25519 signing public key")
-	ErrBadDeviceID        = errors.New("device_id must be exactly 16 bytes")
-	ErrBadDeviceName      = errors.New("device_name must be 1..128 UTF-8 bytes without control characters")
-	ErrTooManyAttempts    = errors.New("too many auth attempts")
-	ErrRegistrationClosed = errors.New("registration is closed")
-	ErrInviteInvalid      = errors.New("node access invite is invalid")
+	ErrChallengeTooOld      = errors.New("challenge expired")
+	ErrChallengeUnknown     = errors.New("unknown challenge")
+	ErrBadSignature         = errors.New("invalid signature")
+	ErrSigningKeyMismatch   = errors.New("signing key does not match registered identity")
+	ErrBadIdentityProof     = errors.New("invalid X25519 identity proof")
+	ErrBadKeyLength         = errors.New("key must be exactly 32 bytes")
+	ErrBadSigningKey        = errors.New("invalid Ed25519 signing public key")
+	ErrBadDeviceID          = errors.New("device_id must be exactly 16 bytes")
+	ErrBadDeviceName        = errors.New("device_name must be 1..128 UTF-8 bytes without control characters")
+	ErrTooManyAttempts      = errors.New("too many auth attempts")
+	ErrRegistrationClosed   = errors.New("registration is closed")
+	ErrInviteInvalid        = errors.New("node access invite is invalid")
+	ErrPublicOriginRequired = errors.New("canonical public origin is required")
+	ErrAuthProtocolMismatch = errors.New("authentication protocol mismatch")
 )
 
-const wsAuthDomainV2 = "veil-ws-auth-v2\x00"
+const (
+	wsAuthDomainV2 = "veil-ws-auth-v2\x00"
+
+	// WSAuthProtocolVersionV3 is the frozen version marker returned by the
+	// transport-neutral v3 challenge foundation. It is not live negotiation.
+	WSAuthProtocolVersionV3 uint32 = 3
+)
+
+type challengeProtocol uint32
+
+const (
+	challengeProtocolV2 challengeProtocol = 2
+	challengeProtocolV3 challengeProtocol = challengeProtocol(WSAuthProtocolVersionV3)
+)
+
+// ChallengeV3 is the transport-neutral server challenge material for the
+// non-activated WS auth v3 contract.
+type ChallengeV3 struct {
+	ProtocolVersion uint32
+	ServerEphemeral [32]byte
+	CanonicalOrigin string
+}
 
 // pendingChallenge stores a single-use ephemeral X25519 key awaiting proof
 // from a client. The public key is sent as the 32-byte AuthChallenge.
 type pendingChallenge struct {
-	private   [32]byte
-	public    [32]byte
-	createdAt time.Time
+	protocol        challengeProtocol
+	private         [32]byte
+	public          [32]byte
+	canonicalOrigin string
+	createdAt       time.Time
 }
 
 // Service handles Ed25519 challenge-response authentication.
@@ -90,6 +115,7 @@ func (s *Service) CreateChallenge(connID string) ([32]byte, error) {
 		clear(previous.private[:])
 	}
 	s.challenges[connID] = &pendingChallenge{
+		protocol:  challengeProtocolV2,
 		private:   private,
 		public:    public,
 		createdAt: time.Now(),
@@ -98,6 +124,49 @@ func (s *Service) CreateChallenge(connID string) ([32]byte, error) {
 	clear(private[:])
 
 	return public, nil
+}
+
+// CreateChallengeV3 generates and stores one origin-bound, one-shot v3
+// challenge without activating any wire protocol. The canonical origin must
+// already have passed gateway configuration validation.
+func (s *Service) CreateChallengeV3(connID string) (ChallengeV3, error) {
+	var result ChallengeV3
+	if s.cfg.PublicOrigin.IsZero() {
+		return result, ErrPublicOriginRequired
+	}
+
+	var private, public [32]byte
+	if _, err := rand.Read(private[:]); err != nil {
+		clear(private[:])
+		return result, fmt.Errorf("generate ephemeral X25519 key: %w", err)
+	}
+	publicBytes, err := curve25519.X25519(private[:], curve25519.Basepoint)
+	if err != nil {
+		clear(private[:])
+		return result, fmt.Errorf("derive ephemeral X25519 public key: %w", err)
+	}
+	copy(public[:], publicBytes)
+
+	canonicalOrigin := s.cfg.PublicOrigin.String()
+	s.mu.Lock()
+	if previous := s.challenges[connID]; previous != nil {
+		clear(previous.private[:])
+	}
+	s.challenges[connID] = &pendingChallenge{
+		protocol:        challengeProtocolV3,
+		private:         private,
+		public:          public,
+		canonicalOrigin: canonicalOrigin,
+		createdAt:       time.Now(),
+	}
+	s.mu.Unlock()
+	clear(private[:])
+
+	return ChallengeV3{
+		ProtocolVersion: WSAuthProtocolVersionV3,
+		ServerEphemeral: public,
+		CanonicalOrigin: canonicalOrigin,
+	}, nil
 }
 
 // AuthResult contains the result of a successful authentication.
@@ -163,20 +232,11 @@ func (s *Service) VerifyResponseV2(ctx context.Context, connID string, identityK
 	}
 
 	// --- Challenge lookup + expiry check ---
-	s.mu.Lock()
-	challenge, ok := s.challenges[connID]
-	if ok {
-		delete(s.challenges, connID) // One-shot: challenge consumed regardless of outcome
-	}
-	s.mu.Unlock()
-
-	if !ok {
-		return nil, ErrChallengeUnknown
+	challenge, err := s.takeChallenge(connID, challengeProtocolV2)
+	if err != nil {
+		return nil, err
 	}
 	defer clear(challenge.private[:])
-	if time.Since(challenge.createdAt) > s.cfg.AuthChallengeTTL {
-		return nil, ErrChallengeTooOld
-	}
 
 	// --- X25519 proof-of-possession + domain-separated signature ---
 	sharedSecret, err := curve25519.X25519(challenge.private[:], identityKey)
@@ -317,6 +377,31 @@ func (s *Service) VerifyResponseV2(ctx context.Context, connID string, identityK
 		DeviceBindingVersion: resultVersion,
 		DeviceBindingStatus:  resultStatus,
 	}, nil
+}
+
+// takeChallenge atomically removes one pending challenge without copying its
+// private key. Failure paths clear the removed object immediately; a
+// successful caller must clear that same object after proof verification.
+func (s *Service) takeChallenge(connID string, expectedProtocol challengeProtocol) (*pendingChallenge, error) {
+	s.mu.Lock()
+	challenge, ok := s.challenges[connID]
+	if ok {
+		delete(s.challenges, connID)
+	}
+	s.mu.Unlock()
+
+	if !ok {
+		return nil, ErrChallengeUnknown
+	}
+	if challenge.protocol != expectedProtocol {
+		clear(challenge.private[:])
+		return nil, ErrAuthProtocolMismatch
+	}
+	if time.Since(challenge.createdAt) > s.cfg.AuthChallengeTTL {
+		clear(challenge.private[:])
+		return nil, ErrChallengeTooOld
+	}
+	return challenge, nil
 }
 
 func normalizeDeviceName(name string) (string, error) {

@@ -732,6 +732,12 @@ func envelopeKind(env *pb.Envelope) string {
 }
 
 func (c *Client) handleEnvelope(env *pb.Envelope) {
+	// AuthResponseV3 remains deliberately unactivated, but the generated oneof
+	// now decodes its raw Pass field. Clear that unavoidable decoded bearer copy
+	// on every legacy/default dispatch path instead of leaving it until GC.
+	if response := env.GetAuthResponseV3(); response != nil {
+		defer clear(response.NodeAccessPass)
+	}
 	ctx := context.Background()
 	clientMessageID, sendMessageReason := sendMessageEnvelopeContext(env)
 

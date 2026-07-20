@@ -85,6 +85,14 @@ message Envelope {
 
     // Error
     Error error = 100;
+
+    // Dedicated v3 foundation. Appended after every legacy oneof declaration
+    // to preserve generated descriptor indexes. The current /ws runtime stays
+    // legacy and does not emit or authenticate these variants before explicit
+    // activation; wire tags remain the reserved auth-adjacent values 14–16.
+    AuthChallengeV3 auth_challenge_v3 = 14;
+    AuthResponseV3 auth_response_v3 = 15;
+    AuthResultV3 auth_result_v3 = 16;
   }
 }
 
