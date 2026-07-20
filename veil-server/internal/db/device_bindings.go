@@ -82,7 +82,25 @@ func (db *DB) StoreDeviceBinding(ctx context.Context, binding *DeviceBinding) (*
 		return nil, fmt.Errorf("begin device binding transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
+	stored, err := storeDeviceBindingTx(ctx, tx, binding)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit device binding: %w", err)
+	}
+	return stored, nil
+}
 
+// storeDeviceBindingTx applies the same immutable binding state machine inside
+// a caller-owned transaction. It deliberately never commits or rolls back so a
+// first-account admission can make account, device, binding and Pass state one
+// indivisible database outcome.
+func storeDeviceBindingTx(ctx context.Context, tx pgx.Tx, binding *DeviceBinding) (*DeviceBinding, error) {
+	if err := validateDeviceBindingForStore(binding); err != nil {
+		return nil, err
+	}
+	var err error
 	var ownerID string
 	var storedDeviceKey []byte
 	if err := tx.QueryRow(ctx,
@@ -130,9 +148,6 @@ func (db *DB) StoreDeviceBinding(ctx context.Context, binding *DeviceBinding) (*
 				return nil, err
 			}
 		}
-		if err := tx.Commit(ctx); err != nil {
-			return nil, fmt.Errorf("commit initial device binding: %w", err)
-		}
 		return cloneDeviceBinding(binding), nil
 	}
 	if err != nil {
@@ -152,9 +167,6 @@ func (db *DB) StoreDeviceBinding(ctx context.Context, binding *DeviceBinding) (*
 		return nil, ErrDeviceBindingStale
 	case binding.Version == current.Version:
 		if bindingEqual(current, binding) {
-			if err := tx.Commit(ctx); err != nil {
-				return nil, fmt.Errorf("commit idempotent device binding: %w", err)
-			}
 			return current, nil
 		}
 		return nil, ErrDeviceBindingConflict
@@ -178,9 +190,6 @@ func (db *DB) StoreDeviceBinding(ctx context.Context, binding *DeviceBinding) (*
 		if err := pruneDeviceSenderKeyTargets(ctx, tx, binding.DeviceID); err != nil {
 			return nil, err
 		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit device binding: %w", err)
 	}
 	return cloneDeviceBinding(binding), nil
 }

@@ -118,6 +118,25 @@ func TestCreateChallengeV3RequiresPublicOrigin(t *testing.T) {
 	}
 }
 
+func TestCreateChallengeV3FailsClosedWithoutServiceOrConfig(t *testing.T) {
+	var nilService *auth.Service
+	services := map[string]*auth.Service{
+		"nil service": nilService,
+		"nil config":  auth.NewService(nil, nil),
+	}
+	for name, service := range services {
+		t.Run(name, func(t *testing.T) {
+			challenge, err := service.CreateChallengeV3(t.Name())
+			if !errors.Is(err, auth.ErrPublicOriginRequired) {
+				t.Fatalf("CreateChallengeV3 error = %v, want ErrPublicOriginRequired", err)
+			}
+			if challenge != (auth.ChallengeV3{}) {
+				t.Fatalf("failed CreateChallengeV3 returned material: %+v", challenge)
+			}
+		})
+	}
+}
+
 func TestCreateChallengeV3ReturnsExactFreshMaterial(t *testing.T) {
 	const origin = "https://veil.example:443"
 	svc := newTestServiceWithPublicOrigin(t, origin)

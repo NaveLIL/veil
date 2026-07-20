@@ -76,8 +76,9 @@ type pendingChallenge struct {
 
 // Service handles Ed25519 challenge-response authentication.
 type Service struct {
-	db  *db.DB
-	cfg *config.Config
+	db            *db.DB
+	cfg           *config.Config
+	wsAuthV3Store wsAuthV3AdmissionStore
 
 	mu         sync.Mutex
 	challenges map[string]*pendingChallenge // connID -> challenge
@@ -88,6 +89,9 @@ func NewService(database *db.DB, cfg *config.Config) *Service {
 		db:         database,
 		cfg:        cfg,
 		challenges: make(map[string]*pendingChallenge),
+	}
+	if database != nil {
+		s.wsAuthV3Store = database
 	}
 	// Periodically clean up expired challenges
 	go s.cleanupLoop()
@@ -131,7 +135,7 @@ func (s *Service) CreateChallenge(connID string) ([32]byte, error) {
 // already have passed gateway configuration validation.
 func (s *Service) CreateChallengeV3(connID string) (ChallengeV3, error) {
 	var result ChallengeV3
-	if s.cfg.PublicOrigin.IsZero() {
+	if s == nil || s.cfg == nil || s.cfg.PublicOrigin.IsZero() {
 		return result, ErrPublicOriginRequired
 	}
 
@@ -383,6 +387,9 @@ func (s *Service) VerifyResponseV2(ctx context.Context, connID string, identityK
 // private key. Failure paths clear the removed object immediately; a
 // successful caller must clear that same object after proof verification.
 func (s *Service) takeChallenge(connID string, expectedProtocol challengeProtocol) (*pendingChallenge, error) {
+	if s == nil {
+		return nil, ErrChallengeUnknown
+	}
 	s.mu.Lock()
 	challenge, ok := s.challenges[connID]
 	if ok {
@@ -396,6 +403,10 @@ func (s *Service) takeChallenge(connID string, expectedProtocol challengeProtoco
 	if challenge.protocol != expectedProtocol {
 		clear(challenge.private[:])
 		return nil, ErrAuthProtocolMismatch
+	}
+	if s.cfg == nil {
+		clear(challenge.private[:])
+		return nil, ErrPublicOriginRequired
 	}
 	if time.Since(challenge.createdAt) > s.cfg.AuthChallengeTTL {
 		clear(challenge.private[:])
@@ -467,6 +478,14 @@ func (s *Service) cleanupLoop() {
 	defer ticker.Stop()
 	for range ticker.C {
 		s.mu.Lock()
+		if s.cfg == nil {
+			for id, challenge := range s.challenges {
+				clear(challenge.private[:])
+				delete(s.challenges, id)
+			}
+			s.mu.Unlock()
+			continue
+		}
 		now := time.Now()
 		for id, ch := range s.challenges {
 			if now.Sub(ch.createdAt) > s.cfg.AuthChallengeTTL*2 {
