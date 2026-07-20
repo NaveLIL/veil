@@ -254,9 +254,11 @@ chain. They did not start or contact a Veil Node.
 
 The immutable shared transport-auth fixture remained byte-identical at SHA-256
 `c90f7aac7619d178e06c0ac0d7aab6084511ceffb505b8fcf7058ba6812ad9bc`.
-Static call-site tests and review confirmed that the native preparer is private
-and the gateway has no v2 verifier constructor, HTTP adapter, dispatcher, or
-route call site. This evidence is not a live transport, two-Node relay, phone,
+The static unit test recursively scans every other Rust source file in
+`veil-client`; repo-wide call-site review additionally confirmed that the
+preparer remains private and that the gateway has no v2 verifier constructor,
+HTTP adapter, dispatcher, or route call site. This evidence is not a live
+transport, two-Node relay, phone,
 release-signing, external audit, or production-readiness result.
 
 Independent read-only in-repository reviews found no P0 or P1 client issue and
