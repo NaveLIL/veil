@@ -157,6 +157,14 @@ physical-device result is claimed. See the
   background reopen or process restart may recover it. A future explicit
   “Forget Node / remain offline” action requires a separate destructive
   contract; no hidden clear API exists in this preview.
+- A host-only D03 precursor now drops the complete native session after a
+  deterministic server ledger accepts a Direct send but before its ACK reaches
+  the client. Reopening the same file-backed SQLCipher store replays the exact
+  client ID, header, ciphertext, and encoded payload without a second ratchet
+  advance; the production protobuf decoder/deferred FIFO then converges the
+  outbox and local projection to one `Sent` message. This proves the native
+  persistence/reconciliation path against a bounded test oracle, not Android OS
+  process death, a physical device, or a real Veil Node.
 - Foreground authority is process-wide and restricted to exact `MainActivity`
   and `RecoveryActivity` surfaces. Internal handoff/configuration recreation
   cannot impersonate app background, dependency Activities cannot keep the
@@ -177,7 +185,8 @@ This remains a closed Direct Preview, not a tester release or production-ready
 mobile messenger. Authenticated Direct directory/history, bounded live receive,
 native projection, per-conversation prekey establishment, guarded send/outbox,
 typed transient reconnect, and canonical-origin process-death recovery are
-present. Same-account force-stop recovery without a new Pass or device has been
+present, and the ambiguous-ACK D03 path has the host-only precursor described
+above. Same-account force-stop recovery without a new Pass or device has been
 physically confirmed on a Samsung S23. `PublicFailureCodeV1` is implemented for
 identity setup and the secure runtime gate. A reviewed terminal subset is now
 retained by the native process across snapshot reads and React recreation, but

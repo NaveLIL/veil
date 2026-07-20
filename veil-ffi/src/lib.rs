@@ -3834,7 +3834,9 @@ fn require_rest_target(target: &str) -> Result<(), VeilError> {
 mod tests {
     use super::*;
     use bip39::Language;
+    use prost::Message as ProstMessage;
     use sha2::{Digest, Sha256};
+    use veil_client::protocol::proto;
 
     #[test]
     fn mobile_live_retryability_is_a_positive_typed_allowlist() {
@@ -3927,6 +3929,263 @@ mod tests {
                 user_id: "550e8400-e29b-41d4-a716-446655440001".to_string(),
             },
             generation,
+        }
+    }
+
+    struct MobileTestSqlCipherCleanup {
+        path: std::path::PathBuf,
+    }
+
+    impl MobileTestSqlCipherCleanup {
+        fn new(label: &str) -> Self {
+            Self {
+                path: std::env::temp_dir()
+                    .join(format!("veil-mobile-{label}-{}.db", uuid::Uuid::new_v4())),
+            }
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.path
+        }
+    }
+
+    impl Drop for MobileTestSqlCipherCleanup {
+        fn drop(&mut self) {
+            for candidate in [
+                self.path.clone(),
+                std::path::PathBuf::from(format!("{}-wal", self.path.display())),
+                std::path::PathBuf::from(format!("{}-shm", self.path.display())),
+            ] {
+                let _ = std::fs::remove_file(candidate);
+            }
+        }
+    }
+
+    fn mobile_test_publish_authenticated_epoch(
+        session: &VeilMobileSession,
+        generation: u64,
+    ) -> String {
+        let epoch = mobile_test_epoch(generation);
+        {
+            let mut client = session.client.lock().unwrap();
+            let identity_key = client.identity_key().unwrap();
+            let signing_key = client.signing_key().unwrap();
+            client
+                .db()
+                .unwrap()
+                .bind_authenticated_self_and_select_mobile_reconnect_target_v1(
+                    &epoch.binding.canonical_server_origin,
+                    &epoch.binding.user_id,
+                    &identity_key,
+                    &signing_key,
+                )
+                .unwrap();
+            client
+                .test_only_restore_authenticated_user_from_durable_binding(
+                    &epoch.binding.canonical_server_origin,
+                    &epoch.binding.user_id,
+                )
+                .unwrap();
+        }
+        *session.binding.lock().unwrap() = Some(epoch.clone());
+        session
+            .next_binding_generation
+            .store(generation, Ordering::Release);
+        let lease = session.begin_direct_sync().unwrap();
+        assert_eq!(
+            lease.canonical_server_origin,
+            epoch.binding.canonical_server_origin
+        );
+        assert_eq!(lease.user_id, epoch.binding.user_id);
+        session.direct_sync.lock().unwrap().as_mut().unwrap().phase =
+            MobileDirectSyncPhase::Directory;
+        lease.token
+    }
+
+    fn mobile_test_install_authenticated_queued_connection(
+        session: &VeilMobileSession,
+    ) -> veil_client::connection::TestOnlyAuthenticatedQueuedConnectionV1 {
+        let _runtime_guard = session.runtime.enter();
+        session
+            .client
+            .lock()
+            .unwrap()
+            .test_only_install_authenticated_queued_connection_v1()
+    }
+
+    fn mobile_test_decode_direct_send(wire: &[u8]) -> (u64, proto::SendMessage) {
+        let envelope = proto::Envelope::decode(wire).unwrap();
+        let Some(proto::envelope::Payload::SendMessage(send)) = envelope.payload else {
+            panic!("expected SendMessage envelope")
+        };
+        (envelope.seq, send)
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct MobileTestDirectServerReceipt {
+        message_id: String,
+        server_timestamp: u64,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct MobileTestDirectServerRow {
+        authenticated_account_id: String,
+        conversation_id: String,
+        client_message_id: String,
+        exact_send_message_payload: Vec<u8>,
+        receipt: MobileTestDirectServerReceipt,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct MobileTestDirectServerAcceptance {
+        request_sequence: u64,
+        client_message_id: String,
+        receipt: MobileTestDirectServerReceipt,
+        replayed: bool,
+    }
+
+    impl MobileTestDirectServerAcceptance {
+        fn acknowledgement_wire_v1(&self) -> Vec<u8> {
+            proto::Envelope {
+                seq: self.request_sequence,
+                timestamp: self.receipt.server_timestamp,
+                payload: Some(proto::envelope::Payload::MessageAck(proto::MessageAck {
+                    message_id: self.receipt.message_id.clone(),
+                    server_timestamp: self.receipt.server_timestamp,
+                    ref_seq: self.request_sequence,
+                    target_device_id: Vec::new(),
+                    conversation_id: None,
+                    sender_key_generation: None,
+                    roster_version: None,
+                    envelope_commitment: None,
+                    client_message_id: self.client_message_id.clone(),
+                })),
+            }
+            .encode_to_vec()
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum MobileTestDirectServerAcceptError {
+        MalformedEnvelope,
+        InvalidSequence,
+        MissingSendMessage,
+        InvalidClientMessageId,
+        AccountMismatch,
+        RouteMismatch,
+        ClientMessageIdConflict,
+    }
+
+    /// Process-independent idempotency oracle for the ambiguous-ACK test.
+    ///
+    /// Only successfully accepted requests mutate this fixture. A rejected
+    /// conflict must leave the receipt ledger and every acceptance counter
+    /// byte-for-byte unchanged.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct MobileTestDirectServerLedger {
+        expected_account_id: String,
+        expected_conversation_id: String,
+        rows: HashMap<String, MobileTestDirectServerRow>,
+        attempts: usize,
+        new_deliveries: usize,
+        replayed_deliveries: usize,
+    }
+
+    impl MobileTestDirectServerLedger {
+        fn new(expected_account_id: String, expected_conversation_id: String) -> Self {
+            Self {
+                expected_account_id,
+                expected_conversation_id,
+                rows: HashMap::new(),
+                attempts: 0,
+                new_deliveries: 0,
+                replayed_deliveries: 0,
+            }
+        }
+
+        fn accept_raw_send_envelope_v1(
+            &mut self,
+            authenticated_account_id: &str,
+            wire: &[u8],
+        ) -> Result<MobileTestDirectServerAcceptance, MobileTestDirectServerAcceptError> {
+            if authenticated_account_id != self.expected_account_id {
+                return Err(MobileTestDirectServerAcceptError::AccountMismatch);
+            }
+            let envelope = proto::Envelope::decode(wire)
+                .map_err(|_| MobileTestDirectServerAcceptError::MalformedEnvelope)?;
+            if envelope.seq == 0 {
+                return Err(MobileTestDirectServerAcceptError::InvalidSequence);
+            }
+            let Some(proto::envelope::Payload::SendMessage(send)) = envelope.payload else {
+                return Err(MobileTestDirectServerAcceptError::MissingSendMessage);
+            };
+            if send.conversation_id != self.expected_conversation_id {
+                return Err(MobileTestDirectServerAcceptError::RouteMismatch);
+            }
+            let canonical_client_message_id = uuid::Uuid::parse_str(&send.client_message_id)
+                .ok()
+                .map(|value| value.hyphenated().to_string());
+            if canonical_client_message_id.as_deref() != Some(send.client_message_id.as_str()) {
+                return Err(MobileTestDirectServerAcceptError::InvalidClientMessageId);
+            }
+
+            let exact_send_message_payload = send.encode_to_vec();
+            let client_message_id = send.client_message_id.clone();
+            if let Some(existing) = self.rows.get(&client_message_id) {
+                if existing.authenticated_account_id != authenticated_account_id
+                    || existing.conversation_id != send.conversation_id
+                    || existing.client_message_id != client_message_id
+                    || existing.exact_send_message_payload != exact_send_message_payload
+                {
+                    return Err(MobileTestDirectServerAcceptError::ClientMessageIdConflict);
+                }
+                let receipt = existing.receipt.clone();
+                self.attempts = self.attempts.checked_add(1).expect("test attempt overflow");
+                self.replayed_deliveries = self
+                    .replayed_deliveries
+                    .checked_add(1)
+                    .expect("test replay counter overflow");
+                return Ok(MobileTestDirectServerAcceptance {
+                    request_sequence: envelope.seq,
+                    client_message_id,
+                    receipt,
+                    replayed: true,
+                });
+            }
+
+            let row_ordinal = u128::try_from(self.rows.len()).expect("test row count fits u128");
+            let receipt = MobileTestDirectServerReceipt {
+                message_id: uuid::Uuid::from_u128(
+                    0x7600_0000_0000_0000_0000_0000_0000_0006u128
+                        .checked_add(row_ordinal)
+                        .expect("test server message ID overflow"),
+                )
+                .to_string(),
+                server_timestamp: 1_700_000_000_789_000_000u64
+                    .checked_add(u64::try_from(self.rows.len()).expect("test row count fits u64"))
+                    .expect("test server timestamp overflow"),
+            };
+            self.rows.insert(
+                client_message_id.clone(),
+                MobileTestDirectServerRow {
+                    authenticated_account_id: authenticated_account_id.to_string(),
+                    conversation_id: send.conversation_id,
+                    client_message_id: client_message_id.clone(),
+                    exact_send_message_payload,
+                    receipt: receipt.clone(),
+                },
+            );
+            self.attempts = self.attempts.checked_add(1).expect("test attempt overflow");
+            self.new_deliveries = self
+                .new_deliveries
+                .checked_add(1)
+                .expect("test delivery counter overflow");
+            Ok(MobileTestDirectServerAcceptance {
+                request_sequence: envelope.seq,
+                client_message_id,
+                receipt,
+                replayed: false,
+            })
         }
     }
 
@@ -6990,6 +7249,416 @@ mod tests {
 
         drop(session);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn mobile_direct_process_reopen_after_server_accept_before_ack_converges_exactly_once() {
+        let cleanup = MobileTestSqlCipherCleanup::new("direct-ambiguous-ack-reopen");
+        let database_path = cleanup.path().to_string_lossy().into_owned();
+        let mnemonic = Zeroizing::new(generate_mnemonic());
+        let authenticated_account_id = mobile_test_epoch(141).binding.user_id;
+
+        let first_session = VeilMobileSession::from_mnemonic_bytes(
+            mnemonic.as_bytes().to_vec(),
+            database_path.clone(),
+        )
+        .unwrap();
+        let first_identity_key = first_session.client.lock().unwrap().identity_key().unwrap();
+        let first_device_id = first_session.client.lock().unwrap().device_id();
+        let first_token = mobile_test_publish_authenticated_epoch(&first_session, 141);
+        let (directory_response, peer) = mobile_test_directory_response(&first_session);
+        let first_directory_request = first_session
+            .prepare_direct_directory_request(first_token.clone())
+            .unwrap();
+        let first_page = first_session
+            .install_direct_directory_page(
+                first_token.clone(),
+                first_directory_request.request_token,
+                directory_response.clone(),
+            )
+            .unwrap();
+        assert_eq!(first_page.conversations.len(), 1);
+        assert!(first_page.conversations[0].needs_prekey);
+        let conversation_id = first_page.conversations[0].conversation_id.clone();
+        {
+            let mut sync = first_session.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.phase = MobileDirectSyncPhase::Ready;
+            state.outbox_replay_complete = true;
+        }
+
+        let (peer_identity_key, bundle) = mobile_test_prekey_bundle(peer);
+        first_session
+            .client
+            .lock()
+            .unwrap()
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        let ratchet_before_send = first_session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        let ratchet_before_send_revision = ratchet_before_send.revision;
+        let ratchet_before_send_bytes = Zeroizing::new(ratchet_before_send.session_data.clone());
+        drop(ratchet_before_send);
+
+        let mut first_transport =
+            mobile_test_install_authenticated_queued_connection(&first_session);
+        assert_eq!(
+            first_session
+                .send_direct_text(
+                    first_token,
+                    conversation_id.clone(),
+                    b"accepted before local ACK commit".to_vec(),
+                )
+                .unwrap(),
+            MobileDirectTextSendOutcome::Accepted
+        );
+
+        // The process-independent test ledger accepts the frame and creates
+        // its durable receipt before the native session disappears. It then
+        // deliberately withholds that receipt's ACK from the first process.
+        let first_wire = first_session
+            .runtime
+            .block_on(first_transport.recv_outbound_v1())
+            .expect("accepted Direct frame must reach the test server");
+        let (first_sequence, first_send) = mobile_test_decode_direct_send(&first_wire);
+        assert!(first_sequence > 0);
+        let mut accepted_server = MobileTestDirectServerLedger::new(
+            authenticated_account_id.clone(),
+            conversation_id.clone(),
+        );
+        let first_acceptance = accepted_server
+            .accept_raw_send_envelope_v1(&authenticated_account_id, &first_wire)
+            .unwrap();
+        assert!(!first_acceptance.replayed);
+
+        let (exact_payload, client_message_id, local_message_id, outbox_ratchet_revision): (
+            Vec<u8>,
+            String,
+            String,
+            i64,
+        ) = first_session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT exact_send_message_payload, client_message_id,
+                        local_message_id, ratchet_revision
+                 FROM direct_message_outbox_v1 WHERE state = 0",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(client_message_id, local_message_id);
+        assert_eq!(first_send.client_message_id, client_message_id);
+        assert_eq!(first_send.encode_to_vec(), exact_payload);
+        {
+            let accepted_row = accepted_server.rows.get(&client_message_id).unwrap();
+            assert_eq!(
+                accepted_row.authenticated_account_id,
+                authenticated_account_id
+            );
+            assert_eq!(accepted_row.conversation_id, conversation_id);
+            assert_eq!(accepted_row.client_message_id, client_message_id);
+            assert_eq!(accepted_row.exact_send_message_payload, exact_payload);
+            assert_eq!(accepted_row.receipt, first_acceptance.receipt);
+        }
+
+        let ratchet_after_send = first_session
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ratchet_after_send.revision,
+            ratchet_before_send_revision + 1,
+            "the durable send must advance the ratchet exactly once"
+        );
+        assert_eq!(
+            i64::try_from(ratchet_after_send.revision).unwrap(),
+            outbox_ratchet_revision
+        );
+        assert_ne!(
+            ratchet_after_send.session_data.as_slice(),
+            ratchet_before_send_bytes.as_slice()
+        );
+        let committed_ratchet_revision = ratchet_after_send.revision;
+        let committed_ratchet_bytes = Zeroizing::new(ratchet_after_send.session_data.clone());
+        drop(ratchet_after_send);
+
+        let pending_projection = first_session
+            .project_direct_messages(conversation_id.clone())
+            .unwrap();
+        assert_eq!(pending_projection.messages.len(), 1);
+        assert_eq!(
+            pending_projection.messages[0].message_id(),
+            local_message_id
+        );
+        assert_eq!(
+            pending_projection.messages[0].delivery(),
+            MobileDirectMessageDelivery::Sending
+        );
+
+        drop(pending_projection);
+        drop(first_transport);
+        drop(first_session);
+
+        let reopened =
+            VeilMobileSession::from_mnemonic_bytes(mnemonic.as_bytes().to_vec(), database_path)
+                .unwrap();
+        assert!(matches!(
+            reopened.authenticated_binding(),
+            Err(VeilError::Session { .. })
+        ));
+        assert!(reopened.direct_sync.lock().unwrap().is_none());
+        let reconnect_target = reopened.mobile_reconnect_target().unwrap().unwrap();
+        assert_eq!(
+            reconnect_target.canonical_server_origin,
+            mobile_test_epoch(141).binding.canonical_server_origin
+        );
+        assert_eq!(
+            reconnect_target.expected_user_id,
+            mobile_test_epoch(141).binding.user_id
+        );
+        assert_eq!(
+            reopened.client.lock().unwrap().identity_key().unwrap(),
+            first_identity_key
+        );
+        assert_eq!(reopened.client.lock().unwrap().device_id(), first_device_id);
+
+        let reopened_ratchet = reopened
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened_ratchet.revision, committed_ratchet_revision);
+        assert_eq!(
+            reopened_ratchet.session_data.as_slice(),
+            committed_ratchet_bytes.as_slice()
+        );
+        drop(reopened_ratchet);
+
+        let reopened_token = mobile_test_publish_authenticated_epoch(&reopened, 142);
+        let reopened_directory_request = reopened
+            .prepare_direct_directory_request(reopened_token.clone())
+            .unwrap();
+        let reopened_page = reopened
+            .install_direct_directory_page(
+                reopened_token.clone(),
+                reopened_directory_request.request_token,
+                directory_response,
+            )
+            .unwrap();
+        assert_eq!(reopened_page.conversations.len(), 1);
+        assert_eq!(
+            reopened_page.conversations[0].conversation_id,
+            conversation_id
+        );
+        assert!(!reopened_page.conversations[0].needs_prekey);
+        {
+            let mut sync = reopened.direct_sync.lock().unwrap();
+            let state = sync.as_mut().unwrap();
+            state.phase = MobileDirectSyncPhase::Ready;
+            state.outbox_replay_cursor = None;
+            state.outbox_replay_complete = false;
+        }
+
+        let mut replay_transport = mobile_test_install_authenticated_queued_connection(&reopened);
+        let replay = reopened
+            .replay_direct_outbox(reopened_token.clone())
+            .unwrap();
+        assert_eq!(replay.visited, 1);
+        assert_eq!(replay.enqueued, 1);
+        assert!(replay.replay_complete);
+        assert!(!replay.needs_immediate_pump);
+        let replay_wire = reopened
+            .runtime
+            .block_on(replay_transport.recv_outbound_v1())
+            .expect("the reopened session must replay the durable frame");
+        let (replay_sequence, replay_send) = mobile_test_decode_direct_send(&replay_wire);
+        assert!(replay_sequence > 0);
+        assert_eq!(replay_send.client_message_id, client_message_id);
+        assert_eq!(replay_send.ciphertext, first_send.ciphertext);
+        assert_eq!(replay_send.header, first_send.header);
+        assert_eq!(replay_send.encode_to_vec(), exact_payload);
+        let replay_acceptance = accepted_server
+            .accept_raw_send_envelope_v1(&authenticated_account_id, &replay_wire)
+            .unwrap();
+        assert!(replay_acceptance.replayed);
+        assert_eq!(replay_acceptance.receipt, first_acceptance.receipt);
+
+        // Reusing the accepted client ID for different canonical SendMessage
+        // bytes is a terminal conflict and cannot mutate the durable receipt,
+        // delivery count, or replay counters.
+        let mut conflicting_envelope = proto::Envelope::decode(replay_wire.as_slice()).unwrap();
+        let Some(proto::envelope::Payload::SendMessage(conflicting_send)) =
+            conflicting_envelope.payload.as_mut()
+        else {
+            panic!("replayed envelope lost its SendMessage payload")
+        };
+        conflicting_send.ciphertext.push(0x5a);
+        let conflicting_wire = conflicting_envelope.encode_to_vec();
+        let server_before_conflict = accepted_server.clone();
+        assert_eq!(
+            accepted_server
+                .accept_raw_send_envelope_v1(&authenticated_account_id, &conflicting_wire),
+            Err(MobileTestDirectServerAcceptError::ClientMessageIdConflict)
+        );
+        assert_eq!(accepted_server, server_before_conflict);
+        assert_eq!(
+            (
+                accepted_server.attempts,
+                accepted_server.new_deliveries,
+                accepted_server.replayed_deliveries,
+                accepted_server.rows.len(),
+            ),
+            (2, 1, 1, 1),
+            "two accepted attempts must converge to one server delivery row"
+        );
+        let replay_receipt = replay_acceptance.receipt.clone();
+
+        let ratchet_after_replay = reopened
+            .client
+            .lock()
+            .unwrap()
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ratchet_after_replay.revision, committed_ratchet_revision);
+        assert_eq!(
+            ratchet_after_replay.session_data.as_slice(),
+            committed_ratchet_bytes.as_slice(),
+            "exact replay must not encrypt or advance the ratchet again"
+        );
+        drop(ratchet_after_replay);
+        let replay_projection = reopened
+            .project_direct_messages(conversation_id.clone())
+            .unwrap();
+        assert_eq!(replay_projection.messages.len(), 1);
+        assert_eq!(replay_projection.messages[0].message_id(), local_message_id);
+        assert_eq!(
+            replay_projection.messages[0].delivery(),
+            MobileDirectMessageDelivery::Sending
+        );
+
+        let ack_wire = replay_acceptance.acknowledgement_wire_v1();
+        reopened
+            .runtime
+            .block_on(replay_transport.dispatch_authenticated_binary_frame_v1(&ack_wire))
+            .unwrap();
+        assert_eq!(
+            reopened
+                .client
+                .lock()
+                .unwrap()
+                .buffer_connection_events_during_sync_classified_v1()
+                .unwrap(),
+            1,
+            "the production deferred FIFO must own the decoded ACK before replay"
+        );
+
+        let ack = reopened.replay_direct_live_events(reopened_token).unwrap();
+        assert_eq!(ack.consumed, 1);
+        assert!(ack.projection_changed);
+        assert!(!ack.needs_immediate_pump);
+        assert!(!ack.outbox_replay_required);
+        assert!(ack.ready);
+
+        let sent_projection = reopened
+            .project_direct_messages(conversation_id.clone())
+            .unwrap();
+        assert_eq!(sent_projection.messages.len(), 1);
+        let sent = &sent_projection.messages[0];
+        assert_eq!(sent.message_id(), replay_receipt.message_id);
+        assert_eq!(sent.text(), "accepted before local ACK commit");
+        assert_eq!(
+            sent.timestamp_ms(),
+            Some(i64::try_from(replay_receipt.server_timestamp / 1_000_000).unwrap())
+        );
+        assert_eq!(sent.direction(), MobileDirectMessageDirection::Outgoing);
+        assert_eq!(sent.delivery(), MobileDirectMessageDelivery::Sent);
+
+        let client = reopened.client.lock().unwrap();
+        let pending_count: i64 = client
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM direct_message_outbox_v1 WHERE state = 0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending_count, 0);
+        let receipt: (i64, bool, String, i64) = client
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT state, exact_send_message_payload IS NULL,
+                        server_message_id, server_timestamp_ms
+                 FROM direct_message_outbox_v1 WHERE client_message_id = ?1",
+                [client_message_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            receipt,
+            (
+                1,
+                true,
+                replay_receipt.message_id.clone(),
+                i64::try_from(replay_receipt.server_timestamp / 1_000_000).unwrap(),
+            )
+        );
+        let converged_rows: (i64, i64, i64) = client
+            .db()
+            .unwrap()
+            .conn()
+            .query_row(
+                "SELECT COUNT(*),
+                        SUM(CASE WHEN id = ?2 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN id = ?3 THEN 1 ELSE 0 END)
+                 FROM messages WHERE conversation_id = ?1",
+                [
+                    conversation_id.as_str(),
+                    replay_receipt.message_id.as_str(),
+                    local_message_id.as_str(),
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(converged_rows, (1, 1, 0));
+        let ratchet_after_ack = client
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ratchet_after_ack.revision, committed_ratchet_revision);
+        assert_eq!(
+            ratchet_after_ack.session_data.as_slice(),
+            committed_ratchet_bytes.as_slice()
+        );
     }
 
     #[test]

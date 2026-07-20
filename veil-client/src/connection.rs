@@ -1363,6 +1363,33 @@ pub struct Connection {
     read_task: tokio::task::AbortHandle,
 }
 
+/// In-memory authenticated transport owned exclusively by cross-crate tests.
+///
+/// Raw inbound bytes still pass through the production protobuf decoder and
+/// authenticated event dispatcher before they enter the normal bounded event
+/// queue. The type is absent unless the non-default `test-utils` feature (or
+/// this crate's own test build) is active.
+#[cfg(any(test, feature = "test-utils"))]
+#[doc(hidden)]
+pub struct TestOnlyAuthenticatedQueuedConnectionV1 {
+    outbound: mpsc::Receiver<Vec<u8>>,
+    inbound: ConnectionEventSenderV1,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl TestOnlyAuthenticatedQueuedConnectionV1 {
+    pub async fn recv_outbound_v1(&mut self) -> Option<Vec<u8>> {
+        self.outbound.recv().await
+    }
+
+    pub async fn dispatch_authenticated_binary_frame_v1(
+        &self,
+        wire: &[u8],
+    ) -> Result<(), ConnectionEventBufferErrorV1> {
+        dispatch_authenticated_binary_frame(&self.inbound, wire).await
+    }
+}
+
 fn signal_disconnected(
     terminal: &ConnectionTerminalStateV1,
     shutdown: &watch::Sender<bool>,
@@ -1928,10 +1955,32 @@ impl Connection {
 
     #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn test_only_queued_connection() -> (Self, mpsc::Receiver<Vec<u8>>) {
+        let (connection, outbound, _inbound) = Self::test_only_queued_connection_parts_v1();
+        (connection, outbound)
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) fn test_only_authenticated_queued_connection_v1(
+    ) -> (Self, TestOnlyAuthenticatedQueuedConnectionV1) {
+        let (connection, outbound, inbound) = Self::test_only_queued_connection_parts_v1();
+        (
+            connection,
+            TestOnlyAuthenticatedQueuedConnectionV1 { outbound, inbound },
+        )
+    }
+
+    #[cfg(any(test, feature = "test-utils"))]
+    fn test_only_queued_connection_parts_v1(
+    ) -> (Self, mpsc::Receiver<Vec<u8>>, ConnectionEventSenderV1) {
         let write_join = tokio::spawn(std::future::pending::<()>());
         let read_join = tokio::spawn(std::future::pending::<()>());
         let (sender, outbound) = mpsc::channel(4);
-        let (_event_sender, event_receiver) = mpsc::channel(1);
+        let (event_sender, event_receiver) =
+            mpsc::channel::<BudgetedConnectionEventV1>(LIVE_EVENT_QUEUE_CAPACITY);
+        let inbound = ConnectionEventSenderV1 {
+            sender: event_sender,
+            budget: ConnectionEventBudgetV1::production(),
+        };
         let terminal = Arc::new(ConnectionTerminalStateV1::default());
         (
             Self {
@@ -1946,6 +1995,7 @@ impl Connection {
                 read_task: read_join.abort_handle(),
             },
             outbound,
+            inbound,
         )
     }
 

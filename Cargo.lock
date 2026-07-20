@@ -7225,6 +7225,7 @@ dependencies = [
  "base64 0.22.1",
  "bip39",
  "hex",
+ "prost",
  "rand 0.8.6",
  "serde_json",
  "sha2",

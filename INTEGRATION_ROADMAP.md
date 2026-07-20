@@ -1870,6 +1870,18 @@ typed backoff с ordinal 0 после первой разрешённой оши
 новому staged Pass. Manual disconnect остаётся non-destructive и сохраняет
 target; отдельного `Forget Node / remain offline` API пока нет.
 
+Host-only precursor D03 от 2026-07-20 закрывает именно native persistence и
+ACK reconciliation для неоднозначной доставки: после первого accept в
+детерминированном server ledger полная `VeilMobileSession` уничтожается до
+локального ACK, затем тот же file-backed SQLCipher store открывается заново.
+Replay сохраняет exact client ID/header/ciphertext/encoded payload, ratchet
+остаётся продвинут ровно один раз, повторный accept возвращает прежний receipt,
+а production protobuf decoder и deferred FIFO сводят outbox и projection к
+одной `Sent` строке. Конфликт того же client ID с другими ciphertext bytes
+отклоняется без мутации ledger. Это automated test oracle, а не реальный Veil
+Node, Android OS process-death или physical-device evidence; строка D03
+физической матрицы и полный exit gate 5B остаются открыты.
+
 1. Сначала один честный Desktop ↔ Android DM: X3DH/Double Ratchet, history sync,
    ack/outbox, reconnect, airplane mode и process death.
 2. Реальные DM list/chat, затем private groups на Sender Keys.

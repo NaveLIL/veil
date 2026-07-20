@@ -126,6 +126,13 @@ Run both Android-to-desktop and desktop-to-Android directions.
 | D09 | Staged Pass races stored reconnect | New enrollment intent suppresses stale stored reconnect without bearer leakage |
 | D10 | Storage failure at each transaction boundary | No false ACK, partial ratchet commit, orphan plaintext, or unsafe automatic retry |
 
+D03 has a host-only automated precursor: a file-backed SQLCipher session is
+fully dropped after a deterministic server ledger accepts the send and before
+the ACK is delivered, then reopened and reconciled through the production
+decoder/FIFO with exact ciphertext replay and one resulting delivery. That
+bounded test oracle is not a real Node, Android OS process-death, or physical
+device result, so D03 remains open in this matrix.
+
 ## Matrix E — public errors, privacy, and hostile inputs
 
 | ID | Scenario | Required result |

@@ -5402,6 +5402,22 @@ impl VeilClient {
         outbound
     }
 
+    /// Install a bounded in-memory transport whose inbound raw frames still
+    /// traverse the production authenticated protobuf decoder and event FIFO.
+    ///
+    /// This bridge exists only for cross-crate process-recovery tests and is
+    /// absent from every build that does not explicitly enable `test-utils`.
+    #[cfg(any(test, feature = "test-utils"))]
+    #[doc(hidden)]
+    pub fn test_only_install_authenticated_queued_connection_v1(
+        &mut self,
+    ) -> crate::connection::TestOnlyAuthenticatedQueuedConnectionV1 {
+        let (connection, transport) =
+            crate::connection::Connection::test_only_authenticated_queued_connection_v1();
+        self.connection = Some(connection);
+        transport
+    }
+
     /// Test-only equivalent of the production pre-install reconnect barrier.
     #[cfg(any(test, feature = "test-utils"))]
     #[doc(hidden)]
