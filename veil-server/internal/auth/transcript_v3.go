@@ -8,8 +8,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/NaveLIL/veil/veil-server/internal/authmw"
 	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
+	"github.com/NaveLIL/veil/veil-server/internal/nodeorigin"
 )
 
 const (
@@ -64,7 +64,7 @@ type WSAuthContextV3Input struct {
 // preimage is cleared before this function returns.
 func NodeAccessPassCommitmentV1(canonicalOrigin string, rawPass []byte) ([sha256.Size]byte, error) {
 	var commitment [sha256.Size]byte
-	if err := authmw.ValidateCanonicalRESTOriginV2(canonicalOrigin); err != nil {
+	if err := nodeorigin.ValidateCanonical(canonicalOrigin); err != nil {
 		return commitment, wsAuthV3Invalid("canonical origin", err)
 	}
 	if len(rawPass) != NodeAccessPassSizeV1 || allZeroWSAuthV3(rawPass) {
@@ -162,7 +162,7 @@ func WSAuthV3DeviceProofMessage(input WSAuthContextV3Input, deviceShared, accoun
 }
 
 func validateWSAuthContextV3Input(input WSAuthContextV3Input) error {
-	if err := authmw.ValidateCanonicalRESTOriginV2(input.CanonicalOrigin); err != nil {
+	if err := nodeorigin.ValidateCanonical(input.CanonicalOrigin); err != nil {
 		return wsAuthV3Invalid("canonical origin", err)
 	}
 	if allZeroWSAuthV3(input.ServerEphemeral[:]) {

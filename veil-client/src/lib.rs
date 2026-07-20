@@ -21,3 +21,5 @@ pub mod protocol;
 
 #[cfg(test)]
 mod auth_contract_fixture_tests;
+#[cfg(test)]
+mod origin_contract_fixture_tests;

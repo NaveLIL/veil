@@ -21,6 +21,26 @@ must not be enabled in production. Docker Compose supplies its own explicit
 `DATABASE_URL` and requires `VEIL_DB_PASSWORD`, so it does not use this escape
 hatch.
 
+## Required canonical public origin
+
+Every gateway process requires one explicit client-visible Node origin:
+
+```text
+VEIL_PUBLIC_ORIGIN=https://veil.example:443
+```
+
+The value is already canonical: `https://host:port`, or `http://host:port` only
+for exact local loopback development. Scheme and DNS host are lowercase, the
+port is explicit canonical decimal, and credentials, path, query, fragment,
+trailing DNS dot, Unicode host aliases, and parser-normalized spellings are
+rejected. Startup fails closed when the value is absent or invalid. It is never
+derived from `Host`, forwarded headers, redirects, or DNS.
+
+This is Phase 5S.3B-1 configuration foundation, not transport activation. The
+current `/ws` and signed REST paths remain legacy Preview WS auth v2 and REST
+auth v1 until their versioned runtime wiring, replay semantics, downgrade gate,
+and two-Node relay evidence are complete.
+
 ## Account registration
 
 First-time account creation is disabled by default. Existing accounts can

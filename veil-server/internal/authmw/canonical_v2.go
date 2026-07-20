@@ -5,11 +5,12 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
-	"net/netip"
 	"strconv"
 	"strings"
 
+	"github.com/NaveLIL/veil/veil-server/internal/nodeorigin"
 	"github.com/google/uuid"
 )
 
@@ -19,7 +20,7 @@ const (
 	RESTAuthV2Domain = "veil-rest-auth-v2\x00"
 
 	RESTAuthV2NonceSize      = 32
-	RESTAuthV2MaxOriginBytes = 512
+	RESTAuthV2MaxOriginBytes = nodeorigin.MaxBytes
 	RESTAuthV2MaxMethodBytes = 32
 	RESTAuthV2MaxTargetBytes = 16 * 1024
 )
@@ -149,118 +150,8 @@ func ParseCanonicalRESTNonceV2(value string) ([RESTAuthV2NonceSize]byte, error) 
 // with an explicit port. HTTPS is mandatory except for exact local-loopback
 // HTTP development origins.
 func ValidateCanonicalRESTOriginV2(origin string) error {
-	if origin == "" || len(origin) > RESTAuthV2MaxOriginBytes || !printableASCIIRESTAuthV2(origin) {
-		return errors.New("REST auth v2 origin is empty, oversized, or non-ASCII")
-	}
-
-	var scheme, authority string
-	switch {
-	case strings.HasPrefix(origin, "https://"):
-		scheme, authority = "https", strings.TrimPrefix(origin, "https://")
-	case strings.HasPrefix(origin, "http://"):
-		scheme, authority = "http", strings.TrimPrefix(origin, "http://")
-	default:
-		return errors.New("REST auth v2 origin has an invalid scheme")
-	}
-	if authority == "" || strings.ContainsAny(authority, "/?#@") {
-		return errors.New("REST auth v2 origin must contain only an authority")
-	}
-
-	host, port, loopback, err := canonicalRESTAuthV2Authority(authority)
-	if err != nil {
-		return err
-	}
-	if scheme == "http" && !loopback {
-		return errors.New("REST auth v2 HTTP origin is not loopback")
-	}
-	canonical := scheme + "://" + host + ":" + port
-	if canonical != origin {
-		return errors.New("REST auth v2 origin is not canonical")
-	}
-	return nil
-}
-
-func canonicalRESTAuthV2Authority(authority string) (host, port string, loopback bool, err error) {
-	if strings.HasPrefix(authority, "[") {
-		end := strings.IndexByte(authority, ']')
-		if end <= 1 || end+2 > len(authority) || authority[end+1] != ':' ||
-			strings.Contains(authority[1:end], "%") {
-			return "", "", false, errors.New("REST auth v2 origin has invalid bracketed IPv6")
-		}
-		address, parseErr := netip.ParseAddr(authority[1:end])
-		if parseErr != nil || !address.Is6() || address.Is4In6() || address.Zone() != "" {
-			return "", "", false, errors.New("REST auth v2 origin has invalid IPv6")
-		}
-		port, err = canonicalRESTAuthV2Port(authority[end+2:])
-		if err != nil {
-			return "", "", false, err
-		}
-		host = "[" + address.String() + "]"
-		return host, port, address == netip.IPv6Loopback(), nil
-	}
-
-	if strings.Count(authority, ":") != 1 {
-		return "", "", false, errors.New("REST auth v2 origin requires one explicit port")
-	}
-	separator := strings.LastIndexByte(authority, ':')
-	host = authority[:separator]
-	port, err = canonicalRESTAuthV2Port(authority[separator+1:])
-	if err != nil {
-		return "", "", false, err
-	}
-	if host == "" {
-		return "", "", false, errors.New("REST auth v2 origin host is empty")
-	}
-	if address, parseErr := netip.ParseAddr(host); parseErr == nil {
-		if !address.Is4() || address.String() != host {
-			return "", "", false, errors.New("REST auth v2 origin IPv4 is not canonical")
-		}
-		return host, port, address == netip.MustParseAddr("127.0.0.1"), nil
-	}
-	if err := validateRESTAuthV2Hostname(host); err != nil {
-		return "", "", false, err
-	}
-	return host, port, host == "localhost", nil
-}
-
-func canonicalRESTAuthV2Port(value string) (string, error) {
-	if value == "" || (len(value) > 1 && value[0] == '0') {
-		return "", errors.New("REST auth v2 origin port is not canonical")
-	}
-	for index := 0; index < len(value); index++ {
-		if value[index] < '0' || value[index] > '9' {
-			return "", errors.New("REST auth v2 origin port is invalid")
-		}
-	}
-	parsed, err := strconv.ParseUint(value, 10, 16)
-	if err != nil || parsed == 0 || strconv.FormatUint(parsed, 10) != value {
-		return "", errors.New("REST auth v2 origin port is out of range")
-	}
-	return value, nil
-}
-
-func validateRESTAuthV2Hostname(host string) error {
-	if len(host) > 253 || host != strings.ToLower(host) || strings.HasSuffix(host, ".") {
-		return errors.New("REST auth v2 origin hostname is not canonical")
-	}
-	allNumericOrDot := true
-	for _, label := range strings.Split(host, ".") {
-		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
-			return errors.New("REST auth v2 origin hostname label is invalid")
-		}
-		for index := 0; index < len(label); index++ {
-			character := label[index]
-			if !((character >= 'a' && character <= 'z') ||
-				(character >= '0' && character <= '9') || character == '-') {
-				return errors.New("REST auth v2 origin hostname is not ASCII LDH")
-			}
-			if character < '0' || character > '9' {
-				allNumericOrDot = false
-			}
-		}
-	}
-	if allNumericOrDot {
-		return errors.New("REST auth v2 origin has an invalid numeric host")
+	if err := nodeorigin.ValidateCanonical(origin); err != nil {
+		return fmt.Errorf("REST auth v2 origin is invalid: %w", err)
 	}
 	return nil
 }
@@ -336,15 +227,6 @@ func ValidateCanonicalRESTTargetV2(target string) error {
 		}
 	}
 	return nil
-}
-
-func printableASCIIRESTAuthV2(value string) bool {
-	for index := 0; index < len(value); index++ {
-		if value[index] < 0x21 || value[index] > 0x7e {
-			return false
-		}
-	}
-	return true
 }
 
 func upperHexRESTAuthV2(value byte) bool {

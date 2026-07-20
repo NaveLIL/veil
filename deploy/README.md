@@ -38,6 +38,19 @@ tag. Set `VEIL_RELEASE_ID` to the matching Git tag or Git commit SHA and change
 it for every rollout. This makes Compose recreate the completed migration job
 when a release changes.
 
+`VEIL_PUBLIC_ORIGIN` is also mandatory. For the managed Node it is exactly
+`https://veil.erez.pro:443`: lowercase scheme/host, an explicit canonical port,
+and no credentials, path, query, fragment, or trailing slash. Compose has no
+production fallback for this value, and gateway startup fails closed when it is
+missing or non-canonical. The application must never infer this trust scope from
+incoming `Host`, `X-Forwarded-Host`, redirects, or DNS.
+
+This configuration is the non-deployed Phase 5S.3B-1 foundation only. It does
+not activate the frozen transport-auth builders: `/ws` and signed REST still use
+legacy Preview WS auth v2 and REST auth v1 until the separately reviewed live
+cutover. Do not describe this setting as closing the hostile-Node P1, enabling
+production cryptography, or satisfying the two-Node relay gate.
+
 Keep `VEIL_ALLOW_REGISTRATION=false` while the managed Node is in closed
 Preview. This setting blocks creation of first-time accounts but does not lock
 out identities already registered on that Node. Opening registration is an
@@ -109,6 +122,10 @@ Validate configuration before contacting a registry or starting containers:
 ```sh
 docker compose -f deploy/compose.prod.yml --env-file deploy/.env config --quiet
 ```
+
+Configuration resolution must fail if `VEIL_PUBLIC_ORIGIN` is removed or set to
+an empty value. This check is local and must not be replaced by starting or
+mutating the running Node.
 
 ## 2. First certificate and the existing Nginx SNI router
 

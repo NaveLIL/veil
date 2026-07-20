@@ -151,7 +151,7 @@ func main() {
 	// Switch to structured JSON logging via slog (consumed by httpmw.AccessLog).
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})))
 
-	cfg, err := config.Load()
+	cfg, err := config.LoadGateway()
 	if err != nil {
 		log.Fatalf("configuration error: %v", err)
 	}

@@ -8,14 +8,17 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/NaveLIL/veil/veil-server/internal/nodeorigin"
 )
 
 const insecureDevDatabaseURL = "postgres://veil:veil@localhost:5432/veil?sslmode=disable"
 
 // Config holds all server configuration, loaded from environment variables.
 type Config struct {
-	Port        string
-	DatabaseURL string
+	Port         string
+	DatabaseURL  string
+	PublicOrigin nodeorigin.Canonical
 
 	// Auth
 	AuthChallengeTTL  time.Duration // How long a challenge is valid
@@ -27,6 +30,31 @@ type Config struct {
 	MaxMessageSize        int // Max ciphertext size (bytes)
 	MessageBatchLimit     int // Max messages per sync request
 	MaxConversationFanout int // Max recipients in a DM fan-out
+}
+
+// LoadGateway loads the shared server configuration and the gateway's
+// fail-closed, exact public origin. The configured value is validated as-is
+// and is never inferred from an incoming request.
+func LoadGateway() (*Config, error) {
+	cfg, err := Load()
+	if err != nil {
+		return nil, err
+	}
+
+	publicOrigin, configured := os.LookupEnv("VEIL_PUBLIC_ORIGIN")
+	if !configured || publicOrigin == "" {
+		return nil, errors.New("VEIL_PUBLIC_ORIGIN is required for the gateway")
+	}
+	if strings.TrimSpace(publicOrigin) != publicOrigin {
+		return nil, errors.New("VEIL_PUBLIC_ORIGIN must not contain surrounding whitespace")
+	}
+	canonicalOrigin, err := nodeorigin.ParseCanonical(publicOrigin)
+	if err != nil {
+		return nil, fmt.Errorf("invalid VEIL_PUBLIC_ORIGIN: %w", err)
+	}
+
+	cfg.PublicOrigin = canonicalOrigin
+	return cfg, nil
 }
 
 func Load() (*Config, error) {

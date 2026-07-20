@@ -72,7 +72,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; durable setup-result reconciliation реализован и host-tested в текущем локальном checkpoint; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
-| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher и pure Rust↔Go exact-origin WS v3/REST v2 contract checkpoints реализованы; runtime configured-origin cutover/two-Node relay, Android consumption, `libsignal` spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
+| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher, pure Rust↔Go exact-origin contract и mandatory configured-origin foundation реализованы; live WS v3/REST v2 cutover/two-Node relay, Android consumption, `libsignal` spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -2141,6 +2141,16 @@ Immutable synthetic fixture
 Ни gateway/protobuf/middleware, ни Node config/deploy/compatibility policy этим
 checkpoint не меняются: P1 остаётся открытым до mandatory configured origin,
 live fail-closed cutover и реальной two-Node relay matrix.
+
+**Local checkpoint 5S.3B-1 2026-07-20:** добавлен обязательный
+`VEIL_PUBLIC_ORIGIN` с exact canonical explicit-port значениями для local
+Compose и managed deployment; оба gateway Compose path используют required
+substitution без production fallback, а документация фиксирует fail-closed
+startup boundary. Это только non-deployed configured-origin foundation:
+текущие `/ws` и signed REST остаются legacy Preview WS auth v2/REST auth v1,
+никакой live Node/config activation не выполнено, P1 и Phase 5S остаются
+открытыми. Phone/ADB/APK/Pass/recovery testing по-прежнему отложен до явного
+возобновления и подтверждённо записанной recovery phrase.
 
 Private/E2EE keys при этом не извлекаются, но A может получить authenticated
 control/metadata context на B и злоупотреблять server-authoritative actions,

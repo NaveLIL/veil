@@ -38,8 +38,11 @@ The words **MUST**, **MUST NOT**, **SHOULD**, and **MAY** are normative.
    are lowercase; DNS labels use canonical LDH/punycode form; IPv4 and bracketed
    IPv6 use their canonical textual forms. Userinfo, path, trailing slash, query,
    fragment, trailing DNS dot, zone identifier, implicit/zero/leading-zero port,
-   raw Unicode, and parser-normalized aliases are rejected. Implementations
-   reconstruct the origin and require byte-for-byte equality.
+   raw Unicode, and parser-normalized aliases are rejected. An ACE hostname
+   MUST survive non-transitional WHATWG/UTS #46 domain-to-ASCII processing
+   byte-for-byte, and a DNS spelling whose final label triggers WHATWG's legacy
+   IPv4-number path is rejected. Implementations reconstruct the origin and
+   require byte-for-byte equality.
 3. Runtime activation MUST compare the signed origin with a mandatory configured
    public Node origin and the client-selected TLS origin. It MUST NOT derive the
    security scope from `Host`, forwarded headers, DNS resolution, or redirects.

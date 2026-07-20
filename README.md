@@ -157,7 +157,8 @@ Dependencies зафиксированы lock-файлами. Не обновля
 ```powershell
 Copy-Item .env.example .env
 openssl rand -hex 32
-# Запишите результат в VEIL_DB_PASSWORD и проверьте exact VEIL_WS_ORIGINS.
+# Запишите результат в VEIL_DB_PASSWORD и проверьте exact
+# VEIL_PUBLIC_ORIGIN/VEIL_WS_ORIGINS.
 docker compose up -d --build
 docker compose ps
 ```
@@ -166,6 +167,18 @@ Gateway разработки публикуется только на `127.0.0.1
 `127.0.0.1:9081`; PostgreSQL остаётся внутри Compose network. Одноразовый
 `migrate` применяет все SQL migrations до запуска gateway. Ошибка migration
 блокирует partial deployment.
+
+`VEIL_PUBLIC_ORIGIN` обязателен, содержит client-visible canonical origin с
+явным портом и не выводится из входного `Host` или forwarded headers. Для
+стандартного локального Compose это `http://127.0.0.1:9080`; при включении
+публичного proxy значение нужно явно заменить на его exact HTTPS origin.
+Отсутствующее или неканоническое значение блокирует gateway fail closed.
+
+Это configured-origin foundation, а не активация нового transport auth:
+текущие `/ws` и signed REST остаются legacy Preview WS auth v2/REST auth v1.
+До live WS v3/REST v2 cutover, two-Node relay gate и независимого review эта
+настройка не является production-готовностью или новой криптографической
+гарантией.
 
 Uploads и push намеренно fail closed, пока не заданы их ключи:
 
@@ -188,6 +201,9 @@ identity.
 
 ```powershell
 $env:VEIL_PUBLIC_HOST = 'veil.example.com'
+$env:VEIL_PUBLIC_ORIGIN = 'https://veil.example.com:443'
+$env:VEIL_WS_ORIGINS = 'https://veil.example.com'
+$env:VEIL_CORS_ORIGINS = 'https://veil.example.com'
 $env:VEIL_TLS_EMAIL = 'admin@example.com'
 docker compose --profile proxy up -d --build
 ```
