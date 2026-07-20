@@ -51,6 +51,7 @@ ADR фиксирует принятое решение и причины. Изм
 - [Android Direct Preview physical test plan](reviews/android-direct-preview-physical-test-plan.md)
 - [Phase 5S Direct-v1 transcript checkpoint](reviews/phase-5s-direct-v1-transcript-checkpoint.md)
 - [Phase 5S Direct-v1 key-validation checkpoint](reviews/phase-5s-direct-v1-key-validation-checkpoint.md)
+- [Phase 5S Direct-v1 skipped-key/state checkpoint](reviews/phase-5s-direct-v1-skipped-key-state-checkpoint.md)
 
 Эти документы являются внутренними инженерными review и evidence, а не
 заключением независимого внешнего аудитора.

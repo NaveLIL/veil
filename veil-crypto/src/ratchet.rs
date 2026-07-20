@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use subtle::ConstantTimeEq;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::aead;
 use crate::kdf;
@@ -16,6 +16,10 @@ type SkippedKeysMap = HashMap<([u8; 32], u32), [u8; 32]>;
 const MAX_SKIP: u32 = 1000;
 /// Absolute maximum number of total stored skipped keys (prevents unbounded growth).
 const MAX_TOTAL_SKIPPED: usize = 5000;
+/// Upper bound for one encrypted-at-rest ratchet JSON document. This mirrors
+/// the SQLCipher boundary and prevents direct callers from allocating an
+/// unbounded persisted session before the skipped-key cap is evaluated.
+const MAX_SERIALIZED_RATCHET_BYTES: usize = 1024 * 1024;
 /// Current authenticated Double Ratchet wire format.
 const RATCHET_HEADER_VERSION: u8 = 0x02;
 /// Domain-separated protocol associated data. The caller-provided AD and the
@@ -83,7 +87,7 @@ fn message_aad(associated_data: &[u8], header: &MessageHeader) -> Result<Vec<u8>
 ///
 /// Provides forward secrecy: each message is encrypted with a unique key.
 /// Even if a session state is compromised, past messages cannot be decrypted.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize)]
 pub struct RatchetSession {
     /// DH ratchet sending keypair (our current ratchet key)
     #[serde(with = "secret_key_serde")]
@@ -111,6 +115,84 @@ pub struct RatchetSession {
     skipped_keys: HashMap<([u8; 32], u32), [u8; 32]>,
 }
 
+struct SecretSkippedKeysMap(SkippedKeysMap);
+
+impl Drop for SecretSkippedKeysMap {
+    fn drop(&mut self) {
+        for message_key in self.0.values_mut() {
+            message_key.zeroize();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct SecretBytes32([u8; 32]);
+
+impl Drop for SecretBytes32 {
+    fn drop(&mut self) {
+        self.0.zeroize();
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(transparent)]
+struct OptionalSecretBytes32(Option<[u8; 32]>);
+
+impl Drop for OptionalSecretBytes32 {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.0.as_mut() {
+            bytes.zeroize();
+        }
+    }
+}
+
+struct OptionalSecretVec(Option<Vec<u8>>);
+
+impl Drop for OptionalSecretVec {
+    fn drop(&mut self) {
+        if let Some(bytes) = self.0.as_mut() {
+            bytes.zeroize();
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersistedRatchetSessionV1 {
+    #[serde(deserialize_with = "secret_key_serde::deserialize_guard")]
+    dh_sending_secret: OptionalSecretVec,
+    dh_sending_public: Option<[u8; 32]>,
+    dh_receiving: Option<[u8; 32]>,
+    root_key: SecretBytes32,
+    sending_chain_key: OptionalSecretBytes32,
+    receiving_chain_key: OptionalSecretBytes32,
+    send_count: u32,
+    recv_count: u32,
+    prev_send_count: u32,
+    #[serde(deserialize_with = "skipped_keys_serde::deserialize_guard")]
+    skipped_keys: SecretSkippedKeysMap,
+}
+
+impl PersistedRatchetSessionV1 {
+    fn into_validated_session(mut self) -> Result<RatchetSession, String> {
+        let session = RatchetSession {
+            dh_sending_secret: std::mem::take(&mut self.dh_sending_secret.0),
+            dh_sending_public: self.dh_sending_public,
+            dh_receiving: self.dh_receiving,
+            root_key: std::mem::take(&mut self.root_key.0),
+            sending_chain_key: std::mem::take(&mut self.sending_chain_key.0),
+            receiving_chain_key: std::mem::take(&mut self.receiving_chain_key.0),
+            send_count: self.send_count,
+            recv_count: self.recv_count,
+            prev_send_count: self.prev_send_count,
+            skipped_keys: std::mem::take(&mut self.skipped_keys.0),
+        };
+        session.validate_persisted_shape_v1()?;
+        Ok(session)
+    }
+}
+
 impl Drop for RatchetSession {
     fn drop(&mut self) {
         if let Some(ref mut secret) = self.dh_sending_secret {
@@ -130,12 +212,70 @@ impl Drop for RatchetSession {
 }
 
 impl RatchetSession {
+    fn validate_persisted_shape_v1(&self) -> Result<(), String> {
+        let secret_bytes = self
+            .dh_sending_secret
+            .as_deref()
+            .ok_or_else(|| "persisted ratchet sending secret is absent".to_string())?;
+        if secret_bytes.len() != 32 {
+            return Err("persisted ratchet sending secret must be 32 bytes".to_string());
+        }
+        let sending_public = self
+            .dh_sending_public
+            .ok_or_else(|| "persisted ratchet sending public key is absent".to_string())?;
+        let mut secret_array = [0u8; 32];
+        secret_array.copy_from_slice(secret_bytes);
+        let secret = X25519StaticSecret::from(secret_array);
+        secret_array.zeroize();
+        if X25519PublicKey::from(&secret).as_bytes() != &sending_public {
+            return Err("persisted ratchet DH secret/public keys do not match".to_string());
+        }
+        match (
+            self.dh_receiving.is_some(),
+            self.sending_chain_key.is_some(),
+            self.receiving_chain_key.is_some(),
+        ) {
+            // Bob before the first authenticated receive.
+            (false, false, false)
+                if self.send_count == 0
+                    && self.recv_count == 0
+                    && self.prev_send_count == 0
+                    && self.skipped_keys.is_empty() => {}
+            // Alice before the first authenticated receive. Sending may have
+            // advanced, but there is no previous sending chain yet.
+            (true, true, false)
+                if self.recv_count == 0
+                    && self.prev_send_count == 0
+                    && self.skipped_keys.is_empty() => {}
+            // An authenticated live ratchet always has both chain keys and at
+            // least one successfully received message in its current chain.
+            // The DH step is never published separately from that receive.
+            (true, true, true) if self.recv_count > 0 => {}
+            _ => {
+                return Err("persisted ratchet state shape is unreachable".to_string());
+            }
+        }
+        if let Some(current_ratchet_key) = self.dh_receiving {
+            if self.skipped_keys.keys().any(|(ratchet_key, number)| {
+                ratchet_key == &current_ratchet_key && *number >= self.recv_count
+            }) {
+                return Err(
+                    "persisted current-chain skipped key is ahead of receive state".to_string(),
+                );
+            }
+        }
+        if self.skipped_keys.len() > MAX_TOTAL_SKIPPED {
+            return Err("persisted skipped message key capacity exceeded".to_string());
+        }
+        Ok(())
+    }
+
     /// Compare this live ratchet with one SQLCipher serialization without
     /// relying on JSON object order. Secret fields and message-key values are
     /// compared in constant time; public counters/map keys may select shape.
     /// The decoded candidate zeroizes its secrets on drop.
     pub fn matches_serialized_v1(&self, serialized: &[u8]) -> Result<bool, String> {
-        let persisted: Self = serde_json::from_slice(serialized)
+        let persisted = Self::deserialize(serialized)
             .map_err(|error| format!("decode persisted ratchet session: {error}"))?;
         Ok(self.same_state_v1(&persisted))
     }
@@ -509,7 +649,7 @@ impl RatchetSession {
 
     /// Skip ahead to message number `until`, storing skipped keys.
     fn skip_messages(&mut self, until: u32) -> Result<(), String> {
-        if self.recv_count + MAX_SKIP < until {
+        if until.saturating_sub(self.recv_count) > MAX_SKIP {
             return Err(format!(
                 "too many skipped messages: {} → {}",
                 self.recv_count, until
@@ -517,28 +657,37 @@ impl RatchetSession {
         }
 
         if let Some(ref ck) = self.receiving_chain_key {
+            let ratchet_key = self
+                .dh_receiving
+                .ok_or("receiving chain has no ratchet key")?;
+            let gap = until.saturating_sub(self.recv_count) as usize;
+            if gap > MAX_TOTAL_SKIPPED.saturating_sub(self.skipped_keys.len()) {
+                return Err("skipped message key capacity exhausted".to_string());
+            }
+            if (self.recv_count..until)
+                .any(|number| self.skipped_keys.contains_key(&(ratchet_key, number)))
+            {
+                return Err("duplicate skipped message key state".to_string());
+            }
+
             let mut chain_key = *ck;
             while self.recv_count < until {
-                let message_key = kdf::hmac_sha256(&chain_key, b"\x01");
-                let next_ck = kdf::hmac_sha256(&chain_key, b"\x02");
+                let mut message_key = kdf::hmac_sha256(&chain_key, b"\x01");
+                let mut next_ck = kdf::hmac_sha256(&chain_key, b"\x02");
+                chain_key.zeroize();
                 chain_key = next_ck;
+                next_ck.zeroize();
 
-                let rk = self.dh_receiving.unwrap_or([0u8; 32]);
-                // Enforce global cap on stored skipped keys
-                if self.skipped_keys.len() >= MAX_TOTAL_SKIPPED {
-                    // Evict oldest entry (arbitrary key — HashMap is unordered)
-                    if let Some(&oldest) = self.skipped_keys.keys().next() {
-                        let mut evicted = self.skipped_keys.remove(&oldest).unwrap_or([0u8; 32]);
-                        evicted.zeroize();
-                    }
-                }
-                self.skipped_keys.insert((rk, self.recv_count), message_key);
+                let skipped_key = (ratchet_key, self.recv_count);
+                self.skipped_keys.insert(skipped_key, message_key);
+                message_key.zeroize();
                 self.recv_count = self
                     .recv_count
                     .checked_add(1)
                     .ok_or("recv counter overflow in skip".to_string())?;
             }
             self.receiving_chain_key = Some(chain_key);
+            chain_key.zeroize();
         }
 
         Ok(())
@@ -552,14 +701,29 @@ impl RatchetSession {
         aad: &[u8],
     ) -> Result<Option<Vec<u8>>, String> {
         let key = (header.ratchet_key, header.n);
-        if let Some(mut message_key) = self.skipped_keys.remove(&key) {
+        if let Some(stored_message_key) = self.skipped_keys.get(&key) {
+            let message_key = Zeroizing::new(*stored_message_key);
             let nonce: [u8; aead::NONCE_SIZE] = ciphertext[..aead::NONCE_SIZE]
                 .try_into()
                 .map_err(|_| "invalid nonce")?;
             let ct = &ciphertext[aead::NONCE_SIZE..];
             let result = aead::decrypt_with_aad(&message_key, ct, &nonce, aad);
-            message_key.zeroize();
-            Ok(Some(result?))
+            let plaintext = result?;
+
+            // Wipe the live bucket before removing it. Removing a Copy value
+            // first can leave the moved-from bucket outside the map's Drop
+            // traversal. On authentication error the entry remains active, so
+            // dropping the unpublished candidate wipes it normally.
+            self.skipped_keys
+                .get_mut(&key)
+                .ok_or("authenticated skipped message key disappeared")?
+                .zeroize();
+            let mut removed = self
+                .skipped_keys
+                .remove(&key)
+                .ok_or("authenticated skipped message key disappeared")?;
+            removed.zeroize();
+            Ok(Some(plaintext))
         } else {
             Ok(None)
         }
@@ -580,100 +744,244 @@ impl RatchetSession {
 
     /// Serialize session state for persistence (encrypted by veil-store).
     pub fn serialize(&self) -> Result<Vec<u8>, String> {
-        serde_json::to_vec(self).map_err(|e| format!("serialize: {e}"))
+        self.validate_persisted_shape_v1()
+            .map_err(|error| format!("serialize: {error}"))?;
+        let mut serialized = Zeroizing::new(Vec::new());
+        serde_json::to_writer(&mut *serialized, self).map_err(|e| format!("serialize: {e}"))?;
+        if serialized.len() > MAX_SERIALIZED_RATCHET_BYTES {
+            return Err("serialize: ratchet session is oversized".to_string());
+        }
+        Ok(std::mem::take(&mut *serialized))
     }
 
     /// Deserialize session state.
     pub fn deserialize(data: &[u8]) -> Result<Self, String> {
-        serde_json::from_slice(data).map_err(|e| format!("deserialize: {e}"))
+        if data.is_empty() || data.len() > MAX_SERIALIZED_RATCHET_BYTES {
+            return Err("deserialize: ratchet session is empty or oversized".to_string());
+        }
+        // The v1 writer never emits JSON escapes: every field name is fixed,
+        // Base64 uses an escape-free alphabet, and all other fields are
+        // numeric. Reject aliases before serde_json can copy an escaped secret
+        // string into its internal scratch buffer, which it does not zeroize.
+        if data.contains(&b'\\') {
+            return Err("deserialize: ratchet session contains non-canonical JSON escapes".into());
+        }
+        let persisted: PersistedRatchetSessionV1 =
+            serde_json::from_slice(data).map_err(|e| format!("deserialize: {e}"))?;
+        persisted
+            .into_validated_session()
+            .map_err(|e| format!("deserialize: {e}"))
     }
 }
 
 // Serde helpers for secret key serialization
 mod secret_key_serde {
     use base64::Engine;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::{Deserialize, Deserializer, Serializer};
+    use zeroize::{Zeroize, Zeroizing};
+
+    const ENCODED_KEY_BYTES: usize = 44;
+    // Padded Base64 length estimates can be one byte above the actual decoded
+    // length. Keep that byte caller-owned and wipe the entire buffer on drop.
+    const DECODE_BUFFER_BYTES: usize = 33;
 
     pub fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        value
-            .as_ref()
-            .map(|v| base64::engine::general_purpose::STANDARD.encode(v))
-            .serialize(serializer)
+        match value {
+            Some(value) => {
+                let mut encoded = base64::engine::general_purpose::STANDARD.encode(value);
+                let result = serializer.serialize_some(&encoded);
+                encoded.zeroize();
+                result
+            }
+            None => serializer.serialize_none(),
+        }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    pub fn deserialize_guard<'de, D>(deserializer: D) -> Result<super::OptionalSecretVec, D::Error>
     where
         D: Deserializer<'de>,
     {
         use base64::Engine;
         let opt: Option<String> = Option::deserialize(deserializer)?;
         match opt {
-            Some(s) => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(&s)
+            Some(encoded) => {
+                let encoded = Zeroizing::new(encoded);
+                if encoded.len() != ENCODED_KEY_BYTES {
+                    return Err(serde::de::Error::custom(
+                        "invalid canonical ratchet sending secret",
+                    ));
+                }
+
+                let mut decoded = Zeroizing::new([0u8; DECODE_BUFFER_BYTES]);
+                let decoded_len = base64::engine::general_purpose::STANDARD
+                    .decode_slice(encoded.as_bytes(), decoded.as_mut())
                     .map_err(serde::de::Error::custom)?;
-                Ok(Some(bytes))
+                let canonical = decoded_len == 32 && {
+                    let mut canonical_encoded =
+                        base64::engine::general_purpose::STANDARD.encode(&decoded[..decoded_len]);
+                    let result = canonical_encoded == encoded.as_str();
+                    canonical_encoded.zeroize();
+                    result
+                };
+                if !canonical {
+                    return Err(serde::de::Error::custom(
+                        "invalid canonical ratchet sending secret",
+                    ));
+                }
+                Ok(super::OptionalSecretVec(Some(decoded[..32].to_vec())))
             }
-            None => Ok(None),
+            None => Ok(super::OptionalSecretVec(None)),
         }
     }
 }
 
 mod skipped_keys_serde {
-    use super::SkippedKeysMap;
+    use super::{SecretSkippedKeysMap, SkippedKeysMap, MAX_TOTAL_SKIPPED};
     use base64::Engine;
-    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use serde::de::{MapAccess, Visitor};
+    use serde::ser::SerializeMap;
+    use serde::{Deserializer, Serializer};
     use std::collections::HashMap;
+    use std::fmt;
+    use zeroize::{Zeroize, Zeroizing};
+
+    const ENCODED_KEY_BYTES: usize = 44;
+    const DECODE_BUFFER_BYTES: usize = 33;
 
     pub fn serialize<S>(value: &SkippedKeysMap, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let map: HashMap<String, String> = value
-            .iter()
-            .map(|((key, n), mk)| {
-                let k = format!(
-                    "{}:{}",
-                    base64::engine::general_purpose::STANDARD.encode(key),
-                    n
-                );
-                let v = base64::engine::general_purpose::STANDARD.encode(mk);
-                (k, v)
-            })
-            .collect();
-        map.serialize(serializer)
+        if value.len() > MAX_TOTAL_SKIPPED {
+            return Err(serde::ser::Error::custom(
+                "skipped message key capacity exceeded",
+            ));
+        }
+        // Preserve the existing v1 JSON object shape but emit raw ratchet-key
+        // bytes and numeric counters in a canonical order. In particular,
+        // frozen empty states remain `{}`, while 2 sorts before 10.
+        let mut entries: Vec<_> = value.iter().collect();
+        entries.sort_unstable_by(
+            |((left_key, left_number), _), ((right_key, right_number), _)| {
+                left_key.cmp(right_key).then(left_number.cmp(right_number))
+            },
+        );
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for ((ratchet_key, number), message_key) in entries {
+            let encoded_key = format!(
+                "{}:{}",
+                base64::engine::general_purpose::STANDARD.encode(ratchet_key),
+                number
+            );
+            let mut encoded_message_key =
+                base64::engine::general_purpose::STANDARD.encode(message_key);
+            let serialized = map.serialize_entry(&encoded_key, &encoded_message_key);
+            encoded_message_key.zeroize();
+            serialized?;
+        }
+        map.end()
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<SkippedKeysMap, D::Error>
+    pub fn deserialize_guard<'de, D>(deserializer: D) -> Result<SecretSkippedKeysMap, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let map: HashMap<String, String> = HashMap::deserialize(deserializer)?;
-        let mut result = HashMap::new();
-        for (k, v) in map {
-            let parts: Vec<&str> = k.rsplitn(2, ':').collect();
-            if parts.len() != 2 {
-                continue;
+        struct SkippedKeysVisitor;
+
+        impl<'de> Visitor<'de> for SkippedKeysVisitor {
+            type Value = SecretSkippedKeysMap;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("a bounded canonical skipped-message-key object")
             }
-            let n: u32 = parts[0].parse().map_err(serde::de::Error::custom)?;
-            let key_bytes = base64::engine::general_purpose::STANDARD
-                .decode(parts[1])
-                .map_err(serde::de::Error::custom)?;
-            let mk_bytes = base64::engine::general_purpose::STANDARD
-                .decode(&v)
-                .map_err(serde::de::Error::custom)?;
-            if key_bytes.len() == 32 && mk_bytes.len() == 32 {
-                let mut key = [0u8; 32];
-                let mut mk = [0u8; 32];
-                key.copy_from_slice(&key_bytes);
-                mk.copy_from_slice(&mk_bytes);
-                result.insert((key, n), mk);
+
+            fn visit_map<A>(self, mut entries: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut result = SecretSkippedKeysMap(HashMap::new());
+                while let Some((encoded_key, encoded_message_key)) =
+                    entries.next_entry::<String, String>()?
+                {
+                    let encoded_message_key = Zeroizing::new(encoded_message_key);
+                    if result.0.len() >= MAX_TOTAL_SKIPPED {
+                        return Err(serde::de::Error::custom(
+                            "skipped message key capacity exceeded",
+                        ));
+                    }
+                    let (encoded_ratchet_key, encoded_number) = encoded_key
+                        .rsplit_once(':')
+                        .ok_or_else(|| serde::de::Error::custom("invalid skipped message key"))?;
+                    let number: u32 = encoded_number.parse().map_err(serde::de::Error::custom)?;
+                    if encoded_number != number.to_string() {
+                        return Err(serde::de::Error::custom(
+                            "non-canonical skipped message number",
+                        ));
+                    }
+
+                    if encoded_ratchet_key.len() != ENCODED_KEY_BYTES {
+                        return Err(serde::de::Error::custom(
+                            "invalid canonical skipped ratchet key",
+                        ));
+                    }
+                    let mut ratchet_key_bytes = [0u8; DECODE_BUFFER_BYTES];
+                    let ratchet_key_len = base64::engine::general_purpose::STANDARD
+                        .decode_slice(encoded_ratchet_key.as_bytes(), &mut ratchet_key_bytes)
+                        .map_err(serde::de::Error::custom)?;
+                    if ratchet_key_len != 32
+                        || base64::engine::general_purpose::STANDARD
+                            .encode(&ratchet_key_bytes[..ratchet_key_len])
+                            != encoded_ratchet_key
+                    {
+                        return Err(serde::de::Error::custom(
+                            "invalid canonical skipped ratchet key",
+                        ));
+                    }
+
+                    if encoded_message_key.len() != ENCODED_KEY_BYTES {
+                        return Err(serde::de::Error::custom(
+                            "invalid canonical skipped message key material",
+                        ));
+                    }
+                    let mut message_key_bytes = Zeroizing::new([0u8; DECODE_BUFFER_BYTES]);
+                    let message_key_len = base64::engine::general_purpose::STANDARD
+                        .decode_slice(encoded_message_key.as_bytes(), message_key_bytes.as_mut())
+                        .map_err(serde::de::Error::custom)?;
+                    let canonical_message_key = if message_key_len == 32 {
+                        let mut canonical_encoded = base64::engine::general_purpose::STANDARD
+                            .encode(&message_key_bytes[..message_key_len]);
+                        let result = canonical_encoded == encoded_message_key.as_str();
+                        canonical_encoded.zeroize();
+                        result
+                    } else {
+                        false
+                    };
+                    if !canonical_message_key {
+                        return Err(serde::de::Error::custom(
+                            "invalid canonical skipped message key material",
+                        ));
+                    }
+
+                    let mut ratchet_key = [0u8; 32];
+                    ratchet_key.copy_from_slice(&ratchet_key_bytes[..32]);
+                    let mut message_key = [0u8; 32];
+                    message_key.copy_from_slice(&message_key_bytes[..32]);
+                    if result.0.contains_key(&(ratchet_key, number)) {
+                        message_key.zeroize();
+                        return Err(serde::de::Error::custom("duplicate skipped message key"));
+                    }
+                    result.0.insert((ratchet_key, number), message_key);
+                    message_key.zeroize();
+                }
+
+                Ok(result)
             }
         }
-        Ok(result)
+
+        deserializer.deserialize_map(SkippedKeysVisitor)
     }
 }
 
@@ -733,7 +1041,9 @@ mod tests {
 
     #[test]
     fn persisted_state_match_is_independent_of_skipped_key_map_order() {
-        let (mut live, _) = setup_sessions();
+        let (mut sender, mut live) = setup_sessions();
+        let (header, ciphertext) = sender.encrypt(b"initialize receiver").unwrap();
+        live.decrypt(&header, &ciphertext).unwrap();
         let first = ([0x31; 32], 7);
         let second = ([0x42; 32], 9);
         live.skipped_keys.insert(first, [0xA1; 32]);
@@ -744,12 +1054,292 @@ mod tests {
         persisted.skipped_keys.insert(second, [0xB2; 32]);
         persisted.skipped_keys.insert(first, [0xA1; 32]);
         let serialized = serde_json::to_vec(&persisted).unwrap();
+        assert_eq!(live.serialize().unwrap(), persisted.serialize().unwrap());
         assert!(live.matches_serialized_v1(&serialized).unwrap());
 
         persisted.skipped_keys.insert(first, [0xFF; 32]);
         let changed = serde_json::to_vec(&persisted).unwrap();
         assert!(!live.matches_serialized_v1(&changed).unwrap());
         assert!(live.matches_serialized_v1(b"not-json").is_err());
+    }
+
+    fn replace_skipped_entries(serialized: &[u8], entries: &str) -> Vec<u8> {
+        String::from_utf8(serialized.to_vec())
+            .unwrap()
+            .replacen(
+                "\"skipped_keys\":{}",
+                &format!("\"skipped_keys\":{{{entries}}}"),
+                1,
+            )
+            .into_bytes()
+    }
+
+    fn session_json_with_skipped_entries(entries: &str) -> Vec<u8> {
+        let (mut sender, mut session) = setup_sessions();
+        let (header, ciphertext) = sender.encrypt(b"initialize receiver").unwrap();
+        session.decrypt(&header, &ciphertext).unwrap();
+        replace_skipped_entries(&session.serialize().unwrap(), entries)
+    }
+
+    fn encoded_skipped_entry(
+        ratchet_key: impl AsRef<[u8]>,
+        number: &str,
+        message_key: impl AsRef<[u8]>,
+    ) -> String {
+        use base64::Engine;
+
+        format!(
+            "\"{}:{}\":\"{}\"",
+            base64::engine::general_purpose::STANDARD.encode(ratchet_key),
+            number,
+            base64::engine::general_purpose::STANDARD.encode(message_key)
+        )
+    }
+
+    #[test]
+    fn skipped_key_serialization_is_canonical_and_accepts_legacy_member_order() {
+        let first = encoded_skipped_entry([0x31; 32], "7", [0xA1; 32]);
+        let second = encoded_skipped_entry([0x42; 32], "9", [0xB2; 32]);
+        let (mut sender, mut session) = setup_sessions();
+        let (header, ciphertext) = sender.encrypt(b"initialize receiver").unwrap();
+        session.decrypt(&header, &ciphertext).unwrap();
+        let base = session.serialize().unwrap();
+        let forward = replace_skipped_entries(&base, &format!("{first},{second}"));
+        let reverse = replace_skipped_entries(&base, &format!("{second},{first}"));
+
+        let forward = RatchetSession::deserialize(&forward).unwrap();
+        let reverse = RatchetSession::deserialize(&reverse).unwrap();
+        assert!(forward.same_state_v1(&reverse));
+        assert_eq!(forward.serialize().unwrap(), reverse.serialize().unwrap());
+
+        let ten = encoded_skipped_entry([0x55; 32], "10", [0x10; 32]);
+        let two = encoded_skipped_entry([0x55; 32], "2", [0x02; 32]);
+        let numeric =
+            RatchetSession::deserialize(&replace_skipped_entries(&base, &format!("{ten},{two}")))
+                .unwrap();
+        let numeric = String::from_utf8(numeric.serialize().unwrap()).unwrap();
+        assert!(numeric.find(":2\"").unwrap() < numeric.find(":10\"").unwrap());
+    }
+
+    #[test]
+    fn persisted_ratchet_shape_rejects_unknown_mismatched_and_impossible_state() {
+        use base64::Engine;
+
+        let (session, _) = setup_sessions();
+        let base: serde_json::Value =
+            serde_json::from_slice(&session.serialize().unwrap()).unwrap();
+
+        let mut unknown = base.clone();
+        unknown["unexpected"] = serde_json::json!(true);
+        assert!(RatchetSession::deserialize(&serde_json::to_vec(&unknown).unwrap()).is_err());
+
+        let mut mismatched_public = base.clone();
+        let first_public_byte = mismatched_public["dh_sending_public"][0].as_u64().unwrap();
+        mismatched_public["dh_sending_public"][0] = serde_json::json!(first_public_byte ^ 1);
+        assert!(
+            RatchetSession::deserialize(&serde_json::to_vec(&mismatched_public).unwrap()).is_err()
+        );
+
+        let mut short_secret = base.clone();
+        short_secret["dh_sending_secret"] =
+            serde_json::json!(base64::engine::general_purpose::STANDARD.encode([0x11; 31]));
+        assert!(RatchetSession::deserialize(&serde_json::to_vec(&short_secret).unwrap()).is_err());
+
+        let mut malformed_secret = base.clone();
+        malformed_secret["dh_sending_secret"] = serde_json::json!("!".repeat(44));
+        assert!(
+            RatchetSession::deserialize(&serde_json::to_vec(&malformed_secret).unwrap()).is_err()
+        );
+
+        let mut escaped_secret = Zeroizing::new(
+            String::from_utf8(session.serialize().unwrap()).expect("ratchet JSON is UTF-8"),
+        );
+        let secret_marker = "\"dh_sending_secret\":\"";
+        let secret_start = escaped_secret.find(secret_marker).unwrap() + secret_marker.len();
+        let secret_byte = escaped_secret.as_bytes()[secret_start];
+        escaped_secret.replace_range(
+            secret_start..secret_start + 1,
+            &format!("\\u00{secret_byte:02X}"),
+        );
+        let error = match RatchetSession::deserialize(escaped_secret.as_bytes()) {
+            Ok(_) => panic!("escaped persisted secret was accepted"),
+            Err(error) => error,
+        };
+        assert!(error.contains("non-canonical JSON escapes"));
+
+        let mut missing_initial_sending_chain = base.clone();
+        missing_initial_sending_chain["sending_chain_key"] = serde_json::Value::Null;
+        assert!(RatchetSession::deserialize(
+            &serde_json::to_vec(&missing_initial_sending_chain).unwrap()
+        )
+        .is_err());
+
+        let mut impossible_previous_chain = base.clone();
+        impossible_previous_chain["prev_send_count"] = serde_json::json!(1);
+        assert!(RatchetSession::deserialize(
+            &serde_json::to_vec(&impossible_previous_chain).unwrap()
+        )
+        .is_err());
+
+        let mut impossible_counter = base;
+        impossible_counter["sending_chain_key"] = serde_json::Value::Null;
+        impossible_counter["send_count"] = serde_json::json!(1);
+        assert!(
+            RatchetSession::deserialize(&serde_json::to_vec(&impossible_counter).unwrap()).is_err()
+        );
+
+        let (mut sender, mut receiver) = setup_sessions();
+        let (header, ciphertext) = sender.encrypt(b"initialize receiver").unwrap();
+        receiver.decrypt(&header, &ciphertext).unwrap();
+        let mut missing_live_sending_chain: serde_json::Value =
+            serde_json::from_slice(&receiver.serialize().unwrap()).unwrap();
+        missing_live_sending_chain["sending_chain_key"] = serde_json::Value::Null;
+        assert!(RatchetSession::deserialize(
+            &serde_json::to_vec(&missing_live_sending_chain).unwrap()
+        )
+        .is_err());
+
+        let mut responder_live_with_zero_recv: serde_json::Value =
+            serde_json::from_slice(&receiver.serialize().unwrap()).unwrap();
+        responder_live_with_zero_recv["recv_count"] = serde_json::json!(0);
+        assert!(RatchetSession::deserialize(
+            &serde_json::to_vec(&responder_live_with_zero_recv).unwrap()
+        )
+        .is_err());
+
+        let (reply_header, reply_ciphertext) = receiver.encrypt(b"reply").unwrap();
+        sender.decrypt(&reply_header, &reply_ciphertext).unwrap();
+        let mut initiator_live_with_zero_recv: serde_json::Value =
+            serde_json::from_slice(&sender.serialize().unwrap()).unwrap();
+        initiator_live_with_zero_recv["recv_count"] = serde_json::json!(0);
+        assert!(RatchetSession::deserialize(
+            &serde_json::to_vec(&initiator_live_with_zero_recv).unwrap()
+        )
+        .is_err());
+
+        let mut ahead = receiver.serialize().unwrap();
+        let entry = encoded_skipped_entry(
+            receiver.dh_receiving.unwrap(),
+            &receiver.recv_count.to_string(),
+            [0x22; 32],
+        );
+        ahead = replace_skipped_entries(&ahead, &entry);
+        assert!(RatchetSession::deserialize(&ahead).is_err());
+    }
+
+    #[test]
+    fn skipped_key_deserialization_rejects_malformed_noncanonical_and_duplicate_entries() {
+        use base64::Engine;
+
+        let canonical = encoded_skipped_entry([0x31; 32], "7", [0xA1; 32]);
+        let short_ratchet = encoded_skipped_entry([0x31; 31], "7", [0xA1; 32]);
+        let short_message = encoded_skipped_entry([0x31; 32], "7", [0xA1; 31]);
+        let leading_zero = encoded_skipped_entry([0x31; 32], "07", [0xA1; 32]);
+        let unpadded_ratchet = canonical.replacen(
+            &base64::engine::general_purpose::STANDARD.encode([0x31; 32]),
+            &base64::engine::general_purpose::STANDARD_NO_PAD.encode([0x31; 32]),
+            1,
+        );
+        let invalid_message = format!(
+            "\"{}:7\":\"{}\"",
+            base64::engine::general_purpose::STANDARD.encode([0x31; 32]),
+            "!".repeat(44)
+        );
+        let malformed = format!(
+            "\"missing-number\":\"{}\"",
+            base64::engine::general_purpose::STANDARD.encode([0xA1; 32])
+        );
+
+        for entries in [
+            malformed,
+            short_ratchet,
+            short_message,
+            leading_zero,
+            unpadded_ratchet,
+            invalid_message,
+            format!("{canonical},{canonical}"),
+        ] {
+            assert!(
+                RatchetSession::deserialize(&session_json_with_skipped_entries(&entries)).is_err(),
+                "accepted malformed skipped-key entry: {entries}"
+            );
+        }
+    }
+
+    #[test]
+    fn skipped_key_deserialization_enforces_total_and_document_bounds() {
+        let entries = (0..=MAX_TOTAL_SKIPPED)
+            .map(|number| encoded_skipped_entry([0x31; 32], &number.to_string(), [0xA1; 32]))
+            .collect::<Vec<_>>()
+            .join(",");
+        let oversized_map = session_json_with_skipped_entries(&entries);
+        assert!(oversized_map.len() < MAX_SERIALIZED_RATCHET_BYTES);
+        let map_error = match RatchetSession::deserialize(&oversized_map) {
+            Ok(_) => panic!("oversized skipped-key map was accepted"),
+            Err(error) => error,
+        };
+        assert!(map_error.contains("capacity exceeded"));
+        let document_error =
+            match RatchetSession::deserialize(&vec![b' '; MAX_SERIALIZED_RATCHET_BYTES + 1]) {
+                Ok(_) => panic!("oversized ratchet document was accepted"),
+                Err(error) => error,
+            };
+        assert!(document_error.contains("empty or oversized"));
+    }
+
+    #[test]
+    fn skipped_key_capacity_and_counter_exhaustion_roll_back() {
+        let (mut alice, mut bob) = setup_sessions();
+        let (header, ciphertext) = alice.encrypt(b"initialize receiving chain").unwrap();
+        bob.decrypt(&header, &ciphertext).unwrap();
+
+        for number in 0..MAX_TOTAL_SKIPPED as u32 {
+            bob.skipped_keys.insert(([0x7A; 32], number), [0xA5; 32]);
+        }
+        let before_capacity = bob.serialize().unwrap();
+        let error = bob.skip_messages(bob.recv_count + 1).unwrap_err();
+        assert!(error.contains("capacity exhausted"));
+        assert_eq!(bob.serialize().unwrap(), before_capacity);
+
+        bob.skipped_keys.clear();
+        bob.recv_count = u32::MAX - 1;
+        bob.skip_messages(u32::MAX).unwrap();
+        let before_counter = bob.serialize().unwrap();
+        let header = MessageHeader {
+            ratchet_key: bob.dh_receiving.unwrap(),
+            n: u32::MAX,
+            pn: 0,
+        };
+        let error = bob.decrypt(&header, &[0; aead::NONCE_SIZE]).unwrap_err();
+        assert!(error.contains("recv counter overflow"));
+        assert_eq!(bob.serialize().unwrap(), before_counter);
+    }
+
+    #[test]
+    fn per_chain_skip_limit_rejects_without_losing_authentic_packets() {
+        let (mut alice, mut bob) = setup_sessions();
+        let mut packets = Vec::new();
+        for number in 0..=MAX_SKIP + 1 {
+            packets.push(
+                alice
+                    .encrypt(format!("message-{number}").as_bytes())
+                    .unwrap(),
+            );
+        }
+        let before = bob.serialize().unwrap();
+        let rejected = &packets[(MAX_SKIP + 1) as usize];
+        assert!(bob.decrypt(&rejected.0, &rejected.1).is_err());
+        assert_eq!(bob.serialize().unwrap(), before);
+
+        let boundary = &packets[MAX_SKIP as usize];
+        assert_eq!(
+            bob.decrypt(&boundary.0, &boundary.1).unwrap(),
+            format!("message-{MAX_SKIP}").as_bytes()
+        );
+        assert_eq!(
+            bob.decrypt(&packets[0].0, &packets[0].1).unwrap(),
+            b"message-0"
+        );
     }
 
     #[test]
@@ -953,6 +1543,14 @@ mod tests {
 
         let mut tampered = h1.clone();
         tampered.pn ^= 1;
+        let mut rejected_candidate = bob.clone();
+        let aad = message_aad(&[], &tampered).unwrap();
+        assert!(rejected_candidate
+            .try_skipped_keys(&tampered, &ct1, &aad)
+            .is_err());
+        assert!(rejected_candidate
+            .skipped_keys
+            .contains_key(&(tampered.ratchet_key, tampered.n)));
         assert!(bob.decrypt(&tampered, &ct1).is_err());
         assert_serialized_session_eq(bob.serialize().unwrap(), before);
         assert_eq!(bob.decrypt(&h1, &ct1).unwrap(), b"one");

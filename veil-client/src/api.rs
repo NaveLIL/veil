@@ -55,6 +55,7 @@ const DEVICE_ROSTER_COMMITMENT_DOMAIN: &[u8] = b"veil-conversation-device-roster
 const SEND_MESSAGE_REQUEST_DIGEST_DOMAIN_V1: &[u8] = b"veil.message.send.v1\0";
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PendingInitialHeader {
     ephemeral_public: [u8; 32],
     signed_prekey_id: u32,
@@ -143,6 +144,7 @@ struct ReceiveCryptoSnapshot {
     otk_secrets: HashMap<u32, [u8; 32]>,
     sender_keys: SenderKeyStore,
     channel_conversations: HashSet<String>,
+    sender_key_distribution_pending: HashSet<String>,
     pending_initial_headers: HashMap<[u8; 32], PendingInitialHeader>,
     pending_initial_sequences: HashMap<u64, [u8; 32]>,
 }
@@ -182,6 +184,27 @@ fn ratchet_associated_data(
     ad.extend_from_slice(&prefix_len.to_be_bytes());
     ad.extend_from_slice(wire_prefix);
     Ok(ad)
+}
+
+fn persist_existing_ratchet_transition_v1(
+    db: &VeilDb,
+    peer_identity_key: &[u8; 32],
+    expected_session: &RatchetSession,
+    advanced_session: &RatchetSession,
+) -> Result<u64, String> {
+    let persisted = db
+        .load_ratchet_session_with_revision_v1(peer_identity_key)?
+        .ok_or_else(|| "ratchet session is absent from SQLCipher".to_string())?;
+    if !expected_session.matches_serialized_v1(&persisted.session_data)? {
+        return Err("in-memory ratchet differs from its SQLCipher revision".to_string());
+    }
+    let advanced = Zeroizing::new(advanced_session.serialize()?);
+    db.compare_and_swap_ratchet_session_v1(
+        peer_identity_key,
+        persisted.revision,
+        &persisted.session_data,
+        &advanced,
+    )
 }
 
 fn random_device_id() -> [u8; 16] {
@@ -242,7 +265,7 @@ pub enum ReceiveMessageResult {
     Duplicate,
 }
 
-/// Internal classification used by authenticated Direct history.
+/// Internal classification used by authenticated inbound mutations.
 ///
 /// Public desktop APIs deliberately keep their established `String` surface;
 /// this type exists so a peer-controlled cryptographic rejection can be
@@ -384,9 +407,9 @@ fn is_retryable_correlated_send_error_v1(code: u32, reason: Option<&str>) -> boo
         || (code == 401 && reason == Some("not_authenticated"))
 }
 
-/// Internal classification for initiator-side X3DH persistence. Cryptographic
-/// or peer-bundle rejection is definite; a SQLCipher error is not, because the
-/// ratchet/header transaction may already have committed.
+/// Internal classification for initiator/responder X3DH persistence.
+/// Cryptographic or peer-bundle rejection is definite; a SQLCipher error is
+/// not, because the ratchet/header transaction may already have committed.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DirectSessionEstablishErrorV1 {
     Rejected(String),
@@ -1052,6 +1075,7 @@ impl VeilClient {
             otk_secrets: self.otk_secrets.clone(),
             sender_keys: self.sender_keys.clone(),
             channel_conversations: self.channel_conversations.clone(),
+            sender_key_distribution_pending: self.sender_key_distribution_pending.clone(),
             pending_initial_headers: self.pending_initial_headers.clone(),
             pending_initial_sequences: self.pending_initial_sequences.clone(),
         }
@@ -1062,6 +1086,8 @@ impl VeilClient {
         self.otk_secrets = std::mem::take(&mut snapshot.otk_secrets);
         self.sender_keys = std::mem::replace(&mut snapshot.sender_keys, SenderKeyStore::new());
         self.channel_conversations = std::mem::take(&mut snapshot.channel_conversations);
+        self.sender_key_distribution_pending =
+            std::mem::take(&mut snapshot.sender_key_distribution_pending);
         self.pending_initial_headers = std::mem::take(&mut snapshot.pending_initial_headers);
         self.pending_initial_sequences = std::mem::take(&mut snapshot.pending_initial_sequences);
     }
@@ -1288,18 +1314,29 @@ impl VeilClient {
         self.ratchet_sessions.clear();
         self.pending_initial_headers.clear();
         self.pending_initial_sequences.clear();
+        let mut decoded_ratchet_sessions = HashMap::new();
+        for (peer, persisted) in db.load_all_ratchet_sessions_with_revision_v1()? {
+            let session = RatchetSession::deserialize(&persisted.session_data)
+                .map_err(|error| format!("decode persisted ratchet session: {error}"))?;
+            if decoded_ratchet_sessions.insert(peer, session).is_some() {
+                return Err("duplicate persisted ratchet peer identity key".to_string());
+            }
+        }
+        let mut hydrated_ratchet_sessions = HashMap::new();
         for conversation in db.get_conversations()? {
             if let Some(peer) = conversation.peer_identity_key {
-                if let Ok(peer) = <[u8; 32]>::try_from(peer.as_slice()) {
-                    if let Ok(Some(data)) = db.load_ratchet_session(&peer) {
-                        let data = Zeroizing::new(data);
-                        if let Ok(session) = serde_json::from_slice::<RatchetSession>(&data) {
-                            self.ratchet_sessions.insert(peer, session);
-                        }
-                    }
+                let peer: [u8; 32] = peer.try_into().map_err(|peer: Vec<u8>| {
+                    format!(
+                        "persisted Direct conversation peer identity key has invalid length {}",
+                        peer.len()
+                    )
+                })?;
+                if let Some(session) = decoded_ratchet_sessions.get(&peer) {
+                    hydrated_ratchet_sessions.insert(peer, session.clone());
                 }
             }
         }
+        let mut hydrated_pending_initial_headers = HashMap::new();
         for (peer, header_data) in db.load_pending_initial_headers()? {
             let header: PendingInitialHeader = serde_json::from_slice(&header_data)
                 .map_err(|e| format!("decode pending X3DH header: {e}"))?;
@@ -1307,18 +1344,23 @@ impl VeilClient {
                 return Err("invalid persisted pending X3DH header".to_string());
             }
             if let std::collections::hash_map::Entry::Vacant(entry) =
-                self.ratchet_sessions.entry(peer)
+                hydrated_ratchet_sessions.entry(peer)
             {
-                let data = db
-                    .load_ratchet_session(&peer)?
+                let session = decoded_ratchet_sessions
+                    .get(&peer)
+                    .cloned()
                     .ok_or("pending X3DH header has no ratchet session")?;
-                let data = Zeroizing::new(data);
-                let session = serde_json::from_slice::<RatchetSession>(&data)
-                    .map_err(|e| format!("decode pending initiator ratchet: {e}"))?;
                 entry.insert(session);
             }
-            self.pending_initial_headers.insert(peer, header);
+            if hydrated_pending_initial_headers
+                .insert(peer, header)
+                .is_some()
+            {
+                return Err("duplicate persisted pending X3DH peer identity key".to_string());
+            }
         }
+        self.ratchet_sessions = hydrated_ratchet_sessions;
+        self.pending_initial_headers = hydrated_pending_initial_headers;
 
         self.device_identity = Some(device_identity);
         self.identity = Some(identity);
@@ -2664,10 +2706,9 @@ impl VeilClient {
                     MessageAckCorrelationV1::Mutation => {
                         self.confirm_initial_message(*ref_seq)?;
                         // Move a confirmed edit (and its plaintext) into the
-                        // caller-visible event only after the fallible initial
-                        // session persistence has completed. Otherwise that
-                        // later failure would drop plaintext outside the
-                        // explicit revoke/zeroization path.
+                        // caller-visible event only after initial correlation
+                        // is cleared. The ratchet step was already committed by
+                        // send and ACK deliberately performs no ratchet write.
                         *mutation = self.confirm_pending_mutation(*ref_seq, *server_timestamp)?;
                     }
                     MessageAckCorrelationV1::SenderKey => {
@@ -3013,6 +3054,20 @@ impl VeilClient {
             Ok(value) => Ok(value),
             Err(DirectHistoryMutationError::ConversationRejected(detail)) => Err(detail),
             Err(DirectHistoryMutationError::StorageUncertain(detail)) => {
+                self.revoke_after_storage_uncertain_v1();
+                Err(detail)
+            }
+        }
+    }
+
+    fn resolve_public_session_establish_v1<T>(
+        &mut self,
+        result: Result<T, DirectSessionEstablishErrorV1>,
+    ) -> Result<T, String> {
+        match result {
+            Ok(value) => Ok(value),
+            Err(DirectSessionEstablishErrorV1::Rejected(detail)) => Err(detail),
+            Err(DirectSessionEstablishErrorV1::StorageUncertain(detail)) => {
                 self.revoke_after_storage_uncertain_v1();
                 Err(detail)
             }
@@ -4306,22 +4361,14 @@ impl VeilClient {
     }
 
     fn confirm_initial_message(&mut self, sequence: u64) -> Result<(), String> {
-        let Some(peer_identity_key) = self.pending_initial_sequences.get(&sequence).copied() else {
+        if !self.pending_initial_sequences.contains_key(&sequence) {
             return Ok(());
-        };
-        if let (Some(db), Some(session)) = (
-            self.db.as_ref(),
-            self.ratchet_sessions.get(&peer_identity_key),
-        ) {
-            let data = Zeroizing::new(
-                serde_json::to_vec(session)
-                    .map_err(|e| format!("serialize acknowledged ratchet session: {e}"))?,
-            );
-            db.save_ratchet_session(&peer_identity_key, &data)?;
         }
         // A server ACK proves durable transport only, not that the peer can
-        // derive this X3DH session. Keep attaching the initial metadata until
-        // an authenticated inbound DM proves peer possession.
+        // derive this X3DH session. The send transition is already durable;
+        // rewriting it here would create a stale-writer rollback window. Keep
+        // attaching the initial metadata until an authenticated inbound DM
+        // proves peer possession.
         self.pending_initial_sequences.remove(&sequence);
         Ok(())
     }
@@ -4974,7 +5021,7 @@ impl VeilClient {
             ));
         }
         let advanced_ratchet_session =
-            Zeroizing::new(serde_json::to_vec(&prepared.candidate).map_err(|error| {
+            Zeroizing::new(prepared.candidate.serialize().map_err(|error| {
                 DirectSendErrorV1::storage(format!(
                     "serialize advanced Direct ratchet session: {error}"
                 ))
@@ -5012,6 +5059,7 @@ impl VeilClient {
             request_digest,
             exact_send_message_payload: exact_send_message_payload.clone(),
             expected_ratchet_revision: persisted_ratchet.revision,
+            expected_ratchet_session: persisted_ratchet.session_data.to_vec(),
             advanced_ratchet_session: advanced_ratchet_session.to_vec(),
             plaintext: plaintext.to_string(),
             reply_to_id: None,
@@ -5703,14 +5751,7 @@ impl VeilClient {
         bundle: &x3dh::PreKeyBundle,
     ) -> Result<(), String> {
         let result = self.establish_session_classified_v1(peer_identity_key, bundle);
-        match result {
-            Ok(()) => Ok(()),
-            Err(DirectSessionEstablishErrorV1::Rejected(detail)) => Err(detail),
-            Err(DirectSessionEstablishErrorV1::StorageUncertain(detail)) => {
-                self.revoke_after_storage_uncertain_v1();
-                Err(detail)
-            }
-        }
+        self.resolve_public_session_establish_v1(result)
     }
 
     pub(crate) fn establish_session_classified_v1(
@@ -5725,6 +5766,26 @@ impl VeilClient {
         }
         self.require_crypto_runtime_active_v1()
             .map_err(DirectSessionEstablishErrorV1::rejected)?;
+        if self.ratchet_sessions.contains_key(peer_identity_key)
+            || self.pending_initial_headers.contains_key(peer_identity_key)
+        {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "ratchet session with this peer already exists",
+            ));
+        }
+        if self
+            .db
+            .as_ref()
+            .map(|db| db.load_ratchet_session_with_revision_v1(peer_identity_key))
+            .transpose()
+            .map_err(DirectSessionEstablishErrorV1::storage)?
+            .flatten()
+            .is_some()
+        {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "durable ratchet session with this peer already exists",
+            ));
+        }
         let identity = self
             .identity
             .as_ref()
@@ -5742,7 +5803,7 @@ impl VeilClient {
             one_time_prekey_id: bundle.one_time_prekey_id,
         };
         if let Some(db) = self.db.as_ref() {
-            let session_data = Zeroizing::new(serde_json::to_vec(&session).map_err(|e| {
+            let session_data = Zeroizing::new(session.serialize().map_err(|e| {
                 DirectSessionEstablishErrorV1::rejected(format!(
                     "serialize initiator ratchet session: {e}"
                 ))
@@ -5770,16 +5831,54 @@ impl VeilClient {
         spk_id: u32,
         opk_id: Option<u32>,
     ) -> Result<(), String> {
-        self.require_crypto_runtime_active_v1()?;
-        let session =
-            self.build_responder_session(sender_identity_key, ephemeral_key, spk_id, opk_id)?;
+        let result = self.process_initial_message_classified_v1(
+            sender_identity_key,
+            ephemeral_key,
+            spk_id,
+            opk_id,
+        );
+        self.resolve_public_session_establish_v1(result)
+    }
+
+    fn process_initial_message_classified_v1(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        ephemeral_key: &[u8; 32],
+        spk_id: u32,
+        opk_id: Option<u32>,
+    ) -> Result<(), DirectSessionEstablishErrorV1> {
+        self.require_crypto_runtime_active_v1()
+            .map_err(DirectSessionEstablishErrorV1::rejected)?;
+        if self.ratchet_sessions.contains_key(sender_identity_key) {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "ratchet session with this peer already exists",
+            ));
+        }
+        if self
+            .db
+            .as_ref()
+            .map(|db| db.load_ratchet_session_with_revision_v1(sender_identity_key))
+            .transpose()
+            .map_err(DirectSessionEstablishErrorV1::storage)?
+            .flatten()
+            .is_some()
+        {
+            return Err(DirectSessionEstablishErrorV1::rejected(
+                "durable ratchet session with this peer already exists",
+            ));
+        }
+        let session = self
+            .build_responder_session(sender_identity_key, ephemeral_key, spk_id, opk_id)
+            .map_err(DirectSessionEstablishErrorV1::rejected)?;
 
         if let Some(db) = self.db.as_ref() {
-            let data = Zeroizing::new(
-                serde_json::to_vec(&session)
-                    .map_err(|e| format!("serialize initial ratchet session: {e}"))?,
-            );
-            db.commit_initial_ratchet_session(sender_identity_key, &data, opk_id)?;
+            let data = Zeroizing::new(session.serialize().map_err(|e| {
+                DirectSessionEstablishErrorV1::storage(format!(
+                    "serialize initial ratchet session: {e}"
+                ))
+            })?);
+            db.commit_initial_ratchet_session(sender_identity_key, &data, opk_id)
+                .map_err(DirectSessionEstablishErrorV1::storage)?;
         }
         if let Some(id) = opk_id {
             if let Some(mut secret) = self.otk_secrets.remove(&id) {
@@ -5960,11 +6059,17 @@ impl VeilClient {
         // persist before transport. The idempotent Direct send path commits
         // this same candidate together with its local row and payload instead.
         if let Some(ref db) = self.db {
-            let data = Zeroizing::new(serde_json::to_vec(&prepared.candidate).map_err(|e| {
-                DirectSendErrorV1::rejected(format!("serialize ratchet session: {e}"))
-            })?);
-            db.save_ratchet_session(peer_identity_key, &data)
-                .map_err(DirectSendErrorV1::storage)?;
+            let current = self
+                .ratchet_sessions
+                .get(peer_identity_key)
+                .ok_or_else(|| DirectSendErrorV1::rejected("ratchet session disappeared"))?;
+            persist_existing_ratchet_transition_v1(
+                db,
+                peer_identity_key,
+                current,
+                &prepared.candidate,
+            )
+            .map_err(DirectSendErrorV1::storage)?;
         }
         self.ratchet_sessions
             .insert(*peer_identity_key, prepared.candidate);
@@ -6259,21 +6364,42 @@ impl VeilClient {
         ciphertext: &[u8],
         security_context: Option<&MessageSecurityContextV1>,
     ) -> Result<DecryptedPayload, String> {
-        self.require_direct_conversation_available_v1(conversation_id)?;
+        let result = self.decrypt_from_with_security_context_classified_v1(
+            sender_identity_key,
+            conversation_id,
+            header,
+            ciphertext,
+            security_context,
+        );
+        self.resolve_public_classified_mutation_v1(result)
+    }
+
+    fn decrypt_from_with_security_context_classified_v1(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        conversation_id: &str,
+        header: &[u8],
+        ciphertext: &[u8],
+        security_context: Option<&MessageSecurityContextV1>,
+    ) -> Result<DecryptedPayload, DirectHistoryMutationError> {
+        self.require_direct_conversation_available_v1(conversation_id)
+            .map_err(DirectHistoryMutationError::rejected)?;
         if header.is_empty() {
             // Network messages without an authenticated E2E header are a
             // downgrade attempt (or unsupported legacy data), not plaintext.
-            return Err("rejected unencrypted message: missing E2E header".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "rejected unencrypted message: missing E2E header",
+            ));
         }
 
         match header[0] {
             HEADER_INITIAL => {
                 // Parse X3DH init header
                 if header.len() != 1 + 32 + 4 + 4 + 41 {
-                    return Err(format!(
+                    return Err(DirectHistoryMutationError::rejected(format!(
                         "invalid initial header length: expected 82, got {}",
                         header.len()
-                    ));
+                    )));
                 }
                 let mut ek = [0u8; 32];
                 ek.copy_from_slice(&header[1..33]);
@@ -6286,27 +6412,37 @@ impl VeilClient {
                     Some(opk_id_raw)
                 };
 
-                let rh = MessageHeader::from_bytes(&header[41..82])?;
-                let our_identity_key = self.identity_key()?;
+                let rh = MessageHeader::from_bytes(&header[41..82])
+                    .map_err(DirectHistoryMutationError::rejected)?;
+                let our_identity_key = self
+                    .identity_key()
+                    .map_err(DirectHistoryMutationError::rejected)?;
                 let associated_data = ratchet_associated_data(
                     conversation_id,
                     sender_identity_key,
                     &our_identity_key,
                     &header[..41],
-                )?;
+                )
+                .map_err(DirectHistoryMutationError::rejected)?;
                 let plaintext = if self.has_session(sender_identity_key) {
-                    let mut candidate = self
-                        .ratchet_sessions
-                        .get(sender_identity_key)
-                        .cloned()
-                        .ok_or("session lookup failed")?;
-                    let plaintext = candidate.decrypt_with_ad(&rh, ciphertext, &associated_data)?;
+                    let current =
+                        self.ratchet_sessions
+                            .get(sender_identity_key)
+                            .ok_or_else(|| {
+                                DirectHistoryMutationError::storage("session lookup failed")
+                            })?;
+                    let mut candidate = current.clone();
+                    let plaintext = candidate
+                        .decrypt_with_ad(&rh, ciphertext, &associated_data)
+                        .map_err(DirectHistoryMutationError::rejected)?;
                     if let Some(db) = self.db.as_ref() {
-                        let data = Zeroizing::new(
-                            serde_json::to_vec(&candidate)
-                                .map_err(|e| format!("serialize ratchet session: {e}"))?,
-                        );
-                        db.save_ratchet_session(sender_identity_key, &data)?;
+                        persist_existing_ratchet_transition_v1(
+                            db,
+                            sender_identity_key,
+                            current,
+                            &candidate,
+                        )
+                        .map_err(DirectHistoryMutationError::storage)?;
                     }
                     self.ratchet_sessions
                         .insert(*sender_identity_key, candidate);
@@ -6314,15 +6450,20 @@ impl VeilClient {
                 } else {
                     // Do not consume the OPK or install/persist a responder
                     // session until the first packet authenticates successfully.
-                    let mut candidate =
-                        self.build_responder_session(sender_identity_key, &ek, spk_id, opk_id)?;
-                    let plaintext = candidate.decrypt_with_ad(&rh, ciphertext, &associated_data)?;
+                    let mut candidate = self
+                        .build_responder_session(sender_identity_key, &ek, spk_id, opk_id)
+                        .map_err(DirectHistoryMutationError::rejected)?;
+                    let plaintext = candidate
+                        .decrypt_with_ad(&rh, ciphertext, &associated_data)
+                        .map_err(DirectHistoryMutationError::rejected)?;
                     if let Some(db) = self.db.as_ref() {
-                        let data = Zeroizing::new(
-                            serde_json::to_vec(&candidate)
-                                .map_err(|e| format!("serialize initial ratchet session: {e}"))?,
-                        );
-                        db.commit_initial_ratchet_session(sender_identity_key, &data, opk_id)?;
+                        let data = Zeroizing::new(candidate.serialize().map_err(|error| {
+                            DirectHistoryMutationError::storage(format!(
+                                "serialize initial ratchet session: {error}"
+                            ))
+                        })?);
+                        db.commit_initial_ratchet_session(sender_identity_key, &data, opk_id)
+                            .map_err(DirectHistoryMutationError::storage)?;
                     }
                     if let Some(id) = opk_id {
                         if let Some(mut secret) = self.otk_secrets.remove(&id) {
@@ -6334,89 +6475,112 @@ impl VeilClient {
                     plaintext
                 };
 
-                self.process_ratchet_plaintext(sender_identity_key, plaintext)
+                self.process_ratchet_plaintext_classified_v1(sender_identity_key, plaintext)
             }
             HEADER_RATCHET => {
                 if header.len() != 1 + 41 {
-                    return Err(format!(
+                    return Err(DirectHistoryMutationError::rejected(format!(
                         "invalid ratchet header length: expected 42, got {}",
                         header.len()
-                    ));
+                    )));
                 }
-                let rh = MessageHeader::from_bytes(&header[1..])?;
-                let our_identity_key = self.identity_key()?;
+                let rh = MessageHeader::from_bytes(&header[1..])
+                    .map_err(DirectHistoryMutationError::rejected)?;
+                let our_identity_key = self
+                    .identity_key()
+                    .map_err(DirectHistoryMutationError::rejected)?;
                 let associated_data = ratchet_associated_data(
                     conversation_id,
                     sender_identity_key,
                     &our_identity_key,
                     &header[..1],
-                )?;
-                let mut candidate = self
+                )
+                .map_err(DirectHistoryMutationError::rejected)?;
+                let current = self
                     .ratchet_sessions
                     .get(sender_identity_key)
-                    .cloned()
-                    .ok_or("no ratchet session with this peer")?;
-                let plaintext = candidate.decrypt_with_ad(&rh, ciphertext, &associated_data)?;
+                    .ok_or_else(|| {
+                        DirectHistoryMutationError::rejected("no ratchet session with this peer")
+                    })?;
+                let mut candidate = current.clone();
+                let plaintext = candidate
+                    .decrypt_with_ad(&rh, ciphertext, &associated_data)
+                    .map_err(DirectHistoryMutationError::rejected)?;
 
                 if let Some(ref db) = self.db {
-                    let data = Zeroizing::new(
-                        serde_json::to_vec(&candidate)
-                            .map_err(|e| format!("serialize ratchet session: {e}"))?,
-                    );
-                    db.save_ratchet_session(sender_identity_key, &data)?;
+                    persist_existing_ratchet_transition_v1(
+                        db,
+                        sender_identity_key,
+                        current,
+                        &candidate,
+                    )
+                    .map_err(DirectHistoryMutationError::storage)?;
                 }
                 self.ratchet_sessions
                     .insert(*sender_identity_key, candidate);
 
-                self.process_ratchet_plaintext(sender_identity_key, plaintext)
+                self.process_ratchet_plaintext_classified_v1(sender_identity_key, plaintext)
             }
             HEADER_SENDER_KEY => {
-                let context = security_context
-                    .ok_or("Sender-Key v5 message is missing persisted device security context")?;
-                let (generation, route) = match self.validated_sender_key_route_for_message(
-                    conversation_id,
-                    sender_identity_key,
-                    ciphertext,
-                    context,
-                )? {
+                let context = security_context.ok_or_else(|| {
+                    DirectHistoryMutationError::rejected(
+                        "Sender-Key v5 message is missing persisted device security context",
+                    )
+                })?;
+                let (generation, route) = match self
+                    .validated_sender_key_route_for_message(
+                        conversation_id,
+                        sender_identity_key,
+                        ciphertext,
+                        context,
+                    )
+                    .map_err(DirectHistoryMutationError::rejected)?
+                {
                     ValidatedSenderKeyRouteForMessageV1::Verified { generation, route } => {
                         (generation, route)
                     }
                     ValidatedSenderKeyRouteForMessageV1::MissingExactRoute { .. } => {
-                        return Err(
-                            "trusted historical Sender-Key route is unavailable".to_string()
-                        );
+                        return Err(DirectHistoryMutationError::rejected(
+                            "trusted historical Sender-Key route is unavailable",
+                        ));
                     }
                 };
                 self.ensure_incoming_sender_key_loaded(
                     conversation_id,
                     &route.sender_device_identity_key,
                     generation,
-                )?;
-                let mut decrypted = self.sender_keys.decrypt_signed_with_metadata(
-                    conversation_id,
-                    &route.sender_device_identity_key,
-                    &route.sender_device_signing_key,
-                    ciphertext,
-                )?;
+                )
+                .map_err(DirectHistoryMutationError::rejected)?;
+                let mut decrypted = self
+                    .sender_keys
+                    .decrypt_signed_with_metadata(
+                        conversation_id,
+                        &route.sender_device_identity_key,
+                        &route.sender_device_signing_key,
+                        ciphertext,
+                    )
+                    .map_err(DirectHistoryMutationError::rejected)?;
                 if decrypted.generation != generation {
-                    return Err("sender-key generation changed during authenticated decrypt".into());
+                    return Err(DirectHistoryMutationError::rejected(
+                        "sender-key generation changed during authenticated decrypt",
+                    ));
                 }
                 self.persist_incoming_sender_key(
                     conversation_id,
                     &route.sender_device_identity_key,
                     generation,
-                )?;
+                )
+                .map_err(DirectHistoryMutationError::storage)?;
                 Ok(DecryptedPayload::Text(std::mem::take(
                     &mut *decrypted.plaintext,
                 )))
             }
             _ => {
                 // Unknown wire versions are never interpreted as plaintext.
-                Err(format!(
+                Err(DirectHistoryMutationError::rejected(format!(
                     "rejected message with unknown E2E header type {:#04x}",
                     header[0]
-                ))
+                )))
             }
         }
     }
@@ -6468,30 +6632,28 @@ impl VeilClient {
                 .map_err(DirectHistoryMutationError::rejected)?;
 
                 if self.has_session(sender_identity_key) {
-                    let mut candidate = self
-                        .ratchet_sessions
-                        .get(sender_identity_key)
-                        .cloned()
-                        .ok_or_else(|| {
-                            DirectHistoryMutationError::storage(
-                                "Direct history ratchet session lookup failed",
-                            )
-                        })?;
+                    let current =
+                        self.ratchet_sessions
+                            .get(sender_identity_key)
+                            .ok_or_else(|| {
+                                DirectHistoryMutationError::storage(
+                                    "Direct history ratchet session lookup failed",
+                                )
+                            })?;
+                    let mut candidate = current.clone();
                     let plaintext = candidate
                         .decrypt_with_ad(&ratchet_header, ciphertext, &associated_data)
                         .map_err(DirectHistoryMutationError::rejected)?;
-                    let data = Zeroizing::new(serde_json::to_vec(&candidate).map_err(|error| {
-                        DirectHistoryMutationError::storage(format!(
-                            "serialize Direct history ratchet session: {error}"
-                        ))
-                    })?);
-                    self.db
-                        .as_ref()
-                        .ok_or_else(|| {
-                            DirectHistoryMutationError::storage("database not initialized")
-                        })?
-                        .save_ratchet_session(sender_identity_key, &data)
-                        .map_err(DirectHistoryMutationError::storage)?;
+                    let db = self.db.as_ref().ok_or_else(|| {
+                        DirectHistoryMutationError::storage("database not initialized")
+                    })?;
+                    persist_existing_ratchet_transition_v1(
+                        db,
+                        sender_identity_key,
+                        current,
+                        &candidate,
+                    )
+                    .map_err(DirectHistoryMutationError::storage)?;
                     self.ratchet_sessions
                         .insert(*sender_identity_key, candidate);
                     plaintext
@@ -6507,7 +6669,7 @@ impl VeilClient {
                     let plaintext = candidate
                         .decrypt_with_ad(&ratchet_header, ciphertext, &associated_data)
                         .map_err(DirectHistoryMutationError::rejected)?;
-                    let data = Zeroizing::new(serde_json::to_vec(&candidate).map_err(|error| {
+                    let data = Zeroizing::new(candidate.serialize().map_err(|error| {
                         DirectHistoryMutationError::storage(format!(
                             "serialize Direct history initial ratchet session: {error}"
                         ))
@@ -6551,28 +6713,28 @@ impl VeilClient {
                     &header[..1],
                 )
                 .map_err(DirectHistoryMutationError::rejected)?;
-                let mut candidate = self
+                let current = self
                     .ratchet_sessions
                     .get(sender_identity_key)
-                    .cloned()
                     .ok_or_else(|| {
                         DirectHistoryMutationError::rejected(
                             "no Direct history ratchet session with this peer",
                         )
                     })?;
+                let mut candidate = current.clone();
                 let plaintext = candidate
                     .decrypt_with_ad(&ratchet_header, ciphertext, &associated_data)
                     .map_err(DirectHistoryMutationError::rejected)?;
-                let data = Zeroizing::new(serde_json::to_vec(&candidate).map_err(|error| {
-                    DirectHistoryMutationError::storage(format!(
-                        "serialize Direct history ratchet session: {error}"
-                    ))
-                })?);
-                self.db
-                    .as_ref()
-                    .ok_or_else(|| DirectHistoryMutationError::storage("database not initialized"))?
-                    .save_ratchet_session(sender_identity_key, &data)
-                    .map_err(DirectHistoryMutationError::storage)?;
+                let db = self.db.as_ref().ok_or_else(|| {
+                    DirectHistoryMutationError::storage("database not initialized")
+                })?;
+                persist_existing_ratchet_transition_v1(
+                    db,
+                    sender_identity_key,
+                    current,
+                    &candidate,
+                )
+                .map_err(DirectHistoryMutationError::storage)?;
                 self.ratchet_sessions
                     .insert(*sender_identity_key, candidate);
                 plaintext
@@ -6603,14 +6765,26 @@ impl VeilClient {
     /// `0x00` = real text (return Text), `0x01` = SKDM (process and return Control).
     /// Unprefixed/unknown payloads are rejected to prevent inner-protocol
     /// downgrade after successful ratchet decryption.
+    #[cfg(test)]
     fn process_ratchet_plaintext(
         &mut self,
         sender_identity_key: &[u8; 32],
         plaintext: Vec<u8>,
     ) -> Result<DecryptedPayload, String> {
+        self.process_ratchet_plaintext_classified_v1(sender_identity_key, plaintext)
+            .map_err(DirectHistoryMutationError::into_detail)
+    }
+
+    fn process_ratchet_plaintext_classified_v1(
+        &mut self,
+        sender_identity_key: &[u8; 32],
+        plaintext: Vec<u8>,
+    ) -> Result<DecryptedPayload, DirectHistoryMutationError> {
         let mut plaintext = Zeroizing::new(plaintext);
         if plaintext.is_empty() {
-            return Err("ratchet plaintext is missing its inner type".to_string());
+            return Err(DirectHistoryMutationError::rejected(
+                "ratchet plaintext is missing its inner type",
+            ));
         }
         match plaintext[0] {
             INNER_TEXT => {
@@ -6620,22 +6794,30 @@ impl VeilClient {
             INNER_SKDM => {
                 let body = &plaintext[1..];
                 let dist: SenderKeyDistribution =
-                    serde_json::from_slice(body).map_err(|e| format!("decode SKDM: {e}"))?;
+                    serde_json::from_slice(body).map_err(|error| {
+                        DirectHistoryMutationError::rejected(format!("decode SKDM: {error}"))
+                    })?;
                 // Only honour SKDMs whose declared sender matches the ratchet peer.
                 if &dist.sender_identity_key != sender_identity_key {
-                    return Err("SKDM sender mismatch".to_string());
+                    return Err(DirectHistoryMutationError::rejected("SKDM sender mismatch"));
                 }
                 let group_id = dist.group_id.clone();
-                self.sender_keys.process_distribution(&dist)?;
+                self.sender_keys
+                    .process_distribution(&dist)
+                    .map_err(DirectHistoryMutationError::rejected)?;
                 self.channel_conversations.insert(group_id.clone());
                 self.sender_key_distribution_pending
                     .insert(group_id.clone());
-                self.persist_incoming_sender_key(&group_id, sender_identity_key, dist.key_id)?;
+                self.persist_incoming_sender_key(&group_id, sender_identity_key, dist.key_id)
+                    .map_err(DirectHistoryMutationError::storage)?;
                 Ok(DecryptedPayload::Control)
             }
             _ => {
                 // A valid ratchet frame must still carry a known inner type.
-                Err(format!("unknown ratchet inner type {:#04x}", plaintext[0]))
+                Err(DirectHistoryMutationError::rejected(format!(
+                    "unknown ratchet inner type {:#04x}",
+                    plaintext[0]
+                )))
             }
         }
     }
@@ -8080,16 +8262,13 @@ impl VeilClient {
 
             let mut decrypted = Zeroizing::new(match decrypt_mode {
                 AtomicReceiveDecryptMode::General => {
-                    match client
-                        .decrypt_from_with_security_context(
-                            sender_identity_key,
-                            conversation_id,
-                            header,
-                            ciphertext,
-                            security_context,
-                        )
-                        .map_err(DirectHistoryMutationError::rejected)?
-                    {
+                    match client.decrypt_from_with_security_context_classified_v1(
+                        sender_identity_key,
+                        conversation_id,
+                        header,
+                        ciphertext,
+                        security_context,
+                    )? {
                         DecryptedPayload::Text(plaintext) => plaintext,
                         DecryptedPayload::Control => {
                             return Err(DirectHistoryMutationError::rejected(
@@ -13765,7 +13944,10 @@ mod tests {
         }
 
         fn new_with_db(db: VeilDb) -> Self {
-            let receiver_identity = IdentityKeyPair::generate();
+            Self::new_with_identity_and_db(IdentityKeyPair::generate(), db)
+        }
+
+        fn new_with_identity_and_db(receiver_identity: IdentityKeyPair, db: VeilDb) -> Self {
             let receiver_identity_key = receiver_identity.x25519_public_bytes();
             let receiver_signing_key = receiver_identity.ed25519_public_bytes();
             let receiver_user_id =
@@ -13914,6 +14096,35 @@ mod tests {
                 .try_extend(events)
                 .unwrap();
         }
+    }
+
+    fn restore_single_peer_direct_replay_runtime(
+        client: &mut VeilClient,
+        receiver_identity_key: [u8; 32],
+        peer_identity_key: [u8; 32],
+        conversation_id: &str,
+    ) {
+        let receiver_user_id =
+            uuid::Uuid::from_u128(0x1000_0000_0000_0000_0000_0000_0000_0001).to_string();
+        let peer_user_id =
+            uuid::Uuid::from_u128(0x2000_0000_0000_0000_0000_0000_0000_0001).to_string();
+        client.authenticated_user_id = Some(receiver_user_id.clone());
+        client.authenticated_server_origin = Some(DIRECT_LIVE_TEST_ORIGIN.to_string());
+        client
+            .remember_user_identity(&receiver_user_id, receiver_identity_key)
+            .unwrap();
+        client
+            .remember_user_identity(&peer_user_id, peer_identity_key)
+            .unwrap();
+        client
+            .replace_authorized_conversation_senders(
+                conversation_id,
+                [receiver_identity_key, peer_identity_key],
+            )
+            .unwrap();
+        client
+            .bind_dm_conversation(conversation_id, peer_identity_key)
+            .unwrap();
     }
 
     fn runtime_ratchet_fingerprint_v1(
@@ -14109,6 +14320,278 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn skipped_keys_survive_reopen_and_stale_receive_cannot_roll_back_ratchet() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path = std::env::temp_dir().join(format!(
+            "veil-skipped-key-reopen-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&path);
+        let db_key = Zeroizing::new(kdf::derive_db_key(&mnemonic).unwrap());
+        let receiver_identity = IdentityKeyPair::from_mnemonic(&mnemonic).unwrap();
+        let db = VeilDb::open(&path, &db_key).unwrap();
+        let mut fixture = DirectLiveReplayFixture::new_with_identity_and_db(receiver_identity, db);
+        let peer = fixture.add_peer();
+        let receiver_identity_key = fixture.receiver_identity_key;
+        let receiver_signing_key = fixture.receiver_signing_key;
+        let peer_identity_key = fixture.peers[peer].sender_identity_key;
+        let conversation_id = fixture.peers[peer].conversation_id.clone();
+
+        let initial = fixture.peers[peer].next_event("initial");
+        fixture.enqueue(vec![initial]);
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap()
+                .stored,
+            1
+        );
+
+        let late_one = fixture.peers[peer].next_event("late-one");
+        let late_two = fixture.peers[peer].next_event("late-two");
+        let late_three = fixture.peers[peer].next_event("late-three");
+
+        let mut stale = VeilClient::new();
+        stale.init_with_mnemonic(&mnemonic, &path).unwrap();
+        restore_single_peer_direct_replay_runtime(
+            &mut stale,
+            receiver_identity_key,
+            peer_identity_key,
+            &conversation_id,
+        );
+        let mut stale_general = VeilClient::new();
+        stale_general.init_with_mnemonic(&mnemonic, &path).unwrap();
+        restore_single_peer_direct_replay_runtime(
+            &mut stale_general,
+            receiver_identity_key,
+            peer_identity_key,
+            &conversation_id,
+        );
+        let stale_before = stale
+            .ratchet_sessions
+            .get(&peer_identity_key)
+            .unwrap()
+            .serialize()
+            .unwrap();
+
+        fixture.enqueue(vec![late_three]);
+        assert_eq!(
+            fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap()
+                .stored,
+            1
+        );
+        let durable_after_gap = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        let gap_revision = durable_after_gap.revision;
+        assert_eq!(durable_after_gap.revision, 1);
+        assert!(!fixture
+            .receiver
+            .ratchet_sessions
+            .get(&peer_identity_key)
+            .unwrap()
+            .matches_serialized_v1(&stale_before)
+            .unwrap());
+
+        // Emulate a valid historical writer which emitted the two skipped-key
+        // members in the opposite order. Startup must validate and hydrate it,
+        // never eagerly rewrite it or advance the revision merely to
+        // canonicalize JSON.
+        let serialized =
+            Zeroizing::new(String::from_utf8(durable_after_gap.session_data.to_vec()).unwrap());
+        let marker = "\"skipped_keys\":{";
+        let body_start = serialized.find(marker).unwrap() + marker.len();
+        let body_end = body_start + serialized[body_start..].find('}').unwrap();
+        let mut skipped_entries: Vec<_> = serialized[body_start..body_end].split(',').collect();
+        assert_eq!(skipped_entries.len(), 2);
+        skipped_entries.reverse();
+        let mut legacy_order = Zeroizing::new(String::with_capacity(serialized.len()));
+        legacy_order.push_str(&serialized[..body_start]);
+        for (index, entry) in skipped_entries.into_iter().enumerate() {
+            if index != 0 {
+                legacy_order.push(',');
+            }
+            legacy_order.push_str(entry);
+        }
+        legacy_order.push_str(&serialized[body_end..]);
+        assert_ne!(
+            legacy_order.as_bytes(),
+            durable_after_gap.session_data.as_slice()
+        );
+        RatchetSession::deserialize(legacy_order.as_bytes()).unwrap();
+        assert_eq!(
+            fixture
+                .receiver
+                .db()
+                .unwrap()
+                .conn()
+                .execute(
+                    "UPDATE ratchet_sessions SET session_data = ?1
+                     WHERE peer_identity_key = ?2 AND revision = ?3",
+                    rusqlite::params![
+                        legacy_order.as_bytes(),
+                        peer_identity_key.as_slice(),
+                        i64::try_from(durable_after_gap.revision).unwrap(),
+                    ],
+                )
+                .unwrap(),
+            1
+        );
+
+        let mut stale_fixture = DirectLiveReplayFixture {
+            receiver: stale,
+            receiver_identity_key,
+            receiver_signing_key,
+            peers: Vec::new(),
+        };
+        stale_fixture.enqueue(vec![late_one.clone()]);
+        let stale_error = stale_fixture
+            .receiver
+            .replay_direct_live_events_v1()
+            .await
+            .unwrap_err();
+        assert_eq!(stale_error.stop, DirectLiveReplayStopV1::StorageUncertain);
+        assert!(stale_fixture.receiver.direct_live_storage_uncertain);
+        assert!(stale_fixture.receiver.db().is_none());
+
+        let ConnectionEvent::MessageReceived {
+            message_id,
+            conversation_id: late_two_conversation,
+            sender_identity_key,
+            ciphertext,
+            header,
+            reply_to_id,
+            ..
+        } = &late_two
+        else {
+            unreachable!();
+        };
+        let sender_identity_key: [u8; 32] = sender_identity_key.as_slice().try_into().unwrap();
+        assert!(stale_general
+            .receive_and_persist_message(
+                message_id,
+                late_two_conversation,
+                &sender_identity_key,
+                None,
+                None,
+                false,
+                None,
+                None,
+                header,
+                ciphertext,
+                None,
+                reply_to_id.as_deref(),
+                None,
+            )
+            .is_err());
+        assert!(stale_general.direct_live_storage_uncertain);
+        assert!(stale_general.db().is_none());
+        assert!(stale_general.identity.is_none());
+        assert!(stale_general.ratchet_sessions.is_empty());
+        assert_eq!(
+            fixture
+                .receiver
+                .db()
+                .unwrap()
+                .get_messages(&conversation_id, 10)
+                .unwrap()
+                .len(),
+            2
+        );
+        let durable_after_stale = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_after_stale.session_data, legacy_order.as_bytes());
+        assert_eq!(durable_after_stale.revision, durable_after_gap.revision);
+
+        drop(durable_after_stale);
+        drop(durable_after_gap);
+        drop(stale_general);
+        drop(stale_fixture);
+        drop(fixture);
+
+        let mut reopened = VeilClient::new();
+        reopened.init_with_mnemonic(&mnemonic, &path).unwrap();
+        restore_single_peer_direct_replay_runtime(
+            &mut reopened,
+            receiver_identity_key,
+            peer_identity_key,
+            &conversation_id,
+        );
+        let hydrated_without_migration = reopened
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            hydrated_without_migration.session_data,
+            legacy_order.as_bytes()
+        );
+        assert_eq!(hydrated_without_migration.revision, gap_revision);
+        drop(hydrated_without_migration);
+        let mut reopened_fixture = DirectLiveReplayFixture {
+            receiver: reopened,
+            receiver_identity_key,
+            receiver_signing_key,
+            peers: Vec::new(),
+        };
+        reopened_fixture.enqueue(vec![late_one, late_two]);
+        assert_eq!(
+            reopened_fixture
+                .receiver
+                .replay_direct_live_events_v1()
+                .await
+                .unwrap()
+                .stored,
+            2
+        );
+        let durable_final = reopened_fixture
+            .receiver
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_final.revision, 3);
+        assert!(reopened_fixture
+            .receiver
+            .ratchet_sessions
+            .get(&peer_identity_key)
+            .unwrap()
+            .matches_serialized_v1(&durable_final.session_data)
+            .unwrap());
+        assert_eq!(
+            reopened_fixture
+                .receiver
+                .db()
+                .unwrap()
+                .get_messages(&conversation_id, 10)
+                .unwrap()
+                .len(),
+            4
+        );
+
+        drop(durable_final);
+        drop(reopened_fixture);
+        remove_test_database(&path);
     }
 
     #[tokio::test]
@@ -14352,7 +14835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ack_initial_session_failure_never_moves_or_persists_pending_edit_plaintext() {
+    async fn initial_ack_does_not_rewrite_ratchet_and_confirms_edit_once() {
         let path =
             std::env::temp_dir().join(format!("veil-ack-late-failure-{}.db", uuid::Uuid::new_v4()));
         remove_test_database(&path);
@@ -14374,10 +14857,16 @@ mod tests {
             .await
             .unwrap();
 
+        let ratchet_before_ack = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
         // One sequence deliberately overlaps a plaintext-bearing edit and an
-        // initial-session acknowledgement. Persisting the ratchet fails after
-        // the earlier ACK step; the edit must still be owned by the pending
-        // map so revoke can explicitly zeroize it.
+        // initial-session acknowledgement. ACK must not rewrite the already
+        // durable ratchet; only the pending edit confirmation may commit.
         let sequence = 0xB2;
         fixture.receiver.pending_mutations.insert(
             sequence,
@@ -14398,8 +14887,8 @@ mod tests {
             .conn()
             .execute_batch(
                 "CREATE TRIGGER reject_ack_ratchet
-                 BEFORE INSERT ON ratchet_sessions
-                 BEGIN SELECT RAISE(FAIL, 'forced acknowledged ratchet failure'); END;",
+                 BEFORE UPDATE ON ratchet_sessions
+                 BEGIN SELECT RAISE(FAIL, 'ACK attempted a ratchet rewrite'); END;",
             )
             .unwrap();
         fixture.enqueue(vec![ConnectionEvent::MessageAcked {
@@ -14412,17 +14901,57 @@ mod tests {
             sender_key: None,
         }]);
 
-        let error = fixture.receiver.poll_event().await.unwrap_err();
-        assert!(error.contains("forced acknowledged ratchet failure"));
-        assert!(fixture.receiver.direct_live_storage_uncertain);
+        let event = fixture.receiver.poll_event().await.unwrap().unwrap();
+        assert!(matches!(
+            event,
+            ConnectionEvent::MessageAcked {
+                mutation: Some(ConfirmedMutation::Edit { ref new_text, .. }),
+                ..
+            } if new_text == "sensitive edit that must never escape"
+        ));
+        assert!(!fixture.receiver.direct_live_storage_uncertain);
         assert!(fixture.receiver.pending_mutations.is_empty());
-        assert!(fixture.receiver.db().is_none());
+        assert!(!fixture
+            .receiver
+            .pending_initial_sequences
+            .contains_key(&sequence));
+        assert!(fixture.receiver.db().is_some());
 
+        let ratchet_after_ack = fixture
+            .receiver
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ratchet_after_ack.revision, ratchet_before_ack.revision);
+        assert_eq!(
+            ratchet_after_ack.session_data,
+            ratchet_before_ack.session_data
+        );
+
+        // The trigger above is a test-only tripwire, not part of the durable
+        // schema. Remove it before reopen so the exact ratchet schema gate can
+        // distinguish a clean database from an unknown/future trigger.
+        fixture
+            .receiver
+            .db()
+            .unwrap()
+            .conn()
+            .execute_batch("DROP TRIGGER reject_ack_ratchet;")
+            .unwrap();
+
+        drop(ratchet_after_ack);
+        drop(ratchet_before_ack);
+        drop(fixture);
         let reopened = VeilDb::open(&path, &db_key).unwrap();
         let messages = reopened.get_messages(&conversation_id, 10).unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].id, message_id);
-        assert_eq!(messages[0].plaintext, "original durable text");
+        assert_eq!(
+            messages[0].plaintext,
+            "sensitive edit that must never escape"
+        );
         drop(reopened);
         remove_test_database(&path);
     }
@@ -14492,7 +15021,7 @@ mod tests {
             let trigger = match fault {
                 "ratchet" => {
                     "CREATE TRIGGER reject_direct_send_ratchet
-                     BEFORE INSERT ON ratchet_sessions
+                     BEFORE UPDATE ON ratchet_sessions
                      BEGIN SELECT RAISE(ABORT, 'forced Direct send ratchet failure'); END;"
                 }
                 "pending" => {
@@ -16001,6 +16530,136 @@ mod tests {
     }
 
     #[test]
+    fn legacy_process_initial_refuses_existing_runtime_and_durable_sessions() {
+        let mut client = VeilClient::from_identity(IdentityKeyPair::generate());
+        let peer = IdentityKeyPair::generate().x25519_public_bytes();
+        let existing = RatchetSession::init_initiator(&[0x61; 32], &peer);
+        let existing_bytes = existing.serialize().unwrap();
+        client.ratchet_sessions.insert(peer, existing);
+
+        let error = client
+            .process_initial_message(&peer, &[0x62; 32], 1, None)
+            .unwrap_err();
+        assert!(error.contains("already exists"));
+        assert!(!client.direct_live_storage_uncertain);
+        assert!(client
+            .ratchet_sessions
+            .get(&peer)
+            .unwrap()
+            .matches_serialized_v1(&existing_bytes)
+            .unwrap());
+
+        let durable_peer = IdentityKeyPair::generate().x25519_public_bytes();
+        let db = VeilDb::open_memory(&[0x63; 32]).unwrap();
+        db.commit_initial_ratchet_session(&durable_peer, &existing_bytes, None)
+            .unwrap();
+        client.db = Some(db);
+        let error = client
+            .process_initial_message(&durable_peer, &[0x64; 32], 2, None)
+            .unwrap_err();
+        assert!(error.contains("durable ratchet session"));
+        assert!(!client.direct_live_storage_uncertain);
+        assert!(!client.ratchet_sessions.contains_key(&durable_peer));
+        let durable = client
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&durable_peer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.session_data, existing_bytes);
+        assert_eq!(durable.revision, 0);
+    }
+
+    #[test]
+    fn corrupt_ratchet_reopen_fails_closed_without_replacement() {
+        let mnemonic = generate_mnemonic().to_string();
+        let path = std::env::temp_dir().join(format!(
+            "veil-corrupt-ratchet-reopen-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        remove_test_database(&path);
+
+        let mut seeded = VeilClient::new();
+        seeded.init_with_mnemonic(&mnemonic, &path).unwrap();
+        let (peer_identity_key, bundle) = test_peer_prekey_bundle();
+        seeded
+            .establish_session(&peer_identity_key, &bundle)
+            .unwrap();
+        seeded
+            .db()
+            .unwrap()
+            .upsert_directory_conversation(
+                "6a84c960-1d0c-4b83-b0b6-22387f40e8d1",
+                ConversationType::DM as u8,
+                "https://corrupt-ratchet.test:443",
+                Some("Corrupt Ratchet Peer"),
+                Some("5fdf3a20-a1df-4c55-9834-609bacade83a"),
+                Some(peer_identity_key.as_slice()),
+                None,
+                "2026-07-20T00:00:00Z",
+            )
+            .unwrap();
+        seeded
+            .db()
+            .unwrap()
+            .clear_pending_initial_header(&peer_identity_key)
+            .unwrap();
+        let stored = seeded
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        let mut corrupted = String::from_utf8(stored.session_data.to_vec()).unwrap();
+        corrupted = corrupted.replacen(
+            "\"skipped_keys\":{}",
+            "\"skipped_keys\":{\"malformed\":\"AA==\"}",
+            1,
+        );
+        let changed = seeded
+            .db()
+            .unwrap()
+            .conn()
+            .execute(
+                "UPDATE ratchet_sessions SET session_data = ?1
+                 WHERE peer_identity_key = ?2",
+                rusqlite::params![corrupted.as_bytes(), peer_identity_key.as_slice()],
+            )
+            .unwrap();
+        assert_eq!(changed, 1);
+        let expected_revision = stored.revision;
+        drop(stored);
+        drop(seeded);
+
+        let mut reopened = VeilClient::new();
+        let error = reopened.init_with_mnemonic(&mnemonic, &path).unwrap_err();
+        assert!(error.contains("decode persisted ratchet session"));
+        assert!(reopened.direct_live_storage_uncertain);
+        assert!(reopened.db().is_none());
+        assert!(reopened.identity.is_none());
+        assert!(reopened.ratchet_sessions.is_empty());
+        assert!(reopened.pending_initial_headers.is_empty());
+
+        let db_key = Zeroizing::new(kdf::derive_db_key(&mnemonic).unwrap());
+        let inspection = VeilDb::open(&path, &db_key).unwrap();
+        let unchanged = inspection
+            .load_ratchet_session_with_revision_v1(&peer_identity_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.session_data, corrupted.as_bytes());
+        assert_eq!(unchanged.revision, expected_revision);
+        assert!(inspection
+            .load_pending_initial_headers()
+            .unwrap()
+            .is_empty());
+
+        drop(unchanged);
+        drop(inspection);
+        corrupted.zeroize();
+        remove_test_database(&path);
+    }
+
+    #[test]
     fn x3dh_header_repeats_until_authenticated_peer_possession() {
         let alice_identity = IdentityKeyPair::generate();
         let alice_key = alice_identity.x25519_public_bytes();
@@ -16489,6 +17148,123 @@ mod tests {
             .unwrap()
             .expect("stored fixture message persisted its ratchet");
         (runtime, persisted)
+    }
+
+    #[test]
+    fn rejected_control_frame_restores_sender_key_pending_and_ratchet_state() {
+        let mut fixture = duplicate_receive_fixture();
+        fixture
+            .bob
+            .bind_dm_conversation("dm-duplicate", fixture.alice_key)
+            .unwrap();
+        let group_id = "control-frame-rollback";
+        let distribution = fixture
+            .alice
+            .sender_keys
+            .create_outgoing(group_id, &fixture.alice_key);
+        let distribution_json = Zeroizing::new(serde_json::to_vec(&distribution).unwrap());
+        let mut inner = Zeroizing::new(Vec::with_capacity(1 + distribution_json.len()));
+        inner.push(INNER_SKDM);
+        inner.extend_from_slice(&distribution_json);
+        let (ciphertext, header) = fixture
+            .alice
+            .encrypt_for_conversation_classified_v1(
+                &fixture.bob_key,
+                "dm-duplicate",
+                inner.as_slice(),
+            )
+            .unwrap();
+
+        let pending_before = fixture.bob.sender_key_distribution_pending.clone();
+        let channels_before = fixture.bob.channel_conversations.clone();
+        let runtime_before = fixture
+            .bob
+            .ratchet_sessions
+            .get(&fixture.alice_key)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        let durable_before = fixture
+            .bob
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&fixture.alice_key)
+            .unwrap()
+            .unwrap();
+        let message_count_before = fixture
+            .bob
+            .db()
+            .unwrap()
+            .get_messages("dm-duplicate", 10)
+            .unwrap()
+            .len();
+
+        let error = fixture
+            .bob
+            .receive_and_persist_message(
+                "rejected-control-frame",
+                "dm-duplicate",
+                &fixture.alice_key,
+                Some(&fixture.author),
+                Some(MessageAuthorContext::DirectoryMemberAtObservation),
+                false,
+                None,
+                Some("Alice"),
+                &header,
+                &ciphertext,
+                Some(1800),
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(error.contains("control frame is not valid"));
+        assert!(!fixture.bob.direct_live_storage_uncertain);
+        assert!(fixture.bob.db().is_some());
+        assert_eq!(fixture.bob.sender_key_distribution_pending, pending_before);
+        assert_eq!(fixture.bob.channel_conversations, channels_before);
+        assert!(!fixture
+            .bob
+            .sender_keys
+            .has_incoming(group_id, &fixture.alice_key));
+        assert!(fixture
+            .bob
+            .ratchet_sessions
+            .get(&fixture.alice_key)
+            .unwrap()
+            .matches_serialized_v1(&runtime_before)
+            .unwrap());
+        let durable_after = fixture
+            .bob
+            .db()
+            .unwrap()
+            .load_ratchet_session_with_revision_v1(&fixture.alice_key)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_after.session_data, durable_before.session_data);
+        assert_eq!(durable_after.revision, durable_before.revision);
+        assert!(fixture
+            .bob
+            .db()
+            .unwrap()
+            .load_incoming_sender_key_generations_for_group(group_id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            fixture
+                .bob
+                .db()
+                .unwrap()
+                .get_messages("dm-duplicate", 10)
+                .unwrap()
+                .len(),
+            message_count_before
+        );
+        assert!(!fixture
+            .bob
+            .db()
+            .unwrap()
+            .message_exists("rejected-control-frame")
+            .unwrap());
     }
 
     #[test]

@@ -115,7 +115,8 @@ not silently repair or accept them:
 | --- | --- |
 | 1, exact peer/bundle identity | Hardened by the host-tested [Direct-v1 key-validation checkpoint](phase-5s-direct-v1-key-validation-checkpoint.md) |
 | 2, contributory received ratchet DH | Hardened by the same key-validation checkpoint using the actual X25519 shared result before state publication |
-| 3–5 | Open; AAD review/origin-device binding and skipped-key serialization/exhaustion/rollback remain Phase 5S work |
+| 3–4 | Open; AAD review and origin/account/device binding remain Phase 5S work |
+| 5, skipped-key/state persistence | Canonical parsing, deterministic bounds, strict hydration, and live-database stale-writer rollback are hardened by the host-tested [skipped-key/state checkpoint](phase-5s-direct-v1-skipped-key-state-checkpoint.md). Deterministic key expiry and whole-file rollback detection remain open. |
 
 Owners, residual resolution/acceptance criteria, and external review remain part
 of the Phase 5S gate. No ledger entry authorizes plaintext fallback, automatic

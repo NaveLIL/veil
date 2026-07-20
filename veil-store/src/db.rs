@@ -56,6 +56,9 @@ pub struct DirectMessageOutboxScopeV1 {
 /// surrounding transport envelope. `veil-store` intentionally treats it as an
 /// opaque bounded byte string and authenticates only its domain-separated
 /// digest; protobuf interpretation remains owned by the protocol crate.
+/// `expected_ratchet_revision` and `expected_ratchet_session` form one exact
+/// CAS precondition; neither is sufficient by itself against same-revision
+/// state replacement.
 #[derive(Clone)]
 pub struct DirectMessageOutboxEnqueueV1 {
     pub scope: DirectMessageOutboxScopeV1,
@@ -65,6 +68,7 @@ pub struct DirectMessageOutboxEnqueueV1 {
     pub request_digest: [u8; 32],
     pub exact_send_message_payload: Vec<u8>,
     pub expected_ratchet_revision: u64,
+    pub expected_ratchet_session: Vec<u8>,
     pub advanced_ratchet_session: Vec<u8>,
     pub plaintext: String,
     pub reply_to_id: Option<String>,
@@ -81,6 +85,7 @@ impl Zeroize for DirectMessageOutboxEnqueueV1 {
         self.request_digest.zeroize();
         self.exact_send_message_payload.zeroize();
         self.expected_ratchet_revision.zeroize();
+        self.expected_ratchet_session.zeroize();
         self.advanced_ratchet_session.zeroize();
         self.plaintext.zeroize();
         self.reply_to_id.zeroize();
@@ -207,9 +212,226 @@ pub const DIRECT_MESSAGE_OUTBOX_MAX_PAYLOAD_BYTES_V1: usize = 256 * 1024;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_PENDING_V1: usize = 256;
 pub const DIRECT_MESSAGE_OUTBOX_MAX_LOAD_V1: usize = 256;
 const DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1: usize = 1024 * 1024;
+const DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1: i64 = 1024 * 1024;
+const DIRECT_MESSAGE_RATCHET_UPDATED_AT_MAX_CHARS_SQLITE_V1: i64 = 64;
+/// Maximum number of durable pairwise ratchets hydrated into one native epoch.
+pub const DIRECT_RATCHET_SESSION_MAX_ROWS_V1: usize = 4096;
+/// Maximum aggregate serialized ratchet bytes hydrated into one native epoch.
+pub const DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_V1: usize = 64 * 1024 * 1024;
+const DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1: i64 = 4096;
+const DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1: i64 = 64 * 1024 * 1024;
 const DIRECT_MESSAGE_PLAINTEXT_MAX_BYTES_V1: usize = 32 * 1024;
 const DIRECT_MESSAGE_REJECTION_REASON_MAX_BYTES_V1: usize = 128;
 const DIRECT_MESSAGE_DIGEST_DOMAIN_V1: &[u8] = b"veil.message.send.v1\x00";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RatchetSessionSchemaShapeV1 {
+    LegacyWithoutRevision,
+    LegacyWithRevision,
+    HardenedWithoutRowid,
+}
+
+impl RatchetSessionSchemaShapeV1 {
+    fn has_revision(self) -> bool {
+        !matches!(self, Self::LegacyWithoutRevision)
+    }
+}
+
+const RATCHET_SESSION_LEGACY_NO_REVISION_DDL_V1: &str = concat!(
+    "create table ratchet_sessions(",
+    "peer_identity_key blob primary key,",
+    "session_data blob not null,",
+    "updated_at text not null default(datetime('now'))",
+    ")"
+);
+const RATCHET_SESSION_LEGACY_REVISION_BEFORE_UPDATED_DDL_V1: &str = concat!(
+    "create table ratchet_sessions(",
+    "peer_identity_key blob primary key,",
+    "session_data blob not null,",
+    "revision integer not null default 0 check(revision>=0),",
+    "updated_at text not null default(datetime('now'))",
+    ")"
+);
+const RATCHET_SESSION_LEGACY_REVISION_AFTER_UPDATED_DDL_V1: &str = concat!(
+    "create table ratchet_sessions(",
+    "peer_identity_key blob primary key,",
+    "session_data blob not null,",
+    "updated_at text not null default(datetime('now')),",
+    "revision integer not null default 0 check(revision>=0)",
+    ")"
+);
+const RATCHET_SESSION_HARDENED_DDL_V1: &str = concat!(
+    "create table ratchet_sessions(",
+    "peer_identity_key blob not null primary key ",
+    "check(typeof(peer_identity_key)='blob' and length(peer_identity_key)=32),",
+    "session_data blob not null ",
+    "check(typeof(session_data)='blob' and length(session_data)between 1 and 1048576),",
+    "revision integer not null default 0 check(revision>=0),",
+    "updated_at text not null default(datetime('now'))",
+    "check(typeof(updated_at)='text' and length(updated_at)between 1 and 64)",
+    ")without rowid"
+);
+const RATCHET_SESSION_CAPACITY_TRIGGER_NAMES_V1: [&str; 6] = [
+    "ratchet_session_capacity_insert_v1",
+    "ratchet_session_capacity_insert_commit_v1",
+    "ratchet_session_capacity_update_v1",
+    "ratchet_session_capacity_update_commit_v1",
+    "ratchet_session_capacity_delete_v1",
+    "ratchet_session_capacity_delete_commit_v1",
+];
+
+/// Normalize only the exact ASCII DDL emitted by Veil's historical migrations.
+/// Comments and non-separating whitespace are discarded; token-separating
+/// whitespace is canonicalized so distinct declarations cannot alias after
+/// compaction. Quoted bytes stay exact to preserve string/collation semantics.
+fn normalize_ratchet_session_ddl_v1(sql: &str) -> Result<String, String> {
+    fn token_edge(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b'_' | b'$' | b'\'' | b'"' | b'`' | b'[' | b']')
+    }
+
+    if !sql.is_ascii() {
+        return Err("ratchet session table DDL is not canonical ASCII".to_string());
+    }
+    let bytes = sql.as_bytes();
+    let mut normalized = String::with_capacity(bytes.len());
+    let mut index = 0usize;
+    let mut quoted_until: Option<u8> = None;
+    let mut separator_pending = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(quote_end) = quoted_until {
+            normalized.push(char::from(byte));
+            if byte == quote_end {
+                if quote_end != b']' && bytes.get(index + 1) == Some(&quote_end) {
+                    normalized.push(char::from(quote_end));
+                    index += 2;
+                    continue;
+                }
+                quoted_until = None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if separator_pending {
+            if normalized
+                .as_bytes()
+                .last()
+                .copied()
+                .is_some_and(token_edge)
+                && token_edge(byte)
+            {
+                normalized.push(' ');
+            }
+            separator_pending = false;
+        }
+
+        match byte {
+            b'\'' | b'"' | b'`' => {
+                quoted_until = Some(byte);
+                normalized.push(char::from(byte));
+                index += 1;
+            }
+            b'[' => {
+                quoted_until = Some(b']');
+                normalized.push('[');
+                index += 1;
+            }
+            b'-' if bytes.get(index + 1) == Some(&b'-') => {
+                separator_pending = true;
+                index += 2;
+                while index < bytes.len() && !matches!(bytes[index], b'\r' | b'\n') {
+                    index += 1;
+                }
+            }
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                separator_pending = true;
+                index += 2;
+                let mut closed = false;
+                while index + 1 < bytes.len() {
+                    if bytes[index] == b'*' && bytes[index + 1] == b'/' {
+                        index += 2;
+                        closed = true;
+                        break;
+                    }
+                    index += 1;
+                }
+                if !closed {
+                    return Err("ratchet session table DDL has an unterminated comment".to_string());
+                }
+            }
+            byte if byte.is_ascii_whitespace() => {
+                separator_pending = true;
+                index += 1;
+            }
+            _ => {
+                normalized.push(char::from(byte.to_ascii_lowercase()));
+                index += 1;
+            }
+        }
+    }
+    if quoted_until.is_some() {
+        return Err("ratchet session table DDL has an unterminated quote".to_string());
+    }
+    if normalized.ends_with(';') {
+        normalized.pop();
+    }
+    Ok(normalized)
+}
+
+fn classify_ratchet_session_schema_v1(
+    without_rowid: i64,
+    strict: i64,
+    sql: &str,
+) -> Result<RatchetSessionSchemaShapeV1, String> {
+    if strict != 0 {
+        return Err("ratchet session table has unsupported STRICT semantics".to_string());
+    }
+    let normalized = normalize_ratchet_session_ddl_v1(sql)?;
+    match (without_rowid, normalized.as_str()) {
+        (0, RATCHET_SESSION_LEGACY_NO_REVISION_DDL_V1) => {
+            Ok(RatchetSessionSchemaShapeV1::LegacyWithoutRevision)
+        }
+        (
+            0,
+            RATCHET_SESSION_LEGACY_REVISION_BEFORE_UPDATED_DDL_V1
+            | RATCHET_SESSION_LEGACY_REVISION_AFTER_UPDATED_DDL_V1,
+        ) => Ok(RatchetSessionSchemaShapeV1::LegacyWithRevision),
+        (1, RATCHET_SESSION_HARDENED_DDL_V1) => {
+            Ok(RatchetSessionSchemaShapeV1::HardenedWithoutRowid)
+        }
+        (0 | 1, _) => {
+            Err("ratchet session table DDL is not an exact supported historical shape".to_string())
+        }
+        _ => Err("ratchet session table has an invalid WITHOUT ROWID marker".to_string()),
+    }
+}
+
+fn validate_ratchet_session_blob_v1(session_data: &[u8]) -> Result<(), String> {
+    if session_data.is_empty() || session_data.len() > DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1 {
+        return Err("ratchet session is empty or oversized".to_string());
+    }
+    Ok(())
+}
+
+fn validate_ratchet_session_load_preflight_v1(
+    row_count: i64,
+    total_session_bytes: i64,
+    invalid_rows: i64,
+) -> Result<usize, String> {
+    if invalid_rows != 0 {
+        return Err("persisted ratchet session row is malformed".to_string());
+    }
+    if !(0..=DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1).contains(&row_count) {
+        return Err("persisted ratchet session row limit exceeded".to_string());
+    }
+    if !(0..=DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1).contains(&total_session_bytes) {
+        return Err("persisted ratchet session aggregate byte limit exceeded".to_string());
+    }
+    usize::try_from(row_count)
+        .map_err(|_| "persisted ratchet session row count is invalid".to_string())
+}
 
 pub fn direct_message_request_digest_v1(payload: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
@@ -1079,11 +1301,10 @@ fn validate_direct_message_outbox_enqueue_v1(
     if direct_message_request_digest_v1(&input.exact_send_message_payload) != input.request_digest {
         return Err("Direct outbox request digest does not match its exact payload".to_string());
     }
-    if input.advanced_ratchet_session.is_empty()
-        || input.advanced_ratchet_session.len() > DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1
-    {
-        return Err("Direct outbox ratchet session is empty or oversized".to_string());
-    }
+    validate_ratchet_session_blob_v1(&input.expected_ratchet_session)
+        .map_err(|error| format!("Direct outbox expected {error}"))?;
+    validate_ratchet_session_blob_v1(&input.advanced_ratchet_session)
+        .map_err(|error| format!("Direct outbox advanced {error}"))?;
     if input.plaintext.len() > DIRECT_MESSAGE_PLAINTEXT_MAX_BYTES_V1
         || (input.plaintext.is_empty() && input.attachments.is_empty())
     {
@@ -2155,11 +2376,15 @@ impl VeilDb {
             );
 
             CREATE TABLE IF NOT EXISTS ratchet_sessions (
-                peer_identity_key BLOB PRIMARY KEY,
-                session_data BLOB NOT NULL,  -- Serialized RatchetSession (encrypted by SQLCipher)
+                peer_identity_key BLOB NOT NULL PRIMARY KEY
+                    CHECK(typeof(peer_identity_key) = 'blob' AND length(peer_identity_key) = 32),
+                session_data BLOB NOT NULL
+                    CHECK(typeof(session_data) = 'blob' AND length(session_data) BETWEEN 1 AND 1048576),
+                    -- Serialized RatchetSession (encrypted by SQLCipher)
                 revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-            );
+                    CHECK(typeof(updated_at) = 'text' AND length(updated_at) BETWEEN 1 AND 64)
+            ) WITHOUT ROWID;
 
             CREATE TABLE IF NOT EXISTS pending_initial_headers (
                 peer_identity_key BLOB PRIMARY KEY CHECK(length(peer_identity_key) = 32),
@@ -2535,7 +2760,7 @@ impl VeilDb {
             )
             .map_err(|e| format!("migrations: {e}"))?;
 
-        self.ensure_ratchet_session_revision_schema()?;
+        self.ensure_ratchet_sessions_without_rowid_schema()?;
         self.ensure_conversation_identity_schema()?;
         self.ensure_network_profile_avatar_schema()?;
         self.ensure_message_author_context_schema()?;
@@ -2562,40 +2787,701 @@ impl VeilDb {
         Ok(())
     }
 
-    /// Older SQLCipher files predate ratchet CAS. Add the revision inside one
-    /// IMMEDIATE schema transaction and preserve every existing session at
-    /// revision zero; callers must explicitly advance it with the outbox write.
-    fn ensure_ratchet_session_revision_schema(&self) -> Result<(), String> {
-        let tx = begin_immediate(&self.conn, "ratchet session revision schema upgrade")?;
-        let has_revision: bool = tx
+    fn validate_absence_of_temp_ratchet_schema_on(tx: &Transaction<'_>) -> Result<(), String> {
+        let conflicting_objects: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_temp_schema
+                 WHERE lower(name) IN (
+                           'ratchet_sessions',
+                           'ratchet_sessions_rowid_legacy_v1',
+                           'ratchet_session_capacity_v1',
+                           'ratchet_session_capacity_insert_v1',
+                           'ratchet_session_capacity_insert_commit_v1',
+                           'ratchet_session_capacity_update_v1',
+                           'ratchet_session_capacity_update_commit_v1',
+                           'ratchet_session_capacity_delete_v1',
+                           'ratchet_session_capacity_delete_commit_v1'
+                       )
+                    OR lower(COALESCE(tbl_name, '')) IN (
+                           'ratchet_sessions',
+                           'ratchet_session_capacity_v1'
+                       )
+                    OR instr(lower(COALESCE(sql, '')), 'ratchet_sessions') > 0
+                    OR instr(
+                           lower(COALESCE(sql, '')),
+                           'ratchet_session_capacity_v1'
+                       ) > 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect temporary ratchet schema objects: {error}"))?;
+        if conflicting_objects != 0 {
+            return Err("temporary schema has a ratchet object or dependency".to_string());
+        }
+        Ok(())
+    }
+
+    fn validate_existing_ratchet_capacity_schema_on(
+        tx: &Transaction<'_>,
+        schema_shape: RatchetSessionSchemaShapeV1,
+    ) -> Result<(), String> {
+        let dependent_views: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'view'
+                   AND instr(lower(COALESCE(sql, '')), 'ratchet_session_capacity_v1') > 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect ratchet capacity dependent views: {error}"))?;
+        let dependent_external_triggers: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'trigger'
+                   AND lower(name) NOT IN (
+                       'ratchet_session_capacity_insert_v1',
+                       'ratchet_session_capacity_insert_commit_v1',
+                       'ratchet_session_capacity_update_v1',
+                       'ratchet_session_capacity_update_commit_v1',
+                       'ratchet_session_capacity_delete_v1',
+                       'ratchet_session_capacity_delete_commit_v1'
+                   )
+                   AND instr(lower(COALESCE(sql, '')), 'ratchet_session_capacity_v1') > 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                format!("inspect ratchet capacity dependent external triggers: {error}")
+            })?;
+        let outbound_foreign_keys: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('ratchet_session_capacity_v1')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect ratchet capacity outbound foreign keys: {error}"))?;
+        let inbound_foreign_keys: i64 = tx
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_schema AS owner
+                 JOIN pragma_foreign_key_list(owner.name) AS foreign_key
+                 WHERE owner.type = 'table'
+                   AND lower(owner.name) != 'ratchet_session_capacity_v1'
+                   AND lower(foreign_key.\"table\") = 'ratchet_session_capacity_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect ratchet capacity inbound foreign keys: {error}"))?;
+        let dependent_objects: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE lower(tbl_name) = 'ratchet_session_capacity_v1'
+                   AND type IN ('index', 'trigger')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect ratchet capacity owned objects: {error}"))?;
+        if dependent_views != 0
+            || dependent_external_triggers != 0
+            || outbound_foreign_keys != 0
+            || inbound_foreign_keys != 0
+            || dependent_objects != 0
+        {
+            return Err("ratchet capacity schema has unsupported dependencies".to_string());
+        }
+
+        let reserved_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE lower(name) = 'ratchet_session_capacity_v1'
+                    OR lower(name) IN (
+                       'ratchet_session_capacity_insert_v1',
+                       'ratchet_session_capacity_insert_commit_v1',
+                       'ratchet_session_capacity_update_v1',
+                       'ratchet_session_capacity_update_commit_v1',
+                       'ratchet_session_capacity_delete_v1',
+                       'ratchet_session_capacity_delete_commit_v1'
+                    )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect reserved ratchet capacity objects: {error}"))?;
+        if reserved_count == 0 {
+            return Ok(());
+        }
+        if schema_shape != RatchetSessionSchemaShapeV1::HardenedWithoutRowid || reserved_count != 7
+        {
+            return Err("reserved ratchet capacity schema is incomplete or unexpected".to_string());
+        }
+
+        let expected = Connection::open_in_memory()
+            .map_err(|error| format!("open expected ratchet capacity schema: {error}"))?;
+        expected
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB NOT NULL PRIMARY KEY
+                         CHECK(typeof(peer_identity_key) = 'blob'
+                               AND length(peer_identity_key) = 32),
+                     session_data BLOB NOT NULL
+                         CHECK(typeof(session_data) = 'blob'
+                               AND length(session_data) BETWEEN 1 AND 1048576),
+                     revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                         CHECK(typeof(updated_at) = 'text'
+                               AND length(updated_at) BETWEEN 1 AND 64)
+                 ) WITHOUT ROWID;",
+            )
+            .map_err(|error| format!("create expected ratchet session schema: {error}"))?;
+        let expected_tx = begin_immediate(&expected, "expected ratchet capacity schema")?;
+        Self::install_ratchet_session_capacity_schema_on(&expected_tx, 0, 0)?;
+        expected_tx
+            .commit()
+            .map_err(|error| format!("commit expected ratchet capacity schema: {error}"))?;
+
+        for name in std::iter::once("ratchet_session_capacity_v1")
+            .chain(RATCHET_SESSION_CAPACITY_TRIGGER_NAMES_V1)
+        {
+            let load = |connection: &Connection| {
+                connection
+                    .query_row(
+                        "SELECT type, tbl_name, sql FROM sqlite_schema WHERE name = ?1",
+                        rusqlite::params![name],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()
+            };
+            let actual = tx
+                .query_row(
+                    "SELECT type, tbl_name, sql FROM sqlite_schema
+                     WHERE name = ?1 COLLATE NOCASE",
+                    rusqlite::params![name],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, Option<String>>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(|error| format!("load ratchet capacity object {name}: {error}"))?
+                .ok_or_else(|| format!("ratchet capacity object {name} is absent"))?;
+            let expected_object = load(&expected)
+                .map_err(|error| format!("load expected ratchet capacity object {name}: {error}"))?
+                .ok_or_else(|| format!("expected ratchet capacity object {name} is absent"))?;
+            let actual_sql = actual
+                .2
+                .as_deref()
+                .ok_or_else(|| format!("ratchet capacity object {name} has no DDL"))?;
+            let expected_sql = expected_object
+                .2
+                .as_deref()
+                .ok_or_else(|| format!("expected ratchet capacity object {name} has no DDL"))?;
+            if actual.0 != expected_object.0
+                || actual.1 != expected_object.1
+                || normalize_ratchet_session_ddl_v1(actual_sql)?
+                    != normalize_ratchet_session_ddl_v1(expected_sql)?
+            {
+                return Err(format!(
+                    "ratchet capacity object {name} has unsupported DDL"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Rebuild either exact historical rowid-backed ratchet table into the
+    /// hardened V1 WITHOUT ROWID shape and publish revision/capacity state in
+    /// one IMMEDIATE transaction. DDL, indexes and external dependencies are
+    /// allowlisted before any schema mutation so an older binary cannot erase
+    /// constraints introduced by an unknown schema.
+    fn ensure_ratchet_sessions_without_rowid_schema(&self) -> Result<(), String> {
+        let tx = begin_immediate(&self.conn, "ratchet session WITHOUT ROWID schema upgrade")?;
+        Self::validate_absence_of_temp_ratchet_schema_on(&tx)?;
+        let (without_rowid, strict, table_sql) = tx
+            .query_row(
+                "SELECT table_list.wr, table_list.strict, schema.sql
+                 FROM pragma_table_list AS table_list
+                 JOIN sqlite_schema AS schema
+                   ON schema.type = 'table' AND schema.name = table_list.name
+                 WHERE table_list.schema = 'main'
+                   AND table_list.name = 'ratchet_sessions'
+                   AND table_list.type = 'table'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(|error| format!("inspect ratchet session table kind: {error}"))?
+            .ok_or_else(|| "ratchet session table is absent".to_string())?;
+        let schema_shape = classify_ratchet_session_schema_v1(without_rowid, strict, &table_sql)?;
+
+        let mut index_statement = tx
+            .prepare(
+                "SELECT name, \"unique\", origin, partial
+                 FROM pragma_index_list('ratchet_sessions') ORDER BY seq",
+            )
+            .map_err(|error| format!("inspect ratchet session indexes: {error}"))?;
+        let indexes = index_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })
+            .map_err(|error| format!("query ratchet session indexes: {error}"))?;
+        let mut index_count = 0usize;
+        for index in indexes {
+            let (name, unique, origin, partial) =
+                index.map_err(|error| format!("read ratchet session index: {error}"))?;
+            index_count += 1;
+            if name != "sqlite_autoindex_ratchet_sessions_1"
+                || unique != 1
+                || origin != "pk"
+                || partial != 0
+            {
+                return Err(format!(
+                    "ratchet session table has an unsupported index: {name}"
+                ));
+            }
+        }
+        drop(index_statement);
+        if index_count != 1 {
+            return Err(
+                "ratchet session table does not have its exact primary-key index".to_string(),
+            );
+        }
+        let mut index_topology_statement = tx
+            .prepare(
+                "SELECT seqno, cid, name, \"desc\", coll, key
+                 FROM pragma_index_xinfo('sqlite_autoindex_ratchet_sessions_1')
+                 ORDER BY seqno",
+            )
+            .map_err(|error| format!("inspect ratchet primary-key topology: {error}"))?;
+        let index_topology = index_topology_statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| format!("query ratchet primary-key topology: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("read ratchet primary-key topology: {error}"))?;
+        drop(index_topology_statement);
+        let binary = Some("BINARY".to_string());
+        let expected_index_topology = match schema_shape {
+            RatchetSessionSchemaShapeV1::LegacyWithoutRevision
+            | RatchetSessionSchemaShapeV1::LegacyWithRevision => vec![
+                (
+                    0,
+                    0,
+                    Some("peer_identity_key".to_string()),
+                    0,
+                    binary.clone(),
+                    1,
+                ),
+                (1, -1, None, 0, binary.clone(), 0),
+            ],
+            RatchetSessionSchemaShapeV1::HardenedWithoutRowid => vec![
+                (
+                    0,
+                    0,
+                    Some("peer_identity_key".to_string()),
+                    0,
+                    binary.clone(),
+                    1,
+                ),
+                (1, 1, Some("session_data".to_string()), 0, binary.clone(), 0),
+                (2, 2, Some("revision".to_string()), 0, binary.clone(), 0),
+                (3, 3, Some("updated_at".to_string()), 0, binary, 0),
+            ],
+        };
+        if index_topology != expected_index_topology {
+            return Err("ratchet session primary-key index topology is unsupported".to_string());
+        }
+
+        let mut object_statement = tx
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE lower(tbl_name) = 'ratchet_sessions' AND type = 'trigger'",
+            )
+            .map_err(|error| format!("inspect ratchet session schema objects: {error}"))?;
+        let objects = object_statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("query ratchet session schema objects: {error}"))?;
+        let mut capacity_trigger_count = 0usize;
+        for object in objects {
+            let name =
+                object.map_err(|error| format!("read ratchet session schema object: {error}"))?;
+            if !RATCHET_SESSION_CAPACITY_TRIGGER_NAMES_V1
+                .iter()
+                .any(|expected| name.eq_ignore_ascii_case(expected))
+            {
+                return Err(format!(
+                    "ratchet session table has an unsupported trigger: {name}"
+                ));
+            }
+            capacity_trigger_count += 1;
+        }
+        drop(object_statement);
+        let valid_trigger_count = match schema_shape {
+            RatchetSessionSchemaShapeV1::HardenedWithoutRowid => {
+                matches!(capacity_trigger_count, 0 | 6)
+            }
+            RatchetSessionSchemaShapeV1::LegacyWithoutRevision
+            | RatchetSessionSchemaShapeV1::LegacyWithRevision => capacity_trigger_count == 0,
+        };
+        if !valid_trigger_count {
+            return Err(
+                "ratchet session capacity trigger set is incomplete or unexpected".to_string(),
+            );
+        }
+        Self::validate_existing_ratchet_capacity_schema_on(&tx, schema_shape)?;
+
+        let dependent_views: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'view'
+                   AND instr(lower(COALESCE(sql, '')), 'ratchet_sessions') > 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect ratchet session dependent views: {error}"))?;
+        let dependent_external_triggers: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_schema
+                 WHERE type = 'trigger' AND lower(tbl_name) != 'ratchet_sessions'
+                   AND instr(lower(COALESCE(sql, '')), 'ratchet_sessions') > 0",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| {
+                format!("inspect ratchet session dependent external triggers: {error}")
+            })?;
+        let outbound_foreign_keys: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_list('ratchet_sessions')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect ratchet session outbound foreign keys: {error}"))?;
+        let inbound_foreign_keys: i64 = tx
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM sqlite_schema AS owner
+                 JOIN pragma_foreign_key_list(owner.name) AS foreign_key
+                 WHERE owner.type = 'table' AND owner.name != 'ratchet_sessions'
+                   AND lower(foreign_key.\"table\") = 'ratchet_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("inspect ratchet session inbound foreign keys: {error}"))?;
+        if dependent_views != 0
+            || dependent_external_triggers != 0
+            || outbound_foreign_keys != 0
+            || inbound_foreign_keys != 0
+        {
+            return Err("ratchet session table has unsupported schema dependencies".to_string());
+        }
+
+        let reserved_object_exists: bool = tx
             .query_row(
                 "SELECT EXISTS(
-                    SELECT 1 FROM pragma_table_info('ratchet_sessions')
-                    WHERE name = 'revision'
+                    SELECT 1 FROM sqlite_schema
+                    WHERE lower(name) = 'ratchet_sessions_rowid_legacy_v1'
                  )",
                 [],
                 |row| row.get(0),
             )
-            .map_err(|error| format!("inspect ratchet session revision schema: {error}"))?;
-        if !has_revision {
-            tx.execute_batch(
-                "ALTER TABLE ratchet_sessions
-                 ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0);",
-            )
-            .map_err(|error| format!("add ratchet session revision: {error}"))?;
+            .map_err(|error| format!("inspect ratchet migration object: {error}"))?;
+        if reserved_object_exists {
+            return Err("unexpected ratchet session migration object exists".to_string());
         }
-        let invalid: bool = tx
+
+        let revision_projection = if schema_shape.has_revision() {
+            "revision"
+        } else {
+            "0"
+        };
+        let preflight_sql = format!(
+            "SELECT COUNT(*),
+                        COALESCE(SUM(
+                            CASE
+                                WHEN typeof(session_data) = 'blob'
+                                 AND length(session_data) BETWEEN 1 AND ?1
+                                THEN length(session_data)
+                                ELSE 0
+                            END
+                        ), 0),
+                        COALESCE(MAX(
+                            CASE
+                                WHEN typeof(peer_identity_key) != 'blob'
+                                  OR length(peer_identity_key) != 32
+                                  OR typeof(session_data) != 'blob'
+                                  OR length(session_data) NOT BETWEEN 1 AND ?1
+                                  OR typeof(revision) != 'integer'
+                                  OR revision < 0
+                                  OR typeof(updated_at) != 'text'
+                                  OR length(updated_at) NOT BETWEEN 1 AND ?2
+                                THEN 1
+                                ELSE 0
+                            END
+                        ), 0)
+                 FROM (
+                     SELECT peer_identity_key, session_data,
+                            {revision_projection} AS revision, updated_at
+                     FROM ratchet_sessions
+                     LIMIT ?3
+                 )"
+        );
+        let (row_count, total_session_bytes, invalid_rows): (i64, i64, i64) = tx
             .query_row(
-                "SELECT EXISTS(SELECT 1 FROM ratchet_sessions WHERE revision < 0)",
-                [],
-                |row| row.get(0),
+                &preflight_sql,
+                rusqlite::params![
+                    DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1,
+                    DIRECT_MESSAGE_RATCHET_UPDATED_AT_MAX_CHARS_SQLITE_V1,
+                    DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1 + 1,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
-            .map_err(|error| format!("validate ratchet session revisions: {error}"))?;
-        if invalid {
-            return Err("persisted ratchet session revision is invalid".to_string());
+            .map_err(|error| format!("preflight ratchet session table upgrade: {error}"))?;
+        validate_ratchet_session_load_preflight_v1(row_count, total_session_bytes, invalid_rows)?;
+
+        if !matches!(
+            schema_shape,
+            RatchetSessionSchemaShapeV1::HardenedWithoutRowid
+        ) {
+            let rebuild_sql = format!(
+                "DROP TRIGGER IF EXISTS ratchet_session_capacity_insert_v1;
+                 DROP TRIGGER IF EXISTS ratchet_session_capacity_insert_commit_v1;
+                 DROP TRIGGER IF EXISTS ratchet_session_capacity_update_v1;
+                 DROP TRIGGER IF EXISTS ratchet_session_capacity_update_commit_v1;
+                 DROP TRIGGER IF EXISTS ratchet_session_capacity_delete_v1;
+                 DROP TRIGGER IF EXISTS ratchet_session_capacity_delete_commit_v1;
+
+                 ALTER TABLE ratchet_sessions
+                     RENAME TO ratchet_sessions_rowid_legacy_v1;
+                 CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB NOT NULL PRIMARY KEY
+                         CHECK(typeof(peer_identity_key) = 'blob'
+                               AND length(peer_identity_key) = 32),
+                     session_data BLOB NOT NULL
+                         CHECK(typeof(session_data) = 'blob'
+                               AND length(session_data) BETWEEN 1 AND 1048576),
+                     revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                         CHECK(typeof(updated_at) = 'text'
+                               AND length(updated_at) BETWEEN 1 AND 64)
+                 ) WITHOUT ROWID;
+                 INSERT INTO ratchet_sessions
+                     (peer_identity_key, session_data, revision, updated_at)
+                 SELECT peer_identity_key, session_data,
+                        {revision_projection} AS revision, updated_at
+                 FROM ratchet_sessions_rowid_legacy_v1;"
+            );
+            tx.execute_batch(&rebuild_sql)
+                .map_err(|error| format!("rebuild ratchet session table WITHOUT ROWID: {error}"))?;
+
+            let copied_rows: i64 = tx
+                .query_row("SELECT COUNT(*) FROM ratchet_sessions", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|error| format!("count rebuilt ratchet session rows: {error}"))?;
+            let comparison_sql = format!(
+                "SELECT
+                         EXISTS(
+                             SELECT peer_identity_key, session_data,
+                                    {revision_projection} AS revision, updated_at
+                             FROM ratchet_sessions_rowid_legacy_v1
+                             EXCEPT
+                             SELECT peer_identity_key, session_data, revision, updated_at
+                             FROM ratchet_sessions
+                         ),
+                         EXISTS(
+                             SELECT peer_identity_key, session_data, revision, updated_at
+                             FROM ratchet_sessions
+                             EXCEPT
+                             SELECT peer_identity_key, session_data,
+                                    {revision_projection} AS revision, updated_at
+                             FROM ratchet_sessions_rowid_legacy_v1
+                         )"
+            );
+            let (legacy_missing, rebuilt_missing): (bool, bool) = tx
+                .query_row(&comparison_sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
+                .map_err(|error| format!("compare rebuilt ratchet session rows: {error}"))?;
+            if copied_rows != row_count || legacy_missing || rebuilt_missing {
+                return Err("rebuilt ratchet session rows differ from legacy bytes".to_string());
+            }
+            tx.execute_batch("DROP TABLE ratchet_sessions_rowid_legacy_v1;")
+                .map_err(|error| format!("drop legacy ratchet session table: {error}"))?;
         }
+
+        Self::install_ratchet_session_capacity_schema_on(&tx, row_count, total_session_bytes)?;
         tx.commit()
-            .map_err(|error| format!("commit ratchet session revision schema upgrade: {error}"))
+            .map_err(|error| format!("commit ratchet session storage schema upgrade: {error}"))
+    }
+
+    /// Install the derived capacity table and every mutation trigger inside an
+    /// already-held schema transaction. The caller supplies counters computed
+    /// directly from the bounded ratchet table snapshot.
+    fn install_ratchet_session_capacity_schema_on(
+        tx: &Transaction<'_>,
+        row_count: i64,
+        total_session_bytes: i64,
+    ) -> Result<(), String> {
+        let schema = format!(
+            "DROP TRIGGER IF EXISTS ratchet_session_capacity_insert_v1;
+             DROP TRIGGER IF EXISTS ratchet_session_capacity_insert_commit_v1;
+             DROP TRIGGER IF EXISTS ratchet_session_capacity_update_v1;
+             DROP TRIGGER IF EXISTS ratchet_session_capacity_update_commit_v1;
+             DROP TRIGGER IF EXISTS ratchet_session_capacity_delete_v1;
+             DROP TRIGGER IF EXISTS ratchet_session_capacity_delete_commit_v1;
+             DROP TABLE IF EXISTS ratchet_session_capacity_v1;
+
+             CREATE TABLE ratchet_session_capacity_v1 (
+                 singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                 row_count INTEGER NOT NULL
+                     CHECK(row_count BETWEEN 0 AND {max_rows}),
+                 total_session_bytes INTEGER NOT NULL
+                     CHECK(total_session_bytes BETWEEN 0 AND {max_total_bytes})
+             );
+             INSERT INTO ratchet_session_capacity_v1
+                 (singleton, row_count, total_session_bytes)
+             VALUES (1, {row_count}, {total_session_bytes});
+
+             CREATE TRIGGER ratchet_session_capacity_insert_v1
+             BEFORE INSERT ON ratchet_sessions
+             BEGIN
+                 SELECT CASE
+                     WHEN typeof(NEW.peer_identity_key) != 'blob'
+                       OR length(NEW.peer_identity_key) != 32
+                       OR typeof(NEW.session_data) != 'blob'
+                       OR length(NEW.session_data) NOT BETWEEN 1 AND {max_blob_bytes}
+                       OR typeof(NEW.revision) != 'integer'
+                       OR NEW.revision < 0
+                       OR typeof(NEW.updated_at) != 'text'
+                       OR length(NEW.updated_at) NOT BETWEEN 1 AND {max_updated_at_chars}
+                     THEN RAISE(ABORT, 'invalid ratchet session row')
+                 END;
+                 SELECT CASE
+                     WHEN (SELECT COUNT(*) FROM ratchet_session_capacity_v1
+                           WHERE singleton = 1) != 1
+                     THEN RAISE(ABORT, 'ratchet capacity metadata is absent')
+                 END;
+                 SELECT CASE
+                     WHEN EXISTS(
+                         SELECT 1 FROM ratchet_sessions
+                         WHERE peer_identity_key = NEW.peer_identity_key
+                     )
+                     THEN RAISE(ABORT, 'ratchet session already exists')
+                 END;
+                 SELECT CASE
+                     WHEN (SELECT row_count FROM ratchet_session_capacity_v1
+                           WHERE singleton = 1) >= {max_rows}
+                       OR (SELECT total_session_bytes FROM ratchet_session_capacity_v1
+                           WHERE singleton = 1)
+                          > {max_total_bytes} - length(NEW.session_data)
+                     THEN RAISE(ABORT, 'ratchet session capacity exceeded')
+                 END;
+             END;
+
+             CREATE TRIGGER ratchet_session_capacity_insert_commit_v1
+             AFTER INSERT ON ratchet_sessions
+             BEGIN
+                 UPDATE ratchet_session_capacity_v1
+                 SET row_count = row_count + 1,
+                     total_session_bytes = total_session_bytes + length(NEW.session_data)
+                 WHERE singleton = 1;
+             END;
+
+             CREATE TRIGGER ratchet_session_capacity_update_v1
+             BEFORE UPDATE ON ratchet_sessions
+             BEGIN
+                 SELECT CASE
+                     WHEN typeof(NEW.peer_identity_key) != 'blob'
+                       OR length(NEW.peer_identity_key) != 32
+                       OR typeof(NEW.session_data) != 'blob'
+                       OR length(NEW.session_data) NOT BETWEEN 1 AND {max_blob_bytes}
+                       OR typeof(NEW.revision) != 'integer'
+                       OR NEW.revision < 0
+                       OR NEW.peer_identity_key != OLD.peer_identity_key
+                       OR typeof(NEW.updated_at) != 'text'
+                       OR length(NEW.updated_at) NOT BETWEEN 1 AND {max_updated_at_chars}
+                     THEN RAISE(ABORT, 'invalid ratchet session row')
+                 END;
+                 SELECT CASE
+                     WHEN (SELECT COUNT(*) FROM ratchet_session_capacity_v1
+                           WHERE singleton = 1) != 1
+                     THEN RAISE(ABORT, 'ratchet capacity metadata is absent')
+                 END;
+                 SELECT CASE
+                     WHEN (SELECT total_session_bytes FROM ratchet_session_capacity_v1
+                           WHERE singleton = 1)
+                          - length(OLD.session_data) + length(NEW.session_data)
+                          NOT BETWEEN 0 AND {max_total_bytes}
+                     THEN RAISE(ABORT, 'ratchet session capacity exceeded')
+                 END;
+             END;
+
+             CREATE TRIGGER ratchet_session_capacity_update_commit_v1
+             AFTER UPDATE ON ratchet_sessions
+             BEGIN
+                 UPDATE ratchet_session_capacity_v1
+                 SET total_session_bytes = total_session_bytes
+                     - length(OLD.session_data) + length(NEW.session_data)
+                 WHERE singleton = 1;
+             END;
+
+             CREATE TRIGGER ratchet_session_capacity_delete_v1
+             BEFORE DELETE ON ratchet_sessions
+             BEGIN
+                 SELECT CASE
+                     WHEN (SELECT COUNT(*) FROM ratchet_session_capacity_v1
+                           WHERE singleton = 1) != 1
+                     THEN RAISE(ABORT, 'ratchet capacity metadata is absent')
+                 END;
+                 SELECT CASE
+                     WHEN (SELECT row_count FROM ratchet_session_capacity_v1
+                           WHERE singleton = 1) <= 0
+                       OR (SELECT total_session_bytes FROM ratchet_session_capacity_v1
+                           WHERE singleton = 1) < length(OLD.session_data)
+                     THEN RAISE(ABORT, 'ratchet capacity metadata is inconsistent')
+                 END;
+             END;
+
+             CREATE TRIGGER ratchet_session_capacity_delete_commit_v1
+             AFTER DELETE ON ratchet_sessions
+             BEGIN
+                 UPDATE ratchet_session_capacity_v1
+                 SET row_count = row_count - 1,
+                     total_session_bytes = total_session_bytes - length(OLD.session_data)
+                 WHERE singleton = 1;
+             END;",
+            max_rows = DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1,
+            max_total_bytes = DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1,
+            max_blob_bytes = DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1,
+            max_updated_at_chars = DIRECT_MESSAGE_RATCHET_UPDATED_AT_MAX_CHARS_SQLITE_V1,
+        );
+        tx.execute_batch(&schema)
+            .map_err(|error| format!("install ratchet session capacity schema: {error}"))
     }
 
     /// Add the nullable origin/account coordinates used by authenticated
@@ -4959,12 +5845,13 @@ impl VeilDb {
             .execute(
                 "UPDATE ratchet_sessions
                  SET session_data = ?1, revision = ?2, updated_at = datetime('now')
-                 WHERE peer_identity_key = ?3 AND revision = ?4",
+                 WHERE peer_identity_key = ?3 AND revision = ?4 AND session_data = ?5",
                 rusqlite::params![
                     &input.advanced_ratchet_session,
                     next_revision,
                     route.peer_identity_key.as_slice(),
                     expected_revision,
+                    &input.expected_ratchet_session,
                 ],
             )
             .map_err(|error| format!("advance Direct outbox ratchet session: {error}"))?;
@@ -6418,32 +7305,43 @@ impl VeilDb {
 
     // ─── CRUD: Ratchet Sessions ───────────────────────────
 
-    pub fn save_ratchet_session(
+    /// Replace exactly one established ratchet revision. A stale process or
+    /// second SQLCipher handle cannot overwrite a state it did not decrypt or
+    /// encrypt from.
+    pub fn compare_and_swap_ratchet_session_v1(
         &self,
-        peer_identity_key: &[u8],
-        session_data: &[u8],
-    ) -> Result<(), String> {
-        self.conn
+        peer_identity_key: &[u8; 32],
+        expected_revision: u64,
+        expected_session_data: &[u8],
+        advanced_session_data: &[u8],
+    ) -> Result<u64, String> {
+        validate_ratchet_session_blob_v1(expected_session_data)?;
+        validate_ratchet_session_blob_v1(advanced_session_data)?;
+        let expected_revision = i64::try_from(expected_revision)
+            .map_err(|_| "ratchet session revision exceeds SQLite integer".to_string())?;
+        let next_revision = expected_revision
+            .checked_add(1)
+            .ok_or_else(|| "ratchet session revision is exhausted".to_string())?;
+        let changed = self
+            .conn
             .execute(
-                "INSERT INTO ratchet_sessions
-                    (peer_identity_key, session_data, revision, updated_at)
-                 VALUES (?1, ?2, 0, datetime('now'))
-                 ON CONFLICT(peer_identity_key) DO UPDATE SET
-                    session_data = excluded.session_data,
-                    revision = ratchet_sessions.revision + 1,
-                    updated_at = datetime('now')
-                 WHERE ratchet_sessions.revision < 9223372036854775807",
-                rusqlite::params![peer_identity_key, session_data],
+                "UPDATE ratchet_sessions
+                 SET session_data = ?1, revision = ?2, updated_at = datetime('now')
+                 WHERE peer_identity_key = ?3 AND revision = ?4 AND session_data = ?5",
+                rusqlite::params![
+                    advanced_session_data,
+                    next_revision,
+                    peer_identity_key.as_slice(),
+                    expected_revision,
+                    expected_session_data,
+                ],
             )
-            .map_err(|e| format!("save ratchet session: {e}"))
-            .and_then(|changed| {
-                if changed == 1 {
-                    Ok(())
-                } else {
-                    Err("ratchet session revision is exhausted".to_string())
-                }
-            })?;
-        Ok(())
+            .map_err(|error| format!("advance ratchet session: {error}"))?;
+        if changed != 1 {
+            return Err("ratchet session revision changed or session is absent".to_string());
+        }
+        u64::try_from(next_revision)
+            .map_err(|_| "advanced ratchet session revision is invalid".to_string())
     }
 
     /// Persist a newly initiated ratchet together with the X3DH metadata that
@@ -6454,6 +7352,7 @@ impl VeilDb {
         session_data: &[u8],
         initial_header_data: &[u8],
     ) -> Result<(), String> {
+        validate_ratchet_session_blob_v1(session_data)?;
         let tx = self
             .conn
             .unchecked_transaction()
@@ -6461,22 +7360,10 @@ impl VeilDb {
         tx.execute(
             "INSERT INTO ratchet_sessions
                (peer_identity_key, session_data, revision, updated_at)
-             VALUES (?1, ?2, 0, datetime('now'))
-             ON CONFLICT(peer_identity_key) DO UPDATE SET
-                session_data = excluded.session_data,
-                revision = ratchet_sessions.revision + 1,
-                updated_at = datetime('now')
-             WHERE ratchet_sessions.revision < 9223372036854775807",
+             VALUES (?1, ?2, 0, datetime('now'))",
             rusqlite::params![peer_identity_key.as_slice(), session_data],
         )
-        .map_err(|e| format!("save initiator ratchet session: {e}"))
-        .and_then(|changed| {
-            if changed == 1 {
-                Ok(())
-            } else {
-                Err("initiator ratchet session revision is exhausted".to_string())
-            }
-        })?;
+        .map_err(|e| format!("insert initiator ratchet session: {e}"))?;
         tx.execute(
             "INSERT OR REPLACE INTO pending_initial_headers
                (peer_identity_key, header_data, updated_at)
@@ -6523,12 +7410,23 @@ impl VeilDb {
         &self,
         peer_identity_key: &[u8],
     ) -> Result<Option<Vec<u8>>, String> {
+        if peer_identity_key.len() != 32 {
+            return Err("ratchet peer identity key must be 32 bytes".to_string());
+        }
         match self.conn.query_row(
-            "SELECT session_data FROM ratchet_sessions WHERE peer_identity_key = ?1",
-            rusqlite::params![peer_identity_key],
-            |row| row.get(0),
+            "SELECT CASE
+                        WHEN length(session_data) BETWEEN 1 AND ?2 THEN session_data
+                        ELSE NULL
+                    END
+             FROM ratchet_sessions WHERE peer_identity_key = ?1",
+            rusqlite::params![
+                peer_identity_key,
+                DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1
+            ],
+            |row| row.get::<_, Option<Vec<u8>>>(0),
         ) {
-            Ok(data) => Ok(Some(data)),
+            Ok(Some(data)) => Ok(Some(data)),
+            Ok(None) => Err("persisted ratchet session is empty or oversized".to_string()),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(format!("load ratchet session: {e}")),
         }
@@ -6543,25 +7441,156 @@ impl VeilDb {
         let row = self
             .conn
             .query_row(
-                "SELECT session_data, revision
+                "SELECT CASE
+                            WHEN length(session_data) BETWEEN 1 AND ?2 THEN session_data
+                            ELSE NULL
+                        END,
+                        revision
                  FROM ratchet_sessions WHERE peer_identity_key = ?1",
-                rusqlite::params![peer_identity_key.as_slice()],
-                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+                rusqlite::params![
+                    peer_identity_key.as_slice(),
+                    DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1
+                ],
+                |row| Ok((row.get::<_, Option<Vec<u8>>>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()
             .map_err(|error| format!("load ratchet session revision: {error}"))?;
         let Some((session_data, revision)) = row else {
             return Ok(None);
         };
-        if session_data.is_empty() || session_data.len() > DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1 {
-            return Err("persisted ratchet session is empty or oversized".to_string());
-        }
+        let session_data = session_data
+            .ok_or_else(|| "persisted ratchet session is empty or oversized".to_string())?;
         let revision = u64::try_from(revision)
             .map_err(|_| "persisted ratchet session revision is invalid".to_string())?;
         Ok(Some(RatchetSessionWithRevisionV1 {
             session_data,
             revision,
         }))
+    }
+
+    /// Load every encrypted-at-rest ratchet row for startup validation. The
+    /// caller may publish only origin-authorized peers, but malformed orphan
+    /// rows must not remain a silent future session-replacement hazard.
+    pub fn load_all_ratchet_sessions_with_revision_v1(
+        &self,
+    ) -> Result<Vec<([u8; 32], RatchetSessionWithRevisionV1)>, String> {
+        // Keep the resource preflight and row read on one SQLite snapshot so a
+        // second process cannot race extra rows or bytes in after validation.
+        // Aggregate length/type checks do not materialize any BLOB in Rust.
+        let transaction = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|error| format!("begin ratchet session validation load: {error}"))?;
+        let (row_count, total_session_bytes, invalid_rows): (i64, i64, i64) = transaction
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE(SUM(
+                            CASE
+                                WHEN typeof(session_data) = 'blob'
+                                 AND length(session_data) BETWEEN 1 AND ?1
+                                THEN length(session_data)
+                                ELSE 0
+                            END
+                        ), 0),
+                        COALESCE(MAX(
+                            CASE
+                                WHEN typeof(peer_identity_key) != 'blob'
+                                  OR length(peer_identity_key) != 32
+                                  OR typeof(session_data) != 'blob'
+                                  OR length(session_data) NOT BETWEEN 1 AND ?1
+                                  OR typeof(revision) != 'integer'
+                                  OR revision < 0
+                                THEN 1
+                                ELSE 0
+                            END
+                        ), 0)
+                 FROM (
+                     SELECT peer_identity_key, session_data, revision
+                     FROM ratchet_sessions
+                     LIMIT ?2
+                 )",
+                rusqlite::params![
+                    DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1,
+                    DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1 + 1,
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .map_err(|error| format!("preflight ratchet session validation load: {error}"))?;
+        let row_capacity = validate_ratchet_session_load_preflight_v1(
+            row_count,
+            total_session_bytes,
+            invalid_rows,
+        )?;
+
+        let mut statement = transaction
+            .prepare(
+                "SELECT CASE
+                            WHEN typeof(peer_identity_key) = 'blob'
+                             AND length(peer_identity_key) = 32
+                            THEN peer_identity_key
+                            ELSE NULL
+                        END,
+                        CASE
+                            WHEN typeof(session_data) = 'blob'
+                             AND length(session_data) BETWEEN 1 AND ?1
+                            THEN session_data
+                            ELSE NULL
+                        END,
+                        CASE
+                            WHEN typeof(revision) = 'integer' AND revision >= 0
+                            THEN revision
+                            ELSE NULL
+                        END
+                 FROM ratchet_sessions",
+            )
+            .map_err(|error| format!("prepare ratchet session validation load: {error}"))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<Vec<u8>>>(0)?,
+                        row.get::<_, Option<Vec<u8>>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                    ))
+                },
+            )
+            .map_err(|error| format!("query ratchet session validation rows: {error}"))?;
+        let mut result = Vec::with_capacity(row_capacity);
+        for row in rows {
+            let (peer_identity_key, session_data, revision) =
+                row.map_err(|error| format!("read ratchet session validation row: {error}"))?;
+            let mut session_data =
+                zeroize::Zeroizing::new(session_data.ok_or_else(|| {
+                    "persisted ratchet session is empty or oversized".to_string()
+                })?);
+            let peer_identity_key: [u8; 32] = peer_identity_key
+                .ok_or_else(|| "persisted ratchet peer identity key is malformed".to_string())?
+                .try_into()
+                .map_err(|peer_identity_key: Vec<u8>| {
+                    format!(
+                        "persisted ratchet peer identity key has invalid length {}",
+                        peer_identity_key.len()
+                    )
+                })?;
+            let revision = u64::try_from(
+                revision
+                    .ok_or_else(|| "persisted ratchet session revision is invalid".to_string())?,
+            )
+            .map_err(|_| "persisted ratchet session revision is invalid".to_string())?;
+            result.push((
+                peer_identity_key,
+                RatchetSessionWithRevisionV1 {
+                    session_data: std::mem::take(&mut *session_data),
+                    revision,
+                },
+            ));
+        }
+        drop(statement);
+        transaction
+            .commit()
+            .map_err(|error| format!("commit ratchet session validation load: {error}"))?;
+        Ok(result)
     }
 
     /// Return the stable per-install device ID stored inside SQLCipher, or
@@ -7396,6 +8425,7 @@ impl VeilDb {
         session_data: &[u8],
         one_time_prekey_id: Option<u32>,
     ) -> Result<(), String> {
+        validate_ratchet_session_blob_v1(session_data)?;
         // SAVEPOINT composes with the outer atomic receive savepoint while
         // still providing standalone all-or-nothing semantics in direct use.
         self.conn
@@ -7406,22 +8436,10 @@ impl VeilDb {
                 .execute(
                     "INSERT INTO ratchet_sessions
                        (peer_identity_key, session_data, revision, updated_at)
-                     VALUES (?1, ?2, 0, datetime('now'))
-                     ON CONFLICT(peer_identity_key) DO UPDATE SET
-                        session_data = excluded.session_data,
-                        revision = ratchet_sessions.revision + 1,
-                        updated_at = datetime('now')
-                     WHERE ratchet_sessions.revision < 9223372036854775807",
+                     VALUES (?1, ?2, 0, datetime('now'))",
                     rusqlite::params![peer_identity_key.as_slice(), session_data],
                 )
-                .map_err(|e| format!("save initial ratchet session: {e}"))
-                .and_then(|changed| {
-                    if changed == 1 {
-                        Ok(())
-                    } else {
-                        Err("initial ratchet session revision is exhausted".to_string())
-                    }
-                })?;
+                .map_err(|e| format!("insert initial ratchet session: {e}"))?;
             if let Some(id) = one_time_prekey_id {
                 let changed = self
                     .conn
@@ -9448,6 +10466,8 @@ mod tests {
             request_digest: direct_message_request_digest_v1(payload),
             exact_send_message_payload: payload.to_vec(),
             expected_ratchet_revision,
+            expected_ratchet_session: format!("ratchet-session-v{expected_ratchet_revision}")
+                .into_bytes(),
             advanced_ratchet_session: format!("ratchet-session-v{}", expected_ratchet_revision + 1)
                 .into_bytes(),
             plaintext: format!("plaintext for {client_message_id}"),
@@ -9475,6 +10495,66 @@ mod tests {
             })
             .unwrap()
     }
+
+    fn ratchet_capacity(db: &VeilDb) -> (i64, i64) {
+        db.conn
+            .query_row(
+                "SELECT row_count, total_session_bytes
+                 FROM ratchet_session_capacity_v1 WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    }
+
+    fn ratchet_table_without_rowid(db: &VeilDb) -> bool {
+        db.conn
+            .query_row(
+                "SELECT wr FROM pragma_table_list
+                 WHERE schema = 'main' AND name = 'ratchet_sessions' AND type = 'table'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            == 1
+    }
+
+    fn assert_ratchet_rowid_sql_is_unavailable(db: &VeilDb, existing_peer: &[u8; 32]) {
+        let rejected_peer = [0xFEu8; 32];
+        let capacity_before = ratchet_capacity(db);
+        assert!(db
+            .conn
+            .prepare("SELECT rowid FROM ratchet_sessions")
+            .is_err());
+        assert!(db
+            .conn
+            .execute(
+                "INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, revision, updated_at)
+                 VALUES (-1, ?1, x'63', 0, datetime('now'))",
+                rusqlite::params![rejected_peer.as_slice()],
+            )
+            .is_err());
+        assert!(db
+            .conn
+            .execute(
+                "UPDATE ratchet_sessions SET rowid = -1
+                 WHERE peer_identity_key = ?1",
+                rusqlite::params![existing_peer.as_slice()],
+            )
+            .is_err());
+        assert!(db
+            .conn
+            .execute(
+                "INSERT OR REPLACE INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, revision, updated_at)
+                 VALUES (-1, ?1, x'64', 0, datetime('now'))",
+                rusqlite::params![rejected_peer.as_slice()],
+            )
+            .is_err());
+        assert_eq!(ratchet_capacity(db), capacity_before);
+    }
+
     use rusqlite::params;
 
     #[test]
@@ -9491,6 +10571,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+        assert!(ratchet_table_without_rowid(&db));
     }
 
     #[test]
@@ -13731,14 +14812,1329 @@ mod tests {
         assert!(erased.0.is_none());
         assert_eq!(erased.1, 1);
 
-        // Reusing the OTK fails and rolls back the attempted session update.
+        // Reusing the OTK for a different peer reaches the late consume check,
+        // then rolls back both the successful INSERT and its AFTER capacity
+        // counter update.
+        let capacity_before_reuse = ratchet_capacity(&db);
+        let reuse_peer = [31u8; 32];
         assert!(db
-            .commit_initial_ratchet_session(&peer, b"ratchet-two", Some(9))
+            .commit_initial_ratchet_session(&reuse_peer, b"ratchet-two-grown", Some(9))
             .is_err());
+        assert!(db.load_ratchet_session(&reuse_peer).unwrap().is_none());
+        assert_eq!(ratchet_capacity(&db), capacity_before_reuse);
         assert_eq!(
             db.load_ratchet_session(&peer).unwrap().unwrap(),
             b"ratchet-one"
         );
+    }
+
+    #[test]
+    fn ratchet_cas_requires_exact_revision_and_expected_bytes() {
+        let db = VeilDb::open_memory(&[0xC1; 32]).unwrap();
+        let peer = [0x31; 32];
+        db.commit_initial_ratchet_session(&peer, b"state-zero", None)
+            .unwrap();
+
+        assert_eq!(
+            db.compare_and_swap_ratchet_session_v1(&peer, 0, b"state-zero", b"state-one",)
+                .unwrap(),
+            1
+        );
+        assert!(db
+            .compare_and_swap_ratchet_session_v1(&peer, 0, b"state-zero", b"stale-state",)
+            .is_err());
+        assert!(db
+            .compare_and_swap_ratchet_session_v1(
+                &peer,
+                1,
+                b"same-revision-equivocation",
+                b"must-not-commit",
+            )
+            .is_err());
+
+        let stored = db
+            .load_ratchet_session_with_revision_v1(&peer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session_data, b"state-one");
+        assert_eq!(stored.revision, 1);
+    }
+
+    #[test]
+    fn file_backed_stale_ratchet_handle_cannot_overwrite_newer_state() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-ratchet-stale-cas-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let key = [0xC2; 32];
+        let peer = [0x32; 32];
+        let first = VeilDb::open(&path, &key).unwrap();
+        first
+            .commit_initial_ratchet_session(&peer, b"state-zero", None)
+            .unwrap();
+        let stale = VeilDb::open(&path, &key).unwrap();
+        let stale_snapshot = stale
+            .load_ratchet_session_with_revision_v1(&peer)
+            .unwrap()
+            .unwrap();
+
+        first
+            .compare_and_swap_ratchet_session_v1(&peer, 0, b"state-zero", b"state-one")
+            .unwrap();
+        assert!(stale
+            .compare_and_swap_ratchet_session_v1(
+                &peer,
+                stale_snapshot.revision,
+                &stale_snapshot.session_data,
+                b"stale-branch",
+            )
+            .is_err());
+        let durable = stale
+            .load_ratchet_session_with_revision_v1(&peer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.session_data, b"state-one");
+        assert_eq!(durable.revision, 1);
+
+        drop(durable);
+        drop(stale_snapshot);
+        drop(stale);
+        drop(first);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ratchet_storage_bounds_and_initial_inserts_fail_closed() {
+        let db = VeilDb::open_memory(&[0xC3; 32]).unwrap();
+        let peer = [0x33; 32];
+        db.commit_initial_ratchet_session(&peer, b"original", None)
+            .unwrap();
+        assert!(db
+            .save_initiator_session(&peer, b"replacement", b"pending")
+            .is_err());
+        let stored = db
+            .load_ratchet_session_with_revision_v1(&peer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session_data, b"original");
+        assert_eq!(stored.revision, 0);
+        assert!(db.load_pending_initial_headers().unwrap().is_empty());
+        assert!(db
+            .commit_initial_ratchet_session(&[0x34; 32], b"", None)
+            .is_err());
+        assert!(db
+            .commit_initial_ratchet_session(
+                &[0x35; 32],
+                &vec![0u8; DIRECT_MESSAGE_RATCHET_MAX_BYTES_V1 + 1],
+                None,
+            )
+            .is_err());
+
+        db.conn
+            .execute_batch(
+                "DROP TRIGGER ratchet_session_capacity_insert_v1;
+                 DROP TRIGGER ratchet_session_capacity_insert_commit_v1;
+                 DROP TRIGGER ratchet_session_capacity_update_v1;
+                 DROP TRIGGER ratchet_session_capacity_update_commit_v1;
+                 DROP TRIGGER ratchet_session_capacity_delete_v1;
+                 DROP TRIGGER ratchet_session_capacity_delete_commit_v1;
+                 PRAGMA ignore_check_constraints = ON;",
+            )
+            .unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ratchet_sessions
+                   (peer_identity_key, session_data, revision, updated_at)
+                 VALUES (?1, zeroblob(?2), 0, datetime('now'))",
+                rusqlite::params![
+                    [0x36u8; 32].as_slice(),
+                    DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1 + 1,
+                ],
+            )
+            .unwrap();
+        assert!(db.load_all_ratchet_sessions_with_revision_v1().is_err());
+        db.conn.execute("DELETE FROM ratchet_sessions", []).unwrap();
+        db.conn
+            .execute(
+                "INSERT INTO ratchet_sessions
+                   (peer_identity_key, session_data, revision, updated_at)
+                 VALUES (zeroblob(?1), x'01', 0, datetime('now'))",
+                rusqlite::params![DIRECT_MESSAGE_RATCHET_MAX_BYTES_SQLITE_V1 + 1],
+            )
+            .unwrap();
+        assert!(db.load_all_ratchet_sessions_with_revision_v1().is_err());
+
+        assert_eq!(
+            validate_ratchet_session_load_preflight_v1(
+                DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1,
+                DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1,
+                0,
+            )
+            .unwrap(),
+            DIRECT_RATCHET_SESSION_MAX_ROWS_V1
+        );
+        assert!(validate_ratchet_session_load_preflight_v1(
+            DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1 + 1,
+            1,
+            0,
+        )
+        .is_err());
+        assert!(validate_ratchet_session_load_preflight_v1(
+            1,
+            DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1 + 1,
+            0,
+        )
+        .is_err());
+        assert!(validate_ratchet_session_load_preflight_v1(1, 1, 1).is_err());
+    }
+
+    #[test]
+    fn ratchet_fresh_schema_is_without_rowid_and_rejects_rowid_sql() {
+        let db = VeilDb::open_memory(&[0xC4; 32]).unwrap();
+        let peer = [0x40; 32];
+        db.commit_initial_ratchet_session(&peer, b"fresh-state", None)
+            .unwrap();
+
+        assert!(ratchet_table_without_rowid(&db));
+        assert_ratchet_rowid_sql_is_unavailable(&db, &peer);
+        let durable = db
+            .load_ratchet_session_with_revision_v1(&peer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.session_data, b"fresh-state");
+        assert_eq!(durable.revision, 0);
+    }
+
+    #[test]
+    fn ratchet_legacy_rowid_table_migrates_losslessly_and_reopens_idempotently() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-ratchet-without-rowid-migration-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let key = [0xC5; 32];
+        let first_peer = [0x81; 32];
+        let second_peer = [0x82; 32];
+        let first_session = [0x00, 0xFF, 0x10, 0x00, 0x7F];
+        let second_session = [0x80, 0x00, 0x01, 0xFE, 0xFD, 0xFC];
+        let first_updated_at = "2026-07-19T01:02:03.456789Z";
+        let second_updated_at = "2026-07-19 04:05:06.000001+05:00";
+
+        let legacy = VeilDb::open(&path, &key).unwrap();
+        legacy
+            .conn
+            .execute_batch(
+                "DROP TRIGGER ratchet_session_capacity_insert_v1;
+                 DROP TRIGGER ratchet_session_capacity_insert_commit_v1;
+                 DROP TRIGGER ratchet_session_capacity_update_v1;
+                 DROP TRIGGER ratchet_session_capacity_update_commit_v1;
+                 DROP TRIGGER ratchet_session_capacity_delete_v1;
+                 DROP TRIGGER ratchet_session_capacity_delete_commit_v1;
+                 DROP TABLE ratchet_session_capacity_v1;
+                 DROP TABLE ratchet_sessions;
+                 CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL,
+                     revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );",
+            )
+            .unwrap();
+        legacy
+            .conn
+            .execute(
+                "INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, revision, updated_at)
+                 VALUES (-1, ?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    first_peer.as_slice(),
+                    first_session.as_slice(),
+                    7_i64,
+                    first_updated_at,
+                ],
+            )
+            .unwrap();
+        legacy
+            .conn
+            .execute(
+                "INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, revision, updated_at)
+                 VALUES (42, ?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    second_peer.as_slice(),
+                    second_session.as_slice(),
+                    19_i64,
+                    second_updated_at,
+                ],
+            )
+            .unwrap();
+        assert!(!ratchet_table_without_rowid(&legacy));
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT rowid FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                    rusqlite::params![first_peer.as_slice()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            -1
+        );
+        drop(legacy);
+
+        let assert_preserved = |db: &VeilDb| {
+            assert!(ratchet_table_without_rowid(db));
+            assert_eq!(table_count(db, "ratchet_sessions"), 2);
+            let first: (Vec<u8>, i64, Vec<u8>) = db
+                .conn
+                .query_row(
+                    "SELECT session_data, revision, CAST(updated_at AS BLOB)
+                     FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                    rusqlite::params![first_peer.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let second: (Vec<u8>, i64, Vec<u8>) = db
+                .conn
+                .query_row(
+                    "SELECT session_data, revision, CAST(updated_at AS BLOB)
+                     FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                    rusqlite::params![second_peer.as_slice()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                first,
+                (
+                    first_session.to_vec(),
+                    7,
+                    first_updated_at.as_bytes().to_vec(),
+                )
+            );
+            assert_eq!(
+                second,
+                (
+                    second_session.to_vec(),
+                    19,
+                    second_updated_at.as_bytes().to_vec(),
+                )
+            );
+            assert_eq!(
+                ratchet_capacity(db),
+                (
+                    2,
+                    i64::try_from(first_session.len() + second_session.len()).unwrap(),
+                )
+            );
+        };
+
+        let migrated = VeilDb::open(&path, &key).unwrap();
+        assert_preserved(&migrated);
+        assert_ratchet_rowid_sql_is_unavailable(&migrated, &first_peer);
+        migrated.run_migrations().unwrap();
+        assert_preserved(&migrated);
+        drop(migrated);
+
+        let reopened = VeilDb::open(&path, &key).unwrap();
+        assert_preserved(&reopened);
+        assert_ratchet_rowid_sql_is_unavailable(&reopened, &second_peer);
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ratchet_legacy_future_column_fails_closed_without_rebuild() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     future_state BLOB NOT NULL
+                 );
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, updated_at, future_state)
+                 VALUES (
+                     -1,
+                     x'9191919191919191919191919191919191919191919191919191919191919191',
+                     x'0001ff',
+                     '2026-07-19T11:12:13.123456Z',
+                     x'deadbeef'
+                 );",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+
+        assert!(legacy.run_migrations().is_err());
+        assert!(!ratchet_table_without_rowid(&legacy));
+        let preserved: (i64, Vec<u8>, Vec<u8>, Vec<u8>) = legacy
+            .conn
+            .query_row(
+                "SELECT rowid, session_data, CAST(updated_at AS BLOB), future_state
+                 FROM ratchet_sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                -1,
+                vec![0, 1, 0xFF],
+                b"2026-07-19T11:12:13.123456Z".to_vec(),
+                vec![0xDE, 0xAD, 0xBE, 0xEF],
+            )
+        );
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('ratchet_sessions')
+                     WHERE name = 'revision'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE name IN (
+                         'ratchet_sessions_rowid_legacy_v1',
+                         'ratchet_session_capacity_v1'
+                     )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn ratchet_legacy_unique_autoindex_fails_closed_without_mutation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL UNIQUE,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, updated_at)
+                 VALUES (
+                     -1,
+                     x'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1',
+                     x'0001ff',
+                     '2026-07-19T12:13:14.123456Z'
+                 );",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+        let schema_before: String = legacy
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'ratchet_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let indexes_before: Vec<(String, String)> = {
+            let mut statement = legacy
+                .conn
+                .prepare(
+                    "SELECT name, origin FROM pragma_index_list('ratchet_sessions')
+                     ORDER BY seq",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(indexes_before.len(), 2);
+        assert!(indexes_before.iter().any(|(_, origin)| origin == "u"));
+
+        assert!(legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .is_err());
+
+        let schema_after: String = legacy
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table' AND name = 'ratchet_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_after, schema_before);
+        let indexes_after: Vec<(String, String)> = {
+            let mut statement = legacy
+                .conn
+                .prepare(
+                    "SELECT name, origin FROM pragma_index_list('ratchet_sessions')
+                     ORDER BY seq",
+                )
+                .unwrap();
+            statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap()
+        };
+        assert_eq!(indexes_after, indexes_before);
+        assert!(legacy
+            .conn
+            .execute(
+                "INSERT INTO ratchet_sessions
+                     (peer_identity_key, session_data, updated_at)
+                 VALUES (?1, x'0001ff', '2026-07-19T12:13:15Z')",
+                rusqlite::params![[0xA2u8; 32].as_slice()],
+            )
+            .is_err());
+        let preserved: (i64, Vec<u8>, Vec<u8>) = legacy
+            .conn
+            .query_row(
+                "SELECT rowid, session_data, CAST(updated_at AS BLOB)
+                 FROM ratchet_sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (
+                -1,
+                vec![0, 1, 0xFF],
+                b"2026-07-19T12:13:14.123456Z".to_vec(),
+            )
+        );
+    }
+
+    #[test]
+    fn ratchet_legacy_check_and_strict_shapes_fail_closed_without_mutation() {
+        for (suffix, expected_strict) in [
+            (
+                ", CHECK(length(session_data) > 0)\n                 )",
+                0_i64,
+            ),
+            (") STRICT", 1_i64),
+        ] {
+            let connection = Connection::open_in_memory().unwrap();
+            connection
+                .execute_batch(&format!(
+                    "CREATE TABLE ratchet_sessions (
+                         peer_identity_key BLOB PRIMARY KEY,
+                         session_data BLOB NOT NULL,
+                         updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                         {suffix};
+                     INSERT INTO ratchet_sessions
+                         (rowid, peer_identity_key, session_data, updated_at)
+                     VALUES (
+                         -1,
+                         x'a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3',
+                         x'010203',
+                         '2026-07-19T13:14:15.123456Z'
+                     );"
+                ))
+                .unwrap();
+            let legacy = VeilDb { conn: connection };
+            let schema_before: String = legacy
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name = 'ratchet_sessions'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+
+            assert!(legacy
+                .ensure_ratchet_sessions_without_rowid_schema()
+                .is_err());
+
+            assert_eq!(
+                legacy
+                    .conn
+                    .query_row(
+                        "SELECT sql FROM sqlite_schema WHERE name = 'ratchet_sessions'",
+                        [],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .unwrap(),
+                schema_before
+            );
+            assert_eq!(
+                legacy
+                    .conn
+                    .query_row(
+                        "SELECT strict FROM pragma_table_list
+                         WHERE schema = 'main' AND name = 'ratchet_sessions'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                expected_strict
+            );
+            assert_eq!(
+                legacy
+                    .conn
+                    .query_row("SELECT rowid FROM ratchet_sessions", [], |row| row
+                        .get::<_, i64>(0),)
+                    .unwrap(),
+                -1
+            );
+            assert_eq!(
+                legacy
+                    .conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM sqlite_schema
+                         WHERE name = 'ratchet_session_capacity_v1'
+                            OR name = 'ratchet_sessions_rowid_legacy_v1'",
+                        [],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0
+            );
+        }
+
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOBNOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, updated_at)
+                 VALUES (
+                     -1,
+                     x'a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8a8',
+                     x'010203',
+                     '2026-07-19T13:14:16.123456Z'
+                 );",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+        let schema_before: String = legacy
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema WHERE name = 'ratchet_sessions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .is_err());
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema WHERE name = 'ratchet_sessions'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            schema_before
+        );
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT type, \"notnull\" FROM pragma_table_info('ratchet_sessions')
+                     WHERE name = 'session_data'",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            ("BLOBNOT".to_string(), 0)
+        );
+    }
+
+    #[test]
+    fn ratchet_legacy_altered_revision_migrates_losslessly_and_idempotently() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 ALTER TABLE ratchet_sessions
+                     ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0);
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, updated_at, revision)
+                 VALUES (
+                     -1,
+                     x'a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9',
+                     x'ff0001',
+                     '2026-07-19T17:18:19.123456Z',
+                     37
+                 );",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+
+        legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .unwrap();
+        legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .unwrap();
+
+        assert!(ratchet_table_without_rowid(&legacy));
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT session_data, revision, CAST(updated_at AS BLOB)
+                     FROM ratchet_sessions",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, Vec<u8>>(2)?,
+                        ))
+                    },
+                )
+                .unwrap(),
+            (
+                vec![0xFF, 0, 1],
+                37,
+                b"2026-07-19T17:18:19.123456Z".to_vec(),
+            )
+        );
+        assert_eq!(ratchet_capacity(&legacy), (1, 3));
+        assert_ratchet_rowid_sql_is_unavailable(&legacy, &[0xA9; 32]);
+    }
+
+    #[test]
+    fn ratchet_legacy_external_rowid_trigger_fails_closed_without_mutation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL,
+                     revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0),
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, revision, updated_at)
+                 VALUES (
+                     -1,
+                     x'a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4',
+                     x'040506',
+                     29,
+                     '2026-07-19T14:15:16.123456Z'
+                 );
+                 CREATE TABLE external_probe (probe INTEGER NOT NULL);
+                 CREATE TABLE external_result (ratchet_rowid INTEGER NOT NULL);
+                 CREATE TRIGGER external_ratchet_rowid_probe
+                 AFTER INSERT ON external_probe
+                 BEGIN
+                     INSERT INTO external_result (ratchet_rowid)
+                     SELECT rowid FROM ratchet_sessions LIMIT 1;
+                 END;",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+        let trigger_before: String = legacy
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'trigger' AND name = 'external_ratchet_rowid_probe'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .is_err());
+
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema
+                     WHERE type = 'trigger' AND name = 'external_ratchet_rowid_probe'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            trigger_before
+        );
+        legacy
+            .conn
+            .execute("INSERT INTO external_probe (probe) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(
+            legacy
+                .conn
+                .query_row("SELECT ratchet_rowid FROM external_result", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            -1
+        );
+        let preserved: (Vec<u8>, i64, Vec<u8>) = legacy
+            .conn
+            .query_row(
+                "SELECT session_data, revision, CAST(updated_at AS BLOB)
+                 FROM ratchet_sessions",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            preserved,
+            (vec![4, 5, 6], 29, b"2026-07-19T14:15:16.123456Z".to_vec(),)
+        );
+    }
+
+    #[test]
+    fn ratchet_legacy_external_rowid_view_fails_closed_without_mutation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                     revision INTEGER NOT NULL DEFAULT 0 CHECK(revision >= 0)
+                 );
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, revision, updated_at)
+                 VALUES (
+                     -1,
+                     x'a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5',
+                     x'070809',
+                     31,
+                     '2026-07-19T15:16:17.123456Z'
+                 );
+                 CREATE VIEW external_ratchet_rowid_view AS
+                 SELECT rowid AS ratchet_rowid FROM ratchet_sessions;",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+        let view_before: String = legacy
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'view' AND name = 'external_ratchet_rowid_view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .is_err());
+
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema
+                     WHERE type = 'view' AND name = 'external_ratchet_rowid_view'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            view_before
+        );
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT ratchet_rowid FROM external_ratchet_rowid_view",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            -1
+        );
+        assert!(!ratchet_table_without_rowid(&legacy));
+    }
+
+    #[test]
+    fn ratchet_reserved_capacity_schema_fails_closed_without_mutation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, updated_at)
+                 VALUES (
+                     -1,
+                     x'a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6a6',
+                     x'0a0b0c',
+                     '2026-07-19T16:17:18.123456Z'
+                 );
+                 CREATE TABLE RATCHET_SESSION_CAPACITY_V1 (
+                     future_owner TEXT NOT NULL
+                 );
+                 INSERT INTO RATCHET_SESSION_CAPACITY_V1 (future_owner)
+                 VALUES ('preserve-me');",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+        let reserved_before: String = legacy
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'table'
+                   AND lower(name) = 'ratchet_session_capacity_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .is_err());
+
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema
+                     WHERE type = 'table'
+                       AND lower(name) = 'ratchet_session_capacity_v1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            reserved_before
+        );
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT future_owner FROM ratchet_session_capacity_v1",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            "preserve-me"
+        );
+        assert_eq!(
+            legacy
+                .conn
+                .query_row("SELECT rowid FROM ratchet_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn ratchet_mixed_case_reserved_capacity_trigger_fails_closed_without_mutation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, updated_at)
+                 VALUES (
+                     -1,
+                     x'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+                     x'0d0e0f',
+                     '2026-07-19T18:19:20.123456Z'
+                 );
+                 CREATE TABLE external_capacity_probe (probe INTEGER NOT NULL);
+                 CREATE TRIGGER RATCHET_SESSION_CAPACITY_INSERT_V1
+                 AFTER INSERT ON external_capacity_probe
+                 BEGIN
+                     SELECT 1;
+                 END;",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+        let trigger_before: String = legacy
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'trigger'
+                   AND lower(name) = 'ratchet_session_capacity_insert_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .is_err());
+
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema
+                     WHERE type = 'trigger'
+                       AND lower(name) = 'ratchet_session_capacity_insert_v1'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            trigger_before
+        );
+        legacy
+            .conn
+            .execute("INSERT INTO external_capacity_probe (probe) VALUES (1)", [])
+            .unwrap();
+        assert_eq!(
+            legacy
+                .conn
+                .query_row("SELECT rowid FROM ratchet_sessions", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            -1
+        );
+    }
+
+    #[test]
+    fn ratchet_temp_dependencies_fail_closed_without_mutation() {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE ratchet_sessions (
+                     peer_identity_key BLOB PRIMARY KEY,
+                     session_data BLOB NOT NULL,
+                     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+                 );
+                 INSERT INTO ratchet_sessions
+                     (rowid, peer_identity_key, session_data, updated_at)
+                 VALUES (
+                     -1,
+                     x'abababababababababababababababababababababababababababababababab',
+                     x'101112',
+                     '2026-07-19T19:20:21.123456Z'
+                 );
+                 CREATE TEMP VIEW external_temp_ratchet_rowid_view AS
+                 SELECT rowid AS ratchet_rowid FROM main.ratchet_sessions;",
+            )
+            .unwrap();
+        let legacy = VeilDb { conn: connection };
+        let temp_view_before: String = legacy
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_temp_schema
+                 WHERE type = 'view' AND name = 'external_temp_ratchet_rowid_view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .is_err());
+
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT sql FROM sqlite_temp_schema
+                     WHERE type = 'view' AND name = 'external_temp_ratchet_rowid_view'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            temp_view_before
+        );
+        assert_eq!(
+            legacy
+                .conn
+                .query_row(
+                    "SELECT ratchet_rowid FROM external_temp_ratchet_rowid_view",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            -1
+        );
+        assert!(!ratchet_table_without_rowid(&legacy));
+
+        let db = VeilDb::open_memory(&[0xC3; 32]).unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE TEMP VIEW external_temp_ratchet_capacity_view AS
+                 SELECT row_count, total_session_bytes
+                 FROM main.ratchet_session_capacity_v1;",
+            )
+            .unwrap();
+        assert!(db.ensure_ratchet_sessions_without_rowid_schema().is_err());
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT row_count, total_session_bytes
+                     FROM external_temp_ratchet_capacity_view",
+                    [],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'trigger'
+                       AND name LIKE 'ratchet_session_capacity_%_v1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn ratchet_capacity_external_dependency_fails_closed_without_mutation() {
+        let db = VeilDb::open_memory(&[0xC4; 32]).unwrap();
+        let peer = [0xA7; 32];
+        db.commit_initial_ratchet_session(&peer, b"capacity", None)
+            .unwrap();
+        db.conn
+            .execute_batch(
+                "CREATE VIEW external_ratchet_capacity_view AS
+                 SELECT row_count, total_session_bytes
+                 FROM ratchet_session_capacity_v1;",
+            )
+            .unwrap();
+        let view_before: String = db
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_schema
+                 WHERE type = 'view' AND name = 'external_ratchet_capacity_view'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        assert!(db.ensure_ratchet_sessions_without_rowid_schema().is_err());
+
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT sql FROM sqlite_schema
+                     WHERE type = 'view' AND name = 'external_ratchet_capacity_view'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+            view_before
+        );
+        assert_eq!(ratchet_capacity(&db), (1, 8));
+        assert_eq!(
+            db.load_ratchet_session_with_revision_v1(&peer)
+                .unwrap()
+                .unwrap()
+                .session_data,
+            b"capacity"
+        );
+        assert_eq!(
+            db.conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_schema
+                     WHERE type = 'trigger'
+                       AND name LIKE 'ratchet_session_capacity_%_v1'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            6
+        );
+    }
+
+    #[test]
+    fn ratchet_capacity_triggers_gate_insert_and_update_atomically() {
+        let db = VeilDb::open_memory(&[0xC6; 32]).unwrap();
+        let peer = [0x41; 32];
+        let second_peer = [0x42; 32];
+        db.commit_initial_ratchet_session(&peer, b"a", None)
+            .unwrap();
+        assert_eq!(ratchet_capacity(&db), (1, 1));
+        assert_eq!(
+            db.compare_and_swap_ratchet_session_v1(&peer, 0, b"a", b"aaaa")
+                .unwrap(),
+            1
+        );
+        assert_eq!(ratchet_capacity(&db), (1, 4));
+        assert_eq!(
+            db.compare_and_swap_ratchet_session_v1(&peer, 1, b"aaaa", b"aa")
+                .unwrap(),
+            2
+        );
+        assert_eq!(ratchet_capacity(&db), (1, 2));
+
+        db.commit_initial_ratchet_session(&second_peer, b"b", None)
+            .unwrap();
+        assert_eq!(ratchet_capacity(&db), (2, 3));
+        for sql in [
+            "INSERT OR IGNORE INTO ratchet_sessions
+                 (peer_identity_key, session_data, revision, updated_at)
+             VALUES (?1, x'63', 0, datetime('now'))",
+            "INSERT INTO ratchet_sessions
+                 (peer_identity_key, session_data, revision, updated_at)
+             VALUES (?1, x'63', 0, datetime('now'))
+             ON CONFLICT(peer_identity_key) DO UPDATE SET session_data = excluded.session_data",
+            "INSERT OR REPLACE INTO ratchet_sessions
+                 (peer_identity_key, session_data, revision, updated_at)
+             VALUES (?1, x'63', 0, datetime('now'))",
+        ] {
+            assert!(db
+                .conn
+                .execute(sql, rusqlite::params![peer.as_slice()])
+                .is_err());
+            assert_eq!(ratchet_capacity(&db), (2, 3));
+            let durable = db
+                .load_ratchet_session_with_revision_v1(&peer)
+                .unwrap()
+                .unwrap();
+            assert_eq!(durable.session_data, b"aa");
+            assert_eq!(durable.revision, 2);
+        }
+        assert_ratchet_rowid_sql_is_unavailable(&db, &peer);
+        assert_eq!(ratchet_capacity(&db), (2, 3));
+        assert_eq!(
+            db.load_ratchet_session_with_revision_v1(&peer)
+                .unwrap()
+                .unwrap()
+                .session_data,
+            b"aa"
+        );
+        assert_eq!(
+            db.load_ratchet_session_with_revision_v1(&second_peer)
+                .unwrap()
+                .unwrap()
+                .session_data,
+            b"b"
+        );
+        assert_eq!(
+            db.conn
+                .execute(
+                    "DELETE FROM ratchet_sessions WHERE peer_identity_key = ?1",
+                    rusqlite::params![second_peer.as_slice()],
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(ratchet_capacity(&db), (1, 2));
+
+        db.conn
+            .execute(
+                "UPDATE ratchet_session_capacity_v1 SET row_count = ?1
+                 WHERE singleton = 1",
+                rusqlite::params![DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1],
+            )
+            .unwrap();
+        assert!(db
+            .commit_initial_ratchet_session(&second_peer, b"b", None)
+            .is_err());
+        assert!(db
+            .load_ratchet_session_with_revision_v1(&second_peer)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            ratchet_capacity(&db),
+            (DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1, 2)
+        );
+
+        db.conn
+            .execute(
+                "UPDATE ratchet_session_capacity_v1
+                 SET row_count = 1, total_session_bytes = ?1
+                 WHERE singleton = 1",
+                rusqlite::params![DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1],
+            )
+            .unwrap();
+        assert!(db
+            .compare_and_swap_ratchet_session_v1(&peer, 2, b"aa", b"aaa")
+            .is_err());
+        let durable = db
+            .load_ratchet_session_with_revision_v1(&peer)
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable.session_data, b"aa");
+        assert_eq!(durable.revision, 2);
+        assert_eq!(
+            ratchet_capacity(&db),
+            (1, DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1)
+        );
+    }
+
+    #[test]
+    fn ratchet_capacity_last_slot_is_visible_across_file_handles() {
+        let path = std::env::temp_dir().join(format!(
+            "veil-ratchet-capacity-last-slot-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let key = [0xC5; 32];
+        let first = VeilDb::open(&path, &key).unwrap();
+        let second = VeilDb::open(&path, &key).unwrap();
+        first
+            .conn
+            .execute(
+                "UPDATE ratchet_session_capacity_v1 SET row_count = ?1
+                 WHERE singleton = 1",
+                rusqlite::params![DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1 - 1],
+            )
+            .unwrap();
+
+        let accepted_peer = [0x51; 32];
+        let rejected_peer = [0x52; 32];
+        first
+            .commit_initial_ratchet_session(&accepted_peer, b"a", None)
+            .unwrap();
+        assert!(second
+            .commit_initial_ratchet_session(&rejected_peer, b"b", None)
+            .is_err());
+        assert_eq!(
+            ratchet_capacity(&first),
+            (DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1, 1)
+        );
+        assert!(second
+            .load_ratchet_session_with_revision_v1(&rejected_peer)
+            .unwrap()
+            .is_none());
+        drop(second);
+        drop(first);
+
+        let reopened = VeilDb::open(&path, &key).unwrap();
+        assert_eq!(ratchet_capacity(&reopened), (1, 1));
+        assert_eq!(
+            reopened
+                .load_ratchet_session_with_revision_v1(&accepted_peer)
+                .unwrap()
+                .unwrap()
+                .session_data,
+            b"a"
+        );
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -13757,6 +16153,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(revision_columns, 1);
+        let capacity_peer = [0xD1; 32];
+        db.commit_initial_ratchet_session(&capacity_peer, b"state", None)
+            .unwrap();
+        db.conn
+            .execute(
+                "UPDATE ratchet_session_capacity_v1
+                 SET row_count = ?1, total_session_bytes = ?2
+                 WHERE singleton = 1",
+                rusqlite::params![
+                    DIRECT_RATCHET_SESSION_MAX_ROWS_SQLITE_V1,
+                    DIRECT_RATCHET_SESSION_MAX_TOTAL_BYTES_SQLITE_V1,
+                ],
+            )
+            .unwrap();
+        db.run_migrations().unwrap();
+        assert_eq!(ratchet_capacity(&db), (1, 5));
+        let capacity_triggers: i64 = db
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'trigger' AND name LIKE 'ratchet_session_capacity_%_v1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(capacity_triggers, 6);
         let schema = db.normalized_table_sql("direct_message_outbox_v1").unwrap();
         assert!(schema.contains("queue_order integer primary key autoincrement"));
         assert!(schema.contains("client_message_id text not null unique"));
@@ -13799,8 +16221,12 @@ mod tests {
             )
             .unwrap();
         let legacy = VeilDb { conn: legacy };
-        legacy.ensure_ratchet_session_revision_schema().unwrap();
-        legacy.ensure_ratchet_session_revision_schema().unwrap();
+        legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .unwrap();
+        legacy
+            .ensure_ratchet_sessions_without_rowid_schema()
+            .unwrap();
         let preserved: (Vec<u8>, i64) = legacy
             .conn
             .query_row(
@@ -13810,6 +16236,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(preserved, (vec![2, 3], 0));
+        assert!(ratchet_table_without_rowid(&legacy));
+        assert_eq!(ratchet_capacity(&legacy), (1, 2));
+        assert_ratchet_rowid_sql_is_unavailable(&legacy, &[1u8; 32]);
     }
 
     #[test]
@@ -13939,6 +16368,7 @@ mod tests {
         ] {
             let db = VeilDb::open_memory(&[0xD1; 32]).unwrap();
             let fixture = install_direct_outbox_fixture(&db);
+            let capacity_before = ratchet_capacity(&db);
             db.conn
                 .execute_batch(&format!(
                     "CREATE TRIGGER fail_direct_enqueue
@@ -13947,8 +16377,11 @@ mod tests {
                 ))
                 .unwrap();
 
-            let input =
+            let mut input =
                 direct_outbox_input(&fixture, DIRECT_CLIENT_ID_1, b"exact-send-payload-fault", 0);
+            input
+                .advanced_ratchet_session
+                .extend_from_slice(b"-grown-before-late-fault");
             assert!(db.enqueue_direct_message_outbox_v1(&input).is_err());
             let ratchet = db
                 .load_ratchet_session_with_revision_v1(&fixture.peer_account.locator.identity_key)
@@ -13956,6 +16389,11 @@ mod tests {
                 .unwrap();
             assert_eq!(ratchet.session_data, b"ratchet-session-v0");
             assert_eq!(ratchet.revision, 0, "fault target: {table}");
+            assert_eq!(
+                ratchet_capacity(&db),
+                capacity_before,
+                "fault target: {table}"
+            );
             assert_eq!(table_count(&db, "messages"), 0, "fault target: {table}");
             assert_eq!(
                 table_count(&db, "message_attachments_v1"),
@@ -14001,6 +16439,30 @@ mod tests {
                 .enqueue_direct_message_outbox_v1(&first_input)
                 .unwrap();
             assert_eq!(committed.ratchet_revision, 1);
+
+            let mut wrong_expected_bytes = direct_outbox_input(
+                &fixture,
+                DIRECT_CLIENT_ID_2,
+                b"same revision, wrong expected ratchet bytes",
+                1,
+            );
+            wrong_expected_bytes.expected_ratchet_session = b"wrong-state-at-revision-one".to_vec();
+            assert!(second_handle
+                .enqueue_direct_message_outbox_v1(&wrong_expected_bytes)
+                .is_err());
+            assert_eq!(message_status(&second_handle, DIRECT_CLIENT_ID_2), None);
+            assert_eq!(table_count(&second_handle, "messages"), 1);
+            assert_eq!(table_count(&second_handle, "message_attachments_v1"), 1);
+            assert_eq!(table_count(&second_handle, "direct_message_outbox_v1"), 1);
+            let durable_after_wrong_bytes = second_handle
+                .load_ratchet_session_with_revision_v1(&fixture.peer_account.locator.identity_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                durable_after_wrong_bytes.session_data,
+                b"ratchet-session-v1"
+            );
+            assert_eq!(durable_after_wrong_bytes.revision, 1);
 
             let stale = direct_outbox_input(
                 &fixture,
@@ -14603,6 +17065,7 @@ mod tests {
                 b"phase-5s Direct-v1 exact-byte store evidence",
                 0,
             );
+            enqueue.expected_ratchet_session = initiator_before.clone();
             enqueue.advanced_ratchet_session = initiator_after.clone();
             let committed = db.enqueue_direct_message_outbox_v1(&enqueue).unwrap();
             assert_eq!(committed.ratchet_revision, 1);
@@ -14613,6 +17076,7 @@ mod tests {
                 b"phase-5s stale Direct-v1 CAS",
                 0,
             );
+            stale.expected_ratchet_session = initiator_before.clone();
             stale.advanced_ratchet_session = initiator_before.clone();
             let stale_error = match db.enqueue_direct_message_outbox_v1(&stale) {
                 Ok(_) => panic!("stale Direct-v1 ratchet CAS unexpectedly committed"),

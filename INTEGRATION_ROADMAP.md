@@ -2022,8 +2022,25 @@ X25519 contributory result до публикации state. Frozen Direct-v1 SHA
 stored-state format не изменились. Scope, host evidence и non-claims
 зафиксированы в
 [`docs/reviews/phase-5s-direct-v1-key-validation-checkpoint.md`](docs/reviews/phase-5s-direct-v1-key-validation-checkpoint.md).
-Findings 3–5, hostile Node, key transparency, session lifecycle, cross-client
-consumption, `libsignal` spike и независимый аудит остаются открытыми.
+
+**Local checkpoint 5S.1C 2026-07-20:** finding 5 получил host-only hardening:
+persisted skipped keys имеют canonical bounded decoder/writer и deterministic
+capacity failure без eviction; все live transitions используют exact
+revision-and-bytes SQLCipher CAS, initial publication остаётся insert-only, а
+legacy rowid-backed `ratchet_sessions` losslessly мигрируется в `WITHOUT ROWID`
+в одной `BEGIN IMMEDIATE` transaction с capacity guards. Exact allowlist трёх
+исторических DDL-вариантов, PK topology и main/TEMP dependencies отклоняет
+future constraints, autoindexes и reserved-name collisions до любой mutation;
+для самой старой схемы `revision = 0` синтезируется только внутри rebuild.
+Stale history/general receivers, process reopen, malformed state, FFI
+recanonicalization и rollback покрыты executable tests. Frozen Direct-v1 SHA не
+изменился. Scope, физическая schema migration, residual risks и non-claims
+зафиксированы в
+[`docs/reviews/phase-5s-direct-v1-skipped-key-state-checkpoint.md`](docs/reviews/phase-5s-direct-v1-skipped-key-state-checkpoint.md).
+
+Findings 3–4, deterministic skipped-key expiry, whole-file rollback, hostile
+Node, key transparency, session lifecycle, cross-client consumption,
+`libsignal` spike и независимый внешний аудит остаются открытыми.
 
 ### 5S.1 — Зафиксировать и атаковать текущий Direct v1
 

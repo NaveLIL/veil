@@ -3195,8 +3195,9 @@ impl VeilRatchet {
 
     #[uniffi::constructor]
     pub fn deserialize(json: String) -> Result<Arc<Self>, VeilError> {
-        let session: RatchetSession =
-            serde_json::from_str(&json).map_err(|e| VeilError::Session { msg: e.to_string() })?;
+        let json = Zeroizing::new(json.into_bytes());
+        let session =
+            RatchetSession::deserialize(&json).map_err(|msg| VeilError::Session { msg })?;
         Ok(Arc::new(Self {
             session: Mutex::new(session),
         }))
@@ -3236,7 +3237,8 @@ impl VeilRatchet {
             .session
             .lock()
             .map_err(|e| VeilError::Session { msg: e.to_string() })?;
-        serde_json::to_string(&*s).map_err(|e| VeilError::Session { msg: e.to_string() })
+        String::from_utf8(s.serialize().map_err(|msg| VeilError::Session { msg })?)
+            .map_err(|e| VeilError::Session { msg: e.to_string() })
     }
 }
 
@@ -3837,6 +3839,97 @@ mod tests {
     use prost::Message as ProstMessage;
     use sha2::{Digest, Sha256};
     use veil_client::protocol::proto;
+
+    #[test]
+    fn standalone_ratchet_ffi_uses_bounded_strict_persisted_state_contract() {
+        let peer = IdentityKeyPair::generate();
+        let ratchet =
+            VeilRatchet::init_initiator(vec![0x41; 32], peer.x25519_public_bytes().to_vec())
+                .unwrap();
+        let mut serialized = ratchet.serialize().unwrap();
+        let restored = VeilRatchet::deserialize(serialized.clone()).unwrap();
+        assert_eq!(restored.serialize().unwrap(), serialized);
+
+        let mut malformed = serialized.replacen(
+            "\"skipped_keys\":{}",
+            "\"skipped_keys\":{\"malformed\":\"AA==\"}",
+            1,
+        );
+        assert!(VeilRatchet::deserialize(malformed.clone()).is_err());
+        assert!(VeilRatchet::deserialize(" ".repeat(1024 * 1024 + 1)).is_err());
+
+        let responder_identity = IdentityKeyPair::generate();
+        let responder_spk = x3dh::SignedPreKey::generate(&responder_identity, 7);
+        let shared_secret = vec![0x52; 32];
+        let initiator = VeilRatchet::init_initiator(
+            shared_secret.clone(),
+            responder_spk.public.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let responder = VeilRatchet::init_responder(
+            shared_secret,
+            responder_spk.secret.to_bytes().to_vec(),
+            responder_spk.public.as_bytes().to_vec(),
+        )
+        .unwrap();
+        let initial = initiator.encrypt(b"initial".to_vec()).unwrap();
+        assert_eq!(
+            responder
+                .decrypt(initial.header, initial.ciphertext)
+                .unwrap(),
+            b"initial"
+        );
+        let late_one = initiator.encrypt(b"late-one".to_vec()).unwrap();
+        let late_two = initiator.encrypt(b"late-two".to_vec()).unwrap();
+        let late_three = initiator.encrypt(b"late-three".to_vec()).unwrap();
+        assert_eq!(
+            responder
+                .decrypt(late_three.header, late_three.ciphertext)
+                .unwrap(),
+            b"late-three"
+        );
+
+        let mut canonical_nonempty = responder.serialize().unwrap();
+        let marker = "\"skipped_keys\":{";
+        let body_start = canonical_nonempty.find(marker).unwrap() + marker.len();
+        let body_end = body_start + canonical_nonempty[body_start..].find('}').unwrap();
+        let mut skipped_entries: Vec<_> = canonical_nonempty[body_start..body_end]
+            .split(',')
+            .collect();
+        assert_eq!(skipped_entries.len(), 2);
+        skipped_entries.reverse();
+        let mut legacy_order = Zeroizing::new(String::with_capacity(canonical_nonempty.len()));
+        legacy_order.push_str(&canonical_nonempty[..body_start]);
+        for (index, entry) in skipped_entries.into_iter().enumerate() {
+            if index != 0 {
+                legacy_order.push(',');
+            }
+            legacy_order.push_str(entry);
+        }
+        legacy_order.push_str(&canonical_nonempty[body_end..]);
+        assert_ne!(legacy_order.as_str(), canonical_nonempty);
+
+        let restored_nonempty = VeilRatchet::deserialize(legacy_order.to_string()).unwrap();
+        let mut recanonical = restored_nonempty.serialize().unwrap();
+        assert_eq!(recanonical, canonical_nonempty);
+        assert_eq!(
+            restored_nonempty
+                .decrypt(late_one.header, late_one.ciphertext)
+                .unwrap(),
+            b"late-one"
+        );
+        assert_eq!(
+            restored_nonempty
+                .decrypt(late_two.header, late_two.ciphertext)
+                .unwrap(),
+            b"late-two"
+        );
+
+        recanonical.zeroize();
+        canonical_nonempty.zeroize();
+        malformed.zeroize();
+        serialized.zeroize();
+    }
 
     #[test]
     fn mobile_live_retryability_is_a_positive_typed_allowlist() {
