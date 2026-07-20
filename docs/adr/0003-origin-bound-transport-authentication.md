@@ -163,19 +163,126 @@ hashed before parsing. Endpoints MUST enforce one fixed media type when media
 type changes parser semantics; supporting multiple security-relevant media
 types requires adding a bounded field in a new contract version.
 
+#### REST v2 HTTP header profile
+
+The REST API path version and the authentication version are independent. A
+request to a path such as `/v1/prekeys` can use REST authentication v2; the path
+MUST NOT select or imply the authentication verifier. The v2 verifier is
+selected only by this exact logical header set:
+
+| Header | Canonical value |
+|---|---|
+| `X-Veil-REST-Auth-Version` | the single ASCII byte `2` |
+| `X-Veil-User` | one canonical lowercase, hyphenated, non-nil UUID |
+| `X-Veil-Timestamp` | one unsigned decimal value in `1..MaxInt64`, with no sign or leading zero |
+| `X-Veil-Nonce` | strict unpadded base64url of exactly 32 non-zero bytes; therefore exactly 43 ASCII characters |
+| `X-Veil-Signature` | strict unpadded base64url of exactly one 64-byte Ed25519 signature; therefore exactly 86 ASCII characters |
+
+Header names follow HTTP's case-insensitive field-name rules; their values do
+not have aliases. Each logical field MUST occur exactly once. Empty, repeated,
+comma-combined, padded, non-canonical, or differently encoded values are
+rejected, even when decoding them could produce otherwise valid bytes. A parser
+MUST decode and re-encode nonce and signature values and require byte-for-byte
+equality with the received value. Authentication values and raw request bodies
+MUST NOT be logged, reflected in an error, or used as telemetry labels.
+
+`X-Veil-REST-Auth-Version` is a fail-closed verifier selector, not an unsigned
+substitute for transcript versioning. The selected verifier always uses the
+`veil-rest-auth-v2\0` domain, so deleting or changing the selector cannot make a
+v2 signature valid as REST v1. A request carrying mixed legacy and v2
+authentication material is rejected; verification failure never triggers a
+second verifier. In the v2-only activation profile, a missing selector is also
+rejected. A separately reviewed Preview compatibility dispatcher MAY select
+legacy v1 directly from an absent selector before verification, but only under
+the explicit flag, owner, telemetry, and expiry rules below; unknown or mixed
+selectors are never a legacy alias.
+
+#### Raw HTTP boundary and media types
+
+On the Go server, the signed target comes from the inbound server-only
+`RequestURI`: the unmodified HTTP/1 request-target or HTTP/2 `:path` made
+available by `net/http`. It MUST NOT be reconstructed from `URL.Path`,
+`EscapedPath`, parsed query values, route variables, `Host`, forwarded headers,
+or a redirect target. The exact `RequestURI` is validated against the bounded
+canonical target grammar before it enters the transcript. Reverse proxies MUST
+preserve accepted target and message-content bytes; an ingress rewrite is a
+signature failure, not a normalization opportunity.
+
+The body commitment covers the exact HTTP message-content bytes read from
+`r.Body` after hop-by-hop transfer framing has been removed and before JSON,
+form, image, compression, or other application decoding. The verifier performs
+one bounded read, hashes those bytes, and restores exactly those bytes for the
+handler. Declared length never replaces the bounded read, including for a
+chunked request or a request whose declared length is zero.
+
+Because media type is not a v2 transcript field, every activated endpoint MUST
+declare one fixed parser policy outside attacker control. A JSON endpoint uses
+one exact reviewed JSON media type; a bodyless endpoint rejects a body; a binary
+endpoint uses its own exact reviewed type. Parameters, alternate content types,
+content encodings, or other headers that could change parser semantics are
+rejected unless a later authentication-contract version signs a bounded
+representation of that choice. Body parsing happens only after authentication
+and replay admission.
+
+#### Verification and durable replay order
+
+The live verifier MUST execute the following order without publishing an
+authenticated principal early:
+
+1. Require a configured non-zero canonical public origin and select exactly
+   REST v2 from the single version header. Reject unknown, missing, duplicate,
+   combined, or mixed authentication fields without trying REST v1.
+2. Parse the canonical user, timestamp, nonce, signature, uppercase method, and
+   raw canonical request target. The activation profile uses one server-clock
+   sample converted once to Unix milliseconds and the inclusive freshness
+   interval `now_ms +/- 60,000`; sub-millisecond precision MUST NOT silently
+   narrow either boundary.
+3. Resolve and strictly validate the account's pinned Ed25519 public key before
+   admitting an attacker-sized body. A header UUID is only a lookup candidate;
+   it becomes the authenticated account only when the v2 signature verifies.
+4. Apply bounded body admission, read the exact body once, enforce the route's
+   fixed media policy, and build the v2 transcript with the configured origin.
+   The incoming `Host`, forwarded headers, DNS result, and TLS routing metadata
+   never provide the transcript origin.
+5. Strictly verify the Ed25519 signature. Failed signatures MUST NOT create a
+   replay marker, so an unauthenticated party cannot poison another account's
+   nonce space.
+6. Atomically consume replay state keyed by the verified canonical account and
+   exact 32-byte nonce in a store shared by every gateway process for that
+   Node. Only the winner may publish the verified-principal context and invoke
+   the handler.
+
+Replay authority MUST be durable across process death and simultaneous gateway
+instances; a process-local map or signature-text cache is not sufficient. The
+marker remains live strictly beyond the last instant at which the signed
+timestamp can pass the freshness window, including a positive clock/precision
+safety margin. Cleanup removes only expired markers. Capacity handling never
+evicts a live marker: per-account or global saturation, storage uncertainty,
+transaction failure, and timeout all fail closed before the handler, with no
+fallback to a local cache or REST v1. Once a verified request wins replay
+admission, its marker remains consumed even if rate limiting, application
+validation, database work, response writing, or the network later fails.
+
+The replay key is account plus nonce, not timestamp, signature text, request
+target, or body digest. Consequently the same nonce cannot authorize a second
+request for that account merely by changing and re-signing another field, while
+independent accounts do not share a nonce namespace.
+
 ### Version and downgrade policy
 
 WebSocket v2 bytes are not valid v3 proof bytes, and REST v1 bytes are not valid
 v2 proof bytes. Unknown fields or semantic changes require a new version; no
 implementation silently appends, omits, or normalizes them.
 
-The first implementation checkpoint is deliberately pure and non-activated. A
-later runtime checkpoint must add dedicated protocol messages/headers, mandatory
-configured public origin, exact client comparison, replay-cache semantics,
-fail-closed negotiation, and a two-Node relay harness. Production MUST reject
-origin-unbound WS v2 and ingress-dependent REST v1. A Preview-only compatibility
-period, if required, needs an explicit flag, telemetry that contains no secrets,
-an owner, and an expiry.
+The pure transcript and isolated foundation checkpoints are deliberately
+non-activated. Runtime activation still requires dedicated transport dispatch,
+mandatory configured public origin, exact client comparison, a shared durable
+replay store, route media policies, fail-closed negotiation, and a two-Node
+relay harness. Missing or unknown version never means "try the other version".
+A Preview-only compatibility dispatcher, if required, MUST select v1 or v2 once
+before verification under an explicit flag with no-secret telemetry, an owner,
+and a finite expiry. Production MUST reject origin-unbound WS v2 and
+ingress-dependent REST v1.
 
 ## Executable evidence
 

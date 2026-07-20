@@ -72,7 +72,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; durable setup-result reconciliation реализован и host-tested в текущем локальном checkpoint; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
-| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher, pure Rust↔Go exact-origin contract и mandatory configured-origin foundation реализованы; live WS v3/REST v2 cutover/two-Node relay, Android consumption, `libsignal` spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
+| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher, shared Rust↔Go exact-origin contract, mandatory configured origin и изолированные non-activated WS v3/REST v2 client/server/replay foundations реализованы; live dispatch/raw HTTP/media cutover, v3 Pass verifier, two-Node relay, Android consumption, `libsignal` spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -2151,6 +2151,28 @@ startup boundary. Это только non-deployed configured-origin foundation:
 никакой live Node/config activation не выполнено, P1 и Phase 5S остаются
 открытыми. Phone/ADB/APK/Pass/recovery testing по-прежнему отложен до явного
 возобновления и подтверждённо записанной recovery phrase.
+
+**Local checkpoint 5S.3B-2 2026-07-20:** добавлен отдельный, намеренно
+неактивированный WS auth v3 foundation: append-only protobuf messages/tags,
+origin-bound one-shot challenge и private native account/device proof/result
+helpers с явным existing/open/Pass intent. Живой `/ws` по-прежнему создаёт и
+проверяет только legacy v2; canonical raw protobuf boundary, полный v3 verifier,
+atomic Pass/account transaction, transport dispatch и двухнодовая relay-матрица
+остаются blocking gates. Точные evidence и non-claims опубликованы в
+[`docs/reviews/phase-5s-ws-auth-v3-foundation-checkpoint.md`](docs/reviews/phase-5s-ws-auth-v3-foundation-checkpoint.md).
+
+**Local checkpoint 5S.3B-3 2026-07-20:** добавлен изолированный REST auth v2
+foundation. Private native preparer использует системные clock/CSPRNG, строит
+пять канонических header values и не имеет transport/FFI call site;
+transport-neutral Go verifier принимает уже захваченные bounded target/body,
+публикует principal только после strict Ed25519 proof и atomic replay claim.
+PostgreSQL migration хранит replay по exact `(account, nonce)` с пятиминутным
+retention и bounded expired-only cleanup, общими между процессами и restart.
+Это не HTTP activation: raw `RequestURI`/body capture and restore, route media
+policy, version dispatcher, desktop/Android transport, legacy cutover и real
+two-Node matrix остаются открытыми, а Node Access Pass принадлежит только
+будущему WS v3 registration verifier. Точный checkpoint:
+[`docs/reviews/phase-5s-rest-auth-v2-foundation-checkpoint.md`](docs/reviews/phase-5s-rest-auth-v2-foundation-checkpoint.md).
 
 Private/E2EE keys при этом не извлекаются, но A может получить authenticated
 control/metadata context на B и злоупотреблять server-authoritative actions,

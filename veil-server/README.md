@@ -36,10 +36,13 @@ trailing DNS dot, Unicode host aliases, and parser-normalized spellings are
 rejected. Startup fails closed when the value is absent or invalid. It is never
 derived from `Host`, forwarded headers, redirects, or DNS.
 
-This is Phase 5S.3B-1 configuration foundation, not transport activation. The
-current `/ws` and signed REST paths remain legacy Preview WS auth v2 and REST
-auth v1 until their versioned runtime wiring, replay semantics, downgrade gate,
-and two-Node relay evidence are complete.
+This began as the Phase 5S.3B-1 configuration foundation. Isolated,
+non-activated WS v3 protocol/challenge helpers and a transport-neutral REST v2
+verifier plus PostgreSQL replay migration now also exist, but no gateway route
+calls them. The current `/ws` and signed REST paths remain legacy Preview WS
+auth v2 and REST auth v1 until the raw transport boundaries, v3 verifier,
+route media policy, replay operations, downgrade cutover, and two-Node relay
+evidence are complete.
 
 ## Account registration
 

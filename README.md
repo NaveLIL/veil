@@ -174,11 +174,14 @@ Gateway разработки публикуется только на `127.0.0.1
 публичного proxy значение нужно явно заменить на его exact HTTPS origin.
 Отсутствующее или неканоническое значение блокирует gateway fail closed.
 
-Это configured-origin foundation, а не активация нового transport auth:
-текущие `/ws` и signed REST остаются legacy Preview WS auth v2/REST auth v1.
-До live WS v3/REST v2 cutover, two-Node relay gate и независимого review эта
-настройка не является production-готовностью или новой криптографической
-гарантией.
+Это configured-origin и изолированный transport-auth foundation, а не активация
+нового протокола. Отдельные WS v3 protobuf/native proof helpers и REST v2
+private native preparer/server verifier/PostgreSQL replay boundary существуют,
+но намеренно не подключены к transport, FFI или gateway routes: текущие `/ws` и
+signed REST остаются legacy Preview WS auth v2/REST auth v1. До live cutover,
+raw HTTP/media-policy gate, двухнодовой relay-матрицы и независимого review эти
+компоненты не являются production-готовностью или новой live
+криптографической гарантией.
 
 Uploads и push намеренно fail closed, пока не заданы их ключи:
 

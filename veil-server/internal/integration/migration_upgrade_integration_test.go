@@ -1297,18 +1297,114 @@ func TestMigrationUpgradePreflights(t *testing.T) {
 		}
 	})
 
-	t.Run("fresh migration chain includes and applies 001 through 029", func(t *testing.T) {
+	t.Run("030 adds bounded cross-process REST auth v2 replay markers", func(t *testing.T) {
+		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_030")
+		applyMigrationsBefore(t, pool, migrations, 30)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		var userA, userB string
+		for index, destination := range []*string{&userA, &userB} {
+			if err := pool.QueryRow(ctx,
+				`INSERT INTO users(identity_key, signing_key, username)
+				 VALUES ($1, $2, $3) RETURNING id::text`,
+				bytes.Repeat([]byte{byte(0xe1 + index*2)}, 32),
+				bytes.Repeat([]byte{byte(0xe2 + index*2)}, 32),
+				fmt.Sprintf("rest-replay-%d", index),
+			).Scan(destination); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := execMigration(t, pool, migrations, 30); err != nil {
+			t.Fatalf("migration 030: %v", err)
+		}
+
+		nonce := bytes.Repeat([]byte{0xf1}, 32)
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO rest_auth_v2_replay_nonces (user_id, nonce, expires_at)
+			 VALUES ($1::uuid, $2, clock_timestamp() + interval '5 minutes')`,
+			userA, nonce,
+		); err != nil {
+			t.Fatalf("insert valid REST replay marker: %v", err)
+		}
+		_, err := pool.Exec(ctx,
+			`INSERT INTO rest_auth_v2_replay_nonces (user_id, nonce, expires_at)
+			 VALUES ($1::uuid, $2, clock_timestamp() + interval '5 minutes')`,
+			userA, nonce,
+		)
+		requireMigrationError(t, err, "23505", "rest_auth_v2_replay_nonces_pkey")
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO rest_auth_v2_replay_nonces (user_id, nonce, expires_at)
+			 VALUES ($1::uuid, $2, clock_timestamp() + interval '5 minutes')`,
+			userB, nonce,
+		); err != nil {
+			t.Fatalf("account-scoped nonce insert: %v", err)
+		}
+
+		for name, input := range map[string]struct {
+			nonce      []byte
+			expiry     string
+			constraint string
+		}{
+			"short nonce": {
+				nonce: bytes.Repeat([]byte{0xf2}, 31), expiry: "5 minutes",
+				constraint: "rest_auth_v2_replay_nonce_length",
+			},
+			"zero nonce": {
+				nonce: make([]byte, 32), expiry: "5 minutes",
+				constraint: "rest_auth_v2_replay_nonce_nonzero",
+			},
+			"old expiry": {
+				nonce: bytes.Repeat([]byte{0xf3}, 32), expiry: "-1 minute",
+				constraint: "rest_auth_v2_replay_expiry_order",
+			},
+			"long expiry": {
+				nonce: bytes.Repeat([]byte{0xf4}, 32), expiry: "11 minutes",
+				constraint: "rest_auth_v2_replay_retention_bound",
+			},
+		} {
+			t.Run(name, func(t *testing.T) {
+				_, err := pool.Exec(ctx,
+					`INSERT INTO rest_auth_v2_replay_nonces (user_id, nonce, expires_at)
+					 VALUES ($1::uuid, $2, clock_timestamp() + $3::interval)`,
+					userA, input.nonce, input.expiry,
+				)
+				requireMigrationError(t, err, "23514", input.constraint)
+			})
+		}
+
+		var expiryIndexes int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM pg_indexes
+			 WHERE schemaname = current_schema()
+			   AND tablename = 'rest_auth_v2_replay_nonces'
+			   AND indexname = 'idx_rest_auth_v2_replay_expiry'`,
+		).Scan(&expiryIndexes); err != nil || expiryIndexes != 1 {
+			t.Fatalf("expiry indexes=%d err=%v, want 1", expiryIndexes, err)
+		}
+		if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id=$1::uuid`, userB); err != nil {
+			t.Fatal(err)
+		}
+		var retained int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM rest_auth_v2_replay_nonces WHERE user_id=$1::uuid`, userB,
+		).Scan(&retained); err != nil || retained != 0 {
+			t.Fatalf("user cascade retained=%d err=%v, want 0", retained, err)
+		}
+	})
+
+	t.Run("fresh migration chain includes and applies 001 through 030", func(t *testing.T) {
 		pool := newMigrationDatabase(t, admin, baseDSN, "veil_migration_fresh")
 		seen := make(map[int]bool)
 		for _, item := range migrations {
 			seen[migrationNumber(t, item.name)] = true
 		}
-		for number := 1; number <= 29; number++ {
+		for number := 1; number <= 30; number++ {
 			if !seen[number] {
 				t.Fatalf("migration chain is missing %03d", number)
 			}
 		}
-		applyMigrationsBefore(t, pool, migrations, 30)
+		applyMigrationsBefore(t, pool, migrations, 31)
 	})
 }
 

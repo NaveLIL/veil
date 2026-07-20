@@ -55,6 +55,8 @@ ADR фиксирует принятое решение и причины. Изм
 - [Phase 5S Direct-v1 skipped-key/state checkpoint](reviews/phase-5s-direct-v1-skipped-key-state-checkpoint.md)
 - [Phase 5S exact-origin transport-auth contract checkpoint](reviews/phase-5s-hostile-node-auth-contract-checkpoint.md)
 - [Phase 5S configured-origin foundation checkpoint](reviews/phase-5s-configured-origin-foundation-checkpoint.md)
+- [Phase 5S WebSocket auth v3 foundation checkpoint](reviews/phase-5s-ws-auth-v3-foundation-checkpoint.md)
+- [Phase 5S REST auth v2 foundation checkpoint](reviews/phase-5s-rest-auth-v2-foundation-checkpoint.md)
 
 Эти документы являются внутренними инженерными review и evidence, а не
 заключением независимого внешнего аудитора.

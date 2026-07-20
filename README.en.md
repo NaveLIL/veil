@@ -91,9 +91,12 @@ The Veil Node stores and routes ciphertext, but it still sees unavoidable
 routing metadata such as network addresses, timing, sizes, account and
 conversation membership, and delivery state. E2EE does not hide that metadata.
 The canonical HTTPS origin is part of the account model. The Preview validates
-URL/TLS and managed legacy REST authority strictly, but WS v2/REST v1 do not yet
-bind the full origin/user context end to end; WS v3/REST v2 remains a Phase 5S
-security gate.
+URL/TLS and managed legacy REST authority strictly. Isolated WS v3 protobuf and
+native proof helpers plus a private REST v2 native preparer, server verifier,
+and PostgreSQL replay boundary now exist, but none is wired into live transport,
+FFI, or gateway routes. WS v2/REST v1 therefore still do not bind the full
+origin/user context end to end; activation, the raw HTTP/media boundary, the
+two-Node relay matrix, and independent review remain Phase 5S security gates.
 
 Files are encrypted before upload. Push payloads are restricted to generic
 wake-up signals without sender, message, conversation, or plaintext preview.
