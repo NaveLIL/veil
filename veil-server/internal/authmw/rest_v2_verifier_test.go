@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -30,6 +31,20 @@ type restV2VerifierLookup struct {
 	calls int
 }
 
+type restV2VerifierBlockingLookup struct {
+	deadline chan time.Time
+}
+
+func (lookup *restV2VerifierBlockingLookup) GetSigningKey(ctx context.Context, _ string) (ed25519.PublicKey, error) {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return nil, errors.New("lookup context had no deadline")
+	}
+	lookup.deadline <- deadline
+	<-ctx.Done()
+	return nil, errors.Join(ErrSigningKeyNotFound, ctx.Err())
+}
+
 func (lookup *restV2VerifierLookup) GetSigningKey(_ context.Context, userID string) (ed25519.PublicKey, error) {
 	lookup.mu.Lock()
 	defer lookup.mu.Unlock()
@@ -39,7 +54,7 @@ func (lookup *restV2VerifierLookup) GetSigningKey(_ context.Context, userID stri
 	}
 	key, ok := lookup.keys[userID]
 	if !ok {
-		return nil, errors.New("unknown synthetic account")
+		return nil, ErrSigningKeyNotFound
 	}
 	return append(ed25519.PublicKey(nil), key...), nil
 }
@@ -514,7 +529,7 @@ func TestRESTAuthV2VerifierReplayScopeAndStoreFailure(t *testing.T) {
 	}
 }
 
-func TestRESTAuthV2VerifierRejectsUnknownOrInvalidAccountKeyBeforeClaim(t *testing.T) {
+func TestRESTAuthV2VerifierClassifiesAccountKeyFailuresBeforeClaim(t *testing.T) {
 	fixture := newRESTV2VerifierFixture(t)
 	wrongSeed := make([]byte, ed25519.SeedSize)
 	for index := range wrongSeed {
@@ -525,24 +540,123 @@ func TestRESTAuthV2VerifierRejectsUnknownOrInvalidAccountKeyBeforeClaim(t *testi
 		t, restV2VerifierUserA, fixture.privateKey, fixture.now, fixture.nonce,
 		"GET", "/v1/users/search?username=alice", nil,
 	)
-	for name, lookup := range map[string]*restV2VerifierLookup{
-		"unknown": {keys: map[string]ed25519.PublicKey{}},
-		"wrong": {keys: map[string]ed25519.PublicKey{
-			restV2VerifierUserA: wrongPublic,
-		}},
-		"low order": {keys: map[string]ed25519.PublicKey{
-			restV2VerifierUserA: make(ed25519.PublicKey, ed25519.PublicKeySize),
-		}},
+	for name, testCase := range map[string]struct {
+		lookup *restV2VerifierLookup
+		want   RESTAuthV2Failure
+	}{
+		"unknown": {
+			lookup: &restV2VerifierLookup{keys: map[string]ed25519.PublicKey{}},
+			want:   RESTAuthV2AuthenticationFailed,
+		},
+		"wrong": {
+			lookup: &restV2VerifierLookup{keys: map[string]ed25519.PublicKey{restV2VerifierUserA: wrongPublic}},
+			want:   RESTAuthV2AuthenticationFailed,
+		},
+		"invalid stored key": {
+			lookup: &restV2VerifierLookup{keys: map[string]ed25519.PublicKey{restV2VerifierUserA: make(ed25519.PublicKey, ed25519.PublicKeySize)}},
+			want:   RESTAuthV2KeyLookupFailed,
+		},
+		"lookup outage": {
+			lookup: &restV2VerifierLookup{keys: map[string]ed25519.PublicKey{}, err: errors.New("private database outage")},
+			want:   RESTAuthV2KeyLookupFailed,
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			store := newRESTV2VerifierReplayStore()
-			_, err := fixture.verifier(t, lookup, store).Verify(context.Background(), request)
-			requireRESTAuthV2Failure(t, err, RESTAuthV2AuthenticationFailed)
+			_, err := fixture.verifier(t, testCase.lookup, store).Verify(context.Background(), request)
+			requireRESTAuthV2Failure(t, err, testCase.want)
 			if store.callCount() != 0 {
 				t.Fatal("invalid account key reached replay store")
 			}
 		})
 	}
+}
+
+func TestRESTAuthV2VerifierLookupCancellationAndDeadlineAreUnavailable(t *testing.T) {
+	fixture := newRESTV2VerifierFixture(t)
+	request := fixture.request(
+		t, restV2VerifierUserA, fixture.privateKey, fixture.now, fixture.nonce,
+		http.MethodGet, "/v1/users/search?username=alice", nil,
+	)
+
+	t.Run("already canceled context beats returned key", func(t *testing.T) {
+		lookup := &restV2VerifierLookup{keys: map[string]ed25519.PublicKey{restV2VerifierUserA: fixture.publicKey}}
+		store := newRESTV2VerifierReplayStore()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		principal, err := fixture.verifier(t, lookup, store).Verify(ctx, request)
+		requireRESTAuthV2Failure(t, err, RESTAuthV2KeyLookupFailed)
+		if principal.UserID() != "" || store.callCount() != 0 {
+			t.Fatalf("principal=%q replay=%d", principal.UserID(), store.callCount())
+		}
+	})
+
+	t.Run("joined deadline beats not found", func(t *testing.T) {
+		lookup := &restV2VerifierLookup{
+			keys: map[string]ed25519.PublicKey{},
+			err:  errors.Join(ErrSigningKeyNotFound, context.DeadlineExceeded),
+		}
+		store := newRESTV2VerifierReplayStore()
+		principal, err := fixture.verifier(t, lookup, store).Verify(context.Background(), request)
+		requireRESTAuthV2Failure(t, err, RESTAuthV2KeyLookupFailed)
+		if principal.UserID() != "" || store.callCount() != 0 {
+			t.Fatalf("principal=%q replay=%d", principal.UserID(), store.callCount())
+		}
+	})
+
+	t.Run("joined outage beats not found", func(t *testing.T) {
+		lookup := &restV2VerifierLookup{
+			keys: map[string]ed25519.PublicKey{},
+			err:  errors.Join(ErrSigningKeyNotFound, errors.New("private database outage")),
+		}
+		store := newRESTV2VerifierReplayStore()
+		principal, err := fixture.verifier(t, lookup, store).Verify(context.Background(), request)
+		requireRESTAuthV2Failure(t, err, RESTAuthV2KeyLookupFailed)
+		if principal.UserID() != "" || store.callCount() != 0 {
+			t.Fatalf("principal=%q replay=%d", principal.UserID(), store.callCount())
+		}
+	})
+
+	t.Run("joined not found only remains authentication failure", func(t *testing.T) {
+		lookup := &restV2VerifierLookup{
+			keys: map[string]ed25519.PublicKey{},
+			err: errors.Join(
+				ErrSigningKeyNotFound,
+				fmt.Errorf("wrapped: %w", ErrSigningKeyNotFound),
+			),
+		}
+		store := newRESTV2VerifierReplayStore()
+		principal, err := fixture.verifier(t, lookup, store).Verify(context.Background(), request)
+		requireRESTAuthV2Failure(t, err, RESTAuthV2AuthenticationFailed)
+		if principal.UserID() != "" || store.callCount() != 0 {
+			t.Fatalf("principal=%q replay=%d", principal.UserID(), store.callCount())
+		}
+	})
+
+	t.Run("wrapped explicit absence remains authentication failure", func(t *testing.T) {
+		lookup := &restV2VerifierLookup{keys: map[string]ed25519.PublicKey{}, err: fmt.Errorf("wrapped: %w", ErrSigningKeyNotFound)}
+		store := newRESTV2VerifierReplayStore()
+		principal, err := fixture.verifier(t, lookup, store).Verify(context.Background(), request)
+		requireRESTAuthV2Failure(t, err, RESTAuthV2AuthenticationFailed)
+		if principal.UserID() != "" || store.callCount() != 0 {
+			t.Fatalf("principal=%q replay=%d", principal.UserID(), store.callCount())
+		}
+	})
+
+	t.Run("bounded lookup deadline", func(t *testing.T) {
+		lookup := &restV2VerifierBlockingLookup{deadline: make(chan time.Time, 1)}
+		store := newRESTV2VerifierReplayStore()
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+		defer cancel()
+		started := time.Now()
+		principal, err := fixture.verifier(t, lookup, store).Verify(ctx, request)
+		elapsed := time.Since(started)
+		requireRESTAuthV2Failure(t, err, RESTAuthV2KeyLookupFailed)
+		deadline := <-lookup.deadline
+		if principal.UserID() != "" || store.callCount() != 0 || elapsed > time.Second || deadline.After(started.Add(250*time.Millisecond)) {
+			t.Fatalf("principal=%q replay=%d elapsed=%s deadline=%s", principal.UserID(), store.callCount(), elapsed, deadline)
+		}
+	})
 }
 
 func TestRESTAuthV2VerifierFailuresExposeOnlyStableMessages(t *testing.T) {
@@ -551,6 +665,7 @@ func TestRESTAuthV2VerifierFailuresExposeOnlyStableMessages(t *testing.T) {
 		RESTAuthV2InvalidRequest:       "REST authentication request is invalid",
 		RESTAuthV2TimestampRejected:    "REST authentication timestamp was rejected",
 		RESTAuthV2AuthenticationFailed: "REST authentication failed",
+		RESTAuthV2KeyLookupFailed:      "REST authentication signing key lookup is unavailable",
 		RESTAuthV2Replay:               "REST authentication nonce was already used",
 		RESTAuthV2ReplayStoreFailed:    "REST authentication replay protection is unavailable",
 	} {
@@ -563,6 +678,14 @@ func TestRESTAuthV2VerifierFailuresExposeOnlyStableMessages(t *testing.T) {
 				t.Fatal("internal cause was not retained for private classification")
 			}
 		})
+	}
+	var typedNil *RESTAuthV2VerifyError
+	if typedNil.Error() != "REST authentication failed" || typedNil.Unwrap() != nil || errors.Is(typedNil, privateCause) {
+		t.Fatal("nil RESTAuthV2VerifyError receiver was not fail-safe")
+	}
+	var extracted *RESTAuthV2VerifyError
+	if !errors.As(error(typedNil), &extracted) || extracted != nil || fmt.Sprint(error(typedNil)) == "" {
+		t.Fatal("typed-nil RESTAuthV2VerifyError was not safe through errors/fmt")
 	}
 }
 

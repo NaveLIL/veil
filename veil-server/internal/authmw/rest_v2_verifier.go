@@ -7,6 +7,7 @@ import (
 	"errors"
 	"math"
 	"reflect"
+	"sync/atomic"
 	"time"
 
 	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
@@ -23,6 +24,11 @@ const (
 	RESTAuthV2ProtocolVersion = "2"
 
 	restAuthV2KeyLookupTimeout = 2 * time.Second
+	restAuthV2ReplayTimeout    = 2 * time.Second
+	// A staged proof may retain a resolved key only for one freshness window.
+	// This is deliberately well below the durable replay marker retention and
+	// uses time.Time's monotonic component in production.
+	restAuthV2PreflightMaxAge = SignatureMaxSkew
 )
 
 // RESTAuthV2Failure is a stable, non-secret classification for an isolated
@@ -33,6 +39,7 @@ const (
 	RESTAuthV2InvalidRequest       RESTAuthV2Failure = "invalid_request"
 	RESTAuthV2TimestampRejected    RESTAuthV2Failure = "timestamp_rejected"
 	RESTAuthV2AuthenticationFailed RESTAuthV2Failure = "authentication_failed"
+	RESTAuthV2KeyLookupFailed      RESTAuthV2Failure = "key_lookup_failed"
 	RESTAuthV2Replay               RESTAuthV2Failure = "replay"
 	RESTAuthV2ReplayStoreFailed    RESTAuthV2Failure = "replay_store_failed"
 )
@@ -48,6 +55,9 @@ type RESTAuthV2VerifyError struct {
 }
 
 func (err *RESTAuthV2VerifyError) Error() string {
+	if err == nil {
+		return "REST authentication failed"
+	}
 	switch err.Failure {
 	case RESTAuthV2InvalidRequest:
 		return "REST authentication request is invalid"
@@ -55,6 +65,8 @@ func (err *RESTAuthV2VerifyError) Error() string {
 		return "REST authentication timestamp was rejected"
 	case RESTAuthV2AuthenticationFailed:
 		return "REST authentication failed"
+	case RESTAuthV2KeyLookupFailed:
+		return "REST authentication signing key lookup is unavailable"
 	case RESTAuthV2Replay:
 		return "REST authentication nonce was already used"
 	case RESTAuthV2ReplayStoreFailed:
@@ -64,7 +76,12 @@ func (err *RESTAuthV2VerifyError) Error() string {
 	}
 }
 
-func (err *RESTAuthV2VerifyError) Unwrap() error { return err.cause }
+func (err *RESTAuthV2VerifyError) Unwrap() error {
+	if err == nil {
+		return nil
+	}
+	return err.cause
+}
 
 func restAuthV2Failure(failure RESTAuthV2Failure, cause error) error {
 	return &RESTAuthV2VerifyError{Failure: failure, cause: cause}
@@ -116,6 +133,25 @@ type RESTAuthV2Verifier struct {
 	lookup          UserKeyLookup
 	replay          RESTAuthV2ReplayStore
 	now             func() time.Time
+	replayTimeout   time.Duration
+}
+
+// restAuthV2Preflight is an unexported, single-use verification continuation.
+// It exists so the HTTP boundary can reject malformed metadata and resolve the
+// candidate account key before admitting an attacker-controlled body. It never
+// publishes an authenticated principal: only finish can do that, after the
+// exact body signature and durable replay claim both succeed.
+type restAuthV2Preflight struct {
+	verifier      *RESTAuthV2Verifier
+	userID        string
+	method        string
+	requestTarget string
+	timestampMS   uint64
+	startedAt     time.Time
+	nonce         [RESTAuthV2NonceSize]byte
+	signature     [ed25519.SignatureSize]byte
+	publicKey     ed25519.PublicKey
+	consumed      atomic.Bool
 }
 
 func NewRESTAuthV2Verifier(
@@ -147,6 +183,7 @@ func newRESTAuthV2VerifierWithClock(
 		lookup:          lookup,
 		replay:          replay,
 		now:             now,
+		replayTimeout:   restAuthV2ReplayTimeout,
 	}, nil
 }
 
@@ -170,98 +207,215 @@ func (verifier *RESTAuthV2Verifier) Verify(
 	request RESTAuthV2Request,
 ) (VerifiedRESTAuthV2Principal, error) {
 	var empty VerifiedRESTAuthV2Principal
-	if verifier == nil || verifier.canonicalOrigin.IsZero() || verifier.lookup == nil || verifier.replay == nil || verifier.now == nil {
-		return empty, restAuthV2Failure(RESTAuthV2ReplayStoreFailed, ErrRESTAuthV2VerifierConfiguration)
+	if err := verifier.validateRESTAuthV2Runtime(ctx); err != nil {
+		return empty, err
+	}
+	// The transport-neutral convenience API already owns the complete body, so
+	// it can reject an oversized input before doing a database key lookup. The
+	// HTTP adapter instead calls preflight before it starts its bounded read.
+	if len(request.Body) > maxSignedBodyBytes {
+		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("REST auth v2 body is oversized"))
+	}
+	preflight, err := verifier.preflight(ctx, request.Headers, request.Method, request.RequestTarget)
+	if err != nil {
+		return empty, err
+	}
+	return preflight.finish(ctx, request.Body)
+}
+
+func (verifier *RESTAuthV2Verifier) validateRESTAuthV2Runtime(ctx context.Context) error {
+	if verifier == nil || verifier.canonicalOrigin.IsZero() || verifier.lookup == nil ||
+		verifier.replay == nil || verifier.now == nil || verifier.replayTimeout <= 0 {
+		return restAuthV2Failure(RESTAuthV2ReplayStoreFailed, ErrRESTAuthV2VerifierConfiguration)
 	}
 	if ctx == nil {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("nil request context"))
+		return restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("nil request context"))
+	}
+	return nil
+}
+
+// preflight validates every body-independent proof field, samples freshness
+// once, and resolves a strict copy of the pinned account signing key. It must
+// run before the HTTP boundary acquires body-retention capacity or reads r.Body.
+func (verifier *RESTAuthV2Verifier) preflight(
+	ctx context.Context,
+	headers RESTAuthV2HeaderValues,
+	method string,
+	requestTarget string,
+) (*restAuthV2Preflight, error) {
+	if err := verifier.validateRESTAuthV2Runtime(ctx); err != nil {
+		return nil, err
 	}
 
-	version, ok := oneRESTAuthV2Header(request.Headers.Versions)
+	version, ok := oneRESTAuthV2Header(headers.Versions)
 	if !ok || version != RESTAuthV2ProtocolVersion {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid protocol version header"))
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid protocol version header"))
 	}
-	userID, ok := oneRESTAuthV2Header(request.Headers.Users)
+	userID, ok := oneRESTAuthV2Header(headers.Users)
 	if !ok {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid user header cardinality"))
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid user header cardinality"))
 	}
 	if _, err := ParseCanonicalRESTUserIDV2(userID); err != nil {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
 	}
-	timestampHeader, ok := oneRESTAuthV2Header(request.Headers.Timestamps)
+	timestampHeader, ok := oneRESTAuthV2Header(headers.Timestamps)
 	if !ok {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid timestamp header cardinality"))
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid timestamp header cardinality"))
 	}
 	timestampMS, err := ParseCanonicalRESTTimestampV2(timestampHeader)
 	if err != nil {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
 	}
-	nonceHeader, ok := oneRESTAuthV2Header(request.Headers.Nonces)
+	nonceHeader, ok := oneRESTAuthV2Header(headers.Nonces)
 	if !ok {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid nonce header cardinality"))
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid nonce header cardinality"))
 	}
 	nonce, err := ParseCanonicalRESTNonceV2(nonceHeader)
 	if err != nil {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
 	}
-	signatureHeader, ok := oneRESTAuthV2Header(request.Headers.Signatures)
+	signatureHeader, ok := oneRESTAuthV2Header(headers.Signatures)
 	if !ok {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid signature header cardinality"))
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid signature header cardinality"))
 	}
 	signature, err := parseCanonicalRESTSignatureV2(signatureHeader)
 	if err != nil {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
 	}
-	if err := ValidateCanonicalRESTMethodV2(request.Method); err != nil {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
+	// The decoded slice is temporary even when a later metadata or lookup
+	// check fails. The continuation receives its own fixed-size copy below.
+	defer clear(signature)
+	if err := ValidateCanonicalRESTMethodV2(method); err != nil {
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
 	}
-	if err := ValidateCanonicalRESTTargetV2(request.RequestTarget); err != nil {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
-	}
-	if len(request.Body) > maxSignedBodyBytes {
-		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("REST auth v2 body is oversized"))
+	if err := ValidateCanonicalRESTTargetV2(requestTarget); err != nil {
+		return nil, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
 	}
 
 	now := verifier.now()
 	if now.IsZero() || !restAuthV2TimestampWithinSkew(int64(timestampMS), now.UnixMilli()) {
-		return empty, restAuthV2Failure(RESTAuthV2TimestampRejected, errors.New("timestamp outside acceptance window"))
+		return nil, restAuthV2Failure(RESTAuthV2TimestampRejected, errors.New("timestamp outside acceptance window"))
 	}
 
 	lookupCtx, cancel := context.WithTimeout(ctx, restAuthV2KeyLookupTimeout)
 	publicKey, err := verifier.lookup.GetSigningKey(lookupCtx, userID)
+	lookupContextErr := lookupCtx.Err()
 	cancel()
+	if lookupContextErr != nil {
+		return nil, restAuthV2Failure(RESTAuthV2KeyLookupFailed, lookupContextErr)
+	}
 	if err != nil {
-		return empty, restAuthV2Failure(RESTAuthV2AuthenticationFailed, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil, restAuthV2Failure(RESTAuthV2KeyLookupFailed, err)
+		}
+		if signingKeyLookupErrorOnlyMatches(err, ErrSigningKeyNotFound) {
+			return nil, restAuthV2Failure(RESTAuthV2AuthenticationFailed, err)
+		}
+		return nil, restAuthV2Failure(RESTAuthV2KeyLookupFailed, err)
 	}
 	publicKey = append(ed25519.PublicKey(nil), publicKey...)
 	if !cryptokey.ValidEd25519PublicKey(publicKey) {
-		return empty, restAuthV2Failure(RESTAuthV2AuthenticationFailed, errors.New("invalid account signing key"))
+		return nil, restAuthV2Failure(RESTAuthV2KeyLookupFailed, errors.New("invalid account signing key"))
+	}
+	preflight := &restAuthV2Preflight{
+		verifier:      verifier,
+		userID:        userID,
+		method:        method,
+		requestTarget: requestTarget,
+		timestampMS:   timestampMS,
+		startedAt:     now,
+		nonce:         nonce,
+		publicKey:     publicKey,
+	}
+	copy(preflight.signature[:], signature)
+	return preflight, nil
+}
+
+// finish consumes a preflight exactly once. The durable nonce claim remains
+// the cross-process replay authority; this local guard only prevents accidental
+// reuse of one in-memory continuation by an adapter bug.
+func (preflight *restAuthV2Preflight) finish(
+	ctx context.Context,
+	body []byte,
+) (VerifiedRESTAuthV2Principal, error) {
+	var empty VerifiedRESTAuthV2Principal
+	if preflight == nil {
+		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid REST auth v2 preflight"))
+	}
+	if !preflight.consumed.CompareAndSwap(false, true) {
+		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("REST auth v2 preflight already consumed"))
+	}
+	defer preflight.clear()
+	// Check mutable continuation fields only after winning the atomic consume.
+	// Losing concurrent calls touch no data that clear can overwrite.
+	if preflight.verifier == nil || ctx == nil {
+		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("invalid REST auth v2 preflight"))
+	}
+	if len(body) > maxSignedBodyBytes {
+		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, errors.New("REST auth v2 body is oversized"))
 	}
 
 	message, err := RESTAuthV2SigningMessage(RESTAuthV2Input{
-		CanonicalOrigin: verifier.canonicalOrigin.String(),
-		UserID:          userID,
-		Method:          request.Method,
-		RequestTarget:   request.RequestTarget,
-		TimestampMS:     timestampMS,
-		Nonce:           nonce,
-		BodySHA256:      RESTAuthV2BodyDigest(request.Body),
+		CanonicalOrigin: preflight.verifier.canonicalOrigin.String(),
+		UserID:          preflight.userID,
+		Method:          preflight.method,
+		RequestTarget:   preflight.requestTarget,
+		TimestampMS:     preflight.timestampMS,
+		Nonce:           preflight.nonce,
+		BodySHA256:      RESTAuthV2BodyDigest(body),
 	})
 	if err != nil {
 		return empty, restAuthV2Failure(RESTAuthV2InvalidRequest, err)
 	}
-	if !ed25519.Verify(publicKey, message, signature) {
+	defer clear(message)
+	if !ed25519.Verify(preflight.publicKey, message, preflight.signature[:]) {
 		return empty, restAuthV2Failure(RESTAuthV2AuthenticationFailed, errors.New("invalid account signature"))
 	}
+	// A staged HTTP body can arrive slowly after the key preflight. Recheck
+	// freshness immediately before the durable claim so a proof cannot outlive
+	// the replay store's timestamp-based retention assumptions while waiting
+	// for admission or body I/O.
+	now := preflight.verifier.now()
+	age := now.Sub(preflight.startedAt)
+	if now.IsZero() || preflight.startedAt.IsZero() || age < 0 || age > restAuthV2PreflightMaxAge ||
+		!restAuthV2TimestampWithinSkew(int64(preflight.timestampMS), now.UnixMilli()) {
+		return empty, restAuthV2Failure(RESTAuthV2TimestampRejected, errors.New("timestamp outside acceptance window"))
+	}
 
-	claimed, err := verifier.replay.ClaimRESTAuthV2Nonce(ctx, userID, nonce)
+	replayCtx, cancel := context.WithTimeout(ctx, preflight.verifier.replayTimeout)
+	claimed, err := preflight.verifier.replay.ClaimRESTAuthV2Nonce(
+		replayCtx,
+		preflight.userID,
+		preflight.nonce,
+	)
+	replayContextErr := replayCtx.Err()
+	cancel()
+	if replayContextErr != nil {
+		return empty, restAuthV2Failure(RESTAuthV2ReplayStoreFailed, replayContextErr)
+	}
 	if err != nil {
 		return empty, restAuthV2Failure(RESTAuthV2ReplayStoreFailed, err)
 	}
 	if !claimed {
 		return empty, restAuthV2Failure(RESTAuthV2Replay, errors.New("nonce already claimed"))
 	}
-	return VerifiedRESTAuthV2Principal{userID: userID}, nil
+	return VerifiedRESTAuthV2Principal{userID: preflight.userID}, nil
+}
+
+func (preflight *restAuthV2Preflight) clear() {
+	if preflight == nil {
+		return
+	}
+	preflight.verifier = nil
+	preflight.userID = ""
+	preflight.method = ""
+	preflight.requestTarget = ""
+	preflight.timestampMS = 0
+	preflight.startedAt = time.Time{}
+	clear(preflight.nonce[:])
+	clear(preflight.signature[:])
+	clear(preflight.publicKey)
+	preflight.publicKey = nil
 }
 
 func oneRESTAuthV2Header(values []string) (string, bool) {

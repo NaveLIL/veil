@@ -94,6 +94,70 @@ type UserKeyLookup interface {
 	GetSigningKey(ctx context.Context, userID string) (ed25519.PublicKey, error)
 }
 
+// ErrSigningKeyNotFound is the only lookup error that means a syntactically
+// valid account ID is explicitly absent. REST v2 maps this condition to an
+// authentication failure. Implementations must return every timeout,
+// cancellation, storage outage, malformed row, and other indeterminate result
+// as a different error so REST v2 can fail closed as unavailable. Legacy v1
+// intentionally retains its existing behavior of treating every lookup error
+// as an unknown user until its public contract is versioned separately.
+var ErrSigningKeyNotFound = errors.New("signing key account not found")
+
+// NormalizeSigningKeyLookupError adapts a storage-specific absence sentinel to
+// the shared lookup contract. Cancellation and deadline errors always take
+// precedence, including joined errors, so an indeterminate query can never be
+// downgraded to an authentication failure.
+func NormalizeSigningKeyLookupError(ctx context.Context, lookupErr, storageNotFound error) error {
+	if lookupErr == nil {
+		return nil
+	}
+	if ctx == nil {
+		return lookupErr
+	}
+	if contextErr := ctx.Err(); contextErr != nil {
+		return contextErr
+	}
+	if errors.Is(lookupErr, context.Canceled) || errors.Is(lookupErr, context.DeadlineExceeded) {
+		return lookupErr
+	}
+	if storageNotFound != nil && signingKeyLookupErrorOnlyMatches(lookupErr, storageNotFound) {
+		return ErrSigningKeyNotFound
+	}
+	return lookupErr
+}
+
+// signingKeyLookupErrorOnlyMatches accepts a wrapped or joined absence result
+// only when every leaf has exactly that meaning. A mixed
+// not-found-plus-outage tree is operational uncertainty and must not be
+// downgraded to an authentication failure merely because errors.Is finds one
+// absence branch.
+func signingKeyLookupErrorOnlyMatches(err, target error) bool {
+	if err == nil || target == nil {
+		return false
+	}
+	if err == target {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		children := joined.Unwrap()
+		if len(children) == 0 {
+			return false
+		}
+		for _, child := range children {
+			if !signingKeyLookupErrorOnlyMatches(child, target) {
+				return false
+			}
+		}
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		if child := wrapped.Unwrap(); child != nil {
+			return signingKeyLookupErrorOnlyMatches(child, target)
+		}
+	}
+	return errors.Is(err, target)
+}
+
 // LookupFunc is a convenience adapter that turns a plain function into a
 // UserKeyLookup. Useful for handler packages that already have a
 // FindUserByID-style helper and don't want to declare a wrapper type.

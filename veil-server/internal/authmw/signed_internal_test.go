@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"github.com/NaveLIL/veil/veil-server/internal/cryptokey"
+	"github.com/jackc/pgx/v5"
 )
 
 type countedBody struct{ reads int }
@@ -68,6 +70,68 @@ func TestRequireSignedRejectsUnknownAccountBeforeReadingBody(t *testing.T) {
 	})(response, fakeBodyRequest(body))
 	if response.Code != http.StatusUnauthorized || body.reads != 0 {
 		t.Fatalf("status=%d body reads=%d, want 401 before body read", response.Code, body.reads)
+	}
+}
+
+func TestNormalizeSigningKeyLookupErrorUsesContextBeforeAbsence(t *testing.T) {
+	storageNotFound := pgx.ErrNoRows
+	outage := errors.New("private database outage")
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, testCase := range []struct {
+		name         string
+		ctx          context.Context
+		lookupErr    error
+		want         error
+		wantNotFound bool
+	}{
+		{name: "nil error", ctx: context.Background()},
+		{name: "exact absence", ctx: context.Background(), lookupErr: storageNotFound, want: ErrSigningKeyNotFound, wantNotFound: true},
+		{name: "wrapped absence", ctx: context.Background(), lookupErr: fmt.Errorf("wrapped: %w", storageNotFound), want: ErrSigningKeyNotFound, wantNotFound: true},
+		{name: "joined absence only", ctx: context.Background(), lookupErr: errors.Join(storageNotFound, fmt.Errorf("wrapped: %w", storageNotFound)), want: ErrSigningKeyNotFound, wantNotFound: true},
+		{name: "outage", ctx: context.Background(), lookupErr: outage, want: outage},
+		{name: "joined absence and outage", ctx: context.Background(), lookupErr: errors.Join(storageNotFound, outage), want: outage},
+		{name: "joined absence and deadline", ctx: context.Background(), lookupErr: errors.Join(storageNotFound, context.DeadlineExceeded), want: context.DeadlineExceeded},
+		{name: "canceled context beats absence", ctx: canceledCtx, lookupErr: storageNotFound, want: context.Canceled},
+		{name: "nil context cannot assert absence", lookupErr: storageNotFound, want: storageNotFound},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			got := NormalizeSigningKeyLookupError(testCase.ctx, testCase.lookupErr, storageNotFound)
+			if testCase.want == nil {
+				if got != nil {
+					t.Fatalf("error=%v, want nil", got)
+				}
+				return
+			}
+			if !errors.Is(got, testCase.want) {
+				t.Fatalf("error=%v, want errors.Is(%v)", got, testCase.want)
+			}
+			if errors.Is(got, ErrSigningKeyNotFound) != testCase.wantNotFound {
+				t.Fatalf("error=%v not-found=%v, want %v", got, errors.Is(got, ErrSigningKeyNotFound), testCase.wantNotFound)
+			}
+		})
+	}
+}
+
+func TestLegacyV1LookupErrorsRetainUnauthorizedContract(t *testing.T) {
+	for _, lookupErr := range []error{
+		ErrSigningKeyNotFound,
+		errors.New("private database outage"),
+		context.Canceled,
+		context.DeadlineExceeded,
+		errors.Join(ErrSigningKeyNotFound, context.DeadlineExceeded),
+	} {
+		middleware := New(LookupFunc(func(context.Context, string) (ed25519.PublicKey, error) {
+			return nil, lookupErr
+		}))
+		body := &countedBody{}
+		response := httptest.NewRecorder()
+		called := false
+		middleware.RequireSigned(func(http.ResponseWriter, *http.Request) { called = true })(response, fakeBodyRequest(body))
+		middleware.Close()
+		if response.Code != http.StatusUnauthorized || called || body.reads != 0 {
+			t.Fatalf("lookup error=%v status=%d called=%v body reads=%d", lookupErr, response.Code, called, body.reads)
+		}
 	}
 }
 

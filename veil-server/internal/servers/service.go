@@ -11,6 +11,7 @@ import (
 	"github.com/NaveLIL/veil/veil-server/internal/authmw"
 	"github.com/NaveLIL/veil/veil-server/internal/db"
 	pb "github.com/NaveLIL/veil/veil-server/pkg/proto/v1"
+	"github.com/jackc/pgx/v5"
 )
 
 // Broadcaster delivers WebSocket envelopes to a set of users.
@@ -45,9 +46,15 @@ func NewService(database *db.DB, bcast Broadcaster) *Service {
 // database, used when constructing the shared signing middleware.
 func (s *Service) SigningKeyLookup() authmw.UserKeyLookup {
 	return authmw.LookupFunc(func(ctx context.Context, userID string) (ed25519.PublicKey, error) {
+		if s == nil || s.db == nil || s.db.Pool == nil {
+			return nil, errors.New("signing key lookup database is unavailable")
+		}
 		u, err := s.db.FindUserByID(ctx, userID)
 		if err != nil {
-			return nil, err
+			return nil, authmw.NormalizeSigningKeyLookupError(ctx, err, pgx.ErrNoRows)
+		}
+		if u == nil {
+			return nil, errors.New("signing key lookup returned no account row")
 		}
 		return ed25519.PublicKey(u.SigningKey), nil
 	})
