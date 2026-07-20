@@ -175,13 +175,14 @@ Gateway разработки публикуется только на `127.0.0.1
 Отсутствующее или неканоническое значение блокирует gateway fail closed.
 
 Это configured-origin и изолированный transport-auth foundation, а не активация
-нового протокола. Отдельные WS v3 protobuf/native proof helpers и REST v2
-private native preparer/server verifier/PostgreSQL replay boundary существуют,
-но намеренно не подключены к transport, FFI или gateway routes: текущие `/ws` и
-signed REST остаются legacy Preview WS auth v2/REST auth v1. До live cutover,
-raw HTTP/media-policy gate, двухнодовой relay-матрицы и независимого review эти
-компоненты не являются production-готовностью или новой live
-криптографической гарантией.
+нового протокола. Отдельные WS v3 protobuf/native proof helpers, server
+verifier/atomic admission и REST v2 private native preparer, HTTP boundary,
+version dispatcher и PostgreSQL replay boundary существуют, но намеренно не
+подключены к transport, FFI или gateway routes: текущие `/ws` и signed REST
+остаются legacy Preview WS auth v2/REST auth v1. До live WS raw-protobuf/
+subprotocol dispatch, REST route/media/ServeMux cutover, двухнодовой
+relay-матрицы и независимого review эти компоненты не являются
+production-готовностью или новой live криптографической гарантией.
 
 Uploads и push намеренно fail closed, пока не заданы их ключи:
 

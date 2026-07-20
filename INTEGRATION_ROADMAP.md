@@ -72,7 +72,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; durable setup-result reconciliation реализован и host-tested в текущем локальном checkpoint; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
-| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher, shared Rust↔Go exact-origin contract, mandatory configured origin и изолированные non-activated WS v3/REST v2 client/server/replay foundations реализованы; live dispatch/raw HTTP/media cutover, v3 Pass verifier, two-Node relay, Android consumption, `libsignal` spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
+| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher, shared Rust↔Go exact-origin contract, mandatory configured origin и изолированные non-activated WS v3 verifier/atomic admission и REST v2 HTTP/version-dispatch foundations реализованы; live WS raw-protobuf/subprotocol/gateway dispatch, REST route/ServeMux cutover, two-Node relay, Android consumption, `libsignal` spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -2173,6 +2173,36 @@ policy, version dispatcher, desktop/Android transport, legacy cutover и real
 two-Node matrix остаются открытыми, а Node Access Pass принадлежит только
 будущему WS v3 registration verifier. Точный checkpoint:
 [`docs/reviews/phase-5s-rest-auth-v2-foundation-checkpoint.md`](docs/reviews/phase-5s-rest-auth-v2-foundation-checkpoint.md).
+
+**Local checkpoint 5S.3B-4 2026-07-20:** добавлены изолированный server WS auth
+v3 verifier и атомарный PostgreSQL admission. One-shot challenge, exact
+configured origin, account-signed active device binding, contributory
+account/device DH и chained Ed25519 proofs проверяются до любой registration
+policy или Pass lookup. Для новой identity account, device, immutable binding
+state и расход Pass входят в одну транзакцию; exact existing identity выигрывает
+до Pass и делает uncertain post-commit retry идемпотентным. Успех возвращает
+opaque verified result с principal, protocol, origin и signed intent из той же
+проверенной попытки. Repo-wide AST gate подтверждает отсутствие live
+`CreateChallengeV3`/`VerifyResponseV3` callsite. Живой `/ws` всё ещё v2; raw
+canonical protobuf, subprotocol/gateway dispatch, client consumption и реальная
+двухнодовая relay-матрица остаются blocking gates. Точный checkpoint:
+[`docs/reviews/phase-5s-ws-auth-v3-verifier-admission-checkpoint.md`](docs/reviews/phase-5s-ws-auth-v3-verifier-admission-checkpoint.md).
+
+**Local checkpoint 5S.3B-5 2026-07-20:** добавлены изолированные REST auth v2
+HTTP boundary и version dispatcher без live route. Boundary получает signed
+target только из raw `RequestURI`, собирает все case-insensitive header values,
+до body read выполняет canonical preflight/key lookup, затем один раз bounded
+читает и точно восстанавливает body под общей v1/v2 admission authority.
+Principal публикуется только после exact body signature, повторной freshness
+проверки, 60-секундного monotonic staged-proof bound и durable replay winner.
+Явный `not found` отделён от timeout/cancel/storage failure: первый даёт generic
+401, неопределённость — generic 503. `V2Only` не допускает downgrade;
+`PreviewDual` имеет owner, максимум 30 дней, monotonic deadline и sticky
+fail-closed expiry без fallback. Это всё ещё не activation: route/media table,
+ServeMux/redirect guard, bounded key-lookup concurrency, short absolute body
+read deadline, telemetry/config wiring, desktop/Android transport и реальная
+two-Node matrix остаются blocking gates. Точный checkpoint:
+[`docs/reviews/phase-5s-rest-auth-v2-http-boundary-checkpoint.md`](docs/reviews/phase-5s-rest-auth-v2-http-boundary-checkpoint.md).
 
 Private/E2EE keys при этом не извлекаются, но A может получить authenticated
 control/metadata context на B и злоупотреблять server-authoritative actions,

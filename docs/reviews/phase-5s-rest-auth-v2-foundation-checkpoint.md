@@ -153,6 +153,11 @@ signing transport, Preview compatibility expiry, and real two-Node relay tests
 remain absent or outside this checkpoint. No source file or migration by itself
 constitutes an activation claim.
 
+Follow-on checkpoint 5S.3B-5 now supplies the still non-activated HTTP adapter
+and version dispatcher; its evidence and remaining route/client/two-Node gates
+are recorded in
+[the REST auth v2 HTTP boundary checkpoint](phase-5s-rest-auth-v2-http-boundary-checkpoint.md).
+
 No Compose service is started, stopped, recreated, or contacted for this
 checkpoint. A host-only integration gate may create and destroy a disposable
 PostgreSQL testcontainer populated only with synthetic accounts; that is not a

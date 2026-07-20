@@ -80,8 +80,10 @@ Node не означает одну identity. Wildcard origin, HTTP downgrade и
 автоматическое доверие self-signed сертификату нарушают эту границу. Текущий
 Preview строго проверяет URL/TLS и exact legacy REST authority на managed
 ingress, но WS v2/REST v1 ещё не связывают полный canonical origin/user context
-end to end. Версионированные WS v3/REST v2 и hostile two-Node matrix остаются
-blocking gate Phase 5S.
+end to end. Изолированные WS v3 verifier/atomic admission и REST v2 HTTP/version
+dispatcher существуют, но не подключены к gateway. Live raw-protobuf/
+subprotocol и route/ServeMux cutover, hostile two-Node matrix и client
+consumption остаются blocking gate Phase 5S.
 
 ### Локальные данные и поиск
 

@@ -85,6 +85,11 @@ prost/Go decoding can discard their representation; the pure helpers in this
 checkpoint intentionally accept already-decoded structures and cannot enforce
 that wire-boundary rule by themselves.
 
+Follow-on checkpoint 5S.3B-4 now supplies the still non-activated verifier and
+atomic admission described above; its evidence and remaining raw-wire/runtime
+gates are recorded in
+[the WS auth v3 verifier/admission checkpoint](phase-5s-ws-auth-v3-verifier-admission-checkpoint.md).
+
 No phone, ADB, APK, recovery ceremony, Pass issuance/application, Compose
 runtime, live Node, or deployment configuration was accessed or changed.
 Physical Android testing remains deferred until it is explicitly resumed and a

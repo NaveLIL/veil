@@ -233,10 +233,10 @@ authenticated principal early:
    REST v2 from the single version header. Reject unknown, missing, duplicate,
    combined, or mixed authentication fields without trying REST v1.
 2. Parse the canonical user, timestamp, nonce, signature, uppercase method, and
-   raw canonical request target. The activation profile uses one server-clock
-   sample converted once to Unix milliseconds and the inclusive freshness
-   interval `now_ms +/- 60,000`; sub-millisecond precision MUST NOT silently
-   narrow either boundary.
+   raw canonical request target. Perform the initial freshness decision with
+   one server-clock sample converted once to Unix milliseconds and the
+   inclusive interval `now_ms +/- 60,000`; sub-millisecond precision MUST NOT
+   silently narrow either boundary.
 3. Resolve and strictly validate the account's pinned Ed25519 public key before
    admitting an attacker-sized body. A header UUID is only a lookup candidate;
    it becomes the authenticated account only when the v2 signature verifies.
@@ -247,10 +247,24 @@ authenticated principal early:
 5. Strictly verify the Ed25519 signature. Failed signatures MUST NOT create a
    replay marker, so an unauthenticated party cannot poison another account's
    nonce space.
-6. Atomically consume replay state keyed by the verified canonical account and
-   exact 32-byte nonce in a store shared by every gateway process for that
-   Node. Only the winner may publish the verified-principal context and invoke
-   the handler.
+6. Immediately before the durable replay claim, take one new server-clock
+   sample, convert it once to Unix milliseconds, and revalidate the same
+   inclusive freshness interval. A proof that became stale while its bounded
+   body was admitted or read fails without a replay claim. The staged
+   continuation also MUST NOT remain usable for more than one 60-second
+   freshness window measured with monotonic elapsed time when available;
+   negative elapsed time, an invalid clock sample, or a longer delay fails
+   closed without a replay claim. Activated HTTP transport MUST also impose an
+   absolute body-read deadline no later than that continuation expiry; a
+   post-read age check alone is not a bound on a connection blocked in `Read`.
+   The bound MUST also cover any automatic `net/http` body drain after an early
+   rejection, or that rejection MUST close the connection safely; restoring a
+   longer listener deadline MUST NOT reopen that resource window.
+   Then atomically
+   consume replay state keyed by the verified canonical account and exact
+   32-byte nonce in a store shared by every gateway process for that Node. Only
+   the winner may publish the verified-principal context and invoke the
+   handler.
 
 Replay authority MUST be durable across process death and simultaneous gateway
 instances; a process-local map or signature-text cache is not sufficient. The
@@ -281,8 +295,11 @@ replay store, route media policies, fail-closed negotiation, and a two-Node
 relay harness. Missing or unknown version never means "try the other version".
 A Preview-only compatibility dispatcher, if required, MUST select v1 or v2 once
 before verification under an explicit flag with no-secret telemetry, an owner,
-and a finite expiry. Production MUST reject origin-unbound WS v2 and
-ingress-dependent REST v1.
+and a finite expiry no more than 30 days after process start. The process MUST
+reattach that bounded interval to a monotonic deadline when available and MUST
+keep legacy selection disabled after any request observes expiry or an invalid
+clock; a later wall-clock rollback cannot re-enable it. Production MUST reject
+origin-unbound WS v2 and ingress-dependent REST v1.
 
 ## Executable evidence
 
