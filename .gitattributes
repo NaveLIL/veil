@@ -6,6 +6,8 @@
 Dockerfile text eol=lf
 *.yml text eol=lf
 *.yaml text eol=lf
+/test-vectors/direct-v1/*.json text eol=lf
+/test-vectors/direct-v1/SHA256SUMS text eol=lf
 
 # Windows-native scripts should keep the platform convention.
 *.ps1 text eol=crlf

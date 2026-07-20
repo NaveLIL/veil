@@ -35,3 +35,6 @@ pub use sender_key::{
     AuthenticatedSkdm, SenderKeyDistribution, SenderKeyStore, UnverifiedSkdmMetadata,
 };
 pub use x3dh::{PreKeyBundle, X3DHResult};
+
+#[cfg(test)]
+mod direct_v1_fixture_tests;

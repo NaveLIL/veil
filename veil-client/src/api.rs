@@ -18124,3 +18124,7 @@ mod tests {
         assert_eq!(messages[0].server_timestamp, Some(2));
     }
 }
+
+#[cfg(test)]
+#[path = "direct_v1_fixture_tests.rs"]
+mod direct_v1_fixture_tests;

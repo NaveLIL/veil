@@ -46,6 +46,7 @@ ADR фиксирует принятое решение и причины. Изм
 - [Phase 4P device push client review](reviews/phase-4p-device-push-client-review.md)
 - [Android runtime terminal failure review](reviews/android-runtime-terminal-failure-review.md)
 - [Android Direct Preview physical test plan](reviews/android-direct-preview-physical-test-plan.md)
+- [Phase 5S Direct-v1 transcript checkpoint](reviews/phase-5s-direct-v1-transcript-checkpoint.md)
 
 Эти документы являются внутренними инженерными review и evidence, а не
 заключением независимого внешнего аудитора.

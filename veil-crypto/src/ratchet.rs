@@ -181,8 +181,32 @@ impl RatchetSession {
     /// - `shared_secret`: the SK from X3DH
     /// - `peer_ratchet_key`: Bob's SPK (used as initial ratchet key)
     pub fn init_initiator(shared_secret: &[u8; 32], peer_ratchet_key: &[u8; 32]) -> Self {
-        // Generate our first ratchet keypair
         let dh_secret = X25519StaticSecret::random_from_rng(OsRng);
+        Self::init_initiator_with_secret(shared_secret, peer_ratchet_key, dh_secret)
+    }
+
+    /// Test-only deterministic initiator initialization for immutable vectors.
+    ///
+    /// This is deliberately unavailable outside crate tests so production and
+    /// FFI callers cannot replace the CSPRNG-backed ratchet key generation.
+    #[cfg(test)]
+    pub(crate) fn init_initiator_with_secret_for_test(
+        shared_secret: &[u8; 32],
+        peer_ratchet_key: &[u8; 32],
+        ratchet_secret: &[u8; 32],
+    ) -> Self {
+        Self::init_initiator_with_secret(
+            shared_secret,
+            peer_ratchet_key,
+            X25519StaticSecret::from(*ratchet_secret),
+        )
+    }
+
+    fn init_initiator_with_secret(
+        shared_secret: &[u8; 32],
+        peer_ratchet_key: &[u8; 32],
+        dh_secret: X25519StaticSecret,
+    ) -> Self {
         let dh_public = X25519PublicKey::from(&dh_secret);
 
         // First DH ratchet step
@@ -314,17 +338,65 @@ impl RatchetSession {
         }
 
         let mut candidate = self.clone();
-        let plaintext = candidate.decrypt_in_place(header, ciphertext, associated_data)?;
+        let plaintext = candidate.decrypt_in_place_with_next_ratchet_secret(
+            header,
+            ciphertext,
+            associated_data,
+            || X25519StaticSecret::random_from_rng(OsRng),
+        )?;
         *self = candidate;
         Ok(plaintext)
     }
 
-    fn decrypt_in_place(
+    /// Test-only authenticated transition with one reviewed next ratchet key.
+    ///
+    /// The production path above always supplies `OsRng`. This crate-private
+    /// hook exists only so an immutable transcript can freeze the exact state
+    /// after the responder's first DH step. It fails unless that transition
+    /// consumes the supplied secret exactly once.
+    #[cfg(test)]
+    pub(crate) fn decrypt_with_ad_and_next_ratchet_secret_for_test(
         &mut self,
         header: &MessageHeader,
         ciphertext: &[u8],
         associated_data: &[u8],
+        next_ratchet_secret: &[u8; 32],
     ) -> Result<Vec<u8>, String> {
+        if ciphertext.len() < aead::NONCE_SIZE {
+            return Err("ciphertext too short".to_string());
+        }
+
+        let mut candidate = self.clone();
+        let mut secret_uses = 0u8;
+        let plaintext = candidate.decrypt_in_place_with_next_ratchet_secret(
+            header,
+            ciphertext,
+            associated_data,
+            || {
+                secret_uses += 1;
+                X25519StaticSecret::from(*next_ratchet_secret)
+            },
+        );
+        if secret_uses != 1 {
+            return Err(format!(
+                "test-only next ratchet secret must be consumed exactly once, got {secret_uses}"
+            ));
+        }
+        let plaintext = plaintext?;
+        *self = candidate;
+        Ok(plaintext)
+    }
+
+    fn decrypt_in_place_with_next_ratchet_secret<F>(
+        &mut self,
+        header: &MessageHeader,
+        ciphertext: &[u8],
+        associated_data: &[u8],
+        next_ratchet_secret: F,
+    ) -> Result<Vec<u8>, String>
+    where
+        F: FnOnce() -> X25519StaticSecret,
+    {
         let aad = message_aad(associated_data, header)?;
 
         // Try skipped keys first (out-of-order message)
@@ -341,7 +413,7 @@ impl RatchetSession {
         if need_ratchet {
             // Skip any remaining messages in the current receiving chain
             self.skip_messages(header.pn)?;
-            self.dh_ratchet_step(&header.ratchet_key)?;
+            self.dh_ratchet_step_with_next_secret(&header.ratchet_key, next_ratchet_secret)?;
         }
 
         // Skip messages if needed (gaps in sequence)
@@ -372,7 +444,14 @@ impl RatchetSession {
     }
 
     /// Perform a DH ratchet step (peer sent a new ratchet key).
-    fn dh_ratchet_step(&mut self, peer_ratchet_key: &[u8; 32]) -> Result<(), String> {
+    fn dh_ratchet_step_with_next_secret<F>(
+        &mut self,
+        peer_ratchet_key: &[u8; 32],
+        next_ratchet_secret: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce() -> X25519StaticSecret,
+    {
         self.prev_send_count = self.send_count;
         self.send_count = 0;
         self.recv_count = 0;
@@ -393,8 +472,9 @@ impl RatchetSession {
         self.receiving_chain_key = Some(recv_ck);
         kdf_out.zeroize();
 
-        // Generate new sending ratchet keypair
-        let new_secret = X25519StaticSecret::random_from_rng(OsRng);
+        // The production caller supplies an OsRng-generated key. Crate tests
+        // may supply one reviewed fixed key to freeze an exact transcript.
+        let new_secret = next_ratchet_secret();
         let new_public = X25519PublicKey::from(&new_secret);
         let dh_output2 = new_secret.diffie_hellman(&peer_key);
 

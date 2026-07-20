@@ -9200,7 +9200,136 @@ mod tests {
         peer_account: AccountSnapshot,
     }
 
+    #[derive(serde::Deserialize)]
+    struct DirectV1StoreVector {
+        expected: DirectV1StoreExpected,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DirectV1StoreExpected {
+        identities: DirectV1StoreIdentities,
+        sessions: DirectV1StoreSessions,
+        headers: DirectV1StoreHeaders,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DirectV1StoreIdentities {
+        bob: DirectV1StoreBobIdentity,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DirectV1StoreBobIdentity {
+        x25519_public_b64: String,
+        ed25519_public_b64: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DirectV1StoreSessions {
+        initiator_before_message_json_b64: String,
+        initiator_after_message_json_b64: String,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct DirectV1StoreHeaders {
+        pending_initial_json_b64: String,
+    }
+
+    fn decode_direct_v1_vector_b64(label: &str, value: &str) -> Vec<u8> {
+        fn sextet(label: &str, index: usize, value: u8) -> u8 {
+            match value {
+                b'A'..=b'Z' => value - b'A',
+                b'a'..=b'z' => value - b'a' + 26,
+                b'0'..=b'9' => value - b'0' + 52,
+                b'+' => 62,
+                b'/' => 63,
+                _ => panic!("Direct-v1 {label} has invalid Base64 byte at {index}"),
+            }
+        }
+
+        let input = value.as_bytes();
+        assert!(
+            input.len().is_multiple_of(4),
+            "Direct-v1 {label} Base64 length is not divisible by four"
+        );
+        let mut decoded = Vec::with_capacity(input.len() / 4 * 3);
+        let chunk_count = input.len() / 4;
+        for (chunk_index, chunk) in input.chunks_exact(4).enumerate() {
+            assert!(
+                chunk[0] != b'=' && chunk[1] != b'=',
+                "Direct-v1 {label} has early Base64 padding"
+            );
+            let padding = match (chunk[2] == b'=', chunk[3] == b'=') {
+                (true, true) => 2,
+                (false, true) => 1,
+                (false, false) => 0,
+                (true, false) => panic!("Direct-v1 {label} has invalid Base64 padding"),
+            };
+            assert!(
+                padding == 0 || chunk_index + 1 == chunk_count,
+                "Direct-v1 {label} has non-terminal Base64 padding"
+            );
+
+            let offset = chunk_index * 4;
+            let a = sextet(label, offset, chunk[0]);
+            let b = sextet(label, offset + 1, chunk[1]);
+            let c = if padding == 2 {
+                0
+            } else {
+                sextet(label, offset + 2, chunk[2])
+            };
+            let d = if padding == 0 {
+                sextet(label, offset + 3, chunk[3])
+            } else {
+                0
+            };
+            if padding == 2 {
+                assert_eq!(
+                    b & 0x0f,
+                    0,
+                    "Direct-v1 {label} has non-canonical Base64 padding bits"
+                );
+            } else if padding == 1 {
+                assert_eq!(
+                    c & 0x03,
+                    0,
+                    "Direct-v1 {label} has non-canonical Base64 padding bits"
+                );
+            }
+
+            decoded.push((a << 2) | (b >> 4));
+            if padding < 2 {
+                decoded.push((b << 4) | (c >> 2));
+            }
+            if padding == 0 {
+                decoded.push((c << 6) | d);
+            }
+        }
+        decoded
+    }
+
+    fn remove_sqlcipher_test_files(path: &std::path::Path) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+    }
+
     fn install_direct_outbox_fixture(db: &VeilDb) -> DirectOutboxFixture {
+        install_direct_outbox_fixture_with_ratchet(
+            db,
+            [0x73; 32],
+            test_signing_key(0x74),
+            b"ratchet-session-v0",
+            b"initial-header-v1",
+        )
+    }
+
+    fn install_direct_outbox_fixture_with_ratchet(
+        db: &VeilDb,
+        peer_identity_key: [u8; 32],
+        peer_signing_key: [u8; 32],
+        session_data: &[u8],
+        initial_header_data: &[u8],
+    ) -> DirectOutboxFixture {
         let self_account = sample_account(
             ORIGIN_A,
             USER_A,
@@ -9208,13 +9337,15 @@ mod tests {
             AccountSnapshotSource::AuthenticatedConversationDirectory,
             Some(1),
         );
-        let peer_account = sample_account(
+        let mut peer_account = sample_account(
             ORIGIN_A,
             USER_B,
             0x73,
             AccountSnapshotSource::AuthenticatedConversationDirectory,
             Some(1),
         );
+        peer_account.locator.identity_key = peer_identity_key;
+        peer_account.signing_key = peer_signing_key;
         db.bind_authenticated_self(
             ORIGIN_A,
             USER_A,
@@ -9243,8 +9374,8 @@ mod tests {
         .unwrap();
         db.save_initiator_session(
             &peer_account.locator.identity_key,
-            b"ratchet-session-v0",
-            b"initial-header-v1",
+            session_data,
+            initial_header_data,
         )
         .unwrap();
 
@@ -14377,5 +14508,144 @@ mod tests {
                 .revision,
             1
         );
+    }
+
+    #[test]
+    fn direct_v1_vector_roundtrips_exact_ratchet_and_pending_header_through_sqlcipher_cas() {
+        let vector_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../test-vectors/direct-v1/v1.json");
+        let vector_json = std::fs::read_to_string(&vector_path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", vector_path.display()));
+        let vector: DirectV1StoreVector = serde_json::from_str(&vector_json)
+            .unwrap_or_else(|error| panic!("parse {}: {error}", vector_path.display()));
+        let peer_identity_key: [u8; 32] = decode_direct_v1_vector_b64(
+            "Bob identity",
+            &vector.expected.identities.bob.x25519_public_b64,
+        )
+        .try_into()
+        .unwrap_or_else(|value: Vec<u8>| {
+            panic!(
+                "Direct-v1 Bob identity has {} bytes, expected 32",
+                value.len()
+            )
+        });
+        let peer_signing_key: [u8; 32] = decode_direct_v1_vector_b64(
+            "Bob signing identity",
+            &vector.expected.identities.bob.ed25519_public_b64,
+        )
+        .try_into()
+        .unwrap_or_else(|value: Vec<u8>| {
+            panic!(
+                "Direct-v1 Bob signing identity has {} bytes, expected 32",
+                value.len()
+            )
+        });
+        let initiator_before = decode_direct_v1_vector_b64(
+            "initiator pre-message session",
+            &vector.expected.sessions.initiator_before_message_json_b64,
+        );
+        let initiator_after = decode_direct_v1_vector_b64(
+            "initiator post-message session",
+            &vector.expected.sessions.initiator_after_message_json_b64,
+        );
+        let pending_initial_header = decode_direct_v1_vector_b64(
+            "pending initial header",
+            &vector.expected.headers.pending_initial_json_b64,
+        );
+        assert!(!initiator_before.is_empty());
+        assert!(!initiator_after.is_empty());
+        assert_ne!(initiator_before, initiator_after);
+        assert!(!pending_initial_header.is_empty());
+
+        let path =
+            std::env::temp_dir().join(format!("veil-direct-v1-vector-{}.db", uuid::Uuid::new_v4()));
+        let key = [0x5A; 32];
+        remove_sqlcipher_test_files(&path);
+
+        let fixture;
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            fixture = install_direct_outbox_fixture_with_ratchet(
+                &db,
+                peer_identity_key,
+                peer_signing_key,
+                &initiator_before,
+                &pending_initial_header,
+            );
+            let stored = db
+                .load_ratchet_session_with_revision_v1(&peer_identity_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.session_data, initiator_before);
+            assert_eq!(stored.revision, 0);
+            assert_eq!(
+                db.load_pending_initial_headers().unwrap(),
+                vec![(peer_identity_key, pending_initial_header.clone())]
+            );
+        }
+
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            let stored = db
+                .load_ratchet_session_with_revision_v1(&peer_identity_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.session_data, initiator_before);
+            assert_eq!(stored.revision, 0);
+            assert_eq!(
+                db.load_pending_initial_headers().unwrap(),
+                vec![(peer_identity_key, pending_initial_header.clone())]
+            );
+
+            let mut enqueue = direct_outbox_input(
+                &fixture,
+                DIRECT_CLIENT_ID_1,
+                b"phase-5s Direct-v1 exact-byte store evidence",
+                0,
+            );
+            enqueue.advanced_ratchet_session = initiator_after.clone();
+            let committed = db.enqueue_direct_message_outbox_v1(&enqueue).unwrap();
+            assert_eq!(committed.ratchet_revision, 1);
+
+            let mut stale = direct_outbox_input(
+                &fixture,
+                DIRECT_CLIENT_ID_2,
+                b"phase-5s stale Direct-v1 CAS",
+                0,
+            );
+            stale.advanced_ratchet_session = initiator_before.clone();
+            let stale_error = match db.enqueue_direct_message_outbox_v1(&stale) {
+                Ok(_) => panic!("stale Direct-v1 ratchet CAS unexpectedly committed"),
+                Err(error) => error,
+            };
+            assert!(stale_error.contains("ratchet revision changed"));
+        }
+
+        {
+            let db = VeilDb::open(&path, &key).unwrap();
+            let stored = db
+                .load_ratchet_session_with_revision_v1(&peer_identity_key)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.session_data, initiator_after);
+            assert_eq!(stored.revision, 1);
+            assert_eq!(
+                db.load_pending_initial_headers().unwrap(),
+                vec![(peer_identity_key, pending_initial_header)]
+            );
+            assert_eq!(
+                db.load_pending_direct_message_outbox_v1(&fixture.scope, 1)
+                    .unwrap()[0]
+                    .ratchet_revision,
+                1
+            );
+            assert_eq!(
+                db.count_pending_direct_message_outbox_v1(&fixture.scope)
+                    .unwrap(),
+                1
+            );
+        }
+
+        remove_sqlcipher_test_files(&path);
     }
 }

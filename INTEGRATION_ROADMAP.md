@@ -70,7 +70,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; ограниченный S23 smoke подтверждён, connected recovery/vault/capture matrix и signed standalone APK открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
-| 5S | Direct protocol assurance & hostile Node | blocking security gate: exact-spec review, `libsignal` spike, key-transparency ADR и независимый аудит открыты; legacy REST authority mismatch mitigated, но cryptographic cross-Node credential scope WS v2/REST v1 остаётся P1 |
+| 5S | Direct protocol assurance & hostile Node | immutable shared-Rust Direct-v1 transcript/SQLCipher checkpoint реализован; Android/desktop cross-runtime fixtures, exact-spec review, `libsignal` spike, key-transparency ADR и независимый аудит открыты; legacy REST authority mismatch mitigated, но cryptographic cross-Node credential scope WS v2/REST v1 остаётся P1 |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -1966,7 +1966,7 @@ Desktop ↔ Android и Android ↔ Android тестов, независимог�
 
 ## Phase 5S — Direct protocol assurance, `libsignal` decision и hostile Node
 
-**Статус 2026-07-19: открыт; блокирует stable и финальный multi-device design,
+**Статус 2026-07-20: открыт; блокирует stable и финальный multi-device design,
 но не требует аварийной замены работающего Preview-протокола.** X3DH, Double
 Ratchet и Sender Keys в Veil —
 собственные protocol implementations поверх стандартных примитивов. Текущие
@@ -1976,6 +1976,18 @@ Ratchet и Sender Keys в Veil —
 подтверждённый cross-Node credential-scope P1 в WebSocket authentication и
 связанной REST authority-модели записан в 5S.3 и должен быть закрыт до
 production/multi-Node claims.
+
+**Checkpoint 5S.1A 2026-07-20:** добавлен immutable синтетический Direct-v1
+transcript с SHA-256, executable primitive oracle, production `veil-client`
+hydrate/encrypt/decrypt negative matrix и file-backed SQLCipher CAS `0 → 1`.
+Инъекция фиксированных X3DH/ratchet secrets в общие transitions доступна только
+crate-private `cfg(test)` коду, а fixed nonce используется отдельным test oracle;
+production randomness не ослаблена. Это покрывает shared Rust boundary, но ещё
+не Android FFI/UI или отдельный desktop runtime consumer. Точный scope, findings
+и non-claims записаны в
+[`docs/reviews/phase-5s-direct-v1-transcript-checkpoint.md`](docs/reviews/phase-5s-direct-v1-transcript-checkpoint.md).
+Hostile Node, key transparency, session lifecycle, cross-client consumption,
+`libsignal` spike и независимый аудит остаются открытыми.
 
 ### 5S.1 — Зафиксировать и атаковать текущий Direct v1
 

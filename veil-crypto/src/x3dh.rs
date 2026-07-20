@@ -148,7 +148,33 @@ pub fn initiate(
     identity: &IdentityKeyPair,
     peer_bundle: &PreKeyBundle,
 ) -> Result<X3DHResult, String> {
-    // Verify SPK signature with peer's Ed25519 signing key
+    verify_peer_bundle_signature(peer_bundle)?;
+
+    let ek_secret = X25519StaticSecret::random_from_rng(OsRng);
+    initiate_with_ephemeral_secret(identity, peer_bundle, ek_secret)
+}
+
+/// Test-only deterministic entry point for immutable interoperability vectors.
+///
+/// The fixed secret is accepted only after the same signed-prekey verification
+/// used by [`initiate`]. Keeping this helper crate-private and behind
+/// `cfg(test)` prevents deterministic key generation from becoming a runtime
+/// capability or crossing the public/UniFFI API boundary.
+#[cfg(test)]
+pub(crate) fn initiate_with_ephemeral_secret_for_test(
+    identity: &IdentityKeyPair,
+    peer_bundle: &PreKeyBundle,
+    ephemeral_secret: &[u8; 32],
+) -> Result<X3DHResult, String> {
+    verify_peer_bundle_signature(peer_bundle)?;
+    initiate_with_ephemeral_secret(
+        identity,
+        peer_bundle,
+        X25519StaticSecret::from(*ephemeral_secret),
+    )
+}
+
+fn verify_peer_bundle_signature(peer_bundle: &PreKeyBundle) -> Result<(), String> {
     let signature_message = signed_prekey_signature_message(&peer_bundle.signed_prekey);
     if !crate::signature::verify(
         &peer_bundle.signing_key,
@@ -157,9 +183,14 @@ pub fn initiate(
     ) {
         return Err("invalid SPK signature: peer's signed prekey failed verification".to_string());
     }
+    Ok(())
+}
 
-    // Generate ephemeral keypair
-    let ek_secret = X25519StaticSecret::random_from_rng(OsRng);
+fn initiate_with_ephemeral_secret(
+    identity: &IdentityKeyPair,
+    peer_bundle: &PreKeyBundle,
+    ek_secret: X25519StaticSecret,
+) -> Result<X3DHResult, String> {
     let ek_public = X25519PublicKey::from(&ek_secret);
 
     let spk_public = X25519PublicKey::from(peer_bundle.signed_prekey);
