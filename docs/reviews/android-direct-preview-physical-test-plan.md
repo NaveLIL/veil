@@ -4,6 +4,10 @@
 > checks does not satisfy this gate. This document does not claim that a tester
 > APK or production-ready Android client exists.
 
+Execution was explicitly deferred on 2026-07-20. Until the user resumes this
+gate, no ADB/device command, install, uninstall, package-data clear, connected
+test, Node Access Pass application, or recovery ceremony is authorized.
+
 This is the final hands-on evidence matrix for the Android Direct Preview. It
 is intentionally deferred until the implementation, release signing, and
 non-destructive test packaging are ready.
