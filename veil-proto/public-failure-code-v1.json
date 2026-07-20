@@ -112,6 +112,20 @@
       "exposure_gate": "generic_fail_closed_fallback",
       "recovery_action_key": "remain_closed_and_retry",
       "state": "active"
+    },
+    {
+      "code": "VEIL-DIRECT-001",
+      "semantic_key": "direct_message_definitely_not_sent",
+      "exposure_gate": "bounded_local_or_typed_native_direct_definite_non_acceptance",
+      "recovery_action_key": "keep_or_edit_then_send_new_intent_only_when_ready",
+      "state": "active"
+    },
+    {
+      "code": "VEIL-DIRECT-002",
+      "semantic_key": "direct_delivery_unknown",
+      "exposure_gate": "typed_native_direct_delivery_unknown",
+      "recovery_action_key": "keep_original_and_wait_without_blind_resend",
+      "state": "active"
     }
   ]
 }

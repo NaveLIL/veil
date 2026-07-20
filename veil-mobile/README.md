@@ -198,13 +198,15 @@ typed transient reconnect, and canonical-origin process-death recovery are
 present, and the ambiguous-ACK D03 path has the host-only precursor described
 above. Same-account force-stop recovery without a new Pass or device has been
 physically confirmed on a Samsung S23. `PublicFailureCodeV1` is implemented for
-identity setup and the secure runtime gate. The reviewed runtime terminal-failure
-subset remains process-local and is not persisted across OS process death.
+identity setup, the secure runtime gate, and the host-tested Direct send/delivery
+action split. The reviewed runtime terminal-failure subset remains process-local
+and is not persisted across OS process death.
 Separately, identity-setup results now have a durable native journal/reconciler
 and a fail-closed React bootstrap gate. This implementation has host-only
 automated evidence; Activity recreation and OS process-death cases A04/A05 have
-not been executed. Direct session/send/delivery and desktop/Go consumer parity
-remain open. Cross-client E2EE text/airplane/background evidence, connected
+not been executed. A narrower Direct-session public outcome, desktop/Go consumer
+parity, and physical confirmation of the send/delivery cards remain open.
+Cross-client E2EE text/airplane/background evidence, connected
 recovery/vault/capture instrumentation, push publication, Circle/Space/
 attachments, correct multi-device, signed standalone APK distribution, and the
 broader physical-device matrix remain gated.

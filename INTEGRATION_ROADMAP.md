@@ -1720,19 +1720,22 @@ process-death, autofill/accessibility и concurrent recovery остаётся о
 
 ### Public failure codes v1 — обязательный gate 5A/5B
 
-**Статус 2026-07-20: Android setup/runtime-gate slice реализован, app-wide
-consumer и общий rollout ещё не закрыты.**
+**Статус 2026-07-20: Android setup/runtime-gate и Direct send/delivery action
+slice реализованы host-only; app-wide consumer и общий rollout ещё не закрыты.**
 Machine-readable registry, immutable history, schema/append-only validator и CI
 синхронизируют точные Kotlin/TypeScript allowlist. Rust/UniFFI передаёт typed
 `Transport`, `AuthRejected`, `RegistrationClosed`, `InviteInvalid`, `EpochInvalid`
 и `StorageUncertain`; Android не анализирует exception/server text, разделяет
 локальные Pass/binding failures и публикует только sanitised internal code плюс
 `userInfo.publicFailureCodeV1` для secure runtime gate. React Native имеет reviewed
-catalog всех 16 кодов и в setup/runtime gate закрывает unknown/malformed/conflicting
-outcomes через `VEIL-RUNTIME-999`. Однако Direct session/send/delivery bridge всё
-ещё публикует generic `E_VEIL_DIRECT_*`, а chat UI — фиксированный generic text.
-Desktop и Go consumers, локали кроме текущего Android catalog и общий cross-client
-conformance gate остаются открытыми.
+catalog всех 18 кодов и в setup/runtime gate закрывает unknown/malformed/conflicting
+outcomes через `VEIL-RUNTIME-999`. Direct definite non-send и durable delivery
+unknown теперь разделены как `VEIL-DIRECT-001/002`; malformed/conflicting metadata,
+session и mixed unavailable outcomes остаются честным `VEIL-RUNTIME-999`.
+Desktop и Go consumers, локали кроме текущего Android catalog, более узкий Direct
+session outcome и общий cross-client conformance gate остаются открытыми.
+Exact routing, UI actions, host evidence и non-claims записаны в
+[`docs/reviews/android-direct-public-failure-action-contract.md`](docs/reviews/android-direct-public-failure-action-contract.md).
 
 До подписанного tester APK используется append-only `PublicFailureCodeV1` с единым
 machine-readable registry под `veil-proto`, одинаковым для Rust, Go, desktop,
@@ -1762,6 +1765,8 @@ body или `String(error)` никогда не рендерятся.
 | `VEIL-RUNTIME-002` | operation отменена lifecycle/lock; вернуться в Veil и повторить с тем же аккаунтом |
 | `VEIL-SYNC-001` | аккаунт аутентифицирован и сохранён, но Direct bootstrap не завершён; reconnect без нового Pass |
 | `VEIL-RUNTIME-999` | неизвестный, malformed или ещё не рассмотренный outcome; generic fail-closed fallback |
+| `VEIL-DIRECT-001` | typed definite non-send либо durable failed; сохранить/исправить текст, новый send только как новый explicit intent при отдельно подтверждённом текущем Ready generation |
+| `VEIL-DIRECT-002` | durable delivery unknown; исходное сообщение могло дойти, сохранить и ждать authenticated reconciliation без blind resend |
 
 Коды описывают только безопасную presentation/recovery семантику. **Публичный
 код никогда не разрешает retry, reconnect, Pass replay или ослабление trust.**

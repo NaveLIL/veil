@@ -25,6 +25,8 @@ class PublicFailureCodeV1Test {
         "VEIL-RUNTIME-002",
         "VEIL-SYNC-001",
         "VEIL-RUNTIME-999",
+        "VEIL-DIRECT-001",
+        "VEIL-DIRECT-002",
       ),
       PublicFailureCodeV1.entries.map { it.wireValue },
     )
@@ -46,6 +48,7 @@ class PublicFailureCodeV1Test {
       "E_VEIL_CONNECTING" to PublicFailureCodeV1.RUNTIME_001,
       "E_VEIL_CANCELLED" to PublicFailureCodeV1.RUNTIME_002,
       "E_VEIL_SYNC" to PublicFailureCodeV1.SYNC_001,
+      "E_VEIL_DIRECT_SEND_REJECTED" to PublicFailureCodeV1.DIRECT_001,
     )
 
     expected.forEach { (internalCode, publicCode) ->
@@ -62,7 +65,6 @@ class PublicFailureCodeV1Test {
     val ambiguousAllowedCodes = listOf(
       "E_VEIL_ACCESS_PASS",
       "E_VEIL_CONNECT",
-      "E_VEIL_DIRECT_SEND_REJECTED",
       "E_VEIL_DIRECT_SEND_UNAVAILABLE",
       "E_VEIL_DIRECT_SESSION",
       "E_VEIL_DISCONNECT",

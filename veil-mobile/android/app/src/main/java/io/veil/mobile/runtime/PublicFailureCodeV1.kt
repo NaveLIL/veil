@@ -23,6 +23,8 @@ internal enum class PublicFailureCodeV1(val wireValue: String) {
   RUNTIME_002("VEIL-RUNTIME-002"),
   SYNC_001("VEIL-SYNC-001"),
   RUNTIME_999("VEIL-RUNTIME-999"),
+  DIRECT_001("VEIL-DIRECT-001"),
+  DIRECT_002("VEIL-DIRECT-002"),
 }
 
 /** No text, throwable, or server field participates in this mapping. */
@@ -41,6 +43,7 @@ internal fun publicFailureCodeV1ForInternalRuntimeCode(code: String): PublicFail
     "E_VEIL_CONNECTING" -> PublicFailureCodeV1.RUNTIME_001
     "E_VEIL_CANCELLED" -> PublicFailureCodeV1.RUNTIME_002
     "E_VEIL_SYNC" -> PublicFailureCodeV1.SYNC_001
+    "E_VEIL_DIRECT_SEND_REJECTED" -> PublicFailureCodeV1.DIRECT_001
     // Legacy E_VEIL_CONNECT/E_VEIL_ACCESS_PASS and every unknown code combine
     // multiple trust states, so a narrower public outcome would be unsafe.
     else -> PublicFailureCodeV1.RUNTIME_999

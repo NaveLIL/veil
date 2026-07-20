@@ -11,6 +11,7 @@ import {
 import { colors, radii, spacing } from "../../lib/theme";
 import { DM_HOME_ID, type Member, useChatStore } from "../../stores/chat";
 import { UserAvatar } from "../identity/UserAvatar";
+import { PublicFailureCard } from "../runtime/PublicFailureCard";
 import { Island } from "../ui/Island";
 
 const EMPTY_MESSAGES: never[] = [];
@@ -182,7 +183,18 @@ export const ChatIsland: React.FC<{
                     <Text style={styles.timestamp}>{message.ts}</Text>
                   </View>
                   <Text style={styles.text}>{message.text}</Text>
-                  {message.direction === "outgoing" && message.delivery !== "sent" ? (
+                  {message.direction === "outgoing" && message.deliveryPublicFailureCodeV1 ? (
+                    <View
+                      testID={`direct-delivery-failure-${message.id}`}
+                      style={styles.deliveryFailure}
+                    >
+                      <PublicFailureCard
+                        announce={false}
+                        code={message.deliveryPublicFailureCodeV1}
+                        compact
+                      />
+                    </View>
+                  ) : message.direction === "outgoing" && message.delivery !== "sent" ? (
                     <Text style={styles.delivery}>{message.delivery}</Text>
                   ) : null}
                 </View>
@@ -221,11 +233,9 @@ export const ChatIsland: React.FC<{
           </Pressable>
         </View>
         {directSendError ? (
-          <Text testID="direct-send-error" style={styles.sendError}>
-            {directSendError === "rejected"
-              ? "Message was rejected"
-              : "Direct messaging is unavailable"}
-          </Text>
+          <View testID="direct-send-error" style={styles.sendError}>
+            <PublicFailureCard code={directSendError.publicFailureCodeV1} compact />
+          </View>
         ) : null}
       </Island>
     </View>
@@ -282,6 +292,7 @@ const styles = StyleSheet.create({
     textTransform: "uppercase",
     letterSpacing: 0.8,
   },
+  deliveryFailure: { maxWidth: 420 },
   composer: {
     flexDirection: "row",
     alignItems: "center",
@@ -319,8 +330,6 @@ const styles = StyleSheet.create({
     fontWeight: "800",
   },
   sendError: {
-    color: colors.destructive,
-    fontSize: 11,
     paddingHorizontal: spacing.md,
     paddingBottom: spacing.sm,
   },

@@ -1,6 +1,10 @@
 import { create } from "zustand";
 
 import type { IdentityAuthority } from "../components/identity/IdentityProof";
+import {
+  directDeliveryPublicFailureCodeV1,
+  type PublicFailureCodeV1,
+} from "../contracts/publicFailureCodesV1";
 import VeilRuntime, {
   isExactAuthenticatedBinding,
   type AuthenticatedBinding,
@@ -72,10 +76,21 @@ export interface Message {
   timestampMs: number | null;
   direction: DirectMessageDirection;
   delivery: DirectMessageDelivery;
+  deliveryPublicFailureCodeV1?: PublicFailureCodeV1;
 }
 
 export type DirectProjectionState = "idle" | "loading" | "available" | "unavailable";
 export type DirectTextSendResult = "accepted" | DirectTextSendFailure;
+
+export type DirectTextSendErrorState =
+  | {
+      readonly reason: "rejected";
+      readonly publicFailureCodeV1: "VEIL-DIRECT-001";
+    }
+  | {
+      readonly reason: "unavailable";
+      readonly publicFailureCodeV1: "VEIL-RUNTIME-999";
+    };
 
 /** Special pseudo-server id representing the native Direct inbox. */
 export const DM_HOME_ID: ServerId = "__dm__";
@@ -117,7 +132,7 @@ interface ChatState {
   directoryRevision: number;
   projectionRequestRevision: number;
   directSendPending: boolean;
-  directSendError: DirectTextSendFailure | null;
+  directSendError: DirectTextSendErrorState | null;
   directSendRequestRevision: number;
   hydrateRuntimeDirectory: (snapshot: VeilMobileRuntimeSnapshot) => void;
   selectServer: (id: ServerId) => void;
@@ -310,20 +325,58 @@ function formatTimestamp(timestampMs: number | null): string {
   });
 }
 
+function directTextSendErrorState(error: unknown): DirectTextSendErrorState {
+  try {
+    if (error && typeof error === "object" && !Array.isArray(error)) {
+      const reasonProperty = Object.getOwnPropertyDescriptor(error, "reason");
+      const codeProperty = Object.getOwnPropertyDescriptor(error, "publicFailureCodeV1");
+      const reason = reasonProperty && "value" in reasonProperty
+        ? reasonProperty.value
+        : undefined;
+      const publicFailureCodeV1 = codeProperty && "value" in codeProperty
+        ? codeProperty.value
+        : undefined;
+      if (reason === "rejected" && publicFailureCodeV1 === "VEIL-DIRECT-001") {
+        return {
+          reason: "rejected",
+          publicFailureCodeV1: "VEIL-DIRECT-001",
+        };
+      }
+      if (reason === "unavailable" && publicFailureCodeV1 === "VEIL-RUNTIME-999") {
+        return {
+          reason: "unavailable",
+          publicFailureCodeV1: "VEIL-RUNTIME-999",
+        };
+      }
+    }
+  } catch {
+    // Revoked proxies and hostile getters are untrusted exception shapes.
+  }
+  // Never retain an exception message, native detail, or an unreviewed code.
+  return {
+    reason: "unavailable",
+    publicFailureCodeV1: "VEIL-RUNTIME-999",
+  };
+}
+
 function toRenderableMessages(
   projection: DirectMessageProjection,
   members: { self: Member; peer: Member },
 ): Message[] | null {
   if (projection.availability !== "available") return null;
-  return projection.messages.map((message: DirectMessageView) => ({
-    id: message.messageId,
-    author: message.direction === "outgoing" ? members.self : members.peer,
-    text: message.text,
-    ts: formatTimestamp(message.timestampMs),
-    timestampMs: message.timestampMs,
-    direction: message.direction,
-    delivery: message.delivery,
-  }));
+  return projection.messages.map((message: DirectMessageView) => {
+    const deliveryPublicFailureCodeV1 = directDeliveryPublicFailureCodeV1(message.delivery);
+    return {
+      id: message.messageId,
+      author: message.direction === "outgoing" ? members.self : members.peer,
+      text: message.text,
+      ts: formatTimestamp(message.timestampMs),
+      timestampMs: message.timestampMs,
+      direction: message.direction,
+      delivery: message.delivery,
+      ...(deliveryPublicFailureCodeV1 ? { deliveryPublicFailureCodeV1 } : {}),
+    };
+  });
 }
 
 const initialChatState = {
@@ -342,7 +395,7 @@ const initialChatState = {
   directoryRevision: 0,
   projectionRequestRevision: 0,
   directSendPending: false,
-  directSendError: null as DirectTextSendFailure | null,
+  directSendError: null as DirectTextSendErrorState | null,
   directSendRequestRevision: 0,
 };
 
@@ -555,11 +608,7 @@ export const useChatStore = create<ChatState>((set, get) => ({
     try {
       await VeilRuntime.sendDirectText(conversationId, directGeneration, text);
     } catch (error) {
-      const reason = (
-        error
-        && typeof error === "object"
-        && (error as { reason?: unknown }).reason === "rejected"
-      ) ? "rejected" : "unavailable";
+      const failure = directTextSendErrorState(error);
       const current = get();
       if (current.directSendRequestRevision === requestRevision) {
         const stillSelectedAuthority = current.selectedDmId === conversationId
@@ -568,10 +617,10 @@ export const useChatStore = create<ChatState>((set, get) => ({
           && current.directMembersByConversation[conversationId] === members;
         set({
           directSendPending: false,
-          directSendError: stillSelectedAuthority ? reason : null,
+          directSendError: stillSelectedAuthority ? failure : null,
         });
       }
-      return reason;
+      return failure.reason;
     }
 
     const current = get();

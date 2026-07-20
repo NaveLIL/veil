@@ -15,6 +15,8 @@ export const PUBLIC_FAILURE_CODES_V1 = [
   "VEIL-RUNTIME-002",
   "VEIL-SYNC-001",
   "VEIL-RUNTIME-999",
+  "VEIL-DIRECT-001",
+  "VEIL-DIRECT-002",
 ] as const;
 
 export type PublicFailureCodeV1 = typeof PUBLIC_FAILURE_CODES_V1[number];
@@ -114,6 +116,16 @@ const ENGLISH_PUBLIC_FAILURE_CATALOG_V1: Record<
     description: "Veil received an unknown, malformed, or not-yet-reviewed outcome and failed closed.",
     nextAction: "Keep this local account, close and reopen Veil, and do not bypass security checks.",
   },
+  "VEIL-DIRECT-001": {
+    title: "Direct message was not sent",
+    description: "Veil has a typed, definite result that this message was not accepted for delivery.",
+    nextAction: "Keep or edit the text. Create a new send only when this Direct conversation is currently Ready.",
+  },
+  "VEIL-DIRECT-002": {
+    title: "Direct delivery is unknown",
+    description: "The original message may already have reached the peer; Veil has no trustworthy delivery conclusion.",
+    nextAction: "Keep the original message and wait for authenticated reconciliation. Never resend it blindly.",
+  },
 };
 
 export function isPublicFailureCodeV1(value: unknown): value is PublicFailureCodeV1 {
@@ -122,6 +134,15 @@ export function isPublicFailureCodeV1(value: unknown): value is PublicFailureCod
 
 export function normalizePublicFailureCodeV1(value: unknown): PublicFailureCodeV1 {
   return isPublicFailureCodeV1(value) ? value : UNKNOWN_PUBLIC_FAILURE_CODE_V1;
+}
+
+/** Map only authoritative Direct delivery states; malformed values are not failures. */
+export function directDeliveryPublicFailureCodeV1(
+  value: unknown,
+): PublicFailureCodeV1 | null {
+  if (value === "failed") return "VEIL-DIRECT-001";
+  if (value === "unknown") return "VEIL-DIRECT-002";
+  return null;
 }
 
 /** Deterministic bundled English fallback. No remote or native text participates. */

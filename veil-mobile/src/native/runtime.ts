@@ -13,9 +13,12 @@ import {
 } from "react-native";
 
 import {
+  UNKNOWN_PUBLIC_FAILURE_CODE_V1,
   isPublicFailureCodeV1,
   type PublicFailureCodeV1,
 } from "../contracts/publicFailureCodesV1";
+
+const DIRECT_SEND_REJECTED_PUBLIC_FAILURE_CODE_V1: PublicFailureCodeV1 = "VEIL-DIRECT-001";
 
 export type NativeSessionState = "locked" | "opening" | "open" | "closing" | "error";
 export type NativeConnectionState = "disconnected" | "connecting" | "connected" | "error";
@@ -90,11 +93,18 @@ export type DirectTextSendFailure = "rejected" | "unavailable";
 /** Opaque failure category for a payload-free native Direct send. */
 export class DirectTextSendError extends Error {
   readonly reason: DirectTextSendFailure;
+  readonly publicFailureCodeV1: PublicFailureCodeV1;
 
-  constructor(reason: DirectTextSendFailure) {
-    super(reason === "rejected" ? "Direct message was rejected" : "Direct messaging is unavailable");
+  constructor(reason: DirectTextSendFailure, publicFailureCodeV1: PublicFailureCodeV1) {
+    const exactRejected = reason === "rejected"
+      && publicFailureCodeV1 === DIRECT_SEND_REJECTED_PUBLIC_FAILURE_CODE_V1;
+    const safeReason = exactRejected ? "rejected" : "unavailable";
+    super(safeReason === "rejected" ? "Direct message was rejected" : "Direct messaging is unavailable");
     this.name = "DirectTextSendError";
-    this.reason = reason;
+    this.reason = safeReason;
+    this.publicFailureCodeV1 = exactRejected
+      ? DIRECT_SEND_REJECTED_PUBLIC_FAILURE_CODE_V1
+      : UNKNOWN_PUBLIC_FAILURE_CODE_V1;
   }
 }
 
@@ -517,10 +527,96 @@ function directMessageProjection(value: unknown): DirectMessageProjection {
   return { availability: "available", messages };
 }
 
-function nativeErrorCode(value: unknown): string | null {
-  if (!value || typeof value !== "object") return null;
-  const code = (value as Record<string, unknown>).code;
-  return typeof code === "string" ? code : null;
+type OwnDataPropertyRead =
+  | { kind: "absent" }
+  | { kind: "data"; value: unknown }
+  | { kind: "invalid" };
+
+function isNonArrayObject(value: unknown): value is object {
+  if (value === null || typeof value !== "object") return false;
+  try {
+    return !Array.isArray(value);
+  } catch {
+    return false;
+  }
+}
+
+function ownDataProperty(value: object, key: string): OwnDataPropertyRead {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (!descriptor) return { kind: "absent" };
+    if (!("value" in descriptor)) return { kind: "invalid" };
+    return { kind: "data", value: descriptor.value };
+  } catch {
+    return { kind: "invalid" };
+  }
+}
+
+interface NativeDirectSendFailureMetadata {
+  internalCode: string | null;
+  publicFailureCodeV1: PublicFailureCodeV1 | null;
+  structurallyValid: boolean;
+}
+
+function nativeDirectSendFailureMetadata(value: unknown): NativeDirectSendFailureMetadata {
+  const invalid: NativeDirectSendFailureMetadata = {
+    internalCode: null,
+    publicFailureCodeV1: null,
+    structurallyValid: false,
+  };
+  if (!isNonArrayObject(value)) return invalid;
+
+  const internalCodeProperty = ownDataProperty(value, "code");
+  if (
+    internalCodeProperty.kind === "invalid"
+    || (internalCodeProperty.kind === "data" && typeof internalCodeProperty.value !== "string")
+  ) return invalid;
+  const internalCode = internalCodeProperty.kind === "data"
+    ? internalCodeProperty.value as string
+    : null;
+
+  const topLevelPublicCode = ownDataProperty(value, "publicFailureCodeV1");
+  if (
+    topLevelPublicCode.kind === "invalid"
+    || (topLevelPublicCode.kind === "data" && !isPublicFailureCodeV1(topLevelPublicCode.value))
+  ) return invalid;
+
+  const userInfoProperty = ownDataProperty(value, "userInfo");
+  if (userInfoProperty.kind === "invalid") return invalid;
+  let nestedPublicCode: OwnDataPropertyRead = { kind: "absent" };
+  if (userInfoProperty.kind === "data") {
+    if (!isNonArrayObject(userInfoProperty.value)) return invalid;
+    nestedPublicCode = ownDataProperty(userInfoProperty.value, "publicFailureCodeV1");
+    if (
+      nestedPublicCode.kind === "invalid"
+      || (nestedPublicCode.kind === "data" && !isPublicFailureCodeV1(nestedPublicCode.value))
+    ) return invalid;
+  }
+
+  if (
+    topLevelPublicCode.kind === "data"
+    && nestedPublicCode.kind === "data"
+    && topLevelPublicCode.value !== nestedPublicCode.value
+  ) return invalid;
+  const publicFailureCodeV1 = topLevelPublicCode.kind === "data"
+    ? topLevelPublicCode.value as PublicFailureCodeV1
+    : nestedPublicCode.kind === "data"
+      ? nestedPublicCode.value as PublicFailureCodeV1
+      : null;
+  return { internalCode, publicFailureCodeV1, structurallyValid: true };
+}
+
+function normalizeNativeDirectTextSendError(value: unknown): DirectTextSendError {
+  const failure = nativeDirectSendFailureMetadata(value);
+  const exactRejected = failure.structurallyValid
+    && failure.internalCode === DIRECT_SEND_REJECTED_CODE
+    && failure.publicFailureCodeV1 === DIRECT_SEND_REJECTED_PUBLIC_FAILURE_CODE_V1;
+  return new DirectTextSendError(
+    exactRejected ? "rejected" : "unavailable",
+    exactRejected
+      ? DIRECT_SEND_REJECTED_PUBLIC_FAILURE_CODE_V1
+      : UNKNOWN_PUBLIC_FAILURE_CODE_V1,
+  );
 }
 
 const VeilRuntime = {
@@ -571,21 +667,23 @@ const VeilRuntime = {
       || !isCanonicalUuid(conversationId)
       || !Number.isSafeInteger(expectedDirectGeneration)
       || expectedDirectGeneration < 1
-    ) throw new DirectTextSendError("unavailable");
+    ) throw new DirectTextSendError("unavailable", UNKNOWN_PUBLIC_FAILURE_CODE_V1);
     const textBytes = boundedUtf8Length(text, MAX_DIRECT_MESSAGE_TEXT_BYTES);
-    if (textBytes === null || textBytes < 1) throw new DirectTextSendError("rejected");
+    if (textBytes === null || textBytes < 1) {
+      throw new DirectTextSendError("rejected", DIRECT_SEND_REJECTED_PUBLIC_FAILURE_CODE_V1);
+    }
+    let result: unknown;
     try {
-      const result = await requireRuntime().sendDirectText(
+      result = await requireRuntime().sendDirectText(
         conversationId,
         expectedDirectGeneration,
         text,
       );
-      if (result !== null) throw new DirectTextSendError("unavailable");
     } catch (error) {
-      if (error instanceof DirectTextSendError) throw error;
-      throw new DirectTextSendError(
-        nativeErrorCode(error) === DIRECT_SEND_REJECTED_CODE ? "rejected" : "unavailable",
-      );
+      throw normalizeNativeDirectTextSendError(error);
+    }
+    if (result !== null) {
+      throw new DirectTextSendError("unavailable", UNKNOWN_PUBLIC_FAILURE_CODE_V1);
     }
   },
   subscribe(listener: (snapshot: VeilMobileRuntimeSnapshot) => void): EmitterSubscription {

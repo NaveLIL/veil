@@ -72,10 +72,12 @@ const snapshot = (
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((settle) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((settle, fail) => {
     resolve = settle;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
 const available = (
@@ -145,6 +147,49 @@ describe("production Direct chat store", () => {
           name: "You",
         }),
       }),
+    ]);
+  });
+
+  test("projects only authoritative failed and unknown delivery states to Direct public codes", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya]));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValue({
+      availability: "available",
+      messages: [
+        {
+          messageId: "11111111-2222-4333-8444-555555555551",
+          text: "definitely failed",
+          timestampMs: 1_720_000_000_000,
+          direction: "outgoing",
+          delivery: "failed",
+        },
+        {
+          messageId: "11111111-2222-4333-8444-555555555552",
+          text: "delivery unknown",
+          timestampMs: 1_720_000_000_001,
+          direction: "outgoing",
+          delivery: "unknown",
+        },
+        {
+          messageId: "11111111-2222-4333-8444-555555555553",
+          text: "still sending",
+          timestampMs: null,
+          direction: "outgoing",
+          delivery: "sending",
+        },
+      ],
+    });
+
+    await useChatStore.getState().loadSelectedDirectMessages();
+
+    const projected = useChatStore.getState().messagesByChannel[anya.conversationId];
+    expect(projected.map((message) => ({
+      delivery: message.delivery,
+      publicFailureCodeV1: message.deliveryPublicFailureCodeV1 ?? null,
+    }))).toEqual([
+      { delivery: "failed", publicFailureCodeV1: "VEIL-DIRECT-001" },
+      { delivery: "unknown", publicFailureCodeV1: "VEIL-DIRECT-002" },
+      { delivery: "sending", publicFailureCodeV1: null },
     ]);
   });
 
@@ -317,7 +362,11 @@ describe("production Direct chat store", () => {
       "existing native row",
     ));
     await useChatStore.getState().loadSelectedDirectMessages();
-    runtime.sendDirectText.mockRejectedValue({ reason: "rejected" });
+    runtime.sendDirectText.mockRejectedValue({
+      reason: "rejected",
+      publicFailureCodeV1: "VEIL-DIRECT-001",
+      detail: "must never enter store state",
+    });
 
     await expect(useChatStore.getState().sendSelectedDirectText("rejected intent"))
       .resolves.toBe("rejected");
@@ -325,10 +374,136 @@ describe("production Direct chat store", () => {
     expect(runtime.getDirectMessages).toHaveBeenCalledTimes(1);
     expect(useChatStore.getState()).toMatchObject({
       directSendPending: false,
-      directSendError: "rejected",
+      directSendError: {
+        reason: "rejected",
+        publicFailureCodeV1: "VEIL-DIRECT-001",
+      },
     });
+    expect(JSON.stringify(useChatStore.getState().directSendError)).not.toContain("detail");
     expect(useChatStore.getState().messagesByChannel[anya.conversationId])
       .toEqual([expect.objectContaining({ text: "existing native row" })]);
+  });
+
+  test("stores an exact unavailable send result as the generic fail-closed public code", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya]));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValue(available(
+      "33333333-aaaa-4aaa-8aaa-333333333337",
+      "existing native row",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+    runtime.sendDirectText.mockRejectedValue({
+      reason: "unavailable",
+      publicFailureCodeV1: "VEIL-RUNTIME-999",
+    });
+
+    await expect(useChatStore.getState().sendSelectedDirectText("unavailable intent"))
+      .resolves.toBe("unavailable");
+    expect(useChatStore.getState().directSendError).toEqual({
+      reason: "unavailable",
+      publicFailureCodeV1: "VEIL-RUNTIME-999",
+    });
+  });
+
+  test("fails unreviewed and delivery-only send codes closed without retaining detail", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya]));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValue(available(
+      "33333333-aaaa-4aaa-8aaa-333333333334",
+      "existing native row",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+    for (const failure of [
+      {
+        reason: "rejected",
+        publicFailureCodeV1: "VEIL-PASS-001",
+        detail: "hostile detail",
+      },
+      {
+        reason: "unavailable",
+        publicFailureCodeV1: "VEIL-DIRECT-002",
+        detail: "delivery-only code",
+      },
+    ]) {
+      runtime.sendDirectText.mockRejectedValueOnce(failure);
+      await expect(useChatStore.getState().sendSelectedDirectText("ambiguous intent"))
+        .resolves.toBe("unavailable");
+      expect(useChatStore.getState().directSendError).toEqual({
+        reason: "unavailable",
+        publicFailureCodeV1: "VEIL-RUNTIME-999",
+      });
+    }
+    expect(JSON.stringify(useChatStore.getState().directSendError)).not.toContain("detail");
+    expect(JSON.stringify(useChatStore.getState().directSendError)).not.toContain("VEIL-PASS");
+    expect(JSON.stringify(useChatStore.getState().directSendError)).not.toContain("VEIL-DIRECT-002");
+  });
+
+  test("contains hostile send error getters as unavailable without escaping the guard", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot([anya]));
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValue(available(
+      "33333333-aaaa-4aaa-8aaa-333333333336",
+      "existing native row",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+    const hostileGetter = jest.fn(() => {
+      throw new Error("hostile getter detail");
+    });
+    const hostile = {};
+    Object.defineProperty(hostile, "reason", {
+      get: hostileGetter,
+    });
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const inherited = Object.create({
+      reason: "rejected",
+      publicFailureCodeV1: "VEIL-DIRECT-001",
+    });
+    runtime.sendDirectText
+      .mockRejectedValueOnce(hostile)
+      .mockRejectedValueOnce(revoked.proxy)
+      .mockRejectedValueOnce(inherited);
+
+    for (const intent of [
+      "getter guarded intent",
+      "proxy guarded intent",
+      "inherited guarded intent",
+    ]) {
+      await expect(useChatStore.getState().sendSelectedDirectText(intent))
+        .resolves.toBe("unavailable");
+      expect(useChatStore.getState().directSendError).toEqual({
+        reason: "unavailable",
+        publicFailureCodeV1: "VEIL-RUNTIME-999",
+      });
+    }
+    expect(hostileGetter).not.toHaveBeenCalled();
+  });
+
+  test("does not publish a late typed send failure after the selected peer changes", async () => {
+    useChatStore.getState().hydrateRuntimeDirectory(snapshot());
+    useChatStore.getState().selectDm(anya.conversationId);
+    runtime.getDirectMessages.mockResolvedValue(available(
+      "33333333-aaaa-4aaa-8aaa-333333333335",
+      "Anya history",
+    ));
+    await useChatStore.getState().loadSelectedDirectMessages();
+    const nativeSend = deferred<void>();
+    runtime.sendDirectText.mockReturnValue(nativeSend.promise);
+
+    const send = useChatStore.getState().sendSelectedDirectText("only for Anya");
+    useChatStore.getState().selectDm(mark.conversationId);
+    nativeSend.reject({
+      reason: "rejected",
+      publicFailureCodeV1: "VEIL-DIRECT-001",
+    });
+
+    await expect(send).resolves.toBe("rejected");
+    expect(useChatStore.getState()).toMatchObject({
+      selectedDmId: mark.conversationId,
+      directSendPending: false,
+      directSendError: null,
+      messagesByChannel: {},
+    });
   });
 
   test("never refreshes or publishes an accepted intent after generation replacement", async () => {

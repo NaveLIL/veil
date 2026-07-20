@@ -10,6 +10,14 @@ import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 
+private const val DIRECT_SESSION_ERROR_CODE = "E_VEIL_DIRECT_SESSION"
+private const val DIRECT_SESSION_ERROR = "Unable to establish the secure Direct session"
+private const val DIRECT_SEND_REJECTED_CODE = "E_VEIL_DIRECT_SEND_REJECTED"
+private const val DIRECT_SEND_UNAVAILABLE_CODE = "E_VEIL_DIRECT_SEND_UNAVAILABLE"
+private const val DIRECT_SEND_UNAVAILABLE = "Direct messaging is unavailable"
+private const val PUBLIC_FAILURE_CODE_KEY = "publicFailureCodeV1"
+private const val RUNTIME_FAILURE_MESSAGE = "Native mobile runtime operation failed"
+
 internal class VeilMobileRuntimeModule(
   context: ReactApplicationContext,
   private val runtime: VeilMobileRuntime,
@@ -99,12 +107,7 @@ internal class VeilMobileRuntimeModule(
     val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
       ?: throw VeilMobileRuntimeException(DIRECT_SESSION_ERROR_CODE, DIRECT_SESSION_ERROR)
     runtime.establishDirectSession(conversationId, generation) { result ->
-      when (result) {
-        is NativeDirectSessionActionResult.Success ->
-          promise.resolve(result.install.toWritableMap())
-        NativeDirectSessionActionResult.Unavailable ->
-          promise.reject(DIRECT_SESSION_ERROR_CODE, DIRECT_SESSION_ERROR)
-      }
+      promise.publishDirectSessionResult(result)
     }
   }
 
@@ -123,13 +126,7 @@ internal class VeilMobileRuntimeModule(
     val generation = expectedDirectGeneration.toSafeDirectGenerationOrNull()
       ?: throw VeilMobileRuntimeException(DIRECT_SEND_UNAVAILABLE_CODE, DIRECT_SEND_UNAVAILABLE)
     runtime.sendDirectText(conversationId, generation, text) { result ->
-      when (result) {
-        NativeDirectTextSendResult.ACCEPTED -> promise.resolve(null)
-        NativeDirectTextSendResult.REJECTED ->
-          promise.reject(DIRECT_SEND_REJECTED_CODE, DIRECT_SEND_REJECTED)
-        NativeDirectTextSendResult.UNAVAILABLE ->
-          promise.reject(DIRECT_SEND_UNAVAILABLE_CODE, DIRECT_SEND_UNAVAILABLE)
-      }
+      promise.publishDirectTextSendResult(result)
     }
   }
 
@@ -162,37 +159,70 @@ internal class VeilMobileRuntimeModule(
     runtime.execute {
       try {
         operation()
-      } catch (error: VeilMobileRuntimeException) {
-        promise.rejectRuntimeFailure(error.code)
-      } catch (_: Throwable) {
-        promise.rejectRuntimeFailure("E_VEIL_RUNTIME")
+      } catch (error: Throwable) {
+        promise.rejectRuntimePublicationFailure(error)
       }
     }
   }
 
-  private fun Promise.rejectRuntimeFailure(internalCode: String) {
-    val failure = runtimeFailureBridgeV1(internalCode)
-    val userInfo = Arguments.createMap().apply {
-      putString(
-        PUBLIC_FAILURE_CODE_KEY,
-        failure.publicCode.wireValue,
-      )
-    }
-    // Throwable/native/server text must not cross the React Native boundary.
-    reject(failure.internalCode, RUNTIME_FAILURE_MESSAGE, userInfo)
-  }
-
   companion object {
     const val EVENT_STATE_CHANGED = "VeilRuntimeStateChanged"
-    private const val DIRECT_SESSION_ERROR_CODE = "E_VEIL_DIRECT_SESSION"
-    private const val DIRECT_SESSION_ERROR = "Unable to establish the secure Direct session"
-    private const val DIRECT_SEND_REJECTED_CODE = "E_VEIL_DIRECT_SEND_REJECTED"
-    private const val DIRECT_SEND_REJECTED = "Direct message was rejected"
-    private const val DIRECT_SEND_UNAVAILABLE_CODE = "E_VEIL_DIRECT_SEND_UNAVAILABLE"
-    private const val DIRECT_SEND_UNAVAILABLE = "Direct messaging is unavailable"
-    private const val PUBLIC_FAILURE_CODE_KEY = "publicFailureCodeV1"
-    private const val RUNTIME_FAILURE_MESSAGE = "Native mobile runtime operation failed"
   }
+}
+
+internal fun Promise.publishDirectSessionResult(
+  result: NativeDirectSessionActionResult,
+  userInfoFactory: () -> WritableMap = { Arguments.createMap() },
+) {
+  when (result) {
+    is NativeDirectSessionActionResult.Success -> resolve(result.install.toWritableMap())
+    NativeDirectSessionActionResult.Unavailable ->
+      rejectRuntimeFailure(DIRECT_SESSION_ERROR_CODE, userInfoFactory)
+  }
+}
+
+internal fun Promise.publishDirectTextSendResult(
+  result: NativeDirectTextSendResult,
+  userInfoFactory: () -> WritableMap = { Arguments.createMap() },
+) {
+  when (result) {
+    NativeDirectTextSendResult.ACCEPTED -> resolve(null)
+    NativeDirectTextSendResult.REJECTED ->
+      rejectRuntimeFailure(DIRECT_SEND_REJECTED_CODE, userInfoFactory)
+    NativeDirectTextSendResult.UNAVAILABLE ->
+      rejectRuntimeFailure(DIRECT_SEND_UNAVAILABLE_CODE, userInfoFactory)
+  }
+}
+
+internal fun Promise.rejectRuntimePublicationFailure(
+  error: Throwable,
+  userInfoFactory: () -> WritableMap = { Arguments.createMap() },
+) {
+  val internalCode = if (error is VeilMobileRuntimeException) {
+    error.code
+  } else {
+    "E_VEIL_RUNTIME"
+  }
+  rejectRuntimeFailure(internalCode, userInfoFactory)
+}
+
+/**
+ * Publish one closed, typed failure envelope. The factory seam exists only so
+ * JVM tests can use React Native's Java-only map without loading JNI.
+ */
+private fun Promise.rejectRuntimeFailure(
+  internalCode: String,
+  userInfoFactory: () -> WritableMap = { Arguments.createMap() },
+) {
+  val failure = runtimeFailureBridgeV1(internalCode)
+  val userInfo = userInfoFactory().apply {
+    putString(
+      PUBLIC_FAILURE_CODE_KEY,
+      failure.publicCode.wireValue,
+    )
+  }
+  // Throwable/native/server text must not cross the React Native boundary.
+  reject(failure.internalCode, RUNTIME_FAILURE_MESSAGE, userInfo)
 }
 
 internal data class PublicDirectConversationView(

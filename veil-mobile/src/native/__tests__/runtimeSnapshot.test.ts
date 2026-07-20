@@ -268,6 +268,8 @@ describe("native runtime snapshot projection", () => {
       "VEIL-PASS-003",
       "VEIL-RUNTIME-001",
       "VEIL-RUNTIME-002",
+      "VEIL-DIRECT-001",
+      "VEIL-DIRECT-002",
     ];
 
     await expect(installRuntime(missing).getSnapshot()).resolves.toEqual(restrictiveSnapshot);

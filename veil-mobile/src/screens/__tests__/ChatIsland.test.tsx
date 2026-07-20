@@ -1,9 +1,10 @@
 import React from "react";
 import { afterEach, beforeEach, describe, expect, it, jest } from "@jest/globals";
-import { act, fireEvent, render, waitFor } from "@testing-library/react-native";
+import { act, fireEvent, render, waitFor, within } from "@testing-library/react-native";
 import { StyleSheet } from "react-native";
 
 import { ChatIsland } from "../../components/layout/ChatIsland";
+import { publicFailurePresentationV1 } from "../../contracts/publicFailureCodesV1";
 import type {
   DirectMessageProjection,
   VeilMobileRuntimeSnapshot,
@@ -128,6 +129,52 @@ describe("ChatIsland native Direct projection", () => {
       .toEqual({ disabled: true });
   });
 
+  it("renders catalog delivery failures without Retry or assertive repeated announcements", async () => {
+    const failedMessageId = "44444444-4444-4444-8444-444444444445";
+    const unknownMessageId = "44444444-4444-4444-8444-444444444446";
+    runtime.getDirectMessages.mockResolvedValue({
+      availability: "available",
+      messages: [
+        {
+          messageId: failedMessageId,
+          text: "definitely rejected",
+          timestampMs: 1_720_000_000_000,
+          direction: "outgoing",
+          delivery: "failed",
+        },
+        {
+          messageId: unknownMessageId,
+          text: "possibly delivered",
+          timestampMs: 1_720_000_000_001,
+          direction: "outgoing",
+          delivery: "unknown",
+        },
+      ],
+    });
+
+    const view = render(<ChatIsland />);
+    const failedPresentation = publicFailurePresentationV1("VEIL-DIRECT-001");
+    const unknownPresentation = publicFailurePresentationV1("VEIL-DIRECT-002");
+    expect(unknownPresentation.description).toMatch(/may .*have .*reached the peer/i);
+
+    for (const [messageId, presentation] of [
+      [failedMessageId, failedPresentation],
+      [unknownMessageId, unknownPresentation],
+    ] as const) {
+      const delivery = await view.findByTestId(`direct-delivery-failure-${messageId}`);
+      const scoped = within(delivery);
+      expect(scoped.getByText(presentation.title)).toBeTruthy();
+      expect(scoped.getByText(presentation.description)).toBeTruthy();
+      expect(scoped.getByText(presentation.nextAction)).toBeTruthy();
+      expect(scoped.getByText(presentation.code)).toBeTruthy();
+      expect(scoped.queryByRole("button")).toBeNull();
+      expect(scoped.getByTestId("public-failure-card-v1").props).toMatchObject({
+        accessibilityLiveRegion: "none",
+      });
+      expect(scoped.getByTestId("public-failure-card-v1").props.accessibilityRole).toBeUndefined();
+    }
+  });
+
   it("replaces all rows with an opaque unavailable state", async () => {
     runtime.getDirectMessages.mockResolvedValue({
       availability: "unavailable",
@@ -205,9 +252,13 @@ describe("ChatIsland native Direct projection", () => {
     expect(runtime.getDirectMessages).toHaveBeenCalledTimes(2);
   });
 
-  it("retains the draft and shows only a generic rejection", async () => {
+  it("retains the draft and shows only the catalog rejection presentation", async () => {
     runtime.getDirectMessages.mockResolvedValue({ availability: "available", messages: [] });
-    runtime.sendDirectText.mockRejectedValue({ reason: "rejected", detail: "must stay hidden" });
+    runtime.sendDirectText.mockRejectedValue({
+      reason: "rejected",
+      publicFailureCodeV1: "VEIL-DIRECT-001",
+      detail: "must stay hidden",
+    });
 
     const view = render(<ChatIsland />);
     await waitFor(() => expect(view.getByText("No messages yet")).toBeTruthy());
@@ -215,9 +266,16 @@ describe("ChatIsland native Direct projection", () => {
     fireEvent.press(view.getByTestId("direct-send-button"));
 
     await waitFor(() => expect(view.getByTestId("direct-send-error")).toBeTruthy());
-    expect(view.getByTestId("direct-send-error").props.children).toBe("Message was rejected");
+    const presentation = publicFailurePresentationV1("VEIL-DIRECT-001");
+    const failure = within(view.getByTestId("direct-send-error"));
+    expect(failure.getByText(presentation.title)).toBeTruthy();
+    expect(failure.getByText(presentation.description)).toBeTruthy();
+    expect(failure.getByText(presentation.nextAction)).toBeTruthy();
+    expect(failure.getByText(presentation.code)).toBeTruthy();
+    expect(view.queryByText("must stay hidden")).toBeNull();
     expect(view.getByTestId("direct-composer").props.value).toBe("keep this draft");
     expect(runtime.getDirectMessages).toHaveBeenCalledTimes(1);
+    expect(runtime.sendDirectText).toHaveBeenCalledTimes(1);
   });
 
   it("does not clear an identical draft entered under a newer generation", async () => {

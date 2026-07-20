@@ -71,14 +71,32 @@ function parseFixture(value, label = "fixture") {
   return parseAndValidateRegistry(canonicalRegistryText(value), label);
 }
 
-test("reviewed registry has exactly the 16 initial roadmap codes", () => {
+test("reviewed registry preserves the exact 16-code history and appends two Direct codes", () => {
   const registry = parseAndValidateRegistry(registryRaw, "registry");
   const history = parseAndValidateRegistry(historyRaw, "history");
 
   assert.equal(registry.version, 1);
-  assert.equal(registry.codes.length, 16);
-  assert.deepEqual(registry, history);
+  assert.equal(registry.codes.length, 18);
+  assert.equal(history.codes.length, 16);
+  assert.deepEqual(registry.codes.slice(0, history.codes.length), history.codes);
+  assert.deepEqual(registry.codes.slice(history.codes.length), [
+    {
+      code: "VEIL-DIRECT-001",
+      semantic_key: "direct_message_definitely_not_sent",
+      exposure_gate: "bounded_local_or_typed_native_direct_definite_non_acceptance",
+      recovery_action_key: "keep_or_edit_then_send_new_intent_only_when_ready",
+      state: "active",
+    },
+    {
+      code: "VEIL-DIRECT-002",
+      semantic_key: "direct_delivery_unknown",
+      exposure_gate: "typed_native_direct_delivery_unknown",
+      recovery_action_key: "keep_original_and_wait_without_blind_resend",
+      state: "active",
+    },
+  ]);
   assert.doesNotThrow(() => validateInitialHistory(history, canonicalRegistryText(history)));
+  assert.doesNotThrow(() => validateAppendOnly(history, registry));
 });
 
 test("SETUP-002 keeps active or ambiguous ceremonies fail closed", () => {
@@ -98,7 +116,7 @@ test("mobile literal consumer exactly matches active registry values and order",
   const registry = parseAndValidateRegistry(registryRaw);
   const consumerCodes = parsePublicFailureCodeConsumer(consumerRaw);
 
-  assert.equal(consumerCodes.length, 16);
+  assert.equal(consumerCodes.length, 18);
   assert.deepEqual(
     consumerCodes,
     registry.codes.filter((entry) => entry.state === "active").map((entry) => entry.code),
@@ -175,7 +193,7 @@ test("Android literal consumer exactly matches active registry values and order"
   const registry = parseAndValidateRegistry(registryRaw);
   const consumerCodes = parseAndroidPublicFailureCodeConsumer(androidConsumerRaw);
 
-  assert.equal(consumerCodes.length, 16);
+  assert.equal(consumerCodes.length, 18);
   assert.deepEqual(
     consumerCodes,
     registry.codes.filter((entry) => entry.state === "active").map((entry) => entry.code),

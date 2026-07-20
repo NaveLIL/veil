@@ -130,9 +130,10 @@ reverse proxy. Конкретная схема и rollback gate описаны �
   terminal failure snapshot и host-tested durable non-secret setup journal/
   reconciler реализованы, но A04/A05 и cross-client/airplane physical
   matrix, connected recovery/capture instrumentation, app-wide public failure
-  codes и standalone signing ещё не закрыты; `PublicFailureCodeV1` ограничен
-  Android identity setup/secure runtime gate, а Direct send/delivery и
-  desktop/Go consumers открыты; calls и MLS runtime не включены;
+  codes и standalone signing ещё не закрыты; `PublicFailureCodeV1` покрывает
+  Android identity setup/secure runtime gate и host-tested Direct send/delivery
+  action split, но Direct-session-specific outcome, desktop/Go consumers и
+  cross-client conformance открыты; calls и MLS runtime не включены;
 - key transparency отсутствует;
 - attachment, multi-device и platform signing matrices требуют дальнейшего
   release evidence;
