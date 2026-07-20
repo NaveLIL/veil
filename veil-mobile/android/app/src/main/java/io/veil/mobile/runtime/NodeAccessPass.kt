@@ -1,5 +1,6 @@
 package io.veil.mobile.runtime
 
+import io.veil.mobile.BuildConfig
 import java.net.URI
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
@@ -23,11 +24,11 @@ internal object NodeAccessPassParser {
     val uri = try {
       URI(raw)
     } catch (_: Exception) {
-      return raw.startsWith("veil://enroll", ignoreCase = true) ||
+      return raw.startsWith("$ENROLLMENT_SCHEME://enroll", ignoreCase = true) ||
         targetsMalformedOfficialEnrollment(raw)
     }
     return when (uri.scheme?.lowercase()) {
-      "veil" -> uri.host.equals("enroll", ignoreCase = true)
+      ENROLLMENT_SCHEME -> uri.host.equals("enroll", ignoreCase = true)
       "https" -> uri.rawPath == "/enroll" || uri.rawPath == "/enroll/"
       else -> false
     }
@@ -42,7 +43,7 @@ internal object NodeAccessPassParser {
     val authority = remainder.substring(0, pathStart).substringAfterLast('@')
     val host = authority.substringBefore(':')
     val path = remainder.substring(pathStart)
-    return host == OFFICIAL_ENROLLMENT_HOST && (path == "/enroll" || path == "/enroll/")
+    return host == ENROLLMENT_HTTPS_HOST && (path == "/enroll" || path == "/enroll/")
   }
 
   fun parse(raw: String): ParsedNodeAccessPass {
@@ -56,7 +57,7 @@ internal object NodeAccessPassParser {
     }
     return when (uri.scheme?.lowercase()) {
       "https" -> parseHttps(uri)
-      "veil" -> parseCustom(uri)
+      ENROLLMENT_SCHEME -> parseCustom(uri)
       else -> throw IllegalArgumentException("unsupported Node Access Pass transport")
     }
   }
@@ -160,7 +161,8 @@ internal object NodeAccessPassParser {
   }
 
   private val TOKEN_PATTERN = Regex("^[A-Za-z0-9_-]{43}$")
-  private const val OFFICIAL_ENROLLMENT_HOST = "veil.erez.pro"
+  private val ENROLLMENT_SCHEME = BuildConfig.ENROLLMENT_SCHEME.lowercase()
+  private val ENROLLMENT_HTTPS_HOST = BuildConfig.ENROLLMENT_HTTPS_HOST.lowercase()
   private const val TOKEN_BYTES = 32
   private const val MAX_LINK_CHARS = 4096
 }

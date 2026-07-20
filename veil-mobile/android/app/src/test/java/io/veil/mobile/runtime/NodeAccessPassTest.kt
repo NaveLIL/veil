@@ -1,5 +1,6 @@
 package io.veil.mobile.runtime
 
+import io.veil.mobile.BuildConfig
 import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.util.Base64
@@ -16,16 +17,18 @@ import org.junit.Test
 class NodeAccessPassTest {
   private val tokenBytes = ByteArray(32) { index -> (index + 1).toByte() }
   private val token = Base64.getUrlEncoder().withoutPadding().encodeToString(tokenBytes)
+  private val enrollmentScheme = BuildConfig.ENROLLMENT_SCHEME
+  private val enrollmentHttpsHost = BuildConfig.ENROLLMENT_HTTPS_HOST
 
   @Test
   fun parsesHttpsAndCustomTransportsIntoOneCanonicalOrigin() {
     val web = NodeAccessPassParser.parse("https://ACCESS.Example/enroll#invite=$token")
     val encodedOrigin = URLEncoder.encode("https://ACCESS.Example", StandardCharsets.UTF_8.name())
     val customQuery = NodeAccessPassParser.parse(
-      "veil://enroll/v1?origin=$encodedOrigin&invite=$token",
+      "$enrollmentScheme://enroll/v1?origin=$encodedOrigin&invite=$token",
     )
     val customFragment = NodeAccessPassParser.parse(
-      "veil://enroll/v1?origin=$encodedOrigin#invite=$token",
+      "$enrollmentScheme://enroll/v1?origin=$encodedOrigin#invite=$token",
     )
 
     web.use {
@@ -54,13 +57,13 @@ class NodeAccessPassTest {
       "https://access.example/enroll?next=evil#invite=$token",
       "https://access.example/enroll#invite=short",
       "https://access.example/enroll#invite=$token&extra=1",
-      "veil://enroll/v2?origin=$encodedOrigin&invite=$token",
-      "veil://enroll/v1?origin=${URLEncoder.encode("http://access.example", "UTF-8")}&invite=$token",
-      "veil://enroll/v1?origin=$encodedOrigin&unknown=x&invite=$token",
-      "veil://enroll/v1?origin=$encodedOrigin&origin=$encodedOrigin&invite=$token",
-      "veil://enroll/v1?origin=$encodedOrigin&invite=$token#invite=$token",
-      "veil://enroll/v1?origin=$encodedOrigin&invite=${token}=",
-      "veil://enroll/v1?origin=$encodedOrigin&invite=$token&",
+      "$enrollmentScheme://enroll/v2?origin=$encodedOrigin&invite=$token",
+      "$enrollmentScheme://enroll/v1?origin=${URLEncoder.encode("http://access.example", "UTF-8")}&invite=$token",
+      "$enrollmentScheme://enroll/v1?origin=$encodedOrigin&unknown=x&invite=$token",
+      "$enrollmentScheme://enroll/v1?origin=$encodedOrigin&origin=$encodedOrigin&invite=$token",
+      "$enrollmentScheme://enroll/v1?origin=$encodedOrigin&invite=$token#invite=$token",
+      "$enrollmentScheme://enroll/v1?origin=$encodedOrigin&invite=${token}=",
+      "$enrollmentScheme://enroll/v1?origin=$encodedOrigin&invite=$token&",
     )
 
     invalid.forEach { raw ->
@@ -82,13 +85,27 @@ class NodeAccessPassTest {
 
   @Test
   fun recognizesMalformedEnrollmentTargetsSoTheyCannotFallThroughToReactNativeLinking() {
-    assertTrue(NodeAccessPassParser.isPotentialEnrollment("veil://enroll/%"))
-    assertTrue(NodeAccessPassParser.isPotentialEnrollment("https://veil.erez.pro/enroll#%"))
-    assertTrue(NodeAccessPassParser.isPotentialEnrollment("https://veil.erez.pro:443/enroll#%"))
-    assertTrue(NodeAccessPassParser.isPotentialEnrollment("https://user@veil.erez.pro/enroll#%"))
-    assertTrue(NodeAccessPassParser.isPotentialEnrollment("HTTPS://VEIL.EREZ.PRO/enroll?%"))
-    assertFalse(NodeAccessPassParser.isPotentialEnrollment("https://veil.erez.pro.evil/enroll#%"))
-    assertFalse(NodeAccessPassParser.isPotentialEnrollment("https://veil.erez.pro/other#%"))
+    assertTrue(NodeAccessPassParser.isPotentialEnrollment("$enrollmentScheme://enroll/%"))
+    assertTrue(NodeAccessPassParser.isPotentialEnrollment("https://$enrollmentHttpsHost/enroll#%"))
+    assertTrue(NodeAccessPassParser.isPotentialEnrollment("https://$enrollmentHttpsHost:443/enroll#%"))
+    assertTrue(NodeAccessPassParser.isPotentialEnrollment("https://user@$enrollmentHttpsHost/enroll#%"))
+    assertTrue(NodeAccessPassParser.isPotentialEnrollment("HTTPS://${enrollmentHttpsHost.uppercase()}/enroll?%"))
+    assertFalse(NodeAccessPassParser.isPotentialEnrollment("https://$enrollmentHttpsHost.evil/enroll#%"))
+    assertFalse(NodeAccessPassParser.isPotentialEnrollment("https://$enrollmentHttpsHost/other#%"))
+  }
+
+  @Test
+  fun customEnrollmentTransportIsBoundToTheVariantBuildConfig() {
+    val encodedOrigin = URLEncoder.encode("https://access.example", StandardCharsets.UTF_8.name())
+    val otherScheme = if (enrollmentScheme == "veil") "veil-tester" else "veil"
+
+    assertTrue(NodeAccessPassParser.isPotentialEnrollment("$enrollmentScheme://enroll/v1"))
+    assertFalse(NodeAccessPassParser.isPotentialEnrollment("$otherScheme://enroll/v1"))
+    assertThrows(IllegalArgumentException::class.java) {
+      NodeAccessPassParser.parse(
+        "$otherScheme://enroll/v1?origin=$encodedOrigin&invite=$token",
+      )
+    }
   }
 
   @Test

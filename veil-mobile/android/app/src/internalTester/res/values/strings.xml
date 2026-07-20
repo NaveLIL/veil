@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+  <string name="app_name">Veil Tester</string>
+  <string name="recovery_activity_label">Veil Tester secure identity setup</string>
+  <string name="recovery_brand">VEIL TESTER · DIRECT PREVIEW</string>
+</resources>

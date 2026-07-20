@@ -87,6 +87,45 @@ def releaseKeyAlias = System.getenv('VEIL_ANDROID_KEY_ALIAS')
 def releaseKeyPassword = System.getenv('VEIL_ANDROID_KEY_PASSWORD')
 def releaseSigningConfigured = [releaseStorePath, releaseStorePassword, releaseKeyAlias, releaseKeyPassword].every { it }
 
+def nonBlankEnvironmentValue = { String name ->
+    def value = System.getenv(name)
+    value != null && !value.trim().isEmpty() ? value : null
+}
+def testerStorePath = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_KEYSTORE')
+def testerStorePassword = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_KEYSTORE_PASSWORD')
+def testerKeyAlias = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_KEY_ALIAS')
+def testerKeyPassword = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_KEY_PASSWORD')
+def testerSigningValues = [testerStorePath, testerStorePassword, testerKeyAlias, testerKeyPassword]
+def testerSigningPartiallyConfigured = testerSigningValues.any { it != null } && !testerSigningValues.every { it != null }
+if (testerSigningPartiallyConfigured) {
+    throw new GradleException('Tester signing is partially configured. Set all of VEIL_ANDROID_TESTER_KEYSTORE, VEIL_ANDROID_TESTER_KEYSTORE_PASSWORD, VEIL_ANDROID_TESTER_KEY_ALIAS, and VEIL_ANDROID_TESTER_KEY_PASSWORD, or unset all four.')
+}
+def testerSigningConfigured = testerSigningValues.every { it != null }
+
+def testerVersionCodeRaw = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_VERSION_CODE')
+def testerVersionNameRaw = nonBlankEnvironmentValue('VEIL_ANDROID_TESTER_VERSION_NAME')
+if ((testerVersionCodeRaw == null) != (testerVersionNameRaw == null)) {
+    throw new GradleException('Tester versioning is partially configured. Set both VEIL_ANDROID_TESTER_VERSION_CODE and VEIL_ANDROID_TESTER_VERSION_NAME, or unset both.')
+}
+def testerVersionCode = null
+if (testerVersionCodeRaw != null) {
+    if (!(testerVersionCodeRaw ==~ /^[1-9][0-9]{0,9}$/)) {
+        throw new GradleException('VEIL_ANDROID_TESTER_VERSION_CODE must be a positive decimal integer no greater than 2100000000.')
+    }
+    def parsed = Long.parseLong(testerVersionCodeRaw)
+    if (parsed > 2100000000L) {
+        throw new GradleException('VEIL_ANDROID_TESTER_VERSION_CODE must be a positive decimal integer no greater than 2100000000.')
+    }
+    testerVersionCode = (int) parsed
+}
+def testerVersionNamePattern = ~/^[0-9]+(?:\.[0-9]+){2}-tester(?:\.[0-9A-Za-z][0-9A-Za-z.-]{0,31})?$/
+if (testerVersionNameRaw != null && (testerVersionNameRaw.length() > 64 || !(testerVersionNameRaw ==~ testerVersionNamePattern))) {
+    throw new GradleException('VEIL_ANDROID_TESTER_VERSION_NAME must use safe syntax such as 0.1.0-tester or 0.1.0-tester.20260720.1.')
+}
+def sourceCommitRaw = nonBlankEnvironmentValue('VEIL_SOURCE_COMMIT')
+def sourceCommitValid = sourceCommitRaw != null && sourceCommitRaw ==~ /^[0-9a-f]{40}$/
+def sourceCommitForMetadata = sourceCommitValid ? sourceCommitRaw : 'unconfigured'
+
 android {
     ndkVersion rootProject.ext.ndkVersion
 
@@ -117,6 +156,18 @@ android {
                 keyPassword releaseKeyPassword
             }
         }
+        if (testerSigningConfigured) {
+            tester {
+                storeFile file(testerStorePath)
+                storePassword testerStorePassword
+                keyAlias testerKeyAlias
+                keyPassword testerKeyPassword
+                enableV1Signing = false
+                enableV2Signing = true
+                enableV3Signing = false
+                enableV4Signing = false
+            }
+        }
     }
     buildTypes {
         debug {
@@ -124,9 +175,31 @@ android {
             // ready shell. MainActivity still starts secure and re-secures on
             // pause; RecoveryActivity and Recents are never downgraded.
             buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "true"
+            buildConfigField "String", "BUILD_CHANNEL", '"debug"'
+            buildConfigField "String", "SOURCE_COMMIT", "\"${sourceCommitForMetadata}\""
+            buildConfigField "String", "ENROLLMENT_SCHEME", '"veil"'
+            buildConfigField "String", "ENROLLMENT_HTTPS_HOST", '"veil.erez.pro"'
+            manifestPlaceholders = [
+                veilBuildChannel: 'debug',
+                veilSourceCommit: sourceCommitForMetadata,
+                veilAllowReadyScreenCapture: 'true',
+                veilEnrollmentScheme: 'veil',
+                veilEnrollmentHttpsHost: 'veil.erez.pro',
+            ]
         }
         release {
             buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "false"
+            buildConfigField "String", "BUILD_CHANNEL", '"release"'
+            buildConfigField "String", "SOURCE_COMMIT", "\"${sourceCommitForMetadata}\""
+            buildConfigField "String", "ENROLLMENT_SCHEME", '"veil"'
+            buildConfigField "String", "ENROLLMENT_HTTPS_HOST", '"veil.erez.pro"'
+            manifestPlaceholders = [
+                veilBuildChannel: 'release',
+                veilSourceCommit: sourceCommitForMetadata,
+                veilAllowReadyScreenCapture: 'false',
+                veilEnrollmentScheme: 'veil',
+                veilEnrollmentHttpsHost: 'veil.erez.pro',
+            ]
             if (releaseSigningConfigured) {
                 signingConfig signingConfigs.release
             }
@@ -134,6 +207,32 @@ android {
             minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
             crunchPngs (findProperty('android.enablePngCrunchInReleaseBuilds')?.toBoolean() ?: true)
+        }
+        internalTester {
+            initWith release
+            applicationIdSuffix ".tester"
+            debuggable false
+            matchingFallbacks = ['release']
+
+            // initWith(release) copies release signing. Always clear it before
+            // selecting the independently configured tester identity.
+            signingConfig = null
+            if (testerSigningConfigured) {
+                signingConfig signingConfigs.tester
+            }
+
+            buildConfigField "boolean", "ALLOW_READY_SCREEN_CAPTURE", "false"
+            buildConfigField "String", "BUILD_CHANNEL", '"tester"'
+            buildConfigField "String", "SOURCE_COMMIT", "\"${sourceCommitForMetadata}\""
+            buildConfigField "String", "ENROLLMENT_SCHEME", '"veil-tester"'
+            buildConfigField "String", "ENROLLMENT_HTTPS_HOST", '"tester.invalid"'
+            manifestPlaceholders = [
+                veilBuildChannel: 'tester',
+                veilSourceCommit: sourceCommitForMetadata,
+                veilAllowReadyScreenCapture: 'false',
+                veilEnrollmentScheme: 'veil-tester',
+                veilEnrollmentHttpsHost: 'tester.invalid',
+            ]
         }
     }
     packagingOptions {
@@ -143,6 +242,17 @@ android {
     }
     androidResources {
         ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:!CVS:!thumbs.db:!picasa.ini:!*~'
+    }
+}
+
+// AGP 8 VariantOutput properties keep tester artifact versions independent
+// from the desktop/release defaults without mutating defaultConfig.
+androidComponents {
+    onVariants(selector().withBuildType('internalTester')) { variant ->
+        variant.outputs.each { output ->
+            output.versionCode.set(testerVersionCode ?: 1)
+            output.versionName.set(testerVersionNameRaw ?: '0.1.0-tester.unconfigured')
+        }
     }
 }
 
@@ -208,12 +318,94 @@ dependencies {
 }
 
 gradle.taskGraph.whenReady { graph ->
-    def requestedRelease = graph.allTasks.any {
-        def taskName = it.name.toLowerCase()
-        it.project == project && taskName.contains('release') && !taskName.contains('clean')
+    def deviceMutationTasks = graph.allTasks.findAll {
+        it.project == project && it.name ==~ /(?i)^(?:install|uninstall).*/
     }
-    if (requestedRelease && !releaseSigningConfigured) {
+    if (!deviceMutationTasks.isEmpty()) {
+        throw new GradleException(
+            'Android install and uninstall tasks are blocked. Use an assemble* task for a host-only build; ' +
+            'device installation or removal requires separate authorization under the manual physical test plan.'
+        )
+    }
+
+    def releasePackagingTaskNames = [
+        'assemblerelease',
+        'bundlerelease',
+        'packagerelease',
+        'packagereleasebundle',
+        'packagereleaseuniversalapk',
+        'signreleasebundle',
+        'installrelease',
+        'validatesigningrelease',
+        'makeapkfrombundleforrelease',
+        'zipapksforrelease',
+        'extractapksforrelease',
+    ] as Set
+    def releasePackagingTasks = graph.allTasks.findAll {
+        def taskName = it.name.toLowerCase()
+        it.project == project && (
+            releasePackagingTaskNames.contains(taskName) ||
+            taskName.startsWith('publishrelease')
+        )
+    }
+    if (!releasePackagingTasks.isEmpty() && !releaseSigningConfigured) {
         throw new GradleException('Release signing is required. Set VEIL_ANDROID_KEYSTORE, VEIL_ANDROID_KEYSTORE_PASSWORD, VEIL_ANDROID_KEY_ALIAS, and VEIL_ANDROID_KEY_PASSWORD.')
+    }
+
+    def testerBuildType = android.buildTypes.getByName('internalTester')
+    def effectiveTesterSigning = testerBuildType.signingConfig
+    if (testerSigningConfigured) {
+        if (effectiveTesterSigning == null || effectiveTesterSigning.name != 'tester') {
+            throw new GradleException('Tester signing is not bound to the isolated tester signingConfig.')
+        }
+        if (effectiveTesterSigning.enableV1Signing != false ||
+            effectiveTesterSigning.enableV2Signing != true ||
+            effectiveTesterSigning.enableV3Signing != false ||
+            effectiveTesterSigning.enableV4Signing != false) {
+            throw new GradleException('Tester signing must use only APK Signature Scheme v2.')
+        }
+        if (releaseSigningConfigured &&
+            file(testerStorePath).canonicalFile == file(releaseStorePath).canonicalFile &&
+            testerKeyAlias == releaseKeyAlias) {
+            throw new GradleException('Tester signing must not reuse the production keystore alias.')
+        }
+    } else if (effectiveTesterSigning != null) {
+        throw new GradleException('Tester signing unexpectedly inherited another signingConfig.')
+    }
+
+    def testerPackagingTaskNames = [
+        'assembleinternaltester',
+        'bundleinternaltester',
+        'packageinternaltester',
+        'packageinternaltesterbundle',
+        'packageinternaltesteruniversalapk',
+        'signinternaltesterbundle',
+        'installinternaltester',
+        'validatesigninginternaltester',
+        'makeapkfrombundleforinternaltester',
+        'zipapksforinternaltester',
+        'extractapksforinternaltester',
+    ] as Set
+    def testerPackagingTasks = graph.allTasks.findAll {
+        def taskName = it.name.toLowerCase()
+        it.project == project && (
+            testerPackagingTaskNames.contains(taskName) ||
+            taskName.startsWith('publishinternaltester')
+        )
+    }
+    if (!testerPackagingTasks.isEmpty()) {
+        if (!testerSigningConfigured) {
+            throw new GradleException('Tester packaging is blocked without all VEIL_ANDROID_TESTER_KEYSTORE, VEIL_ANDROID_TESTER_KEYSTORE_PASSWORD, VEIL_ANDROID_TESTER_KEY_ALIAS, and VEIL_ANDROID_TESTER_KEY_PASSWORD values.')
+        }
+        if (!file(testerStorePath).isFile()) {
+            throw new GradleException('Tester packaging is blocked because VEIL_ANDROID_TESTER_KEYSTORE does not name a file.')
+        }
+        if (testerVersionCode == null || testerVersionNameRaw == null) {
+            throw new GradleException('Tester packaging requires VEIL_ANDROID_TESTER_VERSION_CODE and VEIL_ANDROID_TESTER_VERSION_NAME.')
+        }
+        if (!sourceCommitValid) {
+            throw new GradleException('Tester packaging requires VEIL_SOURCE_COMMIT as exactly 40 lowercase hexadecimal characters.')
+        }
     }
 
     def connectedAndroidTestTasks = graph.allTasks.findAll {
@@ -290,12 +482,14 @@ gradle.taskGraph.whenReady { graph ->
                 throw new GradleException('Connected Android instrumentation is blocked: the disposable emulator must contain only Android user 0.')
             }
 
-            def retainedPackage = runAdb(
-                ['-s', serial, 'shell', 'pm', 'list', 'packages', '--user', '0', '-u', 'io.veil.mobile'],
-                'retained Veil package state'
-            )
-            if (!retainedPackage.isEmpty()) {
-                throw new GradleException('Connected Android instrumentation is blocked: io.veil.mobile is already installed or retained on the emulator.')
+            for (packageId in ['io.veil.mobile', 'io.veil.mobile.tester']) {
+                def retainedPackages = runAdb(
+                    ['-s', serial, 'shell', 'pm', 'list', 'packages', '--user', '0', '-u', packageId],
+                    "retained ${packageId} package state"
+                ).readLines().collect { it.trim() }
+                if (retainedPackages.contains("package:${packageId}")) {
+                    throw new GradleException("Connected Android instrumentation is blocked: ${packageId} is already installed or retained on the emulator.")
+                }
             }
             serial
         }

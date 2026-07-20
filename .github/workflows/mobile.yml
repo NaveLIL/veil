@@ -14,6 +14,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/mobile.yml"
+      - ".github/workflows/mobile-tester.yml"
   pull_request:
     branches: [master, main]
     paths:
@@ -27,6 +28,7 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/mobile.yml"
+      - ".github/workflows/mobile-tester.yml"
 
 permissions:
   contents: read
@@ -67,10 +69,13 @@ jobs:
       - name: Run unit tests
         run: pnpm test --runInBand
 
+      - name: Test fail-closed Android tester APK verifier
+        run: pnpm test:android-tester-apk-verifier
+
   android-native:
-    name: Native Android debug build
+    name: Native Android and tester policy
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     env:
       ANDROID_NDK_VERSION: 27.1.12297006
       CARGO_NDK_VERSION: 4.1.2
@@ -194,6 +199,41 @@ jobs:
             exit 1
           fi
 
+      - name: Verify release and tester packaging and device mutation fail closed
+        working-directory: veil-mobile/android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expect_blocked() {
+            local expected="$1"
+            shift
+            local output
+            local status
+            set +e
+            output="$(bash ./gradlew --no-daemon --dry-run "$@" 2>&1)"
+            status=$?
+            set -e
+            if (( status == 0 )) || ! grep -Fq -- "${expected}" <<<"${output}"; then
+              printf '%s\n' "${output}"
+              echo "Expected Gradle task graph to fail closed: $*" >&2
+              exit 1
+            fi
+          }
+
+          expect_blocked \
+            "Tester packaging is blocked without all VEIL_ANDROID_TESTER" \
+            :app:assembleInternalTester
+          expect_blocked \
+            "Release signing is required." \
+            :app:assembleRelease
+          expect_blocked \
+            "Android install and uninstall tasks are blocked." \
+            :app:installDebug
+          expect_blocked \
+            "Android install and uninstall tasks are blocked." \
+            :app:uninstallInternalTester
+
       - name: Run native Android unit tests
         working-directory: veil-mobile/android
         shell: bash
@@ -202,6 +242,20 @@ jobs:
           --no-daemon
           --stacktrace
           :app:testDebugUnitTest
+          -PreactNativeArchitectures=arm64-v8a,x86_64
+
+      - name: Run release-like tester policy tests and lint
+        working-directory: veil-mobile/android
+        shell: bash
+        env:
+          NODE_ENV: production
+        run: >-
+          bash ./gradlew
+          --no-daemon
+          --stacktrace
+          :app:testReleaseUnitTest
+          :app:testInternalTesterUnitTest
+          :app:lintInternalTester
           -PreactNativeArchitectures=arm64-v8a,x86_64
 
       - name: Assemble debug CI APK

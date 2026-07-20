@@ -1,5 +1,6 @@
 package io.veil.mobile.runtime
 
+import io.veil.mobile.BuildConfig
 import io.veil.mobile.crypto.NativeIdentityVaultAccess
 import io.veil.mobile.recovery.NativeIdentitySetupCoordinator
 import io.veil.mobile.recovery.NativeIdentitySetupUnsettledException
@@ -3443,6 +3444,9 @@ class VeilMobileRuntimeTest {
 
   @Test
   fun debugDiagnosticSinkFailureCannotInterruptTheTerminalDirectTransition() {
+    if (!BuildConfig.DEBUG) {
+      assertFalse(BuildConfig.ALLOW_READY_SCREEN_CAPTURE)
+    }
     val executor = CapturingScheduledExecutor()
     val fakeSession = FakeSession()
     val transport = ControllableDirectTransport()
@@ -3469,12 +3473,16 @@ class VeilMobileRuntimeTest {
 
       executor.runCapturedDelayedTask()
 
-      assertEquals(1, sinkCalls.get())
-      assertEquals(
-        NativeDebugDirectFailureCheckpoint.CONTINUOUS_LIVE to
-          NativeDebugDirectFailureCategory.FFI_SESSION,
-        captured.get(),
-      )
+      assertEquals(if (BuildConfig.DEBUG) 1 else 0, sinkCalls.get())
+      if (BuildConfig.DEBUG) {
+        assertEquals(
+          NativeDebugDirectFailureCheckpoint.CONTINUOUS_LIVE to
+            NativeDebugDirectFailureCategory.FFI_SESSION,
+          captured.get(),
+        )
+      } else {
+        assertNull(captured.get())
+      }
       val failed = runtime.snapshot()
       assertEquals(NativeConnectionState.ERROR, failed.connectionState)
       assertNull(failed.binding)

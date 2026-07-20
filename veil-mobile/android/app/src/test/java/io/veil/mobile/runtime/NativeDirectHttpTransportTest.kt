@@ -1,5 +1,6 @@
 package io.veil.mobile.runtime
 
+import io.veil.mobile.BuildConfig
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -20,6 +21,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeFalse
+import org.junit.Assume.assumeTrue
 import org.junit.Before
 import org.junit.Test
 
@@ -30,6 +33,8 @@ class NativeDirectHttpTransportTest {
 
   @Before
   fun setUp() {
+    if (!BuildConfig.DEBUG) return
+
     val heldCertificate = HeldCertificate.Builder()
       .commonName("localhost")
       .addSubjectAlternativeName("localhost")
@@ -55,11 +60,12 @@ class NativeDirectHttpTransportTest {
 
   @After
   fun tearDown() {
-    server.shutdown()
+    if (::server.isInitialized) server.shutdown()
   }
 
   @Test
   fun signedGetPreservesExactTargetHostHeadersAndEmptyBodyOnWire() {
+    requireDebugTestTlsFixture()
     val responseBody = """{"conversations":[]}""".toByteArray()
     server.enqueue(MockResponse().setResponseCode(200).setBody(Buffer().write(responseBody)))
     val target = "/v1/conversations?limit=100&cursor=z%2B1%2F2&order=first&order=second"
@@ -83,6 +89,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun signedOwnPrekeyPostPreservesExactBodyTargetAndHeadersOnWire() {
+    requireDebugTestTlsFixture()
     val body = """{"device_id":"00112233445566778899aabbccddeeff","signed_prekey":{"key_id":7}}"""
       .toByteArray()
     val original = body.copyOf()
@@ -163,6 +170,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun redirectIsReturnedAsGenericFailureAndNeverFollowed() {
+    requireDebugTestTlsFixture()
     server.enqueue(
       MockResponse()
         .setResponseCode(302)
@@ -177,6 +185,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun peerPreKeyConnectionFailureIsNeverRetried() {
+    requireDebugTestTlsFixture()
     server.enqueue(
       MockResponse().setSocketPolicy(SocketPolicy.DISCONNECT_AT_START),
     )
@@ -195,6 +204,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun peerPreKeyStatusFollowUpIsBlockedBeforeSecondNetworkExchange() {
+    requireDebugTestTlsFixture()
     server.enqueue(
       MockResponse()
         .setResponseCode(503)
@@ -216,6 +226,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun non200BodyNeverCrossesTheSanitizedFailureBoundary() {
+    requireDebugTestTlsFixture()
     val secretBody = "server-secret-diagnostic-body"
     server.enqueue(MockResponse().setResponseCode(401).setBody(secretBody))
 
@@ -227,6 +238,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun declaredOversizeIsRejectedBeforeBodyConsumption() {
+    requireDebugTestTlsFixture()
     val limit = 32L
     server.enqueue(
       MockResponse()
@@ -242,6 +254,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun chunkedOversizeIsDetectedByReadingAtMostLimitPlusOne() {
+    requireDebugTestTlsFixture()
     val limit = 1_024L
     val oversized = ByteArray((limit + 1L).toInt()) { 0x5a }
     server.enqueue(
@@ -257,6 +270,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun cancellationCompletesOnceWithSanitizedFailureAndHandle() {
+    requireDebugTestTlsFixture()
     val target = "/v1/prekeys/peer-identity-key-must-not-leak"
     val signature = SIGNATURE_BASE64
     server.enqueue(
@@ -293,6 +307,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun cancellationBeforeStartNeverReachesNetworkAndStartStaysANoOp() {
+    requireDebugTestTlsFixture()
     val callbackResult = AtomicReference<NativeDirectHttpResult?>()
     val callbackCount = AtomicInteger(0)
     val completed = CountDownLatch(1)
@@ -362,6 +377,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun httpAndNonCanonicalBase64AreRejectedWithoutNetworkOrSensitiveDiagnostics() {
+    requireDebugTestTlsFixture()
     val unpaddedSignature = SIGNATURE_BASE64.removeSuffix("==")
     val invalidHttp = signedRequest(origin = "http://127.0.0.1:80")
     val invalidSignature = signedRequest().copy(
@@ -379,6 +395,7 @@ class NativeDirectHttpTransportTest {
 
   @Test
   fun invalidMethodPathBodyAndOwnPrekeyLimitsAreRejectedBeforeNetwork() {
+    requireDebugTestTlsFixture()
     val invalid = listOf(
       signedRequest(body = byteArrayOf(1)),
       signedRequest(
@@ -425,6 +442,31 @@ class NativeDirectHttpTransportTest {
 
     assertEquals("Direct HTTP test TLS is unavailable in release builds", error.message)
     requireNativeDirectHttpTestTlsAllowed(debugBuild = true)
+  }
+
+  @Test
+  fun releaseLikeVariantRejectsTheRealCustomTestTlsConstructor() {
+    assumeFalse("policy assertion applies only to non-debug variants", BuildConfig.DEBUG)
+    val heldCertificate = HeldCertificate.Builder()
+      .commonName("localhost")
+      .addSubjectAlternativeName("localhost")
+      .build()
+    val clientCertificates = HandshakeCertificates.Builder()
+      .addTrustedCertificate(heldCertificate.certificate)
+      .build()
+
+    val error = assertThrows(IllegalStateException::class.java) {
+      NativeDirectHttpTransport(
+        clientCertificates.sslSocketFactory(),
+        clientCertificates.trustManager,
+      )
+    }
+
+    assertEquals("Direct HTTP test TLS is unavailable in release builds", error.message)
+  }
+
+  private fun requireDebugTestTlsFixture() {
+    assumeTrue("custom TLS fixture is debug-only", BuildConfig.DEBUG)
   }
 
   private fun signedRequest(

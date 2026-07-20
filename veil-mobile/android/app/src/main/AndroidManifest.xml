@@ -17,6 +17,11 @@
     <meta-data android:name="expo.modules.updates.ENABLED" android:value="false"/>
     <meta-data android:name="expo.modules.updates.EXPO_UPDATES_CHECK_ON_LAUNCH" android:value="ALWAYS"/>
     <meta-data android:name="expo.modules.updates.EXPO_UPDATES_LAUNCH_WAIT_MS" android:value="0"/>
+    <meta-data android:name="io.veil.mobile.BUILD_CHANNEL" android:value="${veilBuildChannel}"/>
+    <meta-data android:name="io.veil.mobile.SOURCE_COMMIT" android:value="${veilSourceCommit}"/>
+    <meta-data android:name="io.veil.mobile.ALLOW_READY_SCREEN_CAPTURE" android:value="${veilAllowReadyScreenCapture}"/>
+    <meta-data android:name="io.veil.mobile.ENROLLMENT_SCHEME" android:value="${veilEnrollmentScheme}"/>
+    <meta-data android:name="io.veil.mobile.ENROLLMENT_HTTPS_HOST" android:value="${veilEnrollmentHttpsHost}"/>
     <activity android:name=".MainActivity" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode" android:launchMode="singleTask" android:windowSoftInputMode="adjustResize" android:theme="@style/Theme.App.SplashScreen" android:exported="true" android:screenOrientation="portrait">
       <intent-filter>
         <action android:name="android.intent.action.MAIN"/>
@@ -26,13 +31,13 @@
         <action android:name="android.intent.action.VIEW"/>
         <category android:name="android.intent.category.DEFAULT"/>
         <category android:name="android.intent.category.BROWSABLE"/>
-        <data android:scheme="veil"/>
+        <data android:scheme="${veilEnrollmentScheme}"/>
       </intent-filter>
       <intent-filter android:autoVerify="true">
         <action android:name="android.intent.action.VIEW"/>
         <category android:name="android.intent.category.DEFAULT"/>
         <category android:name="android.intent.category.BROWSABLE"/>
-        <data android:scheme="https" android:host="veil.erez.pro" android:path="/enroll"/>
+        <data android:scheme="https" android:host="${veilEnrollmentHttpsHost}" android:path="/enroll"/>
       </intent-filter>
     </activity>
     <activity
@@ -41,6 +46,7 @@
       android:enableOnBackInvokedCallback="true"
       android:excludeFromRecents="true"
       android:exported="false"
+      android:label="@string/recovery_activity_label"
       android:noHistory="false"
       android:stateNotNeeded="true"
       android:theme="@style/Theme.Veil.Recovery" />

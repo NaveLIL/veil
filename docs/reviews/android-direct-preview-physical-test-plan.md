@@ -38,20 +38,23 @@ Record all of the following before touching a physical device:
 | Evidence | Required result |
 |---|---|
 | Source | exact commit, clean tree, reviewed diff |
-| Artifact | release-mode tester APK, byte size, SHA-256 |
+| Artifact | release-like tester APK, byte size, SHA-256 |
 | Signing | stable tester certificate fingerprint; no debug key |
-| Package isolation | tester application ID can coexist with the current debug package, or the exact destructive migration is separately approved |
+| Package isolation | exact tester application ID `io.veil.mobile.tester` coexists with `io.veil.mobile`; no package replacement or migration |
 | Runtime | bundled JS; Metro and developer menu unavailable |
-| Native libraries | expected ABI set, reproducible Rust hashes, no stale generated UniFFI bindings |
-| Policy | release `FLAG_SECURE` cannot be downgraded by JS/settings |
+| Native libraries | expected ABI set, recorded Rust library hashes, no stale generated UniFFI bindings |
+| Policy | release `FLAG_SECURE` cannot be downgraded by JS/settings; APK evidence binds SDK, permissions, recovery activity, and complete backup/transfer exclusions |
 | Supply chain | dependency lock, notices/licenses, secret scan, CI provenance |
+| Verifier | sanitized JSON passes the independent tester APK contract and records the exact APK SHA-256 |
 | Node | disposable exact HTTPS origin, pinned configuration snapshot, admin access for one-use Pass issuance/revocation |
 | Desktop peer | exact desktop build/commit and a disposable peer identity |
 
 A differently signed tester APK cannot replace an existing debug package in
-place. The preferred plan is a production-like tester flavor with an isolated
-application ID and package-scoped Keystore/database. Do not solve this by
-uninstalling the user's current package.
+place. The checked-in contract reserves `io.veil.mobile.tester`, `veil-tester`,
+distinct visual branding, and a package-scoped Keystore/database for this
+purpose. This is packaging code only: no signed artifact has yet been produced
+or tested. Do not solve a failed preflight by uninstalling the user's current
+package.
 
 ## Evidence record
 

@@ -17,6 +17,8 @@
     "ios": "expo run:ios",
     "native:android": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-android-native.ps1",
     "verify:android-production-bundle": "node scripts/verify-android-production-bundle.mjs",
+    "verify:android-tester-apk": "node scripts/verify-android-tester-apk.mjs",
+    "test:android-tester-apk-verifier": "node --test scripts/verify-android-tester-apk.test.mjs",
     "lint": "eslint .",
     "test": "jest"
   },

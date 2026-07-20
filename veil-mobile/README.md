@@ -41,12 +41,16 @@ and app-private files. Generic `connected*AndroidTest` tasks are consequently
 blocked unless the current invocation supplies the explicit acknowledgement
 printed by Gradle, `ANDROID_SERIAL` names exactly the sole connected device, and
 that device is a fresh single-user emulator with no installed or retained
-`io.veil.mobile` package. The guard repeats those checks immediately before the
-connected task action and rejects a task-level `--serial` override unless it is
-the same verified emulator. Physical devices are forbidden, and a work profile
+`io.veil.mobile` or `io.veil.mobile.tester` package. The guard repeats those
+checks immediately before the connected task action and rejects a task-level
+`--serial` override unless it is the same verified emulator. Physical devices
+are forbidden, and a work profile
 on an account-bearing handset is not a disposable boundary. This guard does not
-cover manual `adb` or future managed-device providers. For an explicitly
-authorized phone smoke, `adb install -r` is only a non-uninstalling update path:
+cover manual `adb` or future managed-device providers. Every app-project Gradle
+`install*` and `uninstall*` task is separately blocked before execution; use
+`assemble*` for host-only work. Any later device mutation belongs to the
+explicitly resumed manual physical plan. For an explicitly authorized phone
+smoke, `adb install -r` is only a non-uninstalling update path:
 upgraded code and migrations can still mutate state. Check `firstInstallTime`
 and verify the same local account/vault afterwards; neither check is
 instrumentation proof.
@@ -64,6 +68,47 @@ $env:VEIL_ANDROID_KEY_PASSWORD='...'
 
 Keep the keystore and passwords outside the repository. A release task fails if
 any value is missing.
+
+## Isolated tester artifact
+
+The release-like `internalTester` build type is reserved for the closed Direct
+Preview and emits the `tester` channel. It uses application ID
+`io.veil.mobile.tester`, the `veil-tester` enrollment scheme, the user-visible
+name `Veil Tester`, bundled JavaScript, release capture policy, and a signing
+identity that is independent of both production release and debug signing. It
+can coexist with `io.veil.mobile`; its package-scoped Keystore, SQLCipher
+database, and app-private files are separate.
+
+Tester packaging requires all four `VEIL_ANDROID_TESTER_*` keystore values,
+`VEIL_ANDROID_TESTER_VERSION_CODE`, `VEIL_ANDROID_TESTER_VERSION_NAME`, and an
+exact lowercase 40-hex `VEIL_SOURCE_COMMIT`. Missing, partial, or malformed
+inputs fail closed; tester never inherits the release signer or debug key. The
+manual protected workflow verifies the completed APK with:
+
+```text
+pnpm verify:android-tester-apk -- --apk <apk> \
+  --expected-cert-sha256 <64-lowercase-hex> \
+  --forbidden-cert-sha256 <production-64-lowercase-hex> \
+  --expected-version-code <positive-decimal> \
+  --expected-version-name <exact-name> \
+  --expected-source-commit <40-lowercase-hex> \
+  --evidence-out <json> --android-sdk <sdk-root>
+```
+
+The verifier requires an exact v2-only signature by exactly one expected
+certificate distinct from the protected production fingerprint. With
+v1/v3/v3.1/v4 disabled, no production-certificate signing history is accepted.
+It also requires the isolated package and exact SDK/activity/permission
+manifest policy, the reviewed component inventory with deferred exported
+UnifiedPush connector components absent, complete packaged
+cloud-backup/device-transfer exclusions (including device-protected domains),
+exact tester launcher/recovery branding, a production JS bundle, and exactly
+the two reviewed Rust ABIs. The checked-in
+code is only the packaging/verifier contract: no stable
+tester key has been provided, no signed tester APK has been produced, and no
+physical-device result is claimed. See the
+[artifact contract](../docs/reviews/android-tester-artifact-contract.md) and the
+[deferred physical plan](../docs/reviews/android-direct-preview-physical-test-plan.md).
 
 ## Current security boundary
 

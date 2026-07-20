@@ -46,8 +46,10 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
    реализованы. Ограниченный Samsung S23 smoke подтверждает Pass registration,
    public-WebPKI transport, empty Direct и same-account force-stop reopen, но
    полный Desktop ↔ Android E2EE/send/ACK/outbox/reconnect/airplane/background/
-   process-death gate, connected recovery/capture matrix и подписанный tester APK
-   остаются открыты. Точный checkpoint приведён в Phase 5.
+   process-death gate и connected recovery/capture matrix остаются открыты.
+   Изолированный release-like tester packaging/verifier/CI-контракт уже
+   реализован, но стабильный подписанный APK ещё не произведён и не проверен.
+   Точный checkpoint приведён в Phase 5.
 7. Параллельно с physical Direct gate провести Phase 5S: зафиксировать точный
    protocol transcript, проверить hostile-Node модель, выполнить изолированный
    `libsignal` spike и заказать независимый аудит. До решения 5S текущий Direct
@@ -67,7 +69,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
-| 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; ограниченный S23 smoke подтверждён, connected recovery/vault/capture matrix и signed standalone APK открыты |
+| 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
 | 5S | Direct protocol assurance & hostile Node | immutable shared-Rust Direct-v1 transcript/SQLCipher checkpoint реализован; Android/desktop cross-runtime fixtures, exact-spec review, `libsignal` spike, key-transparency ADR и независимый аудит открыты; legacy REST authority mismatch mitigated, но cryptographic cross-Node credential scope WS v2/REST v1 остаётся P1 |
@@ -1265,8 +1267,11 @@ Process-local non-secret setup receipt через App-owned continuation unit-te
 не физическое доказательство RecoveryActivity pause/result ordering и не durable
 receipt: connected Activity instrumentation и React-context/OS process-death
 reconciliation результата setup остаются отдельными открытыми gates.
-Это всё ещё закрытый Direct Preview: cross-client E2EE
-text/airplane/background matrix и подписанный standalone tester APK пока не готовы.
+Это всё ещё закрытый Direct Preview: cross-client E2EE text/airplane/background
+matrix не готова. Изолированный `internalTester` package/signing contract,
+fail-closed APK verifier и ручной protected workflow реализованы, но stable
+tester key не предоставлен, подписанный standalone APK не произведён и physical
+matrix не выполнялась.
 
 **Authoritative local status sync 2026-07-20:** после UI checkpoint `d65927c`
 локальная ветка содержит fail-closed connected-test guard `8e31cc1` и текущий
@@ -1305,7 +1310,7 @@ androidTest APK также собираются. Connected instrumentation на 
 Gradle `connected*AndroidTest` теперь fail closed до выполнения task graph и
 разрешается только явным одноразовым подтверждением, когда `ANDROID_SERIAL`
 точно связывает AGP с единственным свежим single-user emulator без установленного/
-retained `io.veil.mobile`; проверка повторяется непосредственно перед connected
+retained `io.veil.mobile` или `io.veil.mobile.tester`; проверка повторяется непосредственно перед connected
 task action, а task-level `--serial` разрешён только для того же проверенного
 emulator. Lifecycle connected tests может удалить target package вместе с
 Keystore, SQLCipher и app-private state. Физический телефон запрещён, а work
@@ -1313,9 +1318,10 @@ profile на account-bearing handset не считается disposable boundary
 разрешённого phone smoke `adb install -r` является лишь non-uninstalling update
 path: новый код/миграции всё равно способны изменить state. `firstInstallTime`
 и тот же account/vault проверяются после обновления, но не считаются
-instrumentation evidence. Guard не распространяется на manual `adb`, прямые
-install/uninstall AndroidTest tasks и будущие managed-device providers; для
-physical instrumentation нужен отдельный wiped/attested workflow.
+instrumentation evidence. Все app-project Gradle `install*`/`uninstall*` tasks
+теперь безусловно блокируются до execution; guard по-прежнему не распространяется
+на manual `adb` и будущие managed-device providers. Для physical instrumentation
+нужен отдельный wiped/attested workflow.
 
 **Локальные checkpoints, ещё не на origin:** `d65927c` содержит mobile Island IA/
 settings, Circle/Space/Rooms/Voice `DESIGN PREVIEW` и нижний safe-area Direct
