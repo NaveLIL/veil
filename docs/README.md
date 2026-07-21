@@ -48,6 +48,7 @@ ADR фиксирует принятое решение и причины. Изм
 - [Android runtime terminal failure review](reviews/android-runtime-terminal-failure-review.md)
 - [Android identity setup reconciliation review](reviews/android-identity-setup-reconciliation-review.md)
 - [Android Direct public-failure action contract](reviews/android-direct-public-failure-action-contract.md)
+- [Android native contacts and Direct initiation contract](reviews/android-native-contacts-direct-initiation-contract.md)
 - [Android tester artifact contract](reviews/android-tester-artifact-contract.md)
 - [Android Direct Preview physical test plan](reviews/android-direct-preview-physical-test-plan.md)
 - [Phase 5S Direct-v1 transcript checkpoint](reviews/phase-5s-direct-v1-transcript-checkpoint.md)

@@ -63,6 +63,11 @@ status and remaining physical/device matrices are tracked in
 - Android still lacks the full Desktop ↔ Android send/outbox/reconnect/airplane/
   process-death device matrix, connected recovery/capture instrumentation,
   app-wide public failure codes, and signed standalone tester distribution.
+  Its native Direct runtime currently opens and services only the authenticated
+  existing Direct directory: Android does not yet provide native user search,
+  friend-request handling, or creation of a new Direct. Those are required for
+  functional desktop parity and must not be represented as a completed mobile
+  contact flow.
   `PublicFailureCodeV1` currently covers Android identity setup and the secure
   runtime gate; Direct session/send/delivery and desktop/Go consumers remain
   open. Calls and the MLS runtime are not enabled as complete user features.

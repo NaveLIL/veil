@@ -50,6 +50,11 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
    Изолированный release-like tester packaging/verifier/CI-контракт уже
    реализован, но стабильный подписанный APK ещё не произведён и не проверен.
    Точный checkpoint приведён в Phase 5.
+   Следующий функциональный parity-срез — native contacts → identity check →
+   friend request → create Direct: текущий Android обслуживает только уже
+   существующий authenticated Direct directory. Контракт, запрещающий
+   renderer-only или cross-origin fallback, зафиксирован в
+   [`android-native-contacts-direct-initiation-contract.md`](docs/reviews/android-native-contacts-direct-initiation-contract.md).
 7. Параллельно с physical Direct gate провести Phase 5S: зафиксировать точный
    protocol transcript, проверить hostile-Node модель, выполнить изолированный
    `libsignal` spike и заказать независимый аудит. До решения 5S текущий Direct

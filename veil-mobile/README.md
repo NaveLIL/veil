@@ -201,6 +201,13 @@ physically confirmed on a Samsung S23. `PublicFailureCodeV1` is implemented for
 identity setup, the secure runtime gate, and the host-tested Direct send/delivery
 action split. The reviewed runtime terminal-failure subset remains process-local
 and is not persisted across OS process death.
+
+This preview currently consumes only the authenticated directory of Direct
+conversations that already exist. It does not provide a native Android user
+search, friend-request lifecycle, or new-Direct creation path. A renderer-only
+contacts UI would be unsafe and misleading: the future capability must bind
+each mutation and resulting peer identity to the exact authenticated native
+origin/account generation.
 Separately, identity-setup results now have a durable native journal/reconciler
 and a fail-closed React bootstrap gate. This implementation has host-only
 automated evidence; Activity recreation and OS process-death cases A04/A05 have

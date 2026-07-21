@@ -86,6 +86,11 @@ native-клиента.
   локальном checkpoint. A04/A05 и cross-client
   E2EE/airplane matrix, connected recovery/capture instrumentation, app-wide
   публичные коды ошибок и подписанный standalone APK ещё входят в Phase 5A/5B.
+  Нативный Android Direct пока открывает и обслуживает только уже
+  аутентифицированный каталог существующих Direct: поиска человека, обработки
+  заявок в друзья и создания нового Direct на Android ещё нет. Эти возможности
+  обязательны для функционального паритета с desktop и не выдаются за готовый
+  mobile contact flow.
   `PublicFailureCodeV1` покрывает Android identity setup и secure runtime gate,
   включая сохранение точной terminal-причины при React recreation, но Direct
   send/delivery и desktop/Go consumer parity открыты; MLS runtime и звонки не
