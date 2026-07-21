@@ -71,6 +71,57 @@ function parseFixture(value, label = "fixture") {
   return parseAndValidateRegistry(canonicalRegistryText(value), label);
 }
 
+function createGitHistoryFixture(prefix) {
+  const temporaryRepository = mkdtempSync(resolve(tmpdir(), prefix));
+  const registryPath = resolve(
+    temporaryRepository,
+    "veil-proto",
+    "public-failure-code-v1.json",
+  );
+  const historyPath = resolve(
+    temporaryRepository,
+    "veil-proto",
+    "history",
+    "public-failure-code-v1.initial.json",
+  );
+  mkdirSync(resolve(temporaryRepository, "veil-proto", "history"), { recursive: true });
+  execFileSync("git", ["init", "--quiet"], { cwd: temporaryRepository });
+  execFileSync("git", ["config", "core.autocrlf", "false"], {
+    cwd: temporaryRepository,
+  });
+  execFileSync("git", ["config", "user.name", "Veil Contract Test"], {
+    cwd: temporaryRepository,
+  });
+  execFileSync("git", ["config", "user.email", "veil-contract-test@invalid"], {
+    cwd: temporaryRepository,
+  });
+  execFileSync("git", ["commit", "--quiet", "--allow-empty", "-m", "baseline"], {
+    cwd: temporaryRepository,
+  });
+  const reference = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: temporaryRepository,
+    encoding: "utf8",
+  }).trim();
+  return { temporaryRepository, registryPath, historyPath, reference };
+}
+
+function commitContractRevision(fixture, registryText, message, commitDate = "") {
+  writeFileSync(fixture.registryPath, registryText, "utf8");
+  writeFileSync(fixture.historyPath, historyRaw, "utf8");
+  execFileSync("git", ["add", "veil-proto"], { cwd: fixture.temporaryRepository });
+  const environment = commitDate === ""
+    ? process.env
+    : {
+        ...process.env,
+        GIT_AUTHOR_DATE: commitDate,
+        GIT_COMMITTER_DATE: commitDate,
+      };
+  execFileSync("git", ["commit", "--quiet", "-m", message], {
+    cwd: fixture.temporaryRepository,
+    env: environment,
+  });
+}
+
 test("reviewed registry preserves the exact 16-code history and appends two Direct codes", () => {
   const registry = parseAndValidateRegistry(registryRaw, "registry");
   const history = parseAndValidateRegistry(historyRaw, "history");
@@ -446,5 +497,144 @@ test("Git baseline comparison accepts append and rejects historical mutation", (
     );
   } finally {
     rmSync(temporaryRepository, { recursive: true, force: true });
+  }
+});
+
+test("Git bootstrap validates an exact initial commit followed by append-only commits", () => {
+  const fixture = createGitHistoryFixture("veil-public-failure-bootstrap-");
+  try {
+    commitContractRevision(fixture, historyRaw, "initial registry snapshot");
+    commitContractRevision(fixture, registryRaw, "append Direct failure codes");
+
+    assert.deepEqual(
+      validateGitHistory({
+        repositoryRoot: fixture.temporaryRepository,
+        reference: fixture.reference,
+        registryPath: fixture.registryPath,
+        historyPath: fixture.historyPath,
+        registry: parseAndValidateRegistry(registryRaw),
+        history: parseAndValidateRegistry(historyRaw),
+      }),
+      { compared: true, bootstrap: true },
+    );
+  } finally {
+    rmSync(fixture.temporaryRepository, { recursive: true, force: true });
+  }
+});
+
+test("Git bootstrap rejects a first committed registry that already contains appends", () => {
+  const fixture = createGitHistoryFixture("veil-public-failure-preappended-");
+  try {
+    commitContractRevision(fixture, registryRaw, "invalid pre-appended registry");
+
+    assert.throws(
+      () =>
+        validateGitHistory({
+          repositoryRoot: fixture.temporaryRepository,
+          reference: fixture.reference,
+          registryPath: fixture.registryPath,
+          historyPath: fixture.historyPath,
+          registry: parseAndValidateRegistry(registryRaw),
+          history: parseAndValidateRegistry(historyRaw),
+        }),
+      /first registry revision must exactly match the immutable initial history snapshot/,
+    );
+  } finally {
+    rmSync(fixture.temporaryRepository, { recursive: true, force: true });
+  }
+});
+
+test("Git bootstrap rejects an intermediate immutable-field mutation even when later restored", () => {
+  const fixture = createGitHistoryFixture("veil-public-failure-intermediate-mutation-");
+  try {
+    commitContractRevision(fixture, historyRaw, "initial registry snapshot");
+    const mutated = parseAndValidateRegistry(historyRaw);
+    mutated.codes[0].semantic_key = "mutated_setup_semantic";
+    commitContractRevision(
+      fixture,
+      canonicalRegistryText(mutated),
+      "invalid intermediate mutation",
+    );
+    commitContractRevision(fixture, registryRaw, "restore and append Direct failure codes");
+
+    assert.throws(
+      () =>
+        validateGitHistory({
+          repositoryRoot: fixture.temporaryRepository,
+          reference: fixture.reference,
+          registryPath: fixture.registryPath,
+          historyPath: fixture.historyPath,
+          registry: parseAndValidateRegistry(registryRaw),
+          history: parseAndValidateRegistry(historyRaw),
+        }),
+      /VEIL-SETUP-001\.semantic_key is immutable/,
+    );
+  } finally {
+    rmSync(fixture.temporaryRepository, { recursive: true, force: true });
+  }
+});
+
+test("Git bootstrap rejects a hidden side-branch mutation when merge keeps the clean tree", () => {
+  const fixture = createGitHistoryFixture("veil-public-failure-side-branch-mutation-");
+  try {
+    commitContractRevision(fixture, historyRaw, "initial registry snapshot");
+    const cleanBranch = execFileSync("git", ["branch", "--show-current"], {
+      cwd: fixture.temporaryRepository,
+      encoding: "utf8",
+    }).trim();
+    execFileSync("git", ["branch", "side-mutation"], {
+      cwd: fixture.temporaryRepository,
+    });
+
+    commitContractRevision(
+      fixture,
+      registryRaw,
+      "append Direct failure codes",
+      "2030-01-02T00:00:00Z",
+    );
+    execFileSync("git", ["switch", "--quiet", "side-mutation"], {
+      cwd: fixture.temporaryRepository,
+    });
+    const mutated = parseAndValidateRegistry(historyRaw);
+    mutated.codes[0].semantic_key = "hidden_side_branch_mutation";
+    commitContractRevision(
+      fixture,
+      canonicalRegistryText(mutated),
+      "mutate immutable identity on side branch",
+      "2030-01-03T00:00:00Z",
+    );
+
+    execFileSync("git", ["switch", "--quiet", cleanBranch], {
+      cwd: fixture.temporaryRepository,
+    });
+    execFileSync(
+      "git",
+      [
+        "merge",
+        "--quiet",
+        "--no-ff",
+        "--strategy=ours",
+        "-m",
+        "merge side history while preserving clean registry",
+        "side-mutation",
+      ],
+      { cwd: fixture.temporaryRepository },
+    );
+    assert.equal(readFileSync(fixture.registryPath, "utf8"), registryRaw);
+
+    assert.throws(
+      () =>
+        validateGitHistory({
+          repositoryRoot: fixture.temporaryRepository,
+          reference: fixture.reference,
+          registryPath: fixture.registryPath,
+          historyPath: fixture.historyPath,
+          registry: parseAndValidateRegistry(registryRaw),
+          history: parseAndValidateRegistry(historyRaw),
+        }),
+      /Git contract history is not linear/,
+    );
+  } finally {
+    rmSync(fixture.temporaryRepository, { recursive: true, force: true });
   }
 });

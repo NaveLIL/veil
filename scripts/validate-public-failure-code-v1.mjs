@@ -328,6 +328,49 @@ function assertGitCommit(repositoryRoot, reference) {
   }
 }
 
+function assertGitAncestor(repositoryRoot, ancestor, descendant) {
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch {
+    fail(`Git contract history is not linear: ${ancestor} is not an ancestor of ${descendant}`);
+  }
+}
+
+function listGitContractRevisions(
+  repositoryRoot,
+  reference,
+  registryRepositoryPath,
+  historyRepositoryPath,
+) {
+  try {
+    const output = execFileSync(
+      "git",
+      [
+        "rev-list",
+        "--reverse",
+        "--topo-order",
+        "--full-history",
+        `${reference}..HEAD`,
+        "--",
+        registryRepositoryPath,
+        historyRepositoryPath,
+      ],
+      {
+        cwd: repositoryRoot,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    ).trim();
+    return output === "" ? [] : output.split(/\r?\n/);
+  } catch {
+    fail(`cannot enumerate PublicFailureCodeV1 revisions after Git baseline ${reference}`);
+  }
+}
+
 function readFileAtGitRef(repositoryRoot, reference, repositoryPath) {
   try {
     return execFileSync("git", ["show", `${reference}:${repositoryPath}`], {
@@ -380,16 +423,74 @@ export function validateGitHistory({
     fail("Git baseline registry exists without its immutable initial history snapshot");
   }
 
-  if (previousRegistryRaw === null) {
-    if (canonicalRegistryText(registry) !== canonicalRegistryText(history)) {
-      fail("first registry revision must exactly match the immutable initial history snapshot");
-    }
-    return { compared: true, bootstrap: true };
+  assertGitAncestor(repositoryRoot, reference, "HEAD");
+  const revisions = listGitContractRevisions(
+    repositoryRoot,
+    reference,
+    registryRepositoryPath,
+    historyRepositoryPath,
+  );
+  const bootstrap = previousRegistryRaw === null;
+  let previousRegistry = previousRegistryRaw === null
+    ? null
+    : parseAndValidateRegistry(previousRegistryRaw, "Git baseline registry");
+  let previousRevision = reference;
+
+  if (bootstrap && revisions.length === 0) {
+    fail("cannot locate the first committed registry revision after the Git baseline");
   }
 
-  const previousRegistry = parseAndValidateRegistry(previousRegistryRaw, "Git baseline registry");
-  validateAppendOnly(previousRegistry, registry, `Git baseline ${reference}`);
-  return { compared: true, bootstrap: false };
+  for (const revision of revisions) {
+    assertGitAncestor(repositoryRoot, previousRevision, revision);
+    const revisionHistoryRaw = readFileAtGitRef(
+      repositoryRoot,
+      revision,
+      historyRepositoryPath,
+    );
+    if (revisionHistoryRaw === null) {
+      fail(`Git revision ${revision} is missing the immutable initial history snapshot`);
+    }
+    const revisionHistory = parseAndValidateRegistry(
+      revisionHistoryRaw,
+      `Git revision ${revision} history`,
+    );
+    if (canonicalRegistryText(revisionHistory) !== canonicalRegistryText(history)) {
+      fail(`initial history snapshot changed at Git revision ${revision}`);
+    }
+
+    const revisionRegistryRaw = readFileAtGitRef(
+      repositoryRoot,
+      revision,
+      registryRepositoryPath,
+    );
+    if (revisionRegistryRaw === null) {
+      fail(`Git revision ${revision} deleted or omitted the registry`);
+    }
+    const revisionRegistry = parseAndValidateRegistry(
+      revisionRegistryRaw,
+      `Git revision ${revision} registry`,
+    );
+
+    if (previousRegistry === null) {
+      if (canonicalRegistryText(revisionRegistry) !== canonicalRegistryText(history)) {
+        fail("first registry revision must exactly match the immutable initial history snapshot");
+      }
+    } else {
+      validateAppendOnly(
+        previousRegistry,
+        revisionRegistry,
+        `Git revision ${previousRevision} -> ${revision}`,
+      );
+    }
+    previousRegistry = revisionRegistry;
+    previousRevision = revision;
+  }
+
+  if (previousRegistry === null) {
+    fail("Git history did not produce a registry revision");
+  }
+  validateAppendOnly(previousRegistry, registry, `Git working tree after ${previousRevision}`);
+  return { compared: true, bootstrap };
 }
 
 function usage(message) {
