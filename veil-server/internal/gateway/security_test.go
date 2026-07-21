@@ -5,10 +5,35 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/NaveLIL/veil/veil-server/internal/httpmw"
 )
+
+func TestFriendWireIDsAreCanonicalAndMessageBounded(t *testing.T) {
+	valid := "a0000000-0000-4000-8000-000000000001"
+	for _, value := range []string{
+		valid,
+		strings.ToUpper(valid),
+		strings.ReplaceAll(valid, "-", ""),
+		"00000000-0000-0000-0000-000000000000",
+		"not-a-uuid",
+	} {
+		want := value == valid
+		if got := isCanonicalNonNilUUID(value); got != want {
+			t.Fatalf("isCanonicalNonNilUUID(%q) = %v, want %v", value, got, want)
+		}
+	}
+	exactMessage := strings.Repeat("x", maxFriendRequestMessageBytes)
+	overlongMessage := strings.Repeat("x", maxFriendRequestMessageBytes+1)
+	if !isValidFriendRequestInput(valid, &exactMessage) {
+		t.Fatal("exact-bound friend request must remain valid")
+	}
+	if isValidFriendRequestInput(valid, &overlongMessage) {
+		t.Fatal("overlong friend request must be rejected")
+	}
+}
 
 func makeSenderKeyEnvelopeV3(group string, generation uint32, identity []byte, signingKey ed25519.PrivateKey, recipient []byte) []byte {
 	return makeSenderKeyEnvelopeV3WithMarker(group, generation, identity, signingKey, recipient, 1)

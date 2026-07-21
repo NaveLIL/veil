@@ -44,6 +44,12 @@ const MAX_EVENT_CIPHERTEXT_BYTES: usize = 64 * 1024;
 const MAX_EVENT_HEADER_BYTES: usize = 512;
 const MAX_SEND_MESSAGE_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_ERROR_REASON_BYTES: usize = 64;
+/// Contacts are authenticated transport metadata, not an unbounded UI cache.
+/// Keep this aligned with the Direct directory's hard maximum until the
+/// versioned native contacts state machine replaces the desktop-era events.
+const MAX_FRIEND_LIST_ENTRIES: usize = 10_000;
+const MAX_FRIEND_USERNAME_BYTES: usize = 128;
+const MAX_FRIEND_REQUEST_MESSAGE_BYTES: usize = 1_024;
 
 fn client_version(client_id: &str) -> String {
     format!("{client_id}/{}", env!("CARGO_PKG_VERSION"))
@@ -2831,6 +2837,66 @@ fn is_valid_error_reason(value: &str) -> bool {
         })
 }
 
+fn is_valid_friend_username(value: &str) -> bool {
+    !value.is_empty() && value.len() <= MAX_FRIEND_USERNAME_BYTES
+}
+
+fn is_valid_friend_timestamp(value: u64) -> bool {
+    value != 0 && value <= i64::MAX as u64
+}
+
+fn validate_friend_request_fields(
+    request_id: &str,
+    from_user_id: &str,
+    from_username: &str,
+    message: Option<&str>,
+    timestamp: u64,
+) -> bool {
+    is_canonical_lowercase_uuid(request_id)
+        && is_canonical_lowercase_uuid(from_user_id)
+        && is_valid_friend_username(from_username)
+        && message.is_none_or(|message| message.len() <= MAX_FRIEND_REQUEST_MESSAGE_BYTES)
+        && is_valid_friend_timestamp(timestamp)
+}
+
+fn validate_friend_list_response(
+    friends: &[proto::FriendEntry],
+    pending_requests: &[proto::FriendRequestEntry],
+) -> bool {
+    if friends.len() > MAX_FRIEND_LIST_ENTRIES || pending_requests.len() > MAX_FRIEND_LIST_ENTRIES {
+        return false;
+    }
+
+    let mut friend_user_ids = HashSet::with_capacity(friends.len());
+    for friend in friends {
+        if !is_canonical_lowercase_uuid(&friend.user_id)
+            || !is_valid_friend_username(&friend.username)
+            || proto::PresenceStatus::try_from(friend.status).is_err()
+            || friend
+                .last_seen
+                .is_some_and(|last_seen| !is_valid_friend_timestamp(last_seen))
+            || !friend_user_ids.insert(friend.user_id.as_str())
+        {
+            return false;
+        }
+    }
+
+    let mut request_ids = HashSet::with_capacity(pending_requests.len());
+    for request in pending_requests {
+        if !validate_friend_request_fields(
+            &request.request_id,
+            &request.from_user_id,
+            &request.from_username,
+            request.message.as_deref(),
+            request.timestamp,
+        ) || !request_ids.insert(request.request_id.as_str())
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Decode a post-authentication envelope which is part of the event contract.
 ///
 /// Known payloads that this client intentionally does not consume remain an
@@ -3004,6 +3070,15 @@ fn connection_event_from_envelope(
             last_seen: pu.last_seen,
         },
         Some(proto::envelope::Payload::FriendRequestEvent(fre)) => {
+            if !validate_friend_request_fields(
+                &fre.request_id,
+                &fre.from_user_id,
+                &fre.from_username,
+                fre.message.as_deref(),
+                fre.timestamp,
+            ) {
+                return Err(protocol_violation("FriendRequestEvent"));
+            }
             ConnectionEvent::FriendRequestReceived {
                 request_id: fre.request_id,
                 from_user_id: fre.from_user_id,
@@ -3013,15 +3088,28 @@ fn connection_event_from_envelope(
             }
         }
         Some(proto::envelope::Payload::FriendAcceptedEvent(fae)) => {
+            if !is_canonical_lowercase_uuid(&fae.user_id)
+                || !is_valid_friend_username(&fae.username)
+            {
+                return Err(protocol_violation("FriendAcceptedEvent"));
+            }
             ConnectionEvent::FriendAccepted {
                 user_id: fae.user_id,
                 username: fae.username,
             }
         }
-        Some(proto::envelope::Payload::FriendRemovedEvent(fre)) => ConnectionEvent::FriendRemoved {
-            user_id: fre.user_id,
-        },
+        Some(proto::envelope::Payload::FriendRemovedEvent(fre)) => {
+            if !is_canonical_lowercase_uuid(&fre.user_id) {
+                return Err(protocol_violation("FriendRemovedEvent"));
+            }
+            ConnectionEvent::FriendRemoved {
+                user_id: fre.user_id,
+            }
+        }
         Some(proto::envelope::Payload::FriendListResponse(flr)) => {
+            if !validate_friend_list_response(&flr.friends, &flr.pending_requests) {
+                return Err(protocol_violation("FriendListResponse"));
+            }
             ConnectionEvent::FriendListReceived {
                 friends: flr
                     .friends
@@ -4083,6 +4171,125 @@ mod tests {
             ..Default::default()
         })
         .is_err());
+    }
+
+    #[test]
+    fn friend_event_contract_is_bounded_canonical_and_duplicate_free() {
+        const FRIEND_ID: &str = "e0000000-0000-4000-8000-000000000001";
+        const REQUEST_ID: &str = "f0000000-0000-4000-8000-000000000001";
+
+        let request = proto::FriendRequestEvent {
+            request_id: REQUEST_ID.to_string(),
+            from_user_id: FRIEND_ID.to_string(),
+            from_username: "user_friend".to_string(),
+            message: Some("hello".to_string()),
+            timestamp: 1,
+        };
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::FriendRequestEvent(request)),
+                ..Default::default()
+            }),
+            Ok(Some(ConnectionEvent::FriendRequestReceived {
+                request_id,
+                from_user_id,
+                ..
+            })) if request_id == REQUEST_ID && from_user_id == FRIEND_ID
+        ));
+
+        let valid_list = proto::FriendListResponse {
+            friends: vec![proto::FriendEntry {
+                user_id: FRIEND_ID.to_string(),
+                username: "user_friend".to_string(),
+                status: 1,
+                last_seen: Some(1),
+            }],
+            pending_requests: vec![proto::FriendRequestEntry {
+                request_id: REQUEST_ID.to_string(),
+                from_user_id: FRIEND_ID.to_string(),
+                from_username: "user_friend".to_string(),
+                message: None,
+                timestamp: 1,
+                outgoing: false,
+            }],
+        };
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::FriendListResponse(valid_list)),
+                ..Default::default()
+            }),
+            Ok(Some(ConnectionEvent::FriendListReceived {
+                friends,
+                pending_requests,
+            })) if friends.len() == 1 && pending_requests.len() == 1
+        ));
+
+        let invalid_request = proto::FriendRequestEvent {
+            request_id: REQUEST_ID.to_uppercase(),
+            from_user_id: FRIEND_ID.to_string(),
+            from_username: "user_friend".to_string(),
+            message: None,
+            timestamp: 1,
+        };
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::FriendRequestEvent(
+                    invalid_request
+                )),
+                ..Default::default()
+            }),
+            Err(ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "FriendRequestEvent"
+            })
+        ));
+
+        let duplicate_friend_list = proto::FriendListResponse {
+            friends: vec![
+                proto::FriendEntry {
+                    user_id: FRIEND_ID.to_string(),
+                    username: "user_friend".to_string(),
+                    status: 1,
+                    last_seen: None,
+                },
+                proto::FriendEntry {
+                    user_id: FRIEND_ID.to_string(),
+                    username: "user_friend_renamed".to_string(),
+                    status: 1,
+                    last_seen: None,
+                },
+            ],
+            pending_requests: Vec::new(),
+        };
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::FriendListResponse(
+                    duplicate_friend_list
+                )),
+                ..Default::default()
+            }),
+            Err(ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "FriendListResponse"
+            })
+        ));
+
+        let invalid_status = proto::FriendListResponse {
+            friends: vec![proto::FriendEntry {
+                user_id: FRIEND_ID.to_string(),
+                username: "user_friend".to_string(),
+                status: 99,
+                last_seen: None,
+            }],
+            pending_requests: Vec::new(),
+        };
+        assert!(matches!(
+            connection_event_from_envelope(proto::Envelope {
+                payload: Some(proto::envelope::Payload::FriendListResponse(invalid_status)),
+                ..Default::default()
+            }),
+            Err(ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "FriendListResponse"
+            })
+        ));
     }
 
     #[tokio::test]

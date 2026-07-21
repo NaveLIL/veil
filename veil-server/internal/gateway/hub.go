@@ -33,9 +33,14 @@ import (
 
 const (
 	maxMessageSize = 64 * 1024
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
+	// Friend metadata travels over the same authenticated event queue as Direct
+	// traffic. Keep sender validation aligned with the client ingress bound so
+	// one client cannot persist a request that forces another to reject its
+	// authenticated epoch.
+	maxFriendRequestMessageBytes = 1024
+	writeWait                    = 10 * time.Second
+	pongWait                     = 60 * time.Second
+	pingPeriod                   = (pongWait * 9) / 10
 
 	// defaultMaxConnsPerIP caps concurrent WebSocket connections originating
 	// from a single client IP. Override via VEIL_WS_MAX_CONNS_PER_IP. Zero or
@@ -1528,6 +1533,10 @@ func (h *Hub) broadcastPresenceOnDisconnect(userID string, identityKey []byte) {
 // --- Friends ---
 
 func (c *Client) handleFriendRequest(ctx context.Context, seq uint64, req *pb.FriendRequest) {
+	if !isValidFriendRequestInput(req.TargetUserId, req.Message) {
+		c.sendError(seq, http.StatusBadRequest, "invalid friend request")
+		return
+	}
 	// Prevent self-friend
 	if req.TargetUserId == c.userID {
 		c.sendError(seq, 400, "cannot send friend request to yourself")
@@ -1603,6 +1612,10 @@ func (c *Client) handleFriendRequest(ctx context.Context, seq uint64, req *pb.Fr
 }
 
 func (c *Client) handleFriendRespond(ctx context.Context, seq uint64, resp *pb.FriendRespond) {
+	if !isCanonicalNonNilUUID(resp.RequestId) {
+		c.sendError(seq, http.StatusBadRequest, "invalid friend request response")
+		return
+	}
 	if resp.Accept {
 		otherUserID, err := c.hub.chatSvc.DB().AcceptFriendRequest(ctx, resp.RequestId, c.userID)
 		if err != nil {
@@ -1671,6 +1684,10 @@ func (c *Client) handleFriendRespond(ctx context.Context, seq uint64, resp *pb.F
 }
 
 func (c *Client) handleFriendRemove(ctx context.Context, seq uint64, req *pb.FriendRemove) {
+	if !isCanonicalNonNilUUID(req.UserId) {
+		c.sendError(seq, http.StatusBadRequest, "invalid friend id")
+		return
+	}
 	err := c.hub.chatSvc.DB().RemoveFriend(ctx, c.userID, req.UserId)
 	if err != nil {
 		c.sendPublicError(seq, http.StatusBadRequest, err)
@@ -1772,6 +1789,16 @@ func (c *Client) handleFriendListRequest(ctx context.Context, seq uint64) {
 			},
 		},
 	})
+}
+
+func isCanonicalNonNilUUID(value string) bool {
+	parsed, err := uuid.Parse(value)
+	return err == nil && parsed != uuid.Nil && parsed.String() == value
+}
+
+func isValidFriendRequestInput(targetUserID string, message *string) bool {
+	return isCanonicalNonNilUUID(targetUserID) &&
+		(message == nil || len(*message) <= maxFriendRequestMessageBytes)
 }
 
 // --- Helpers ---

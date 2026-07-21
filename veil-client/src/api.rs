@@ -9088,6 +9088,11 @@ impl VeilClient {
         target_user_id: &str,
         message: Option<&str>,
     ) -> Result<(), String> {
+        if !Self::is_canonical_live_uuid_v1(target_user_id)
+            || message.is_some_and(|message| message.len() > 1_024)
+        {
+            return Err("invalid friend request".to_string());
+        }
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let seq = conn.next_seq().await;
         conn.send_envelope(&proto::Envelope {
@@ -9109,6 +9114,9 @@ impl VeilClient {
         request_id: &str,
         accept: bool,
     ) -> Result<(), String> {
+        if !Self::is_canonical_live_uuid_v1(request_id) {
+            return Err("invalid friend request response".to_string());
+        }
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let seq = conn.next_seq().await;
         conn.send_envelope(&proto::Envelope {
@@ -9126,6 +9134,9 @@ impl VeilClient {
 
     /// Remove a friend.
     pub async fn remove_friend(&self, user_id: &str) -> Result<(), String> {
+        if !Self::is_canonical_live_uuid_v1(user_id) {
+            return Err("invalid friend id".to_string());
+        }
         let conn = self.connection.as_ref().ok_or("not connected")?;
         let seq = conn.next_seq().await;
         conn.send_envelope(&proto::Envelope {
@@ -19077,6 +19088,42 @@ mod tests {
         let messages = client.db().unwrap().get_messages("dm-ack", 10).unwrap();
         assert_eq!(messages[0].id, "server-message");
         assert_eq!(messages[0].server_timestamp, Some(2));
+    }
+
+    #[tokio::test]
+    async fn friend_mutations_reject_malformed_or_oversized_input_before_transport() {
+        let client = VeilClient::new();
+        assert_eq!(
+            client
+                .send_friend_request("not-a-uuid", None)
+                .await
+                .unwrap_err(),
+            "invalid friend request"
+        );
+        assert_eq!(
+            client
+                .send_friend_request(
+                    "a0000000-0000-4000-8000-000000000001",
+                    Some(&"x".repeat(1_025)),
+                )
+                .await
+                .unwrap_err(),
+            "invalid friend request"
+        );
+        assert_eq!(
+            client
+                .respond_friend_request("not-a-uuid", true)
+                .await
+                .unwrap_err(),
+            "invalid friend request response"
+        );
+        assert_eq!(
+            client
+                .remove_friend(uuid::Uuid::nil().to_string().as_str())
+                .await
+                .unwrap_err(),
+            "invalid friend id"
+        );
     }
 }
 
