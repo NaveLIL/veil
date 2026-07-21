@@ -76,8 +76,11 @@ status and remaining physical/device matrices are tracked in
 - Platform signing, multi-device, attachment, and distributor matrices still
   require release evidence.
 - There is no full browser client. Web surfaces are deliberately limited to
-  the project site, origin-hosted Node Access and Space invitation pages, and
-  a narrow one-time Share Viewer.
+  the project site and origin-hosted Node Access and Space invitation pages.
+  A narrow Secure Share Viewer is planned, but the current WASM module is an
+  unwired prototype rather than a working public service.
+- Node-wide administration, an in-product report queue, and the production
+  guest Secure Share flow are planned contracts, not completed Preview features.
 
 ## Security boundary
 
@@ -126,7 +129,7 @@ databases, or unsanitized logs in a public Issue.
 | **veil-mobile** | Closed Android Direct Preview using React Native, Kotlin, and Rust/UniFFI |
 | **veil-server** | Go Veil Node gateway and hosted web surfaces |
 | **veil-proto** | Protobuf wire contracts |
-| **veil-share-viewer** | Isolated one-time share viewer |
+| **veil-share-viewer** | Experimental viewer prototype; production Secure Share is not wired |
 | **deploy** | Production Compose, Nginx, backup, rollback, and smoke procedures |
 
 ## Build and run pointers

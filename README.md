@@ -52,9 +52,10 @@ Preview-сборки, но ещё не достиг стабильного ре�
 
 Браузерного клиента Veil нет и не планируется. Web-поверхности ограничены
 статическим сайтом/документацией/загрузками, origin-hosted страницами Node
-Access Pass и preview Veil Link, а также узким one-time Share Viewer. Они не
-получают account session, recovery flow, историю сообщений или ключи
-native-клиента.
+Access Pass и preview Veil Link. Узкий Secure Share Viewer запланирован, но
+текущий WASM-модуль является несвязанным с gateway прототипом, а не работающим
+публичным сервисом. Эти поверхности не получают account session, recovery flow,
+историю сообщений или ключи native-клиента.
 
 ## Текущее состояние
 
@@ -72,6 +73,9 @@ native-клиента.
 - Phase 4E Veil Spaces implementation и automated gate выполнены; физическая
   desktop↔desktop Veil Link/multi-device матрица остаётся обязательным release
   evidence.
+- Phase 4F Node administration/reports и Phase 4G Secure Share добавлены как
+  planned contracts. Space moderation foundation существует, но Node console,
+  report queue и production guest-share flow ещё не реализованы.
 - Phase 3B desktop attachments имеет существенную реализацию, но product gate
   остаётся открытым до физической upload/download/tamper/resume/media matrix.
 - Phase 4P transport core и desktop management существуют, но native mobile
@@ -116,7 +120,7 @@ native-клиента.
 | `veil-desktop` | Rust + SolidJS | Tauri v2 desktop client и Island UI |
 | `veil-mobile` | TypeScript + Kotlin + Rust | закрытый Android Direct Preview; tester signing и physical exit matrix открыты |
 | `veil-mls` | Rust | экспериментальный OpenMLS foundation, выключенный в desktop runtime |
-| `veil-share-viewer` | Rust/WASM | изолированный viewer для one-time secure-share capability |
+| `veil-share-viewer` | Rust/WASM | экспериментальный viewer prototype; production Secure Share ещё не подключён |
 
 ## Security model и известные границы
 

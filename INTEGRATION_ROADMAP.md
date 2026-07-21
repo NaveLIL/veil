@@ -1,6 +1,6 @@
 # Дорожная карта Veil
 
-> Актуально на 2026-07-20. Это основной продуктовый и интеграционный план.
+> Актуально на 2026-07-21. Это основной продуктовый и интеграционный план.
 > [`ROADMAP.md`](ROADMAP.md) сохранён как исторический security/infra backlog;
 > при расхождении приоритетов главным считается этот документ.
 
@@ -40,7 +40,11 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 5. Phase 3B и 4P сохраняются отдельными незакрытыми product scopes: имеющийся
    desktop/transport foundation не заменяет physical attachment и native mobile
    push device matrices.
-6. Продолжить Android Direct Preview: foundation/runtime 5A, receive/read,
+6. До public beta закрыть Phase 4F: отделить полномочия Node operator от Space
+   moderation, добавить транзакционный audit и встроенный report/case lifecycle.
+7. Secure Share вести как отдельную Phase 4G: сначала reviewed text/small-payload
+   capability, затем streaming large-file flow на фундаменте Phase 3B.
+8. Продолжить Android Direct Preview: foundation/runtime 5A, receive/read,
    one-shot peer-prekey, shared idempotent send/outbox, typed ACK deadline,
    transient reconnect и automated canonical-origin process-death recovery уже
    реализованы. Ограниченный Samsung S23 smoke подтверждает Pass registration,
@@ -55,11 +59,11 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
    существующий authenticated Direct directory. Контракт, запрещающий
    renderer-only или cross-origin fallback, зафиксирован в
    [`android-native-contacts-direct-initiation-contract.md`](docs/reviews/android-native-contacts-direct-initiation-contract.md).
-7. Параллельно с physical Direct gate провести Phase 5S: зафиксировать точный
+9. Параллельно с physical Direct gate провести Phase 5S: зафиксировать точный
    protocol transcript, проверить hostile-Node модель, выполнить изолированный
    `libsignal` spike и заказать независимый аудит. До решения 5S текущий Direct
    остаётся Preview-only, а stable/critical-use claims заблокированы.
-8. Затем довести MLS runtime, звонки и release polish.
+10. Затем довести MLS runtime, звонки и release polish.
 
 ## Статус по фазам
 
@@ -74,6 +78,8 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 4C | Server Channel Crypto Decision | baseline закрыт: exact-device/offline/ACK/atomic recovery реализованы |
 | 4D | Identity Island & Profiles | закрыто: product/security scope и completion gate зелёные |
 | 4E | Veil Spaces Experience | implementation/automated gate закрыты; manual two-device Veil Link matrix pending |
+| 4F | Node Administration, Moderation & Reports | запланировано: Space moderation существует, Node console/report queue отсутствуют |
+| 4G | Secure Share for guests | prototype foundation существует; production gateway/viewer/large-file lifecycle отсутствуют |
 | 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; durable setup-result reconciliation реализован и host-tested в текущем локальном checkpoint; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
@@ -102,10 +108,12 @@ origin, identity, границы доступа и фактический crypto
 | **Room** | функциональный контекст внутри Space | text Room сейчас соответствует `channel` и отдельной conversation/security domain |
 | **Veil Node** | self-hosted инфраструктура и canonical origin аккаунта | exact `(scheme, host, effective port)` origin |
 | **Veil Link** | versioned приглашение в Space | scoped capability, не browser session и не identity proof |
+| **Secure Share** *(reserved planned term)* | настраиваемая E2EE-ссылка для текста/файлов получателю без аккаунта | несовместимые prototype crypto/schema/viewer pieces; production flow отсутствует |
 | **Community** *(future)* | публикационное совместное пространство с постами, комментариями, реакциями и опросами | отдельный будущий product/schema/privacy/security contract; runtime отсутствует |
 
 `Home`, `Direct`, `Circle`, `Space`, `Room`, `Veil Link` и `Veil Node` являются
-продуктовым языком. Внутренние `dm/group/server/channel` в PostgreSQL, REST,
+текущим продуктовым языком. `Secure Share` зарезервирован только для Phase 4G и
+не означает доступную функцию. Внутренние `dm/group/server/channel` в PostgreSQL, REST,
 protobuf и Rust/Go не переименовываются механически: это точные protocol/storage
 сущности, а не обязательство поддерживать старую информационную архитектуру.
 Ни один UI-термин не меняет crypto mode, ACL, roster или history policy.
@@ -1251,6 +1259,196 @@ Link от public preview до явного authenticated join. Permission/device
 protocol/security, Docker, visual/a11y, Windows native и ручная физическая
 desktop↔desktop матрицы зелёные; полный installer собирается на completion gate,
 а не после каждого малого UI-checkpoint.
+
+---
+
+## Phase 4F — Node Administration, Moderation & Reports
+
+**Статус 2026-07-15: запланировано.** Полноценной Node-админки и встроенной
+системы жалоб сейчас нет. Реализованы роли/ACL, kick, authoritative Space ban/
+unban и Veil Links внутри отдельного Space; `veil-admin` умеет только создавать
+Node Access Pass. Текущий пользовательский abuse flow — ручное обращение на
+`abuse@erez.pro`.
+
+Полный product/security contract находится в
+[`docs/product/node-administration-and-reports.md`](docs/product/node-administration-and-reports.md).
+Phase 4F разделяет две независимые authority:
+
+- Space owner/moderator управляет только своим Space;
+- Node operator управляет одним self-hosted инстансом, admission, account
+  availability, quotas и abuse cases. Report schema не имеет key-material fields,
+  а официальный клиент не читает/не экспортирует recovery/account/device/ratchet/
+  attachment stores. Storage получает encrypted evidence package, а выбранный
+  untrusted plaintext раскрывается только authorized moderation role. Existing
+  TOFU/malicious-service limits сохраняются до transparency work.
+
+### 4F.1 — private operator boundary и CLI
+
+- Отдельная operator identity/authorization namespace, не обычный Veil account
+  и не Space role.
+- CLI-first управление через local root-owned boundary; удалённо — SSH/private
+  management network. Public `/admin` с обычной account session не добавляется.
+- Bounded list/inspect account/device state, lifecycle Node Access Pass и quota.
+  Node-level account/device denial хранится отдельно от account-signed device
+  binding и увеличивает monotonic authorization revision; REST остаётся stateless,
+  а live session означает WebSocket connection.
+- Высокорисковые действия требуют reason, expected revision и повторной
+  авторизации; санкция и typed audit entry фиксируются атомарно.
+
+### 4F.2 — Space moderation parity
+
+- Desktop открывает kick/ban/unban делегированным ролям ровно по authoritative
+  permissions, а не только owner UI condition.
+- Добавляются warning/timeout/mute с bounded reason/expiry и понятным appeal
+  path; Space ban остаётся отдельным от Node suspension.
+- `Manage Messages` либо получает review и реальную серверную semantics для
+  чужого сообщения, либо удаляется из UI до реализации. Нельзя показывать
+  неработающее moderation permission.
+
+### 4F.3 — reports и добровольное evidence disclosure
+
+- In-app `Report` покрывает account/profile, Space/Room metadata, Veil Link,
+  Secure Share, file и конкретное message reference.
+- Жалоба имеет bounded category/comment, random receipt ID, deduplication и
+  retention. Per-account/capability/IP limits ограничивают cost/queue growth;
+  uniform response не перечисляет чужие аккаунты, receipt не раскрывает case/
+  target data, attacker-selected content не отражается третьим лицам.
+- E2EE plaintext/attachment передаётся модератору только после отдельного
+  подтверждения точного выбранного evidence. История, recovery phrase,
+  ratchet/file keys и unrelated context не прикладываются автоматически.
+- Selective-disclosure evidence получает отдельный crypto review: reporter-
+  supplied plaintext нельзя без доказательства называть verified authorship.
+
+### 4F.4 — audit и private console
+
+- Typed hash-linked operator journal хранит scoped immutable actor/action/target/
+  case/reason, timestamp и commitment предыдущей записи. Tamper evidence против
+  root/DB operator требует independently signed checkpoint с custody вне live
+  Node/DB, append-only export, fork/rollback detection и verifier procedure. В
+  journal нет username, public key, raw
+  content, token, IP или arbitrary JSON; доступ к evidence также audit event.
+- Case lifecycle revision-checked и идемпотентен при concurrent operators:
+  `new -> triaged -> actioned | dismissed -> appealed? -> closed`.
+- Private console начинается read-only dashboard и только затем получает узкие
+  mutations. Operator authentication, short session, re-auth, CSRF/CSP и
+  отсутствие browser-stored bearer являются blocking requirements.
+
+Критерий выхода: Space moderator не может получить Node privileges; report schema
+не имеет key fields и official evidence builder не читает/автоматически не
+экспортирует protected key stores; storage получает encrypted evidence package,
+а selected untrusted content доступен только authorized moderation role. TOFU/
+malicious-service limits документированы. DB sanction + audit является
+linearization point: после commit новая revision блокирует stale HTTP/WS auth,
+а соединения закрываются идемпотентно в bounded deadline. Concurrent sanction/
+case операции сохраняют audit chain и independently verified checkpoint, а
+purge/backup/restore не воскресают истёкшее evidence. Integration/concurrency/
+security/native UI/privacy gates зелёные. До
+этого момента продукт честно описывает только Space administration и ручной
+abuse contact.
+
+---
+
+## Phase 4G — Secure Share for guests
+
+**Статус 2026-07-15: prototype foundation, production flow отсутствует.** В
+репозитории есть legacy `shares` schema, small-payload crypto и экспериментальный
+WASM viewer, но gateway не регистрирует share API, ожидаемый viewer bundle/API
+не собирается, schema/protobuf/password formats не согласованы, а whole-buffer
+JSON/WASM path непригоден для больших файлов.
+
+Авторитетный planned contract находится в
+[`docs/product/secure-share-for-guests.md`](docs/product/secure-share-for-guests.md).
+Secure Share — узкая E2EE capability: зарегистрированный creator отправляет
+текст/файлы получателю без Veil account. Это не browser messenger и не anonymous
+account session.
+
+Canonical v1 link имеет вид:
+
+```text
+https://node.example/s/v1/<public-selector>#k=<root-secret>
+```
+
+Selector только находит запись. 256-bit fragment secret не уходит в HTTP request;
+domain-separated KDF с version/origin/selector context независимо выводит content,
+redemption и report capability material. Node хранит только domain-separated
+credential hashes и ciphertext; успешный claim выдаёт отдельный random lease
+credential. Initial metadata preview ничего не consume: link scanner/unfurl/
+prefetch не должен сжигать секрет. Claim/download pinned к canonical API origin,
+запрещают redirects/downgrade/alternate ports, передают lease только в
+`Authorization`, а cross-origin viewer использует exact CORS allowlist.
+
+### 4G.1 — text и small payload
+
+- Versioned authenticated envelope с hard size bound и encrypted manifest.
+- Native create/list/revoke, bounded TTL и claim count, explicit user claim,
+  atomic consume и отдельная короткая lease на каждый claim.
+- Dedicated cookieless viewer origin (или `credentials: omit` и cookie-ignoring
+  API) без third-party resources, analytics, service worker и generic Veil IPC;
+  строгий CSP, `no-store` для capability responses, `no-referrer`, `nosniff`,
+  `noindex` и generic public errors.
+- Browser threat model честно ограничен: malicious Node может подменить viewer
+  code во время открытия. Signed native client является более сильным
+  code-integrity path.
+
+### 4G.2 — streaming files
+
+- Переиспользуются Phase 3B chunked AEAD и tus только для authenticated creator
+  upload с immutable `purpose=secure_share`/`draft_share_id`, one-time binding и
+  retention, clamped by share expiry. Dual message/share attachment запрещён.
+  Обычный account bearer не расширяется до guest access.
+- Отдельная guest download lease ограничена одним share и immutable blob set.
+  Filename, MIME, digest, chunk geometry и text находятся в encrypted manifest;
+  сервер видит ciphertext size/timing/lifecycle metadata.
+- Viewer проверяет полные AEAD chunks с bounded memory. Multi-gigabyte base64
+  JSON, Rust `Vec`, JS array или browser `Blob` запрещены. Browser хранит в
+  private/OPFS только ciphertext либо plaintext, повторно зашифрованный случайным
+  page-lifetime key, и экспортирует лишь проверенный результат; orphan ciphertext
+  очищается при startup. Без audited atomic file API используется native fallback. Resume
+  совпадает с authenticated chunk boundaries и не публикует partial plaintext
+  как завершённый файл.
+
+### Claim, burn и password contract
+
+- Share state: `active -> burned | expired | revoked -> purging`; каждый
+  successful claim атомарно увеличивает `consumed_claims` и создаёт собственную
+  `issued -> expired | revoked` lease. Abandoned lease остаётся consumed,
+  completion ACK является telemetry. Browser resume ограничен жизнью страницы;
+  crash/resume разрешён native client только с reviewed OS-protected storage.
+- Expiry/revoke commit запрещает новые claim/range/resume requests и помечает
+  leases revoked; active responses отменяются best-effort в bounded deadline,
+  уже отправленные/буферизованные байты не возвращаются. Burn запрещает новые
+  claims, но purge ждёт terminal state ранее выданных leases и затем повторяется
+  идемпотентно. Backup retention не реактивирует burned link.
+- «Самоуничтожение» означает закрытие последующей серверной авторизации и удаление
+  hosted ciphertext после terminal leases. Оно не удаляет уже переданные байты,
+  сохранённую копию, screenshot или память получателя — UI не обещает невозможного.
+- Legacy downloadable wrapped-key password допускает offline brute force, поэтому
+  server rate limit его не защищает. Candidate V1 требует ADR: password как
+  server-verified второй gate поверх fragment secret, server-bounded Argon2,
+  capability-first checks и единая password+lease transaction. DB theft допускает
+  offline guessing verifier; zero-knowledge требует отдельного OPAQUE/PAKE review.
+
+### Abuse boundary и completion gate
+
+Первый релиз разрешает upload только authenticated creator и применяет account/
+IP/storage/concurrency quotas, orphan cleanup, emergency disable и operator
+revoke. Guest Drop с anonymous upload является отдельным будущим capability и не
+входит в 4G. Guest report использует domain-separated report capability, uniform
+response и отдельные лимиты, не передаёт root secret и не consume claim. Только
+явно выбранный untrusted plaintext раскрывается через consent flow Phase 4F;
+официальный builder не читает и не экспортирует protected key stores.
+
+Критерий выхода: secrets отсутствуют в path/query/application log/referrer/
+application cache/telemetry, а browser history/sync boundary документирован;
+redirect/origin policy fail closed; claim/lease/expiry/revoke races атомарны;
+wrong key/password, tamper, truncation,
+reorder, cross-share substitution и corrupt resume fail closed; browser CSP/XSS
+matrix зелёная; Windows/Linux create и physical text/small/maximum-file/native
+crash-resume flows пройдены; browser тестируется только в declared API matrix с
+verified temporary publication, а crash/reload/cancel не оставляет readable
+plaintext residue; quota, purge retry, backup retention и abuse revoke имеют
+integration/operations evidence. До versioned ADR, threat model и security
+review функция остаётся `planned/prototype`.
 
 ---
 
@@ -2465,10 +2663,11 @@ path. Все сетевые обращения наружу либо отсут�
   работает в LAN без WAN и не проксирует invite secret через центральный сайт;
 - браузерного клиента Veil не будет. Помимо статических product/docs/download
   страниц и локальной gateway landing разрешены только два узких capability-
-  oriented web flow: one-time Share Viewer с собственным ограниченным threat
-  model и unauthenticated allowlisted Veil Link preview. Ни один из них не
-  становится web messenger и не получает account identity/session, recovery
-  flow или keys.
+  oriented web flow: будущий Secure Share Viewer с собственным ограниченным
+  threat model и существующий unauthenticated allowlisted Veil Link preview.
+  Ни один из них не становится web messenger и не получает account identity/
+  session, recovery flow или keys. Наличие prototype `veil-share-viewer` не
+  считается production surface до completion gate Phase 4G.
 
 Компрометация сайта не должна позволять выдать изменённый клиент за Veil:
 подпись приложения проверяется ОС, hashes/signing metadata дублируются в

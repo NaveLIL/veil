@@ -61,7 +61,7 @@
 7. **Metadata honesty**: sealed sender пока не реализован; сервер знает отправителя, участников и маршрут доставки
 8. **Protocol-first**: Protobuf контракт, затем реализация
 9. **Local-first history**: история доступна из SQLCipher без сети; надёжный reconnect/resend для всех операций ещё требует отдельного протокола
-10. **Единственное исключение для Web**: Share Viewer — легковесная страница для просмотра secure links
+10. **Планируемое узкое исключение для Web**: Secure Share Viewer — отдельная легковесная страница для гостевого получения защищённых ссылок. Текущий WASM-модуль является прототипом и ещё не подключён к production-маршрутам
 
 ---
 
@@ -106,7 +106,7 @@
   │                                                             │
   │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────┐  │
   │  │  Gateway     │  │  REST API    │  │  Share Viewer    │  │
-  │  │  (WebSocket) │  │  (OpenAPI)   │  │  (static HTML)   │  │
+  │  │  (WebSocket) │  │  (OpenAPI)   │  │  (planned web)   │  │
   │  └──────┬───────┘  └──────┬───────┘  └──────────────────┘  │
   │         │                 │                                  │
   │  ┌──────┴─────────────────┴──────────────────────────────┐  │
@@ -488,6 +488,12 @@ server/
 
 ### 3.8 Share Viewer: Единственная Web-страница
 
+> **Исторический prototype sketch.** Текущий `veil-share-viewer` не подключён к
+> production gateway и не является готовым сервисом. Актуальный planned contract,
+> browser threat boundary и large-file gate находятся в
+> [`docs/product/secure-share-for-guests.md`](docs/product/secure-share-for-guests.md)
+> и Phase 4G canonical roadmap.
+
 Secure Shares — ссылки, которые любой может открыть в браузере. Для этого нужен **минимальный** web-viewer.
 
 ```
@@ -562,6 +568,11 @@ Bob начинает сессию:
 - **Отличие от EREZ**: MLS (Messaging Layer Security) в будущем для групп >50 участников
 
 ### 4.5 Secure Shares (главная фишка!)
+
+> Схема ниже сохраняется как исходная идея, а не implementation contract. В
+> частности, downloadable `wrapped_key` допускает offline password guessing,
+> которое нельзя остановить server-side rate limit. Актуальное решение обязано
+> пройти отдельный ADR/security review Phase 4G.
 
 ```
 Создание:
@@ -945,7 +956,7 @@ veil/
 - [x] Desktop: reactions (emoji quick-pick in context menu, reaction pills)
 - [ ] Mobile UI: servers, channels (native navigation)
 
-### Phase 5: Secure Shares (1-2 недели) ⚠️ IN PROGRESS
+### Historical Phase 5: Secure Shares prototype (superseded by canonical Phase 4G)
 - [ ] `server/cmd/share`: CRUD, TTL, view counter, auto-purge, password rate-limit
 - [x] `share-viewer/`: minimal web page + veil-crypto-mini.wasm
 - [ ] Desktop: create share from chat, QR code
@@ -1065,7 +1076,8 @@ volumes:
 
 ## 12. Открытые Вопросы
 
-1. **Название**: Veil? Bastion? Aegis? Phantom? Твой вариант?
+1. **Название:** решение отложено; `Veil` остаётся рабочим именем. Актуальный
+   shortlist хранится приватно до проверки товарных знаков и доменов.
 2. **Лицензия (решено 14 июля 2026):** весь монорепозиторий распространяется
    как `AGPL-3.0-or-later`; правообладатель — NaveLIL. Название Veil и логотип
    Phase Shift регулируются отдельно в `TRADEMARKS.md`.
