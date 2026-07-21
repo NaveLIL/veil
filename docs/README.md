@@ -54,6 +54,7 @@ ADR фиксирует принятое решение и причины. Изм
 - [Phase 5S Direct-v1 transcript checkpoint](reviews/phase-5s-direct-v1-transcript-checkpoint.md)
 - [Phase 5S Direct-v1 key-validation checkpoint](reviews/phase-5s-direct-v1-key-validation-checkpoint.md)
 - [Phase 5S Direct-v1 skipped-key/state checkpoint](reviews/phase-5s-direct-v1-skipped-key-state-checkpoint.md)
+- [Phase 5S isolated libsignal source/build spike](reviews/phase-5s-libsignal-isolated-spike.md)
 - [Phase 5S exact-origin transport-auth contract checkpoint](reviews/phase-5s-hostile-node-auth-contract-checkpoint.md)
 - [Phase 5S configured-origin foundation checkpoint](reviews/phase-5s-configured-origin-foundation-checkpoint.md)
 - [Phase 5S WebSocket auth v3 foundation checkpoint](reviews/phase-5s-ws-auth-v3-foundation-checkpoint.md)

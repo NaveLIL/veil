@@ -77,7 +77,7 @@ Veil ещё не выпускался, поэтому runtime backward compatibi
 | 5A | Android foundation | core runtime, TLS, atomic vault, lifecycle/Pass authority, native recovery и debug Ready-capture checkpoints опубликованы; durable setup-result reconciliation реализован и host-tested в текущем локальном checkpoint; изолированный `internalTester` packaging/signing/verifier contract реализован, но stable signed APK и deferred A04/A05/recovery/vault/capture physical matrix открыты |
 | 5B | Android messaging | automated receive/read, one-shot peer-prekey, idempotent native send/outbox, typed ACK, transient reconnect и true-empty Ready опубликованы; полная Desktop ↔ Android E2EE/airplane/background/process-death matrix открыта |
 | 5C | Secure QR device linking / multi-device | отдельный blocking gate не начат: second-device enrollment, SAS approval, atomic activation, revoke и hostile-relay matrix обязательны до корректного multi-device |
-| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher, shared Rust↔Go exact-origin contract, mandatory configured origin и изолированные non-activated WS v3 verifier/atomic admission и REST v2 HTTP/version-dispatch foundations реализованы; live WS raw-protobuf/subprotocol/gateway dispatch, REST route/ServeMux cutover, two-Node relay, Android consumption, `libsignal` spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
+| 5S | Direct protocol assurance & hostile Node | immutable Direct-v1 transcript/SQLCipher, shared Rust↔Go exact-origin contract, mandatory configured origin, изолированные non-activated WS v3 verifier/atomic admission и REST v2 HTTP/version-dispatch foundations, а также pinned host-only `libsignal` source/build checkpoint реализованы; live WS raw-protobuf/subprotocol/gateway dispatch, REST route/ServeMux cutover, two-Node relay, Android consumption, `libsignal` adapter/ABI/state spike, key-transparency ADR и независимый аудит открыты; живые WS v2/REST v1 всё ещё оставляют cross-Node credential-scope P1 |
 | 6 | OpenMLS | фундамент готов, runtime-ветвление выключено |
 | 7 | LiveKit звонки | не начато |
 | 8 | Полировка, релиз | частично: CI и Windows release workflow готовы |
@@ -2045,7 +2045,10 @@ recanonicalization и rollback покрыты executable tests. Frozen Direct-v1
 
 Findings 3–4, deterministic skipped-key expiry, whole-file rollback, hostile
 Node, key transparency, session lifecycle, cross-client consumption,
-`libsignal` spike и независимый внешний аудит остаются открытыми.
+full `libsignal` adapter/ABI/state spike и независимый внешний аудит остаются
+открытыми. Pinned upstream source/build checkpoint 5S.2A is recorded in
+[`docs/reviews/phase-5s-libsignal-isolated-spike.md`](docs/reviews/phase-5s-libsignal-isolated-spike.md);
+it did not integrate or activate the library.
 
 ### 5S.1 — Зафиксировать и атаковать текущий Direct v1
 
