@@ -700,6 +700,7 @@ func TestVerifyResponseV3ClearsDecodedPassWhenChallengeIsAlreadyGone(t *testing.
 func TestVerifyResponseV3RejectsNilContextBeforeProofOrStore(t *testing.T) {
 	store := &recordingWSAuthV3Store{}
 	service, response := newWSAuthV3Attempt(t, store, WSAuthRegistrationCreateWithPassV3)
+	//lint:ignore SA1012 This boundary test deliberately verifies fail-closed nil handling.
 	_, err := service.VerifyResponseV3(nil, t.Name(), response)
 	var failure *WSAuthV3Failure
 	if err == nil || errors.As(err, &failure) {

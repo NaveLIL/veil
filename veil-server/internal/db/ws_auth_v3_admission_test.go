@@ -11,6 +11,7 @@ import (
 
 func TestAdmitWSAuthV3RejectsNilContextBeforeValidationOrPoolUse(t *testing.T) {
 	database := &DB{}
+	//lint:ignore SA1012 This boundary test deliberately verifies fail-closed nil handling.
 	result, err := database.AdmitWSAuthV3(nil, validWSAuthV3AdmissionRequestForTest())
 	if err == nil || result != nil {
 		t.Fatalf("nil-context admission result=%#v err=%v, want nil operational error", result, err)

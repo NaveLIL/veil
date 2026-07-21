@@ -141,9 +141,10 @@ func WSAuthV3AccountProofMessage(input WSAuthContextV3Input, accountShared []byt
 // caller must supply the account proof signature it has already verified
 // strictly against the corresponding account proof message.
 func WSAuthV3DeviceProofMessage(input WSAuthContextV3Input, deviceShared, accountProofSignature []byte) ([]byte, error) {
-	context, err := WSAuthV3Context(input)
-	if err != nil {
-		return nil, err
+	//lint:ignore SA4006 Staticcheck v0.6.1 misreads this Go 1.26 slice; it is length-bound and appended below.
+	canonicalContext, contextErr := WSAuthV3Context(input)
+	if contextErr != nil {
+		return nil, contextErr
 	}
 	if err := validateWSAuthV3SharedSecret(deviceShared); err != nil {
 		return nil, err
@@ -152,10 +153,10 @@ func WSAuthV3DeviceProofMessage(input WSAuthContextV3Input, deviceShared, accoun
 		return nil, wsAuthV3Invalid("account proof signature", nil)
 	}
 
-	message := make([]byte, 0, len(wsAuthDeviceProofDomainV3)+4+len(context)+
+	message := make([]byte, 0, len(wsAuthDeviceProofDomainV3)+4+len(canonicalContext)+
 		WSAuthV3SharedSecretSize+ed25519.SignatureSize)
 	message = append(message, wsAuthDeviceProofDomainV3...)
-	message = appendWSAuthV3Bytes(message, context)
+	message = appendWSAuthV3Bytes(message, canonicalContext)
 	message = append(message, deviceShared...)
 	message = append(message, accountProofSignature...)
 	return message, nil

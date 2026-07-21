@@ -59,6 +59,7 @@ func TestRESTAuthV2ReplayCleanupRejectsInvalidBatchBeforeDatabaseUse(t *testing.
 			t.Fatalf("batch=%d deleted=%d error=%v", batch, deleted, err)
 		}
 	}
+	//lint:ignore SA1012 This boundary test deliberately verifies fail-closed nil handling.
 	if deleted, err := database.DeleteExpiredRESTAuthV2ReplayNonces(nil, 1); deleted != 0 || !errors.Is(err, ErrRESTAuthV2ReplayBatch) {
 		t.Fatalf("nil context deleted=%d error=%v", deleted, err)
 	}
