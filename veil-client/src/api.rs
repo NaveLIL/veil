@@ -3498,6 +3498,7 @@ impl VeilClient {
             | ConnectionEvent::FriendRemoved { .. }
             | ConnectionEvent::FriendListReceived { .. }
             | ConnectionEvent::ProfileUpdated { .. }
+            | ConnectionEvent::ConversationAvailable { .. }
             | ConnectionEvent::ServerEvent { .. }
             | ConnectionEvent::ChannelEvent { .. } => report.ignored += 1,
         }

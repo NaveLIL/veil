@@ -868,6 +868,9 @@ pub(crate) fn connection_event_retained_size_v1(
         }
         ConnectionEvent::FriendRemoved { user_id }
         | ConnectionEvent::ProfileUpdated { user_id, .. } => size.add_string(user_id)?,
+        ConnectionEvent::ConversationAvailable { conversation_id } => {
+            size.add_string(conversation_id)?
+        }
         ConnectionEvent::FriendListReceived {
             friends,
             pending_requests,
@@ -3153,11 +3156,11 @@ fn connection_event_from_envelope(
             }
         }
         Some(proto::envelope::Payload::ConversationAvailable(available)) => {
-            let parsed_conversation_id = Uuid::parse_str(&available.conversation_id).ok()?;
-            if parsed_conversation_id.is_nil()
-                || parsed_conversation_id.to_string() != available.conversation_id
-            {
-                return None;
+            // This is only a non-authoritative discovery hint. Ignore a
+            // malformed value without publishing it; the client still resolves
+            // every accepted identifier through the signed REST directory.
+            if !is_canonical_lowercase_uuid(&available.conversation_id) {
+                return Ok(None);
             }
             ConnectionEvent::ConversationAvailable {
                 conversation_id: available.conversation_id,
@@ -4401,9 +4404,9 @@ mod tests {
                 )),
                 ..Default::default()
             }),
-            Some(ConnectionEvent::ConversationAvailable {
+            Ok(Some(ConnectionEvent::ConversationAvailable {
                 conversation_id: accepted,
-            }) if accepted == conversation_id
+            })) if accepted == conversation_id
         ));
 
         for rejected in [
@@ -4420,6 +4423,7 @@ mod tests {
                 )),
                 ..Default::default()
             })
+            .unwrap()
             .is_none());
         }
     }
