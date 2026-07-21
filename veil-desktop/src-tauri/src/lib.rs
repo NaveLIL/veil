@@ -481,6 +481,23 @@ fn invalidate_disconnected_binding(
     true
 }
 
+/// Fail closed only when the terminal event-stream failure belongs to the
+/// currently published transport generation. A delayed failure from an older
+/// socket must not tear down a replacement binding or its readiness.
+fn invalidate_terminal_poll_generation(
+    current: &mut Option<RestBinding>,
+    renderer_confirmed: &mut Option<RestBinding>,
+    ready: &AtomicBool,
+    failed: &RestBinding,
+) -> bool {
+    if !invalidate_disconnected_binding(current, failed) {
+        return false;
+    }
+    invalidate_disconnected_binding(renderer_confirmed, failed);
+    ready.store(false, Ordering::SeqCst);
+    true
+}
+
 /// App handle bound to the exact authenticated generation which produced an
 /// event. It deliberately does not look up the current binding during `emit`:
 /// a delayed old-socket event must keep its old generation tag and can never
@@ -5662,13 +5679,48 @@ fn connect_to_server(
                     Ok(event) => event,
                     Err(error) => {
                         drop(client);
+                        // `poll_event` errors are terminal for this authenticated
+                        // stream (including fail-closed protocol violations).
+                        // Invalidate the exact generation before notifying the
+                        // renderer so its disconnected handler can reconnect.
+                        // The session-transition guard prevents a replacement
+                        // connection from publishing between the scope check and
+                        // this teardown; the explicit binding comparison also
+                        // protects against any delayed old-generation failure.
+                        let invalidated = {
+                            let mut binding = state_inner
+                                .authenticated_rest_origin
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let mut renderer_binding = state_inner
+                                .renderer_confirmed_rest_binding
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            invalidate_terminal_poll_generation(
+                                &mut binding,
+                                &mut renderer_binding,
+                                &state_inner.offline_sync_ready,
+                                &event_binding,
+                            )
+                        };
+                        state_inner.authenticated_rest_origin.clear_poison();
+                        state_inner.renderer_confirmed_rest_binding.clear_poison();
+                        let detail = format!("failed to reconcile server event: {error}");
                         let _ = app_handle.emit(
                             "veil://error",
                             serde_json::json!({
                                 "code": 5001,
-                                "message": format!("failed to reconcile server event: {error}"),
+                                "message": detail,
                             }),
                         );
+                        if invalidated {
+                            let _ = app_handle.emit(
+                                "veil://disconnected",
+                                serde_json::json!({
+                                    "reason": format!("native event stream terminated: {error}"),
+                                }),
+                            );
+                        }
                         continue;
                     }
                 };
@@ -12658,8 +12710,9 @@ mod e2ee_rest_tests {
         canonical_profile_version, clear_node_access_pass_after_success,
         consume_pending_lock_event, current_target_admission_evidence,
         exact_confirmed_live_action_binding, invalidate_disconnected_binding,
-        lock_transition_requires_sensitive_reset, node_access_attempt_for_origin, offline_sync_url,
-        parse_device_directory, parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
+        invalidate_terminal_poll_generation, lock_transition_requires_sensitive_reset,
+        node_access_attempt_for_origin, offline_sync_url, parse_device_directory,
+        parse_expected_dm_peer_identity_key, parse_media_plaintext_range,
         parse_message_crypto_context, parse_network_profile_response,
         parse_pending_node_access_pass, parse_pending_veil_link, parse_prekey_bundle,
         parse_push_subscription_views, pending_node_access_pass_view, pending_veil_link_view,
@@ -14269,6 +14322,40 @@ mod e2ee_rest_tests {
             &replacement_binding
         ));
         assert_eq!(current, None);
+    }
+
+    #[test]
+    fn terminal_poll_failure_invalidates_only_its_exact_transport_generation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let failed = authenticated_test_binding("chat.example.test", 7);
+        let replacement = authenticated_test_binding("chat.example.test", 8);
+        let ready = AtomicBool::new(true);
+        let mut current = Some(failed.clone());
+        let mut renderer_confirmed = Some(failed.clone());
+
+        assert!(invalidate_terminal_poll_generation(
+            &mut current,
+            &mut renderer_confirmed,
+            &ready,
+            &failed,
+        ));
+        assert_eq!(current, None);
+        assert_eq!(renderer_confirmed, None);
+        assert!(!ready.load(Ordering::Acquire));
+
+        current = Some(replacement.clone());
+        renderer_confirmed = Some(replacement.clone());
+        ready.store(true, Ordering::Release);
+        assert!(!invalidate_terminal_poll_generation(
+            &mut current,
+            &mut renderer_confirmed,
+            &ready,
+            &failed,
+        ));
+        assert_eq!(current, Some(replacement.clone()));
+        assert_eq!(renderer_confirmed, Some(replacement));
+        assert!(ready.load(Ordering::Acquire));
     }
 
     #[test]

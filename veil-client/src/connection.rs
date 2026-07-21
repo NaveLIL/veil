@@ -3156,11 +3156,12 @@ fn connection_event_from_envelope(
             }
         }
         Some(proto::envelope::Payload::ConversationAvailable(available)) => {
-            // This is only a non-authoritative discovery hint. Ignore a
-            // malformed value without publishing it; the client still resolves
-            // every accepted identifier through the signed REST directory.
+            // The hint is non-authoritative, but silently dropping a malformed
+            // handled payload could leave the directory stale indefinitely.
+            // Poison the epoch so reconnect hydration can restore the exact
+            // signed REST state instead of hiding the protocol violation.
             if !is_canonical_lowercase_uuid(&available.conversation_id) {
-                return Ok(None);
+                return Err(protocol_violation("ConversationAvailable"));
             }
             ConnectionEvent::ConversationAvailable {
                 conversation_id: available.conversation_id,
@@ -3684,6 +3685,59 @@ mod tests {
                 envelope: "MessageAck"
             }
         );
+    }
+
+    #[tokio::test]
+    async fn malformed_conversation_discovery_poisoned_epoch_never_enqueues_the_hint() {
+        let budget = ConnectionEventBudgetV1::with_limits(1, LIVE_EVENT_RETAINED_BYTES);
+        let (raw_tx, raw_rx) = mpsc::channel(1);
+        let terminal = Arc::new(ConnectionTerminalStateV1::default());
+        let sender = ConnectionEventSenderV1 {
+            sender: raw_tx,
+            budget,
+        };
+        let mut receiver = ConnectionEventReceiverV1 {
+            receiver: raw_rx,
+            terminal: terminal.clone(),
+        };
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let malformed = proto::Envelope {
+            payload: Some(proto::envelope::Payload::ConversationAvailable(
+                proto::ConversationAvailable {
+                    conversation_id: "70BE554C-B5AD-4CDD-B6F4-CC7B79563690".to_string(),
+                },
+            )),
+            ..Default::default()
+        }
+        .encode_to_vec();
+
+        let error = dispatch_authenticated_binary_frame(&sender, &malformed)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            ConnectionEventBufferErrorV1::ProtocolViolation {
+                envelope: "ConversationAvailable"
+            }
+        );
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        signal_event_buffer_failure(&terminal, &shutdown_tx, error.clone());
+        let terminal_event = receiver.try_recv_budgeted().unwrap();
+        assert_eq!(terminal_event.terminal_failure(), Some(&error));
+        assert!(matches!(
+            terminal_event.into_event(),
+            ConnectionEvent::Disconnected { reason }
+                if reason == "malformed ConversationAvailable envelope after the authenticated barrier"
+        ));
+        assert!(*shutdown_rx.borrow());
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 
     #[tokio::test]
@@ -4415,16 +4469,19 @@ mod tests {
             "70BE554C-B5AD-4CDD-B6F4-CC7B79563690",
             "not-a-uuid",
         ] {
-            assert!(connection_event_from_envelope(proto::Envelope {
-                payload: Some(proto::envelope::Payload::ConversationAvailable(
-                    proto::ConversationAvailable {
-                        conversation_id: rejected.to_string(),
-                    },
-                )),
-                ..Default::default()
-            })
-            .unwrap()
-            .is_none());
+            assert!(matches!(
+                connection_event_from_envelope(proto::Envelope {
+                    payload: Some(proto::envelope::Payload::ConversationAvailable(
+                        proto::ConversationAvailable {
+                            conversation_id: rejected.to_string(),
+                        },
+                    )),
+                    ..Default::default()
+                }),
+                Err(ConnectionEventBufferErrorV1::ProtocolViolation {
+                    envelope: "ConversationAvailable"
+                })
+            ));
         }
     }
 
