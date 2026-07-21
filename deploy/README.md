@@ -234,6 +234,11 @@ sudo certbot renew --dry-run
 
 ## 3. Backup gate before migrations
 
+The current deployment default remains PostgreSQL 16. Do not override it with
+PostgreSQL 18 for an existing volume; the required major-version evidence and
+fresh-volume procedure are defined in
+[`docs/operations/postgresql-18-upgrade-gate.md`](../docs/operations/postgresql-18-upgrade-gate.md).
+
 Start only PostgreSQL first:
 
 ```sh
