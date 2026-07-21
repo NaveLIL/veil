@@ -2,7 +2,7 @@ name: Desktop UI CI
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "ds/beta-all-2026-07-21"]
     paths:
       - "veil-desktop/src/**"
       - "veil-desktop/index.html"

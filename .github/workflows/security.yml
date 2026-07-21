@@ -2,7 +2,7 @@ name: Security Audit
 
 on:
   push:
-    branches: [master, main]
+    branches: [master, main, "ds/beta-all-2026-07-21"]
   pull_request:
     branches: [master, main]
   schedule:
